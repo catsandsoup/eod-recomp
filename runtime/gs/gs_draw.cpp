@@ -524,7 +524,7 @@ inline uint32_t bilerp(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, i
 }
 
 // Sampling from a decoded texture level.
-inline uint32_t sample_cached(const Env &e, int u, int v, bool bilinear, int lvl) {
+__attribute__((always_inline)) inline uint32_t sample_cached(const Env &e, int u, int v, bool bilinear, int lvl) {
     TexEntry &T = *e.tl[lvl];
     int tw = T.w, th = T.h;
     if (lvl) {
@@ -541,6 +541,12 @@ inline uint32_t sample_cached(const Env &e, int u, int v, bool bilinear, int lvl
     int x0 = u >> 4, y0 = v >> 4;
     int xa = wrap(x0, tw, e.wms, e.minu, e.maxu), xb = wrap(x0 + 1, tw, e.wms, e.minu, e.maxu);
     int ya = wrap(y0, th, e.wmt, e.minv, e.maxv), yb = wrap(y0 + 1, th, e.wmt, e.minv, e.maxv);
+    if (((xa ^ xb) | (ya ^ yb)) < 8 && (xa >> 3) == (xb >> 3) && (ya >> 3) == (yb >> 3)) {
+        // all four texels in one tile: one check
+        texel(e, T, xa, ya);
+        const uint32_t *r0 = &T.data[(size_t)ya * tw], *r1 = &T.data[(size_t)yb * tw];
+        return bilerp(r0[xa], r0[xb], r1[xa], r1[xb], u & 15, v & 15);
+    }
     return bilerp(texel(e, T, xa, ya), texel(e, T, xb, ya), texel(e, T, xa, yb), texel(e, T, xb, yb), u & 15, v & 15);
 }
 
@@ -592,6 +598,10 @@ inline int ffloor(double d) {
     int i = (int)d;
     return i - (d < (double)i);
 }
+inline int ffloorf(float d) {
+    int i = (int)d;
+    return i - (d < (float)i);
+}
 
 // ------------------------------------------------------------- pixel
 struct Frag {
@@ -632,7 +642,8 @@ __attribute__((always_inline)) inline void shade_px_t(const Env &e, int x, const
     int r = f.r, g = f.g, b = f.b, a = f.a;
     if (TEX) {
         bool bl = f.lod > 0 ? e.bilinear_min : e.bilinear_mag;
-        uint32_t t = sample(e, f.u, f.v, bl, f.lod > 0 ? f.lod : 0);
+        int lv = f.lod > 0 ? f.lod : 0;
+        uint32_t t = e.tcached ? sample_cached(e, f.u, f.v, bl, lv) : sample(e, f.u, f.v, bl, lv);
         int tr = t & 255, tg = (t >> 8) & 255, tb = (t >> 16) & 255, ta = t >> 24;
         switch (e.tfx) {
         case 0:  // MODULATE
@@ -1016,8 +1027,8 @@ void tri_spans(const Env &e, const TriSpans &ts, int wid, int nw, WStats &ws) {
                 if (STQ) {
                     float qq = q == 0.0f ? 1e-30f : q;
                     float iq = 1.0f / qq;
-                    f.u = ffloor(s * iq * tw16);
-                    f.v = ffloor(t * iq * th16);
+                    f.u = ffloorf(s * iq * tw16);
+                    f.v = ffloorf(t * iq * th16);
                     if (mip) {
                         float lod = e.lcm ? e.k : (-fast_log2(qq) * lod_scale + e.k);
                         int lvl = lod <= 0 ? 0 : (int)(lod + 0.5f);

@@ -7,6 +7,7 @@
 //     +0x1C EE address of the 0xC0-byte "end parameter" block, +0x20 data
 //   nameParam (0x414 bytes): +0 port, +4 slot, +8 flags, +0x18 name
 // All calls complete immediately; the reply word is the result.
+#include <cstdlib>
 #include <sys/stat.h>
 
 #include <cstdio>
@@ -45,7 +46,9 @@ bool g_seen[2];
 std::string g_cwd[2] = {"/", "/"};
 
 std::string port_root(int port) {
-    std::string r = g_game_root + "/memcard";
+    // EOD_MEMCARD=dir puts the cards elsewhere (e.g. a fresh card for tests)
+    const char *env = getenv("EOD_MEMCARD");
+    std::string r = env ? std::string(env) : g_game_root + "/memcard";
     mkdir_host(r.c_str());
     r += port ? "/port1" : "/port0";
     mkdir_host(r.c_str());

@@ -136,6 +136,7 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
   `EOD_GS_TRACE`: logs every write to that pixel) help bisect rendering bugs
 * `EOD_WATCH=addr,...` logs float values at EE addresses when they change;
   `EOD_WATCHW=addr` (Linux) reports the host code that first writes a huge value there
+* `EOD_MEMCARD=dir` uses another memory card folder (e.g. an empty one for repeatable tests)
 * `EOD_WAV=file` (POSIX build) writes the audio output to a WAV file
 * `cmake -DEOD_TRACE_CALLS=ON` records the last EE function calls, printed on crashes
 * `EOD_PAD_SCRIPT=frame:buttons,...` scripts controller input (port 0)
