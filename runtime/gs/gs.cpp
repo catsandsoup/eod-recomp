@@ -853,7 +853,17 @@ int gs_replay(const char *path, int repeat) {
         fprintf(stderr, "replay %d: %.1f ms\n", r + 1, ms);
     }
     fclose(f);
-    fprintf(stderr, "best %.1f ms, %d raster workers\n", best, n);
+    raster_collect_stats();
+    fprintf(stderr, "best %.1f ms, %d raster workers; per replay: %u prims, %u pixels, %llu game frames\n", best, n,
+            stats.prims / repeat, stats.pixels / repeat, (unsigned long long)(g_flips.load() / repeat));
+    uint32_t tri = 0;
+    for (int k = 0; k < 64; k++) {
+        tri += stats.kind_px[k];
+        if (stats.kind_px[k] / repeat > 20000)
+            fprintf(stderr, "  triangles gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels\n", k & 1, (k >> 1) & 1,
+                    (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, stats.kind_px[k] / repeat);
+    }
+    fprintf(stderr, "  sprites/lines: %u pixels\n", (stats.pixels - tri) / repeat);
     std::string shot = std::string(path) + ".ppm";
     gs_screenshot(shot.c_str());
     return 0;

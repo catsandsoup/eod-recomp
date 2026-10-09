@@ -77,6 +77,8 @@ void barrier();
 int g_barrier_cause;  // statistics: what the next barrier is for
 const struct Env *g_env_snap;  // snapshot of g_env referenced by queued jobs
 
+enum { BL_GENERIC, BL_MIX, BL_ADD };
+
 struct Env {
     // frame buffer
     uint32_t fbp, fbw, fpsm, fbmsk;
@@ -114,6 +116,7 @@ struct Env {
     bool need_z;      // depth is tested or written
     uint32_t zmax;    // largest depth value of the format
     int pix_kind;     // shade_px_t variant: tme | depth test << 1 | depth write << 2
+    int blend_kind;   // BL_MIX, BL_ADD or BL_GENERIC
     // address tables
     const SwizzleTab *fbT, *zT, *texT[7];
     uint32_t pal[256];  // CLUT expanded to RGBA for the current texture
@@ -207,7 +210,7 @@ TexEntry *tex_lookup(const Env &e, int lvl) {
     int h = (int)e.th >> lvl;
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    if (w * h > 512 * 512) return nullptr;
+    if (w * h > 1024 * 1024) return nullptr;
     uint32_t first, count;
     page_range(e.mip_tbp[lvl], e.mip_tbw[lvl], e.tpsm, 0, 0, w, h, first, count);
     // a texture inside the buffers being drawn changes under our feet
@@ -259,13 +262,38 @@ TexEntry *tex_lookup(const Env &e, int lvl) {
 
 // Raster workers may decode the same tile at once: they write the same
 // texels, and the flag is published after the data.
+inline uint32_t expand16(uint32_t c, const Env &e);
+
 __attribute__((noinline)) void decode_tile(const Env &e, TexEntry &t, int tx, int ty) {
     int x0 = tx * 8, y0 = ty * 8;
     int x1 = std::min(x0 + 8, t.w), y1 = std::min(y0 + 8, t.h);
     g_wstats[t_wid].decoded += (uint32_t)((x1 - x0) * (y1 - y0));
+    const SwizzleTab &T = *e.texT[t.lvl];
+    const uint32_t bp = e.mip_tbp[t.lvl];
     for (int y = y0; y < y1; y++) {
         uint32_t *d = &t.data[(size_t)y * t.w];
-        for (int x = x0; x < x1; x++) d[x] = fetch(e, x, y, t.lvl);
+        uint32_t rb = T.row_base(bp, y), rc = T.rowC[y & 2047];
+        switch (e.tpsm) {
+        case PSMCT32:
+        case PSMZ32:
+            for (int x = x0; x < x1; x++) d[x] = word(T.addr_row(rb, rc, x));
+            break;
+        case PSMT8:
+            for (int x = x0; x < x1; x++) d[x] = e.pal[byte(T.addr_row(rb, rc, x))];
+            break;
+        case PSMT4:
+            for (int x = x0; x < x1; x++) d[x] = e.pal[nibble(T.addr_row(rb, rc, x))];
+            break;
+        case PSMCT16:
+        case PSMCT16S:
+        case PSMZ16:
+        case PSMZ16S:
+            for (int x = x0; x < x1; x++) d[x] = expand16(half(T.addr_row(rb, rc, x)), e);
+            break;
+        default:
+            for (int x = x0; x < x1; x++) d[x] = fetch(e, x, y, t.lvl);
+            break;
+        }
     }
     __atomic_store_n(&t.valid[ty * t.tiles_w + tx], (uint8_t)1, __ATOMIC_RELEASE);
 }
@@ -407,6 +435,8 @@ void setup_env(uint32_t attr) {
     uint32_t full = e.fpsm == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.write_none = ((e.fbmsk & full) == full && e.zmsk) || e.ztst == 0;
     e.zmax = e.z16 ? 0xFFFFu : e.zpsm == PSMZ24 ? 0xFFFFFFu : 0xFFFFFFFFu;
+    e.blend_kind = (e.ba == 0 && e.bb == 1 && e.bd == 1) ? BL_MIX : (e.ba == 0 && e.bb == 2 && e.bd == 1) ? BL_ADD
+                                                                                                    : BL_GENERIC;
     e.pix_kind = (e.tme ? 1 : 0) | (e.ztst >= 2 ? 2 : 0) | (!e.zmsk && e.ztst != 0 ? 4 : 0);
     e.need_dst = e.date || (e.abe && (e.ba == 1 || e.bb == 1 || e.bd == 1 || e.bc == 1)) || e.fbmsk;
     e.need_z = e.ztst != 1 || !e.zmsk;
@@ -733,7 +763,28 @@ __attribute__((always_inline)) inline void shade_px_t(const Env &e, int x, const
         }
     }
     // ---- blending
-    if (write_fb && e.abe && !(e.pabe && a < 0x80)) {
+    if (write_fb && e.abe && !(e.pabe && a < 0x80) && e.blend_kind != BL_GENERIC) {
+        int dr = (int)(dst & 255), dg = (int)((dst >> 8) & 255), db = (int)((dst >> 16) & 255);
+        int cc = e.bc == 0 ? a : e.bc == 1 ? (int)(dst >> 24) : (int)e.bfix;
+        if (e.blend_kind == BL_MIX) {  // (Cs - Cd) * C + Cd
+            r = (((r - dr) * cc) >> 7) + dr;
+            g = (((g - dg) * cc) >> 7) + dg;
+            b = (((b - db) * cc) >> 7) + db;
+        } else {  // BL_ADD: Cs * C + Cd
+            r = ((r * cc) >> 7) + dr;
+            g = ((g * cc) >> 7) + dg;
+            b = ((b * cc) >> 7) + db;
+        }
+        if (e.colclamp) {
+            r = clamp255(r);
+            g = clamp255(g);
+            b = clamp255(b);
+        } else {
+            r &= 255;
+            g &= 255;
+            b &= 255;
+        }
+    } else if (write_fb && e.abe && !(e.pabe && a < 0x80)) {
         int cs[3] = {r, g, b}, cd[3] = {(int)(dst & 255), (int)((dst >> 8) & 255), (int)((dst >> 16) & 255)};
         int ad = (int)(dst >> 24);
         int cc = e.bc == 0 ? a : e.bc == 1 ? ad : (int)e.bfix;
