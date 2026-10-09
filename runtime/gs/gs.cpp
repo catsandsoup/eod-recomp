@@ -863,7 +863,7 @@ int gs_replay(const char *path, int repeat) {
     std::vector<uint8_t> cmds((size_t)(end - start));
     fseek(f, start, SEEK_SET);
     if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
-    int hw = (int)std::thread::hardware_concurrency();
+    int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
     raster_start(n);
@@ -922,13 +922,13 @@ static void gs_worker() {
 
 void gs_thread_start() {
     const char *e = getenv("EOD_GS_THREAD");
-    bool want = e ? atoi(e) != 0 : std::thread::hardware_concurrency() >= 2;
+    bool want = e ? atoi(e) != 0 : platform_cpu_count() >= 2;
     if (!want) return;
     g_threaded = true;
     std::thread(gs_worker).detach();
     // raster workers on the cores left after the EE and GS threads
     // (EOD_GS_RASTER=n overrides, 0 disables)
-    int hw = (int)std::thread::hardware_concurrency();
+    int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
     if (n > 4) n = 4;

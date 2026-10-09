@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "../platform.h"
+#include <sched.h>
+#include <thread>
 #include "../pad_script.h"
 
 static PlatformConfig g_cfg;
@@ -47,6 +49,18 @@ uint64_t platform_time_us() {
 }
 
 void platform_sleep_us(uint32_t us) { usleep(us); }
+
+int platform_cpu_count() {
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+#endif
+    unsigned n = std::thread::hardware_concurrency();
+    return n ? (int)n : 1;
+}
 
 // Input: only scripted (EOD_PAD_SCRIPT, see pad_script.h).
 void platform_get_pad(int port, HostPadState *out) {

@@ -278,6 +278,19 @@ uint64_t platform_time_us() {
     return (uint64_t)(c.QuadPart / (double)g_qpf.QuadPart * 1000000.0);
 }
 
+int platform_cpu_count() {
+    DWORD_PTR proc = 0, sys = 0;
+    int n = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
+        for (; proc; proc &= proc - 1) n++;
+    if (n <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        n = (int)si.dwNumberOfProcessors;
+    }
+    return n > 0 ? n : 1;
+}
+
 void platform_sleep_us(uint32_t us) {
     if (us >= 1000)
         Sleep(us / 1000);

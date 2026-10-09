@@ -22,6 +22,8 @@ bool platform_pump();
 void platform_present(const uint32_t *pixels, int width, int height, int stride);
 
 uint64_t platform_time_us();
+// Logical CPUs this process may run on (its affinity), at least 1.
+int platform_cpu_count();
 void platform_sleep_us(uint32_t us);
 
 // ------------------------------------------------------------------ input
