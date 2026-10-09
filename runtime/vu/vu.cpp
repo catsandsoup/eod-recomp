@@ -131,7 +131,7 @@ void upper_result(Ctx &c, int reg, const VUReg &v, int dest, bool acc) {
     c.mac_set = true;
 }
 
-void commit_upper(Ctx &c) {
+__attribute__((always_inline)) inline void commit_upper(Ctx &c) {
     if (!c.up_write) return;
     VUState *vu = c.vu;
     VUReg *dst = c.up_acc ? &vu->acc : &vu->vf[c.up_reg];
@@ -221,7 +221,7 @@ inline float apply_t(float acc, float a, float b) {
 }
 
 template <ArOp OP, int SRC, bool ACC, bool FLAGS = true>
-inline void up_fmac(Ctx &c, uint32_t ins) {
+__attribute__((always_inline)) inline void up_fmac(Ctx &c, uint32_t ins) {
     VUState *vu = c.vu;
     const VUReg &s = vu->vf[FS(ins)];
     const VUReg &t = vu->vf[FT(ins)];
