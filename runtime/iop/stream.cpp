@@ -11,7 +11,11 @@
 //   2  Read{lsn, sectors, ee_buffer, ee_status}: sectors are copied into EE
 //      memory and 0 is written to ee_status when done (the EE writes -1
 //      before issuing the request).
-//   3  Stream requests (audio)  - TODO
+//   3  Stream requests (audio): at +0x40, n (word 0) entries {lsn, bytes,
+//      flags}: flags bits 8-11 = channel, bit 0 = clear the channel's queue
+//      first.  The data (SPU ADPCM, mono) is fed into a looping ring buffer
+//      in sound RAM played by one SPU2 voice per channel; the game sets
+//      that voice's volume and pitch itself (see "Audio streaming" below).
 //   4  Debug command
 //
 // The "disc" is the game directory: SLUS_209.10, SYSTEM.CNF and DATA/.
@@ -26,6 +30,7 @@
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "iop.h"
+#include "spu2.h"
 
 namespace {
 
@@ -200,7 +205,99 @@ void disc_read(uint32_t lsn, uint8_t *out, uint32_t bytes) {
 
 uint32_t g_cfg[16];
 
+// ------------------------------------------------------------ audio streaming
+// As stream.irx's SpuChannel: voice `voice` of core 0 loops over a ring
+// buffer in sound RAM (loop start flags on its first block, loop end+repeat
+// on its last); the writer stays ahead of the voice's play address, with
+// queued data or silence.
+struct StreamChannel {
+    int voice;
+    uint32_t start, size;  // ring buffer in sound RAM
+    uint16_t pitch;        // default; the game sets its own
+    bool running = false;
+    uint32_t wpos = 0;  // ring offset written up to
+    struct Req {
+        uint32_t lsn, bytes;
+    };
+    std::vector<Req> queue;
+    uint32_t done = 0;  // bytes of queue[0] already fed
+};
+StreamChannel g_chan[2] = {{0, 0x1FC000, 0x4000, 0x1FD}, {1, 0x1F4000, 0x8000, 0x751}};
+
+uint16_t voice_entry(int voice, uint16_t param) { return (uint16_t)(param | (voice << 1)); }
+
+// Writes `n` bytes (multiple of 16) at ring offset `off` from the queue, or silence.
+void feed(StreamChannel &c, uint32_t off, uint32_t n) {
+    static std::vector<uint8_t> buf;
+    buf.assign(n, 0);
+    uint32_t got = 0;
+    while (got < n && !c.queue.empty()) {
+        StreamChannel::Req &r = c.queue.front();
+        uint32_t take = std::min(n - got, r.bytes - c.done);
+        // read whole sectors around the wanted bytes
+        uint64_t pos = (uint64_t)r.lsn * kSector + c.done;
+        uint32_t first = (uint32_t)(pos / kSector), skip = (uint32_t)(pos % kSector);
+        uint32_t secs = (skip + take + kSector - 1) / kSector;
+        static std::vector<uint8_t> tmp;
+        tmp.resize((size_t)secs * kSector);
+        disc_read(first, tmp.data(), secs * kSector);
+        memcpy(buf.data() + got, tmp.data() + skip, take);
+        got += take;
+        c.done += take;
+        if (c.done >= r.bytes) {
+            c.queue.erase(c.queue.begin());
+            c.done = 0;
+        }
+    }
+    for (uint32_t i = 0; i < n; i += 16) {
+        uint8_t &f = buf[i + 1];
+        if (i >= got) {
+            buf[i] = 0;
+            f = 2;  // silence
+            memset(&buf[i + 2], 0, 14);
+        } else {
+            f &= ~7u;
+        }
+        uint32_t o = off + i;
+        if (o == 0) f |= 6;               // loop start
+        if (o == c.size - 16) f |= 3;     // loop end + repeat
+    }
+    spu2_sram_write(c.start + off, buf.data(), n);
+}
+
+void start_channel(StreamChannel &c) {
+    feed(c, 0, c.size);
+    c.wpos = 0;  // the whole ring is ahead of the voice
+    spu2_set_addr(voice_entry(c.voice, 0x2040), c.start);
+    spu2_set_param(voice_entry(c.voice, 0x0000), 0x3FFF);
+    spu2_set_param(voice_entry(c.voice, 0x0100), 0x3FFF);
+    spu2_set_param(voice_entry(c.voice, 0x0200), c.pitch);
+    spu2_set_switch(0x1500, 1u << c.voice);
+    c.running = true;
+}
+
 }  // namespace
+
+// Keeps the stream voices' ring buffers ahead of playback (called often).
+void iop_stream_update() {
+    for (StreamChannel &c : g_chan) {
+        if (!c.running) continue;
+        uint32_t nax = spu2_get_addr(voice_entry(c.voice, 0x2240));
+        if (nax < c.start || nax >= c.start + c.size) continue;  // voice was moved: leave it
+        uint32_t play = (nax - c.start) & ~15u;
+        // writable: from wpos up to 0x200 bytes before the play position
+        uint32_t limit = (play + c.size - 0x200) % c.size;
+        uint32_t avail = (limit + c.size - c.wpos) % c.size;
+        if (avail > c.size - 0x200) avail = 0;  // wpos is inside the guard zone
+        avail &= ~0x3Fu;
+        while (avail) {
+            uint32_t n = std::min(avail, c.size - c.wpos);
+            feed(c, c.wpos, n);
+            c.wpos = (c.wpos + n) % c.size;
+            avail -= n;
+        }
+    }
+}
 
 void iop_stream_init() {
     iop_register_server(0x8000021A, "stream", [](const RpcCall &c, uint8_t *buf) -> uint32_t {
@@ -231,9 +328,21 @@ void iop_stream_init() {
             return 0;
         }
         case 3: {  // stream (audio) requests
-            uint32_t n = rd32(buf);
-            static int warned;
-            if (warned++ < 8) LOG(LOG_SND, "stream: %u audio stream requests (not implemented)", n);
+            uint32_t n = std::min<uint32_t>(rd32(buf), (c.in_size - 0x40) / 16);
+            for (uint32_t i = 0; i < n; i++) {
+                const uint8_t *e = buf + 0x40 + i * 16;
+                uint32_t lsn = rd32(e), bytes = rd32(e + 4), flags = rd32(e + 8);
+                uint32_t ch = (flags >> 8) & 15;
+                LOG(LOG_SND, "stream: channel %u request lsn %u, %u bytes, flags %x", ch, lsn, bytes, flags);
+                if (ch > 1) continue;
+                StreamChannel &sc = g_chan[ch];
+                if (flags & 1) {
+                    sc.queue.clear();
+                    sc.done = 0;
+                }
+                if (lsn != 0xFFFFFFFFu && bytes && bytes != 0xFFFFFFFFu) sc.queue.push_back({lsn, bytes});
+                if (!sc.running && !sc.queue.empty()) start_channel(sc);
+            }
             return 0;
         }
         case 4:  // debug command

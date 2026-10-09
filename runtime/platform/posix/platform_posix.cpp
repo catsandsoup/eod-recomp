@@ -81,7 +81,31 @@ void platform_get_pad(int port, HostPadState *out) {
 void platform_set_vibration(int, uint8_t, uint8_t) {}
 
 bool platform_audio_open(int) { return true; }
-void platform_audio_submit(const int16_t *, int) {}
+// EOD_WAV=file: the headless build writes the audio (48 kHz stereo) to a WAV file.
+void platform_audio_submit(const int16_t *samples, int frames) {
+    static FILE *f = [] {
+        const char *p = getenv("EOD_WAV");
+        FILE *h = p ? fopen(p, "wb") : nullptr;
+        if (h) {
+            uint8_t hdr[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 2, 0,
+                               0x80, 0xBB, 0, 0, 0, 0xEE, 2, 0, 4, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0};
+            fwrite(hdr, 1, 44, h);
+        }
+        return h;
+    }();
+    static uint32_t bytes;
+    if (!f || frames <= 0) return;
+    fwrite(samples, 4, (size_t)frames, f);
+    bytes += (uint32_t)frames * 4;
+    // keep the header valid so the file can be read at any time
+    long pos = ftell(f);
+    uint32_t riff = bytes + 36;
+    fseek(f, 4, SEEK_SET);
+    fwrite(&riff, 4, 1, f);
+    fseek(f, 40, SEEK_SET);
+    fwrite(&bytes, 4, 1, f);
+    fseek(f, pos, SEEK_SET);
+}
 int platform_audio_queued_frames() { return 0; }
 
 // ------------------------------------------------------------------ fibers

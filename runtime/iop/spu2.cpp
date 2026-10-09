@@ -427,6 +427,10 @@ uint32_t spu2_get_addr(uint16_t entry) {
 void spu2_set_core_attr(uint16_t entry, uint16_t value) { g_core[entry & 1].attr[(entry >> 1) & 7] = value; }
 uint16_t spu2_get_core_attr(uint16_t entry) { return g_core[entry & 1].attr[(entry >> 1) & 7]; }
 
+void spu2_sram_write(uint32_t spu_addr, const uint8_t *src, uint32_t size) {
+    for (uint32_t i = 0; i < size; i++) g_sram[(spu_addr + i) & (kRamSize - 1)] = src[i];
+}
+
 int spu2_voice_trans(int channel, int mode, uint32_t iop_addr, uint32_t spu_addr, uint32_t size) {
     spu_addr &= kRamSize - 1;
     size = std::min(size, kRamSize - spu_addr);

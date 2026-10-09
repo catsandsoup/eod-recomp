@@ -196,4 +196,9 @@ void iop_sound_init() {
     iop_register_server(0x80000701, "sdrdrv", sdr_call);
 }
 
-void iop_sound_update() { spu2_update(); }
+void iop_stream_update();  // stream.cpp
+
+void iop_sound_update() {
+    iop_stream_update();
+    spu2_update();
+}

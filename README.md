@@ -60,7 +60,7 @@ annotated disassembler used for reverse engineering.
 | Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
 | Memory card | Saves to `memcard/port0` next to the game data |
 | Game data | Read from the disc files on disk (`DATA/...`) |
-| Sound | Sound effects and PCM streams (`sdrdrv` + SPU2); music/speech streamed by `stream.irx` not yet |
+| Sound | Sound effects, PCM streams (`sdrdrv` + SPU2), music and speech streamed from `Speech.bnk` (`stream.irx`) |
 | FMV | Intro, attract and menu background movies play (IPU emulation) |
 | Races | Load and play (Action mode tested): track, cars, HUD, physics |
 | Performance | Below full speed in races (on a 4-thread 2.1 GHz CPU about 14 game frames/s); optimisation in progress |
@@ -136,6 +136,7 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
   `EOD_GS_TRACE`: logs every write to that pixel) help bisect rendering bugs
 * `EOD_WATCH=addr,...` logs float values at EE addresses when they change;
   `EOD_WATCHW=addr` (Linux) reports the host code that first writes a huge value there
+* `EOD_WAV=file` (POSIX build) writes the audio output to a WAV file
 * `cmake -DEOD_TRACE_CALLS=ON` records the last EE function calls, printed on crashes
 * `EOD_PAD_SCRIPT=frame:buttons,...` (POSIX build) scripts controller input
 * `python3 tools/dis.py -f <addr>` disassembles a function with string/symbol annotations
