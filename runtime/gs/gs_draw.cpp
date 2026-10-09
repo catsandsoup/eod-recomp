@@ -884,9 +884,10 @@ inline void tex_coords(const Env &e, float s, float t, float q, Frag &f) {
 // Sprite rows; texture coordinates step in 16.16 fixed point.
 // Rows are dealt to raster workers in groups of 4: worker `wid` of `nw`
 // draws the rows y with (y / 4) % nw == wid.
+constexpr int kRowShift = 3;  // rows per group: 1 << kRowShift
 inline bool skip_row(int &y, int wid, int nw) {
-    if (nw > 1 && ((y >> 2) % nw) != wid) {
-        y |= 3;
+    if (nw > 1 && ((y >> kRowShift) % nw) != wid) {
+        y |= (1 << kRowShift) - 1;
         return true;
     }
     return false;
