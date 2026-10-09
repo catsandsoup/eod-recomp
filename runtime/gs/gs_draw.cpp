@@ -1645,6 +1645,13 @@ void raster_start(int n) {
 
 void raster_sync() { barrier(); }
 
+void raster_mark_pages() {
+    if (g_draw_dirty) {
+        mark_env_written(g_env);
+        g_draw_dirty = false;
+    }
+}
+
 void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     if (!g_nw) return;
     uint32_t first, count;

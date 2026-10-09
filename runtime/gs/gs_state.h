@@ -60,6 +60,8 @@ void clut_load(uint64_t tex0);
 // primitives, and order other VRAM accesses after the primitives they touch
 void raster_start(int n);
 void raster_sync();
+// marks the pages drawn since the last env change as written (gs_mem.h page tracking)
+void raster_mark_pages();
 void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 void raster_vram_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 void raster_collect_stats();

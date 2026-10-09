@@ -559,8 +559,34 @@ bool read_circuit(int n, std::vector<uint32_t> &img, int &w, int &h) {
     return true;
 }
 
-void compose_display() {
+// Has anything the display shows changed since the last composition?
+bool display_changed() {
+    static uint64_t last_regs[8];
+    static uint32_t last_clock;
+    static bool valid;
+    uint64_t regs[8] = {st.pmode, st.dispfb[0], st.dispfb[1], st.display[0], st.display[1], st.smode2, st.bgcolor, 0};
+    raster_mark_pages();
+    bool changed = !valid || memcmp(regs, last_regs, sizeof regs) != 0;
+    for (int n = 0; n < 2 && !changed; n++) {
+        if (!((st.pmode >> n) & 1)) continue;
+        uint64_t fb = st.dispfb[n], disp = st.display[n];
+        uint32_t fbp = bits(fb, 0, 9) * 32, fbw = bits(fb, 9, 6), psm = bits(fb, 15, 5);
+        int dby = (int)bits(fb, 43, 11), dh = (int)bits(disp, 44, 11) + 1;
+        uint32_t first, count;
+        page_range(fbp, fbw, psm, 0, 0, (int)(fbw ? fbw : 1) * 64, std::min(2048, dby + dh * 2), first, count);
+        for (uint32_t i = 0; i < count && !changed; i++)
+            if (g_page_gen[(first + i) % kPages] > last_clock) changed = true;
+    }
+    memcpy(last_regs, regs, sizeof regs);
+    last_clock = g_vram_clock;
+    valid = true;
+    return changed;
+}
+
+// Composes the displayed image into g_frame; false when it is unchanged.
+bool compose_display() {
     raster_sync();
+    if (!display_changed()) return false;
     bool en1 = st.pmode & 1, en2 = (st.pmode >> 1) & 1;
     std::vector<uint32_t> a, b;
     int wa = 0, ha = 0, wb = 0, hb = 0;
@@ -570,7 +596,7 @@ void compose_display() {
         g_frame_w = 640;
         g_frame_h = 448;
         g_frame.assign(640 * 448, 0xFF000000u);
-        return;
+        return true;
     }
     if (ha_ok && hb_ok) {
         // blend circuit 1 over circuit 2
@@ -589,7 +615,7 @@ void compose_display() {
             }
         g_frame_w = w;
         g_frame_h = h;
-        return;
+        return true;
     }
     if (ha_ok) {
         g_frame.swap(a);
@@ -600,6 +626,7 @@ void compose_display() {
         g_frame_w = wb;
         g_frame_h = hb;
     }
+    return true;
 }
 
 }  // namespace
@@ -656,8 +683,7 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
 void gs_frame_end(uint64_t frame) {
-    compose_display();
-    {
+    if (compose_display()) {
         std::lock_guard<std::mutex> lk(g_pub_mtx);
         g_pub.swap(g_frame);
         g_pub_w = g_frame_w;
