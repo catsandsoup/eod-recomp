@@ -304,12 +304,14 @@ void service_events() {
         g_vblank_end_pending = false;
         intc_raise(INTC_VBLANK_E);
     }
-    if (now >= g_next_vblank_us) {
+    if (now >= g_next_vblank_us && !g_vblank_end_pending) {
         g_vblank_count++;
-        // don't try to catch up more than one frame
+        // Vblanks missed while the EE was busy are delivered back to back (the
+        // game counts them as time), up to a few frames; beyond that, resync.
         g_next_vblank_us += (uint64_t)kVblankPeriodUs;
-        if (g_next_vblank_us < now) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
-        g_vblank_end_us = now + 1400;
+        bool behind = g_next_vblank_us <= now;
+        if (now > g_next_vblank_us + 6 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
+        g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
         iop_pad_vblank();
         gs_vblank();
