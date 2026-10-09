@@ -340,6 +340,15 @@ extern volatile int g_ee_irq_pending;
 void ee_service_interrupts(void);
 #define IRQ_CHECK() do { if (EE_UNLIKELY(g_ee_irq_pending)) ee_service_interrupts(); } while (0)
 
+/* Debug tracing of function entries (cmake -DEOD_TRACE_CALLS=ON). */
+#ifdef EE_TRACE_CALLS
+extern uint32_t g_ee_trace[256];
+extern uint32_t g_ee_trace_pos;
+#define EE_FUNC_ENTRY(a) (g_ee_trace[(g_ee_trace_pos++) & 255] = (a))
+#else
+#define EE_FUNC_ENTRY(a) ((void)0)
+#endif
+
 typedef void (*EEFunc)(void);
 typedef struct EEFuncEntry {
     uint32_t addr;
@@ -347,6 +356,8 @@ typedef struct EEFuncEntry {
 } EEFuncEntry;
 extern const EEFuncEntry ee_func_table[];
 extern const unsigned ee_func_table_size;
+extern const uint32_t ee_elf_crc32;
+extern const uint32_t ee_elf_size;
 EEFunc ee_lookup_func(uint32_t addr);
 
 #ifdef __cplusplus

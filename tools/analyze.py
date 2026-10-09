@@ -87,6 +87,16 @@ class Program:
                     out.setdefault(w, []).append(s.addr + 4 * k)
         return out
 
+    def jump_targets(self):
+        """Targets of `j` (GCC uses it for tail calls)."""
+        out = set()
+        for i in self.ins:
+            if i.getOpcodeName() == "j":
+                t = i.getInstrIndexAsVram()
+                if self.in_text(t):
+                    out.add(t)
+        return out
+
     def code_pointers(self):
         """Addresses into .text materialised by lui + addiu/ori."""
         out = set()
@@ -119,7 +129,13 @@ class Program:
             return False
         if va == self.text_lo:
             return True
+        i0 = self.at(va)
+        if i0.getOpcodeName() in ("addiu", "daddiu") and i0.rs.value == 29 and i0.rt.value == 29 \
+                and i0.getProcessedImmediate() < 0:
+            return True  # stack frame prologue
         p1 = self.at(va - 4)
+        if p1.getOpcodeName() in ("syscall", "break"):
+            return True
         if p1.isNop():
             return True
         if va - 8 >= self.text_lo:
@@ -282,8 +298,11 @@ def main():
     dptr = p.data_pointers()
     cptr = p.code_pointers()
     seeds = set(jal) | {p.elf.entry} | add
-    weak = (set(dptr) | cptr) - seeds - table_targets
+    weak = (set(dptr) | cptr | p.jump_targets()) - seeds - table_targets
     accepted = {va for va in weak if p.looks_like_start(va)}
+    if os.environ.get("ANALYZE_VERBOSE"):
+        for va in sorted(weak - accepted):
+            print("  rejected seed %08x (refs %s)" % (va, ",".join("%08x" % r for r in dptr.get(va, [])[:3])))
     seeds |= accepted
     seeds -= rem
     print(f"seeds: jal={len(jal)} dataptr={len(dptr)} codeptr={len(cptr)} weak-accepted={len(accepted)}/{len(weak)} total={len(seeds)}")

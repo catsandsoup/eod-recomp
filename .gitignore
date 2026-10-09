@@ -1,3 +1,4 @@
-build/
+build*/
+gen/
 __pycache__/
 *.pyc

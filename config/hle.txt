@@ -1,0 +1,7 @@
+# Functions implemented (replace) or intercepted (wrap) by the runtime.
+# Format: <address> <replace|wrap>  # comment
+# See tools/recomp.py (load_hle) and src/hle_*.cpp.
+
+003A60E0 wrap     # printf (newlib) - mirrored to the log
+00331DF0 wrap     # panic(fmt, ...) - game fatal error
+0033DD90 replace  # StreamFS_Create: use the host0: filesystem (fileio) instead of stream.irx sector reads

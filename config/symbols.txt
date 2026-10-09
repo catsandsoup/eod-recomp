@@ -1,0 +1,26 @@
+# Known symbols: <address> <name>
+# Used by tools/dis.py for annotation; grows as functions are identified.
+00100008 _start
+0032E7F8 main
+003A22B8 exit
+003A60E0 printf
+003AB680 vsprintf
+003A778C strcpy
+003A78A0 strlen
+003A738C strcat
+003A5D88 strncmp
+003A5FD0 memset
+00331DF0 panic
+00331E48 dprintf_stub
+003B1BD0 scePrintf
+003B15A0 _sceVprintf
+003B2408 sceSifInitRpc
+003B2BA0 sceSifBindRpc
+003B2D70 sceSifCallRpc
+003B8030 sceSifRebootIop
+003B7FE0 sceSifSyncIop
+003B7290 sceSifLoadFileReset
+003B3DC0 sceFsReset
+003AFFF0 SifGetReg
+003AFE60 FlushCache
+0033DD90 StreamFS_Create
