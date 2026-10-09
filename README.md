@@ -139,5 +139,6 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
 * `EOD_MEMCARD=dir` uses another memory card folder (e.g. an empty one for repeatable tests)
 * `EOD_WAV=file` (POSIX build) writes the audio output to a WAV file
 * `cmake -DEOD_TRACE_CALLS=ON` records the last EE function calls, printed on crashes
-* `EOD_PAD_SCRIPT=frame:buttons,...` scripts controller input (port 0)
+* `EOD_PAD_SCRIPT=frame:buttons,...` scripts controller input (port 0); `tools/padscript.py`
+  builds it from button names (see its help for a Career-mode example)
 * `python3 tools/dis.py -f <addr>` disassembles a function with string/symbol annotations
