@@ -184,6 +184,72 @@ void handle_rdata(const uint8_t *pkt) {
     rpc_end(rec_id, pkt_addr, rpc_id, client, SIF_CMD_RPC_RDATA, 0, 0, 0);
 }
 
+// ---- calls from the IOP to RPC servers on the EE (e.g. libsdr's callbacks)
+struct EeClient {
+    uint32_t sid;
+    uint32_t client;  // IOP address identifying the client
+    uint32_t server = 0, buff = 0;
+    bool binding = false, bound = false, busy = false;
+    std::deque<std::pair<uint32_t, std::vector<uint8_t>>> queue;  // fno, data
+};
+std::map<uint32_t, EeClient> g_ee_clients;
+
+void ee_client_pump(EeClient &c) {
+    if (!c.bound) {
+        if (c.binding) return;
+        c.binding = true;
+        auto p = make_packet(SIF_CMD_RPC_BIND, 36);
+        wr32(&p[20], c.client);  // pkt_addr
+        wr32(&p[28], c.client);
+        wr32(&p[32], c.sid);
+        LOG(LOG_SIF, "IOP binds EE server %08x", c.sid);
+        if (g_in_call)
+            g_post.push_back(std::move(p));
+        else
+            send_to_ee(std::move(p));
+        return;
+    }
+    if (c.busy || c.queue.empty()) return;
+    auto call = std::move(c.queue.front());
+    c.queue.pop_front();
+    c.busy = true;
+    if (!call.second.empty()) ee_write_block(c.buff, call.second.data(), (uint32_t)call.second.size());
+    auto p = make_packet(SIF_CMD_RPC_CALL, 56);
+    wr32(&p[20], c.client);
+    wr32(&p[28], c.client);
+    wr32(&p[32], call.first);                        // rpc_number
+    wr32(&p[36], (uint32_t)call.second.size());      // send_size
+    wr32(&p[40], 0);                                 // receive
+    wr32(&p[44], 0);                                 // recv_size
+    wr32(&p[48], 0);                                 // rmode
+    wr32(&p[52], c.server);
+    LOG(LOG_SIF, "IOP calls EE server %08x fno %u (%u bytes)", c.sid, call.first, (unsigned)call.second.size());
+    if (g_in_call)
+        g_post.push_back(std::move(p));
+    else
+        send_to_ee(std::move(p));
+}
+
+void handle_rpc_end(const uint8_t *pkt) {
+    uint32_t client = rd32(pkt + 28), cid = rd32(pkt + 32);
+    for (auto &kv : g_ee_clients) {
+        EeClient &c = kv.second;
+        if (c.client != client) continue;
+        if (cid == SIF_CMD_RPC_BIND) {
+            c.binding = false;
+            c.server = rd32(pkt + 36);
+            c.buff = rd32(pkt + 40);
+            c.bound = c.server != 0;
+            LOG(LOG_SIF, "EE server %08x bound: server %08x buff %08x", c.sid, c.server, c.buff);
+            if (!c.bound) c.queue.clear();  // not registered yet: drop, the next event retries
+        } else {
+            c.busy = false;
+        }
+        ee_client_pump(c);
+        return;
+    }
+}
+
 void handle_command(const uint8_t *pkt, uint32_t size) {
     uint32_t cid = rd32(pkt + 8);
     LOG(LOG_SIF, "<- EE cmd %08x size %u opt %08x", cid, size, rd32(pkt + 12));
@@ -215,6 +281,9 @@ void handle_command(const uint8_t *pkt, uint32_t size) {
     case SIF_CMD_RPC_RDATA:
         handle_rdata(pkt);
         break;
+    case SIF_CMD_RPC_END:
+        handle_rpc_end(pkt);
+        break;
     default:
         WARN("SIF: unhandled command %08x", cid);
     }
@@ -231,6 +300,21 @@ void iop_send_cmd(uint32_t cid, uint32_t opt, const void *payload, uint32_t size
         g_post.push_back(std::move(p));
     else
         send_to_ee(std::move(p));
+}
+
+void iop_call_ee_rpc(uint32_t sid, uint32_t fno, const void *data, uint32_t size) {
+    auto it = g_ee_clients.find(sid);
+    if (it == g_ee_clients.end()) {
+        EeClient c;
+        c.sid = sid;
+        c.client = iop_alloc(0x40);
+        it = g_ee_clients.emplace(sid, std::move(c)).first;
+    }
+    EeClient &c = it->second;
+    if (c.queue.size() > 64) c.queue.pop_front();  // the EE isn't keeping up
+    const uint8_t *p = static_cast<const uint8_t *>(data);
+    c.queue.emplace_back(fno, std::vector<uint8_t>(p, p + size));
+    ee_client_pump(c);
 }
 
 void iop_register_server(uint32_t sid, const char *name, RpcHandler h) {

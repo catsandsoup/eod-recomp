@@ -182,6 +182,10 @@ int main(int argc, char **argv) {
     kernel_init(argc, argv);
     uint32_t entry = load_elf(elf);
     LOG(LOG_CORE, "starting at %08x", entry);
+#ifndef _WIN32
+    void debug_watch_init();
+    debug_watch_init();
+#endif
     kernel_run(entry);
     platform_shutdown();
     return 0;

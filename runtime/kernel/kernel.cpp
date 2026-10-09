@@ -18,6 +18,7 @@
 #include "../core/memory.h"
 #include "../gs/gs.h"
 #include "../hw/hw.h"
+#include "../iop/iop.h"
 #include "../iop/sif.h"
 #include "../platform/platform.h"
 
@@ -266,8 +267,38 @@ int call_handler(const Handler &h, uint32_t a0, uint32_t a1, uint32_t a2) {
     return ret;
 }
 
+// EOD_WATCH=addr[,addr...] (hex): logs float values at EE addresses when they change.
+void debug_watch() {
+    static std::vector<uint32_t> addrs;
+    static std::vector<uint32_t> last;
+    static bool parsed;
+    if (!parsed) {
+        parsed = true;
+        if (const char *w = getenv("EOD_WATCH")) {
+            for (const char *p = w; *p;) {
+                char *end;
+                uint32_t a = (uint32_t)strtoul(p, &end, 16);
+                if (*end == '+') a += (uint32_t)strtoul(end + 1, &end, 16);
+                addrs.push_back(a & ~3u);
+                p = *end ? end + 1 : end;
+            }
+            last.assign(addrs.size(), 0xDEADBEEF);
+        }
+    }
+    for (size_t i = 0; i < addrs.size(); i++) {
+        uint32_t v = ee_r32(addrs[i]);
+        if (v == last[i]) continue;
+        last[i] = v;
+        float f;
+        memcpy(&f, &v, 4);
+        LOG(LOG_CORE, "watch %08x = %08x (%g) at vblank %llu", addrs[i], v, f, (unsigned long long)g_vblank_count);
+    }
+}
+
 void service_events() {
     uint64_t now = platform_time_us();
+    iop_sound_update();
+    debug_watch();
     if (!g_next_vblank_us) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
     if (g_vblank_end_pending && now >= g_vblank_end_us) {
         g_vblank_end_pending = false;

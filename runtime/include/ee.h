@@ -233,9 +233,10 @@ EE_INLINE void ee_divu(int pipe, int rs, int rt) {
 /* ------------------------------------------------------------- FPU
  * The EE FPU is not IEEE 754: there are no infinities/NaNs and denormals
  * are flushed to zero (FTZ/DAZ are enabled in MXCSR at startup).  Results
- * that would overflow saturate to +-FLT_MAX.  Only the cases that commonly
- * matter (division by zero, sqrt of negatives, conversion overflow) are
- * emulated by default; define EE_FPU_CLAMP for full result clamping.
+ * that would overflow saturate to +-FLT_MAX.  Every arithmetic result is
+ * clamped: an IEEE infinity would otherwise propagate where the game relies
+ * on saturation (e.g. the track follower walks segments forever).
+ * EE_FPU_NO_CLAMP disables it (division/sqrt/conversion stay emulated).
  */
 EE_INLINE float ee_fclamp(float f) {
     uint32_t u;
@@ -246,14 +247,35 @@ EE_INLINE float ee_fclamp(float f) {
     }
     return f;
 }
-#ifdef EE_FPU_CLAMP
-#define EE_FRES(x) ee_fclamp(x)
+EE_INLINE int ee_fspecial(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (u & 0x7F800000u) == 0x7F800000u;
+}
+/* A special result means an overflow or an operand that is Inf/NaN in IEEE
+ * terms but a (huge) ordinary number on the EE (e.g. 0xFFFFFFFF padding in
+ * a vector multiplied by 0): redo it with saturated operands. */
+#ifndef EE_FPU_NO_CLAMP
+#define EE_FIX2(r, a, b, OP) \
+    if (EE_UNLIKELY(ee_fspecial(r))) r = ee_fclamp(ee_fclamp(a) OP ee_fclamp(b))
 #else
-#define EE_FRES(x) (x)
+#define EE_FIX2(r, a, b, OP) (void)0
 #endif
-EE_INLINE float fadd_ps2(float a, float b) { return EE_FRES(a + b); }
-EE_INLINE float fsub_ps2(float a, float b) { return EE_FRES(a - b); }
-EE_INLINE float fmul_ps2(float a, float b) { return EE_FRES(a * b); }
+EE_INLINE float fadd_ps2(float a, float b) {
+    float r = a + b;
+    EE_FIX2(r, a, b, +);
+    return r;
+}
+EE_INLINE float fsub_ps2(float a, float b) {
+    float r = a - b;
+    EE_FIX2(r, a, b, -);
+    return r;
+}
+EE_INLINE float fmul_ps2(float a, float b) {
+    float r = a * b;
+    EE_FIX2(r, a, b, *);
+    return r;
+}
 EE_INLINE float fdiv_ps2(float a, float b) {
     if (EE_UNLIKELY(b == 0.0f)) {
         uint32_t ua, ub, r;
@@ -264,19 +286,33 @@ EE_INLINE float fdiv_ps2(float a, float b) {
         memcpy(&f, &r, 4);
         return f;
     }
-    return ee_fclamp(a / b);
+    float r = a / b;
+    if (EE_UNLIKELY(ee_fspecial(r))) r = ee_fclamp(ee_fclamp(a) / ee_fclamp(b));
+    return r;
 }
-EE_INLINE float fsqrt_ps2(float a) { return sqrtf(fabsf(a)); }
+EE_INLINE float fsqrt_ps2(float a) { return sqrtf(fabsf(ee_fclamp(a))); }
 EE_INLINE float frsqrt_ps2(float a, float b) {
-    float s = sqrtf(fabsf(b));
+    float s = sqrtf(fabsf(ee_fclamp(b)));
     return fdiv_ps2(a, s);
 }
-EE_INLINE float fmax_ps2(float a, float b) { return a > b ? a : b; }
-EE_INLINE float fmin_ps2(float a, float b) { return a < b ? a : b; }
+EE_INLINE float fmax_ps2(float a, float b) {
+    a = ee_fclamp(a);
+    b = ee_fclamp(b);
+    return a > b ? a : b;
+}
+EE_INLINE float fmin_ps2(float a, float b) {
+    a = ee_fclamp(a);
+    b = ee_fclamp(b);
+    return a < b ? a : b;
+}
+/* comparisons see Inf/NaN bit patterns as the huge numbers they are */
+EE_INLINE int fcmp_eq(float a, float b) { return ee_fclamp(a) == ee_fclamp(b); }
+EE_INLINE int fcmp_lt(float a, float b) { return ee_fclamp(a) < ee_fclamp(b); }
+EE_INLINE int fcmp_le(float a, float b) { return ee_fclamp(a) <= ee_fclamp(b); }
 EE_INLINE int32_t fcvtw_ps2(float f) {
+    f = ee_fclamp(f);
     if (f >= 2147483648.0f) return 0x7FFFFFFF;
     if (f <= -2147483648.0f) return (int32_t)0x80000000;
-    if (f != f) return 0x7FFFFFFF;
     return (int32_t)f;
 }
 uint32_t ee_cfc1(int reg);

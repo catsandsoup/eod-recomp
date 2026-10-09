@@ -27,6 +27,8 @@ void iop_register_server(uint32_t sid, const char *name, RpcHandler h);
 // reply when called from an RPC handler).
 void iop_send_cmd(uint32_t cid, uint32_t opt, const void *payload, uint32_t size);
 bool iop_has_server(uint32_t sid);
+// Calls an RPC server registered on the EE (asynchronous, no reply data).
+void iop_call_ee_rpc(uint32_t sid, uint32_t fno, const void *data, uint32_t size);
 
 // Module loading (called by the loadfile server)
 int iop_load_module(const std::string &path, const std::string &args);
@@ -41,6 +43,7 @@ void iop_cdvd_init();
 void iop_pad_init();
 void iop_mc_init();
 void iop_sound_init();
+void iop_sound_update();  // called often from the EE event loop
 void iop_misc_init();
 void iop_stream_init();
 

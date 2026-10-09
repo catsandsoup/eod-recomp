@@ -550,15 +550,15 @@ class Gen:
 
     def i_c_eq_s(self, w, *a):
         fd, fs, ft = self._f3(w)
-        return "FCC = (%s == %s);" % (F(fs), F(ft))
+        return "FCC = fcmp_eq(%s, %s);" % (F(fs), F(ft))
 
     def i_c_lt_s(self, w, *a):
         fd, fs, ft = self._f3(w)
-        return "FCC = (%s < %s);" % (F(fs), F(ft))
+        return "FCC = fcmp_lt(%s, %s);" % (F(fs), F(ft))
 
     def i_c_le_s(self, w, *a):
         fd, fs, ft = self._f3(w)
-        return "FCC = (%s <= %s);" % (F(fs), F(ft))
+        return "FCC = fcmp_le(%s, %s);" % (F(fs), F(ft))
 
     def i_c_f_s(self, w, *a):
         return "FCC = 0;"

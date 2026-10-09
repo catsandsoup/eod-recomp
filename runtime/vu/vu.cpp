@@ -144,17 +144,33 @@ void commit_upper(Ctx &c) {
 
 enum ArOp { OP_ADD, OP_SUB, OP_MUL, OP_MADD, OP_MSUB, OP_MAX, OP_MIN };
 
+inline bool vu_special(float f) { return (f2u(f) & 0x7F800000u) == 0x7F800000u; }
+
+// The VU has no Inf/NaN: such bit patterns are huge ordinary numbers, so a
+// special result is recomputed with saturated operands (e.g. 0xFFFFFFFF * 0 = 0).
 inline float apply(ArOp op, float acc, float a, float b) {
+    float r;
+    switch (op) {
+    case OP_ADD: r = a + b; break;
+    case OP_SUB: r = a - b; break;
+    case OP_MUL: r = a * b; break;
+    case OP_MADD: r = acc + a * b; break;
+    case OP_MSUB: r = acc - a * b; break;
+    case OP_MAX: return vu_clamp(a) > vu_clamp(b) ? a : b;  // returns the operand's bits (used as a move)
+    case OP_MIN: return vu_clamp(a) < vu_clamp(b) ? a : b;
+    default: return 0;
+    }
+    if (!vu_special(r)) return r;
+    a = vu_clamp(a);
+    b = vu_clamp(b);
+    acc = vu_clamp(acc);
     switch (op) {
     case OP_ADD: return vu_clamp(a + b);
     case OP_SUB: return vu_clamp(a - b);
     case OP_MUL: return vu_clamp(a * b);
-    case OP_MADD: return vu_clamp(acc + a * b);
-    case OP_MSUB: return vu_clamp(acc - a * b);
-    case OP_MAX: return a > b ? a : b;
-    case OP_MIN: return a < b ? a : b;
+    case OP_MADD: return vu_clamp(acc + vu_clamp(a * b));
+    default: return vu_clamp(acc - vu_clamp(a * b));
     }
-    return 0;
 }
 
 // Generic FMAC: src2 is either a vector (bc<0), a broadcast component, or a scalar
@@ -383,7 +399,7 @@ void flush_p(VUState *vu) {
 
 void lower_div(VUState *vu, uint32_t ins, int kind) {
     int fsf = (ins >> 21) & 3, ftf = (ins >> 23) & 3;
-    float fs = vu->vf[FS(ins)].f[fsf], ft = vu->vf[FT(ins)].f[ftf];
+    float fs = vu_clamp(vu->vf[FS(ins)].f[fsf]), ft = vu_clamp(vu->vf[FT(ins)].f[ftf]);
     float r;
     vu->status &= ~0x30u;
     if (kind == 0) {  // DIV
@@ -563,8 +579,8 @@ void lower_ext(Ctx &c, uint32_t ins, uint32_t ext) {
     // EFU
     const VUReg &s = vu->vf[fs];
     int fsf = (ins >> 21) & 3;
-    float x = s.f[0], y = s.f[1], z = s.f[2], w = s.f[3];
-    float v = s.f[fsf];
+    float x = vu_clamp(s.f[0]), y = vu_clamp(s.f[1]), z = vu_clamp(s.f[2]), w = vu_clamp(s.f[3]);
+    float v = vu_clamp(s.f[fsf]);
     float r;
     switch (ext) {
     case 0x70: r = x * x + y * y + z * z; p_pipeline_set(vu, r, 10); return;               // ESADD
@@ -830,6 +846,10 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
             if (r > need) need = r;
         }
         if (need > vu->cycle) vu->cycle = need;
+        // WAITQ stalls the whole pair: the upper instruction sees the new Q
+        if (!(hi & 0x80000000u) && (lo >> 25) == 0x40 && (lo & 0x3C) == 0x3C &&
+            ((lo & 3) | ((lo >> 4) & 0x7C)) == 0x3B)
+            flush_q(vu);
         sync_pipes(vu);
         // upper first (computed against old state), committed after lower
         c.up_write = false;

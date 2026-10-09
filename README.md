@@ -25,7 +25,8 @@ N64Recomp/Zelda64Recomp:
    * `kernel/` – EE kernel: threads (on host fibers), semaphores, interrupt
      and DMA handlers, alarms, vblank timing, libkernel's kernel patches
    * `core/` – CPU state, memory map, MMI instructions, logging
-   * `hw/` – DMA controller, timers, interrupt controller, IPU stub
+   * `hw/` – DMA controller, timers, interrupt controller and the IPU
+     (MPEG-2 macroblock decoding and colour conversion used by the movies)
    * `vu/` – VU0/VU1 interpreter (with the pipeline/stall timing the game's
      microcode depends on) and VIF0/VIF1 (unpack, MPG, MSCAL, DIRECT, PATH3 masking)
    * `gs/` – Graphics Synthesizer: swizzled 4 MB VRAM in all pixel formats,
@@ -34,7 +35,9 @@ N64Recomp/Zelda64Recomp:
    * `iop/` – the I/O processor: the SIF RPC protocol, plus emulations of the
      IRX modules the game loads: `fileio` (game data from disk), `padman`
      (DualShock 2), `mcserv` (memory card in a host folder), `loadfile`,
-     `iopheap`, multitap and the Logitech wheel driver
+     `iopheap`, multitap, the Logitech wheel driver, the game's `stream.irx`
+     disc streamer and `sdrdrv` (sound) on top of an SPU2 emulation
+     (ADPCM voices, ADSR, AutoDMA PCM streaming)
    * `platform/` – Win32 (GDI window, XInput/keyboard, waveOut, fibers) and
      POSIX (headless, used for automated testing)
 4. **`src/`** holds hand-written C++ that replaces or wraps specific game
@@ -49,12 +52,12 @@ annotated disassembler used for reverse engineering.
 | Area | State |
 | --- | --- |
 | Recompiled code | Complete; boots through the SDK libraries and the game's init |
-| Graphics | Software GS renderer; menus and 2D/3D UI render correctly |
+| Graphics | Software GS renderer (runs on its own thread on multi-core CPUs) |
 | Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
 | Memory card | Saves to `memcard/port0` next to the game data |
 | Game data | Read from the disc files on disk (`DATA/...`) |
-| Sound | **Not yet**: `sdrdrv`/`libsd` (SPU2) and the game's `stream.irx` are stubs |
-| FMV | **Not yet**: IPU/MPEG decoding is a stub (movies are skipped) |
+| Sound | Sound effects and PCM streams (`sdrdrv` + SPU2); music/speech streamed by `stream.irx` not yet |
+| FMV | Intro, attract and menu background movies play (IPU emulation) |
 | Performance | Software renderer is the bottleneck (~12-15 of 60 vblanks/s in the 3D garage); optimisation in progress |
 
 The game currently boots, passes the controller and memory card checks, and
@@ -118,6 +121,9 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
 
 * `EOD_GS_TRACE=<frame>` logs every primitive drawn in that frame
 * `EOD_FPS=1` prints vblanks/s (60 = full speed) and draw-buffer switches/s every 5 s
+* `EOD_SKIP_MOVIES=1` skips the movies; `EOD_GS_THREAD=0` renders on the main thread
+* `EOD_WATCH=addr,...` logs float values at EE addresses when they change;
+  `EOD_WATCHW=addr` (Linux) reports the host code that first writes a huge value there
 * `cmake -DEOD_TRACE_CALLS=ON` records the last EE function calls, printed on crashes
 * `EOD_PAD_SCRIPT=frame:buttons,...` (POSIX build) scripts controller input
 * `python3 tools/dis.py -f <addr>` disassembles a function with string/symbol annotations

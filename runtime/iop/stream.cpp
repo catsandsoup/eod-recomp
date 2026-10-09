@@ -171,6 +171,8 @@ void build_disc() {
               [](const Node &a, const Node &b) { return a.name < b.name; });
     assign(root);
     build_toc(root, nullptr);
+    for (const DiscFile &f : g_files)
+        LOG(LOG_FILE, "stream: lsn %7u-%7u %s", f.lsn, f.lsn + f.sectors, f.host_path.c_str());
     LOG(LOG_FILE, "stream: virtual disc with %zu files, %u sectors, %zu TOC entries", g_files.size(), g_next_lsn,
         g_toc.size());
 }

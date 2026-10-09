@@ -6,6 +6,11 @@
 #include <string>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "../core/log.h"
@@ -23,7 +28,8 @@ State st;
 Stats stats;
 
 namespace {
-uint64_t g_flips;  // draw buffer changes (roughly the game's frame count)
+std::atomic<uint64_t> g_flips{0};  // draw buffer changes (roughly the game's frame count)
+std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
 
 // ------------------------------------------------------------ GIF parsing
 struct PathState {
@@ -249,12 +255,12 @@ void write_reg(uint32_t reg, uint64_t v) {
     case 0x60: {  // SIGNAL
         uint32_t id = (uint32_t)(v >> 32), mask = (uint32_t)v;
         st.siglblid = (st.siglblid & ~(uint64_t)mask) | (id & mask);
-        st.csr |= 1;
+        g_csr |= 1;
         if (!(st.imr & 0x100)) intc_raise(INTC_GS);
         break;
     }
     case 0x61:  // FINISH
-        st.csr |= 2;
+        g_csr |= 2;
         if (!(st.imr & 0x200)) intc_raise(INTC_GS);
         break;
     case 0x62: {  // LABEL
@@ -593,19 +599,173 @@ extern int g_opt_frames;
 extern int g_opt_screenshot_every;
 extern std::string g_opt_screenshot_dir;
 
+void priv_apply(uint32_t off, uint64_t v);
+void gs_flush();
+void gs_sync();
+void gs_frame_end(uint64_t frame);
+
+// ------------------------------------------------------------ GS thread
+// With a second CPU core the GIF stream is executed on a worker thread:
+// the EE side appends commands (GIF data, privileged register writes,
+// vblank) to chunks that the worker runs in order.  The EE only waits for
+// it when it reads state the worker produces.
+namespace {
+
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
+
+bool g_threaded;
+std::mutex g_q_mtx;
+std::condition_variable g_q_cv, g_q_cv_done;
+std::deque<std::vector<uint8_t>> g_q;
+std::vector<uint8_t> g_chunk;
+uint64_t g_pushed, g_done;  // chunks (guarded by g_q_mtx)
+uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mtx)
+
+// last composed frame (presented on the EE thread)
+std::mutex g_pub_mtx;
+std::vector<uint32_t> g_pub;
+int g_pub_w, g_pub_h;
+
+void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t size) {
+    uint32_t h[4] = {kind, a, b, size};
+    size_t at = g_chunk.size();
+    g_chunk.resize(at + 16 + ((size + 15) & ~15u));
+    memcpy(&g_chunk[at], h, 16);
+    if (size) memcpy(&g_chunk[at + 16], data, size);
+    if (g_chunk.size() >= 256 * 1024) gs_flush();
+}
+
+}  // namespace
+
+// Publishes the display and does the per-frame bookkeeping (GS side).
+void gs_frame_end(uint64_t frame) {
+    compose_display();
+    {
+        std::lock_guard<std::mutex> lk(g_pub_mtx);
+        g_pub.swap(g_frame);
+        g_pub_w = g_frame_w;
+        g_pub_h = g_frame_h;
+    }
+    {
+        static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
+        gs::g_trace = (int)frame == trace_at;
+    }
+    if (g_log_enabled[LOG_GS] && (frame % 60) == 0)
+        LOG(LOG_GS, "frame %llu: %u prims, %u pixels, %u transfers", (unsigned long long)frame, stats.prims,
+            stats.pixels, stats.transfers);
+    stats = Stats();
+}
+
+void gs_flush() {
+    if (!g_threaded || g_chunk.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_q_mtx);
+        g_q.push_back(std::move(g_chunk));
+        g_pushed++;
+    }
+    g_q_cv.notify_one();
+    g_chunk.clear();
+    g_chunk.reserve(64 * 1024);
+}
+
+void gs_sync() {
+    if (!g_threaded) return;
+    gs_flush();
+    std::unique_lock<std::mutex> lk(g_q_mtx);
+    g_q_cv_done.wait(lk, [] { return g_done == g_pushed; });
+}
+
+static void gs_worker() {
+    for (;;) {
+        std::vector<uint8_t> c;
+        {
+            std::unique_lock<std::mutex> lk(g_q_mtx);
+            g_q_cv.wait(lk, [] { return !g_q.empty(); });
+            c = std::move(g_q.front());
+            g_q.pop_front();
+        }
+        uint64_t frames = 0;
+        for (size_t p = 0; p < c.size();) {
+            uint32_t h[4];
+            memcpy(h, &c[p], 16);
+            const uint8_t *d = &c[p + 16];
+            switch (h[0]) {
+            case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
+            case CMD_PRIV: {
+                uint64_t v;
+                memcpy(&v, d, 8);
+                priv_apply(h[1], v);
+                break;
+            }
+            case CMD_VBLANK:
+                gs_frame_end(h[1]);
+                frames = h[1];
+                break;
+            case CMD_PATH_RESET:
+                for (auto &ps : g_path) ps = PathState();
+                break;
+            }
+            p += 16 + ((h[3] + 15) & ~15u);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_q_mtx);
+            g_done++;
+            if (frames) g_frames_done = frames;
+        }
+        g_q_cv_done.notify_all();
+    }
+}
+
+void gs_thread_start() {
+    const char *e = getenv("EOD_GS_THREAD");
+    bool want = e ? atoi(e) != 0 : std::thread::hardware_concurrency() >= 2;
+    if (!want) return;
+    g_threaded = true;
+    std::thread(gs_worker).detach();
+    LOG(LOG_GS, "GS runs on its own thread");
+}
+
 void gs_init() {
     mem_init();
     memset(&st, 0, sizeof st);
     st.imr = 0xFF00;
-    st.csr = 0x551B0000ull | 0x8000;  // REV/ID, FIFO empty
     st.prmodecont = 1;
+    gs_thread_start();
 }
 
-void gif_transfer(int path, const uint8_t *data, uint32_t qwc) { gif_process(path, data, qwc); }
+void gif_transfer(int path, const uint8_t *data, uint32_t qwc) {
+    if (!g_threaded) {
+        gif_process(path, data, qwc);
+        return;
+    }
+    push_cmd(CMD_GIF, (uint32_t)path, 0, data, qwc * 16);
+}
 
 namespace {
 std::vector<uint8_t> g_p3q;  // queued PATH3 data
 size_t g_p3pos;
+
+// Follows GIF tags to find packet boundaries (without executing them).
+struct GifTracker {
+    bool in_packet = false;
+    uint32_t left = 0;  // data quadwords left in the current tag
+    bool eop = false;
+    void feed(const uint8_t *q) {
+        if (!in_packet || left == 0) {
+            uint64_t lo;
+            memcpy(&lo, q, 8);
+            uint32_t nloop = (uint32_t)(lo & 0x7FFF), flg = (uint32_t)((lo >> 58) & 3);
+            uint32_t nreg = (uint32_t)((lo >> 60) & 0xF);
+            if (!nreg) nreg = 16;
+            eop = (lo >> 15) & 1;
+            left = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+            in_packet = true;
+            if (left == 0 && eop) in_packet = false;
+            return;
+        }
+        if (--left == 0 && eop) in_packet = false;
+    }
+} g_p3track;
 bool g_p3_vif_mask, g_p3_mode_mask;
 }  // namespace
 
@@ -619,15 +779,16 @@ void gif_set_path3_mask(bool masked) { g_p3_vif_mask = masked; }
 
 bool gif_path3_run(int max_packets) {
     if (g_p3_vif_mask || g_p3_mode_mask) return !gif_path3_pending();
-    PathState &ps = g_path[GIF_PATH3];
     int done = 0;
+    size_t start = g_p3pos;
     while (g_p3pos < g_p3q.size()) {
-        gif_process(GIF_PATH3, &g_p3q[g_p3pos], 1);
+        g_p3track.feed(&g_p3q[g_p3pos]);
         g_p3pos += 16;
-        if (!ps.in_packet) {  // packet finished (EOP)
+        if (!g_p3track.in_packet) {  // packet finished (EOP)
             if (max_packets >= 0 && ++done >= max_packets) break;
         }
     }
+    if (g_p3pos > start) gif_transfer(GIF_PATH3, &g_p3q[start], (uint32_t)((g_p3pos - start) / 16));
     if (g_p3pos >= g_p3q.size()) {
         g_p3q.clear();
         g_p3pos = 0;
@@ -651,7 +812,10 @@ void gif_reg_write(uint32_t off, uint32_t v) {
     if (off == 0x3000) {
         gif_reg_ctrl = v;
         if (v & 1) {
-            for (auto &p : g_path) p = PathState();
+            g_p3track = GifTracker();
+            if (g_threaded) push_cmd(CMD_PATH_RESET, 0, 0, nullptr, 0);
+            else
+                for (auto &p : g_path) p = PathState();
         }
     } else if (off == 0x3010) {
         gif_reg_mode = v;
@@ -662,7 +826,7 @@ void gif_reg_write(uint32_t off, uint32_t v) {
 
 void gs_set_crt(int interlace, int mode, int ffmd) {
     LOG(LOG_GS, "SetGsCrt(interlace=%d, mode=%d, ffmd=%d)", interlace, mode, ffmd);
-    st.smode2 = (interlace & 1) | ((ffmd & 1) << 1);
+    gs_priv_write64(0x0020, (interlace & 1) | ((ffmd & 1) << 1));
 }
 
 uint32_t gs_get_imr() { return (uint32_t)st.imr; }
@@ -671,15 +835,41 @@ void gs_put_imr(uint32_t v) { st.imr = v; }
 uint64_t gs_priv_read64(uint32_t p) {
     uint32_t off = p & 0x1FFF;
     if (off == 0x1000) {
-        return st.csr;
+        gs_flush();  // let the GS thread reach pending FINISH/SIGNAL
+        return g_csr;
     }
     if (off == 0x1010) return st.imr;
-    if (off == 0x1080) return st.siglblid;
+    if (off == 0x1080) {
+        gs_sync();
+        return st.siglblid;
+    }
     return 0;
 }
 
 void gs_priv_write64(uint32_t p, uint64_t v) {
     uint32_t off = p & 0x1FFF;
+    if (off == 0x1000) {
+        // CSR: writing 1 clears SIGNAL/FINISH/HSINT/VSINT/EDWINT
+        g_csr &= ~(v & 0x1F);
+        if (v & 0x200) {  // RESET
+            if (g_threaded) push_cmd(CMD_PATH_RESET, 0, 0, nullptr, 0);
+            else
+                for (auto &ps : g_path) ps = PathState();
+        }
+        return;
+    }
+    if (off == 0x1010) {
+        st.imr = v;
+        return;
+    }
+    if (g_threaded) {
+        push_cmd(CMD_PRIV, off, 0, &v, 8);
+        return;
+    }
+    priv_apply(off, v);
+}
+
+void priv_apply(uint32_t off, uint64_t v) {
     switch (off) {
     case 0x0000: st.pmode = v; break;
     case 0x0010: st.smode1 = v; break;
@@ -696,14 +886,6 @@ void gs_priv_write64(uint32_t p, uint64_t v) {
     case 0x00C0: st.extdata = v; break;
     case 0x00D0: st.extwrite = v; break;
     case 0x00E0: st.bgcolor = v; break;
-    case 0x1000:
-        // CSR: writing 1 clears SIGNAL/FINISH/HSINT/VSINT/EDWINT
-        st.csr &= ~(v & 0x1F);
-        if (v & 0x200) {  // RESET
-            for (auto &ps : g_path) ps = PathState();
-        }
-        break;
-    case 0x1010: st.imr = v; break;
     case 0x1040: st.busdir = v; break;
     case 0x1080: st.siglblid = v; break;
     default: break;
@@ -714,7 +896,7 @@ void gs_priv_write32(uint32_t p, uint32_t v) {
     uint32_t off = p & 0x1FFF;
     uint64_t cur = 0;
     switch (off & ~7u) {
-    case 0x1000: cur = st.csr; break;
+    case 0x1000: cur = g_csr; break;
     case 0x1010: cur = st.imr; break;
     default: break;
     }
@@ -727,11 +909,12 @@ void gs_priv_write32(uint32_t p, uint32_t v) {
 }
 
 bool gs_screenshot(const char *path) {
-    if (g_frame.empty()) return false;
+    std::lock_guard<std::mutex> lk(g_pub_mtx);
+    if (g_pub.empty()) return false;
     FILE *f = fopen(path, "wb");
     if (!f) return false;
-    fprintf(f, "P6\n%d %d\n255\n", g_frame_w, g_frame_h);
-    for (uint32_t px : g_frame) {
+    fprintf(f, "P6\n%d %d\n255\n", g_pub_w, g_pub_h);
+    for (uint32_t px : g_pub) {
         uint8_t rgb[3] = {(uint8_t)px, (uint8_t)(px >> 8), (uint8_t)(px >> 16)};
         fwrite(rgb, 1, 3, f);
     }
@@ -741,20 +924,24 @@ bool gs_screenshot(const char *path) {
 
 void gs_vblank() {
     // VSINT, field toggle
-    st.csr |= 8;
-    st.csr ^= 0x2000;
+    g_csr |= 8;
+    g_csr ^= 0x2000;
     if (!(st.imr & 0x800)) intc_raise(INTC_GS);
-    compose_display();
-    platform_present(g_frame.data(), g_frame_w, g_frame_h, g_frame_w);
     g_frames++;
-    {
-        static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
-        gs::g_trace = (int)g_frames == trace_at;
+    if (g_threaded) {
+        uint64_t f = g_frames;
+        push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
+        gs_flush();
+        // don't let the GS thread fall more than a couple of frames behind
+        std::unique_lock<std::mutex> lk(g_q_mtx);
+        g_q_cv_done.wait(lk, [] { return g_frames_done + 2 >= g_frames; });
+    } else {
+        gs_frame_end(g_frames);
     }
-    if (g_log_enabled[LOG_GS] && (g_frames % 60) == 0)
-        LOG(LOG_GS, "frame %llu: %u prims, %u pixels, %u transfers", (unsigned long long)g_frames, stats.prims,
-            stats.pixels, stats.transfers);
-    stats = Stats();
+    {
+        std::lock_guard<std::mutex> lk(g_pub_mtx);
+        if (!g_pub.empty()) platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+    }
     {
         // EOD_FPS=1: print the game's frame rate every 5 seconds
         static bool show = getenv("EOD_FPS") != nullptr;
