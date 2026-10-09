@@ -456,3 +456,20 @@ bool platform_find_file(const char *root, const char *rel, char *out, size_t out
 }
 
 bool platform_mkdir(const char *path) { return CreateDirectoryA(path, nullptr) != 0; }
+
+bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out) {
+    std::string pat = std::string(path) + "\\*";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        DirEntryInfo info = {};
+        snprintf(info.name, sizeof info.name, "%s", fd.cFileName);
+        info.is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        info.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        out.push_back(info);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return true;
+}

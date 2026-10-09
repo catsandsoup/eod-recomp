@@ -79,4 +79,5 @@ void iop_modules_init() {
     iop_mc_init();
     iop_sound_init();
     iop_misc_init();
+    iop_stream_init();
 }

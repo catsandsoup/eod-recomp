@@ -42,6 +42,7 @@ void iop_pad_init();
 void iop_mc_init();
 void iop_sound_init();
 void iop_misc_init();
+void iop_stream_init();
 
 // Root directory of the game data (contains DATA/...)
 extern std::string g_game_root;

@@ -24,3 +24,7 @@
 003AFFF0 SifGetReg
 003AFE60 FlushCache
 0033DD90 StreamFS_Create
+0033D4F8 StrmFindFile
+0033DAB0 StrmRead
+0033CAD8 StrmReadSectors
+0033D078 StrmLoadBank

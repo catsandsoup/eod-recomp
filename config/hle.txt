@@ -4,4 +4,4 @@
 
 003A60E0 wrap     # printf (newlib) - mirrored to the log
 00331DF0 wrap     # panic(fmt, ...) - game fatal error
-0033DD90 replace  # StreamFS_Create: use the host0: filesystem (fileio) instead of stream.irx sector reads
+0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc

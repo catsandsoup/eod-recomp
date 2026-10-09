@@ -78,3 +78,12 @@ void platform_start_ticker(void (*cb)(), unsigned period_us);
 // Returns true and fills out (absolute host path) when found.
 bool platform_find_file(const char *root, const char *rel, char *out, size_t out_size);
 bool platform_mkdir(const char *path);
+
+struct DirEntryInfo {
+    char name[260];
+    bool is_dir;
+    uint64_t size;
+};
+// Lists a directory (without "." and ".."). Returns false if it can't be read.
+#include <vector>
+bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out);

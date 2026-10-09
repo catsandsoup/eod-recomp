@@ -186,3 +186,21 @@ bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {
     h = g_last_h;
     return true;
 }
+
+bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out) {
+    DIR *d = opendir(path);
+    if (!d) return false;
+    while (dirent *e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        DirEntryInfo info = {};
+        snprintf(info.name, sizeof info.name, "%s", e->d_name);
+        std::string full = std::string(path) + "/" + e->d_name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0) continue;
+        info.is_dir = S_ISDIR(st.st_mode);
+        info.size = (uint64_t)st.st_size;
+        out.push_back(info);
+    }
+    closedir(d);
+    return true;
+}
