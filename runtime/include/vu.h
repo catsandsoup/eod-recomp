@@ -34,10 +34,14 @@ struct VUState {
     uint32_t mem_mask;      /* 0xFFF (VU0) or 0x3FFF (VU1) */
     uint8_t *micro;         /* micro memory */
     uint32_t micro_mask;    /* 0xFFF (VU0) or 0x3FFF (VU1) */
-    /* pipeline emulation for q/p */
+    /* pipeline emulation (cycle accurate enough for software-pipelined
+       microcode): FMAC results are ready 4 cycles after issue, Q/P when
+       their divider/EFU finishes; reading a pending register stalls. */
+    uint64_t cycle;
     float q_pending, p_pending;
-    int q_delay, p_delay;
-    int ebit_delay;
+    int q_busy, p_busy;
+    uint64_t q_ready, p_ready;
+    uint64_t vf_ready[32][4];
 };
 
 typedef struct VUState VUState;

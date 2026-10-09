@@ -106,7 +106,7 @@ void dma_sink(int ch, const uint8_t *data, uint32_t qwc) {
         vif_write(1, reinterpret_cast<const uint32_t *>(data), qwc * 4);
         break;
     case DMA_GIF:
-        gif_transfer(GIF_PATH3, data, qwc);
+        gif_path3_enqueue(data, qwc);
         break;
     case DMA_IPU_TO:
         ipu_in_fifo(data, qwc);
@@ -305,7 +305,14 @@ void dma_start(int ch) {
         c.sadr = s;
         c.qwc = 0;
     }
+    if (ch == DMA_GIF) {
+        // completes (STR cleared) when PATH3 has consumed the data
+        if (!gif_path3_pending()) dmac_channel_done(ch);
+        else gif_path3_run(-1);
+        return;
+    }
     dmac_channel_done(ch);
+    if (ch == DMA_VIF1 && gif_path3_pending()) gif_path3_run(-1);
 }
 
 uint32_t g_sio_line_len;

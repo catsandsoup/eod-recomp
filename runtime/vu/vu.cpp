@@ -334,27 +334,50 @@ inline void set_vi(VUState *vu, int r, uint32_t v) {
 
 inline int16_t vis(VUState *vu, int r) { return (int16_t)vu->vi[r]; }
 
+void sync_pipes(VUState *vu) {
+    if (vu->q_busy && vu->cycle >= vu->q_ready) {
+        vu->q = vu->q_pending;
+        vu->q_busy = 0;
+    }
+    if (vu->p_busy && vu->cycle >= vu->p_ready) {
+        vu->p = vu->p_pending;
+        vu->p_busy = 0;
+    }
+}
+
 void q_pipeline_set(VUState *vu, float v, int latency) {
+    if (vu->q_busy) {  // divider busy: stall until the previous result is out
+        if (vu->cycle < vu->q_ready) vu->cycle = vu->q_ready;
+        sync_pipes(vu);
+    }
     vu->q_pending = v;
-    vu->q_delay = latency;
+    vu->q_ready = vu->cycle + latency;
+    vu->q_busy = 1;
 }
 
 void p_pipeline_set(VUState *vu, float v, int latency) {
+    if (vu->p_busy) {
+        if (vu->cycle < vu->p_ready) vu->cycle = vu->p_ready;
+        sync_pipes(vu);
+    }
     vu->p_pending = v;
-    vu->p_delay = latency;
+    vu->p_ready = vu->cycle + latency;
+    vu->p_busy = 1;
 }
 
 void flush_q(VUState *vu) {
-    if (vu->q_delay > 0) {
+    if (vu->q_busy) {
+        if (vu->cycle < vu->q_ready) vu->cycle = vu->q_ready;
         vu->q = vu->q_pending;
-        vu->q_delay = 0;
+        vu->q_busy = 0;
     }
 }
 
 void flush_p(VUState *vu) {
-    if (vu->p_delay > 0) {
+    if (vu->p_busy) {
+        if (vu->cycle < vu->p_ready) vu->cycle = vu->p_ready;
         vu->p = vu->p_pending;
-        vu->p_delay = 0;
+        vu->p_busy = 0;
     }
 }
 
@@ -675,9 +698,104 @@ void lower(Ctx &c, uint32_t ins, uint32_t pc) {
     WARN("VU%d: unknown lower instruction %08x at %04x", vu->index, ins, pc);
 }
 
-void tick_pipelines(VUState *vu) {
-    if (vu->q_delay > 0 && --vu->q_delay == 0) vu->q = vu->q_pending;
-    if (vu->p_delay > 0 && --vu->p_delay == 0) vu->p = vu->p_pending;
+// --------------------------------------------------- hazard / stall model
+struct RegUse {
+    int reg;
+    int mask;  // bit3 = x ... bit0 = w
+};
+
+inline int bcmask(int c) { return 8 >> c; }
+
+// VF registers read by an upper instruction.
+int upper_reads(uint32_t ins, RegUse *out) {
+    uint32_t op = ins & 0x3F;
+    int dest = dest_of(ins);
+    int n = 0;
+    if (op < 0x3C) {
+        if (op >= 0x2E && op != 0x2F) {  // OPMSUB: cross product
+            if (op == 0x2E) {
+                out[n++] = {FS(ins), 0xE};
+                out[n++] = {FT(ins), 0xE};
+                return n;
+            }
+        }
+        out[n++] = {FS(ins), dest};
+        if (op < 0x1C) out[n++] = {FT(ins), bcmask(BC(ins))};
+        else if (op >= 0x28) out[n++] = {FT(ins), dest};
+        return n;
+    }
+    uint32_t ext = ((ins >> 6) & 31) << 2 | (ins & 3);
+    if (ext == 0x2F) return 0;  // NOP
+    if (ext == 0x1F) {          // CLIP
+        out[n++] = {FS(ins), 0xE};
+        out[n++] = {FT(ins), 1};
+        return n;
+    }
+    if (ext == 0x2E) {  // OPMULA
+        out[n++] = {FS(ins), 0xE};
+        out[n++] = {FT(ins), 0xE};
+        return n;
+    }
+    out[n++] = {FS(ins), dest};
+    if (ext < 0x10 || (ext >= 0x18 && ext < 0x1C)) out[n++] = {FT(ins), bcmask(BC(ins))};
+    else if (ext >= 0x28) out[n++] = {FT(ins), dest};
+    return n;
+}
+
+// VF registers read / written by a micro-mode lower instruction.
+int lower_reads(uint32_t ins, RegUse *out, RegUse *write) {
+    uint32_t op = ins >> 25;
+    int dest = dest_of(ins);
+    int n = 0;
+    write->reg = 0;
+    switch (op) {
+    case 0x00: write->reg = FT(ins); write->mask = dest; return 0;  // LQ
+    case 0x01: out[n++] = {FS(ins), dest}; return n;               // SQ
+    case 0x40: {
+        uint32_t f = ins & 0x3F;
+        if (f < 0x3C) return 0;
+        uint32_t ext = ((ins >> 6) & 31) << 2 | (ins & 3);
+        int fsf = (ins >> 21) & 3, ftf = (ins >> 23) & 3;
+        switch (ext) {
+        case 0x30: case 0x31:  // MOVE, MR32
+            out[n++] = {FS(ins), ext == 0x31 ? 0xF : dest};
+            write->reg = FT(ins);
+            write->mask = dest;
+            return n;
+        case 0x34: case 0x36: write->reg = FT(ins); write->mask = dest; return 0;  // LQI/LQD
+        case 0x35: case 0x37: out[n++] = {FS(ins), dest}; return n;              // SQI/SQD
+        case 0x38: case 0x3A:  // DIV, RSQRT
+            out[n++] = {FS(ins), bcmask(fsf)};
+            out[n++] = {FT(ins), bcmask(ftf)};
+            return n;
+        case 0x39: out[n++] = {FT(ins), bcmask(ftf)}; return n;  // SQRT
+        case 0x3C: case 0x42: case 0x43: out[n++] = {FS(ins), bcmask(fsf)}; return n;  // MTIR/RINIT/RXOR
+        case 0x3D: case 0x40: case 0x41: case 0x64:  // MFIR, RNEXT, RGET, MFP
+            write->reg = FT(ins);
+            write->mask = dest;
+            return 0;
+        default:
+            if (ext >= 0x70) out[n++] = {FS(ins), 0xF};  // EFU
+            return n;
+        }
+    }
+    }
+    return 0;
+}
+
+inline uint64_t ready_of(const VUState *vu, const RegUse &u) {
+    if (u.reg == 0) return 0;
+    uint64_t r = 0;
+    for (int k = 0; k < 4; k++)
+        if ((u.mask >> (3 - k)) & 1)
+            if (vu->vf_ready[u.reg][k] > r) r = vu->vf_ready[u.reg][k];
+    return r;
+}
+
+inline void mark_write(VUState *vu, int reg, int mask, uint64_t when) {
+    if (!reg) return;
+    for (int k = 0; k < 4; k++)
+        if ((mask >> (3 - k)) & 1) vu->vf_ready[reg][k] = when;
 }
 
 }  // namespace
@@ -701,12 +819,25 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
         uint32_t lo, hi;
         memcpy(&lo, vu->micro + pc, 4);
         memcpy(&hi, vu->micro + pc + 4, 4);
-        tick_pipelines(vu);
+        // stall until every register this pair reads has been written
+        RegUse uses[4];
+        RegUse lw = {0, 0};
+        int nu = upper_reads(hi, uses);
+        if (!(hi & 0x80000000u)) nu += lower_reads(lo, uses + nu, &lw);
+        uint64_t need = 0;
+        for (int k = 0; k < nu; k++) {
+            uint64_t r = ready_of(vu, uses[k]);
+            if (r > need) need = r;
+        }
+        if (need > vu->cycle) vu->cycle = need;
+        sync_pipes(vu);
         // upper first (computed against old state), committed after lower
         c.up_write = false;
         c.mac_set = false;
         c.branch = false;
         upper(c, hi);
+        bool up_vf = c.up_write && !c.up_acc;
+        int up_reg = c.up_reg, up_dest = c.up_dest;
         if (hi & 0x80000000u) {
             // I bit: lower word is a float immediate for the I register
             commit_upper(c);
@@ -715,6 +846,9 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
             lower(c, lo, pc);
             commit_upper(c);
         }
+        if (up_vf) mark_write(vu, up_reg, up_dest, vu->cycle + 4);
+        if (lw.reg) mark_write(vu, lw.reg, lw.mask, vu->cycle + 4);
+        vu->cycle++;
         if (hi & 0x40000000u) end_countdown = 1;  // E bit: one more pair
         if (hi & 0x08000000u) { /* T bit: debug */ }
         if (hi & 0x10000000u) { /* D bit: debug */ }
