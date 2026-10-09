@@ -12,10 +12,12 @@
 #include "../core/log.h"
 #include "gs_mem.h"
 #include "gs_state.h"
+#include "gs_swizzle.h"
 
 namespace gs {
 
 bool g_trace;  // log every primitive of one frame (EOD_GS_TRACE=frame)
+uint32_t g_reg_gen = 1;
 
 namespace {
 
@@ -52,6 +54,11 @@ struct Env {
     uint32_t fogr, fogg, fogb;
     bool fb16, z16;
     bool write_none;  // e.g. FBMSK all set and ZMSK
+    bool need_dst;    // the destination colour is read
+    bool need_z;      // depth is tested or written
+    // address tables
+    const SwizzleTab *fbT, *zT, *texT[7];
+    uint32_t pal[256];  // CLUT expanded to RGBA for the current texture
 };
 
 Env g_env;
@@ -72,7 +79,15 @@ void trace_prim(const char *kind, const Vertex *v, int n) {
 
 
 // ----------------------------------------------------------------- setup
+uint32_t g_env_attr = ~0u, g_env_gen;
+
+uint32_t clut_lookup(uint32_t idx, const Env &e, bool four_bit);
+
 void setup_env(uint32_t attr) {
+    attr &= ~7u;  // the primitive type doesn't matter here
+    if (attr == g_env_attr && g_reg_gen == g_env_gen) return;
+    g_env_attr = attr;
+    g_env_gen = g_reg_gen;
     Env &e = g_env;
     const Context &c = st.ctx[(attr >> 9) & 1];
     e.fbp = bits(c.frame, 0, 9) * 32;
@@ -158,6 +173,18 @@ void setup_env(uint32_t attr) {
     e.z16 = e.zpsm == PSMZ16 || e.zpsm == PSMZ16S;
     uint32_t full = e.fpsm == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.write_none = (e.fbmsk & full) == full && e.zmsk;
+    e.need_dst = e.date || (e.abe && (e.ba == 1 || e.bb == 1 || e.bd == 1 || e.bc == 1)) || e.fbmsk;
+    e.need_z = e.ztst != 1 || !e.zmsk;
+    e.fbT = swizzle_table(e.fpsm, e.fbw);
+    e.zT = swizzle_table(e.zpsm, e.fbw);
+    if (e.tme) {
+        int levels = (e.mmin >= 2 && e.mxl > 0) ? e.mxl : 0;
+        for (int i = 0; i <= levels && i < 7; i++) e.texT[i] = swizzle_table(e.tpsm, e.mip_tbw[i]);
+        bool four = e.tpsm == PSMT4 || e.tpsm == PSMT4HL || e.tpsm == PSMT4HH;
+        bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
+        if (four || eight)
+            for (uint32_t i = 0, n = four ? 16 : 256; i < n; i++) e.pal[i] = clut_lookup(i, e, four);
+    }
 }
 
 // ------------------------------------------------------------- texturing
@@ -173,7 +200,7 @@ inline uint32_t expand16(uint32_t c, const Env &e) {
 
 bool g_debug_noclut = getenv("EOD_DEBUG_NOCLUT") != nullptr;
 
-inline uint32_t clut_lookup(uint32_t idx, const Env &e, bool four_bit) {
+uint32_t clut_lookup(uint32_t idx, const Env &e, bool four_bit) {
     if (g_debug_noclut) {
         uint32_t g = four_bit ? idx * 17 : idx;
         return g | (g << 8) | (g << 16) | 0x80000000u;
@@ -191,39 +218,29 @@ inline uint32_t clut_lookup(uint32_t idx, const Env &e, bool four_bit) {
     return expand16(st.clut[i], e);
 }
 
-inline uint32_t fetch(const Env &e, int u, int v, uint32_t tbp, uint32_t tbw) {
+inline uint32_t fetch(const Env &e, int u, int v, int lvl) {
+    uint32_t a = e.texT[lvl]->addr(e.mip_tbp[lvl], u, v);
     switch (e.tpsm) {
     case PSMCT32:
-        return word(addr32(u, v, tbp, tbw));
-    case PSMCT24: {
-        uint32_t c = word(addr32(u, v, tbp, tbw)) & 0xFFFFFF;
-        uint32_t a = (e.aem && c == 0) ? 0 : e.ta0;
-        return c | (a << 24);
-    }
-    case PSMCT16:
-        return expand16(half(addr16(u, v, tbp, tbw)), e);
-    case PSMCT16S:
-        return expand16(half(addr16s(u, v, tbp, tbw)), e);
-    case PSMT8:
-        return clut_lookup(byte(addr8(u, v, tbp, tbw)), e, false);
-    case PSMT4:
-        return clut_lookup(nibble(addr4(u, v, tbp, tbw)), e, true);
-    case PSMT8H:
-        return clut_lookup(word(addr32(u, v, tbp, tbw)) >> 24, e, false);
-    case PSMT4HL:
-        return clut_lookup((word(addr32(u, v, tbp, tbw)) >> 24) & 15, e, true);
-    case PSMT4HH:
-        return clut_lookup(word(addr32(u, v, tbp, tbw)) >> 28, e, true);
     case PSMZ32:
-        return word(addr32z(u, v, tbp, tbw));
-    case PSMZ24: {
-        uint32_t c = word(addr32z(u, v, tbp, tbw)) & 0xFFFFFF;
-        return c | (e.ta0 << 24);
+        return word(a);
+    case PSMCT24: {
+        uint32_t c = word(a) & 0xFFFFFF;
+        uint32_t al = (e.aem && c == 0) ? 0 : e.ta0;
+        return c | (al << 24);
     }
+    case PSMZ24:
+        return (word(a) & 0xFFFFFF) | (e.ta0 << 24);
+    case PSMCT16:
+    case PSMCT16S:
     case PSMZ16:
-        return expand16(half(addr16z(u, v, tbp, tbw)), e);
     case PSMZ16S:
-        return expand16(half(addr16sz(u, v, tbp, tbw)), e);
+        return expand16(half(a), e);
+    case PSMT8: return e.pal[byte(a)];
+    case PSMT4: return e.pal[nibble(a)];
+    case PSMT8H: return e.pal[word(a) >> 24];
+    case PSMT4HL: return e.pal[(word(a) >> 24) & 15];
+    case PSMT4HH: return e.pal[word(a) >> 28];
     }
     return 0;
 }
@@ -246,7 +263,6 @@ uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
     int tw = (int)e.tw >> lvl, th = (int)e.th >> lvl;
     if (tw < 1) tw = 1;
     if (th < 1) th = 1;
-    uint32_t tbp = e.mip_tbp[lvl], tbw = e.mip_tbw[lvl];
     if (lvl) {
         u >>= lvl;
         v >>= lvl;
@@ -254,7 +270,7 @@ uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
     if (!bilinear) {
         int x = wrap(u >> 4, tw, e.wms, e.minu, e.maxu);
         int y = wrap(v >> 4, th, e.wmt, e.minv, e.maxv);
-        return fetch(e, x, y, tbp, tbw);
+        return fetch(e, x, y, lvl);
     }
     u -= 8;
     v -= 8;
@@ -262,8 +278,8 @@ uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
     int fu = u & 15, fv = v & 15;
     int xa = wrap(x0, tw, e.wms, e.minu, e.maxu), xb = wrap(x0 + 1, tw, e.wms, e.minu, e.maxu);
     int ya = wrap(y0, th, e.wmt, e.minv, e.maxv), yb = wrap(y0 + 1, th, e.wmt, e.minv, e.maxv);
-    uint32_t c00 = fetch(e, xa, ya, tbp, tbw), c10 = fetch(e, xb, ya, tbp, tbw);
-    uint32_t c01 = fetch(e, xa, yb, tbp, tbw), c11 = fetch(e, xb, yb, tbp, tbw);
+    uint32_t c00 = fetch(e, xa, ya, lvl), c10 = fetch(e, xb, ya, lvl);
+    uint32_t c01 = fetch(e, xa, yb, lvl), c11 = fetch(e, xb, yb, lvl);
     uint32_t out = 0;
     for (int sh = 0; sh < 32; sh += 8) {
         int a = (c00 >> sh) & 255, b = (c10 >> sh) & 255, c = (c01 >> sh) & 255, d = (c11 >> sh) & 255;
@@ -276,20 +292,23 @@ uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
 }
 
 // ---------------------------------------------------------- frame buffer
-inline uint32_t fb_addr(const Env &e, int x, int y) {
-    switch (e.fpsm) {
-    case PSMCT16: return addr16(x, y, e.fbp, e.fbw);
-    case PSMCT16S: return addr16s(x, y, e.fbp, e.fbw);
-    default: return addr32(x, y, e.fbp, e.fbw);
-    }
+// Per-row parts of the frame and depth buffer addresses.
+struct RowAddr {
+    uint32_t fb, fbc, z, zc;
+};
+
+inline void row_addr(const Env &e, int y, RowAddr &ra) {
+    ra.fb = e.fbT->row_base(e.fbp, y);
+    ra.fbc = e.fbT->rowC[y & 2047];
+    ra.z = e.zT->row_base(e.zbp, y);
+    ra.zc = e.zT->rowC[y & 2047];
 }
 
-inline uint32_t z_addr(const Env &e, int x, int y) {
-    switch (e.zpsm) {
-    case PSMZ16: return addr16z(x, y, e.zbp, e.fbw);
-    case PSMZ16S: return addr16sz(x, y, e.zbp, e.fbw);
-    default: return addr32z(x, y, e.zbp, e.fbw);
-    }
+inline int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+inline int ffloor(double d) {
+    int i = (int)d;
+    return i - (d < (double)i);
 }
 
 // ------------------------------------------------------------- pixel
@@ -301,17 +320,19 @@ struct Frag {
     int lod;         // mip level
 };
 
-void shade(const Env &e, int x, int y, const Frag &f) {
-    if (x < e.scx0 || x > e.scx1 || y < e.scy0 || y > e.scy1) return;
+// One pixel inside the scissor rectangle.
+inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
     stats.pixels++;
     // ---- depth test
     uint32_t za = 0;
+    bool have_za = false;
     uint32_t z = f.z;
     if (e.zpsm == PSMZ24) z = z > 0xFFFFFF ? 0xFFFFFF : z;
     else if (e.z16) z = z > 0xFFFF ? 0xFFFF : z;
     if (e.ztst != 1) {
         if (e.ztst == 0) return;
-        za = z_addr(e, x, y);
+        za = e.zT->addr_row(ra.z, ra.zc, x);
+        have_za = true;
         uint32_t zb = e.z16 ? half(za) : (e.zpsm == PSMZ24 ? word(za) & 0xFFFFFF : word(za));
         if (e.ztst == 2 ? z < zb : z <= zb) return;
     }
@@ -390,10 +411,9 @@ void shade(const Env &e, int x, int y, const Frag &f) {
     }
     // ---- destination colour
     uint32_t fa = 0, dst = 0;
-    bool need_dst = e.date || (e.abe && (e.ba == 1 || e.bb == 1 || e.bd == 1 || e.bc == 1)) || e.fbmsk;
     if (write_fb) {
-        fa = fb_addr(e, x, y);
-        if (need_dst) {
+        fa = e.fbT->addr_row(ra.fb, ra.fbc, x);
+        if (e.need_dst) {
             if (e.fb16) {
                 uint32_t c = half(fa);
                 dst = ((c & 0x1F) << 3) | (((c >> 5) & 0x1F) << 11) | (((c >> 10) & 0x1F) << 19) |
@@ -453,7 +473,7 @@ void shade(const Env &e, int x, int y, const Frag &f) {
         }
     }
     if (write_z && e.ztst != 0) {
-        if (!za) za = z_addr(e, x, y);
+        if (!have_za) za = e.zT->addr_row(ra.z, ra.zc, x);
         if (e.z16)
             half(za) = (uint16_t)z;
         else if (e.zpsm == PSMZ24)
@@ -463,14 +483,20 @@ void shade(const Env &e, int x, int y, const Frag &f) {
     }
 }
 
+void shade(const Env &e, int x, int y, const Frag &f) {
+    if (x < e.scx0 || x > e.scx1 || y < e.scy0 || y > e.scy1) return;
+    RowAddr ra;
+    row_addr(e, y, ra);
+    shade_px(e, x, ra, f);
+}
+
 // texture coordinates for a fragment
 inline void tex_coords(const Env &e, float s, float t, float q, Frag &f) {
     if (e.fst) return;  // already in f.u / f.v
     if (q == 0.0f) q = 1e-30f;
-    float uf = s / q * (float)e.tw * 16.0f;
-    float vf = t / q * (float)e.th * 16.0f;
-    f.u = (int)floorf(uf);
-    f.v = (int)floorf(vf);
+    float iq = 1.0f / q;
+    f.u = ffloor(s * iq * (float)(e.tw * 16));
+    f.v = ffloor(t * iq * (float)(e.th * 16));
     if (e.mmin >= 2 && e.mxl > 0) {
         float lod = e.lcm ? e.k : (log2f(1.0f / fabsf(q)) * (float)(1 << e.l) + e.k);
         int lvl = lod <= 0 ? 0 : (int)(lod + 0.5f);
@@ -541,12 +567,15 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         u0 = s0 + (x0 * 16 - v0.x) * du / 16.0;
         w0 = t0 + (y0 * 16 - v0.y) * dw / 16.0;
     }
+    if (e.ztst == 0) return;
     for (int y = y0; y < y1; y++) {
-        f.v = (int)floor(w0 + (y - y0) * dw);
+        RowAddr ra;
+        row_addr(e, y, ra);
+        f.v = ffloor(w0 + (y - y0) * dw);
         double u = u0;
         for (int x = x0; x < x1; x++, u += du) {
-            f.u = (int)floor(u);
-            shade(e, x, y, f);
+            f.u = ffloor(u);
+            shade_px(e, x, ra, f);
         }
     }
 }
@@ -633,8 +662,18 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
         ed[k].ya = pa.y;
         ed[k].bias = (ed[k].dy > 0 || (ed[k].dy == 0 && ed[k].dx < 0)) ? 0 : 1;
     }
+    if (e.ztst == 0) return;
+    const bool gour = e.iip, tex = e.tme, fog = e.fge, need_z = e.need_z, stq = e.tme && !e.fst;
     Frag f;
     f.lod = 0;
+    f.z = 0;
+    f.fog = 0;
+    if (!gour) {
+        f.r = clamp255((int)base[R]);
+        f.g = clamp255((int)base[G]);
+        f.b = clamp255((int)base[B]);
+        f.a = clamp255((int)base[A]);
+    }
     for (int y = py0; y <= py1; y++) {
         int64_t Y = (int64_t)y * 16;
         int xl = px0, xr = px1;
@@ -659,33 +698,45 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
             }
         }
         if (empty || xl > xr) continue;
+        RowAddr ra;
+        row_addr(e, y, ra);
         double fy = y - Y0;
         double fx = xl - X0;
         double val[NA];
         for (int i = 0; i < NA; i++) val[i] = base[i] + gx[i] * fx + gy[i] * fy;
+        double r = val[R], g = val[G], b = val[B], a = val[A], zz = val[Z], fo = val[F];
+        double s = val[S], t = val[T], q = val[Q];
         for (int x = xl; x <= xr; x++) {
-            f.r = (int)val[R];
-            f.g = (int)val[G];
-            f.b = (int)val[B];
-            f.a = (int)val[A];
-            f.r = f.r < 0 ? 0 : f.r > 255 ? 255 : f.r;
-            f.g = f.g < 0 ? 0 : f.g > 255 ? 255 : f.g;
-            f.b = f.b < 0 ? 0 : f.b > 255 ? 255 : f.b;
-            f.a = f.a < 0 ? 0 : f.a > 255 ? 255 : f.a;
-            double zz = val[Z];
-            f.z = zz <= 0 ? 0 : zz >= 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)zz;
-            int fo = (int)val[F];
-            f.fog = fo < 0 ? 0 : fo > 255 ? 255 : fo;
-            if (e.tme) {
-                if (e.fst) {
-                    f.u = (int)floor(val[S]);
-                    f.v = (int)floor(val[T]);
-                } else {
-                    tex_coords(e, (float)val[S], (float)val[T], (float)val[Q], f);
-                }
+            if (gour) {
+                f.r = clamp255((int)r);
+                f.g = clamp255((int)g);
+                f.b = clamp255((int)b);
+                f.a = clamp255((int)a);
+                r += gx[R];
+                g += gx[G];
+                b += gx[B];
+                a += gx[A];
             }
-            shade(e, x, y, f);
-            for (int i = 0; i < NA; i++) val[i] += gx[i];
+            if (need_z) {
+                f.z = zz <= 0 ? 0 : zz >= 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)zz;
+                zz += gx[Z];
+            }
+            if (fog) {
+                f.fog = clamp255((int)fo);
+                fo += gx[F];
+            }
+            if (tex) {
+                if (stq) {
+                    tex_coords(e, (float)s, (float)t, (float)q, f);
+                    q += gx[Q];
+                } else {
+                    f.u = ffloor(s);
+                    f.v = ffloor(t);
+                }
+                s += gx[S];
+                t += gx[T];
+            }
+            shade_px(e, x, ra, f);
         }
     }
 }

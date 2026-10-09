@@ -14,6 +14,7 @@
 #include "../platform/platform.h"
 #include "gs_mem.h"
 #include "gs_state.h"
+#include "gs_swizzle.h"
 
 namespace gs {
 extern bool g_trace;
@@ -45,6 +46,10 @@ struct Transfer {
     // partial pixel bytes for 24-bit and sub-word formats
     uint8_t pend[16];
     int pend_n = 0;
+    // address table and the current row
+    const SwizzleTab *T = nullptr;
+    int ry = -1;
+    uint32_t rb = 0, rc = 0;
 } g_xfer;
 
 void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog);
@@ -74,6 +79,8 @@ void xfer_start() {
         g_xfer.x = 0;
         g_xfer.y = 0;
         g_xfer.pend_n = 0;
+        g_xfer.T = swizzle_table(dpsm, dbw);
+        g_xfer.ry = -1;
         LOG(LOG_GS, "transfer host->local bp=%x bw=%d psm=%x at %d,%d size %dx%d", dbp, dbw, dpsm, dx, dy, w, h);
     } else if (dir == 2) {
         LOG(LOG_GS, "transfer local->local %x(%x)->%x(%x) %dx%d", sbp, spsm, dbp, dpsm, w, h);
@@ -93,7 +100,24 @@ void xfer_start() {
 inline void xfer_put(uint32_t v) {
     Transfer &t = g_xfer;
     if (t.y >= t.h) return;
-    write_pixel(t.dpsm, (t.x0 + t.x) & 2047, (t.y0 + t.y) & 2047, t.dbp, t.dbw, v);
+    int py = (t.y0 + t.y) & 2047;
+    if (py != t.ry) {
+        t.ry = py;
+        t.rb = t.T->row_base(t.dbp, py);
+        t.rc = t.T->rowC[py];
+    }
+    uint32_t a = t.T->addr_row(t.rb, t.rc, (t.x0 + t.x) & 2047);
+    switch (t.dpsm) {
+    case PSMCT32: case PSMZ32: word(a) = v; break;
+    case PSMCT24: case PSMZ24: word(a) = (word(a) & 0xFF000000u) | (v & 0xFFFFFF); break;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: half(a) = (uint16_t)v; break;
+    case PSMT8: byte(a) = (uint8_t)v; break;
+    case PSMT4: set_nibble(a, v); break;
+    case PSMT8H: word(a) = (word(a) & 0x00FFFFFFu) | (v << 24); break;
+    case PSMT4HL: word(a) = (word(a) & 0xF0FFFFFFu) | ((v & 0xF) << 24); break;
+    case PSMT4HH: word(a) = (word(a) & 0x0FFFFFFFu) | ((v & 0xF) << 28); break;
+    default: write_pixel(t.dpsm, (t.x0 + t.x) & 2047, py, t.dbp, t.dbw, v); break;
+    }
     if (++t.x >= t.w) {
         t.x = 0;
         t.y++;
@@ -143,6 +167,8 @@ void tex0_write(int c, uint64_t v) {
 }
 
 void write_reg(uint32_t reg, uint64_t v) {
+    // vertex data and image transfer words don't affect the drawing state
+    if (reg > 0x05 && reg != 0x0A && reg != 0x0C && reg != 0x0D && reg != 0x54) g_reg_gen++;
     switch (reg) {
     case 0x00:  // PRIM
         st.prim = v;
@@ -494,12 +520,24 @@ bool read_circuit(int n, std::vector<uint32_t> &img, int &w, int &h) {
     bool interlaced = st.smode2 & 1;
     bool field_mode = (st.smode2 >> 1) & 1;
     int lines = (interlaced && field_mode) ? h / 2 : h;
-    img.assign((size_t)w * h, 0);
+    img.resize((size_t)w * h);
+    const SwizzleTab *T = swizzle_table(psm, fbw);
+    bool b16 = psm == PSMCT16 || psm == PSMCT16S;
     for (int y = 0; y < h; y++) {
         int sy = (interlaced && field_mode) ? y / 2 : y;
         if (sy >= lines) sy = lines - 1;
-        for (int x = 0; x < w; x++)
-            img[(size_t)y * w + x] = to_rgba(psm, read_pixel(psm, (dbx + x) & 2047, (dby + sy) & 2047, fbp, fbw));
+        uint32_t *row = &img[(size_t)y * w];
+        if (y > 0 && sy == ((interlaced && field_mode) ? (y - 1) / 2 : y - 1)) {
+            memcpy(row, row - w, (size_t)w * 4);  // line doubling
+            continue;
+        }
+        int py = (dby + sy) & 2047;
+        uint32_t rb = T->row_base(fbp, py), rc = T->rowC[py];
+        if (b16) {
+            for (int x = 0; x < w; x++) row[x] = to_rgba(psm, half(T->addr_row(rb, rc, (dbx + x) & 2047)));
+        } else {
+            for (int x = 0; x < w; x++) row[x] = word(T->addr_row(rb, rc, (dbx + x) & 2047)) | 0xFF000000u;
+        }
     }
     return true;
 }

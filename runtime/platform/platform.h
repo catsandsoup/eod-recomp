@@ -67,6 +67,7 @@ struct HostFiber;
 HostFiber *fiber_init_main();  // converts the calling thread
 HostFiber *fiber_create(size_t stack_size, void (*fn)(void *), void *arg);
 void fiber_switch(HostFiber *to);
+HostFiber *fiber_current();
 void fiber_delete(HostFiber *f);
 
 // ---------------------------------------------------------- timer thread

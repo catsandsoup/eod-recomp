@@ -1,6 +1,7 @@
 // hw.cpp - EE hardware register file: timers, INTC, DMAC, SBUS, FIFOs.
 #include "hw.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "../core/log.h"
@@ -81,6 +82,13 @@ DmaChan g_dma[10];
 uint32_t g_d_ctrl, g_d_stat, g_d_pcr, g_d_sqwc, g_d_rbsr, g_d_rbor, g_d_stadr;
 uint32_t g_d_enable = 0x1201;
 
+// incremental state of the IPU channels (0 = fromIPU, 1 = toIPU)
+struct IpuDma {
+    bool in_progress = false;  // MADR/QWC hold data still to transfer
+    bool last = false;         // the channel ends when that data is done
+};
+IpuDma g_ipu_dma[2];
+
 const uint32_t k_chan_base[10] = {0x8000, 0x9000, 0xA000, 0xB000, 0xB400, 0xC000, 0xC400, 0xC800, 0xD000, 0xD400};
 
 int chan_from_addr(uint32_t off) {
@@ -107,9 +115,6 @@ void dma_sink(int ch, const uint8_t *data, uint32_t qwc) {
         break;
     case DMA_GIF:
         gif_path3_enqueue(data, qwc);
-        break;
-    case DMA_IPU_TO:
-        ipu_in_fifo(data, qwc);
         break;
     case DMA_SPR_TO: {
         DmaChan &c = g_dma[ch];
@@ -138,10 +143,6 @@ void dma_run_normal(int ch) {
             c.madr += 16;
         }
         c.sadr = s;
-    } else if (ch == DMA_IPU_FROM) {
-        uint32_t got = ipu_out_fifo(dma_ptr(c.madr), qwc);
-        c.madr += got * 16;
-        qwc = got;
     } else {
         // the chunk may straddle the end of RAM in theory; copy in pieces
         dma_sink(ch, dma_ptr(c.madr), qwc);
@@ -280,6 +281,25 @@ void dma_start(int ch) {
         c.chcr &= ~0x100u;
         return;
     }
+    if (ch == DMA_IPU_FROM || ch == DMA_IPU_TO) {
+        // paced by the IPU FIFOs: the IPU pulls/pushes data as it decodes
+        g_ipu_dma[ch - DMA_IPU_FROM] = IpuDma();
+        if (ch == DMA_IPU_FROM && !(c.qwc & 0xFFFF)) {
+            dmac_channel_done(ch);
+            return;
+        }
+        if (ch == DMA_IPU_TO && mode == 1 && (c.qwc & 0xFFFF)) {
+            // resuming a chain: the tag in CHCR decides whether it ends after this data
+            uint32_t id = (c.chcr >> 28) & 7;
+            g_ipu_dma[1].in_progress = true;
+            g_ipu_dma[1].last = id == 0 || id == 7 || ((c.chcr >> 31) && ((c.chcr >> 7) & 1));
+        } else if (ch == DMA_IPU_TO && mode == 0) {
+            g_ipu_dma[1].in_progress = true;
+            g_ipu_dma[1].last = true;
+        }
+        ipu_dma_kick();
+        return;
+    }
     if (mode == 1) {
         if (ch == DMA_SPR_FROM)
             dma_run_dest_chain(ch);
@@ -324,6 +344,91 @@ void dmac_channel_done(int ch) {
     g_dma[ch].chcr &= ~0x100u;
     g_d_stat |= 1u << ch;
     if (g_d_stat & (1u << (16 + ch))) dmac_raise(ch);
+}
+
+bool dma_ipu_active(int ch) { return (g_dma[ch].chcr & 0x100) != 0; }
+
+uint32_t dma_ipu_to_fetch(uint8_t *dst, uint32_t maxqw) {
+    DmaChan &c = g_dma[DMA_IPU_TO];
+    IpuDma &st = g_ipu_dma[1];
+    uint32_t got = 0;
+    for (int guard = 0; got < maxqw && (c.chcr & 0x100) && guard < 10000; guard++) {
+        if (!st.in_progress) {
+            if (st.last) {
+                dmac_channel_done(DMA_IPU_TO);
+                break;
+            }
+            if ((c.chcr >> 2 & 3) != 1) {  // normal mode with QWC = 0
+                dmac_channel_done(DMA_IPU_TO);
+                break;
+            }
+            // read the next source chain tag
+            uint64_t tag;
+            memcpy(&tag, dma_ptr(c.tadr), 8);
+            uint32_t qwc = (uint32_t)(tag & 0xFFFF);
+            uint32_t id = (uint32_t)(tag >> 28) & 7;
+            bool irq = (tag >> 31) & 1;
+            uint32_t addr = (uint32_t)(tag >> 32) & 0x7FFFFFF0;
+            if (tag >> 63) addr |= 0x80000000u;
+            c.chcr = (c.chcr & 0xFFFF) | ((uint32_t)(tag >> 16) & 0xFFFF0000u);
+            uint32_t next = c.tadr + 16;
+            bool end = false;
+            switch (id) {
+            case 0: c.madr = addr; end = true; break;                    // refe
+            case 1: c.madr = c.tadr + 16; next = c.madr + qwc * 16; break;  // cnt
+            case 2: c.madr = c.tadr + 16; next = addr; break;                // next
+            case 3: case 4: c.madr = addr; break;                            // ref(s)
+            case 5: {                                                         // call
+                c.madr = c.tadr + 16;
+                int asp = (c.chcr >> 4) & 3;
+                if (asp == 0) c.asr0 = c.madr + qwc * 16;
+                else c.asr1 = c.madr + qwc * 16;
+                c.chcr = (c.chcr & ~0x30u) | ((asp + 1) << 4);
+                next = addr;
+                break;
+            }
+            case 6: {                                                         // ret
+                c.madr = c.tadr + 16;
+                int asp = (c.chcr >> 4) & 3;
+                if (asp == 0) {
+                    end = true;
+                } else {
+                    asp--;
+                    next = asp == 0 ? c.asr0 : c.asr1;
+                    c.chcr = (c.chcr & ~0x30u) | (asp << 4);
+                }
+                break;
+            }
+            default: c.madr = c.tadr + 16; end = true; break;                 // end
+            }
+            c.tadr = next;
+            c.qwc = qwc;
+            st.in_progress = qwc != 0;
+            st.last = end || (irq && ((c.chcr >> 7) & 1));
+            continue;
+        }
+        uint32_t n = std::min<uint32_t>(c.qwc & 0xFFFF, maxqw - got);
+        memcpy(dst + got * 16, dma_ptr(c.madr), n * 16);
+        c.madr += n * 16;
+        c.qwc -= n;
+        got += n;
+        if (!(c.qwc & 0xFFFF)) st.in_progress = false;
+    }
+    if ((c.chcr & 0x100) && !st.in_progress && st.last) dmac_channel_done(DMA_IPU_TO);
+    return got;
+}
+
+uint32_t dma_ipu_from_store(const uint8_t *src, uint32_t n) {
+    DmaChan &c = g_dma[DMA_IPU_FROM];
+    if (!(c.chcr & 0x100)) return 0;
+    uint32_t k = std::min<uint32_t>(n, c.qwc & 0xFFFF);
+    for (uint32_t i = 0; i < k; i++) {
+        memcpy(dma_ptr(c.madr), src + i * 16, 16);
+        c.madr += 16;
+    }
+    c.qwc -= k;
+    if (!(c.qwc & 0xFFFF)) dmac_channel_done(DMA_IPU_FROM);
+    return k;
 }
 
 bool hw_dmac_channel_irq_enabled(int ch) { return (g_d_stat >> (16 + ch)) & 1; }

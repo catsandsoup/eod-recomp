@@ -410,9 +410,12 @@ static VOID CALLBACK fiber_start(LPVOID p) {
     ExitProcess(1);
 }
 
+static HostFiber *g_cur_fiber;
+
 HostFiber *fiber_init_main() {
     HostFiber *f = new HostFiber();
     f->fiber = ConvertThreadToFiber(nullptr);
+    g_cur_fiber = f;
     return f;
 }
 
@@ -428,7 +431,13 @@ HostFiber *fiber_create(size_t stack_size, void (*fn)(void *), void *arg) {
     return f;
 }
 
-void fiber_switch(HostFiber *to) { SwitchToFiber(to->fiber); }
+void fiber_switch(HostFiber *to) {
+    if (to == g_cur_fiber) return;
+    g_cur_fiber = to;
+    SwitchToFiber(to->fiber);
+}
+
+HostFiber *fiber_current() { return g_cur_fiber; }
 
 void fiber_delete(HostFiber *f) {
     if (f->fiber) DeleteFiber(f->fiber);

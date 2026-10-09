@@ -119,6 +119,8 @@ class Gen:
         # COP1 encodings rabbitizer doesn't know
         if (w & 0xFFE0003F) == 0x46000004:
             return "%s = fsqrt_ps2(%s);" % (F(sa), F(rt))
+        if (w >> 26) == 0 and (w & 0x3F) in (0x00, 0x02, 0x03, 0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F) and rd == 0:
+            return ""  # shift into $zero: no effect (also covers data words executed as code)
         if (w >> 26) == 0x10 and rd == 25 and rs in (0, 4):
             if rs == 0:
                 return set_s32(rt, "ee_mfpc(%d)" % (w & 0x7FF))
@@ -734,7 +736,8 @@ class FuncEmitter:
                 k += 1
                 continue
             if not i.hasDelaySlot():
-                if not i.isValid() and not ((w & 0xFFE0003F) == 0x46000004 or ((w >> 26) == 0x10 and ((w >> 11) & 31) == 25)):
+                if not i.isValid() and not ((w & 0xFFE0003F) == 0x46000004 or ((w >> 26) == 0x10 and ((w >> 11) & 31) == 25)
+                                            or ((w >> 26) == 0 and (w & 0x3F) in (0x00, 0x02, 0x03, 0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F) and ((w >> 11) & 31) == 0)):
                     body.append("  ee_bad_instruction(%s, %s);" % (hx(va), hx(w)))
                     body.append("  return;")
                     k += 1

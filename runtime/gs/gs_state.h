@@ -41,6 +41,10 @@ struct State {
 
 extern State st;
 
+// Bumped on every register write that can change how primitives are drawn
+// (lets the rasteriser reuse its decoded state between primitives).
+extern uint32_t g_reg_gen;
+
 inline uint32_t bits(uint64_t v, int lo, int n) { return (uint32_t)((v >> lo) & ((1ull << n) - 1)); }
 
 // rasteriser entry points (gs_draw.cpp)

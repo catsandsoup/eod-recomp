@@ -128,6 +128,8 @@ void fiber_switch(HostFiber *to) {
     swapcontext(&from->ctx, &to->ctx);
 }
 
+HostFiber *fiber_current() { return g_current_fiber; }
+
 void fiber_delete(HostFiber *f) { delete f; }
 
 // ------------------------------------------------------------------ ticker

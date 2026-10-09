@@ -40,3 +40,10 @@ enum DmaChannel {
 
 // Marks channel finished: clears STR, sets D_STAT.CIS, raises the interrupt.
 void dmac_channel_done(int ch);
+
+// IPU DMA (channels 3/4), paced by the IPU FIFOs (hw.cpp)
+bool dma_ipu_active(int ch);
+// Takes up to maxqw quadwords from the toIPU channel; ends the channel when done.
+uint32_t dma_ipu_to_fetch(uint8_t *dst, uint32_t maxqw);
+// Stores up to n quadwords through the fromIPU channel; returns how many.
+uint32_t dma_ipu_from_store(const uint8_t *src, uint32_t n);

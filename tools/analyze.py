@@ -28,7 +28,11 @@ def extra_valid(w):
         return True  # mfpc/mtpc/mfps/mtps (performance counters)
     if (w & 0xFFE0003F) == 0x46000004:
         return True  # sqrt.s fd, ft
+    if (w >> 26) == 0 and (w & 0x3F) in SHIFTS and ((w >> 11) & 31) == 0:
+        return True  # shift into $zero with a non-zero rs field (data words executed as no-ops, e.g. libmpeg)
     return False
+
+SHIFTS = (0x00, 0x02, 0x03, 0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F)
 
 # Registers
 RA = 31

@@ -269,38 +269,37 @@ Layout layout_for(uint32_t psm) {
     }
 }
 
-struct CacheEnt {
-    SwizzleTab *t = nullptr;
-    uint64_t used = 0;
-};
-CacheEnt g_cache[24];
-uint64_t g_tick;
+// tables live for the whole run so callers may keep the pointers
+SwizzleTab *g_tabs[8][64];
+
+int layout_index(uint32_t psm) {
+    switch (psm) {
+    case PSMCT16: return 1;
+    case PSMCT16S: return 2;
+    case PSMT8: return 3;
+    case PSMT4: return 4;
+    case PSMZ32: case PSMZ24: return 5;
+    case PSMZ16: return 6;
+    case PSMZ16S: return 7;
+    default: return 0;  // CT32, CT24, T8H, T4HL, T4HH
+    }
+}
 
 }  // namespace
 
 const SwizzleTab *swizzle_table(uint32_t psm, uint32_t bw) {
-    // formats sharing a layout share tables
-    uint32_t key = psm;
-    if (key == PSMCT24 || key == PSMT8H || key == PSMT4HL || key == PSMT4HH) key = PSMCT32;
-    if (key == PSMZ24) key = PSMZ32;
-    g_tick++;
-    CacheEnt *lru = &g_cache[0];
-    for (auto &c : g_cache) {
-        if (c.t && c.t->psm == key && c.t->bw == bw) {
-            c.used = g_tick;
-            return c.t;
-        }
-        if (c.used < lru->used) lru = &c;
-    }
+    bw &= 63;
+    int li = layout_index(psm);
+    if (g_tabs[li][bw]) return g_tabs[li][bw];
+    static const uint32_t keys[8] = {PSMCT32, PSMCT16, PSMCT16S, PSMT8, PSMT4, PSMZ32, PSMZ16, PSMZ16S};
+    uint32_t key = keys[li];
     if (!g_colT32[1]) {
         for (int i = 0; i < 64; i++) g_colT32[i] = columnTable32[i / 8][i % 8];
         for (int i = 0; i < 128; i++) g_colT16[i] = columnTable16[i / 16][i % 16];
         for (int i = 0; i < 256; i++) g_colT8[i] = columnTable8[i / 16][i % 16];
         for (int i = 0; i < 512; i++) g_colT4[i] = columnTable4[i / 32][i % 32];
     }
-    if (!lru->t) lru->t = new SwizzleTab();
-    SwizzleTab &t = *lru->t;
-    lru->used = g_tick;
+    SwizzleTab &t = *(g_tabs[li][bw] = new SwizzleTab());
     Layout L = layout_for(key);
     t.psm = key;
     t.bw = bw;
