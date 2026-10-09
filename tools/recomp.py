@@ -649,6 +649,8 @@ class FuncEmitter:
         if self.local(target):
             self.labels.add(target)
             if target <= self.cur and back_edge_check:
+                if self.g.hle.get(target) == "idle":
+                    return "{ IDLE_CHECK(); goto L_%08X; }" % target
                 return "{ IRQ_CHECK(); goto L_%08X; }" % target
             return "goto L_%08X;" % target
         if target in self.g.funcs:
@@ -905,6 +907,8 @@ def load_hle(path):
     replace: no code is generated; the runtime defines f_<addr>.
     wrap:    the original is generated as f_<addr>_orig and the runtime
              defines f_<addr> (which may call the original).
+    idle:    <addr> heads a loop that polls memory an interrupt handler
+             changes; its back edge waits for the next event (IDLE_CHECK).
     """
     out = {}
     if os.path.exists(path):
@@ -913,7 +917,7 @@ def load_hle(path):
             if line:
                 parts = line.split()
                 mode = parts[1] if len(parts) > 1 else "replace"
-                if mode not in ("replace", "wrap"):
+                if mode not in ("replace", "wrap", "idle"):
                     raise SystemExit("hle.txt: bad mode %r" % mode)
                 out[int(parts[0], 16)] = mode
     return out

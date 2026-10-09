@@ -6,3 +6,8 @@
 00331DF0 wrap     # panic(fmt, ...) - game fatal error
 0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
+
+# Busy-wait loops on memory set by interrupt handlers: sleep until the next
+# event instead of spinning.
+0035C460 idle     # frame loop: wait for the vblank counter to change
+0035C528 idle     # frame loop: wait for the draw-done state (1 or 7)

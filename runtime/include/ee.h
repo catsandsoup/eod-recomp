@@ -375,6 +375,10 @@ void ee_jump_unknown(uint32_t addr);
 extern volatile int g_ee_irq_pending;
 void ee_service_interrupts(void);
 #define IRQ_CHECK() do { if (EE_UNLIKELY(g_ee_irq_pending)) ee_service_interrupts(); } while (0)
+/* Back edge of a loop polling memory that only interrupt handlers change
+   (config/hle.txt "idle"): waits for the next event instead of spinning. */
+void ee_idle_poll(void);
+#define IDLE_CHECK() ee_idle_poll()
 
 /* Debug tracing of function entries (cmake -DEOD_TRACE_CALLS=ON). */
 #ifdef EE_TRACE_CALLS

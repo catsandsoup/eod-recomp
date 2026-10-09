@@ -185,7 +185,7 @@ void idle_until_runnable() {
         uint64_t next = g_vblank_end_pending ? g_vblank_end_us : g_next_vblank_us;
         for (auto &a : g_alarms)
             if (a.used && a.due_us < next) next = a.due_us;
-        if (next > now && !g_intc_stat.load() && !g_dmac_pending.load()) {
+        if (next > now && !(g_intc_stat.load() & g_intc_mask) && !g_dmac_pending.load()) {
             uint64_t d = next - now;
             platform_sleep_us((uint32_t)(d > 2000 ? 2000 : d));
         }
@@ -977,6 +977,23 @@ extern "C" void ee_service_interrupts(void) {
             }
         }
     }
+}
+
+// A loop polling memory that only interrupt handlers change: rather than
+// spin, sleep until the next timed event (vblank, alarm) or an interrupt
+// raised by another host thread, then service it.
+extern "C" void ee_idle_poll(void) {
+    if (!g_ee_irq_pending && !g_in_interrupt && g_ints_enabled) {
+        uint64_t now = platform_time_us();
+        uint64_t next = g_vblank_end_pending ? g_vblank_end_us : g_next_vblank_us;
+        for (auto &a : g_alarms)
+            if (a.used && a.due_us < next) next = a.due_us;
+        if (next > now && !(g_intc_stat.load() & g_intc_mask) && !g_dmac_pending.load()) {
+            uint64_t d = next - now;
+            platform_sleep_us((uint32_t)(d > 500 ? 500 : d));
+        }
+    }
+    ee_service_interrupts();
 }
 
 void intc_raise(int cause) {
