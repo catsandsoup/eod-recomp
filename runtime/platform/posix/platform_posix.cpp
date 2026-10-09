@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../platform.h"
+#include "../pad_script.h"
 
 static PlatformConfig g_cfg;
 
@@ -47,35 +48,12 @@ uint64_t platform_time_us() {
 
 void platform_sleep_us(uint32_t us) { usleep(us); }
 
-// Input: optional scripted input via EOD_PAD_SCRIPT env var:
-//   "frame:buttons_hex,frame:buttons_hex,..." (active high PadButton bits)
-extern uint64_t kernel_vblank_count();
+// Input: only scripted (EOD_PAD_SCRIPT, see pad_script.h).
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     out->connected = port == 0;
-    static std::vector<std::pair<uint64_t, uint16_t>> script;
-    static bool parsed;
-    if (!parsed) {
-        parsed = true;
-        if (const char *s = getenv("EOD_PAD_SCRIPT")) {
-            std::string str(s);
-            size_t pos = 0;
-            while (pos < str.size()) {
-                size_t comma = str.find(',', pos);
-                std::string tok = str.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-                size_t colon = tok.find(':');
-                if (colon != std::string::npos)
-                    script.push_back({strtoull(tok.c_str(), nullptr, 10),
-                                      (uint16_t)strtoul(tok.c_str() + colon + 1, nullptr, 16)});
-                if (comma == std::string::npos) break;
-                pos = comma + 1;
-            }
-        }
-    }
-    if (port != 0) return;
-    uint64_t f = kernel_vblank_count();
-    for (auto &e : script)
-        if (f >= e.first) out->buttons = e.second;
+    uint16_t b;
+    if (port == 0 && pad_script_buttons(b)) out->buttons = b;
 }
 
 void platform_set_vibration(int, uint8_t, uint8_t) {}

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../platform.h"
+#include "../pad_script.h"
 
 namespace {
 
@@ -341,6 +342,13 @@ void platform_get_pad(int port, HostPadState *out) {
             out->pressure[10] = xs.Gamepad.bLeftTrigger;
             out->pressure[11] = xs.Gamepad.bRightTrigger;
         }
+    }
+    // EOD_PAD_SCRIPT (automated testing) replaces port 0's input
+    uint16_t sb;
+    if (port == 0 && pad_script_buttons(sb)) {
+        *out = HostPadState();
+        out->connected = true;
+        out->buttons = sb;
     }
     // pressure for digital buttons
     static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
