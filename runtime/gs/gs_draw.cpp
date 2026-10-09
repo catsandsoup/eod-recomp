@@ -67,9 +67,14 @@ void trace_prim(const char *kind, const Vertex *v, int n) {
     if (!g_trace) return;
     const Env &e = g_env;
     char buf[512];
-    int k = snprintf(buf, sizeof buf, "%s fb=%x/%d/%x tme=%d fst=%d tex=%x bw=%d psm=%x %dx%d tfx=%d tcc=%d cpsm=%x abe=%d",
+    int k = snprintf(buf, sizeof buf,
+                     "%s fb=%x/%d/%x tme=%d fst=%d tex=%x bw=%d psm=%x %dx%d tfx=%d tcc=%d cpsm=%x abe=%d mxl=%d mmin=%d "
+                     "lcm=%d l=%d k=%g mip1=%x/%d csa=%d blend=%d%d%d%d/%x ate=%d/%d/%x/%d date=%d/%d z=%d/%d/%x/%x zm=%d "
+                     "fge=%d fbmsk=%x iip=%d wms=%d/%d",
                      kind, e.fbp, e.fbw, e.fpsm, e.tme, e.fst, e.tbp, e.tbw, e.tpsm, e.tw, e.th, e.tfx, e.tcc, e.cpsm,
-                     e.abe);
+                     e.abe, e.mxl, e.mmin, e.lcm, e.l, e.k, e.mip_tbp[1], e.mip_tbw[1], e.csa, e.ba, e.bb, e.bc, e.bd,
+                     e.bfix, e.ate, e.atst, e.aref, e.afail, e.date, e.datm, e.zte, e.ztst, e.zbp, e.zpsm, e.zmsk,
+                     e.fge, e.fbmsk, e.iip, e.wms, e.wmt);
     for (int i = 0; i < n; i++)
         k += snprintf(buf + k, sizeof buf - k, " | %.1f,%.1f z%u c%02x%02x%02x%02x uv%d,%d st%.3f,%.3f,%.3f",
                       v[i].x / 16.0, v[i].y / 16.0, v[i].z, v[i].r, v[i].g, v[i].b, v[i].a, v[i].u, v[i].v, v[i].s,
@@ -295,6 +300,7 @@ uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
 // Per-row parts of the frame and depth buffer addresses.
 struct RowAddr {
     uint32_t fb, fbc, z, zc;
+    int y;
 };
 
 inline void row_addr(const Env &e, int y, RowAddr &ra) {
@@ -302,6 +308,7 @@ inline void row_addr(const Env &e, int y, RowAddr &ra) {
     ra.fbc = e.fbT->rowC[y & 2047];
     ra.z = e.zT->row_base(e.zbp, y);
     ra.zc = e.zT->rowC[y & 2047];
+    ra.y = y;
 }
 
 inline int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
@@ -321,8 +328,20 @@ struct Frag {
 };
 
 // One pixel inside the scissor rectangle.
+int g_dbg_x = -1, g_dbg_y = -1;  // EOD_DEBUG_PIXEL=x,y: log writes to that pixel in traced frames
+struct DbgPixelInit {
+    DbgPixelInit() {
+        if (const char *p = getenv("EOD_DEBUG_PIXEL")) sscanf(p, "%d,%d", &g_dbg_x, &g_dbg_y);
+    }
+} g_dbg_pixel_init;
+
 inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
     stats.pixels++;
+    if (g_trace && x == g_dbg_x && ra.y == g_dbg_y) {
+        uint32_t t = e.tme ? sample(e, f.u, f.v, f.lod > 0 ? e.bilinear_min : e.bilinear_mag, f.lod > 0 ? f.lod : 0) : 0;
+        log_write(LOG_GS, "PIXEL %d,%d: tex=%x/%d psm=%x %dx%d uv=%d,%d (%.2f,%.2f) lod=%d texel=%08x col=%02x%02x%02x%02x z=%u",
+                  x, ra.y, e.tbp, e.tbw, e.tpsm, e.tw, e.th, f.u, f.v, f.u / 16.0, f.v / 16.0, f.lod, t, f.r, f.g, f.b, f.a, f.z);
+    }
     // ---- depth test
     uint32_t za = 0;
     bool have_za = false;
@@ -497,7 +516,8 @@ inline void tex_coords(const Env &e, float s, float t, float q, Frag &f) {
     float iq = 1.0f / q;
     f.u = ffloor(s * iq * (float)(e.tw * 16));
     f.v = ffloor(t * iq * (float)(e.th * 16));
-    if (e.mmin >= 2 && e.mxl > 0) {
+    static bool nomip = getenv("EOD_DEBUG_NOMIP") != nullptr;
+    if (e.mmin >= 2 && e.mxl > 0 && !nomip) {
         float lod = e.lcm ? e.k : (log2f(1.0f / fabsf(q)) * (float)(1 << e.l) + e.k);
         int lvl = lod <= 0 ? 0 : (int)(lod + 0.5f);
         if (lvl > e.mxl) lvl = e.mxl;
@@ -587,8 +607,26 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     if (g_trace) {
         Vertex vv[3] = {a0, b0, c0};
         trace_prim("TRI", vv, 3);
+        static int dumped;
+        if (!dumped && e.tme && e.tpsm == PSMT4 && !e.abe && getenv("EOD_DUMP_TEX")) {
+            dumped = 1;
+            if (FILE *f = fopen(getenv("EOD_DUMP_TEX"), "wb")) {
+                fwrite(vram, 1, kVramSize, f);
+                fclose(f);
+            }
+            log_write(LOG_GS, "dumped VRAM at TRI tex=%x bw=%d %dx%d cbp0=%x cbp1=%x", e.tbp, e.tbw, e.tw, e.th, st.cbp0,
+                      st.cbp1);
+        }
     }
     if (e.write_none) return;
+    {
+        // EOD_DEBUG_SKIP bits: 1 blended, 2 T8, 4 T4, 8 HIGHLIGHT2, 16 alpha-tested
+        static int skip = getenv("EOD_DEBUG_SKIP") ? atoi(getenv("EOD_DEBUG_SKIP")) : 0;
+        if (skip && (((skip & 1) && e.abe) || ((skip & 2) && e.tme && e.tpsm == PSMT8) ||
+                     ((skip & 4) && e.tme && e.tpsm == PSMT4) || ((skip & 8) && e.tme && e.tfx == 3) ||
+                     ((skip & 16) && e.ate)))
+            return;
+    }
     const Vertex *v[3] = {&a0, &b0, &c0};
     int64_t cross = (int64_t)(v[1]->x - v[0]->x) * (v[2]->y - v[0]->y) - (int64_t)(v[2]->x - v[0]->x) * (v[1]->y - v[0]->y);
     if (cross == 0) return;

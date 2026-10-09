@@ -26,6 +26,7 @@ extern bool g_log_enabled[LOG_CAT_COUNT];
 
 void log_init(const char *spec);  // e.g. "kernel,sif,file" or "all"
 void log_set_file(const char *path);
+void log_frame(uint64_t frame);  // per vblank (EOD_LOG_FROM)
 void log_write(LogCat cat, const char *fmt, ...)
 #if defined(__GNUC__)
     __attribute__((format(printf, 2, 3)))

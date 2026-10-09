@@ -15,6 +15,16 @@ static const char *k_names[LOG_CAT_COUNT] = {
 
 static FILE *g_log_file;
 
+// EOD_LOG_FROM=<vblank>: the categories given with --log start at that vblank.
+static bool g_log_saved[LOG_CAT_COUNT];
+static long long g_log_from = -1;
+
+void log_frame(uint64_t frame) {
+    if (g_log_from < 0 || (long long)frame != g_log_from) return;
+    for (int i = 0; i < LOG_CAT_COUNT; i++) g_log_enabled[i] = g_log_saved[i];
+    g_log_from = -1;
+}
+
 void log_set_file(const char *path) {
     FILE *f = fopen(path, "w");
     if (f) g_log_file = f;
@@ -39,6 +49,13 @@ void log_init(const char *spec) {
         }
         for (int i = 0; i < LOG_CAT_COUNT; i++)
             if (!strcmp(tok, k_names[i])) g_log_enabled[i] = on;
+    }
+    if (const char *f = getenv("EOD_LOG_FROM")) {
+        g_log_from = atoll(f);
+        for (int i = 0; i < LOG_CAT_COUNT; i++) {
+            g_log_saved[i] = g_log_enabled[i];
+            if (i != LOG_CORE && i != LOG_GAME) g_log_enabled[i] = false;
+        }
     }
 }
 

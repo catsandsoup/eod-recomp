@@ -648,7 +648,8 @@ void gs_frame_end(uint64_t frame) {
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
-        gs::g_trace = (int)frame == trace_at;
+        gs::g_trace = trace_at >= 0 && (int)frame >= trace_at && (int)frame < trace_at + 4;
+        if (gs::g_trace) fprintf(stderr, "GS trace on at frame %d\n", (int)frame);
     }
     if (g_log_enabled[LOG_GS] && (frame % 60) == 0)
         LOG(LOG_GS, "frame %llu: %u prims, %u pixels, %u transfers", (unsigned long long)frame, stats.prims,
@@ -928,6 +929,7 @@ void gs_vblank() {
     g_csr ^= 0x2000;
     if (!(st.imr & 0x800)) intc_raise(INTC_GS);
     g_frames++;
+    log_frame(g_frames);
     if (g_threaded) {
         uint64_t f = g_frames;
         push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
@@ -963,6 +965,14 @@ void gs_vblank() {
         char path[1024];
         snprintf(path, sizeof path, "%s/frame_%05llu.ppm", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
         gs_screenshot(path);
+        if (getenv("EOD_DUMP_VRAM")) {  // raw 4MB VRAM next to the screenshot
+            gs_sync();
+            snprintf(path, sizeof path, "%s/vram_%05llu.bin", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
+            if (FILE *f = fopen(path, "wb")) {
+                fwrite(vram, 1, kVramSize, f);
+                fclose(f);
+            }
+        }
     }
     if (g_opt_frames && (int)g_frames >= g_opt_frames) {
         LOG(LOG_CORE, "reached %d frames - exiting", g_opt_frames);
