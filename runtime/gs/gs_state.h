@@ -70,7 +70,8 @@ struct Stats {
     uint32_t decoded, slow_samples, env_setups;
     uint32_t kind_px[64];  // triangle pixels per tri_spans variant
     uint32_t jobs, barriers[8];
-    uint64_t raster_ns;  // raster jobs queued, barriers by cause
+    uint64_t raster_ns;
+    uint32_t skipped;  // game frames skipped  // raster jobs queued, barriers by cause
 };
 extern Stats stats;
 

@@ -33,6 +33,8 @@ Stats stats;
 // Game frames: the display buffer starts being drawn after other buffers
 // were (a flip, or a copy of the finished frame into a fixed display buffer).
 std::atomic<uint64_t> g_flips{0};
+// frame skipping: vblanks issued by the EE and composed by the GS thread
+std::atomic<uint64_t> g_ee_vblanks{0}, g_gs_vblanks{0};
 
 namespace {
 std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
@@ -624,8 +626,10 @@ namespace {
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 
 bool g_threaded;
-uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 2;  // vblanks the GS may trail
-std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us;  // EOD_FPS statistics
+// vblanks the GS thread may trail the EE (beyond that the EE waits; with
+// frame skipping the GS normally catches up by dropping frames first)
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 6;
+std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
 // never destroyed: the worker may still be waiting on them when the process exits
 std::mutex &g_q_mtx = *new std::mutex;
 std::condition_variable &g_q_cv = *new std::condition_variable, &g_q_cv_done = *new std::condition_variable;
@@ -702,6 +706,7 @@ void gs_sync() {
     std::unique_lock<std::mutex> lk(g_q_mtx);
     g_q_cv_done.wait(lk, [] { return g_done == g_pushed; });
     g_ee_wait_us += platform_time_us() - t;
+    g_ee_sync_us += platform_time_us() - t;
 }
 
 static void gs_worker() {
@@ -731,6 +736,7 @@ static void gs_worker() {
                 break;
             }
             case CMD_VBLANK:
+                g_gs_vblanks = h[1];
                 gs_frame_end(h[1]);
                 frames = h[1];
                 break;
@@ -881,6 +887,8 @@ uint64_t gs_priv_read64(uint32_t p) {
     }
     if (off == 0x1010) return st.imr;
     if (off == 0x1080) {
+        static uint32_t n;
+        if ((++n & 255) == 1) LOG(LOG_GS, "SIGLBLID read #%u", n);
         gs_sync();
         return st.siglblid;
     }
@@ -969,6 +977,7 @@ void gs_vblank() {
     g_csr ^= 0x2000;
     if (!(st.imr & 0x800)) intc_raise(INTC_GS);
     g_frames++;
+    g_ee_vblanks = g_frames;
     log_frame(g_frames);
     if (g_threaded) {
         uint64_t f = g_frames;
@@ -995,9 +1004,10 @@ void gs_vblank() {
             if (!t0) t0 = now, f0 = g_flips, v0 = g_frames;
             if (now - t0 >= 5000000) {
                 double sec = (double)(now - t0) / 1e6;
-                fprintf(stderr, "fps: %.1f vblank/s, %.1f frames/s, GS busy %.0f%%, EE waiting %.0f%%\n",
+                fprintf(stderr, "fps: %.1f vblank/s, %.1f frames/s, GS busy %.0f%%, EE waiting %.0f%% (%.0f%% in syncs)\n",
                         (double)(g_frames - v0) / sec, (double)(g_flips - f0) / sec, g_gs_busy_us / (sec * 1e4),
-                        g_ee_wait_us / (sec * 1e4));
+                        g_ee_wait_us / (sec * 1e4), g_ee_sync_us / (sec * 1e4));
+                g_ee_sync_us = 0;
                 g_gs_busy_us = 0;
                 g_ee_wait_us = 0;
                 t0 = now;

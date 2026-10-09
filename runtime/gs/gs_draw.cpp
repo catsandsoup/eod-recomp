@@ -28,7 +28,8 @@
 namespace gs {
 
 bool g_trace;  // log every primitive of one frame (EOD_GS_TRACE=frame)
-extern std::atomic<uint64_t> g_flips;
+extern std::atomic<uint64_t> g_flips, g_ee_vblanks, g_gs_vblanks;
+bool g_skip_frame;  // frame skipping: primitives of the current game frame are dropped
 uint32_t g_reg_gen = 1;
 
 namespace {
@@ -286,9 +287,25 @@ void setup_env(uint32_t attr) {
         g_draw_dirty = false;
     }
     {
+        // Game frames end with drawing into the displayed buffer (a flip, or
+        // a copy of the finished image).  When the next frame starts and the
+        // GS thread trails the EE, the whole frame is skipped (EOD_FRAMESKIP=0
+        // disables; at most 3 frames in a row).
+        static bool presenting;
+        static int skipped;
+        static const bool enabled = !getenv("EOD_FRAMESKIP") || atoi(getenv("EOD_FRAMESKIP")) != 0;
         uint32_t fbp = bits(st.ctx[(attr >> 9) & 1].frame, 0, 9) * 32;
         uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
-        if (fbp != e.fbp && fbp == shown) g_flips++;
+        if (fbp != e.fbp && fbp == shown) {
+            if (!g_skip_frame) g_flips++;
+            presenting = true;
+        } else if (fbp != shown && presenting) {
+            presenting = false;
+            uint64_t lag = g_ee_vblanks.load() - g_gs_vblanks.load();
+            g_skip_frame = enabled && lag >= 2 && skipped < 3;
+            skipped = g_skip_frame ? skipped + 1 : 0;
+            if (g_skip_frame) stats.skipped++;
+        }
     }
     const Context &c = st.ctx[(attr >> 9) & 1];
     e.fbp = bits(c.frame, 0, 9) * 32;
@@ -1236,6 +1253,7 @@ bool add_view(uint32_t bp, uint32_t bw, uint32_t psm, const PageSet &pages) {
 
 // Queues a job for the current env (or runs it now without workers).
 void submit(Job &j) {
+    if (g_skip_frame) return;
     if (!g_nw || g_trace) {
         if (g_nw) barrier();
         j.env = &g_env;
@@ -1296,7 +1314,7 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         Vertex vv[2] = {a, b};
         trace_prim("SPRITE", vv, 2);
     }
-    if (e.write_none) return;
+    if (e.write_none || g_skip_frame) return;
     note_draw();
     Vertex v0 = a, v1 = b;
     if (v1.x < v0.x) {
@@ -1377,7 +1395,7 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
                       st.cbp1);
         }
     }
-    if (e.write_none) return;
+    if (e.write_none || g_skip_frame) return;
     note_draw();
     {
         // EOD_DEBUG_SKIP bits: 1 blended, 2 T8, 4 T4, 8 HIGHLIGHT2, 16 alpha-tested

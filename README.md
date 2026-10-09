@@ -125,7 +125,9 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
 * `EOD_FPS=1` prints vblanks/s (60 = full speed), game frames/s, how busy the GS
   thread is and how long the EE waits for it, every 5 s
 * `EOD_SKIP_MOVIES=1` skips the movies; `EOD_GS_THREAD=0` renders on the main thread;
-  `EOD_GS_RASTER=n` sets the number of raster worker threads (0 = none)
+  `EOD_GS_RASTER=n` sets the number of raster worker threads (0 = none);
+  `EOD_FRAMESKIP=0` disables frame skipping (when rendering falls behind,
+  whole game frames are dropped so the game keeps running at full speed)
 * `--log gs` prints per-second renderer statistics (pixels, texture decoding,
   raster jobs and barriers, pixels per triangle type)
 * `EOD_VU_DUMP=dir` writes the VU micro programs that run (input for
