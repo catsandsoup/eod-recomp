@@ -1,6 +1,9 @@
 // gs_mem.cpp - GS local memory layouts (block/column tables as documented
 // for the GS; identical to those used by other GS implementations).
 #include "gs_mem.h"
+#include "gs_swizzle.h"
+
+#include <cstring>
 
 #include <cstdlib>
 
@@ -236,6 +239,86 @@ void write_pixel(uint32_t psm, int x, int y, uint32_t bp, uint32_t bw, uint32_t 
     case PSMZ16S: half(addr16sz(x, y, bp, bw)) = (uint16_t)v; return;
     }
     word(addr32(x, y, bp, bw)) = v;
+}
+
+// ------------------------------------------------------------ swizzle tables
+namespace {
+
+uint16_t g_colT32[64], g_colT16[128], g_colT8[256], g_colT4[512];
+
+struct Layout {
+    int pw, ph;       // page size in pixels
+    int bw, bh;       // block size in pixels
+    int shift;        // block -> unit
+    int brows, bcols; // block table dimensions
+    const uint8_t *bt;
+    const uint16_t *colT;
+    bool half_stride;  // page stride is bw/2 (8 and 4 bit formats)
+};
+
+Layout layout_for(uint32_t psm) {
+    switch (psm) {
+    case PSMCT16: return {64, 64, 16, 8, 7, 8, 4, &blockTable16[0][0], g_colT16, false};
+    case PSMCT16S: return {64, 64, 16, 8, 7, 8, 4, &blockTable16S[0][0], g_colT16, false};
+    case PSMZ16: return {64, 64, 16, 8, 7, 8, 4, &blockTable16Z[0][0], g_colT16, false};
+    case PSMZ16S: return {64, 64, 16, 8, 7, 8, 4, &blockTable16SZ[0][0], g_colT16, false};
+    case PSMT8: return {128, 64, 16, 16, 8, 4, 8, &blockTable8[0][0], g_colT8, true};
+    case PSMT4: return {128, 128, 32, 16, 9, 8, 4, &blockTable4[0][0], g_colT4, true};
+    case PSMZ32: case PSMZ24: return {64, 32, 8, 8, 6, 4, 8, &blockTable32Z[0][0], g_colT32, false};
+    default: return {64, 32, 8, 8, 6, 4, 8, &blockTable32[0][0], g_colT32, false};
+    }
+}
+
+struct CacheEnt {
+    SwizzleTab *t = nullptr;
+    uint64_t used = 0;
+};
+CacheEnt g_cache[24];
+uint64_t g_tick;
+
+}  // namespace
+
+const SwizzleTab *swizzle_table(uint32_t psm, uint32_t bw) {
+    // formats sharing a layout share tables
+    uint32_t key = psm;
+    if (key == PSMCT24 || key == PSMT8H || key == PSMT4HL || key == PSMT4HH) key = PSMCT32;
+    if (key == PSMZ24) key = PSMZ32;
+    g_tick++;
+    CacheEnt *lru = &g_cache[0];
+    for (auto &c : g_cache) {
+        if (c.t && c.t->psm == key && c.t->bw == bw) {
+            c.used = g_tick;
+            return c.t;
+        }
+        if (c.used < lru->used) lru = &c;
+    }
+    if (!g_colT32[1]) {
+        for (int i = 0; i < 64; i++) g_colT32[i] = columnTable32[i / 8][i % 8];
+        for (int i = 0; i < 128; i++) g_colT16[i] = columnTable16[i / 16][i % 16];
+        for (int i = 0; i < 256; i++) g_colT8[i] = columnTable8[i / 16][i % 16];
+        for (int i = 0; i < 512; i++) g_colT4[i] = columnTable4[i / 32][i % 32];
+    }
+    if (!lru->t) lru->t = new SwizzleTab();
+    SwizzleTab &t = *lru->t;
+    lru->used = g_tick;
+    Layout L = layout_for(key);
+    t.psm = key;
+    t.bw = bw;
+    t.shift = L.shift;
+    t.colT = L.colT;
+    uint32_t stride = L.half_stride ? (bw >> 1) : bw;
+    int base0 = L.bt[0];
+    for (int y = 0; y < 2048; y++) {
+        int r = (y / L.bh) % L.brows;
+        t.rowB[y] = (int32_t)((uint32_t)(y / L.ph) * stride * 32) + (L.bt[r * L.bcols] - base0);
+        t.rowC[y] = (uint16_t)((y % L.bh) * L.bw);
+    }
+    for (int x = 0; x < 2048; x++) {
+        int c = (x / L.bw) % L.bcols;
+        t.colB[x] = (x / L.pw) * 32 + L.bt[c];
+        t.colC[x] = (uint16_t)(x % L.bw);
+    }
+    return &t;
 }
 
 }  // namespace gs

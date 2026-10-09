@@ -22,6 +22,7 @@ State st;
 Stats stats;
 
 namespace {
+uint64_t g_flips;  // draw buffer changes (roughly the game's frame count)
 
 // ------------------------------------------------------------ GIF parsing
 struct PathState {
@@ -199,7 +200,10 @@ void write_reg(uint32_t reg, uint64_t v) {
     case 0x49: st.pabe = v; break;
     case 0x4A: st.ctx[0].fba = v; break;
     case 0x4B: st.ctx[1].fba = v; break;
-    case 0x4C: st.ctx[0].frame = v; break;
+    case 0x4C:
+        if (bits(v, 0, 9) != bits(st.ctx[0].frame, 0, 9)) g_flips++;
+        st.ctx[0].frame = v;
+        break;
     case 0x4D: st.ctx[1].frame = v; break;
     case 0x4E: st.ctx[0].zbuf = v; break;
     case 0x4F: st.ctx[1].zbuf = v; break;
@@ -713,6 +717,23 @@ void gs_vblank() {
         LOG(LOG_GS, "frame %llu: %u prims, %u pixels, %u transfers", (unsigned long long)g_frames, stats.prims,
             stats.pixels, stats.transfers);
     stats = Stats();
+    {
+        // EOD_FPS=1: print the game's frame rate every 5 seconds
+        static bool show = getenv("EOD_FPS") != nullptr;
+        static uint64_t t0, f0, v0;
+        if (show) {
+            uint64_t now = platform_time_us();
+            if (!t0) t0 = now, f0 = g_flips, v0 = g_frames;
+            if (now - t0 >= 5000000) {
+                double sec = (double)(now - t0) / 1e6;
+                fprintf(stderr, "fps: %.1f vblank/s, %.1f buffer switches/s\n", (double)(g_frames - v0) / sec,
+                        (double)(g_flips - f0) / sec);
+                t0 = now;
+                f0 = g_flips;
+                v0 = g_frames;
+            }
+        }
+    }
     if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0) {
         char path[1024];
         snprintf(path, sizeof path, "%s/frame_%05llu.ppm", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);

@@ -55,10 +55,11 @@ annotated disassembler used for reverse engineering.
 | Game data | Read from the disc files on disk (`DATA/...`) |
 | Sound | **Not yet**: `sdrdrv`/`libsd` (SPU2) and the game's `stream.irx` are stubs |
 | FMV | **Not yet**: IPU/MPEG decoding is a stub (movies are skipped) |
-| Performance | Unoptimised software renderer; a hardware renderer is planned |
+| Performance | Software renderer is the bottleneck (~12-15 of 60 vblanks/s in the 3D garage); optimisation in progress |
 
 The game currently boots, passes the controller and memory card checks, and
-reaches the title screen and main menu.
+reaches the title screen, the main menu, the mode and car selection screens
+(with the 3D garage) and starts loading a race.
 
 ![Boot sequence](docs/img/boot_sequence.png)
 
@@ -116,6 +117,7 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
 ## Debugging aids
 
 * `EOD_GS_TRACE=<frame>` logs every primitive drawn in that frame
+* `EOD_FPS=1` prints vblanks/s (60 = full speed) and draw-buffer switches/s every 5 s
 * `cmake -DEOD_TRACE_CALLS=ON` records the last EE function calls, printed on crashes
 * `EOD_PAD_SCRIPT=frame:buttons,...` (POSIX build) scripts controller input
 * `python3 tools/dis.py -f <addr>` disassembles a function with string/symbol annotations
