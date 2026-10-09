@@ -14,6 +14,7 @@
 #include "vu.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
+extern uint32_t g_vu_micro_gen[2];  // vu.cpp
 
 namespace {
 
@@ -201,6 +202,7 @@ void process(Vif &v) {
         case 0x30: memcpy(v.row, d, 16); break;          // STROW
         case 0x31: memcpy(v.col, d, 16); break;          // STCOL
         case 0x4A: {                                      // MPG
+            g_vu_micro_gen[v.n]++;
             uint32_t n = numf ? numf : 256;
             uint32_t a = imm * 8;
             for (uint32_t k = 0; k < n * 2; k++) {

@@ -76,6 +76,19 @@ static uint8_t *direct(uint32_t a, uint32_t &phys, Region &r) {
     return nullptr;
 }
 
+extern uint32_t g_vu_micro_gen[2];  // vu.cpp
+
+// Writes into VU micro memory invalidate compiled micro programs.
+static uint8_t *direct_w(uint32_t a, uint32_t &phys, Region &r) {
+    uint8_t *d = direct(a, phys, r);
+    if (r == REG_VU) {
+        uint32_t off = phys - 0x11000000;
+        if (off < 0x1000) g_vu_micro_gen[0]++;
+        else if (off >= 0x8000 && off < 0xC000) g_vu_micro_gen[1]++;
+    }
+    return d;
+}
+
 static void bad_access(const char *what, uint32_t a) {
     static int count;
     if (count++ < 64)
@@ -156,7 +169,7 @@ void ee_read128_slow(uint32_t a, R128 *out) {
 void ee_write8_slow(uint32_t a, uint8_t v) {
     uint32_t p;
     Region r;
-    if (uint8_t *d = direct(a, p, r)) {
+    if (uint8_t *d = direct_w(a, p, r)) {
         *d = v;
         return;
     }
@@ -170,7 +183,7 @@ void ee_write8_slow(uint32_t a, uint8_t v) {
 void ee_write16_slow(uint32_t a, uint16_t v) {
     uint32_t p;
     Region r;
-    if (uint8_t *d = direct(a, p, r)) {
+    if (uint8_t *d = direct_w(a, p, r)) {
         memcpy(d, &v, 2);
         return;
     }
@@ -184,7 +197,7 @@ void ee_write16_slow(uint32_t a, uint16_t v) {
 void ee_write32_slow(uint32_t a, uint32_t v) {
     uint32_t p;
     Region r;
-    if (uint8_t *d = direct(a, p, r)) {
+    if (uint8_t *d = direct_w(a, p, r)) {
         memcpy(d, &v, 4);
         return;
     }
@@ -202,7 +215,7 @@ void ee_write32_slow(uint32_t a, uint32_t v) {
 void ee_write64_slow(uint32_t a, uint64_t v) {
     uint32_t p;
     Region r;
-    if (uint8_t *d = direct(a, p, r)) {
+    if (uint8_t *d = direct_w(a, p, r)) {
         memcpy(d, &v, 8);
         return;
     }
@@ -220,7 +233,7 @@ void ee_write64_slow(uint32_t a, uint64_t v) {
 void ee_write128_slow(uint32_t a, const R128 *v) {
     uint32_t p;
     Region r;
-    if (uint8_t *d = direct(a, p, r)) {
+    if (uint8_t *d = direct_w(a, p, r)) {
         memcpy(d, v, 16);
         return;
     }

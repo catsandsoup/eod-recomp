@@ -9,6 +9,10 @@
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <set>
+#include <utility>
+#include <cstdio>
+#include <cstdlib>
 
 #include "../core/log.h"
 #include "../gs/gs.h"
@@ -216,8 +220,8 @@ inline float apply_t(float acc, float a, float b) {
     return r;
 }
 
-template <ArOp OP, int SRC, bool ACC>
-void up_fmac(Ctx &c, uint32_t ins) {
+template <ArOp OP, int SRC, bool ACC, bool FLAGS = true>
+inline void up_fmac(Ctx &c, uint32_t ins) {
     VUState *vu = c.vu;
     const VUReg &s = vu->vf[FS(ins)];
     const VUReg &t = vu->vf[FT(ins)];
@@ -236,7 +240,7 @@ void up_fmac(Ctx &c, uint32_t ins) {
     c.up_val = r;
     c.up_dest = dest;
     c.up_acc = ACC;
-    if (OP != OP_MAX && OP != OP_MIN) {  // MAX/MINI don't touch flags
+    if (OP != OP_MAX && OP != OP_MIN && FLAGS) {  // MAX/MINI don't touch flags
         c.mac = mac_for(r, dest);
         c.mac_set = true;
     }
@@ -547,7 +551,10 @@ void lower_div(VUState *vu, uint32_t ins, int kind) {
     vu->status |= (vu->status & 0x30) << 6;
 }
 
+bool g_vu_mute_kick;  // EOD_VU_CHECK: the second run of a program sends nothing
+
 void xgkick(VUState *vu, uint32_t addr_qw) {
+    if (g_vu_mute_kick) return;
     // send a GIF packet (possibly several tags) from VU1 memory via PATH1
     uint32_t a = addr_qw & 0x3FF;
     // walk tags until EOP to find the length (wrapping at 16KB)
@@ -966,9 +973,50 @@ void decode_pair(DecPair &d, uint32_t lo, uint32_t hi) {
 
 }  // namespace
 
+// Bumped when micro memory is loaded (VIF MPG), for EOD_VU_DUMP.
+uint32_t g_vu_micro_gen[2];
+
+namespace {
+// EOD_VU_DUMP=dir: writes each distinct VU micro memory image that runs
+// (dir/vu<n>_<hash>.bin) and lists the entry points (dir/vu_entries.txt):
+// the input of tools/vurecomp.py.
+void vu_dump(VUState *vu, uint32_t pc) {
+    static const char *dir = getenv("EOD_VU_DUMP");
+    if (!dir) return;
+    static uint32_t seen_gen[2] = {~0u, ~0u};
+    static uint64_t cur_hash[2];
+    static std::set<std::pair<uint64_t, uint32_t>> entries;
+    int n = vu->index;
+    uint32_t size = vu->micro_mask + 1;
+    if (seen_gen[n] != g_vu_micro_gen[n]) {
+        seen_gen[n] = g_vu_micro_gen[n];
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < size; i++) h = (h ^ vu->micro[i]) * 1099511628211ull;
+        cur_hash[n] = h;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/vu%d_%016llx.bin", dir, n, (unsigned long long)h);
+        if (FILE *f = fopen(path, "rb")) {
+            fclose(f);
+        } else if ((f = fopen(path, "wb"))) {
+            fwrite(vu->micro, 1, size, f);
+            fclose(f);
+        }
+    }
+    if (entries.insert({cur_hash[n] ^ (uint64_t)n, pc}).second) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/vu_entries.txt", dir);
+        if (FILE *f = fopen(path, "a")) {
+            fprintf(f, "vu%d %016llx %04x\n", n, (unsigned long long)cur_hash[n], pc);
+            fclose(f);
+        }
+    }
+}
+}  // namespace
+
 // --------------------------------------------------------------- micro mode
-void vu_execute(VUState *vu, uint32_t start_pc) {
-    uint32_t pc = start_pc & vu->micro_mask & ~7u;
+// Interprets from `pc` until the program ends.
+static void vu_interp(VUState *vu, uint32_t pc) {
+    uint32_t start_pc = pc;
     Ctx c;
     c.vu = vu;
     bool in_delay = false;
@@ -1051,6 +1099,145 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     flush_p(vu);
     vu->tpc = pc;
     vu->running = 0;
+}
+
+// Micro programs compiled ahead of time by tools/vurecomp.py (gen/vu_rec.inc):
+// used when the code in micro memory matches what was compiled.
+namespace {
+struct VuRange {
+    uint16_t addr, n;  // byte address, words
+    const uint32_t *words;
+};
+struct VuProg {
+    int vu;
+    uint32_t pc;
+    void (*fn)(VUState *vu, uint32_t entry);
+    int nranges;
+    const VuRange *ranges;
+};
+}  // namespace
+
+// Scoreboard stall / write for compiled code (same as vu_interp's).
+#define VU_STALL(ulo, uhi)                                                                    \
+    do {                                                                                      \
+        for (uint64_t dd = 1; dd <= 3; dd++) {                                                \
+            uint64_t ic = vu->cycle - dd;                                                     \
+            int sl = (int)(ic & 3);                                                           \
+            if (sb.stamp[sl] == ic && ((sb.lo[sl] & (ulo)) | (sb.hi[sl] & (uhi)))) {          \
+                vu->cycle = ic + 4;                                                           \
+                break;                                                                        \
+            }                                                                                 \
+        }                                                                                     \
+    } while (0)
+#define VU_SCORE(wlo, whi)                         \
+    do {                                           \
+        int sl = (int)(vu->cycle & 3);             \
+        if (sb.stamp[sl] != vu->cycle) {           \
+            sb.stamp[sl] = vu->cycle;              \
+            sb.lo[sl] = sb.hi[sl] = 0;             \
+        }                                          \
+        sb.lo[sl] |= (wlo);                        \
+        sb.hi[sl] |= (whi);                        \
+    } while (0)
+
+#if __has_include("vu_rec.inc")
+#define VU_REC 1
+namespace {
+#include "vu_rec.inc"
+}  // namespace
+#else
+namespace {
+const VuProg g_vu_progs[1] = {{-1, 0, nullptr, 0, nullptr}};
+const int g_vu_nprogs = 0;
+}  // namespace
+#endif
+
+namespace {
+struct RecSlot {
+    uint32_t gen = ~0u;
+    const VuProg *prog = nullptr;
+};
+RecSlot g_rec_slot[2][0x4000 / 8];
+
+bool vu_rec_matches(const VUState *vu, const VuProg &p) {
+    for (int i = 0; i < p.nranges; i++) {
+        const VuRange &r = p.ranges[i];
+        if (memcmp(vu->micro + r.addr, r.words, (size_t)r.n * 4) != 0) return false;
+    }
+    return true;
+}
+
+const VuProg *vu_rec_find(VUState *vu, uint32_t pc) {
+    static bool off = getenv("EOD_VU_INTERP") != nullptr;
+    if (off || !g_vu_nprogs) return nullptr;
+    RecSlot &s = g_rec_slot[vu->index][pc >> 3];
+    if (s.gen == g_vu_micro_gen[vu->index]) return s.prog;
+    s.gen = g_vu_micro_gen[vu->index];
+    s.prog = nullptr;
+    for (int i = 0; i < g_vu_nprogs; i++) {
+        const VuProg &p = g_vu_progs[i];
+        if (p.vu == vu->index && p.pc == pc && vu_rec_matches(vu, p)) {
+            s.prog = &p;
+            break;
+        }
+    }
+    return s.prog;
+}
+}  // namespace
+
+void vu_execute(VUState *vu, uint32_t start_pc) {
+    uint32_t pc = start_pc & vu->micro_mask & ~7u;
+    vu_dump(vu, pc);
+    if (const VuProg *p = vu_rec_find(vu, pc)) {
+        static bool check = getenv("EOD_VU_CHECK") != nullptr;
+        if (!check) {
+            p->fn(vu, pc);
+            return;
+        }
+        // run the compiled program, then the interpreter from the same state, and compare
+        // (except MAC/status, which programs that never read them don't compute)
+        static VUState before;
+        static uint8_t mem_before[0x4000];
+        static Scoreboard sb_before;
+        uint32_t msize = vu->mem_mask + 1;
+        before = *vu;
+        memcpy(mem_before, vu->mem, msize);
+        sb_before = g_score[vu->index];
+        p->fn(vu, pc);
+        static VUState after;
+        static uint8_t mem_after[0x4000];
+        after = *vu;
+        memcpy(mem_after, vu->mem, msize);
+        Scoreboard sb_after = g_score[vu->index];
+        *vu = before;
+        memcpy(vu->mem, mem_before, msize);
+        g_score[vu->index] = sb_before;
+        g_vu_mute_kick = true;
+        vu_interp(vu, pc);
+        g_vu_mute_kick = false;
+        bool same = memcmp(vu->vf, after.vf, sizeof vu->vf) == 0 && memcmp(vu->vi, after.vi, sizeof vu->vi) == 0 &&
+                    memcmp(&vu->acc, &after.acc, sizeof vu->acc) == 0 && vu->q == after.q && vu->p == after.p &&
+                    vu->i == after.i && vu->clip == after.clip && vu->cycle == after.cycle && vu->tpc == after.tpc &&
+                    memcmp(vu->mem, mem_after, msize) == 0 &&
+                    memcmp(&g_score[vu->index], &sb_after, sizeof sb_after) == 0;
+        static int reports;
+        if (!same && reports++ < 20) {
+            WARN("VU%d program %04x: compiled code differs from the interpreter", vu->index, pc);
+            for (int r = 0; r < 32; r++)
+                if (memcmp(&vu->vf[r], &after.vf[r], 16))
+                    WARN("  vf%d interp %08x %08x %08x %08x compiled %08x %08x %08x %08x", r, vu->vf[r].u[0],
+                         vu->vf[r].u[1], vu->vf[r].u[2], vu->vf[r].u[3], after.vf[r].u[0], after.vf[r].u[1],
+                         after.vf[r].u[2], after.vf[r].u[3]);
+            for (int r = 0; r < 32; r++)
+                if (vu->vi[r] != after.vi[r]) WARN("  vi%d interp %x compiled %x", r, vu->vi[r], after.vi[r]);
+            WARN("  cycle %llu/%llu status %x/%x mac %x/%x clip %x/%x q %g/%g tpc %x/%x mem %s",
+                 (unsigned long long)vu->cycle, (unsigned long long)after.cycle, vu->status, after.status, vu->mac,
+                 after.mac, vu->clip, after.clip, vu->q, after.q, vu->tpc, after.tpc,
+                 memcmp(vu->mem, mem_after, msize) ? "differs" : "same");
+        }
+        return;
+    }
+    vu_interp(vu, pc);
 }
 
 // --------------------------------------------------------------- macro mode

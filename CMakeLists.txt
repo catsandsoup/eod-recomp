@@ -27,6 +27,11 @@ if(NOT EXISTS ${GEN_DIR}/table.c)
     message(FATAL_ERROR "code generation failed")
   endif()
 endif()
+# compiled VU micro programs (optional: the interpreter runs everything without them)
+if(Python3_FOUND AND NOT EXISTS ${GEN_DIR}/vu_rec.inc)
+  execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/vurecomp.py
+                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 file(GLOB GEN_SOURCES ${GEN_DIR}/rec_*.c)
 list(APPEND GEN_SOURCES ${GEN_DIR}/table.c)
 

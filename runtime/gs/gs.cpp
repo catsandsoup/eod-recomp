@@ -624,6 +624,7 @@ namespace {
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 
 bool g_threaded;
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 2;  // vblanks the GS may trail
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us;  // EOD_FPS statistics
 // never destroyed: the worker may still be waiting on them when the process exits
 std::mutex &g_q_mtx = *new std::mutex;
@@ -976,7 +977,7 @@ void gs_vblank() {
         // don't let the GS thread fall more than a couple of frames behind
         uint64_t t = platform_time_us();
         std::unique_lock<std::mutex> lk(g_q_mtx);
-        g_q_cv_done.wait(lk, [] { return g_frames_done + 2 >= g_frames; });
+        g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
         g_ee_wait_us += platform_time_us() - t;
     } else {
         gs_frame_end(g_frames);
