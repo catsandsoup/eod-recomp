@@ -132,6 +132,9 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
   raster jobs and barriers, pixels per triangle type)
 * `EOD_VU_DUMP=dir` writes the VU micro programs that run (input for
   `tools/vurecomp.py`, see `config/vu/`); `EOD_VU_INTERP=1` disables the compiled ones
+* `EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count]` captures the GS state and
+  command stream; `eod --gs-replay file [--repeat N]` replays it alone, prints the time and
+  writes the final image to `file.ppm` (deterministic renderer benchmarks)
 * `EOD_GS_NOTEXCACHE=1`, `EOD_DEBUG_NOMIP=1`, `EOD_DEBUG_PIXEL=x,y` (with
   `EOD_GS_TRACE`: logs every write to that pixel) help bisect rendering bugs
 * `EOD_WATCH=addr,...` logs float values at EE addresses when they change;

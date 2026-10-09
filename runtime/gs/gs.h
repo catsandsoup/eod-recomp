@@ -27,3 +27,5 @@ void gs_put_imr(uint32_t v);
 void gs_vblank();
 // Writes a debug screenshot of the current display to a PPM file.
 bool gs_screenshot(const char *path);
+// replays a GS capture (EOD_GS_DUMP) standalone; returns the exit code
+int gs_replay(const char *path, int repeat);

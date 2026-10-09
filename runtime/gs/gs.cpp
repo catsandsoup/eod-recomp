@@ -735,6 +735,130 @@ void gs_sync() {
     g_ee_sync_us += platform_time_us() - t;
 }
 
+// ------------------------------------------------------------ capture / replay
+// EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count] records the GS
+// state and VRAM after that vblank, then the commands of the next `count`
+// vblanks; `eod --gs-replay file` replays them alone (renderer benchmarks).
+namespace {
+FILE *g_dump;
+uint64_t g_dump_end;
+const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
+
+void dump_state(FILE *f) {
+    uint32_t sizes[3] = {(uint32_t)sizeof st, (uint32_t)sizeof g_path, (uint32_t)sizeof g_xfer};
+    fwrite(kDumpMagic, 1, 8, f);
+    fwrite(sizes, 4, 3, f);
+    fwrite(&st, sizeof st, 1, f);
+    fwrite(g_path, sizeof g_path, 1, f);
+    fwrite(&g_xfer, sizeof g_xfer, 1, f);
+    fwrite(vram, 1, kVramSize, f);
+}
+
+bool load_state(FILE *f) {
+    char magic[8];
+    uint32_t sizes[3];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, kDumpMagic, 8) || fread(sizes, 4, 3, f) != 3 ||
+        sizes[0] != sizeof st || sizes[1] != sizeof g_path || sizes[2] != sizeof g_xfer)
+        return false;
+    bool ok = fread(&st, sizeof st, 1, f) == 1 && fread(g_path, sizeof g_path, 1, f) == 1 &&
+              fread(&g_xfer, sizeof g_xfer, 1, f) == 1 && fread(vram, 1, kVramSize, f) == kVramSize;
+    if (g_xfer.active) g_xfer.T = swizzle_table(g_xfer.dpsm, g_xfer.dbw);
+    g_xfer.ry = -1;
+    return ok;
+}
+}  // namespace
+
+// Runs queued GS commands; returns the last vblank seen.
+uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
+    uint64_t frames = 0;
+    for (size_t p = 0; p < size;) {
+        uint32_t h[4];
+        memcpy(h, &c[p], 16);
+        const uint8_t *d = &c[p + 16];
+        size_t len = 16 + ((h[3] + 15) & ~15u);
+        if (live && g_dump) fwrite(&c[p], 1, len, g_dump);
+        switch (h[0]) {
+        case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
+        case CMD_PRIV: {
+            uint64_t v;
+            memcpy(&v, d, 8);
+            priv_apply(h[1], v);
+            break;
+        }
+        case CMD_VBLANK:
+            g_gs_vblanks = h[1];
+            gs_frame_end(h[1]);
+            frames = h[1];
+            if (live) {
+                static const char *dump = getenv("EOD_GS_DUMP");
+                static uint64_t at = getenv("EOD_GS_DUMP_AT") ? strtoull(getenv("EOD_GS_DUMP_AT"), nullptr, 10) : 0;
+                if (g_dump && h[1] >= g_dump_end) {
+                    fclose(g_dump);
+                    g_dump = nullptr;
+                    fprintf(stderr, "GS dump written\n");
+                } else if (dump && at && h[1] == at && !g_dump) {
+                    raster_sync();
+                    g_dump = fopen(dump, "wb");
+                    if (g_dump) dump_state(g_dump);
+                    g_dump_end = at + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
+                }
+            }
+            break;
+        case CMD_PATH_RESET:
+            for (auto &ps : g_path) ps = PathState();
+            break;
+        }
+        p += len;
+    }
+    return frames;
+}
+
+// eod --gs-replay FILE [--repeat N]: replays a capture, prints the time
+// and writes the last frame to FILE.ppm.
+int gs_replay(const char *path, int repeat) {
+    mem_init();
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "can't open %s\n", path);
+        return 1;
+    }
+    long start = 0;
+    {
+        std::vector<uint8_t> tmp;
+        if (!load_state(f)) {
+            fprintf(stderr, "%s is not a GS capture from this build\n", path);
+            return 1;
+        }
+        start = ftell(f);
+    }
+    fseek(f, 0, SEEK_END);
+    long end = ftell(f);
+    std::vector<uint8_t> cmds((size_t)(end - start));
+    fseek(f, start, SEEK_SET);
+    if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
+    int hw = (int)std::thread::hardware_concurrency();
+    int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
+    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
+    raster_start(n);
+    double best = 1e30;
+    for (int r = 0; r < repeat; r++) {
+        fseek(f, 0, SEEK_SET);
+        load_state(f);
+        raster_reset();
+        uint64_t t0 = platform_time_us();
+        run_cmds(cmds.data(), cmds.size(), false);
+        raster_sync();
+        double ms = (platform_time_us() - t0) / 1000.0;
+        best = std::min(best, ms);
+        fprintf(stderr, "replay %d: %.1f ms\n", r + 1, ms);
+    }
+    fclose(f);
+    fprintf(stderr, "best %.1f ms, %d raster workers\n", best, n);
+    std::string shot = std::string(path) + ".ppm";
+    gs_screenshot(shot.c_str());
+    return 0;
+}
+
 static void gs_worker() {
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-gs");
@@ -747,31 +871,8 @@ static void gs_worker() {
             c = std::move(g_q.front());
             g_q.pop_front();
         }
-        uint64_t frames = 0;
         uint64_t t_start = platform_time_us();
-        for (size_t p = 0; p < c.size();) {
-            uint32_t h[4];
-            memcpy(h, &c[p], 16);
-            const uint8_t *d = &c[p + 16];
-            switch (h[0]) {
-            case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
-            case CMD_PRIV: {
-                uint64_t v;
-                memcpy(&v, d, 8);
-                priv_apply(h[1], v);
-                break;
-            }
-            case CMD_VBLANK:
-                g_gs_vblanks = h[1];
-                gs_frame_end(h[1]);
-                frames = h[1];
-                break;
-            case CMD_PATH_RESET:
-                for (auto &ps : g_path) ps = PathState();
-                break;
-            }
-            p += 16 + ((h[3] + 15) & ~15u);
-        }
+        uint64_t frames = run_cmds(c.data(), c.size(), true);
         g_gs_busy_us += platform_time_us() - t_start;
         {
             std::lock_guard<std::mutex> lk(g_q_mtx);

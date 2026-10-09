@@ -30,6 +30,7 @@ namespace gs {
 bool g_trace;  // log every primitive of one frame (EOD_GS_TRACE=frame)
 extern std::atomic<uint64_t> g_flips, g_ee_vblanks, g_gs_vblanks;
 bool g_skip_frame;  // frame skipping: primitives of the current game frame are dropped
+bool g_replaying;   // GS replay: never skip
 uint32_t g_reg_gen = 1;
 
 namespace {
@@ -302,7 +303,7 @@ void setup_env(uint32_t attr) {
         } else if (fbp != shown && presenting) {
             presenting = false;
             uint64_t lag = g_ee_vblanks.load() - g_gs_vblanks.load();
-            g_skip_frame = enabled && lag >= 2 && skipped < 3;
+            g_skip_frame = enabled && !g_replaying && lag >= 2 && lag < (1u << 30) && skipped < 3;
             skipped = g_skip_frame ? skipped + 1 : 0;
             if (g_skip_frame) stats.skipped++;
         }
@@ -1655,6 +1656,16 @@ void raster_start(int n) {
 }
 
 void raster_sync() { barrier(); }
+
+void raster_reset() {
+    barrier();
+    g_replaying = true;
+    g_env_attr = ~0u;
+    g_draw_dirty = false;
+    g_skip_frame = false;
+    uint32_t c = ++g_vram_clock;
+    for (auto &g : g_page_gen) g = c;
+}
 
 void raster_mark_pages() {
     if (g_draw_dirty) {
