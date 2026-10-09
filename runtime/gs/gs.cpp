@@ -73,6 +73,7 @@ void xfer_start() {
     int sx = (int)bits(st.trxpos, 0, 11), sy = (int)bits(st.trxpos, 16, 11);
     int dx = (int)bits(st.trxpos, 32, 11), dy = (int)bits(st.trxpos, 48, 11);
     stats.transfers++;
+    if (dir == 0 || dir == 2) vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
     if (dir == 0) {
         g_xfer.active = true;
         g_xfer.dbp = dbp;
@@ -614,6 +615,7 @@ namespace {
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 
 bool g_threaded;
+std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us;  // EOD_FPS statistics
 std::mutex g_q_mtx;
 std::condition_variable g_q_cv, g_q_cv_done;
 std::deque<std::vector<uint8_t>> g_q;
@@ -651,10 +653,12 @@ void gs_frame_end(uint64_t frame) {
         gs::g_trace = trace_at >= 0 && (int)frame >= trace_at && (int)frame < trace_at + 4;
         if (gs::g_trace) fprintf(stderr, "GS trace on at frame %d\n", (int)frame);
     }
-    if (g_log_enabled[LOG_GS] && (frame % 60) == 0)
-        LOG(LOG_GS, "frame %llu: %u prims, %u pixels, %u transfers", (unsigned long long)frame, stats.prims,
-            stats.pixels, stats.transfers);
-    stats = Stats();
+    if ((frame % 60) == 0) {
+        LOG(LOG_GS, "frames to %llu: %u prims, %u pixels, %u transfers, %u texels decoded, %u uncached samples, %u env setups per vblank",
+            (unsigned long long)frame, stats.prims / 60, stats.pixels / 60, stats.transfers / 60, stats.decoded / 60,
+            stats.slow_samples / 60, stats.env_setups / 60);
+        stats = Stats();
+    }
 }
 
 void gs_flush() {
@@ -672,8 +676,10 @@ void gs_flush() {
 void gs_sync() {
     if (!g_threaded) return;
     gs_flush();
+    uint64_t t = platform_time_us();
     std::unique_lock<std::mutex> lk(g_q_mtx);
     g_q_cv_done.wait(lk, [] { return g_done == g_pushed; });
+    g_ee_wait_us += platform_time_us() - t;
 }
 
 static void gs_worker() {
@@ -686,6 +692,7 @@ static void gs_worker() {
             g_q.pop_front();
         }
         uint64_t frames = 0;
+        uint64_t t_start = platform_time_us();
         for (size_t p = 0; p < c.size();) {
             uint32_t h[4];
             memcpy(h, &c[p], 16);
@@ -708,6 +715,7 @@ static void gs_worker() {
             }
             p += 16 + ((h[3] + 15) & ~15u);
         }
+        g_gs_busy_us += platform_time_us() - t_start;
         {
             std::lock_guard<std::mutex> lk(g_q_mtx);
             g_done++;
@@ -935,8 +943,10 @@ void gs_vblank() {
         push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
         gs_flush();
         // don't let the GS thread fall more than a couple of frames behind
+        uint64_t t = platform_time_us();
         std::unique_lock<std::mutex> lk(g_q_mtx);
         g_q_cv_done.wait(lk, [] { return g_frames_done + 2 >= g_frames; });
+        g_ee_wait_us += platform_time_us() - t;
     } else {
         gs_frame_end(g_frames);
     }
@@ -953,8 +963,11 @@ void gs_vblank() {
             if (!t0) t0 = now, f0 = g_flips, v0 = g_frames;
             if (now - t0 >= 5000000) {
                 double sec = (double)(now - t0) / 1e6;
-                fprintf(stderr, "fps: %.1f vblank/s, %.1f buffer switches/s\n", (double)(g_frames - v0) / sec,
-                        (double)(g_flips - f0) / sec);
+                fprintf(stderr, "fps: %.1f vblank/s, %.1f buffer switches/s, GS busy %.0f%%, EE waiting %.0f%%\n",
+                        (double)(g_frames - v0) / sec, (double)(g_flips - f0) / sec, g_gs_busy_us / (sec * 1e4),
+                        g_ee_wait_us / (sec * 1e4));
+                g_gs_busy_us = 0;
+                g_ee_wait_us = 0;
                 t0 = now;
                 f0 = g_flips;
                 v0 = g_frames;

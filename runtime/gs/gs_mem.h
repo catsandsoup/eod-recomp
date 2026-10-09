@@ -25,6 +25,16 @@ enum PSM : uint32_t {
 
 void mem_init();
 
+// Write tracking per 8KB page, so decoded textures know when they are stale:
+// g_page_gen[p] is the g_vram_clock value of the last write to page p.
+constexpr uint32_t kPages = kVramSize / 8192;
+extern uint32_t g_page_gen[kPages];
+extern uint32_t g_vram_clock;
+// Pages (first, count; wrapping at kPages) holding rectangle x,y,w,h of a
+// buffer.  Conservative: may include a page or so too many.
+void page_range(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, uint32_t &first, uint32_t &count);
+void vram_mark(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
+
 // Address of pixel (x,y) in the unit natural for the format:
 // 32-bit formats -> word index, 16-bit -> halfword index, 8-bit -> byte
 // index, 4-bit -> nibble index.  bp = block pointer, bw = width / 64.

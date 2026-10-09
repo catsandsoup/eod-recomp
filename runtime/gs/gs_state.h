@@ -59,6 +59,7 @@ void clut_load(uint64_t tex0);
 // statistics for the current frame
 struct Stats {
     uint32_t prims, pixels, transfers;
+    uint32_t decoded, slow_samples, env_setups;
 };
 extern Stats stats;
 

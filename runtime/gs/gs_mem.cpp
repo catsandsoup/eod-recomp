@@ -135,6 +135,35 @@ const uint16_t columnTable4[16][32] = {
 
 void mem_init() { vram = static_cast<uint8_t *>(calloc(kVramSize, 1)); }
 
+uint32_t g_page_gen[kPages];
+uint32_t g_vram_clock = 1;
+
+void page_range(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, uint32_t &first, uint32_t &count) {
+    int pw = 64, ph = 32;
+    uint32_t ppr = bw ? bw : 1;
+    switch (bits_per_pixel(psm)) {
+    case 16: ph = 64; break;
+    case 8: pw = 128; ph = 64; ppr = (bw + 1) / 2; break;
+    case 4: pw = 128; ph = 128; ppr = (bw + 1) / 2; break;
+    default: break;
+    }
+    if (!ppr) ppr = 1;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    uint32_t p0 = (bp >> 5) + (uint32_t)(y / ph) * ppr + (uint32_t)(x / pw);
+    uint32_t p1 = (bp >> 5) + (uint32_t)((y + h - 1) / ph) * ppr + (uint32_t)((x + w - 1) / pw) + ((bp & 31) ? 1 : 0);
+    first = p0 % kPages;
+    count = p1 - p0 + 1;
+    if (count > kPages) count = kPages;
+}
+
+void vram_mark(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    uint32_t first, count;
+    page_range(bp, bw, psm, x, y, w, h, first, count);
+    uint32_t c = ++g_vram_clock;
+    for (uint32_t i = 0; i < count; i++) g_page_gen[(first + i) % kPages] = c;
+}
+
 uint32_t addr32(int x, int y, uint32_t bp, uint32_t bw) {
     uint32_t page = (bp >> 5) + (y >> 5) * bw + (x >> 6);
     uint32_t block = (bp & 31) + blockTable32[(y >> 3) & 3][(x >> 3) & 7];

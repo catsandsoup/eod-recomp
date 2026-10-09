@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <vector>
 
 #include "../core/log.h"
 #include "gs_mem.h"
@@ -20,6 +22,8 @@ bool g_trace;  // log every primitive of one frame (EOD_GS_TRACE=frame)
 uint32_t g_reg_gen = 1;
 
 namespace {
+
+struct TexEntry;
 
 struct Env {
     // frame buffer
@@ -56,9 +60,15 @@ struct Env {
     bool write_none;  // e.g. FBMSK all set and ZMSK
     bool need_dst;    // the destination colour is read
     bool need_z;      // depth is tested or written
+    uint32_t zmax;    // largest depth value of the format
+    int pix_kind;     // shade_px_t variant: tme | depth test << 1 | depth write << 2
     // address tables
     const SwizzleTab *fbT, *zT, *texT[7];
     uint32_t pal[256];  // CLUT expanded to RGBA for the current texture
+    uint32_t fpsm_mem;  // frame buffer format as stored (may be a depth format)
+    // decoded texture levels (linear RGBA) when tcached
+    bool tcached;
+    TexEntry *tl[7];
 };
 
 Env g_env;
@@ -88,12 +98,137 @@ uint32_t g_env_attr = ~0u, g_env_gen;
 
 uint32_t clut_lookup(uint32_t idx, const Env &e, bool four_bit);
 
+// ------------------------------------------------------------ texture cache
+// Textures are decoded to linear RGBA once and reused until a page they
+// live in is written (transfer or rendering) or the CLUT/TEXA change.
+bool g_draw_dirty;  // primitives were drawn with the current env since its pages were marked
+
+void mark_env_written(const Env &e) {
+    int h = e.scy1 + 1;
+    vram_mark(e.fbp, e.fbw, e.fpsm_mem, 0, 0, (int)e.fbw * 64, h);
+    if (!e.zmsk && e.ztst != 0) vram_mark(e.zbp, e.fbw, e.zpsm, 0, 0, (int)e.fbw * 64, h);
+}
+
+inline void note_draw() { g_draw_dirty = true; }
+
+struct TexKey {
+    uint32_t tbp, tbw, psm, w, h, pal_hash, texa;
+    bool operator==(const TexKey &o) const {
+        return tbp == o.tbp && tbw == o.tbw && psm == o.psm && w == o.w && h == o.h && pal_hash == o.pal_hash &&
+               texa == o.texa;
+    }
+};
+struct TexKeyHash {
+    size_t operator()(const TexKey &k) const {
+        uint64_t h = k.tbp * 0x9E3779B97F4A7C15ull;
+        h ^= (k.tbw | (k.psm << 8) | (k.w << 16) | ((uint64_t)k.h << 32)) * 0xC2B2AE3D27D4EB4Full;
+        h ^= ((uint64_t)k.pal_hash << 32 | k.texa) * 0x165667B19E3779F9ull;
+        return (size_t)(h ^ (h >> 29));
+    }
+};
+// A texture level decoded on demand in 8x8 texel tiles.
+struct TexEntry {
+    std::vector<uint32_t> data;
+    std::vector<uint8_t> valid;  // per tile
+    int w, h, tiles_w, lvl;
+    uint32_t stamp;  // g_vram_clock when the tiles were last invalidated
+};
+// never destroyed: the GS thread may still be drawing while the process exits
+std::unordered_map<TexKey, TexEntry, TexKeyHash> &g_tex_cache = *new std::unordered_map<TexKey, TexEntry, TexKeyHash>;
+size_t g_tex_cache_bytes;
+
+uint32_t fetch(const Env &e, int u, int v, int lvl);
+
+bool pages_overlap(uint32_t f0, uint32_t c0, uint32_t f1, uint32_t c1) {
+    for (uint32_t i = 0; i < c0; i++) {
+        uint32_t p = (f0 + i) % kPages;
+        if (((p - f1) % kPages) < c1) return true;
+    }
+    return false;
+}
+
+// Decoded level `lvl` of the current texture, or null when it can't be cached.
+TexEntry *tex_lookup(const Env &e, int lvl) {
+    int w = (int)e.tw >> lvl;
+    int h = (int)e.th >> lvl;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w * h > 512 * 512) return nullptr;
+    uint32_t first, count;
+    page_range(e.mip_tbp[lvl], e.mip_tbw[lvl], e.tpsm, 0, 0, w, h, first, count);
+    // a texture inside the buffers being drawn changes under our feet
+    uint32_t ff, fc;
+    page_range(e.fbp, e.fbw, e.fpsm_mem, 0, 0, (int)e.fbw * 64, e.scy1 + 1, ff, fc);
+    if (pages_overlap(first, count, ff, fc)) return nullptr;
+    if (!e.zmsk) {
+        page_range(e.zbp, e.fbw, e.zpsm, 0, 0, (int)e.fbw * 64, e.scy1 + 1, ff, fc);
+        if (pages_overlap(first, count, ff, fc)) return nullptr;
+    }
+    TexKey k = {e.mip_tbp[lvl], e.mip_tbw[lvl], e.tpsm, (uint32_t)w, (uint32_t)h, 0, 0};
+    bool four = e.tpsm == PSMT4 || e.tpsm == PSMT4HL || e.tpsm == PSMT4HH;
+    bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
+    if (four || eight) {
+        uint32_t hsh = 2166136261u;
+        for (int i = 0, n = four ? 16 : 256; i < n; i++) hsh = (hsh ^ e.pal[i]) * 16777619u;
+        k.pal_hash = hsh;
+    } else if (e.tpsm != PSMCT32 && e.tpsm != PSMZ32) {
+        k.texa = e.ta0 | (e.ta1 << 8) | ((uint32_t)e.aem << 16);
+    }
+    auto it = g_tex_cache.find(k);
+    if (it != g_tex_cache.end()) {
+        TexEntry &t = it->second;
+        bool ok = true;
+        for (uint32_t i = 0; i < count && ok; i++)
+            if (g_page_gen[(first + i) % kPages] >= t.stamp) ok = false;
+        if (!ok) {
+            std::fill(t.valid.begin(), t.valid.end(), 0);
+            t.stamp = ++g_vram_clock;
+        }
+        return &t;
+    }
+    if (g_tex_cache_bytes > (96u << 20)) {
+        g_tex_cache.clear();
+        g_tex_cache_bytes = 0;
+    }
+    TexEntry &t = g_tex_cache.emplace(k, TexEntry()).first->second;
+    g_tex_cache_bytes += (size_t)w * h * 4;
+    t.w = w;
+    t.h = h;
+    t.lvl = lvl;
+    t.tiles_w = (w + 7) >> 3;
+    t.data.resize((size_t)w * h);
+    t.valid.assign((size_t)t.tiles_w * ((h + 7) >> 3), 0);
+    t.stamp = ++g_vram_clock;
+    return &t;
+}
+
+__attribute__((noinline)) void decode_tile(const Env &e, TexEntry &t, int tx, int ty) {
+    t.valid[ty * t.tiles_w + tx] = 1;
+    int x0 = tx * 8, y0 = ty * 8;
+    int x1 = std::min(x0 + 8, t.w), y1 = std::min(y0 + 8, t.h);
+    stats.decoded += (uint32_t)((x1 - x0) * (y1 - y0));
+    for (int y = y0; y < y1; y++) {
+        uint32_t *d = &t.data[(size_t)y * t.w];
+        for (int x = x0; x < x1; x++) d[x] = fetch(e, x, y, t.lvl);
+    }
+}
+
+inline uint32_t texel(const Env &e, TexEntry &t, int x, int y) {
+    if (!t.valid[(y >> 3) * t.tiles_w + (x >> 3)]) decode_tile(e, t, x >> 3, y >> 3);
+    return t.data[(size_t)y * t.w + x];
+}
+
 void setup_env(uint32_t attr) {
     attr &= ~7u;  // the primitive type doesn't matter here
     if (attr == g_env_attr && g_reg_gen == g_env_gen) return;
     g_env_attr = attr;
     g_env_gen = g_reg_gen;
+    stats.env_setups++;
     Env &e = g_env;
+    if (g_draw_dirty) {
+        mark_env_written(e);
+        g_draw_dirty = false;
+    }
     const Context &c = st.ctx[(attr >> 9) & 1];
     e.fbp = bits(c.frame, 0, 9) * 32;
     e.fbw = bits(c.frame, 16, 6);
@@ -177,11 +312,14 @@ void setup_env(uint32_t attr) {
     // A depth format used as the frame buffer keeps its own memory layout
     // but stores colours like the matching colour format.
     e.fbT = swizzle_table(e.fpsm, e.fbw);
+    e.fpsm_mem = e.fpsm;
     if ((e.fpsm & 0x30) == 0x30) e.fpsm &= ~0x30u;
     e.fb16 = e.fpsm == PSMCT16 || e.fpsm == PSMCT16S;
     e.z16 = e.zpsm == PSMZ16 || e.zpsm == PSMZ16S;
     uint32_t full = e.fpsm == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
-    e.write_none = (e.fbmsk & full) == full && e.zmsk;
+    e.write_none = ((e.fbmsk & full) == full && e.zmsk) || e.ztst == 0;
+    e.zmax = e.z16 ? 0xFFFFu : e.zpsm == PSMZ24 ? 0xFFFFFFu : 0xFFFFFFFFu;
+    e.pix_kind = (e.tme ? 1 : 0) | (e.ztst >= 2 ? 2 : 0) | (!e.zmsk && e.ztst != 0 ? 4 : 0);
     e.need_dst = e.date || (e.abe && (e.ba == 1 || e.bb == 1 || e.bd == 1 || e.bc == 1)) || e.fbmsk;
     e.need_z = e.ztst != 1 || !e.zmsk;
     e.zT = swizzle_table(e.zpsm, e.fbw);
@@ -192,6 +330,14 @@ void setup_env(uint32_t attr) {
         bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
         if (four || eight)
             for (uint32_t i = 0, n = four ? 16 : 256; i < n; i++) e.pal[i] = clut_lookup(i, e, four);
+        static bool nocache = getenv("EOD_GS_NOTEXCACHE") != nullptr;
+        e.tcached = !nocache;
+        for (int i = 0; i <= levels && i < 7 && e.tcached; i++) {
+            e.tl[i] = tex_lookup(e, i);
+            if (!e.tl[i]) e.tcached = false;
+        }
+    } else {
+        e.tcached = false;
     }
 }
 
@@ -266,8 +412,43 @@ inline int wrap(int c, int size, int mode, int mn, int mx) {
     }
 }
 
+inline uint32_t bilerp(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fu, int fv) {
+    const uint32_t M = 0x00FF00FFu;
+    uint32_t gu = 16 - (uint32_t)fu, gv = 16 - (uint32_t)fv;
+    uint32_t rb_t = (c00 & M) * gu + (c10 & M) * (uint32_t)fu;
+    uint32_t rb_b = (c01 & M) * gu + (c11 & M) * (uint32_t)fu;
+    uint32_t ag_t = ((c00 >> 8) & M) * gu + ((c10 >> 8) & M) * (uint32_t)fu;
+    uint32_t ag_b = ((c01 >> 8) & M) * gu + ((c11 >> 8) & M) * (uint32_t)fu;
+    uint32_t rb = ((rb_t * gv + rb_b * (uint32_t)fv) >> 8) & M;
+    uint32_t ag = (ag_t * gv + ag_b * (uint32_t)fv) & ~M;
+    return rb | ag;
+}
+
+// Sampling from a decoded texture level.
+inline uint32_t sample_cached(const Env &e, int u, int v, bool bilinear, int lvl) {
+    TexEntry &T = *e.tl[lvl];
+    int tw = T.w, th = T.h;
+    if (lvl) {
+        u >>= lvl;
+        v >>= lvl;
+    }
+    if (!bilinear) {
+        int x = wrap(u >> 4, tw, e.wms, e.minu, e.maxu);
+        int y = wrap(v >> 4, th, e.wmt, e.minv, e.maxv);
+        return texel(e, T, x, y);
+    }
+    u -= 8;
+    v -= 8;
+    int x0 = u >> 4, y0 = v >> 4;
+    int xa = wrap(x0, tw, e.wms, e.minu, e.maxu), xb = wrap(x0 + 1, tw, e.wms, e.minu, e.maxu);
+    int ya = wrap(y0, th, e.wmt, e.minv, e.maxv), yb = wrap(y0 + 1, th, e.wmt, e.minv, e.maxv);
+    return bilerp(texel(e, T, xa, ya), texel(e, T, xb, ya), texel(e, T, xa, yb), texel(e, T, xb, yb), u & 15, v & 15);
+}
+
 // u, v in 1/16 texel units at mip level `lvl`.
 uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
+    if (e.tcached) return sample_cached(e, u, v, bilinear, lvl);
+    stats.slow_samples++;
     int tw = (int)e.tw >> lvl, th = (int)e.th >> lvl;
     if (tw < 1) tw = 1;
     if (th < 1) th = 1;
@@ -288,15 +469,7 @@ uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
     int ya = wrap(y0, th, e.wmt, e.minv, e.maxv), yb = wrap(y0 + 1, th, e.wmt, e.minv, e.maxv);
     uint32_t c00 = fetch(e, xa, ya, lvl), c10 = fetch(e, xb, ya, lvl);
     uint32_t c01 = fetch(e, xa, yb, lvl), c11 = fetch(e, xb, yb, lvl);
-    uint32_t out = 0;
-    for (int sh = 0; sh < 32; sh += 8) {
-        int a = (c00 >> sh) & 255, b = (c10 >> sh) & 255, c = (c01 >> sh) & 255, d = (c11 >> sh) & 255;
-        int top = a * (16 - fu) + b * fu;
-        int bot = c * (16 - fu) + d * fu;
-        int val = (top * (16 - fv) + bot * fv) >> 8;
-        out |= (uint32_t)val << sh;
-    }
-    return out;
+    return bilerp(c00, c10, c01, c11, fu, fv);
 }
 
 // ---------------------------------------------------------- frame buffer
@@ -338,7 +511,9 @@ struct DbgPixelInit {
     }
 } g_dbg_pixel_init;
 
-inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
+// TEX: texture mapping, ZT: depth compare (GEQUAL/GREATER), ZW: depth write.
+template <bool TEX, bool ZT, bool ZW>
+__attribute__((always_inline)) inline void shade_px_t(const Env &e, int x, const RowAddr &ra, const Frag &f) {
     stats.pixels++;
     if (g_trace && x == g_dbg_x && ra.y == g_dbg_y) {
         uint32_t t = e.tme ? sample(e, f.u, f.v, f.lod > 0 ? e.bilinear_min : e.bilinear_mag, f.lod > 0 ? f.lod : 0) : 0;
@@ -346,21 +521,18 @@ inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
                   x, ra.y, e.tbp, e.tbw, e.tpsm, e.tw, e.th, f.u, f.v, f.u / 16.0, f.v / 16.0, f.lod, t, f.r, f.g, f.b, f.a, f.z);
     }
     // ---- depth test
-    uint32_t za = 0;
-    bool have_za = false;
-    uint32_t z = f.z;
-    if (e.zpsm == PSMZ24) z = z > 0xFFFFFF ? 0xFFFFFF : z;
-    else if (e.z16) z = z > 0xFFFF ? 0xFFFF : z;
-    if (e.ztst != 1) {
-        if (e.ztst == 0) return;
+    uint32_t za = 0, z = 0;
+    if (ZT || ZW) {
+        z = f.z > e.zmax ? e.zmax : f.z;
         za = e.zT->addr_row(ra.z, ra.zc, x);
-        have_za = true;
-        uint32_t zb = e.z16 ? half(za) : (e.zpsm == PSMZ24 ? word(za) & 0xFFFFFF : word(za));
+    }
+    if (ZT) {
+        uint32_t zb = e.z16 ? half(za) : word(za) & e.zmax;
         if (e.ztst == 2 ? z < zb : z <= zb) return;
     }
     // ---- texture + colour
     int r = f.r, g = f.g, b = f.b, a = f.a;
-    if (e.tme) {
+    if (TEX) {
         bool bl = f.lod > 0 ? e.bilinear_min : e.bilinear_mag;
         uint32_t t = sample(e, f.u, f.v, bl, f.lod > 0 ? f.lod : 0);
         int tr = t & 255, tg = (t >> 8) & 255, tb = (t >> 16) & 255, ta = t >> 24;
@@ -408,7 +580,7 @@ inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
         b = (fo * b + (255 - fo) * (int)e.fogb) >> 8;
     }
     // ---- alpha test
-    bool write_fb = true, write_z = !e.zmsk, write_alpha = true;
+    bool write_fb = true, write_z = ZW, write_alpha = true;
     if (e.ate) {
         bool pass;
         uint32_t ua = (uint32_t)a;
@@ -496,8 +668,7 @@ inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
         if (g_trace && x == g_dbg_x && ra.y == g_dbg_y)
             log_write(LOG_GS, "PIXEL   dst=%08x -> %08x (wz=%d)", dst, e.fb16 ? half(fa) : word(fa), (int)write_z);
     }
-    if (write_z && e.ztst != 0) {
-        if (!have_za) za = e.zT->addr_row(ra.z, ra.zc, x);
+    if (ZW && write_z) {
         if (e.z16)
             half(za) = (uint16_t)z;
         else if (e.zpsm == PSMZ24)
@@ -507,11 +678,29 @@ inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
     }
 }
 
+inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
+    switch (e.pix_kind) {
+    case 0: shade_px_t<false, false, false>(e, x, ra, f); break;
+    case 1: shade_px_t<true, false, false>(e, x, ra, f); break;
+    case 2: shade_px_t<false, true, false>(e, x, ra, f); break;
+    case 3: shade_px_t<true, true, false>(e, x, ra, f); break;
+    case 4: shade_px_t<false, false, true>(e, x, ra, f); break;
+    case 5: shade_px_t<true, false, true>(e, x, ra, f); break;
+    case 6: shade_px_t<false, true, true>(e, x, ra, f); break;
+    default: shade_px_t<true, true, true>(e, x, ra, f); break;
+    }
+}
+
 void shade(const Env &e, int x, int y, const Frag &f) {
     if (x < e.scx0 || x > e.scx1 || y < e.scy0 || y > e.scy1) return;
     RowAddr ra;
     row_addr(e, y, ra);
     shade_px(e, x, ra, f);
+}
+
+inline bool getenv_nomip() {
+    static bool nomip = getenv("EOD_DEBUG_NOMIP") != nullptr;
+    return nomip;
 }
 
 // texture coordinates for a fragment
@@ -530,6 +719,149 @@ inline void tex_coords(const Env &e, float s, float t, float q, Frag &f) {
     }
 }
 
+// Fast log2 (piecewise linear in the mantissa, error < 0.09): enough to
+// pick a mip level.
+inline float fast_log2(float x) {
+    uint32_t b;
+    memcpy(&b, &x, 4);
+    return (float)((int32_t)(b & 0x7FFFFFFFu) - (127 << 23)) * (1.0f / (1 << 23));
+}
+
+// Triangle set up for scan conversion: edges and attribute planes.
+enum { A_R, A_G, A_B, A_A, A_Z, A_F, A_S, A_T, A_Q, A_N };
+struct TriSpans {
+    struct Edge {
+        int64_t dx, dy, xa, ya;
+        int bias;
+    } ed[3];
+    double base[A_N], gx[A_N], gy[A_N];
+    double X0, Y0;
+    int px0, px1, py0, py1;
+};
+
+// Scan converts a triangle.  GOUR: Gouraud colours, TEX: textured, STQ:
+// perspective texture coordinates, FOG: fogging, ZT/ZW: depth test/write.
+template <bool GOUR, bool TEX, bool STQ, bool FOG, bool ZT, bool ZW>
+void tri_spans(const Env &e, const TriSpans &ts) {
+    constexpr int pk = (TEX ? 1 : 0) | (ZT ? 2 : 0) | (ZW ? 4 : 0);
+    constexpr bool NEEDZ = ZT || ZW;
+    const bool mip = STQ && e.mmin >= 2 && e.mxl > 0 && !getenv_nomip();
+    const float tw16 = (float)(e.tw * 16), th16 = (float)(e.th * 16);
+    const float lod_scale = (float)(1 << e.l);
+    // fixed point steps (16.16) for colour and fog, 48.16 for depth
+    const int32_t dr = (int32_t)(ts.gx[A_R] * 65536.0), dg = (int32_t)(ts.gx[A_G] * 65536.0);
+    const int32_t db = (int32_t)(ts.gx[A_B] * 65536.0), da = (int32_t)(ts.gx[A_A] * 65536.0);
+    const int32_t dfo = (int32_t)(ts.gx[A_F] * 65536.0);
+    const int64_t dz = (int64_t)(ts.gx[A_Z] * 65536.0);
+    const float ds = (float)ts.gx[A_S], dt = (float)ts.gx[A_T], dq = (float)ts.gx[A_Q];
+    Frag f;
+    f.lod = 0;
+    f.z = 0;
+    f.fog = 0;
+    if (!GOUR) {
+        f.r = clamp255((int)ts.base[A_R]);
+        f.g = clamp255((int)ts.base[A_G]);
+        f.b = clamp255((int)ts.base[A_B]);
+        f.a = clamp255((int)ts.base[A_A]);
+    }
+    for (int y = ts.py0; y <= ts.py1; y++) {
+        int64_t Y = (int64_t)y * 16;
+        int xl = ts.px0, xr = ts.px1;
+        bool empty = false;
+        for (int k = 0; k < 3 && !empty; k++) {
+            // E(X) = dy*(X - xa) - (Y - ya)*dx >= bias, X = 16*x
+            const TriSpans::Edge &E = ts.ed[k];
+            int64_t c = -E.dy * E.xa - (Y - E.ya) * E.dx;
+            int64_t A = E.dy * 16;
+            if (A > 0) {
+                int64_t num = E.bias - c;
+                int64_t lo = num >= 0 ? (num + A - 1) / A : -((-num) / A);
+                if (lo > xl) xl = (int)std::min<int64_t>(lo, 1 << 20);
+            } else if (A < 0) {
+                int64_t num = c - E.bias, den = -A;
+                int64_t hi = num >= 0 ? num / den : -((-num + den - 1) / den);
+                if (hi < xr) xr = (int)std::max<int64_t>(hi, -(1 << 20));
+            } else if (c < E.bias) {
+                empty = true;
+            }
+        }
+        if (empty || xl > xr) continue;
+        RowAddr ra;
+        row_addr(e, y, ra);
+        double fy = y - ts.Y0, fx = xl - ts.X0;
+        auto at = [&](int i) { return ts.base[i] + ts.gx[i] * fx + ts.gy[i] * fy; };
+        int32_t r = 0, g = 0, b = 0, a = 0, fo = 0;
+        int64_t zz = 0;
+        float s = 0, t = 0, q = 0;
+        double su = 0, tv = 0;
+        if (GOUR) {
+            r = (int32_t)(std::max(-32768.0, std::min(32767.0, at(A_R))) * 65536.0);
+            g = (int32_t)(std::max(-32768.0, std::min(32767.0, at(A_G))) * 65536.0);
+            b = (int32_t)(std::max(-32768.0, std::min(32767.0, at(A_B))) * 65536.0);
+            a = (int32_t)(std::max(-32768.0, std::min(32767.0, at(A_A))) * 65536.0);
+        }
+        if (FOG) fo = (int32_t)(std::max(-32768.0, std::min(32767.0, at(A_F))) * 65536.0);
+        if (NEEDZ) {
+            double z0 = at(A_Z);
+            zz = (int64_t)(std::max(-1e13, std::min(1e13, z0)) * 65536.0);
+        }
+        if (TEX) {
+            if (STQ) {
+                s = (float)at(A_S);
+                t = (float)at(A_T);
+                q = (float)at(A_Q);
+            } else {
+                su = at(A_S);
+                tv = at(A_T);
+            }
+        }
+        for (int x = xl; x <= xr; x++) {
+            if (GOUR) {
+                f.r = clamp255(r >> 16);
+                f.g = clamp255(g >> 16);
+                f.b = clamp255(b >> 16);
+                f.a = clamp255(a >> 16);
+                r += dr;
+                g += dg;
+                b += db;
+                a += da;
+            }
+            if (NEEDZ) {
+                int64_t zi = zz >> 16;
+                f.z = zi <= 0 ? 0 : zi >= 0xFFFFFFFFll ? 0xFFFFFFFFu : (uint32_t)zi;
+                zz += dz;
+            }
+            if (FOG) {
+                f.fog = clamp255(fo >> 16);
+                fo += dfo;
+            }
+            if (TEX) {
+                if (STQ) {
+                    float qq = q == 0.0f ? 1e-30f : q;
+                    float iq = 1.0f / qq;
+                    f.u = ffloor(s * iq * tw16);
+                    f.v = ffloor(t * iq * th16);
+                    if (mip) {
+                        float lod = e.lcm ? e.k : (-fast_log2(qq) * lod_scale + e.k);
+                        int lvl = lod <= 0 ? 0 : (int)(lod + 0.5f);
+                        f.lod = lvl > e.mxl ? e.mxl : lvl;
+                    }
+                    s += ds;
+                    t += dt;
+                    q += dq;
+                } else {
+                    f.u = ffloor(su);
+                    f.v = ffloor(tv);
+                    su += ts.gx[A_S];
+                    tv += ts.gx[A_T];
+                }
+            }
+            shade_px_t<TEX, ZT, ZW>(e, x, ra, f);
+        }
+    }
+    (void)pk;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------ primitives
@@ -546,6 +878,7 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         trace_prim("SPRITE", vv, 2);
     }
     if (e.write_none) return;
+    note_draw();
     Vertex v0 = a, v1 = b;
     if (v1.x < v0.x) {
         std::swap(v0.x, v1.x);
@@ -624,6 +957,7 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
         }
     }
     if (e.write_none) return;
+    note_draw();
     {
         // EOD_DEBUG_SKIP bits: 1 blended, 2 T8, 4 T4, 8 HIGHLIGHT2, 16 alpha-tested
         static int skip = getenv("EOD_DEBUG_SKIP") ? atoi(getenv("EOD_DEBUG_SKIP")) : 0;
@@ -705,82 +1039,37 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
         ed[k].ya = pa.y;
         ed[k].bias = (ed[k].dy > 0 || (ed[k].dy == 0 && ed[k].dx < 0)) ? 0 : 1;
     }
-    if (e.ztst == 0) return;
-    const bool gour = e.iip, tex = e.tme, fog = e.fge, need_z = e.need_z, stq = e.tme && !e.fst;
-    Frag f;
-    f.lod = 0;
-    f.z = 0;
-    f.fog = 0;
-    if (!gour) {
-        f.r = clamp255((int)base[R]);
-        f.g = clamp255((int)base[G]);
-        f.b = clamp255((int)base[B]);
-        f.a = clamp255((int)base[A]);
+    TriSpans ts;
+    for (int k = 0; k < 3; k++) {
+        ts.ed[k].dx = ed[k].dx;
+        ts.ed[k].dy = ed[k].dy;
+        ts.ed[k].xa = ed[k].xa;
+        ts.ed[k].ya = ed[k].ya;
+        ts.ed[k].bias = ed[k].bias;
     }
-    for (int y = py0; y <= py1; y++) {
-        int64_t Y = (int64_t)y * 16;
-        int xl = px0, xr = px1;
-        bool empty = false;
-        for (int k = 0; k < 3 && !empty; k++) {
-            // E(X) = dy*(X - xa) - (Y - ya)*dx >= bias, X = 16*x
-            const Edge &E = ed[k];
-            int64_t c = -E.dy * E.xa - (Y - E.ya) * E.dx;
-            int64_t A = E.dy * 16;
-            if (A > 0) {
-                // x >= ceil((bias - c) / A)
-                int64_t num = E.bias - c;
-                int64_t lo = num >= 0 ? (num + A - 1) / A : -((-num) / A);
-                if (lo > xl) xl = (int)std::min<int64_t>(lo, 1 << 20);
-            } else if (A < 0) {
-                // x <= floor((c - bias) / -A)
-                int64_t num = c - E.bias, den = -A;
-                int64_t hi = num >= 0 ? num / den : -((-num + den - 1) / den);
-                if (hi < xr) xr = (int)std::max<int64_t>(hi, -(1 << 20));
-            } else if (c < E.bias) {
-                empty = true;
-            }
-        }
-        if (empty || xl > xr) continue;
-        RowAddr ra;
-        row_addr(e, y, ra);
-        double fy = y - Y0;
-        double fx = xl - X0;
-        double val[NA];
-        for (int i = 0; i < NA; i++) val[i] = base[i] + gx[i] * fx + gy[i] * fy;
-        double r = val[R], g = val[G], b = val[B], a = val[A], zz = val[Z], fo = val[F];
-        double s = val[S], t = val[T], q = val[Q];
-        for (int x = xl; x <= xr; x++) {
-            if (gour) {
-                f.r = clamp255((int)r);
-                f.g = clamp255((int)g);
-                f.b = clamp255((int)b);
-                f.a = clamp255((int)a);
-                r += gx[R];
-                g += gx[G];
-                b += gx[B];
-                a += gx[A];
-            }
-            if (need_z) {
-                f.z = zz <= 0 ? 0 : zz >= 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)zz;
-                zz += gx[Z];
-            }
-            if (fog) {
-                f.fog = clamp255((int)fo);
-                fo += gx[F];
-            }
-            if (tex) {
-                if (stq) {
-                    tex_coords(e, (float)s, (float)t, (float)q, f);
-                    q += gx[Q];
-                } else {
-                    f.u = ffloor(s);
-                    f.v = ffloor(t);
-                }
-                s += gx[S];
-                t += gx[T];
-            }
-            shade_px(e, x, ra, f);
-        }
+    for (int i = 0; i < NA; i++) {
+        ts.base[i] = base[i];
+        ts.gx[i] = gx[i];
+        ts.gy[i] = gy[i];
+    }
+    ts.X0 = X0;
+    ts.Y0 = Y0;
+    ts.px0 = px0;
+    ts.px1 = px1;
+    ts.py0 = py0;
+    ts.py1 = py1;
+    int kind = (e.iip ? 1 : 0) | (e.tme ? 2 : 0) | (e.tme && !e.fst ? 4 : 0) | (e.fge ? 8 : 0) | ((e.pix_kind >> 1) << 4);
+    switch (kind) {
+#define TRI_CASE(n) \
+    case n: tri_spans<(n & 1) != 0, (n & 2) != 0, (n & 4) != 0, (n & 8) != 0, (n & 16) != 0, (n & 32) != 0>(e, ts); break;
+        TRI_CASE(0) TRI_CASE(1) TRI_CASE(2) TRI_CASE(3) TRI_CASE(6) TRI_CASE(7) TRI_CASE(8) TRI_CASE(9)
+        TRI_CASE(10) TRI_CASE(11) TRI_CASE(14) TRI_CASE(15) TRI_CASE(16) TRI_CASE(17) TRI_CASE(18) TRI_CASE(19)
+        TRI_CASE(22) TRI_CASE(23) TRI_CASE(24) TRI_CASE(25) TRI_CASE(26) TRI_CASE(27) TRI_CASE(30) TRI_CASE(31)
+        TRI_CASE(32) TRI_CASE(33) TRI_CASE(34) TRI_CASE(35) TRI_CASE(38) TRI_CASE(39) TRI_CASE(40) TRI_CASE(41)
+        TRI_CASE(42) TRI_CASE(43) TRI_CASE(46) TRI_CASE(47) TRI_CASE(48) TRI_CASE(49) TRI_CASE(50) TRI_CASE(51)
+        TRI_CASE(54) TRI_CASE(55) TRI_CASE(56) TRI_CASE(57) TRI_CASE(58) TRI_CASE(59) TRI_CASE(62) TRI_CASE(63)
+#undef TRI_CASE
+    default: break;
     }
 }
 
@@ -789,6 +1078,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
     setup_env(attr);
     Env &e = g_env;
     if (e.write_none) return;
+    note_draw();
     double x0 = a.x / 16.0, y0 = a.y / 16.0, x1 = b.x / 16.0, y1 = b.y / 16.0;
     double len = std::max(fabs(x1 - x0), fabs(y1 - y0));
     int n = (int)ceil(len);
@@ -823,6 +1113,7 @@ void draw_point(const Vertex &a) {
     setup_env(attr);
     Env &e = g_env;
     if (e.write_none) return;
+    note_draw();
     Frag f;
     f.r = a.r;
     f.g = a.g;
