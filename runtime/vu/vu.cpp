@@ -92,18 +92,18 @@ inline int FD(uint32_t i) { return (i >> 6) & 31; }
 inline int BC(uint32_t i) { return i & 3; }
 
 // MAC flag update for the written components of result r.
-uint32_t mac_for(const VUReg &r, int dest) {
+inline uint32_t mac_for(const VUReg &r, int dest) {
     uint32_t m = 0;
     for (int c = 0; c < 4; c++) {
-        if (!has(dest, c)) continue;
         uint32_t u = r.u[c];
         int bit = 3 - c;
-        if ((u & 0x7FFFFFFF) == 0) m |= 1u << bit;               // zero
-        if (u & 0x80000000) m |= 1u << (4 + bit);                 // sign
-        if ((u & 0x7F800000) == 0 && (u & 0x7FFFFF)) m |= 1u << (8 + bit);  // underflow
-        if ((u & 0x7F800000) == 0x7F800000) m |= 1u << (12 + bit);           // overflow
+        uint32_t ex = (u >> 23) & 0xFF;
+        m |= (uint32_t)((u & 0x7FFFFFFF) == 0) << bit;                    // zero
+        m |= (u >> 31) << (4 + bit);                                      // sign
+        m |= (uint32_t)(ex == 0 && (u & 0x7FFFFF) != 0) << (8 + bit);     // underflow
+        m |= (uint32_t)(ex == 0xFF) << (12 + bit);                        // overflow
     }
-    return m;
+    return m & ((uint32_t)dest * 0x1111u);
 }
 
 void set_status_from_mac(VUState *vu, uint32_t mac) {
@@ -194,6 +194,124 @@ void fmac(Ctx &c, uint32_t ins, ArOp op, int bc, const float *scalar, bool to_ac
         return;
     }
     upper_result(c, to_acc ? 0 : FD(ins), r, dest, to_acc);
+}
+
+// FMAC specialized on the operation and the second operand: a vector
+// (S_VEC), a broadcast component (S_BC), Q (S_Q) or I (S_I).
+enum Src { S_VEC, S_BC, S_Q, S_I };
+
+template <ArOp OP>
+inline float apply_t(float acc, float a, float b) {
+    float r = 0.0f;
+    switch (OP) {
+    case OP_ADD: r = a + b; break;
+    case OP_SUB: r = a - b; break;
+    case OP_MUL: r = a * b; break;
+    case OP_MADD: r = acc + a * b; break;
+    case OP_MSUB: r = acc - a * b; break;
+    case OP_MAX: return vu_clamp(a) > vu_clamp(b) ? a : b;
+    default: return vu_clamp(a) < vu_clamp(b) ? a : b;
+    }
+    if (__builtin_expect(vu_special(r), 0)) return apply(OP, acc, a, b);
+    return r;
+}
+
+template <ArOp OP, int SRC, bool ACC>
+void up_fmac(Ctx &c, uint32_t ins) {
+    VUState *vu = c.vu;
+    const VUReg &s = vu->vf[FS(ins)];
+    const VUReg &t = vu->vf[FT(ins)];
+    float b[4];
+    if (SRC == S_VEC) {
+        b[0] = t.f[0], b[1] = t.f[1], b[2] = t.f[2], b[3] = t.f[3];
+    } else {
+        float v = SRC == S_BC ? t.f[ins & 3] : SRC == S_Q ? vu->q : vu->i;
+        b[0] = b[1] = b[2] = b[3] = v;
+    }
+    VUReg r;
+    for (int k = 0; k < 4; k++) r.f[k] = apply_t<OP>(vu->acc.f[k], s.f[k], b[k]);
+    int dest = dest_of(ins);
+    c.up_write = true;
+    c.up_reg = ACC ? 0 : FD(ins);
+    c.up_val = r;
+    c.up_dest = dest;
+    c.up_acc = ACC;
+    if (OP != OP_MAX && OP != OP_MIN) {  // MAX/MINI don't touch flags
+        c.mac = mac_for(r, dest);
+        c.mac_set = true;
+    }
+}
+
+void upper(Ctx &c, uint32_t ins);
+void up_nop(Ctx &, uint32_t) {}
+
+typedef void (*UpFn)(Ctx &c, uint32_t ins);
+
+// Handler for an upper instruction (the generic decoder for the rare ones).
+UpFn decode_upper(uint32_t ins) {
+    uint32_t op = ins & 0x3F;
+#define F(o, src, acc) &up_fmac<o, src, acc>
+    if (op < 0x3C) {
+        switch (op >> 2) {
+        case 0: return F(OP_ADD, S_BC, false);
+        case 1: return F(OP_SUB, S_BC, false);
+        case 2: return F(OP_MADD, S_BC, false);
+        case 3: return F(OP_MSUB, S_BC, false);
+        case 4: return F(OP_MAX, S_BC, false);
+        case 5: return F(OP_MIN, S_BC, false);
+        case 6: return F(OP_MUL, S_BC, false);
+        }
+        switch (op) {
+        case 0x1C: return F(OP_MUL, S_Q, false);
+        case 0x1D: return F(OP_MAX, S_I, false);
+        case 0x1E: return F(OP_MUL, S_I, false);
+        case 0x1F: return F(OP_MIN, S_I, false);
+        case 0x20: return F(OP_ADD, S_Q, false);
+        case 0x21: return F(OP_MADD, S_Q, false);
+        case 0x22: return F(OP_ADD, S_I, false);
+        case 0x23: return F(OP_MADD, S_I, false);
+        case 0x24: return F(OP_SUB, S_Q, false);
+        case 0x25: return F(OP_MSUB, S_Q, false);
+        case 0x26: return F(OP_SUB, S_I, false);
+        case 0x27: return F(OP_MSUB, S_I, false);
+        case 0x28: return F(OP_ADD, S_VEC, false);
+        case 0x29: return F(OP_MADD, S_VEC, false);
+        case 0x2A: return F(OP_MUL, S_VEC, false);
+        case 0x2B: return F(OP_MAX, S_VEC, false);
+        case 0x2C: return F(OP_SUB, S_VEC, false);
+        case 0x2D: return F(OP_MSUB, S_VEC, false);
+        case 0x2F: return F(OP_MIN, S_VEC, false);
+        }
+        return &upper;
+    }
+    uint32_t ext = ((ins >> 6) & 31) << 2 | (ins & 3);
+    switch (ext >> 2) {
+    case 0: return F(OP_ADD, S_BC, true);
+    case 1: return F(OP_SUB, S_BC, true);
+    case 2: return F(OP_MADD, S_BC, true);
+    case 3: return F(OP_MSUB, S_BC, true);
+    case 6: return F(OP_MUL, S_BC, true);
+    }
+    switch (ext) {
+    case 0x1C: return F(OP_MUL, S_Q, true);
+    case 0x1E: return F(OP_MUL, S_I, true);
+    case 0x20: return F(OP_ADD, S_Q, true);
+    case 0x21: return F(OP_MADD, S_Q, true);
+    case 0x22: return F(OP_ADD, S_I, true);
+    case 0x23: return F(OP_MADD, S_I, true);
+    case 0x24: return F(OP_SUB, S_Q, true);
+    case 0x25: return F(OP_MSUB, S_Q, true);
+    case 0x26: return F(OP_SUB, S_I, true);
+    case 0x27: return F(OP_MSUB, S_I, true);
+    case 0x28: return F(OP_ADD, S_VEC, true);
+    case 0x29: return F(OP_MADD, S_VEC, true);
+    case 0x2A: return F(OP_MUL, S_VEC, true);
+    case 0x2C: return F(OP_SUB, S_VEC, true);
+    case 0x2D: return F(OP_MSUB, S_VEC, true);
+    case 0x2F: return &up_nop;
+    }
+#undef F
+    return &upper;
 }
 
 void upper(Ctx &c, uint32_t ins) {
@@ -799,19 +917,51 @@ int lower_reads(uint32_t ins, RegUse *out, RegUse *write) {
     return 0;
 }
 
-inline uint64_t ready_of(const VUState *vu, const RegUse &u) {
-    if (u.reg == 0) return 0;
-    uint64_t r = 0;
-    for (int k = 0; k < 4; k++)
-        if ((u.mask >> (3 - k)) & 1)
-            if (vu->vf_ready[u.reg][k] > r) r = vu->vf_ready[u.reg][k];
-    return r;
+// Decoded instruction pairs, revalidated against micro memory on every use.
+struct DecPair {
+    uint32_t lo, hi;
+    bool valid, waitq;
+    int nu;
+    RegUse uses[4];
+    RegUse lw;
+    UpFn up;
+    uint64_t use_lo, use_hi;  // VF components read (scoreboard bits, 4 per register)
+    uint64_t lw_lo, lw_hi;    // VF components written by the lower instruction
+};
+DecPair g_dec[2][0x4000 / 8];
+
+inline void reg_bits(int reg, int mask, uint64_t &lo, uint64_t &hi) {
+    if (!reg) return;
+    if (reg < 16) lo |= (uint64_t)(mask & 15) << (reg * 4);
+    else hi |= (uint64_t)(mask & 15) << ((reg - 16) * 4);
 }
 
-inline void mark_write(VUState *vu, int reg, int mask, uint64_t when) {
-    if (!reg) return;
-    for (int k = 0; k < 4; k++)
-        if ((mask >> (3 - k)) & 1) vu->vf_ready[reg][k] = when;
+// FMAC results are readable 4 cycles after issue: slot (cycle & 3) holds the
+// VF components written by the pair issued at `stamp`.
+struct Scoreboard {
+    uint64_t lo[4], hi[4], stamp[4];
+};
+Scoreboard g_score[2];
+
+void decode_pair(DecPair &d, uint32_t lo, uint32_t hi) {
+    d.lo = lo;
+    d.hi = hi;
+    d.valid = true;
+    d.lw = {0, 0};
+    d.nu = upper_reads(hi, d.uses);
+    if (!(hi & 0x80000000u)) d.nu += lower_reads(lo, d.uses + d.nu, &d.lw);
+    // drop reads of VF0 (constant)
+    int n = 0;
+    for (int k = 0; k < d.nu; k++)
+        if (d.uses[k].reg) d.uses[n++] = d.uses[k];
+    d.nu = n;
+    // WAITQ stalls the whole pair: the upper instruction sees the new Q
+    d.waitq = !(hi & 0x80000000u) && (lo >> 25) == 0x40 && (lo & 0x3C) == 0x3C &&
+              ((lo & 3) | ((lo >> 4) & 0x7C)) == 0x3B;
+    d.up = decode_upper(hi);
+    d.use_lo = d.use_hi = d.lw_lo = d.lw_hi = 0;
+    for (int k = 0; k < d.nu; k++) reg_bits(d.uses[k].reg, d.uses[k].mask, d.use_lo, d.use_hi);
+    reg_bits(d.lw.reg, d.lw.mask, d.lw_lo, d.lw_hi);
 }
 
 }  // namespace
@@ -835,27 +985,28 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
         uint32_t lo, hi;
         memcpy(&lo, vu->micro + pc, 4);
         memcpy(&hi, vu->micro + pc + 4, 4);
+        DecPair &d = g_dec[vu->index][pc >> 3];
+        if (!d.valid || d.lo != lo || d.hi != hi) decode_pair(d, lo, hi);
         // stall until every register this pair reads has been written
-        RegUse uses[4];
-        RegUse lw = {0, 0};
-        int nu = upper_reads(hi, uses);
-        if (!(hi & 0x80000000u)) nu += lower_reads(lo, uses + nu, &lw);
-        uint64_t need = 0;
-        for (int k = 0; k < nu; k++) {
-            uint64_t r = ready_of(vu, uses[k]);
-            if (r > need) need = r;
+        Scoreboard &sb = g_score[vu->index];
+        if (d.use_lo | d.use_hi) {
+            for (uint64_t dd = 1; dd <= 3; dd++) {
+                uint64_t ic = vu->cycle - dd;
+                int sl = (int)(ic & 3);
+                if (sb.stamp[sl] == ic && ((sb.lo[sl] & d.use_lo) | (sb.hi[sl] & d.use_hi))) {
+                    vu->cycle = ic + 4;
+                    break;
+                }
+            }
         }
-        if (need > vu->cycle) vu->cycle = need;
-        // WAITQ stalls the whole pair: the upper instruction sees the new Q
-        if (!(hi & 0x80000000u) && (lo >> 25) == 0x40 && (lo & 0x3C) == 0x3C &&
-            ((lo & 3) | ((lo >> 4) & 0x7C)) == 0x3B)
-            flush_q(vu);
+        if (d.waitq) flush_q(vu);
         sync_pipes(vu);
+        const uint64_t lw_lo = d.lw_lo, lw_hi = d.lw_hi;
         // upper first (computed against old state), committed after lower
         c.up_write = false;
         c.mac_set = false;
         c.branch = false;
-        upper(c, hi);
+        d.up(c, hi);
         bool up_vf = c.up_write && !c.up_acc;
         int up_reg = c.up_reg, up_dest = c.up_dest;
         if (hi & 0x80000000u) {
@@ -866,8 +1017,19 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
             lower(c, lo, pc);
             commit_upper(c);
         }
-        if (up_vf) mark_write(vu, up_reg, up_dest, vu->cycle + 4);
-        if (lw.reg) mark_write(vu, lw.reg, lw.mask, vu->cycle + 4);
+        {
+            uint64_t wlo = lw_lo, whi = lw_hi;
+            if (up_vf) reg_bits(up_reg, up_dest, wlo, whi);
+            if (wlo | whi) {
+                int sl = (int)(vu->cycle & 3);
+                if (sb.stamp[sl] != vu->cycle) {
+                    sb.stamp[sl] = vu->cycle;
+                    sb.lo[sl] = sb.hi[sl] = 0;
+                }
+                sb.lo[sl] |= wlo;
+                sb.hi[sl] |= whi;
+            }
+        }
         vu->cycle++;
         if (hi & 0x40000000u) end_countdown = 1;  // E bit: one more pair
         if (hi & 0x08000000u) { /* T bit: debug */ }

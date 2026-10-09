@@ -12,6 +12,9 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include "../core/log.h"
 #include "../hw/hw.h"
@@ -27,8 +30,11 @@ extern bool g_trace;
 State st;
 Stats stats;
 
+// Game frames: the display buffer starts being drawn after other buffers
+// were (a flip, or a copy of the finished frame into a fixed display buffer).
+std::atomic<uint64_t> g_flips{0};
+
 namespace {
-std::atomic<uint64_t> g_flips{0};  // draw buffer changes (roughly the game's frame count)
 std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
 
 // ------------------------------------------------------------ GIF parsing
@@ -233,10 +239,7 @@ void write_reg(uint32_t reg, uint64_t v) {
     case 0x49: st.pabe = v; break;
     case 0x4A: st.ctx[0].fba = v; break;
     case 0x4B: st.ctx[1].fba = v; break;
-    case 0x4C:
-        if (bits(v, 0, 9) != bits(st.ctx[0].frame, 0, 9)) g_flips++;
-        st.ctx[0].frame = v;
-        break;
+    case 0x4C: st.ctx[0].frame = v; break;
     case 0x4D: st.ctx[1].frame = v; break;
     case 0x4E: st.ctx[0].zbuf = v; break;
     case 0x4F: st.ctx[1].zbuf = v; break;
@@ -616,15 +619,16 @@ enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 
 bool g_threaded;
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us;  // EOD_FPS statistics
-std::mutex g_q_mtx;
-std::condition_variable g_q_cv, g_q_cv_done;
-std::deque<std::vector<uint8_t>> g_q;
+// never destroyed: the worker may still be waiting on them when the process exits
+std::mutex &g_q_mtx = *new std::mutex;
+std::condition_variable &g_q_cv = *new std::condition_variable, &g_q_cv_done = *new std::condition_variable;
+std::deque<std::vector<uint8_t>> &g_q = *new std::deque<std::vector<uint8_t>>;
 std::vector<uint8_t> g_chunk;
 uint64_t g_pushed, g_done;  // chunks (guarded by g_q_mtx)
 uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mtx)
 
 // last composed frame (presented on the EE thread)
-std::mutex g_pub_mtx;
+std::mutex &g_pub_mtx = *new std::mutex;
 std::vector<uint32_t> g_pub;
 int g_pub_w, g_pub_h;
 
@@ -657,6 +661,10 @@ void gs_frame_end(uint64_t frame) {
         LOG(LOG_GS, "frames to %llu: %u prims, %u pixels, %u transfers, %u texels decoded, %u uncached samples, %u env setups per vblank",
             (unsigned long long)frame, stats.prims / 60, stats.pixels / 60, stats.transfers / 60, stats.decoded / 60,
             stats.slow_samples / 60, stats.env_setups / 60);
+        for (int k = 0; k < 64; k++)
+            if (stats.kind_px[k] / 60 > 5000)
+                LOG(LOG_GS, "  tri kind gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels per vblank", k & 1, (k >> 1) & 1,
+                    (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, stats.kind_px[k] / 60);
         stats = Stats();
     }
 }
@@ -683,6 +691,9 @@ void gs_sync() {
 }
 
 static void gs_worker() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "eod-gs");
+#endif
     for (;;) {
         std::vector<uint8_t> c;
         {
@@ -963,7 +974,7 @@ void gs_vblank() {
             if (!t0) t0 = now, f0 = g_flips, v0 = g_frames;
             if (now - t0 >= 5000000) {
                 double sec = (double)(now - t0) / 1e6;
-                fprintf(stderr, "fps: %.1f vblank/s, %.1f buffer switches/s, GS busy %.0f%%, EE waiting %.0f%%\n",
+                fprintf(stderr, "fps: %.1f vblank/s, %.1f frames/s, GS busy %.0f%%, EE waiting %.0f%%\n",
                         (double)(g_frames - v0) / sec, (double)(g_flips - f0) / sec, g_gs_busy_us / (sec * 1e4),
                         g_ee_wait_us / (sec * 1e4));
                 g_gs_busy_us = 0;

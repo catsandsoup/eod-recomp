@@ -4,6 +4,7 @@
 // vertex space lies inside the primitive (top-left fill rule); sprites
 // cover [x0, x1) x [y0, y1).
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 namespace gs {
 
 bool g_trace;  // log every primitive of one frame (EOD_GS_TRACE=frame)
+extern std::atomic<uint64_t> g_flips;
 uint32_t g_reg_gen = 1;
 
 namespace {
@@ -228,6 +230,11 @@ void setup_env(uint32_t attr) {
     if (g_draw_dirty) {
         mark_env_written(e);
         g_draw_dirty = false;
+    }
+    {
+        uint32_t fbp = bits(st.ctx[(attr >> 9) & 1].frame, 0, 9) * 32;
+        uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
+        if (fbp != e.fbp && fbp == shown) g_flips++;
     }
     const Context &c = st.ctx[(attr >> 9) & 1];
     e.fbp = bits(c.frame, 0, 9) * 32;
@@ -719,6 +726,69 @@ inline void tex_coords(const Env &e, float s, float t, float q, Frag &f) {
     }
 }
 
+// Sprite rows; texture coordinates step in 16.16 fixed point.
+template <bool TEX, bool ZT, bool ZW>
+void sprite_rows(const Env &e, int x0, int x1, int y0, int y1, Frag f, double u0, double du, double w0, double dw) {
+    const int64_t ui = (int64_t)(u0 * 65536.0), d = (int64_t)(du * 65536.0);
+    for (int y = y0; y < y1; y++) {
+        RowAddr ra;
+        row_addr(e, y, ra);
+        if (TEX) f.v = ffloor(w0 + (y - y0) * dw);
+        int64_t u = ui;
+        for (int x = x0; x < x1; x++, u += d) {
+            if (TEX) f.u = (int)(u >> 16);
+            shade_px_t<TEX, ZT, ZW>(e, x, ra, f);
+        }
+    }
+}
+
+// Untextured, unblended, untested sprite (typically a clear): constant colour and depth.
+void fill_rows(const Env &e, int x0, int x1, int y0, int y1, const Frag &f) {
+    stats.pixels += (uint32_t)((x1 - x0) * (y1 - y0));
+    uint32_t oa = (uint32_t)(f.a | (e.fba ? 0x80 : 0)) & 255;
+    uint32_t col = (uint32_t)f.r | ((uint32_t)f.g << 8) | ((uint32_t)f.b << 16) | (oa << 24);
+    uint32_t msk = e.fbmsk;
+    if (!e.fb16 && e.fpsm == PSMCT24) msk |= 0xFF000000u;
+    bool full_mask = e.fb16 ? (msk & 0x80F8F8F8u) == 0x80F8F8F8u : msk == 0xFFFFFFFFu;
+    uint16_t c16 = (uint16_t)(((col >> 3) & 0x1F) | (((col >> 11) & 0x1F) << 5) | (((col >> 19) & 0x1F) << 10) |
+                              ((col >> 31) << 15));
+    uint16_t m16 = (uint16_t)(((msk >> 3) & 0x1F) | (((msk >> 11) & 0x1F) << 5) | (((msk >> 19) & 0x1F) << 10) |
+                              ((msk >> 31) << 15));
+    bool zw = !e.zmsk;
+    uint32_t z = f.z > e.zmax ? e.zmax : f.z;
+    for (int y = y0; y < y1; y++) {
+        RowAddr ra;
+        row_addr(e, y, ra);
+        if (!full_mask) {
+            if (e.fb16) {
+                for (int x = x0; x < x1; x++) {
+                    uint16_t &p = half(e.fbT->addr_row(ra.fb, ra.fbc, x));
+                    p = (uint16_t)((c16 & ~m16) | (p & m16));
+                }
+            } else if (!msk) {
+                for (int x = x0; x < x1; x++) word(e.fbT->addr_row(ra.fb, ra.fbc, x)) = col;
+            } else {
+                for (int x = x0; x < x1; x++) {
+                    uint32_t &p = word(e.fbT->addr_row(ra.fb, ra.fbc, x));
+                    p = (col & ~msk) | (p & msk);
+                }
+            }
+        }
+        if (zw) {
+            if (e.z16) {
+                for (int x = x0; x < x1; x++) half(e.zT->addr_row(ra.z, ra.zc, x)) = (uint16_t)z;
+            } else if (e.zpsm == PSMZ24) {
+                for (int x = x0; x < x1; x++) {
+                    uint32_t &p = word(e.zT->addr_row(ra.z, ra.zc, x));
+                    p = (p & 0xFF000000u) | z;
+                }
+            } else {
+                for (int x = x0; x < x1; x++) word(e.zT->addr_row(ra.z, ra.zc, x)) = z;
+            }
+        }
+    }
+}
+
 // Fast log2 (piecewise linear in the mantissa, error < 0.09): enough to
 // pick a mip level.
 inline float fast_log2(float x) {
@@ -858,6 +928,8 @@ void tri_spans(const Env &e, const TriSpans &ts) {
             }
             shade_px_t<TEX, ZT, ZW>(e, x, ra, f);
         }
+        stats.kind_px[(GOUR ? 1 : 0) | (TEX ? 2 : 0) | (STQ ? 4 : 0) | (FOG ? 8 : 0) | (ZT ? 16 : 0) | (ZW ? 32 : 0)] +=
+            (uint32_t)(xr - xl + 1);
     }
     (void)pk;
 }
@@ -925,16 +997,19 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         u0 = s0 + (x0 * 16 - v0.x) * du / 16.0;
         w0 = t0 + (y0 * 16 - v0.y) * dw / 16.0;
     }
-    if (e.ztst == 0) return;
-    for (int y = y0; y < y1; y++) {
-        RowAddr ra;
-        row_addr(e, y, ra);
-        f.v = ffloor(w0 + (y - y0) * dw);
-        double u = u0;
-        for (int x = x0; x < x1; x++, u += du) {
-            f.u = ffloor(u);
-            shade_px(e, x, ra, f);
-        }
+    if (!e.tme && !e.abe && !e.ate && !e.date && !e.fge && e.ztst == 1 && !g_trace) {
+        fill_rows(e, x0, x1, y0, y1, f);
+        return;
+    }
+    switch (e.pix_kind) {
+    case 0: sprite_rows<false, false, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    case 1: sprite_rows<true, false, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    case 2: sprite_rows<false, true, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    case 3: sprite_rows<true, true, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    case 4: sprite_rows<false, false, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    case 5: sprite_rows<true, false, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    case 6: sprite_rows<false, true, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
+    default: sprite_rows<true, true, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
     }
 }
 

@@ -60,6 +60,7 @@ void clut_load(uint64_t tex0);
 struct Stats {
     uint32_t prims, pixels, transfers;
     uint32_t decoded, slow_samples, env_setups;
+    uint32_t kind_px[64];  // triangle pixels per tri_spans variant
 };
 extern Stats stats;
 
