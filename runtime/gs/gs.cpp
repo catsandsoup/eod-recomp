@@ -1,6 +1,7 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
 #include "gs.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -147,6 +148,31 @@ inline void xfer_put(uint32_t v) {
 void xfer_data(const uint8_t *p, uint32_t n) {
     Transfer &t = g_xfer;
     if (!t.active) return;
+    if (t.dpsm == PSMCT32 || t.dpsm == PSMZ32) {
+        // whole runs of a row at a time
+        uint32_t i = 0;
+        while (i + 4 <= n && t.y < t.h) {
+            int py = (t.y0 + t.y) & 2047;
+            if (py != t.ry) {
+                t.ry = py;
+                t.rb = t.T->row_base(t.dbp, py);
+                t.rc = t.T->rowC[py];
+            }
+            int run = std::min<int>(t.w - t.x, (int)((n - i) / 4));
+            for (int k = 0; k < run; k++, i += 4) {
+                uint32_t v;
+                memcpy(&v, p + i, 4);
+                word(t.T->addr_row(t.rb, t.rc, (t.x0 + t.x + k) & 2047)) = v;
+            }
+            t.x += run;
+            if (t.x >= t.w) {
+                t.x = 0;
+                t.y++;
+            }
+        }
+        if (t.y >= t.h) t.active = false;
+        return;
+    }
     switch (bits_per_pixel(t.dpsm)) {
     case 32:
         for (uint32_t i = 0; i + 4 <= n; i += 4) {
@@ -608,9 +634,10 @@ bool compose_display() {
             for (int x = 0; x < w; x++) {
                 uint32_t p1 = a[(size_t)y * wa + x], p2 = b[(size_t)y * wb + x];
                 uint32_t al = mmod ? alp : 255;  // per-pixel alpha would need the raw value
-                uint32_t r = (((p1 & 0xFF) * al) + ((p2 & 0xFF) * (255 - al))) / 255;
-                uint32_t g = ((((p1 >> 8) & 0xFF) * al) + (((p2 >> 8) & 0xFF) * (255 - al))) / 255;
-                uint32_t bb = ((((p1 >> 16) & 0xFF) * al) + (((p2 >> 16) & 0xFF) * (255 - al))) / 255;
+                // x / 255 == (x * 0x8081) >> 23 for x < 65536
+                uint32_t r = ((((p1 & 0xFF) * al) + ((p2 & 0xFF) * (255 - al))) * 0x8081u) >> 23;
+                uint32_t g = (((((p1 >> 8) & 0xFF) * al) + (((p2 >> 8) & 0xFF) * (255 - al))) * 0x8081u) >> 23;
+                uint32_t bb = (((((p1 >> 16) & 0xFF) * al) + (((p2 >> 16) & 0xFF) * (255 - al))) * 0x8081u) >> 23;
                 g_frame[(size_t)y * w + x] = r | (g << 8) | (bb << 16) | 0xFF000000u;
             }
         g_frame_w = w;

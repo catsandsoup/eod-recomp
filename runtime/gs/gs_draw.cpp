@@ -5,6 +5,9 @@
 // cover [x0, x1) x [y0, y1).
 #include <algorithm>
 #include <atomic>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -542,7 +545,29 @@ inline int wrap(int c, int size, int mode, int mn, int mx) {
     }
 }
 
+#if defined(__SSE2__)
+// Same result as bilerp() below: ((c00*gu + c10*fu)*gv + (c01*gu + c11*fu)*fv) >> 8 per channel.
+inline uint32_t bilerp_sse(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fu, int fv) {
+    const __m128i z = _mm_setzero_si128();
+    __m128i top = _mm_unpacklo_epi8(_mm_unpacklo_epi32(_mm_cvtsi32_si128((int)c00), _mm_cvtsi32_si128((int)c10)), z);
+    __m128i bot = _mm_unpacklo_epi8(_mm_unpacklo_epi32(_mm_cvtsi32_si128((int)c01), _mm_cvtsi32_si128((int)c11)), z);
+    // horizontal weights: low 4 lanes (16 - fu), high 4 lanes fu
+    __m128i wh = _mm_unpacklo_epi64(_mm_set1_epi16((short)(16 - fu)), _mm_set1_epi16((short)fu));
+    top = _mm_mullo_epi16(top, wh);  // <= 255*16
+    bot = _mm_mullo_epi16(bot, wh);
+    top = _mm_add_epi16(top, _mm_srli_si128(top, 8));  // row sums in the low 4 lanes (<= 4080)
+    bot = _mm_add_epi16(bot, _mm_srli_si128(bot, 8));
+    __m128i v = _mm_add_epi16(_mm_mullo_epi16(top, _mm_set1_epi16((short)(16 - fv))),
+                              _mm_mullo_epi16(bot, _mm_set1_epi16((short)fv)));  // <= 65280
+    v = _mm_srli_epi16(v, 8);
+    return (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(v, v));
+}
+#endif
+
 inline uint32_t bilerp(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fu, int fv) {
+#if defined(__SSE2__)
+    if (1) return bilerp_sse(c00, c10, c01, c11, fu, fv);
+#endif
     const uint32_t M = 0x00FF00FFu;
     uint32_t gu = 16 - (uint32_t)fu, gv = 16 - (uint32_t)fv;
     uint32_t rb_t = (c00 & M) * gu + (c10 & M) * (uint32_t)fu;
@@ -570,6 +595,21 @@ __attribute__((always_inline)) inline uint32_t sample_cached(const Env &e, int u
     u -= 8;
     v -= 8;
     int x0 = u >> 4, y0 = v >> 4;
+    if ((e.wms | e.wmt) == 0) {
+        // REPEAT in both directions (sizes are powers of two)
+        int xa = x0 & (tw - 1), xb = (x0 + 1) & (tw - 1), ya = y0 & (th - 1), yb = (y0 + 1) & (th - 1);
+        const uint8_t *V = T.valid.data();
+        int ra = (ya >> 3) * T.tiles_w, rb = (yb >> 3) * T.tiles_w, ca = xa >> 3, cb = xb >> 3;
+        if (!(__atomic_load_n(&V[ra + ca], __ATOMIC_ACQUIRE) & __atomic_load_n(&V[ra + cb], __ATOMIC_ACQUIRE) &
+              __atomic_load_n(&V[rb + ca], __ATOMIC_ACQUIRE) & __atomic_load_n(&V[rb + cb], __ATOMIC_ACQUIRE))) {
+            texel(e, T, xa, ya);
+            texel(e, T, xb, ya);
+            texel(e, T, xa, yb);
+            texel(e, T, xb, yb);
+        }
+        const uint32_t *r0 = &T.data[(size_t)ya * tw], *r1 = &T.data[(size_t)yb * tw];
+        return bilerp(r0[xa], r0[xb], r1[xa], r1[xb], u & 15, v & 15);
+    }
     int xa = wrap(x0, tw, e.wms, e.minu, e.maxu), xb = wrap(x0 + 1, tw, e.wms, e.minu, e.maxu);
     int ya = wrap(y0, th, e.wmt, e.minv, e.maxv), yb = wrap(y0 + 1, th, e.wmt, e.minv, e.maxv);
     if (((xa ^ xb) | (ya ^ yb)) < 8 && (xa >> 3) == (xb >> 3) && (ya >> 3) == (yb >> 3)) {
