@@ -2,3 +2,4 @@ build*/
 gen/
 __pycache__/
 *.pyc
+memcard/

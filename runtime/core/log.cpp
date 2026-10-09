@@ -15,6 +15,11 @@ static const char *k_names[LOG_CAT_COUNT] = {
 
 static FILE *g_log_file;
 
+void log_set_file(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (f) g_log_file = f;
+}
+
 void log_init(const char *spec) {
     g_log_enabled[LOG_CORE] = true;
     g_log_enabled[LOG_GAME] = true;

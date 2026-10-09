@@ -70,7 +70,6 @@ void trace_prim(const char *kind, const Vertex *v, int n) {
     log_write(LOG_GS, "%s", buf);
 }
 
-uint32_t g_prim_attr;
 
 // ----------------------------------------------------------------- setup
 void setup_env(uint32_t attr) {

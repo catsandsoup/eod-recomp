@@ -82,7 +82,7 @@ endif()
 if(WIN32)
   # Windows 7 is the minimum supported version.
   target_compile_definitions(eod PRIVATE _WIN32_WINNT=0x0601 WINVER=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_link_libraries(eod PRIVATE gdi32 user32 winmm dsound dxguid ole32 xinput9_1_0 shell32)
+  target_link_libraries(eod PRIVATE gdi32 user32 winmm)
   if(MINGW)
     target_link_options(eod PRIVATE -static -static-libgcc -static-libstdc++ -mwindows)
   endif()

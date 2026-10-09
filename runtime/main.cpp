@@ -123,13 +123,17 @@ int main(int argc, char **argv) {
         };
         if (a == "--data") data_dir = next();
         else if (a == "--log") log_spec = next();
+        else if (a == "--log-file") log_set_file(next());
         else if (a == "--headless") cfg.headless = true;
         else if (a == "--frames") g_opt_frames = atoi(next());
         else if (a == "--scale") cfg.window_scale = atoi(next());
         else if (a == "--screenshot-every") g_opt_screenshot_every = atoi(next());
         else if (a == "--screenshot-dir") g_opt_screenshot_dir = next();
         else if (a == "--help" || a == "-h") {
-            printf("usage: %s [--data DIR] [--log cats] [--headless] [--frames N] [--scale N]\n", argv[0]);
+            printf("usage: %s [--data DIR] [--log cats] [--log-file PATH] [--headless] [--frames N] [--scale N]\n"
+                   "          [--screenshot-every N] [--screenshot-dir DIR]\n"
+                   "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
+                   argv[0]);
             return 0;
         }
     }

@@ -83,7 +83,7 @@ void deliver_next() {
     g_out.pop_front();
     ee_write_block(g_ee_pktbuf, pkt.data(), (uint32_t)pkt.size());
     g_out_busy = true;
-    LOG(LOG_SIF, "-> EE cmd %08x (%zu bytes) at %08x", rd32(&pkt[8]), pkt.size(), g_ee_pktbuf);
+    LOG(LOG_SIF, "-> EE cmd %08x (%u bytes) at %08x", rd32(&pkt[8]), (unsigned)pkt.size(), g_ee_pktbuf);
     dmac_channel_done(DMA_SIF0);
 }
 
