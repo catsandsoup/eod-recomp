@@ -21,6 +21,8 @@
 #include "../iop/sif.h"
 #include "../platform/platform.h"
 
+void iop_pad_vblank();
+
 extern "C" volatile int g_ee_irq_pending;
 volatile int g_ee_irq_pending;
 
@@ -278,6 +280,7 @@ void service_events() {
         if (g_next_vblank_us < now) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
         g_vblank_end_us = now + 1400;
         g_vblank_end_pending = true;
+        iop_pad_vblank();
         gs_vblank();
         if (g_vsync_flag_addr) {
             ee_w32(g_vsync_flag_addr, 1);
