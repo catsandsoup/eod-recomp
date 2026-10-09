@@ -174,13 +174,16 @@ void setup_env(uint32_t attr) {
     e.fogr = bits(st.fogcol, 0, 8);
     e.fogg = bits(st.fogcol, 8, 8);
     e.fogb = bits(st.fogcol, 16, 8);
+    // A depth format used as the frame buffer keeps its own memory layout
+    // but stores colours like the matching colour format.
+    e.fbT = swizzle_table(e.fpsm, e.fbw);
+    if ((e.fpsm & 0x30) == 0x30) e.fpsm &= ~0x30u;
     e.fb16 = e.fpsm == PSMCT16 || e.fpsm == PSMCT16S;
     e.z16 = e.zpsm == PSMZ16 || e.zpsm == PSMZ16S;
     uint32_t full = e.fpsm == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.write_none = (e.fbmsk & full) == full && e.zmsk;
     e.need_dst = e.date || (e.abe && (e.ba == 1 || e.bb == 1 || e.bd == 1 || e.bc == 1)) || e.fbmsk;
     e.need_z = e.ztst != 1 || !e.zmsk;
-    e.fbT = swizzle_table(e.fpsm, e.fbw);
     e.zT = swizzle_table(e.zpsm, e.fbw);
     if (e.tme) {
         int levels = (e.mmin >= 2 && e.mxl > 0) ? e.mxl : 0;
@@ -490,6 +493,8 @@ inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
             uint32_t &p = word(fa);
             p = msk ? ((col & ~msk) | (p & msk)) : col;
         }
+        if (g_trace && x == g_dbg_x && ra.y == g_dbg_y)
+            log_write(LOG_GS, "PIXEL   dst=%08x -> %08x (wz=%d)", dst, e.fb16 ? half(fa) : word(fa), (int)write_z);
     }
     if (write_z && e.ztst != 0) {
         if (!have_za) za = e.zT->addr_row(ra.z, ra.zc, x);
