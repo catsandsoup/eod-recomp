@@ -5,12 +5,20 @@
 // cover [x0, x1) x [y0, y1).
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include "../core/log.h"
 #include "gs_mem.h"
@@ -26,6 +34,46 @@ uint32_t g_reg_gen = 1;
 namespace {
 
 struct TexEntry;
+
+// Statistics per rasterising thread (0 = GS thread, 1.. raster workers).
+constexpr int kMaxWorkers = 4;
+struct alignas(64) WStats {
+    uint32_t pixels, decoded, slow_samples;
+    uint64_t raster_ns;
+    uint32_t kind_px[64];
+};
+WStats g_wstats[kMaxWorkers + 1];
+thread_local int t_wid;
+
+// 512-page bit set (hazard tracking between queued primitives).
+struct PageSet {
+    uint64_t w[kPages / 64];
+    void clear() { memset(w, 0, sizeof w); }
+    void add(uint32_t first, uint32_t count) {
+        if (count >= kPages) {
+            memset(w, 0xFF, sizeof w);
+            return;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t p = (first + i) % kPages;
+            w[p >> 6] |= 1ull << (p & 63);
+        }
+    }
+    void add(const PageSet &o) {
+        for (size_t i = 0; i < kPages / 64; i++) w[i] |= o.w[i];
+    }
+    bool any(const PageSet &o) const {
+        uint64_t r = 0;
+        for (size_t i = 0; i < kPages / 64; i++) r |= w[i] & o.w[i];
+        return r != 0;
+    }
+};
+
+int g_nw;                          // raster workers (0: rasterise on the GS thread)
+PageSet g_pend_read, g_pend_write;  // pages queued jobs read / write
+void barrier();
+int g_barrier_cause;  // statistics: what the next barrier is for
+const struct Env *g_env_snap;  // snapshot of g_env referenced by queued jobs
 
 struct Env {
     // frame buffer
@@ -71,6 +119,8 @@ struct Env {
     // decoded texture levels (linear RGBA) when tcached
     bool tcached;
     TexEntry *tl[7];
+    // pages read as texture, and of the frame and depth buffers
+    PageSet tex_ps, fb_ps, z_ps;
 };
 
 Env g_env;
@@ -189,6 +239,7 @@ TexEntry *tex_lookup(const Env &e, int lvl) {
         return &t;
     }
     if (g_tex_cache_bytes > (96u << 20)) {
+        barrier();
         g_tex_cache.clear();
         g_tex_cache_bytes = 0;
     }
@@ -204,19 +255,21 @@ TexEntry *tex_lookup(const Env &e, int lvl) {
     return &t;
 }
 
+// Raster workers may decode the same tile at once: they write the same
+// texels, and the flag is published after the data.
 __attribute__((noinline)) void decode_tile(const Env &e, TexEntry &t, int tx, int ty) {
-    t.valid[ty * t.tiles_w + tx] = 1;
     int x0 = tx * 8, y0 = ty * 8;
     int x1 = std::min(x0 + 8, t.w), y1 = std::min(y0 + 8, t.h);
-    stats.decoded += (uint32_t)((x1 - x0) * (y1 - y0));
+    g_wstats[t_wid].decoded += (uint32_t)((x1 - x0) * (y1 - y0));
     for (int y = y0; y < y1; y++) {
         uint32_t *d = &t.data[(size_t)y * t.w];
         for (int x = x0; x < x1; x++) d[x] = fetch(e, x, y, t.lvl);
     }
+    __atomic_store_n(&t.valid[ty * t.tiles_w + tx], (uint8_t)1, __ATOMIC_RELEASE);
 }
 
 inline uint32_t texel(const Env &e, TexEntry &t, int x, int y) {
-    if (!t.valid[(y >> 3) * t.tiles_w + (x >> 3)]) decode_tile(e, t, x >> 3, y >> 3);
+    if (!__atomic_load_n(&t.valid[(y >> 3) * t.tiles_w + (x >> 3)], __ATOMIC_ACQUIRE)) decode_tile(e, t, x >> 3, y >> 3);
     return t.data[(size_t)y * t.w + x];
 }
 
@@ -226,6 +279,7 @@ void setup_env(uint32_t attr) {
     g_env_attr = attr;
     g_env_gen = g_reg_gen;
     stats.env_setups++;
+    g_env_snap = nullptr;
     Env &e = g_env;
     if (g_draw_dirty) {
         mark_env_written(e);
@@ -320,6 +374,15 @@ void setup_env(uint32_t attr) {
     // but stores colours like the matching colour format.
     e.fbT = swizzle_table(e.fpsm, e.fbw);
     e.fpsm_mem = e.fpsm;
+    {
+        uint32_t first, count;
+        page_range(e.fbp, e.fbw, e.fpsm, 0, 0, (int)e.fbw * 64, e.scy1 + 1, first, count);
+        e.fb_ps.clear();
+        e.fb_ps.add(first, count);
+        page_range(e.zbp, e.fbw, e.zpsm, 0, 0, (int)e.fbw * 64, e.scy1 + 1, first, count);
+        e.z_ps.clear();
+        e.z_ps.add(first, count);
+    }
     if ((e.fpsm & 0x30) == 0x30) e.fpsm &= ~0x30u;
     e.fb16 = e.fpsm == PSMCT16 || e.fpsm == PSMCT16S;
     e.z16 = e.zpsm == PSMZ16 || e.zpsm == PSMZ16S;
@@ -337,6 +400,18 @@ void setup_env(uint32_t attr) {
         bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
         if (four || eight)
             for (uint32_t i = 0, n = four ? 16 : 256; i < n; i++) e.pal[i] = clut_lookup(i, e, four);
+        e.tex_ps.clear();
+        for (int i = 0; i <= levels && i < 7; i++) {
+            uint32_t first, count;
+            int w = std::max(1, (int)e.tw >> i), h = std::max(1, (int)e.th >> i);
+            page_range(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0, w, h, first, count);
+            e.tex_ps.add(first, count);
+        }
+        // queued primitives drawing into this texture must finish first
+        if (g_nw && e.tex_ps.any(g_pend_write)) {
+            g_barrier_cause = 4;
+            barrier();
+        }
         static bool nocache = getenv("EOD_GS_NOTEXCACHE") != nullptr;
         e.tcached = !nocache;
         for (int i = 0; i <= levels && i < 7 && e.tcached; i++) {
@@ -455,7 +530,7 @@ inline uint32_t sample_cached(const Env &e, int u, int v, bool bilinear, int lvl
 // u, v in 1/16 texel units at mip level `lvl`.
 uint32_t sample(const Env &e, int u, int v, bool bilinear, int lvl) {
     if (e.tcached) return sample_cached(e, u, v, bilinear, lvl);
-    stats.slow_samples++;
+    g_wstats[t_wid].slow_samples++;
     int tw = (int)e.tw >> lvl, th = (int)e.th >> lvl;
     if (tw < 1) tw = 1;
     if (th < 1) th = 1;
@@ -506,7 +581,7 @@ struct Frag {
     int r, g, b, a;  // vertex colour 0-255
     uint32_t z;
     int fog;
-    int u, v;        // texel coords (1/16) when textured
+    int u = 0, v = 0;  // texel coords (1/16) when textured
     int lod;         // mip level
 };
 
@@ -521,7 +596,6 @@ struct DbgPixelInit {
 // TEX: texture mapping, ZT: depth compare (GEQUAL/GREATER), ZW: depth write.
 template <bool TEX, bool ZT, bool ZW>
 __attribute__((always_inline)) inline void shade_px_t(const Env &e, int x, const RowAddr &ra, const Frag &f) {
-    stats.pixels++;
     if (g_trace && x == g_dbg_x && ra.y == g_dbg_y) {
         uint32_t t = e.tme ? sample(e, f.u, f.v, f.lod > 0 ? e.bilinear_min : e.bilinear_mag, f.lod > 0 ? f.lod : 0) : 0;
         log_write(LOG_GS, "PIXEL %d,%d: tex=%x/%d psm=%x %dx%d uv=%d,%d (%.2f,%.2f) lod=%d texel=%08x col=%02x%02x%02x%02x z=%u",
@@ -700,6 +774,7 @@ inline void shade_px(const Env &e, int x, const RowAddr &ra, const Frag &f) {
 
 void shade(const Env &e, int x, int y, const Frag &f) {
     if (x < e.scx0 || x > e.scx1 || y < e.scy0 || y > e.scy1) return;
+    g_wstats[t_wid].pixels++;
     RowAddr ra;
     row_addr(e, y, ra);
     shade_px(e, x, ra, f);
@@ -727,10 +802,23 @@ inline void tex_coords(const Env &e, float s, float t, float q, Frag &f) {
 }
 
 // Sprite rows; texture coordinates step in 16.16 fixed point.
+// Rows are dealt to raster workers in groups of 4: worker `wid` of `nw`
+// draws the rows y with (y / 4) % nw == wid.
+inline bool skip_row(int &y, int wid, int nw) {
+    if (nw > 1 && ((y >> 2) % nw) != wid) {
+        y |= 3;
+        return true;
+    }
+    return false;
+}
+
 template <bool TEX, bool ZT, bool ZW>
-void sprite_rows(const Env &e, int x0, int x1, int y0, int y1, Frag f, double u0, double du, double w0, double dw) {
+void sprite_rows(const Env &e, int x0, int x1, int y0, int y1, Frag f, double u0, double du, double w0, double dw,
+                 int wid, int nw, WStats &ws) {
     const int64_t ui = (int64_t)(u0 * 65536.0), d = (int64_t)(du * 65536.0);
     for (int y = y0; y < y1; y++) {
+        if (skip_row(y, wid, nw)) continue;
+        ws.pixels += (uint32_t)(x1 - x0);
         RowAddr ra;
         row_addr(e, y, ra);
         if (TEX) f.v = ffloor(w0 + (y - y0) * dw);
@@ -743,8 +831,7 @@ void sprite_rows(const Env &e, int x0, int x1, int y0, int y1, Frag f, double u0
 }
 
 // Untextured, unblended, untested sprite (typically a clear): constant colour and depth.
-void fill_rows(const Env &e, int x0, int x1, int y0, int y1, const Frag &f) {
-    stats.pixels += (uint32_t)((x1 - x0) * (y1 - y0));
+void fill_rows(const Env &e, int x0, int x1, int y0, int y1, const Frag &f, int wid, int nw, WStats &ws) {
     uint32_t oa = (uint32_t)(f.a | (e.fba ? 0x80 : 0)) & 255;
     uint32_t col = (uint32_t)f.r | ((uint32_t)f.g << 8) | ((uint32_t)f.b << 16) | (oa << 24);
     uint32_t msk = e.fbmsk;
@@ -757,6 +844,8 @@ void fill_rows(const Env &e, int x0, int x1, int y0, int y1, const Frag &f) {
     bool zw = !e.zmsk;
     uint32_t z = f.z > e.zmax ? e.zmax : f.z;
     for (int y = y0; y < y1; y++) {
+        if (skip_row(y, wid, nw)) continue;
+        ws.pixels += (uint32_t)(x1 - x0);
         RowAddr ra;
         row_addr(e, y, ra);
         if (!full_mask) {
@@ -812,7 +901,7 @@ struct TriSpans {
 // Scan converts a triangle.  GOUR: Gouraud colours, TEX: textured, STQ:
 // perspective texture coordinates, FOG: fogging, ZT/ZW: depth test/write.
 template <bool GOUR, bool TEX, bool STQ, bool FOG, bool ZT, bool ZW>
-void tri_spans(const Env &e, const TriSpans &ts) {
+void tri_spans(const Env &e, const TriSpans &ts, int wid, int nw, WStats &ws) {
     constexpr int pk = (TEX ? 1 : 0) | (ZT ? 2 : 0) | (ZW ? 4 : 0);
     constexpr bool NEEDZ = ZT || ZW;
     const bool mip = STQ && e.mmin >= 2 && e.mxl > 0 && !getenv_nomip();
@@ -835,6 +924,7 @@ void tri_spans(const Env &e, const TriSpans &ts) {
         f.a = clamp255((int)ts.base[A_A]);
     }
     for (int y = ts.py0; y <= ts.py1; y++) {
+        if (skip_row(y, wid, nw)) continue;
         int64_t Y = (int64_t)y * 16;
         int xl = ts.px0, xr = ts.px1;
         bool empty = false;
@@ -928,10 +1018,267 @@ void tri_spans(const Env &e, const TriSpans &ts) {
             }
             shade_px_t<TEX, ZT, ZW>(e, x, ra, f);
         }
-        stats.kind_px[(GOUR ? 1 : 0) | (TEX ? 2 : 0) | (STQ ? 4 : 0) | (FOG ? 8 : 0) | (ZT ? 16 : 0) | (ZW ? 32 : 0)] +=
+        ws.pixels += (uint32_t)(xr - xl + 1);
+        ws.kind_px[(GOUR ? 1 : 0) | (TEX ? 2 : 0) | (STQ ? 4 : 0) | (FOG ? 8 : 0) | (ZT ? 16 : 0) | (ZW ? 32 : 0)] +=
             (uint32_t)(xr - xl + 1);
     }
     (void)pk;
+}
+
+// ------------------------------------------------------------ raster workers
+// With spare cores, primitives are queued as jobs and rasterised by worker
+// threads that each own interleaved groups of rows; every worker runs all
+// jobs in order, so each pixel still sees the primitives in GS order.  The
+// GS thread waits for the workers (a barrier) only when memory that queued
+// jobs read or write is about to be accessed another way: render-to-texture,
+// transfers, CLUT loads, display readout, or a buffer aliased through a
+// different layout.
+enum JobKind : uint8_t { JOB_TRI, JOB_SPRITE, JOB_FILL };
+struct Job {
+    JobKind kind;
+    int variant;
+    const Env *env;
+    TriSpans ts;
+    int x0, x1, y0, y1;
+    Frag f;
+    double u0, du, w0, dw;
+};
+
+constexpr uint64_t kRing = 4096;
+Job *g_ring;
+std::atomic<uint64_t> g_head{0};  // jobs published
+struct alignas(64) WorkerSync {
+    std::atomic<uint64_t> done{0};
+};
+WorkerSync g_wsync[kMaxWorkers];
+std::atomic<int> g_sleepers{0};
+std::atomic<bool> g_producer_waiting{false};
+std::mutex &g_wmtx = *new std::mutex;
+std::condition_variable &g_wcv = *new std::condition_variable;  // workers wait for jobs
+std::condition_variable &g_pcv = *new std::condition_variable;  // the GS thread waits for workers
+
+struct View {
+    uint32_t bp, bw, psm;
+    PageSet pages;
+};
+View g_views[8];
+int g_nviews;
+
+// Env snapshots referenced by queued jobs (freed at barriers)
+std::deque<Env> &g_env_arena = *new std::deque<Env>;
+
+std::atomic<uint32_t> g_dbg_sleeps, g_dbg_notifies, g_dbg_psleeps;
+uint64_t g_dbg_wait_ns;
+
+// Spins until cond() holds or about `us` microseconds pass (thread wakeups
+// can take far longer than the gaps between jobs).
+template <class F>
+bool spin_until(F cond, int us) {
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0;; i++) {
+        if (cond()) return true;
+        if ((i & 63) == 63) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(us)) return false;
+            if (i > 4096) std::this_thread::yield();
+        }
+#if defined(__i386__) || defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+}
+
+inline void cpu_relax() {
+#if defined(__i386__) || defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+
+void run_job(const Job &j, int wid, int nw, WStats &ws) {
+    const Env &e = *j.env;
+    switch (j.kind) {
+    case JOB_TRI:
+        switch (j.variant) {
+#define TRI_CASE(n)                                                                                                    \
+    case n:                                                                                                            \
+        tri_spans<(n & 1) != 0, (n & 2) != 0, (n & 4) != 0, (n & 8) != 0, (n & 16) != 0, (n & 32) != 0>(e, j.ts, wid, \
+                                                                                                       nw, ws);       \
+        break;
+            TRI_CASE(0) TRI_CASE(1) TRI_CASE(2) TRI_CASE(3) TRI_CASE(6) TRI_CASE(7) TRI_CASE(8) TRI_CASE(9)
+            TRI_CASE(10) TRI_CASE(11) TRI_CASE(14) TRI_CASE(15) TRI_CASE(16) TRI_CASE(17) TRI_CASE(18) TRI_CASE(19)
+            TRI_CASE(22) TRI_CASE(23) TRI_CASE(24) TRI_CASE(25) TRI_CASE(26) TRI_CASE(27) TRI_CASE(30) TRI_CASE(31)
+            TRI_CASE(32) TRI_CASE(33) TRI_CASE(34) TRI_CASE(35) TRI_CASE(38) TRI_CASE(39) TRI_CASE(40) TRI_CASE(41)
+            TRI_CASE(42) TRI_CASE(43) TRI_CASE(46) TRI_CASE(47) TRI_CASE(48) TRI_CASE(49) TRI_CASE(50) TRI_CASE(51)
+            TRI_CASE(54) TRI_CASE(55) TRI_CASE(56) TRI_CASE(57) TRI_CASE(58) TRI_CASE(59) TRI_CASE(62) TRI_CASE(63)
+#undef TRI_CASE
+        default: break;
+        }
+        break;
+    case JOB_SPRITE: {
+#define SPR(t, zt, zw) sprite_rows<t, zt, zw>(e, j.x0, j.x1, j.y0, j.y1, j.f, j.u0, j.du, j.w0, j.dw, wid, nw, ws)
+        switch (j.variant) {
+        case 0: SPR(false, false, false); break;
+        case 1: SPR(true, false, false); break;
+        case 2: SPR(false, true, false); break;
+        case 3: SPR(true, true, false); break;
+        case 4: SPR(false, false, true); break;
+        case 5: SPR(true, false, true); break;
+        case 6: SPR(false, true, true); break;
+        default: SPR(true, true, true); break;
+        }
+#undef SPR
+        break;
+    }
+    case JOB_FILL: fill_rows(e, j.x0, j.x1, j.y0, j.y1, j.f, wid, nw, ws); break;
+    }
+}
+
+void raster_worker(int id) {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "eod-raster");
+#endif
+    t_wid = id + 1;
+    uint64_t idx = 0;
+    for (;;) {
+        if (g_head.load() == idx) {
+            spin_until([&] { return g_head.load() != idx; }, 3000);
+            if (g_head.load() == idx) {
+                std::unique_lock<std::mutex> lk(g_wmtx);
+                g_dbg_sleeps++;
+                g_sleepers++;
+                g_wcv.wait(lk, [&] { return g_head.load() != idx; });
+                g_sleepers--;
+            }
+            continue;
+        }
+        if (g_log_enabled[LOG_GS]) {
+            auto t0 = std::chrono::steady_clock::now();
+            run_job(g_ring[idx % kRing], id, g_nw, g_wstats[id + 1]);
+            g_wstats[id + 1].raster_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count();
+        } else {
+            run_job(g_ring[idx % kRing], id, g_nw, g_wstats[id + 1]);
+        }
+        idx++;
+        g_wsync[id].done.store(idx);
+        if (g_producer_waiting.load()) {
+            std::lock_guard<std::mutex> lk(g_wmtx);
+            g_pcv.notify_all();
+        }
+    }
+}
+
+uint64_t min_done() {
+    uint64_t m = ~0ull;
+    for (int i = 0; i < g_nw; i++) m = std::min(m, g_wsync[i].done.load());
+    return m;
+}
+
+// Waits until the workers have run all jobs up to `upto`.
+void wait_workers(uint64_t upto) {
+    auto t0 = std::chrono::steady_clock::now();
+    if (spin_until([&] { return min_done() >= upto; }, 3000)) {
+        g_dbg_wait_ns +=
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
+    g_dbg_psleeps++;
+    std::unique_lock<std::mutex> lk(g_wmtx);
+    g_producer_waiting = true;
+    g_pcv.wait(lk, [&] { return min_done() >= upto; });
+    g_producer_waiting = false;
+    g_dbg_wait_ns +=
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void barrier() {
+    if (!g_nw) return;
+    stats.barriers[g_barrier_cause & 7]++;
+    g_barrier_cause = 0;
+    if (g_head.load() != min_done()) wait_workers(g_head.load());
+    g_pend_read.clear();
+    g_pend_write.clear();
+    g_nviews = 0;
+    g_env_arena.clear();
+    g_env_snap = nullptr;
+}
+
+void push_job(Job &j) {
+    uint64_t h = g_head.load();
+    if (h - min_done() >= kRing) wait_workers(h - kRing + 1);
+    if (!g_env_snap) {
+        g_env_arena.push_back(g_env);
+        g_env_snap = &g_env_arena.back();
+    }
+    j.env = g_env_snap;
+    stats.jobs++;
+    g_ring[h % kRing] = j;
+    g_head.store(h + 1);
+    if (g_sleepers.load()) {
+        g_dbg_notifies++;
+        std::lock_guard<std::mutex> lk(g_wmtx);
+        g_wcv.notify_all();
+    }
+}
+
+// Registers a buffer layout used by the queued jobs; false when it overlaps
+// another layout's memory (rows wouldn't map to the same workers).
+bool add_view(uint32_t bp, uint32_t bw, uint32_t psm, const PageSet &pages) {
+    for (int i = 0; i < g_nviews; i++) {
+        View &v = g_views[i];
+        if (v.bp == bp && v.bw == bw && v.psm == psm) return true;
+        if (v.pages.any(pages)) return false;
+    }
+    if (g_nviews == 8) return false;
+    g_views[g_nviews++] = {bp, bw, psm, pages};
+    return true;
+}
+
+// Queues a job for the current env (or runs it now without workers).
+void submit(Job &j) {
+    if (!g_nw || g_trace) {
+        if (g_nw) barrier();
+        j.env = &g_env;
+        if (!g_log_enabled[LOG_GS]) {
+            run_job(j, 0, 1, g_wstats[0]);
+            return;
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        run_job(j, 0, 1, g_wstats[0]);
+        g_wstats[0].raster_ns +=
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
+    const Env &e = g_env;
+    bool fb_w = true;  // write_none primitives never get here
+    bool zt = e.ztst >= 2, zw = !e.zmsk && e.ztst != 0;
+    PageSet wr;
+    wr.clear();
+    if (fb_w) wr.add(e.fb_ps);
+    if (zw) wr.add(e.z_ps);
+    bool hazard = (e.tme && e.tex_ps.any(g_pend_write)) || wr.any(g_pend_read);
+    if (!hazard) {
+        if (!add_view(e.fbp, e.fbw, e.fpsm_mem, e.fb_ps)) hazard = true;
+        else if ((zt || zw) && !add_view(e.zbp, e.fbw, e.zpsm, e.z_ps)) hazard = true;
+    }
+    if (hazard) {
+        g_barrier_cause = (e.tme && e.tex_ps.any(g_pend_write)) ? 1 : wr.any(g_pend_read) ? 2 : 3;
+        barrier();
+        add_view(e.fbp, e.fbw, e.fpsm_mem, e.fb_ps);
+        if ((zt || zw) && !add_view(e.zbp, e.fbw, e.zpsm, e.z_ps)) {
+            // the frame and depth buffers overlap each other: draw it here
+            barrier();
+            j.env = &g_env;
+            run_job(j, 0, 1, g_wstats[0]);
+            return;
+        }
+    }
+    // buffers accessed through their own layout keep their order per row;
+    // only texture reads can see another worker's rows
+    if (e.tme) g_pend_read.add(e.tex_ps);
+    g_pend_write.add(wr);
+    if (zt) g_pend_write.add(e.z_ps);
+    push_job(j);
 }
 
 }  // namespace
@@ -997,20 +1344,19 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         u0 = s0 + (x0 * 16 - v0.x) * du / 16.0;
         w0 = t0 + (y0 * 16 - v0.y) * dw / 16.0;
     }
-    if (!e.tme && !e.abe && !e.ate && !e.date && !e.fge && e.ztst == 1 && !g_trace) {
-        fill_rows(e, x0, x1, y0, y1, f);
-        return;
-    }
-    switch (e.pix_kind) {
-    case 0: sprite_rows<false, false, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    case 1: sprite_rows<true, false, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    case 2: sprite_rows<false, true, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    case 3: sprite_rows<true, true, false>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    case 4: sprite_rows<false, false, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    case 5: sprite_rows<true, false, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    case 6: sprite_rows<false, true, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    default: sprite_rows<true, true, true>(e, x0, x1, y0, y1, f, u0, du, w0, dw); break;
-    }
+    Job job;
+    job.kind = (!e.tme && !e.abe && !e.ate && !e.date && !e.fge && e.ztst == 1 && !g_trace) ? JOB_FILL : JOB_SPRITE;
+    job.variant = e.pix_kind;
+    job.x0 = x0;
+    job.x1 = x1;
+    job.y0 = y0;
+    job.y1 = y1;
+    job.f = f;
+    job.u0 = u0;
+    job.du = du;
+    job.w0 = w0;
+    job.dw = dw;
+    submit(job);
 }
 
 void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
@@ -1133,19 +1479,11 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     ts.px1 = px1;
     ts.py0 = py0;
     ts.py1 = py1;
-    int kind = (e.iip ? 1 : 0) | (e.tme ? 2 : 0) | (e.tme && !e.fst ? 4 : 0) | (e.fge ? 8 : 0) | ((e.pix_kind >> 1) << 4);
-    switch (kind) {
-#define TRI_CASE(n) \
-    case n: tri_spans<(n & 1) != 0, (n & 2) != 0, (n & 4) != 0, (n & 8) != 0, (n & 16) != 0, (n & 32) != 0>(e, ts); break;
-        TRI_CASE(0) TRI_CASE(1) TRI_CASE(2) TRI_CASE(3) TRI_CASE(6) TRI_CASE(7) TRI_CASE(8) TRI_CASE(9)
-        TRI_CASE(10) TRI_CASE(11) TRI_CASE(14) TRI_CASE(15) TRI_CASE(16) TRI_CASE(17) TRI_CASE(18) TRI_CASE(19)
-        TRI_CASE(22) TRI_CASE(23) TRI_CASE(24) TRI_CASE(25) TRI_CASE(26) TRI_CASE(27) TRI_CASE(30) TRI_CASE(31)
-        TRI_CASE(32) TRI_CASE(33) TRI_CASE(34) TRI_CASE(35) TRI_CASE(38) TRI_CASE(39) TRI_CASE(40) TRI_CASE(41)
-        TRI_CASE(42) TRI_CASE(43) TRI_CASE(46) TRI_CASE(47) TRI_CASE(48) TRI_CASE(49) TRI_CASE(50) TRI_CASE(51)
-        TRI_CASE(54) TRI_CASE(55) TRI_CASE(56) TRI_CASE(57) TRI_CASE(58) TRI_CASE(59) TRI_CASE(62) TRI_CASE(63)
-#undef TRI_CASE
-    default: break;
-    }
+    Job job;
+    job.kind = JOB_TRI;
+    job.variant = (e.iip ? 1 : 0) | (e.tme ? 2 : 0) | (e.tme && !e.fst ? 4 : 0) | (e.fge ? 8 : 0) | ((e.pix_kind >> 1) << 4);
+    job.ts = ts;
+    submit(job);
 }
 
 void draw_line(const Vertex &a, const Vertex &b) {
@@ -1154,6 +1492,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
     Env &e = g_env;
     if (e.write_none) return;
     note_draw();
+    barrier();
     double x0 = a.x / 16.0, y0 = a.y / 16.0, x1 = b.x / 16.0, y1 = b.y / 16.0;
     double len = std::max(fabs(x1 - x0), fabs(y1 - y0));
     int n = (int)ceil(len);
@@ -1189,6 +1528,7 @@ void draw_point(const Vertex &a) {
     Env &e = g_env;
     if (e.write_none) return;
     note_draw();
+    barrier();
     Frag f;
     f.r = a.r;
     f.g = a.g;
@@ -1232,6 +1572,18 @@ void clut_load(uint64_t tex0) {
     default: return;
     }
     uint32_t cpsm = bits(tex0, 51, 4), csm = bits(tex0, 55, 1), csa = bits(tex0, 56, 5);
+    if (g_nw) {
+        uint32_t first, count;
+        page_range(cbp, csm ? bits(st.texclut, 0, 6) : 1, cpsm, 0, csm ? (int)bits(st.texclut, 12, 10) : 0, 256, 16,
+                   first, count);
+        PageSet ps;
+        ps.clear();
+        ps.add(first, count);
+        if (ps.any(g_pend_write)) {
+            g_barrier_cause = 5;
+            barrier();
+        }
+    }
     if (g_trace)
         log_write(LOG_GS, "CLUT load cld=%u cbp=%x cpsm=%x csm=%u csa=%u psm=%x", cld, cbp, cpsm, csm, csa, psm);
     int n = eight ? 256 : 16;
@@ -1261,6 +1613,55 @@ void clut_load(uint64_t tex0) {
         } else {
             st.clut[(off + i) & 511] = (uint16_t)c;
         }
+    }
+}
+
+// ------------------------------------------------------------ worker control
+void raster_start(int n) {
+    if (n > kMaxWorkers) n = kMaxWorkers;
+    if (n <= 0) return;
+    g_ring = new Job[kRing];
+    g_nw = n;
+    for (int i = 0; i < n; i++) std::thread(raster_worker, i).detach();
+}
+
+void raster_sync() { barrier(); }
+
+void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    if (!g_nw) return;
+    uint32_t first, count;
+    page_range(bp, bw, psm, x, y, w, h, first, count);
+    PageSet ps;
+    ps.clear();
+    ps.add(first, count);
+    if (ps.any(g_pend_read) || ps.any(g_pend_write)) {
+        g_barrier_cause = 6;
+        barrier();
+    }
+}
+
+void raster_vram_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    if (!g_nw) return;
+    uint32_t first, count;
+    page_range(bp, bw, psm, x, y, w, h, first, count);
+    PageSet ps;
+    ps.clear();
+    ps.add(first, count);
+    if (ps.any(g_pend_write)) barrier();
+}
+
+void raster_collect_stats() {
+    LOG(LOG_GS, "  worker sleeps %u, notifies %u, GS thread sleeps %u, GS thread waited %.2f ms (per vblank)",
+        g_dbg_sleeps.load() / 60, g_dbg_notifies.load() / 60, g_dbg_psleeps.load() / 60, g_dbg_wait_ns / 60 / 1e6);
+    g_dbg_sleeps = g_dbg_notifies = g_dbg_psleeps = 0;
+    g_dbg_wait_ns = 0;
+    for (auto &w : g_wstats) {
+        stats.pixels += w.pixels;
+        stats.decoded += w.decoded;
+        stats.slow_samples += w.slow_samples;
+        stats.raster_ns += w.raster_ns;
+        for (int k = 0; k < 64; k++) stats.kind_px[k] += w.kind_px[k];
+        w = WStats();
     }
 }
 

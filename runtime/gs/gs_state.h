@@ -56,11 +56,21 @@ void draw_sprite(const Vertex &a, const Vertex &b);
 // texture/CLUT helpers (gs_draw.cpp)
 void clut_load(uint64_t tex0);
 
+// raster worker threads (gs_draw.cpp): start, wait for all queued
+// primitives, and order other VRAM accesses after the primitives they touch
+void raster_start(int n);
+void raster_sync();
+void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
+void raster_vram_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
+void raster_collect_stats();
+
 // statistics for the current frame
 struct Stats {
     uint32_t prims, pixels, transfers;
     uint32_t decoded, slow_samples, env_setups;
     uint32_t kind_px[64];  // triangle pixels per tri_spans variant
+    uint32_t jobs, barriers[8];
+    uint64_t raster_ns;  // raster jobs queued, barriers by cause
 };
 extern Stats stats;
 

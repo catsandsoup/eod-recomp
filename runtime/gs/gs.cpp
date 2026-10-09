@@ -79,7 +79,12 @@ void xfer_start() {
     int sx = (int)bits(st.trxpos, 0, 11), sy = (int)bits(st.trxpos, 16, 11);
     int dx = (int)bits(st.trxpos, 32, 11), dy = (int)bits(st.trxpos, 48, 11);
     stats.transfers++;
-    if (dir == 0 || dir == 2) vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
+    if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
+    if (dir == 1) raster_sync();
+    if (dir == 0 || dir == 2) {
+        raster_vram_write(dbp, dbw, dpsm, dx, dy, w, h);
+        vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
+    }
     if (dir == 0) {
         g_xfer.active = true;
         g_xfer.dbp = dbp;
@@ -553,6 +558,7 @@ bool read_circuit(int n, std::vector<uint32_t> &img, int &w, int &h) {
 }
 
 void compose_display() {
+    raster_sync();
     bool en1 = st.pmode & 1, en2 = (st.pmode >> 1) & 1;
     std::vector<uint32_t> a, b;
     int wa = 0, ha = 0, wb = 0, hb = 0;
@@ -658,9 +664,16 @@ void gs_frame_end(uint64_t frame) {
         if (gs::g_trace) fprintf(stderr, "GS trace on at frame %d\n", (int)frame);
     }
     if ((frame % 60) == 0) {
+        raster_collect_stats();
         LOG(LOG_GS, "frames to %llu: %u prims, %u pixels, %u transfers, %u texels decoded, %u uncached samples, %u env setups per vblank",
             (unsigned long long)frame, stats.prims / 60, stats.pixels / 60, stats.transfers / 60, stats.decoded / 60,
             stats.slow_samples / 60, stats.env_setups / 60);
+        LOG(LOG_GS, "  raster time %.2f ms per vblank, %.1f ns per pixel", stats.raster_ns / 60 / 1e6,
+            stats.pixels ? (double)stats.raster_ns / stats.pixels : 0.0);
+        LOG(LOG_GS, "  raster jobs %u, barriers: other %u, tex-after-draw %u, draw-over-read %u, layout %u, "
+            "tex-setup %u, clut %u, transfer %u (per vblank)", stats.jobs / 60, stats.barriers[0] / 60,
+            stats.barriers[1] / 60, stats.barriers[2] / 60, stats.barriers[3] / 60, stats.barriers[4] / 60,
+            stats.barriers[5] / 60, stats.barriers[6] / 60);
         for (int k = 0; k < 64; k++)
             if (stats.kind_px[k] / 60 > 5000)
                 LOG(LOG_GS, "  tri kind gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels per vblank", k & 1, (k >> 1) & 1,
@@ -742,7 +755,14 @@ void gs_thread_start() {
     if (!want) return;
     g_threaded = true;
     std::thread(gs_worker).detach();
-    LOG(LOG_GS, "GS runs on its own thread");
+    // raster workers on the cores left after the EE and GS threads
+    // (EOD_GS_RASTER=n overrides, 0 disables)
+    int hw = (int)std::thread::hardware_concurrency();
+    int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
+    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
+    if (n > 4) n = 4;
+    raster_start(n);
+    LOG(LOG_GS, "GS runs on its own thread, %d raster workers", n > 0 ? n : 0);
 }
 
 void gs_init() {
