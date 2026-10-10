@@ -215,7 +215,10 @@ struct StreamChannel {
     uint32_t start, size;  // ring buffer in sound RAM
     uint16_t pitch;        // default; the game sets its own
     bool running = false;
-    uint32_t wpos = 0;  // ring offset written up to
+    // bytes written to / played from the ring since the start (a write
+    // position alone can't tell a full ring from an empty one)
+    uint64_t written = 0, played = 0;
+    uint32_t last_play = 0;  // ring offset of the voice at the last update
     struct Req {
         uint32_t lsn, bytes;
     };
@@ -266,8 +269,10 @@ void feed(StreamChannel &c, uint32_t off, uint32_t n) {
 }
 
 void start_channel(StreamChannel &c) {
-    feed(c, 0, c.size);
-    c.wpos = 0;  // the whole ring is ahead of the voice
+    feed(c, 0, c.size);  // the whole ring is ahead of the voice
+    c.written = c.size;
+    c.played = 0;
+    c.last_play = 0;
     spu2_set_addr(voice_entry(c.voice, 0x2040), c.start);
     spu2_set_param(voice_entry(c.voice, 0x0000), 0x3FFF);
     spu2_set_param(voice_entry(c.voice, 0x0100), 0x3FFF);
@@ -285,15 +290,17 @@ void iop_stream_update() {
         uint32_t nax = spu2_get_addr(voice_entry(c.voice, 0x2240));
         if (nax < c.start || nax >= c.start + c.size) continue;  // voice was moved: leave it
         uint32_t play = (nax - c.start) & ~15u;
-        // writable: from wpos up to 0x200 bytes before the play position
-        uint32_t limit = (play + c.size - 0x200) % c.size;
-        uint32_t avail = (limit + c.size - c.wpos) % c.size;
-        if (avail > c.size - 0x200) avail = 0;  // wpos is inside the guard zone
+        c.played += (play + c.size - c.last_play) % c.size;
+        c.last_play = play;
+        // writable: up to 0x200 bytes before the play position
+        uint64_t limit = c.played + c.size - 0x200;
+        uint32_t avail = limit > c.written ? (uint32_t)std::min<uint64_t>(limit - c.written, c.size) : 0;
         avail &= ~0x3Fu;
         while (avail) {
-            uint32_t n = std::min(avail, c.size - c.wpos);
-            feed(c, c.wpos, n);
-            c.wpos = (c.wpos + n) % c.size;
+            uint32_t wpos = (uint32_t)(c.written % c.size);
+            uint32_t n = std::min(avail, c.size - wpos);
+            feed(c, wpos, n);
+            c.written += n;
             avail -= n;
         }
     }
