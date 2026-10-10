@@ -105,6 +105,10 @@ imports only `kernel32`, `user32`, `gdi32`, `winmm` and `msvcrt`.
 
 ## Running
 
+Prebuilt binaries are in [`release/`](release/): `eod-win32.zip` (Windows 7+)
+and `eod-linux-x86_64.tar.gz` (headless test build), with SHA-256 checksums.
+The game data is not included.
+
 Put `eod.exe` in the folder with the disc files (or pass `--data <folder>`).
 
 | Option | Meaning |
