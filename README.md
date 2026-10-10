@@ -1,11 +1,132 @@
-# Test Drive: Eve of Destruction — native PC port (PS2 static recompilation)
+# eod-recomp — Test Drive: Eve of Destruction, native PC port
 
-This repository turns the PlayStation 2 executable of **Test Drive: Eve of
+> **Work in progress.** The game boots and is playable from start to finish of
+> a race, but there are known bugs, performance is still being worked on and
+> several PC features are missing. See the [TODO](#todo) list below.
+
+This project turns the PlayStation 2 executable of **Test Drive: Eve of
 Destruction** (NTSC-U, `SLUS_209.10`, v1.00) into C/C++ source code that builds
-into a native Windows program (Windows 7 or later, 32- or 64-bit, any SSE2 CPU
-such as a Core 2 Duo).
+into a native Windows program (Windows 7 or later, 32- or 64-bit) by **static
+recompilation**, the approach used by projects like N64Recomp/Zelda64Recomp.
+It is not an emulator: the game's code is translated to C ahead of time and
+runs natively, on top of a runtime that replaces the PS2 hardware.
+
+**No game files are included.** You need your own copy of the game disc.
 
 ![Title screen rendered by the port](docs/img/title_screen.png)
+
+## Status
+
+| Area | State |
+| --- | --- |
+| Recompiled code | Complete; boots through the SDK libraries and the game's init |
+| Graphics | Direct3D 11 renderer (feature level 10_0+, internal resolution up to 6x) and a software GS renderer |
+| Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
+| Memory card | Saves to `memcard/port0` next to the game data |
+| Sound | Sound effects, music and speech work; FMV audio is somewhat distorted |
+| FMV | Intro, attract and menu background movies play |
+| Gameplay | Menus, Career mode, the garage and races play |
+| Performance | Playable on a low-end laptop (Core i3-6006U, Intel HD 520); heavy race scenes are still CPU-bound |
+| Widescreen | Not yet: the 4:3 picture is stretched to the window |
+
+![Boot sequence](docs/img/boot_sequence.png)
+
+## TODO
+
+In order of priority:
+
+1. **VU1 performance.** The game's VU1 micro programs (geometry/lighting) are
+   compiled ahead of time to C++ but still take most of the CPU time in
+   races. Make them cheaper (only compute pipeline flags where they are read,
+   keep registers in locals, fewer scoreboard updates) so races run at full
+   frame rate on low-end CPUs.
+2. **FMV audio.** The audio of the movies plays somewhat distorted.
+3. **More intuitive setup controls.** Make `eodsetup.exe` (keyboard and
+   controller bindings, options) easier to understand and use.
+4. **PC features, further down the line:**
+   * real widescreen support (a wider field of view with correct proportions
+     instead of stretching the 4:3 image), possibly based on existing PS2
+     widescreen patches or SilentPatch-style fixes; FMVs keep playing in 4:3
+   * mouse and keyboard support
+   * mouselook
+
+![Main menu](docs/img/main_menu_seq.png)
+
+## Game files
+
+To run the port you need your own copy of the disc. Copy the whole disc (at
+least `SLUS_209.10`, `SYSTEM.CNF` and the `DATA` folder) into one folder and
+put `eod.exe` there (or pass `--data <folder>`). The executable checks that
+`SLUS_209.10` is the exact version this code was generated from (NTSC-U v1.00).
+
+To **build** the port, `tools/analyze.py` and `tools/recomp.py` also need a
+copy of `SLUS_209.10` in the repository root: the C translation in `gen/` is
+generated from it and is not part of the repository.
+
+## Building
+
+Requirements: your own `SLUS_209.10` in the repository root (see above),
+CMake 3.16+, a C/C++17 compiler and Python 3 with `rabbitizer`
+(`pip install rabbitizer`) to generate `gen/`.
+
+```sh
+# 1. generate the C translation (also done automatically on first configure)
+python3 tools/analyze.py
+python3 tools/recomp.py
+python3 tools/vurecomp.py     # VU micro programs (optional)
+
+# 2a. Windows (cross compile from Linux/WSL with MinGW-w64), 32-bit, runs on Windows 7+
+cmake -S . -B build-win32 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-i686.cmake -DCMAKE_BUILD_TYPE=Release
+ninja -C build-win32          # -> build-win32/eod.exe (static, no DLLs needed)
+
+# 2a'. 64-bit Windows (faster on x64 systems)
+cmake -S . -B build-win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x86_64.cmake -DCMAKE_BUILD_TYPE=Release
+ninja -C build-win64
+
+# 2b. Windows with MSYS2/MinGW on Windows itself
+cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release && cmake --build build
+
+# 2c. Linux (headless test build)
+cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -C build-linux
+```
+
+The 32-bit Windows build targets SSE2 (Pentium 4 / Core 2 and newer) and
+imports only `kernel32`, `user32`, `gdi32`, `winmm` and `msvcrt`.
+
+## Running
+
+There are no prebuilt binaries in this repository yet; build them as above.
+
+`eodsetup.exe` sets the options (renderer, adapter, window size or fullscreen,
+aspect ratio, internal resolution, vsync, sound, keyboard bindings, folders)
+and writes them to `eod.ini` next to `eod.exe`.
+
+The window title shows the speed ("100% speed" = real time) and the drawn
+frames per second.
+
+| Option | Meaning |
+| --- | --- |
+| `--data DIR` | folder containing `SLUS_209.10` and `DATA/` |
+| `--renderer d3d11\|software\|warp` | GS renderer (`warp`: Direct3D 11 on Microsoft's software device) |
+| `--scale N` | initial window size (N × 320×240) |
+| `--log cats` / `--log-file F` | debug logging (`core,kernel,sif,file,gs,...` or `all`; `gsxfer` logs every GS transfer and has to be named) |
+| `--frames N` | exit after N frames (testing) |
+| `--screenshot-every N --screenshot-dir D` | dump frames as PPM |
+
+Keyboard: arrows = D-pad/left stick, X/Space = ✕, C = ○, Z = □, V = △,
+Q/E = L1/R1, A or 1 = L2, D or 3 = R2, Enter = Start, Backspace = Select,
+Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
+
+### Reporting performance
+
+Run a race with
+
+```bat
+set EOD_FPS=1
+eod.exe --log gs,core --log-file eod_log.txt 2> eod_fps.txt
+```
+
+and attach `eod_fps.txt` and `eod_log.txt` to the report.
 
 ## How it works
 
@@ -55,90 +176,6 @@ N64Recomp/Zelda64Recomp:
 
 `config/symbols.txt` collects identified function names; `tools/dis.py` is an
 annotated disassembler used for reverse engineering.
-
-## Status
-
-| Area | State |
-| --- | --- |
-| Recompiled code | Complete; boots through the SDK libraries and the game's init |
-| Graphics | Direct3D 11 renderer (feature level 10_0+, internal resolution up to 6x) and a software GS renderer (own thread on multi-core CPUs, plus raster workers on 4+ threads) |
-| Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
-| Memory card | Saves to `memcard/port0` next to the game data |
-| Game data | Read from the disc files on disk (`DATA/...`) |
-| Sound | Sound effects, PCM streams (`sdrdrv` + SPU2), music and speech streamed from `Speech.bnk` (`stream.irx`) |
-| FMV | Intro, attract and menu background movies play (IPU emulation) |
-| Races | Load and play (Action mode tested): track, cars, HUD, physics |
-| Performance | The game runs at full speed (60 vblanks/s) in races; when rendering can't keep up, frames are skipped (the game logic keeps its speed; about 10-14 drawn frames/s on a 2.1 GHz CPU with 2-4 threads); optimisation in progress |
-
-The game boots, passes the controller and memory card checks, and runs the
-menus, the 3D garage and races.
-
-![Boot sequence](docs/img/boot_sequence.png)
-
-## Game data
-
-The repository does **not** need to contain the game. To run the port you
-need your own copy of the disc. Copy the whole disc (at least `SLUS_209.10`
-and the `DATA` folder: `DATA/RES`, `DATA/CAR`, `DATA/TRK`, `DATA/IOP`, movies)
-into one folder. The executable checks that `SLUS_209.10` is the exact version
-this code was generated from.
-
-## Building
-
-Requirements: CMake 3.16+, a C/C++17 compiler, Python 3 with `rabbitizer`
-(`pip install rabbitizer`) to (re)generate `gen/`.
-
-```sh
-# 1. generate the C translation (also done automatically on first configure)
-python3 tools/analyze.py
-python3 tools/recomp.py
-python3 tools/vurecomp.py     # VU micro programs (optional)
-
-# 2a. Windows (cross compile from Linux/WSL with MinGW-w64), 32-bit, runs on Windows 7+
-cmake -S . -B build-win32 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-i686.cmake -DCMAKE_BUILD_TYPE=Release
-ninja -C build-win32          # -> build-win32/eod.exe (static, no DLLs needed)
-
-# 2a'. 64-bit Windows (faster on x64 systems)
-cmake -S . -B build-win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x86_64.cmake -DCMAKE_BUILD_TYPE=Release
-ninja -C build-win64
-
-# 2b. Windows with MSYS2/MinGW on Windows itself
-cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release && cmake --build build
-
-# 2c. Linux (headless test build)
-cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -C build-linux
-```
-
-The 32-bit Windows build targets SSE2 (Pentium 4 / Core 2 and newer) and
-imports only `kernel32`, `user32`, `gdi32`, `winmm` and `msvcrt`.
-
-## Running
-
-Prebuilt binaries are in [`release/`](release/): `eod-win64.zip` (Windows 7+
-x64, recommended), `eod-win32.zip` (Windows 7+, 32-bit) and
-`eod-linux-x86_64.tar.gz` (headless test build), with SHA-256 checksums.
-The game data is not included.
-
-`eodsetup.exe` sets the options (renderer, adapter, window size or fullscreen,
-aspect ratio, internal resolution, vsync, sound, keyboard bindings, folders)
-and writes them to `eod.ini` next to `eod.exe`.
-
-The window title shows the speed ("100% speed" = real time) and the drawn
-frames per second.
-
-Put `eod.exe` in the folder with the disc files (or pass `--data <folder>`).
-
-| Option | Meaning |
-| --- | --- |
-| `--data DIR` | folder containing `SLUS_209.10` and `DATA/` |
-| `--scale N` | initial window size (N × 320×240) |
-| `--log cats` / `--log-file F` | debug logging (`core,kernel,sif,file,gs,...` or `all`; `gsxfer` logs every GS transfer and has to be named) |
-| `--frames N` | exit after N frames (testing) |
-| `--screenshot-every N --screenshot-dir D` | dump frames as PPM |
-
-Keyboard: arrows = D-pad/left stick, X/Space = ✕, C = ○, Z = □, V = △,
-Q/E = L1/R1, A or 1 = L2, D or 3 = R2, Enter = Start, Backspace = Select,
-Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
 
 ## Debugging aids
 
