@@ -179,7 +179,7 @@ void list_adapters(HWND cb) {
 }
 
 void load_into_ui() {
-    sel(GetDlgItem(g_main, ID_RENDERER), g_cfg.renderer == "software" ? 1 : 0);
+    sel(GetDlgItem(g_main, ID_RENDERER), g_cfg.renderer == "software" ? 1 : g_cfg.renderer == "warp" ? 2 : 0);
     HWND ad = GetDlgItem(g_main, ID_ADAPTER);
     int n = (int)SendMessageA(ad, CB_GETCOUNT, 0, 0);
     sel(ad, g_cfg.adapter < n ? g_cfg.adapter : 0);
@@ -216,7 +216,7 @@ void load_into_ui() {
 }
 
 void read_from_ui() {
-    g_cfg.renderer = cur(ID_RENDERER) == 1 ? "software" : "d3d11";
+    g_cfg.renderer = cur(ID_RENDERER) == 1 ? "software" : cur(ID_RENDERER) == 2 ? "warp" : "d3d11";
     g_cfg.adapter = cur(ID_ADAPTER) < 0 ? 0 : cur(ID_ADAPTER);
     g_cfg.fullscreen = checked(ID_FULLSCREEN);
     int s = cur(ID_WINSIZE);
@@ -238,7 +238,7 @@ void read_from_ui() {
 
 void update_enabled() {
     bool d3d = cur(ID_RENDERER) != 1;
-    EnableWindow(GetDlgItem(g_main, ID_ADAPTER), d3d);
+    EnableWindow(GetDlgItem(g_main, ID_ADAPTER), d3d && cur(ID_RENDERER) != 2);
     EnableWindow(GetDlgItem(g_main, ID_SCALE), d3d);
     EnableWindow(GetDlgItem(g_main, ID_VSYNC), d3d);
     EnableWindow(GetDlgItem(g_main, ID_SMOOTH), d3d);
@@ -302,6 +302,7 @@ void build_ui(HWND w) {
     HWND r = combo(160, y + 22, 330, w, ID_RENDERER);
     add(r, "Direct3D 11 (graphics card, recommended)");
     add(r, "Software (CPU only, most compatible)");
+    add(r, "Direct3D 11 WARP (in software, for testing)");
     label("Graphics adapter:", 28, y + 54, 120, w);
     list_adapters(combo(160, y + 52, 330, w, ID_ADAPTER));
     check("Fullscreen", 28, y + 84, 120, w, ID_FULLSCREEN);

@@ -907,7 +907,7 @@ int gs_replay(const char *path, int repeat) {
     std::vector<uint8_t> cmds((size_t)(end - start));
     fseek(f, start, SEEK_SET);
     if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
-    if (g_config.renderer == "d3d11" && hw::start(false)) fprintf(stderr, "replaying with Direct3D 11\n");
+    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp") && hw::start(false)) fprintf(stderr, "replaying with Direct3D 11\n");
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
@@ -1008,7 +1008,7 @@ void gs_init() {
     memset(&st, 0, sizeof st);
     st.imr = 0xFF00;
     st.prmodecont = 1;
-    if (g_config.renderer == "d3d11") {
+    if (g_config.renderer == "d3d11" || g_config.renderer == "warp") {
         if (hw::start(platform_native_window() != nullptr && !getenv("EOD_D3D_NOWINDOW")))
             LOG(LOG_GS, "Direct3D 11 renderer");
         else

@@ -66,6 +66,17 @@ void release(T *&p) {
     p = nullptr;
 }
 
+// Failed Direct3D calls are logged (the first 50) with their source line.
+int g_fails_logged;
+HRESULT check(HRESULT hr, int line) {
+    if (FAILED(hr) && g_fails_logged < 50) {
+        g_fails_logged++;
+        WARN("d3d11: call at gs_d3d11.cpp:%d failed (%08lx)", line, (unsigned long)hr);
+    }
+    return hr;
+}
+#define CHECK(call) check((call), __LINE__)
+
 // ------------------------------------------------------------------ device
 ID3D11Device *g_dev;
 ID3D11DeviceContext *g_ctx;
@@ -180,7 +191,7 @@ bool create_shaders() {
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"FOG", 0, DXGI_FORMAT_R32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    return SUCCEEDED(g_dev->CreateInputLayout(il, 5, k_vs_draw, sizeof k_vs_draw, &g_layout));
+    return SUCCEEDED(CHECK(g_dev->CreateInputLayout(il, 5, k_vs_draw, sizeof k_vs_draw, &g_layout)));
 }
 
 // --------------------------------------------------------------- surfaces
@@ -216,21 +227,21 @@ bool create_surface_texture(Surface *s) {
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     }
-    if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &s->tex))) return false;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &s->tex)))) return false;
     if (s->depth) {
         D3D11_DEPTH_STENCIL_VIEW_DESC dd = {};
         dd.Format = DXGI_FORMAT_D32_FLOAT;
         dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-        g_dev->CreateDepthStencilView(s->tex, &dd, &s->dsv);
+        CHECK(g_dev->CreateDepthStencilView(s->tex, &dd, &s->dsv));
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
         sd.Format = DXGI_FORMAT_R32_FLOAT;
         sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
-        g_dev->CreateShaderResourceView(s->tex, &sd, &s->srv);
+        CHECK(g_dev->CreateShaderResourceView(s->tex, &sd, &s->srv));
         g_ctx->ClearDepthStencilView(s->dsv, D3D11_CLEAR_DEPTH, 0.0f, 0);
     } else {
-        g_dev->CreateRenderTargetView(s->tex, nullptr, &s->rtv);
-        g_dev->CreateShaderResourceView(s->tex, nullptr, &s->srv);
+        CHECK(g_dev->CreateRenderTargetView(s->tex, nullptr, &s->rtv));
+        CHECK(g_dev->CreateShaderResourceView(s->tex, nullptr, &s->srv));
         float black[4] = {0, 0, 0, 0};
         g_ctx->ClearRenderTargetView(s->rtv, black);
     }
@@ -302,7 +313,7 @@ void run_pass(ID3D11PixelShader *ps, int tw, int th, float dx0, float dy0, float
     cb.src[2] = sx1;
     cb.src[3] = sy1;
     D3D11_MAPPED_SUBRESOURCE m;
-    if (SUCCEEDED(g_ctx->Map(g_cb_pass, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    if (SUCCEEDED(CHECK(g_ctx->Map(g_cb_pass, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))) {
         memcpy(m.pData, &cb, sizeof cb);
         g_ctx->Unmap(g_cb_pass, 0);
     }
@@ -386,7 +397,7 @@ ID3D11BlendState *blend_state(uint32_t key) {
         r.BlendOp = D3D11_BLEND_OP_ADD;
     }
     ID3D11BlendState *s = nullptr;
-    g_dev->CreateBlendState(&bd, &s);
+    CHECK(g_dev->CreateBlendState(&bd, &s));
     g_blend_cache[key] = s;
     return s;
 }
@@ -404,7 +415,7 @@ ID3D11DepthStencilState *depth_state(uint32_t key) {
     dd.DepthWriteMask = (key & 32) ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
     if (!dd.DepthFunc) dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
     ID3D11DepthStencilState *s = nullptr;
-    g_dev->CreateDepthStencilState(&dd, &s);
+    CHECK(g_dev->CreateDepthStencilState(&dd, &s));
     g_depth_cache[key] = s;
     return s;
 }
@@ -423,7 +434,7 @@ ID3D11SamplerState *sampler(int idx) {
             sd.MaxLOD = D3D11_FLOAT32_MAX;
             sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
             ID3D11SamplerState *s = nullptr;
-            g_dev->CreateSamplerState(&sd, &s);
+            CHECK(g_dev->CreateSamplerState(&sd, &s));
             g_samplers.push_back(s);
         }
     }
@@ -437,7 +448,7 @@ void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
     DrawCB cb = s.cb;
     if (s.two_pass) cb.flags |= fail_pass ? 0x800u : 0x400u;
     D3D11_MAPPED_SUBRESOURCE m;
-    if (SUCCEEDED(g_ctx->Map(g_cb_draw, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    if (SUCCEEDED(CHECK(g_ctx->Map(g_cb_draw, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))) {
         memcpy(m.pData, &cb, sizeof cb);
         g_ctx->Unmap(g_cb_draw, 0);
     }
@@ -486,7 +497,7 @@ void flush() {
         mode = D3D11_MAP_WRITE_DISCARD;
     }
     D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(g_ctx->Map(g_vb, 0, mode, 0, &m))) return;
+    if (FAILED(CHECK(g_ctx->Map(g_vb, 0, mode, 0, &m)))) return;
     memcpy((uint8_t *)m.pData + g_vb_pos, verts.data(), bytes);
     g_ctx->Unmap(g_vb, 0);
     UINT first = g_vb_pos / sizeof(HwVertex), count = (UINT)verts.size();
@@ -553,15 +564,15 @@ bool create_raw_textures() {
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_raw_tex))) return false;
-    g_dev->CreateShaderResourceView(g_raw_tex, nullptr, &g_raw_srv);
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_raw_tex)))) return false;
+    CHECK(g_dev->CreateShaderResourceView(g_raw_tex, nullptr, &g_raw_srv));
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
-    if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_rb_tex))) return false;
-    g_dev->CreateRenderTargetView(g_rb_tex, nullptr, &g_rb_rtv);
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_rb_tex)))) return false;
+    CHECK(g_dev->CreateRenderTargetView(g_rb_tex, nullptr, &g_rb_rtv));
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    return SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &g_rb_staging));
+    return SUCCEEDED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_rb_staging)));
 }
 
 // Uploads rectangle (x, y, w, h) of the surface from gs::vram.
@@ -619,7 +630,7 @@ void readback_rect(Surface *s, int x, int y, int w, int h) {
     D3D11_BOX box = {0, 0, 0, (UINT)w, (UINT)h, 1};
     g_ctx->CopySubresourceRegion(g_rb_staging, 0, 0, 0, 0, g_rb_tex, 0, &box);
     D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(g_ctx->Map(g_rb_staging, 0, D3D11_MAP_READ, 0, &m))) return;
+    if (FAILED(CHECK(g_ctx->Map(g_rb_staging, 0, D3D11_MAP_READ, 0, &m)))) return;
     const SwizzleTab *T = swizzle_table(s->psm, s->bw);
     bool b16 = bpp_of(s->psm) == 16, b24 = (s->psm & 0xF) == 0x1;
     for (int r = 0; r < h; r++) {
@@ -678,8 +689,8 @@ ID3D11ShaderResourceView *remap_table(uint32_t dst_psm, uint32_t src_psm) {
     D3D11_SUBRESOURCE_DATA init = {tab.data(), (UINT)pw * 4, 0};
     ID3D11Texture2D *t = nullptr;
     ID3D11ShaderResourceView *srv = nullptr;
-    if (SUCCEEDED(g_dev->CreateTexture2D(&td, &init, &t))) {
-        g_dev->CreateShaderResourceView(t, nullptr, &srv);
+    if (SUCCEEDED(CHECK(g_dev->CreateTexture2D(&td, &init, &t)))) {
+        CHECK(g_dev->CreateShaderResourceView(t, nullptr, &srv));
         t->Release();
     }
     g_remaps[key] = srv;
@@ -989,8 +1000,8 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
         bytes += (uint32_t)(w * h * 4);
     }
     TexObj t;
-    if (FAILED(g_dev->CreateTexture2D(&td, init, &t.tex))) return nullptr;
-    g_dev->CreateShaderResourceView(t.tex, nullptr, &t.srv);
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, init, &t.tex)))) return nullptr;
+    CHECK(g_dev->CreateShaderResourceView(t.tex, nullptr, &t.srv));
     t.bytes = bytes;
     t.last_use = g_frame_no;
     g_tex_bytes += bytes;
@@ -1043,9 +1054,9 @@ TempTex *temp_texture(int w, int h) {
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &t.tex))) return nullptr;
-        g_dev->CreateRenderTargetView(t.tex, nullptr, &t.rtv);
-        g_dev->CreateShaderResourceView(t.tex, nullptr, &t.srv);
+        if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &t.tex)))) return nullptr;
+        CHECK(g_dev->CreateRenderTargetView(t.tex, nullptr, &t.rtv));
+        CHECK(g_dev->CreateShaderResourceView(t.tex, nullptr, &t.srv));
         t.w = w;
         t.h = h;
     }
@@ -1397,8 +1408,22 @@ bool start(bool with_window) {
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     UINT flags = D3D11_CREATE_DEVICE_SINGLETHREADED;
     if (getenv("EOD_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
-    HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                   flags, levels, 3, D3D11_SDK_VERSION, &g_dev, &g_level, &g_ctx);
+    // --renderer warp: Microsoft's software Direct3D 11 device (tells driver bugs from renderer bugs)
+    bool warp = g_config.renderer == "warp";
+    if (warp) release(adapter);
+    if (adapter) {
+        DXGI_ADAPTER_DESC ad;
+        if (SUCCEEDED(adapter->GetDesc(&ad))) {
+            char name[128];
+            WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof name, nullptr, nullptr);
+            LOG(LOG_GS, "d3d11: adapter %s (%04x:%04x, %u MB)", name, ad.VendorId, ad.DeviceId,
+                (unsigned)(ad.DedicatedVideoMemory >> 20));
+        }
+    }
+    HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN
+                                            : warp  ? D3D_DRIVER_TYPE_WARP
+                                                    : D3D_DRIVER_TYPE_HARDWARE,
+                                   nullptr, flags, levels, 3, D3D11_SDK_VERSION, &g_dev, &g_level, &g_ctx);
     if (FAILED(hr)) {
         WARN("d3d11: no device (%08lx)", (unsigned long)hr);
         release(adapter);
@@ -1444,9 +1469,9 @@ bool start(bool with_window) {
             return false;
         }
         ID3D11Texture2D *bb = nullptr;
-        g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
+        CHECK(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb));
         if (bb) {
-            g_dev->CreateRenderTargetView(bb, nullptr, &g_back_rtv);
+            CHECK(g_dev->CreateRenderTargetView(bb, nullptr, &g_back_rtv));
             bb->Release();
         }
     }
@@ -1461,40 +1486,40 @@ bool start(bool with_window) {
     bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    g_dev->CreateBuffer(&bd, nullptr, &g_vb);
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_vb));
     bd.ByteWidth = (sizeof(DrawCB) + 15) & ~15u;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    g_dev->CreateBuffer(&bd, nullptr, &g_cb_draw);
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_cb_draw));
     bd.ByteWidth = (sizeof(PassCB) + 15) & ~15u;
-    g_dev->CreateBuffer(&bd, nullptr, &g_cb_pass);
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_cb_pass));
     D3D11_SAMPLER_DESC smp = {};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     smp.MaxLOD = D3D11_FLOAT32_MAX;
-    g_dev->CreateSamplerState(&smp, &g_point_clamp);
+    CHECK(g_dev->CreateSamplerState(&smp, &g_point_clamp));
     smp.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-    g_dev->CreateSamplerState(&smp, &g_linear_clamp);
+    CHECK(g_dev->CreateSamplerState(&smp, &g_linear_clamp));
     D3D11_RASTERIZER_DESC rd = {};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = FALSE;
     rd.ScissorEnable = TRUE;
-    g_dev->CreateRasterizerState(&rd, &g_rs_scissor);
+    CHECK(g_dev->CreateRasterizerState(&rd, &g_rs_scissor));
     rd.ScissorEnable = FALSE;
-    g_dev->CreateRasterizerState(&rd, &g_rs_noscissor);
+    CHECK(g_dev->CreateRasterizerState(&rd, &g_rs_noscissor));
     D3D11_DEPTH_STENCIL_DESC dd = {};
     dd.DepthEnable = FALSE;
     dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
-    g_dev->CreateDepthStencilState(&dd, &g_ds_off);
+    CHECK(g_dev->CreateDepthStencilState(&dd, &g_ds_off));
     dd.DepthEnable = TRUE;
     dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-    g_dev->CreateDepthStencilState(&dd, &g_ds_write_always);
+    CHECK(g_dev->CreateDepthStencilState(&dd, &g_ds_write_always));
     D3D11_BLEND_DESC bl = {};
     bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    g_dev->CreateBlendState(&bl, &g_bs_opaque);
+    CHECK(g_dev->CreateBlendState(&bl, &g_bs_opaque));
     bl.RenderTarget[0].RenderTargetWriteMask = 0;
-    g_dev->CreateBlendState(&bl, &g_bs_none);
+    CHECK(g_dev->CreateBlendState(&bl, &g_bs_none));
     bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     bl.RenderTarget[0].BlendEnable = TRUE;
     bl.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
@@ -1503,11 +1528,11 @@ bool start(bool with_window) {
     bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
     bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    g_dev->CreateBlendState(&bl, &g_bs_alpha);
+    CHECK(g_dev->CreateBlendState(&bl, &g_bs_alpha));
     memset(g_owner, 0, sizeof g_owner);
     memset(g_vram_ok, 0, sizeof g_vram_ok);
     g_on = true;
-    LOG(LOG_GS, "d3d11: feature level %x, render scale %d", (unsigned)g_level, g_scale);
+    LOG(LOG_GS, "d3d11: feature level %x, render scale %d%s", (unsigned)g_level, g_scale, warp ? " (WARP)" : "");
     return true;
 }
 
@@ -1646,6 +1671,16 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
         Surface *d = find_surface((uint32_t)strtoul(show, nullptr, 16), c.fbw ? c.fbw : 1, c.psm, false);
         if (d) s = d, page = (d->bp >> 5) % kPages;
     }
+    {  // log where the display comes from when that changes (not the buffer flips)
+        static uint64_t last[2];
+        uint64_t key = ((uint64_t)c.fbw << 40) ^ ((uint64_t)c.psm << 32) ^ ((uint64_t)c.w << 20) ^
+                       ((uint64_t)c.lines << 8) ^ (s && g_owner[page] == s ? 1 : 0);
+        if (key != last[n]) {
+            last[n] = key;
+            LOG(LOG_GS, "d3d11: display %d shows %x/%d/%x %dx%d at %d,%d from %s", n, c.fbp, c.fbw, c.psm, c.w, c.lines,
+                c.x, c.y, s && g_owner[page] == s ? "a render target" : "GS memory");
+        }
+    }
     if (s && g_owner[page] == s) {
         float sc = (float)g_scale;
         x0 = c.x * sc;
@@ -1669,8 +1704,8 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_disp_tex[n]))) return nullptr;
-        g_dev->CreateShaderResourceView(g_disp_tex[n], nullptr, &g_disp_srv[n]);
+        if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_disp_tex[n])))) return nullptr;
+        CHECK(g_dev->CreateShaderResourceView(g_disp_tex[n], nullptr, &g_disp_srv[n]));
         g_disp_w = g_disp_h = 2048;
     }
     std::vector<uint32_t> img((size_t)c.w * c.lines);
@@ -1766,11 +1801,11 @@ bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
     td.Usage = D3D11_USAGE_STAGING;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ID3D11Texture2D *stg = nullptr;
-    if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &stg))) return false;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &stg)))) return false;
     D3D11_BOX box = {0, 0, 0, (UINT)w, (UINT)h, 1};
     g_ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, t->tex, 0, &box);
     D3D11_MAPPED_SUBRESOURCE m;
-    bool ok = SUCCEEDED(g_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m));
+    bool ok = SUCCEEDED(CHECK(g_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m)));
     LOG(LOG_GS, "d3d11: capture %dx%d circuits %d/%d map %d pmode %llx", w, h, (int)g_last[0].on, (int)g_last[1].on,
         (int)ok, (unsigned long long)st.pmode);
     for (int n = 0; n < 2; n++) {
@@ -1825,14 +1860,14 @@ void present(bool vsync) {
                 unbind_all();
                 release(g_back_rtv);
                 g_ctx->Flush();
-                if (SUCCEEDED(g_swap->ResizeBuffers(0, (UINT)cw, (UINT)ch, DXGI_FORMAT_UNKNOWN, 0))) {
+                if (SUCCEEDED(CHECK(g_swap->ResizeBuffers(0, (UINT)cw, (UINT)ch, DXGI_FORMAT_UNKNOWN, 0)))) {
                     g_back_w = cw;
                     g_back_h = ch;
                 }
                 ID3D11Texture2D *bb = nullptr;
-                g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
+                CHECK(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb));
                 if (bb) {
-                    g_dev->CreateRenderTargetView(bb, nullptr, &g_back_rtv);
+                    CHECK(g_dev->CreateRenderTargetView(bb, nullptr, &g_back_rtv));
                     bb->Release();
                 }
             }
@@ -1841,7 +1876,9 @@ void present(bool vsync) {
             int x, y, w, h;
             platform_display_rect(g_back_w, g_back_h, &x, &y, &w, &h);
             if (g_have_last) compose(g_back_rtv, g_back_w, g_back_h, x, y, w, h, g_config.smooth_display);
-            g_swap->Present(vsync ? 1 : 0, 0);
+            HRESULT hr = CHECK(g_swap->Present(vsync ? 1 : 0, 0));
+            if (FAILED(hr) && g_fails_logged < 50)
+                WARN("d3d11: device removed reason %08lx", (unsigned long)g_dev->GetDeviceRemovedReason());
         }
     }
 }
@@ -1873,7 +1910,7 @@ void finish() {
     flush();
     D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
     ID3D11Query *q = nullptr;
-    if (FAILED(g_dev->CreateQuery(&qd, &q))) return;
+    if (FAILED(CHECK(g_dev->CreateQuery(&qd, &q)))) return;
     g_ctx->End(q);
     BOOL done = FALSE;
     while (g_ctx->GetData(q, &done, sizeof done, 0) != S_OK || !done) Sleep(0);
