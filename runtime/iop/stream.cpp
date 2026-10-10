@@ -178,8 +178,8 @@ void build_disc() {
     build_toc(root, nullptr);
     for (const DiscFile &f : g_files)
         LOG(LOG_FILE, "stream: lsn %7u-%7u %s", f.lsn, f.lsn + f.sectors, f.host_path.c_str());
-    LOG(LOG_FILE, "stream: virtual disc with %zu files, %u sectors, %zu TOC entries", g_files.size(), g_next_lsn,
-        g_toc.size());
+    LOG(LOG_FILE, "stream: virtual disc with %u files, %u sectors, %u TOC entries", (unsigned)g_files.size(), g_next_lsn,
+        (unsigned)g_toc.size());
 }
 
 // Reads `bytes` starting at sector `lsn` (may span files; gaps read as zero).

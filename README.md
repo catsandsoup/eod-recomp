@@ -35,7 +35,12 @@ N64Recomp/Zelda64Recomp:
    * `gs/` – Graphics Synthesizer: swizzled 4 MB VRAM in all pixel formats,
      GIF packets, transfers, CLUTs and a software rasteriser implementing the
      full GS pixel pipeline, with a decoded-texture cache and, on CPUs with
-     four or more threads, rasterisation spread over worker threads
+     four or more threads, rasterisation spread over worker threads.
+     `gs/d3d11/` is the Direct3D 11 renderer: GPU surfaces own the pages of GS
+     memory they draw, with GPU conversions between colour/depth formats and
+     block layouts (the game's shadows reinterpret depth buffers as colour),
+     a content-hashed texture cache and one shader for the GS pixel pipeline
+     (`tools/build_shaders.py` compiles it ahead of time through Wine)
    * `iop/` – the I/O processor: the SIF RPC protocol, plus emulations of the
      IRX modules the game loads: `fileio` (game data from disk), `padman`
      (DualShock 2), `mcserv` (memory card in a host folder), `loadfile`,
@@ -56,7 +61,7 @@ annotated disassembler used for reverse engineering.
 | Area | State |
 | --- | --- |
 | Recompiled code | Complete; boots through the SDK libraries and the game's init |
-| Graphics | Software GS renderer (own thread on multi-core CPUs, plus raster workers on 4+ threads) |
+| Graphics | Direct3D 11 renderer (feature level 10_0+, internal resolution up to 6x) and a software GS renderer (own thread on multi-core CPUs, plus raster workers on 4+ threads) |
 | Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
 | Memory card | Saves to `memcard/port0` next to the game data |
 | Game data | Read from the disc files on disk (`DATA/...`) |
@@ -114,6 +119,10 @@ x64, recommended), `eod-win32.zip` (Windows 7+, 32-bit) and
 `eod-linux-x86_64.tar.gz` (headless test build), with SHA-256 checksums.
 The game data is not included.
 
+`eodsetup.exe` sets the options (renderer, adapter, window size or fullscreen,
+aspect ratio, internal resolution, vsync, sound, keyboard bindings, folders)
+and writes them to `eod.ini` next to `eod.exe`.
+
 The window title shows the speed ("100% speed" = real time) and the drawn
 frames per second.
 
@@ -143,6 +152,11 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
   whole game frames are dropped so the game keeps running at full speed)
 * `--log gs` prints per-second renderer statistics (pixels, texture decoding,
   raster jobs and barriers, pixels per triangle type)
+* `EOD_GS_CENSUS=file` tallies the GS features used (state combinations, rendered
+  buffers read back as textures); `EOD_GS_REPLAY_TRACE=1` logs the primitives of a
+  replay; `EOD_GS_REPLAY_STOP=n EOD_GS_REPLAY_DUMP=file` dumps GS memory after the
+  n-th primitive (compare renderers with `--renderer d3d11|software`);
+  `EOD_D3D_SHOW=bp` displays another buffer
 * `EOD_VU_CHECK=1` runs every compiled VU program a second time in the
   interpreter and reports differences; `EOD_VIF_CHECK=1` does the same for the
   fast VIF unpack paths
