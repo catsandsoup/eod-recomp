@@ -1079,11 +1079,35 @@ struct GifTracker {
         }
         if (--left == 0 && eop) in_packet = false;
     }
+    // feed() over the quadwords from pos to end, a tag's data at a time; stops
+    // after a packet ends.  Returns the new position.
+    size_t advance(const uint8_t *base, size_t pos, size_t end) {
+        while (pos < end) {
+            if (!in_packet || left == 0) {
+                feed(base + pos);
+                pos += 16;
+            } else {
+                size_t k = std::min<size_t>(left, (end - pos) / 16);
+                left -= (uint32_t)k;
+                pos += k * 16;
+                if (left == 0 && eop) in_packet = false;
+            }
+            if (!in_packet) break;
+        }
+        return pos;
+    }
 } g_p3track;
 bool g_p3_vif_mask, g_p3_mode_mask;
 }  // namespace
 
 void gif_path3_enqueue(const uint8_t *data, uint32_t qwc) {
+    if (!gif_path3_pending() && !g_p3_vif_mask && !g_p3_mode_mask) {
+        // not masked and nothing queued: what gif_path3_run would release right away
+        size_t end = (size_t)qwc * 16;
+        for (size_t pos = 0; pos < end;) pos = g_p3track.advance(data, pos, end);
+        gif_transfer(GIF_PATH3, data, qwc);
+        return;
+    }
     g_p3q.insert(g_p3q.end(), data, data + (size_t)qwc * 16);
 }
 
@@ -1096,8 +1120,7 @@ bool gif_path3_run(int max_packets) {
     int done = 0;
     size_t start = g_p3pos;
     while (g_p3pos < g_p3q.size()) {
-        g_p3track.feed(&g_p3q[g_p3pos]);
-        g_p3pos += 16;
+        g_p3pos = g_p3track.advance(g_p3q.data(), g_p3pos, g_p3q.size());
         if (!g_p3track.in_packet) {  // packet finished (EOP)
             if (max_packets >= 0 && ++done >= max_packets) break;
         }

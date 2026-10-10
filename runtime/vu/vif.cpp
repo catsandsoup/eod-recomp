@@ -120,6 +120,93 @@ const UnpackFn g_unpack_fast[4][3][2] = {
 };
 #undef UF
 
+// Any unpack (mask, filling write, V4-5): the format is a template
+// parameter, the mask codes are decoded once per command and positions are
+// counted instead of divided.  (VL == 3: V4-5, one 16-bit RGBA5551 element.)
+template <uint32_t VN, uint32_t VL, bool USN>
+void unpack_gen(Vif &v, const uint8_t *src, uint32_t addr, uint32_t num, uint32_t cl, uint32_t wl, bool masked) {
+    constexpr uint32_t eb = VL == 3 ? 2 : (4 >> VL), nc = VL == 3 ? 1 : VN + 1;
+    uint8_t *mem = v.vu->mem;
+    const uint32_t qmask = (v.vu->mem_mask + 1) / 16 - 1;
+    // write mode per row (0..3) and component: 0 data, 1 row, 2 col, 3 protected
+    uint8_t mcode[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) mcode[r][k] = masked ? (uint8_t)((v.mask >> (r * 8 + k * 2)) & 3) : 0;
+    const bool fill = wl > cl;
+    const uint32_t mode = v.mode;
+    uint32_t cyc = 0, dst = addr;
+    for (uint32_t i = 0; i < num; i++) {
+        const bool has_input = !fill || cyc < cl;
+        uint32_t val[4] = {0, 0, 0, 0};
+        if (has_input) {
+            if (VL == 3) {
+                uint16_t p;
+                memcpy(&p, src, 2);
+                val[0] = (p & 0x1F) << 3;
+                val[1] = ((p >> 5) & 0x1F) << 3;
+                val[2] = ((p >> 10) & 0x1F) << 3;
+                val[3] = (uint32_t)(p >> 15) << 7;
+            } else {
+                uint32_t comp[4] = {0, 0, 0, 0};
+                for (uint32_t k = 0; k < nc; k++) {
+                    if (VL == 0) {
+                        memcpy(&comp[k], src + k * 4, 4);
+                    } else if (VL == 1) {
+                        uint16_t h;
+                        memcpy(&h, src + k * 2, 2);
+                        comp[k] = USN ? h : (uint32_t)(int32_t)(int16_t)h;
+                    } else {
+                        comp[k] = USN ? src[k] : (uint32_t)(int32_t)(int8_t)src[k];
+                    }
+                }
+                switch (VN) {
+                case 0: val[0] = val[1] = val[2] = val[3] = comp[0]; break;
+                case 1: val[0] = comp[0]; val[1] = comp[1]; val[2] = comp[0]; val[3] = comp[1]; break;
+                case 2: val[0] = comp[0]; val[1] = comp[1]; val[2] = comp[2]; val[3] = 0; break;
+                default: memcpy(val, comp, 16); break;
+                }
+            }
+            src += eb * nc;
+        }
+        uint8_t *q = mem + (dst & qmask) * 16;
+        const uint32_t row_sel = cyc < 3 ? cyc : 3;
+        for (int k = 0; k < 4; k++) {
+            uint32_t m = mcode[row_sel][k];
+            if (!has_input && m == 0) m = 1;  // filling write without input data: row register
+            uint32_t out;
+            if (m == 0) {
+                out = val[k];
+                if (mode == 1) out += v.row[k];
+                else if (mode == 2) out = v.row[k] += val[k];
+            } else if (m == 1) {
+                out = v.row[k];
+            } else if (m == 2) {
+                out = v.col[row_sel];
+            } else {
+                continue;  // write protected
+            }
+            memcpy(q + k * 4, &out, 4);
+        }
+        // next position: WL <= CL skips CL - WL quadwords after each WL; filling writes are contiguous
+        if (++cyc == wl) {
+            cyc = 0;
+            dst += fill ? 1 : cl - wl + 1;
+        } else {
+            dst++;
+        }
+    }
+}
+
+typedef void (*UnpackGenFn)(Vif &, const uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, bool);
+#define UG(vn, vl) &unpack_gen<vn, vl, false>, &unpack_gen<vn, vl, true>
+const UnpackGenFn g_unpack_gen[4][4][2] = {
+    {{UG(0, 0)}, {UG(0, 1)}, {UG(0, 2)}, {UG(0, 3)}},
+    {{UG(1, 0)}, {UG(1, 1)}, {UG(1, 2)}, {UG(1, 3)}},
+    {{UG(2, 0)}, {UG(2, 1)}, {UG(2, 2)}, {UG(2, 3)}},
+    {{UG(3, 0)}, {UG(3, 1)}, {UG(3, 2)}, {UG(3, 3)}},
+};
+#undef UG
+
 void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
     uint32_t vn = (c >> 26) & 3, vl = (c >> 24) & 3;
     bool masked = (c >> 28) & 1;
@@ -137,18 +224,22 @@ void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
     static const bool check = getenv("EOD_VIF_CHECK") != nullptr;  // compare with the generic code
     static uint8_t fast_mem[0x4000];
     static uint32_t fast_row[4];
-    if (!masked && wl <= cl && vl != 3) {
-        if (!check) {
-            g_unpack_fast[vn][vl][usn](v, src, addr, num, cl, wl);
-            v.num = 0;
-            return;
-        }
+    const bool fast = !masked && wl <= cl && vl != 3;
+    if (!check) {
+        if (fast) g_unpack_fast[vn][vl][usn](v, src, addr, num, cl, wl);
+        else g_unpack_gen[vn][vl][usn](v, src, addr, num, cl, wl, masked);
+        v.num = 0;
+        return;
+    }
+    {
+        // EOD_VIF_CHECK: run the specialised code, then the reference loop below, and compare
         static uint8_t saved[0x4000];
         uint32_t saved_row[4];
         size_t msize = v.vu->mem_mask + 1;
         memcpy(saved, v.vu->mem, msize);
         memcpy(saved_row, v.row, 16);
-        g_unpack_fast[vn][vl][usn](v, src, addr, num, cl, wl);
+        if (fast) g_unpack_fast[vn][vl][usn](v, src, addr, num, cl, wl);
+        else g_unpack_gen[vn][vl][usn](v, src, addr, num, cl, wl, masked);
         memcpy(fast_mem, v.vu->mem, msize);
         memcpy(fast_row, v.row, 16);
         memcpy(v.vu->mem, saved, msize);
@@ -222,9 +313,9 @@ void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
         }
     }
     v.num = 0;
-    if (check && !masked && wl <= cl && vl != 3 &&
-        (memcmp(fast_mem, v.vu->mem, v.vu->mem_mask + 1) || memcmp(fast_row, v.row, 16)))
-        WARN("VIF%d unpack %08x (cycle %x mode %d): fast path differs", v.n, c, v.cycle, v.mode);
+    if (memcmp(fast_mem, v.vu->mem, v.vu->mem_mask + 1) || memcmp(fast_row, v.row, 16))
+        WARN("VIF%d unpack %08x (cycle %x mode %d mask %08x): %s path differs", v.n, c, v.cycle, v.mode, v.mask,
+             fast ? "fast" : "generic");
 }
 
 // Executes the complete commands at the start of w[0..n); returns the

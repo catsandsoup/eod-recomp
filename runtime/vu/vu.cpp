@@ -151,7 +151,7 @@ inline void vu_flag_flush(VUState *vu) {
     }
 }
 
-inline void vu_flag_push(VUState *vu, uint32_t kind, uint32_t val) {
+__attribute__((always_inline)) inline void vu_flag_push(VUState *vu, uint32_t kind, uint32_t val) {
     VUFlagUpd u = {vu->cycle + 4, val, kind};
     if (!vu->flag_pipe) {  // macro mode: no visible delay
         flag_apply(vu, u);
@@ -621,6 +621,10 @@ void xgkick(VUState *vu, uint32_t addr_qw) {
         if (eop) break;
     }
     if (n > 0x400) n = 0x400;
+    if (a + n <= 0x400) {  // contiguous: straight from VU memory
+        gif_transfer(GIF_PATH1, vu->mem + a * 16, n);
+        return;
+    }
     for (uint32_t k = 0; k < n; k++) memcpy(buf + k * 16, vu->mem + ((a + k) & 0x3FF) * 16, 16);
     gif_transfer(GIF_PATH1, buf, n);
 }
@@ -1188,6 +1192,33 @@ struct VuProg {
         sb.hi[sl] |= (whi);                        \
     } while (0)
 
+// The same on the compiled code's local cycle counter `cyc` (vu->cycle is
+// brought up to date before helpers that use it): compiled code checks the
+// scoreboard only in a block's first three pairs (later ones can only wait
+// for writes of the block itself, resolved at compile time) and records only
+// the writes of its last three pairs (the only ones a successor can see).
+#define VU_STALL_C(ulo, uhi)                                                                  \
+    do {                                                                                      \
+        for (uint64_t dd = 1; dd <= 3; dd++) {                                                \
+            uint64_t ic = cyc - dd;                                                           \
+            int sl = (int)(ic & 3);                                                           \
+            if (sb.stamp[sl] == ic && ((sb.lo[sl] & (ulo)) | (sb.hi[sl] & (uhi)))) {          \
+                if (cyc < ic + 4) cyc = ic + 4;                                               \
+                break;                                                                        \
+            }                                                                                 \
+        }                                                                                     \
+    } while (0)
+#define VU_SCORE_C(wlo, whi)                       \
+    do {                                           \
+        int sl = (int)(cyc & 3);                   \
+        if (sb.stamp[sl] != cyc) {                 \
+            sb.stamp[sl] = cyc;                    \
+            sb.lo[sl] = sb.hi[sl] = 0;             \
+        }                                          \
+        sb.lo[sl] |= (wlo);                        \
+        sb.hi[sl] |= (whi);                        \
+    } while (0)
+
 #if __has_include("vu_rec.inc")
 #define VU_REC 1
 namespace {
@@ -1328,6 +1359,19 @@ const VuProg *vu_rec_find(VUState *vu, uint32_t pc) {
 }
 }  // namespace
 
+// Scoreboards that will stall later code the same way: the writes stamped
+// in the three cycles before `cycle` (older slots are never looked at).
+static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
+    for (uint64_t dd = 1; dd <= 3; dd++) {
+        uint64_t ic = cycle - dd;
+        int sl = (int)(ic & 3);
+        uint64_t alo = a.stamp[sl] == ic ? a.lo[sl] : 0, ahi = a.stamp[sl] == ic ? a.hi[sl] : 0;
+        uint64_t blo = b.stamp[sl] == ic ? b.lo[sl] : 0, bhi = b.stamp[sl] == ic ? b.hi[sl] : 0;
+        if (alo != blo || ahi != bhi) return false;
+    }
+    return true;
+}
+
 void vu_execute(VUState *vu, uint32_t start_pc) {
     uint32_t pc = start_pc & vu->micro_mask & ~7u;
     vu_dump(vu, pc);
@@ -1361,8 +1405,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
         bool same = memcmp(vu->vf, after.vf, sizeof vu->vf) == 0 && memcmp(vu->vi, after.vi, sizeof vu->vi) == 0 &&
                     memcmp(&vu->acc, &after.acc, sizeof vu->acc) == 0 && vu->q == after.q && vu->p == after.p &&
                     vu->i == after.i && vu->clip == after.clip && vu->cycle == after.cycle && vu->tpc == after.tpc &&
-                    memcmp(vu->mem, mem_after, msize) == 0 &&
-                    memcmp(&g_score[vu->index], &sb_after, sizeof sb_after) == 0;
+                    memcmp(vu->mem, mem_after, msize) == 0 && sb_same(g_score[vu->index], sb_after, vu->cycle);
         static int reports;
         if (!same && reports++ < 20) {
             WARN("VU%d program %04x: compiled code differs from the interpreter", vu->index, pc);

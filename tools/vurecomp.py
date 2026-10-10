@@ -311,6 +311,12 @@ BRANCH_OPS = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
 FLAG_READS = {0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B}  # FS*, FM* lower ops
 
 
+# helpers that read vu->cycle, and those that may advance it (stalls)
+CYC_CALLS = ("sync_pipes", "flush_q", "flush_p", "lower_div", "lower(c", "upper(c", "commit_upper", "vu_flags(",
+             "vu_clip(", "vu_flag_sync")
+CYC_ADVANCE = ("flush_q", "flush_p", "lower_div", "lower(c", "upper(c")
+
+
 def is_branch(lo, hi):
     return not (hi & 0x80000000) and (lo >> 25) in BRANCH_OPS
 
@@ -414,8 +420,8 @@ class Prog:
                 return True
         return False
 
-    def pair_code(self, pc, out, ind):
-        """Code executing pair pc (not its control flow).  Returns the branch kind."""
+    def pair_regs(self, pc):
+        """(read lo, read hi, write lo, write hi) VF register bits of pair pc (for stalls)."""
         lo, hi = self.pair(pc)
         ibit = bool(hi & 0x80000000)
         uses = upper_reads(hi)
@@ -425,13 +431,31 @@ class Prog:
             uses = uses + r
         ulo, uhi = reg_bits(uses)
         wlo, whi = reg_bits([lw, upper_vf_write(hi)])
+        return ulo, uhi, wlo, whi
+
+    def pair_code(self, pc, out, ind, ctx):
+        """Code executing pair pc (not its control flow), as pair ctx['j'] of a block of ctx['n'].
+
+        The cycle counter is the local `cyc`.  Stalls: in the block's first
+        three pairs the scoreboard is checked for writes from before the block;
+        writes of earlier pairs of the block (at most three back) are compared
+        with their issue cycles, kept in locals.  Only the last three pairs
+        record their writes in the scoreboard.  vu->cycle is updated before
+        helpers that use it and read back after those that may stall."""
+        lo, hi = self.pair(pc)
+        ibit = bool(hi & 0x80000000)
+        j, n = ctx["j"], ctx["n"]
+        ulo, uhi, wlo, whi = self.pair_regs(pc)
         waitq = not ibit and (lo >> 25) == 0x40 and (lo & 0x3C) == 0x3C and upper_ext(lo) == 0x3B
         out.append(ind + "{  // %04x: %08x %08x" % (pc, hi, lo))
         ind0, ind = ind, ind + "    "
-        if ulo or uhi:
-            out.append(ind + "VU_STALL(0x%xull, 0x%xull);" % (ulo, uhi))
+        if j < 3 and (ulo or uhi):
+            out.append(ind + "VU_STALL_C(0x%xull, 0x%xull);" % (ulo, uhi))
+        for i in ctx["src"]:
+            out.append(ind + "if (cyc < t%d + 4) cyc = t%d + 4;" % (i, i))
+        body = []
         if waitq:
-            out.append(ind + "flush_q(vu);")
+            body.append("flush_q(vu);")
         fm = upper_fmac(hi)
         um = upper_misc(hi)
         lc = None
@@ -443,15 +467,15 @@ class Prog:
             (fm is not None and fm[1] == "S_Q") or \
             (lc is not None and (lc.startswith("lower(c,") or "vu->p" in lc))
         if need_sync:
-            out.append(ind + "sync_pipes(vu);")
+            body.append("sync_pipes(vu);")
         # flag instructions see the flag results issued 4+ cycles earlier
         if lc is not None and ((lo >> 25) in FLAG_OPS or lc.startswith("lower(c,")):
-            out.append(ind + "vu_flag_sync(vu);")
+            body.append("vu_flag_sync(vu);")
         commit = []
         if fm is not None:
             o, src, acc = fm
             dest = dest_of(hi)
-            out.append(ind + "__m128 ur = up_val<%s, %s>(vu, 0x%08Xu);" % (o, src, hi))
+            body.append("__m128 ur = up_val<%s, %s>(vu, 0x%08Xu);" % (o, src, hi))
             if acc or FD(hi):
                 commit.append("vu_store<%d>(%s, ur);" % (dest, "vu->acc.f" if acc else "vu->vf[%d].f" % FD(hi)))
             if self.flags and o not in ("OP_MAX", "OP_MIN"):
@@ -459,18 +483,18 @@ class Prog:
         elif um is not None:
             pre, val, reg = um
             if pre:
-                out.append(ind + pre)
+                body.append(pre)
             if val and reg and dest_of(hi):
-                out.append(ind + "__m128 ur = %s;" % val)
+                body.append("__m128 ur = %s;" % val)
                 commit.append("vu_store<%d>(vu->vf[%d].f, ur);" % (dest_of(hi), reg))
         elif not upper_is_nop(hi):
-            out.append(ind + "c.up_write = false;")
-            out.append(ind + "c.mac_set = false;")
-            out.append(ind + "upper(c, 0x%08Xu);" % hi)
+            body.append("c.up_write = false;")
+            body.append("c.mac_set = false;")
+            body.append("upper(c, 0x%08Xu);" % hi)
             commit.append("commit_upper(c);")
         if ibit:
-            out += [ind + x for x in commit]
-            out.append(ind + "{ uint32_t b = 0x%08Xu; memcpy(&vu->i, &b, 4); }" % lo)
+            body += commit
+            body.append("{ uint32_t b = 0x%08Xu; memcpy(&vu->i, &b, 4); }" % lo)
         else:
             op = lo >> 25
             if op in BRANCH_OPS:
@@ -479,11 +503,11 @@ class Prog:
                     pass
                 elif op == 0x21:
                     if it:
-                        out.append(ind + "set_vi(vu, %d, %d);" % (it, (pc + 16) // 8))
+                        body.append("set_vi(vu, %d, %d);" % (it, (pc + 16) // 8))
                 elif op in (0x24, 0x25):
-                    out.append(ind + "jr = vu->vi[%d] * 8;" % is_)
+                    body.append("jr = vu->vi[%d] * 8;" % is_)
                     if op == 0x25 and it:
-                        out.append(ind + "set_vi(vu, %d, %d);" % (it, (pc + 16) // 8))
+                        body.append("set_vi(vu, %d, %d);" % (it, (pc + 16) // 8))
                 else:
                     cond = {0x28: "(uint16_t)vu->vi[%d] == (uint16_t)vu->vi[%d]" % (is_, it),
                             0x29: "(uint16_t)vu->vi[%d] != (uint16_t)vu->vi[%d]" % (is_, it),
@@ -491,14 +515,52 @@ class Prog:
                             0x2D: "(int16_t)vu->vi[%d] > 0" % is_,
                             0x2E: "(int16_t)vu->vi[%d] <= 0" % is_,
                             0x2F: "(int16_t)vu->vi[%d] >= 0" % is_}[op]
-                    out.append(ind + "take = %s;" % cond)
+                    body.append("take = %s;" % cond)
             elif lc:
-                out.append(ind + lc)
-            out += [ind + x for x in commit]
-        if wlo or whi:
-            out.append(ind + "VU_SCORE(0x%xull, 0x%xull);" % (wlo, whi))
-        out.append(ind + "vu->cycle++;")
+                body.append(lc)
+            body += commit
+        uses_cyc = any(any(k in b for k in CYC_CALLS) for b in body)
+        advances = any(any(k in b for k in CYC_ADVANCE) for b in body)
+        if uses_cyc:
+            out.append(ind + "vu->cycle = cyc;")
+        out += [ind + b for b in body]
+        if advances:
+            out.append(ind + "cyc = vu->cycle;")
+        if j in ctx["needt"]:
+            out.append(ind + "t%d = cyc;" % j)
+        if j >= n - 3 and (wlo or whi):
+            out.append(ind + "VU_SCORE_C(0x%xull, 0x%xull);" % (wlo, whi))
+        out.append(ind + "cyc++;")
         out.append(ind0 + "}")
+
+    def blocks(self):
+        """Basic blocks: {leader: [pcs]} (a branch's delay slot belongs to its block)."""
+        leaders = set(e & self.mask for e in self.entries)
+        for pc in self.labels:
+            lo, hi = self.pair(pc)
+            if is_branch(lo, hi):
+                op = lo >> 25
+                if op not in (0x24, 0x25):
+                    leaders.add(self.target(pc, lo))
+                if op not in (0x20, 0x24):  # fall-through, or the return address of BAL/JALR
+                    leaders.add((pc + 16) & self.mask)
+        leaders &= self.labels
+        out = {}
+        for ld in sorted(leaders):
+            pcs = []
+            pc = ld
+            while True:
+                lo, hi = self.pair(pc)
+                pcs.append(pc)
+                if has_ebit(hi) or is_branch(lo, hi):
+                    pcs.append((pc + 8) & self.mask)  # E-bit successor / delay slot
+                    break
+                nxt = (pc + 8) & self.mask
+                if nxt in leaders or nxt not in self.labels:
+                    break
+                pc = nxt
+            out[ld] = pcs
+        return out
 
     def emit(self, name):
         out = ["void %s(VUState *vu, uint32_t entry) {" % name,
@@ -507,50 +569,67 @@ class Prog:
                "    Scoreboard &sb = g_score[vu->index];",
                "    bool take = false;",
                "    uint32_t jr = 0;",
+               "    uint64_t cyc;",
                "    (void)take;",
                "    (void)jr;",
                "    (void)sb;",
                "    vu->running = 1;",
                "    vu->flag_pipe = 1;",
                "    switch (entry) {"]
+        bl = self.blocks()
         for e in self.entries:
             out.append("    case 0x%04X: goto L_%04X;" % (e, e))
         out.append("    default: vu_interp(vu, entry); return;")
         out.append("    }")
-        out = out
-        for pc in sorted(self.labels):
-            lo, hi = self.pair(pc)
-            out.append("L_%04X: {" % pc)
-            self.pair_code(pc, out, "    ")
-            nxt = (pc + 8) & self.mask
-            if has_ebit(hi):
-                self.pair_code(nxt, out, "    ")
-                out.append("    vu->tpc = 0x%04X;" % nxt)
+        for ld, pcs in sorted(bl.items()):
+            n = len(pcs)
+            regs = [self.pair_regs(p) for p in pcs]
+            src = []
+            needt = set()
+            for j in range(n):
+                rl, rh = regs[j][0], regs[j][1]
+                s_ = [i for i in range(max(0, j - 3), j) if (regs[i][2] & rl) or (regs[i][3] & rh)]
+                src.append(s_)
+                needt.update(s_)
+            out.append("L_%04X: {" % ld)
+            out.append("    cyc = vu->cycle;")
+            if needt:
+                out.append("    uint64_t %s;" % ", ".join("t%d = 0" % i for i in sorted(needt)))
+            for j, pc in enumerate(pcs):
+                self.pair_code(pc, out, "    ", {"j": j, "n": n, "src": src[j], "needt": needt})
+            out.append("    vu->cycle = cyc;")
+            last = pcs[-2] if n >= 2 else pcs[-1]
+            lo, hi = self.pair(last)
+            tail = pcs[-1]
+            tlo, thi = self.pair(tail)
+            if n >= 2 and has_ebit(hi):
+                out.append("    vu->tpc = 0x%04X;" % tail)
                 out.append("    goto end;")
-            elif is_branch(lo, hi):
+            elif n >= 2 and is_branch(lo, hi):
                 op = lo >> 25
-                self.pair_code(nxt, out, "    ")
-                after = (pc + 16) & self.mask
+                after = (last + 16) & self.mask
                 if op in (0x24, 0x25):
                     out.append("    goto dispatch;")
                 elif op in (0x20, 0x21):
-                    out.append("    goto L_%04X;" % self.target(pc, lo))
+                    out.append("    goto L_%04X;" % self.target(last, lo))
                 else:
-                    out.append("    if (take) goto L_%04X;" % self.target(pc, lo))
+                    out.append("    if (take) goto L_%04X;" % self.target(last, lo))
                     out.append("    goto L_%04X;" % after)
             else:
-                if nxt in self.labels:
+                nxt = (tail + 8) & self.mask
+                if nxt in bl:
                     out.append("    goto L_%04X;" % nxt)
                 else:
                     out.append("    vu_interp(vu, 0x%04X);" % nxt)
                     out.append("    return;")
             out.append("}")
-        out.append("dispatch:")
-        out.append("    switch (jr & 0x%X) {" % self.mask)
-        for pc in sorted(self.labels):
-            out.append("    case 0x%04X: goto L_%04X;" % (pc, pc))
-        out.append("    default: vu_interp(vu, jr & 0x%X); return;" % self.mask)
-        out.append("    }")
+        if any(l.strip() == "goto dispatch;" for l in out):  # a jump through a register
+            out.append("dispatch:")
+            out.append("    switch (jr & 0x%X) {" % self.mask)
+            for ld in sorted(bl):
+                out.append("    case 0x%04X: goto L_%04X;" % (ld, ld))
+            out.append("    default: vu_interp(vu, jr & 0x%X); return;" % self.mask)
+            out.append("    }")
         out.append("end:")
         out.append("    flush_q(vu);")
         out.append("    flush_p(vu);")
