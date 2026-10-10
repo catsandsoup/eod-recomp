@@ -1,0 +1,13 @@
+build*/
+gen/
+__pycache__/
+*.pyc
+memcard/
+
+# game files: never commit
+data/
+DATA/
+SLUS_209.10
+system.cnf
+SYSTEM.CNF
+release/
