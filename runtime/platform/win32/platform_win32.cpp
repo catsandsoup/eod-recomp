@@ -17,8 +17,11 @@
 #include <string>
 #include <vector>
 
+#include "../../core/config.h"
 #include "../platform.h"
 #include "../pad_script.h"
+
+void build_key_map();
 
 namespace {
 
@@ -86,13 +89,8 @@ void paint(HDC dc) {
     GetClientRect(g_hwnd, &rc);
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
     if (g_bgra.empty() || cw <= 0 || ch <= 0) return;
-    // keep 4:3, letterbox the rest
-    int vw = cw, vh = cw * 3 / 4;
-    if (vh > ch) {
-        vh = ch;
-        vw = ch * 4 / 3;
-    }
-    int vx = (cw - vw) / 2, vy = (ch - vh) / 2;
+    int vx, vy, vw, vh;
+    platform_display_rect(cw, ch, &vx, &vy, &vw, &vh);
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = g_fw;
@@ -216,13 +214,14 @@ bool platform_init(const PlatformConfig &cfg) {
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wc.lpszClassName = "EodWindow";
     RegisterClassA(&wc);
-    int scale = cfg.window_scale > 0 ? cfg.window_scale : 2;
-    RECT r = {0, 0, 320 * scale, 240 * scale};
+    build_key_map();
+    RECT r = {0, 0, cfg.width > 0 ? cfg.width : 1280, cfg.height > 0 ? cfg.height : 960};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowA("EodWindow", cfg.title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) return false;
     ShowWindow(g_hwnd, SW_SHOW);
+    if (cfg.fullscreen) toggle_fullscreen();
     UpdateWindow(g_hwnd);
     return true;
 }
@@ -317,28 +316,45 @@ void platform_sleep_us(uint32_t us) {
 // ------------------------------------------------------------------ input
 static inline bool key(int vk) { return g_keys[vk & 255]; }
 
+namespace {
+struct KeyBind {
+    int vk;
+    uint16_t btn;
+};
+std::vector<KeyBind> g_key_map;
+const uint16_t kPadBits[KEY_COUNT] = {PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_CROSS, PAD_CIRCLE, PAD_SQUARE,
+                                      PAD_TRIANGLE, PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_L3, PAD_R3, PAD_START,
+                                      PAD_SELECT};
+}  // namespace
+
+// keyboard bindings from eod.ini ([Input], comma separated key names)
+void build_key_map() {
+    g_key_map.clear();
+    for (int i = 0; i < KEY_COUNT; i++) {
+        const std::string &list = g_config.keys[i];
+        size_t p = 0;
+        while (p <= list.size()) {
+            size_t c = list.find(',', p);
+            if (c == std::string::npos) c = list.size();
+            int vk = key_code(list.substr(p, c - p));
+            if (vk) g_key_map.push_back({vk, kPadBits[i]});
+            p = c + 1;
+        }
+    }
+}
+
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     if (port == 0) {
         // keyboard (always available on port 0)
         out->connected = true;
-        struct Map {
-            int vk;
-            uint16_t btn;
-        } map[] = {
-            {VK_UP, PAD_UP},         {VK_DOWN, PAD_DOWN},     {VK_LEFT, PAD_LEFT},  {VK_RIGHT, PAD_RIGHT},
-            {'X', PAD_CROSS},        {'C', PAD_CIRCLE},       {'Z', PAD_SQUARE},    {'V', PAD_TRIANGLE},
-            {'Q', PAD_L1},           {'E', PAD_R1},           {'1', PAD_L2},        {'3', PAD_R2},
-            {VK_RETURN, PAD_START},  {VK_BACK, PAD_SELECT},   {VK_SPACE, PAD_CROSS},
-            {'A', PAD_L2},           {'D', PAD_R2},
-        };
-        for (const Map &m : map)
+        for (const KeyBind &m : g_key_map)
             if (key(m.vk)) out->buttons |= m.btn;
-        // left stick from WASD-style keys for steering
-        if (key(VK_LEFT)) out->lx = 0;
-        if (key(VK_RIGHT)) out->lx = 255;
-        if (key(VK_UP)) out->ly = 0;
-        if (key(VK_DOWN)) out->ly = 255;
+        // the direction keys also move the left stick (steering)
+        if (out->buttons & PAD_LEFT) out->lx = 0;
+        if (out->buttons & PAD_RIGHT) out->lx = 255;
+        if (out->buttons & PAD_UP) out->ly = 0;
+        if (out->buttons & PAD_DOWN) out->ly = 255;
     }
     if (pXInputGetState) {
         XINPUT_STATE_ xs;
@@ -386,6 +402,24 @@ void platform_get_pad(int port, HostPadState *out) {
         if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
 }
 
+void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
+    int vw = cw, vh = ch;
+    if (g_cfg.aspect != 2) {  // 4:3 or 16:9, letterboxed
+        int an = g_cfg.aspect == 1 ? 16 : 4, ad = g_cfg.aspect == 1 ? 9 : 3;
+        vh = cw * ad / an;
+        if (vh > ch) {
+            vh = ch;
+            vw = ch * an / ad;
+        }
+    }
+    *x = (cw - vw) / 2;
+    *y = (ch - vh) / 2;
+    *w = vw;
+    *h = vh;
+}
+
+void *platform_native_window() { return g_hwnd; }
+
 void platform_set_status(const char *text) {
     if (!g_hwnd) return;
     char buf[256];
@@ -395,6 +429,7 @@ void platform_set_status(const char *text) {
 
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) {
     if (!pXInputSetState) return;
+    if (!g_config.vibration) small_motor = large_motor = 0;
     XINPUT_VIBRATION_ v;
     v.wLeftMotorSpeed = (WORD)(large_motor * 257);
     v.wRightMotorSpeed = small_motor ? 0xFFFF : 0;

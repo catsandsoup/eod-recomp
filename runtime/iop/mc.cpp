@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "../core/config.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "iop.h"
@@ -49,7 +50,9 @@ std::string g_cwd[2] = {"/", "/"};
 std::string port_root(int port) {
     // EOD_MEMCARD=dir puts the cards elsewhere (e.g. a fresh card for tests)
     const char *env = getenv("EOD_MEMCARD");
-    std::string r = env ? std::string(env) : g_game_root + "/memcard";
+    std::string r = env                           ? std::string(env)
+                    : !g_config.memcard_dir.empty() ? g_config.memcard_dir
+                                                    : g_game_root + "/memcard";
     mkdir_host(r.c_str());
     r += port ? "/port1" : "/port0";
     mkdir_host(r.c_str());

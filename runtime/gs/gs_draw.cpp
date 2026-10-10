@@ -17,12 +17,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #if defined(__linux__)
 #include <pthread.h>
 #endif
 
+#include "../core/config.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "gs_mem.h"
@@ -327,7 +329,7 @@ void setup_env(uint32_t attr) {
         // 8 drawn frames per second while the game keeps its speed).
         static bool presenting;
         static int skipped;
-        static const bool enabled = !getenv("EOD_FRAMESKIP") || atoi(getenv("EOD_FRAMESKIP")) != 0;
+        static const bool enabled = getenv("EOD_FRAMESKIP") ? atoi(getenv("EOD_FRAMESKIP")) != 0 : g_config.frame_skip;
         uint32_t fbp = bits(st.ctx[(attr >> 9) & 1].frame, 0, 9) * 32;
         uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
         if (fbp != e.fbp && fbp == shown) {
@@ -475,6 +477,113 @@ void setup_env(uint32_t attr) {
     } else {
         e.tcached = false;
     }
+}
+
+// ------------------------------------------------------------- census
+// EOD_GS_CENSUS=file: tallies the GS features used (state combinations per
+// primitive, rendered buffers read back as textures, transfers and display
+// over rendered memory) and writes them at exit.  Development aid.
+namespace census {
+bool g_on = getenv("EOD_GS_CENSUS") != nullptr;
+std::mutex &g_mtx = *new std::mutex;
+std::unordered_map<std::string, uint64_t> &g_count = *new std::unordered_map<std::string, uint64_t>;
+struct Owner {
+    bool set;
+    bool z;
+    uint32_t bp, bw, psm;
+};
+Owner g_owner[kPages];
+
+void add(const std::string &k, uint64_t n) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_count[k] += n;
+}
+
+void dump() {
+    FILE *f = fopen(getenv("EOD_GS_CENSUS"), "w");
+    if (!f) return;
+    std::vector<std::pair<std::string, uint64_t>> v(g_count.begin(), g_count.end());
+    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    for (auto &kv : v) fprintf(f, "%12llu  %s\n", (unsigned long long)kv.second, kv.first.c_str());
+    fclose(f);
+}
+
+void own(uint32_t bp, uint32_t bw, uint32_t psm, int w, int h, bool z) {
+    uint32_t first, count;
+    page_range(bp, bw, psm, 0, 0, w, h, first, count);
+    for (uint32_t i = 0; i < count; i++) g_owner[(first + i) % kPages] = {true, z, bp, bw, psm};
+}
+
+std::string owners(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    uint32_t first, count;
+    page_range(bp, bw, psm, x, y, w, h, first, count);
+    std::string out;
+    for (uint32_t i = 0; i < count; i++) {
+        const Owner &o = g_owner[(first + i) % kPages];
+        if (!o.set) continue;
+        char b[64];
+        snprintf(b, sizeof b, "%s%x/%d/%x", o.z ? "Z" : "F", o.bp, o.bw, o.psm);
+        if (out.find(b) == std::string::npos) out += std::string(out.empty() ? "" : ",") + b;
+    }
+    return out;
+}
+
+void draw(const Env &e, const char *prim, uint64_t area) {
+    static bool reg = (atexit(dump), true);
+    (void)reg;
+    char k[512];
+    snprintf(k, sizeof k,
+             "draw %s fb=%x/%d/%x msk=%x z=%x/%x zt=%d zm=%d ate=%d/%d/%x/%d date=%d/%d abe=%d %d%d%d%d fix=%x pabe=%d "
+             "clamp=%d fba=%d tme=%d tex=%x/%x cpsm=%x tfx=%d tcc=%d wrap=%d%d mag=%d min=%d mxl=%d fge=%d iip=%d fst=%d",
+             prim, e.fbp, e.fbw, e.fpsm_mem, e.fbmsk, e.zbp, e.zpsm, e.ztst, (int)e.zmsk, (int)e.ate, e.atst, e.aref,
+             e.afail, (int)e.date, (int)e.datm, (int)e.abe, e.ba, e.bb, e.bc, e.bd, e.bfix, (int)e.pabe,
+             (int)e.colclamp, (int)e.fba, (int)e.tme, e.tme ? e.tbp : 0, e.tme ? e.tpsm : 0, e.tme ? e.cpsm : 0,
+             e.tme ? e.tfx : 0, e.tme ? (int)e.tcc : 0, e.tme ? e.wms : 0, e.tme ? e.wmt : 0,
+             e.tme ? (int)e.bilinear_mag : 0, e.tme ? e.mmin : 0, e.tme ? e.mxl : 0, (int)e.fge, (int)e.iip,
+             (int)e.fst);
+    std::string key = k;
+    add(key, 1);
+    add("pixels " + key, area);
+    int h = e.scy1 + 1, w = (int)e.fbw * 64;
+    if (e.tme) {
+        std::string o = owners(e.tbp, e.tbw, e.tpsm, 0, 0, (int)e.tw, (int)e.th);
+        if (!o.empty()) {
+            char t[256];
+            snprintf(t, sizeof t, "tex-from-rendered tex=%x/%d/%x %dx%d <- %s (draw fb=%x/%x)", e.tbp, e.tbw, e.tpsm,
+                     e.tw, e.th, o.c_str(), e.fbp, e.fpsm_mem);
+            add(t, 1);
+        }
+    }
+    uint32_t full = (e.fpsm_mem & 0xF) == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
+    if ((e.fbmsk & full) != full) own(e.fbp, e.fbw, e.fpsm_mem, w, h, false);
+    if (!e.zmsk && e.ztst != 0) own(e.zbp, e.fbw, e.zpsm, w, h, true);
+}
+
+}  // namespace census
+
+void census_xfer_impl(int dir, uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t dbp, uint32_t dbw, uint32_t dpsm,
+                 int sx, int sy, int dx, int dy, int w, int h) {
+    if (!census::g_on) return;
+    char k[256];
+    std::string so = dir == 0 ? "" : census::owners(sbp, sbw, spsm, sx, sy, w, h);
+    std::string d = dir == 1 ? "" : census::owners(dbp, dbw, dpsm, dx, dy, w, h);
+    snprintf(k, sizeof k, "xfer dir=%d src=%x/%d/%x [%s] dst=%x/%d/%x [%s] %dx%d", dir, dir ? sbp : 0, dir ? sbw : 0,
+             dir ? spsm : 0, so.c_str(), dir != 1 ? dbp : 0, dir != 1 ? dbw : 0, dir != 1 ? dpsm : 0, d.c_str(), w,
+             h);
+    census::add(k, 1);
+    if (dir != 1) {
+        uint32_t first, count;
+        page_range(dbp, dbw, dpsm, dx, dy, w, h, first, count);
+        for (uint32_t i = 0; i < count; i++) census::g_owner[(first + i) % kPages].set = false;
+    }
+}
+
+void census_display_impl(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h) {
+    if (!census::g_on) return;
+    char k[256];
+    snprintf(k, sizeof k, "display fb=%x/%d/%x %dx%d <- %s", fbp, fbw, psm, w, h,
+             census::owners(fbp, fbw, psm, 0, 0, w, h).c_str());
+    census::add(k, 1);
 }
 
 // ------------------------------------------------------------- texturing
@@ -1421,6 +1530,8 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
+    if (census::g_on)
+        census::draw(e, "sprite", (uint64_t)std::abs((b.x - a.x) >> 4) * (uint64_t)std::abs((b.y - a.y) >> 4));
     if (g_trace) {
         Vertex vv[2] = {a, b};
         trace_prim("SPRITE", vv, 2);
@@ -1492,6 +1603,10 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
+    if (census::g_on) {
+        int64_t ar = ((int64_t)(b0.x - a0.x) * (c0.y - a0.y) - (int64_t)(c0.x - a0.x) * (b0.y - a0.y)) / 512;
+        census::draw(e, "tri", (uint64_t)(ar < 0 ? -ar : ar));
+    }
     if (g_trace) {
         Vertex vv[3] = {a0, b0, c0};
         trace_prim("TRI", vv, 3);
@@ -1619,6 +1734,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
+    if (census::g_on) census::draw(e, "line", 1);
     if (e.write_none) return;
     note_draw();
     barrier();
@@ -1655,6 +1771,7 @@ void draw_point(const Vertex &a) {
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
+    if (census::g_on) census::draw(e, "point", 1);
     if (e.write_none) return;
     note_draw();
     barrier();
@@ -1811,5 +1928,12 @@ void raster_collect_stats() {
         w = WStats();
     }
 }
+
+void census_xfer(int dir, uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t dbp, uint32_t dbw, uint32_t dpsm,
+                 int sx, int sy, int dx, int dy, int w, int h) {
+    census_xfer_impl(dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
+}
+
+void census_display(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h) { census_display_impl(fbp, fbw, psm, w, h); }
 
 }  // namespace gs

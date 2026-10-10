@@ -76,6 +76,14 @@ void platform_set_vibration(int, uint8_t, uint8_t) {}
 
 void platform_set_status(const char *) {}
 
+void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
+    *x = *y = 0;
+    *w = cw;
+    *h = ch;
+}
+
+void *platform_native_window() { return nullptr; }
+
 bool platform_audio_open(int) { return true; }
 // EOD_WAV=file: the headless build writes the audio (48 kHz stereo) to a WAV file.
 void platform_audio_submit(const int16_t *samples, int frames) {

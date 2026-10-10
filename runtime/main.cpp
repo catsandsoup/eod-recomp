@@ -18,6 +18,7 @@
 #define HAVE_SSE 1
 #endif
 
+#include "core/config.h"
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
@@ -111,6 +112,17 @@ int main(int argc, char **argv) {
 #endif
     PlatformConfig cfg;
     std::string data_dir;
+    // settings: eod.ini next to the executable (--config overrides the path)
+    std::string config_path = dir_of(argv[0]) + "/eod.ini";
+    for (int i = 1; i + 1 < argc; i++)
+        if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
+    config_load(config_path);
+    cfg.width = g_config.width;
+    cfg.height = g_config.height;
+    cfg.fullscreen = g_config.fullscreen;
+    cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
+    cfg.smooth = g_config.smooth_display;
+    if (!g_config.data_dir.empty()) data_dir = g_config.data_dir;
     const char *log_spec = getenv("EOD_LOG");
     const char *replay = nullptr;
     int repeat = 3;
@@ -124,17 +136,26 @@ int main(int argc, char **argv) {
             return argv[++i];
         };
         if (a == "--data") data_dir = next();
+        else if (a == "--config") next();
+        else if (a == "--renderer") g_config.renderer = next();
+        else if (a == "--fullscreen") cfg.fullscreen = true;
+        else if (a == "--windowed") cfg.fullscreen = false;
         else if (a == "--log") log_spec = next();
         else if (a == "--log-file") log_set_file(next());
         else if (a == "--headless") cfg.headless = true;
         else if (a == "--frames") g_opt_frames = atoi(next());
-        else if (a == "--scale") cfg.window_scale = atoi(next());
+        else if (a == "--scale") {
+            int n = atoi(next());
+            cfg.width = 320 * n;
+            cfg.height = 240 * n;
+        }
         else if (a == "--screenshot-every") g_opt_screenshot_every = atoi(next());
         else if (a == "--screenshot-dir") g_opt_screenshot_dir = next();
         else if (a == "--gs-replay") replay = next();
         else if (a == "--repeat") repeat = atoi(next());
         else if (a == "--help" || a == "-h") {
-            printf("usage: %s [--data DIR] [--log cats] [--log-file PATH] [--headless] [--frames N] [--scale N]\n"
+            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
+                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
                    argv[0]);

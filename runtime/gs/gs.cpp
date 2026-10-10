@@ -84,6 +84,7 @@ void xfer_start() {
     int sx = (int)bits(st.trxpos, 0, 11), sy = (int)bits(st.trxpos, 16, 11);
     int dx = (int)bits(st.trxpos, 32, 11), dy = (int)bits(st.trxpos, 48, 11);
     stats.transfers++;
+    census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
     if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
     if (dir == 1) raster_sync();
     if (dir == 0 || dir == 2) {
@@ -561,6 +562,7 @@ bool read_circuit(int n, std::vector<uint32_t> &img, int &w, int &h) {
     w = dw / magh;
     h = dh / magv;
     if (w <= 0 || h <= 0 || w > 2048 || h > 2048) return false;
+    census_display(fbp, fbw, psm, w, h);
     // field mode with interlace: only half the lines are in memory
     bool interlaced = st.smode2 & 1;
     bool field_mode = (st.smode2 >> 1) & 1;
@@ -720,7 +722,7 @@ void gs_frame_end(uint64_t frame) {
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
-        gs::g_trace = trace_at >= 0 && (int)frame >= trace_at && (int)frame < trace_at + 4;
+        if (trace_at >= 0) gs::g_trace = (int)frame >= trace_at && (int)frame < trace_at + 4;
         if (gs::g_trace) fprintf(stderr, "GS trace on at frame %d\n", (int)frame);
     }
     if ((frame % 60) == 0) {
@@ -819,17 +821,33 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             gs_frame_end(h[1]);
             frames = h[1];
             if (live) {
+                // EOD_GS_DUMP_AT may list several vblanks (a,b,c): one file per
+                // capture, named <EOD_GS_DUMP>.<vblank> when there are several
                 static const char *dump = getenv("EOD_GS_DUMP");
-                static uint64_t at = getenv("EOD_GS_DUMP_AT") ? strtoull(getenv("EOD_GS_DUMP_AT"), nullptr, 10) : 0;
+                static std::vector<uint64_t> at_list = [] {
+                    std::vector<uint64_t> v;
+                    if (const char *a = getenv("EOD_GS_DUMP_AT"))
+                        for (const char *p = a; *p;) {
+                            char *e;
+                            uint64_t n = strtoull(p, &e, 10);
+                            if (e == p) break;
+                            v.push_back(n);
+                            p = *e == ',' ? e + 1 : e;
+                        }
+                    return v;
+                }();
                 if (g_dump && h[1] >= g_dump_end) {
                     fclose(g_dump);
                     g_dump = nullptr;
                     fprintf(stderr, "GS dump written\n");
-                } else if (dump && at && h[1] == at && !g_dump) {
+                }
+                if (dump && !g_dump && std::find(at_list.begin(), at_list.end(), h[1]) != at_list.end()) {
                     raster_sync();
-                    g_dump = fopen(dump, "wb");
+                    std::string name = dump;
+                    if (at_list.size() > 1) name += "." + std::to_string(h[1]);
+                    g_dump = fopen(name.c_str(), "wb");
                     if (g_dump) dump_state(g_dump);
-                    g_dump_end = at + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
+                    g_dump_end = h[1] + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
                 }
             }
             break;
@@ -874,6 +892,9 @@ int gs_replay(const char *path, int repeat) {
         fseek(f, 0, SEEK_SET);
         load_state(f);
         raster_reset();
+        // EOD_GS_REPLAY_TRACE: log every primitive of the first replay
+        static const bool replay_trace = getenv("EOD_GS_REPLAY_TRACE") != nullptr;
+        gs::g_trace = replay_trace && r == 0;
         uint64_t t0 = platform_time_us();
         run_cmds(cmds.data(), cmds.size(), false);
         raster_sync();

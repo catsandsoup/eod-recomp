@@ -5,7 +5,10 @@
 #include <cstdint>
 
 struct PlatformConfig {
-    int window_scale = 2;      // initial window size multiplier (640x448 base)
+    int width = 1280, height = 960;  // window client size
+    bool fullscreen = false;         // borderless window over the whole monitor
+    int aspect = 0;                  // displayed image: 0 = 4:3, 1 = 16:9, 2 = stretched to the window
+    bool smooth = true;              // bilinear scaling of the image
     bool headless = false;     // no window (tests)
     bool vsync_throttle = true;
     const char *title = "Eve of Destruction";
@@ -18,9 +21,13 @@ void platform_fatal_message(const char *msg);
 // Pumps OS events. Returns false when the user closed the window.
 bool platform_pump();
 
-// Displays a 32-bit (0xAABBGGRR little endian, i.e. bytes R,G,B,A) image.
+// Where the image goes in a client area of cw x ch (aspect ratio setting).
+void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h);
+// The native window (HWND on Windows; null when headless).
+void *platform_native_window();
 // Short status text shown after the window title (speed statistics).
 void platform_set_status(const char *text);
+// Displays a 32-bit (0xAABBGGRR little endian, i.e. bytes R,G,B,A) image.
 void platform_present(const uint32_t *pixels, int width, int height, int stride);
 
 uint64_t platform_time_us();

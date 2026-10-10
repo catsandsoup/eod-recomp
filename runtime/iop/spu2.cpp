@@ -13,6 +13,7 @@
 
 #include "../core/log.h"
 #include "../core/memory.h"
+#include "../core/config.h"
 #include "../platform/platform.h"
 
 namespace {
@@ -478,7 +479,7 @@ void spu2_update() {
     uint64_t now = platform_time_us();
     if (!g_t0) {
         g_t0 = now;
-        g_audio_open = platform_audio_open(kRate);
+        g_audio_open = g_config.audio && platform_audio_open(kRate);
         return;
     }
     uint64_t due = (now - g_t0) * kRate / 1000000;
@@ -489,5 +490,9 @@ void spu2_update() {
     static std::vector<int16_t> buf;
     buf.resize((size_t)frames * 2);
     mix(buf.data(), frames);
+    if (g_config.volume < 100) {
+        int v = g_config.volume * 256 / 100;
+        for (int16_t &x : buf) x = (int16_t)((x * v) >> 8);
+    }
     if (g_audio_open && platform_audio_queued_frames() < kRate / 5) platform_audio_submit(buf.data(), frames);
 }
