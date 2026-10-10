@@ -160,6 +160,8 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
   n-th primitive (compare renderers with `--renderer d3d11|software`);
   `EOD_D3D_SHOW=bp` displays another buffer; `--renderer warp` runs the Direct3D 11 renderer on Microsoft's
   software device (WARP) instead of the graphics driver, to tell driver problems from renderer bugs
+* `EOD_VU1_THREAD=1` (experimental) runs VIF1/VU1, GIF DMA and the GS command stream on a worker thread;
+  `EOD_GS_SKIPALL=1` makes the GS skip all drawing (benchmarks of the EE side)
 * `EOD_VU_CHECK=1` runs every compiled VU program a second time in the
   interpreter and reports differences; `EOD_VIF_CHECK=1` does the same for the
   fast VIF unpack paths

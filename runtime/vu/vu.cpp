@@ -18,6 +18,7 @@
 
 #include "../core/log.h"
 #include "../gs/gs.h"
+#include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "ee.h"
 #include "vif.h"
@@ -1429,8 +1430,8 @@ extern "C" uint32_t vu0_cfc2(int reg) {
     case REG_P: return f2u(vu->p);
     case REG_TPC: return vu->tpc / 8;
     case REG_CMSAR0: return vu->cmsar;
-    case REG_VPU_STAT: return 0;  // nothing ever runs asynchronously
-    case REG_CMSAR1: return g_vu1.cmsar;
+    case REG_VPU_STAT: return offload_busy() ? 0x100 : 0;  // VBS1: VU1 (on the worker) busy
+    case REG_CMSAR1: offload_sync(); return g_vu1.cmsar;
     }
     return 0;
 }
@@ -1455,8 +1456,10 @@ extern "C" void vu0_ctc2(int reg, uint32_t v) {
         if (v & 0x200) { /* reset VU1 */ }
         break;
     case REG_CMSAR1:
-        g_vu1.cmsar = v & 0xFFFF;
-        vu_execute(&g_vu1, (v & 0xFFFF) * 8);
+        offload_run([v] {
+            g_vu1.cmsar = v & 0xFFFF;
+            vu_execute(&g_vu1, (v & 0xFFFF) * 8);
+        });
         break;
     default:
         break;

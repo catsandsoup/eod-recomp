@@ -2,6 +2,8 @@
 #include "hw.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
 
 #include "../core/log.h"
@@ -11,6 +13,7 @@
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
 #include "../vu/vif.h"
+#include "offload.h"
 #include "vu.h"
 #include "ipu.h"
 
@@ -79,7 +82,17 @@ struct DmaChan {
     uint32_t chcr = 0, madr = 0, qwc = 0, tadr = 0, asr0 = 0, asr1 = 0, sadr = 0;
 };
 DmaChan g_dma[10];
-uint32_t g_d_ctrl, g_d_stat, g_d_pcr, g_d_sqwc, g_d_rbsr, g_d_rbor, g_d_stadr;
+uint32_t g_d_ctrl, g_d_pcr, g_d_sqwc, g_d_rbsr, g_d_rbor, g_d_stadr;
+std::atomic<uint32_t> g_d_stat;  // (the worker completes channels 1 and 2)
+// channels 1/2 handed to the worker and not finished yet
+std::atomic<bool> g_chan_busy[10];
+bool offloaded(int ch) { return (ch == DMA_VIF1 || ch == DMA_GIF) && offload_active(); }
+// waits until the worker has finished channel ch (or has nothing left to do)
+void wait_channel(int ch) {
+    if (offloaded(ch) && g_chan_busy[ch]) offload_wait([ch] { return !g_chan_busy[ch]; });
+}
+// GIF CTRL/MODE as last written by the EE (the worker applies the writes in order)
+uint32_t g_gif_shadow_ctrl, g_gif_shadow_mode;
 uint32_t g_d_enable = 0x1201;
 
 // incremental state of the IPU channels (0 = fromIPU, 1 = toIPU)
@@ -269,6 +282,8 @@ void dma_run_dest_chain(int ch) {
     }
 }
 
+void dma_execute(int ch);
+
 void dma_start(int ch) {
     DmaChan &c = g_dma[ch];
     if (!(g_d_ctrl & 1)) {
@@ -300,6 +315,18 @@ void dma_start(int ch) {
         ipu_dma_kick();
         return;
     }
+    if (offloaded(ch)) {
+        g_chan_busy[ch] = true;
+        offload_run([ch] { dma_execute(ch); });
+        return;
+    }
+    dma_execute(ch);
+}
+
+// Runs a started transfer to its end (channels 1/2: on the worker).
+void dma_execute(int ch) {
+    DmaChan &c = g_dma[ch];
+    int mode = (c.chcr >> 2) & 3;
     if (mode == 1) {
         if (ch == DMA_SPR_FROM)
             dma_run_dest_chain(ch);
@@ -344,6 +371,10 @@ void dmac_channel_done(int ch) {
     g_dma[ch].chcr &= ~0x100u;
     g_d_stat |= 1u << ch;
     if (g_d_stat & (1u << (16 + ch))) dmac_raise(ch);
+    if (g_chan_busy[ch]) {
+        g_chan_busy[ch] = false;
+        offload_notify();
+    }
 }
 
 bool dma_ipu_active(int ch) { return (g_dma[ch].chcr & 0x100) != 0; }
@@ -445,7 +476,15 @@ int hw_dmac_set_channel_irq(int ch, bool on) {
     return was;
 }
 
-int hw_cpcond0() { return 1; }  // all transfers complete synchronously
+// CPCOND0: the channels selected in D_PCR have finished (BC0F loops); only
+// channels 1 and 2 can still be running, on the worker
+int hw_cpcond0() {
+    if (offload_active())
+        offload_wait([] {
+            return !((g_d_pcr & 2) && g_chan_busy[DMA_VIF1]) && !((g_d_pcr & 4) && g_chan_busy[DMA_GIF]);
+        });
+    return 1;
+}
 
 void hw_init() {
     for (auto &c : g_dma) c = DmaChan();
@@ -456,13 +495,23 @@ uint32_t hw_read32(uint32_t p) {
     uint32_t off = p & 0xFFFF;
     if (off < 0x2000) return timer_read(off >> 11, off & 0x7F0);
     if (off >= 0x2000 && off < 0x3000) return ipu_read32(off);
-    if (off >= 0x3000 && off < 0x3800) return gif_reg_read(off);
-    if (off >= 0x3800 && off < 0x4000) return vif_reg_read(off >= 0x3C00 ? 1 : 0, off & 0x3FF);
+    if (off >= 0x3000 && off < 0x3800) {
+        if (!offload_active()) return gif_reg_read(off);
+        return off == 0x3000 ? g_gif_shadow_ctrl : off == 0x3010 ? g_gif_shadow_mode : 0;  // STAT: idle
+    }
+    if (off >= 0x3800 && off < 0x4000) {
+        if (off >= 0x3C00) offload_sync();
+        return vif_reg_read(off >= 0x3C00 ? 1 : 0, off & 0x3FF);
+    }
     if (off >= 0x4000 && off < 0x8000) return 0;  // FIFOs (reads of VIF1/IPU out handled elsewhere)
     if (off >= 0x8000 && off < 0xE000) {
         int ch = chan_from_addr(off);
         if (ch < 0) return 0;
         DmaChan &c = g_dma[ch];
+        if (offloaded(ch)) {
+            if (((off - k_chan_base[ch]) & 0xF0) == 0) wait_channel(ch);  // polling STR
+            else offload_sync();
+        }
         switch ((off - k_chan_base[ch]) & 0xF0) {
         case 0x00: return c.chcr;
         case 0x10: return c.madr;
@@ -504,6 +553,7 @@ void hw_read128(uint32_t p, uint32_t out[4]) {
         return;
     }
     if (off == 0x5000) {
+        offload_sync();
         vif1_read_fifo(out);
         return;
     }
@@ -560,17 +610,21 @@ void hw_write32(uint32_t p, uint32_t v) {
         return;
     }
     if (off >= 0x3000 && off < 0x3800) {
-        gif_reg_write(off, v);
+        if (off == 0x3000) g_gif_shadow_ctrl = v;
+        if (off == 0x3010) g_gif_shadow_mode = v;
+        offload_run([off, v] { gif_reg_write(off, v); });
         return;
     }
     if (off >= 0x3800 && off < 0x4000) {
-        vif_reg_write(off >= 0x3C00 ? 1 : 0, off & 0x3FF, v);
+        if (off >= 0x3C00) offload_run([off, v] { vif_reg_write(1, off & 0x3FF, v); });
+        else vif_reg_write(0, off & 0x3FF, v);
         return;
     }
     if (off >= 0x8000 && off < 0xE000) {
         int ch = chan_from_addr(off);
         if (ch < 0) return;
         DmaChan &c = g_dma[ch];
+        wait_channel(ch);  // (the game only reprograms a finished channel)
         switch ((off - k_chan_base[ch]) & 0xF0) {
         case 0x00: {
             bool start = (v & 0x100) && !(c.chcr & 0x100);
@@ -635,12 +689,16 @@ void hw_write128(uint32_t p, const uint32_t v[4]) {
     case 0x4000:
         vif_write(0, v, 4);
         return;
-    case 0x5000:
-        vif_write(1, v, 4);
+    case 0x5000: {
+        std::array<uint32_t, 4> q = {v[0], v[1], v[2], v[3]};
+        offload_run([q] { vif_write(1, q.data(), 4); });
         return;
-    case 0x6000:
-        gif_transfer(GIF_PATH3, reinterpret_cast<const uint8_t *>(v), 1);
+    }
+    case 0x6000: {
+        std::array<uint32_t, 4> q = {v[0], v[1], v[2], v[3]};
+        offload_run([q] { gif_transfer(GIF_PATH3, reinterpret_cast<const uint8_t *>(q.data()), 1); });
         return;
+    }
     case 0x7000:
         ipu_in_fifo(reinterpret_cast<const uint8_t *>(v), 1);
         return;
@@ -650,6 +708,7 @@ void hw_write128(uint32_t p, const uint32_t v[4]) {
 
 void *hw_vu_mem_ptr(uint32_t phys) {
     uint32_t off = phys - 0x11000000;
+    if (off >= 0x8000) offload_sync();  // VU1 memory: the worker's
     if (off < 0x1000) return g_vu0.micro + off;
     if (off >= 0x4000 && off < 0x5000) return g_vu0.mem + (off - 0x4000);
     if (off >= 0x8000 && off < 0xC000) return g_vu1.micro + (off - 0x8000);

@@ -21,6 +21,7 @@
 #include "../core/config.h"
 #include "../core/log.h"
 #include "../hw/hw.h"
+#include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
 #include "gs_mem.h"
@@ -703,8 +704,28 @@ std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS stat
 // never destroyed: the worker may still be waiting on them when the process exits
 std::mutex &g_q_mtx = *new std::mutex;
 std::condition_variable &g_q_cv = *new std::condition_variable, &g_q_cv_done = *new std::condition_variable;
-std::deque<std::vector<uint8_t>> &g_q = *new std::deque<std::vector<uint8_t>>;
-std::vector<uint8_t> g_chunk;
+// a command chunk: growing it doesn't zero the bytes about to be copied in
+template <class T>
+struct NoInitAlloc : std::allocator<T> {
+    template <class U>
+    struct rebind {
+        using other = NoInitAlloc<U>;
+    };
+    NoInitAlloc() = default;
+    template <class U>
+    NoInitAlloc(const NoInitAlloc<U> &) {}
+    template <class U>
+    void construct(U *p) { ::new (static_cast<void *>(p)) U; }
+    template <class U, class... A>
+    void construct(U *p, A &&...a) { ::new (static_cast<void *>(p)) U(std::forward<A>(a)...); }
+};
+using Chunk = std::vector<uint8_t, NoInitAlloc<uint8_t>>;
+std::deque<Chunk> &g_q = *new std::deque<Chunk>;
+Chunk g_chunk;
+// chunks the worker has run, kept for reuse (guarded by g_q_mtx): allocating
+// fresh ones cost a regrowth copy and freshly zeroed pages every 256KB
+std::vector<Chunk> &g_free = *new std::vector<Chunk>;
+constexpr size_t kChunkFlush = 256 * 1024, kChunkReserve = kChunkFlush + 64 * 1024;
 uint64_t g_pushed, g_done;  // chunks (guarded by g_q_mtx)
 uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mtx)
 
@@ -719,7 +740,7 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
     g_chunk.resize(at + 16 + ((size + 15) & ~15u));
     memcpy(&g_chunk[at], h, 16);
     if (size) memcpy(&g_chunk[at + 16], data, size);
-    if (g_chunk.size() >= 256 * 1024) gs_flush();
+    if (g_chunk.size() >= kChunkFlush) gs_flush();
 }
 
 }  // namespace
@@ -770,18 +791,25 @@ void gs_frame_end(uint64_t frame) {
 
 void gs_flush() {
     if (!g_threaded || g_chunk.empty()) return;
+    Chunk next;
     {
         std::lock_guard<std::mutex> lk(g_q_mtx);
         g_q.push_back(std::move(g_chunk));
         g_pushed++;
+        if (!g_free.empty()) {
+            next = std::move(g_free.back());
+            g_free.pop_back();
+        }
     }
     g_q_cv.notify_one();
+    g_chunk = std::move(next);
     g_chunk.clear();
-    g_chunk.reserve(64 * 1024);
+    g_chunk.reserve(kChunkReserve);
 }
 
 void gs_sync() {
     if (!g_threaded) return;
+    offload_sync();  // (the command stream's producer, when it runs on its own thread)
     gs_flush();
     uint64_t t = platform_time_us();
     std::unique_lock<std::mutex> lk(g_q_mtx);
@@ -967,7 +995,7 @@ static void gs_worker() {
 #endif
     hw::bind_thread();
     for (;;) {
-        std::vector<uint8_t> c;
+        Chunk c;
         {
             std::unique_lock<std::mutex> lk(g_q_mtx);
             g_q_cv.wait(lk, [] { return !g_q.empty(); });
@@ -981,6 +1009,7 @@ static void gs_worker() {
             std::lock_guard<std::mutex> lk(g_q_mtx);
             g_done++;
             if (frames) g_frames_done = frames;
+            if (g_free.size() < 8 && c.capacity() <= 4 * kChunkReserve) g_free.push_back(std::move(c));
         }
         g_q_cv_done.notify_all();
     }
@@ -992,6 +1021,7 @@ void gs_thread_start() {
     if (!want) return;
     g_threaded = true;
     std::thread(gs_worker).detach();
+    offload_start();
     // raster workers on the cores left after the EE and GS threads
     // (EOD_GS_RASTER=n overrides, 0 disables)
     int hw = platform_cpu_count();
@@ -1119,6 +1149,7 @@ void gs_put_imr(uint32_t v) { st.imr = v; }
 uint64_t gs_priv_read64(uint32_t p) {
     uint32_t off = p & 0x1FFF;
     if (off == 0x1000) {
+        offload_sync();
         gs_flush();  // let the GS thread reach pending FINISH/SIGNAL
         return g_csr;
     }
@@ -1138,7 +1169,7 @@ void gs_priv_write64(uint32_t p, uint64_t v) {
         // CSR: writing 1 clears SIGNAL/FINISH/HSINT/VSINT/EDWINT
         g_csr &= ~(v & 0x1F);
         if (v & 0x200) {  // RESET
-            if (g_threaded) push_cmd(CMD_PATH_RESET, 0, 0, nullptr, 0);
+            if (g_threaded) offload_run([] { push_cmd(CMD_PATH_RESET, 0, 0, nullptr, 0); });
             else
                 for (auto &ps : g_path) ps = PathState();
         }
@@ -1149,7 +1180,7 @@ void gs_priv_write64(uint32_t p, uint64_t v) {
         return;
     }
     if (g_threaded) {
-        push_cmd(CMD_PRIV, off, 0, &v, 8);
+        offload_run([off, v] { push_cmd(CMD_PRIV, off, 0, &v, 8); });
         return;
     }
     priv_apply(off, v);
@@ -1227,8 +1258,10 @@ void gs_vblank() {
     log_frame(g_frames);
     if (g_threaded) {
         uint64_t f = g_frames;
-        push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
-        gs_flush();
+        offload_run([f] {
+            push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
+            gs_flush();
+        });
         // don't let the GS thread fall more than a couple of frames behind
         uint64_t t = platform_time_us();
         std::unique_lock<std::mutex> lk(g_q_mtx);
