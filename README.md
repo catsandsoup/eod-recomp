@@ -95,7 +95,11 @@ imports only `kernel32`, `user32`, `gdi32`, `winmm` and `msvcrt`.
 
 ## Running
 
-There are no prebuilt binaries in this repository yet; build them as above.
+Work-in-progress builds for Windows (64- and 32-bit) and Linux are on the
+[Releases](https://github.com/pareidolico/eod-recomp/releases) page. They are
+built by the `Release builds` workflow (`.github/workflows/release.yml`) from
+the Actions tab or when a `v*` tag is pushed. The game is not included in
+them either.
 
 `eodsetup.exe` sets the options (renderer, adapter, window size or fullscreen,
 aspect ratio, internal resolution, vsync, sound, keyboard bindings, folders)
