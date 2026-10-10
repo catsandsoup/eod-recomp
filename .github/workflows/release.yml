@@ -76,10 +76,21 @@ jobs:
             echo "::error::The EOD_DECOMP_TOKEN secret is not set (see the comment at the top of this workflow)."
             exit 1
           fi
-          curl -fsSL -o SLUS_209.10 \
+          code=$(curl -sSL -o SLUS_209.10 -w '%{http_code}' \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/pareidolico/eod-decomp/contents/SLUS_209.10?ref=main"
+            "https://api.github.com/repos/pareidolico/eod-decomp/contents/SLUS_209.10?ref=main")
+          if [ "$code" != 200 ]; then
+            repo=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+              https://api.github.com/repos/pareidolico/eod-decomp)
+            case "$code/$repo" in
+              401/*) echo "::error::EOD_DECOMP_TOKEN is invalid or expired (HTTP 401).";;
+              */404) echo "::error::EOD_DECOMP_TOKEN cannot see pareidolico/eod-decomp. Give the token access to that repository (fine-grained: Repository access -> eod-decomp; classic: the 'repo' scope).";;
+              */200) echo "::error::EOD_DECOMP_TOKEN can see eod-decomp but not its files (HTTP $code). Give it the 'Contents: Read-only' permission.";;
+              *) echo "::error::Downloading SLUS_209.10 failed (HTTP $code, repository check HTTP $repo).";;
+            esac
+            exit 1
+          fi
           echo "$SLUS_SHA256  SLUS_209.10" | sha256sum -c -
 
       - name: Generate sources
