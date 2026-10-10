@@ -103,7 +103,7 @@ std::thread::id g_gs_thread;
 bool g_gs_thread_known;
 
 struct Stats {
-    uint32_t draws, prims, flushes, uploads, readbacks, converts, tex_new, tex_hit, tex_rt, tex_bytes;
+    uint32_t draws, prims, flushes, uploads, readbacks, converts, tex_new, tex_hit, tex_rt, tex_bytes, presents;
     uint32_t rb_reason[4];  // vram_needed from: 0 CPU (CLUT, transfers), 1 textures, 2 acquire, 3 display
 } g_stats;
 int g_rb_reason;
@@ -1877,6 +1877,7 @@ void present(bool vsync) {
             platform_display_rect(g_back_w, g_back_h, &x, &y, &w, &h);
             if (g_have_last) compose(g_back_rtv, g_back_w, g_back_h, x, y, w, h, g_config.smooth_display);
             HRESULT hr = CHECK(g_swap->Present(vsync ? 1 : 0, 0));
+            g_stats.presents++;
             if (FAILED(hr) && g_fails_logged < 50)
                 WARN("d3d11: device removed reason %08lx", (unsigned long)g_dev->GetDeviceRemovedReason());
         }
@@ -1919,10 +1920,10 @@ void finish() {
 
 void stats_line(char *buf, size_t size) {
     snprintf(buf, size,
-             "d3d11: %u draw calls, %u batches, %u prims, %u uploads, %u readbacks, %u conversions, textures %u new "
+             "d3d11: %u presents, %u draw calls, %u batches, %u prims, %u uploads, %u readbacks, %u conversions, textures %u new "
              "(%u KB) %u cached %u rendered, %u surfaces, %u MB textures; readbacks for CPU %u textures %u targets %u "
              "display %u",
-             g_stats.draws, g_stats.flushes, g_stats.prims, g_stats.uploads, g_stats.readbacks, g_stats.converts,
+             g_stats.presents, g_stats.draws, g_stats.flushes, g_stats.prims, g_stats.uploads, g_stats.readbacks, g_stats.converts,
              g_stats.tex_new, g_stats.tex_bytes / 1024, g_stats.tex_hit, g_stats.tex_rt, (unsigned)g_surfaces.size(),
              (unsigned)(g_tex_bytes >> 20), g_stats.rb_reason[0], g_stats.rb_reason[1], g_stats.rb_reason[2],
              g_stats.rb_reason[3]);
