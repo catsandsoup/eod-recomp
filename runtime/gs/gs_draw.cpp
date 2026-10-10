@@ -27,6 +27,8 @@
 #include "../core/config.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
+#include "gs_env.h"
+#include "gs_hw.h"
 #include "gs_mem.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
@@ -38,10 +40,21 @@ extern std::atomic<uint64_t> g_flips, g_game_flips, g_ee_vblanks, g_gs_vblanks;
 bool g_skip_frame;  // frame skipping: primitives of the current game frame are dropped
 bool g_replaying;   // GS replay: never skip
 uint32_t g_reg_gen = 1;
+Env g_env;
+uint32_t g_env_serial;
+// EOD_GS_REPLAY_STOP=n (replays): primitives after the n-th and later transfers are dropped, so the GS
+// memory at that point can be dumped (EOD_GS_REPLAY_DUMP) and compared between renderers
+uint64_t g_prim_counter;
+uint64_t g_replay_stop = getenv("EOD_GS_REPLAY_STOP") ? strtoull(getenv("EOD_GS_REPLAY_STOP"), nullptr, 10) : 0;
+bool replay_frozen() { return g_replay_stop && g_replaying && g_prim_counter >= g_replay_stop; }
+static bool count_prim() {
+    if (!g_replaying || !g_replay_stop) return true;
+    if (g_prim_counter >= g_replay_stop) return false;
+    g_prim_counter++;
+    return true;
+}
 
 namespace {
-
-struct TexEntry;
 
 // Statistics per rasterising thread (0 = GS thread, 1.. raster workers).
 constexpr int kMaxWorkers = 4;
@@ -53,88 +66,11 @@ struct alignas(64) WStats {
 WStats g_wstats[kMaxWorkers + 1];
 thread_local int t_wid;
 
-// 512-page bit set (hazard tracking between queued primitives).
-struct PageSet {
-    uint64_t w[kPages / 64];
-    void clear() { memset(w, 0, sizeof w); }
-    void add(uint32_t first, uint32_t count) {
-        if (count >= kPages) {
-            memset(w, 0xFF, sizeof w);
-            return;
-        }
-        for (uint32_t i = 0; i < count; i++) {
-            uint32_t p = (first + i) % kPages;
-            w[p >> 6] |= 1ull << (p & 63);
-        }
-    }
-    void add(const PageSet &o) {
-        for (size_t i = 0; i < kPages / 64; i++) w[i] |= o.w[i];
-    }
-    bool any(const PageSet &o) const {
-        uint64_t r = 0;
-        for (size_t i = 0; i < kPages / 64; i++) r |= w[i] & o.w[i];
-        return r != 0;
-    }
-};
-
 int g_nw;                          // raster workers (0: rasterise on the GS thread)
 PageSet g_pend_read, g_pend_write;  // pages queued jobs read / write
 void barrier();
 int g_barrier_cause;  // statistics: what the next barrier is for
 const struct Env *g_env_snap;  // snapshot of g_env referenced by queued jobs
-
-enum { BL_GENERIC, BL_MIX, BL_ADD };
-
-struct Env {
-    // frame buffer
-    uint32_t fbp, fbw, fpsm, fbmsk;
-    uint32_t zbp, zpsm;
-    bool zmsk;
-    // tests
-    bool ate;
-    int atst, afail;
-    uint32_t aref;
-    bool date, datm;
-    bool zte;
-    int ztst;
-    // blending
-    bool abe, pabe, colclamp, fba;
-    int ba, bb, bc, bd;
-    uint32_t bfix;
-    // texture
-    bool tme, fst, tcc, bilinear_mag, bilinear_min;
-    int tfx;
-    uint32_t tbp, tbw, tpsm, tw, th, cpsm, csa;
-    int wms, wmt, minu, maxu, minv, maxv;
-    uint32_t ta0, ta1;
-    bool aem;
-    // mipmapping
-    int mxl, lcm, l, mmin;
-    float k;
-    uint32_t mip_tbp[7], mip_tbw[7];
-    // misc
-    int scx0, scx1, scy0, scy1;
-    bool fge, iip;
-    uint32_t fogr, fogg, fogb;
-    bool fb16, z16;
-    bool write_none;  // e.g. FBMSK all set and ZMSK
-    bool need_dst;    // the destination colour is read
-    bool need_z;      // depth is tested or written
-    uint32_t zmax;    // largest depth value of the format
-    int pix_kind;     // shade_px_t variant: tme | depth test << 1 | depth write << 2
-    int blend_kind;   // BL_MIX, BL_ADD or BL_GENERIC
-    // address tables
-    const SwizzleTab *fbT, *zT, *texT[7];
-    uint32_t pal[256];  // CLUT expanded to RGBA for the current texture
-    uint32_t fpsm_mem;  // frame buffer format as stored (may be a depth format)
-    // decoded texture levels (linear RGBA) when tcached
-    bool tcached;
-    TexEntry *tl[7];
-    // pages read as texture, and of the frame and depth buffers
-    PageSet tex_ps, fb_ps, z_ps;
-};
-
-Env g_env;
 
 void trace_prim(const char *kind, const Vertex *v, int n) {
     if (!g_trace) return;
@@ -189,6 +125,7 @@ struct TexKeyHash {
         return (size_t)(h ^ (h >> 29));
     }
 };
+}  // namespace
 // A texture level decoded on demand in 8x8 texel tiles.
 struct TexEntry {
     std::vector<uint32_t> data;
@@ -196,6 +133,7 @@ struct TexEntry {
     int w, h, tiles_w, lvl;
     uint32_t stamp;  // g_vram_clock when the tiles were last invalidated
 };
+namespace {
 // never destroyed: the GS thread may still be drawing while the process exits
 std::unordered_map<TexKey, TexEntry, TexKeyHash> &g_tex_cache = *new std::unordered_map<TexKey, TexEntry, TexKeyHash>;
 size_t g_tex_cache_bytes;
@@ -314,6 +252,7 @@ void setup_env(uint32_t attr) {
     if (attr == g_env_attr && g_reg_gen == g_env_gen) return;
     g_env_attr = attr;
     g_env_gen = g_reg_gen;
+    g_env_serial++;
     stats.env_setups++;
     g_env_snap = nullptr;
     Env &e = g_env;
@@ -456,6 +395,10 @@ void setup_env(uint32_t attr) {
         bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
         if (four || eight)
             for (uint32_t i = 0, n = four ? 16 : 256; i < n; i++) e.pal[i] = clut_lookup(i, e, four);
+        if (hw::g_on) {  // the hardware renderer keeps its own textures
+            e.tcached = false;
+            return;
+        }
         e.tex_ps.clear();
         for (int i = 0; i <= levels && i < 7; i++) {
             uint32_t first, count;
@@ -1527,11 +1470,16 @@ static uint32_t current_attr() {
 }
 
 void draw_sprite(const Vertex &a, const Vertex &b) {
+    if (!count_prim()) return;
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
     if (census::g_on)
         census::draw(e, "sprite", (uint64_t)std::abs((b.x - a.x) >> 4) * (uint64_t)std::abs((b.y - a.y) >> 4));
+    if (hw::g_on) {
+        if (!e.write_none && !g_skip_frame) hw::draw_sprite(e, a, b);
+        return;
+    }
     if (g_trace) {
         Vertex vv[2] = {a, b};
         trace_prim("SPRITE", vv, 2);
@@ -1600,12 +1548,17 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
 }
 
 void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
+    if (!count_prim()) return;
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
     if (census::g_on) {
         int64_t ar = ((int64_t)(b0.x - a0.x) * (c0.y - a0.y) - (int64_t)(c0.x - a0.x) * (b0.y - a0.y)) / 512;
         census::draw(e, "tri", (uint64_t)(ar < 0 ? -ar : ar));
+    }
+    if (hw::g_on) {
+        if (!e.write_none && !g_skip_frame) hw::draw_triangle(e, a0, b0, c0);
+        return;
     }
     if (g_trace) {
         Vertex vv[3] = {a0, b0, c0};
@@ -1731,10 +1684,15 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
 }
 
 void draw_line(const Vertex &a, const Vertex &b) {
+    if (!count_prim()) return;
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
     if (census::g_on) census::draw(e, "line", 1);
+    if (hw::g_on) {
+        if (!e.write_none && !g_skip_frame) hw::draw_line(e, a, b);
+        return;
+    }
     if (e.write_none) return;
     note_draw();
     barrier();
@@ -1768,10 +1726,15 @@ void draw_line(const Vertex &a, const Vertex &b) {
 }
 
 void draw_point(const Vertex &a) {
+    if (!count_prim()) return;
     uint32_t attr = current_attr();
     setup_env(attr);
     Env &e = g_env;
     if (census::g_on) census::draw(e, "point", 1);
+    if (hw::g_on) {
+        if (!e.write_none && !g_skip_frame) hw::draw_point(e, a);
+        return;
+    }
     if (e.write_none) return;
     note_draw();
     barrier();
@@ -1835,6 +1798,12 @@ void clut_load(uint64_t tex0) {
     int n = eight ? 256 : 16;
     uint32_t off = four ? csa * 16 : 0;
     uint32_t cbw = bits(st.texclut, 0, 6), cou = bits(st.texclut, 6, 6), cov = bits(st.texclut, 12, 10);
+    if (hw::g_on) {  // the CLUT may have been rendered
+        if (csm == 0)
+            hw::vram_needed(cbp, 1, cpsm == PSMCT24 ? PSMCT32 : cpsm, 0, 0, eight ? 16 : 8, eight ? 16 : 2);
+        else
+            hw::vram_needed(cbp, cbw, cpsm == PSMCT24 ? PSMCT32 : cpsm, (int)cou * 16, (int)cov, n, 1);
+    }
     for (int i = 0; i < n; i++) {
         int x, y;
         uint32_t bw = 1;
@@ -1935,5 +1904,7 @@ void census_xfer(int dir, uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t db
 }
 
 void census_display(uint32_t fbp, uint32_t fbw, uint32_t psm, int w, int h) { census_display_impl(fbp, fbw, psm, w, h); }
+
+uint32_t tex_fetch(const Env &e, int u, int v, int lvl) { return fetch(e, u, v, lvl); }
 
 }  // namespace gs

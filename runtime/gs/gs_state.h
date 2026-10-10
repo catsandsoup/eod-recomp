@@ -67,6 +67,9 @@ void raster_mark_pages();
 void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 void raster_vram_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 void raster_collect_stats();
+// replay debugging (gs_draw.cpp): primitives after EOD_GS_REPLAY_STOP are dropped
+bool replay_frozen();
+extern uint64_t g_prim_counter;
 // EOD_GS_CENSUS hooks (gs_draw.cpp)
 void census_xfer(int dir, uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t dbp, uint32_t dbw, uint32_t dpsm,
                  int sx, int sy, int dx, int dy, int w, int h);

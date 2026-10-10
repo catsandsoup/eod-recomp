@@ -1,5 +1,6 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
 #include "gs.h"
+#include "gs_hw.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <pthread.h>
 #endif
 
+#include "../core/config.h"
 #include "../core/log.h"
 #include "../hw/hw.h"
 #include "../kernel/kernel.h"
@@ -77,6 +79,10 @@ uint32_t gif_reg_ctrl, gif_reg_mode;
 
 // --------------------------------------------------------------- transfer
 void xfer_start() {
+    if (replay_frozen()) {
+        g_xfer.active = false;
+        return;
+    }
     uint32_t dir = bits(st.trxdir, 0, 2);
     uint32_t dbp = bits(st.bitbltbuf, 32, 14), dbw = bits(st.bitbltbuf, 48, 6), dpsm = bits(st.bitbltbuf, 56, 6);
     uint32_t sbp = bits(st.bitbltbuf, 0, 14), sbw = bits(st.bitbltbuf, 16, 6), spsm = bits(st.bitbltbuf, 24, 6);
@@ -85,6 +91,10 @@ void xfer_start() {
     int dx = (int)bits(st.trxpos, 32, 11), dy = (int)bits(st.trxpos, 48, 11);
     stats.transfers++;
     census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
+    if (hw::g_on) {
+        if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h);
+        if (dir == 0 || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
+    }
     if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
     if (dir == 1) raster_sync();
     if (dir == 0 || dir == 2) {
@@ -714,7 +724,14 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
 void gs_frame_end(uint64_t frame) {
-    if (compose_display()) {
+    if (hw::g_on) {
+        if (display_changed()) {
+            // no vsync wait while the GS thread trails the EE
+            uint64_t lag = g_ee_vblanks.load() - frame;
+            hw::present(g_config.vsync && lag < 2);
+        }
+        hw::vblank();
+    } else if (compose_display()) {
         std::lock_guard<std::mutex> lk(g_pub_mtx);
         g_pub.swap(g_frame);
         g_pub_w = g_frame_w;
@@ -883,21 +900,39 @@ int gs_replay(const char *path, int repeat) {
     std::vector<uint8_t> cmds((size_t)(end - start));
     fseek(f, start, SEEK_SET);
     if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
+    if (g_config.renderer == "d3d11" && hw::start(false)) fprintf(stderr, "replaying with Direct3D 11\n");
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
+    if (hw::g_on) n = 0;
     raster_start(n);
     double best = 1e30;
     for (int r = 0; r < repeat; r++) {
         fseek(f, 0, SEEK_SET);
         load_state(f);
         raster_reset();
+        if (hw::g_on) hw::reset();
         // EOD_GS_REPLAY_TRACE: log every primitive of the first replay
         static const bool replay_trace = getenv("EOD_GS_REPLAY_TRACE") != nullptr;
         gs::g_trace = replay_trace && r == 0;
         uint64_t t0 = platform_time_us();
         run_cmds(cmds.data(), cmds.size(), false);
         raster_sync();
+        if (const char *dump = getenv("EOD_GS_REPLAY_DUMP")) {  // the GS memory after the replay
+            if (hw::g_on)
+                for (uint32_t p = 0; p < kPages; p++) hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+            if (FILE *df = fopen(dump, "wb")) {
+                fwrite(vram, 1, kVramSize, df);
+                fclose(df);
+            }
+        }
+        g_prim_counter = 0;
+        if (hw::g_on) {
+            hw::finish();
+            char line[512];
+            hw::stats_line(line, sizeof line);
+            fprintf(stderr, "%s\n", line);
+        }
         double ms = (platform_time_us() - t0) / 1000.0;
         best = std::min(best, ms);
         fprintf(stderr, "replay %d: %.1f ms\n", r + 1, ms);
@@ -923,6 +958,7 @@ static void gs_worker() {
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-gs");
 #endif
+    hw::bind_thread();
     for (;;) {
         std::vector<uint8_t> c;
         {
@@ -955,6 +991,7 @@ void gs_thread_start() {
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
     if (n > 4) n = 4;
+    if (hw::g_on) n = 0;  // the GPU draws
     raster_start(n);
     LOG(LOG_GS, "GS runs on its own thread, %d raster workers", n > 0 ? n : 0);
 }
@@ -964,6 +1001,12 @@ void gs_init() {
     memset(&st, 0, sizeof st);
     st.imr = 0xFF00;
     st.prmodecont = 1;
+    if (g_config.renderer == "d3d11") {
+        if (hw::start(platform_native_window() != nullptr && !getenv("EOD_D3D_NOWINDOW")))
+            LOG(LOG_GS, "Direct3D 11 renderer");
+        else
+            LOG(LOG_GS, "Direct3D 11 is not available - using the software renderer");
+    }
     gs_thread_start();
 }
 
@@ -1145,12 +1188,21 @@ void gs_priv_write32(uint32_t p, uint32_t v) {
 }
 
 bool gs_screenshot(const char *path) {
-    std::lock_guard<std::mutex> lk(g_pub_mtx);
-    if (g_pub.empty()) return false;
+    std::vector<uint32_t> img;
+    int w = 0, h = 0;
+    if (hw::g_on) {
+        if (!hw::read_display(img, w, h)) return false;
+    } else {
+        std::lock_guard<std::mutex> lk(g_pub_mtx);
+        if (g_pub.empty()) return false;
+        img = g_pub;
+        w = g_pub_w;
+        h = g_pub_h;
+    }
     FILE *f = fopen(path, "wb");
     if (!f) return false;
-    fprintf(f, "P6\n%d %d\n255\n", g_pub_w, g_pub_h);
-    for (uint32_t px : g_pub) {
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (uint32_t px : img) {
         uint8_t rgb[3] = {(uint8_t)px, (uint8_t)(px >> 8), (uint8_t)(px >> 16)};
         fwrite(rgb, 1, 3, f);
     }

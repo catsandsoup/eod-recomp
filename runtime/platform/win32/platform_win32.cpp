@@ -273,6 +273,7 @@ void platform_present(const uint32_t *pixels, int width, int height, int stride)
 
 uint64_t platform_time_us() {
     LARGE_INTEGER c;
+    if (!g_qpf.QuadPart) QueryPerformanceFrequency(&g_qpf);  // (replays run without platform_init)
     QueryPerformanceCounter(&c);
     return (uint64_t)(c.QuadPart / (double)g_qpf.QuadPart * 1000000.0);
 }
