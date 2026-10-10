@@ -134,25 +134,42 @@ FMAC_ACC = {0x1C: ("OP_MUL", "S_Q"), 0x1E: ("OP_MUL", "S_I"), 0x20: ("OP_ADD", "
             0x2D: ("OP_MSUB", "S_VEC")}
 
 
-def upper_code(ins, flags):
+def upper_fmac(ins):
+    """(op, src, to_acc) for an FMAC upper instruction compiled inline, else None."""
     op = ins & 0x3F
-    fl = "true" if flags else "false"
     if op < 0x3C:
         if op < 0x1C:
-            return "up_fmac<%s, S_BC, false, %s>(c, 0x%08Xu);" % (FMAC_BC[op >> 2], fl, ins)
+            return FMAC_BC[op >> 2], "S_BC", False
         if op in FMAC_OP:
-            o, src = FMAC_OP[op]
-            return "up_fmac<%s, %s, false, %s>(c, 0x%08Xu);" % (o, src, fl, ins)
-        return "upper(c, 0x%08Xu);" % ins
+            return FMAC_OP[op] + (False,)
+        return None
     ext = upper_ext(ins)
-    if ext == 0x2F:
-        return ""  # NOP
     if (ext >> 2) in FMAC_ACC_BC:
-        return "up_fmac<%s, S_BC, true, %s>(c, 0x%08Xu);" % (FMAC_ACC_BC[ext >> 2], fl, ins)
+        return FMAC_ACC_BC[ext >> 2], "S_BC", True
     if ext in FMAC_ACC:
-        o, src = FMAC_ACC[ext]
-        return "up_fmac<%s, %s, true, %s>(c, 0x%08Xu);" % (o, src, fl, ins)
-    return "upper(c, 0x%08Xu);" % ins
+        return FMAC_ACC[ext] + (True,)
+    return None
+
+
+def upper_misc(ins):
+    """(pre code, value expression or None, target reg) for ITOF/FTOI/ABS/CLIP, else None."""
+    if (ins & 0x3F) < 0x3C:
+        return None
+    ext = upper_ext(ins)
+    fs, ft = FS(ins), FT(ins)
+    if 0x10 <= ext <= 0x13:
+        return "", "vu_itof(vu, %d, %d)" % (fs, ext & 3), ft
+    if 0x14 <= ext <= 0x17:
+        return "", "vu_ftoi(vu, %d, %d)" % (fs, ext & 3), ft
+    if ext == 0x1D:
+        return "", "vu_abs(vu, %d)" % fs, ft
+    if ext == 0x1F:
+        return "vu_clip(vu, %d, %d);" % (fs, ft), None, 0
+    return None
+
+
+def upper_is_nop(ins):
+    return (ins & 0x3F) >= 0x3C and upper_ext(ins) == 0x2F
 
 
 # ------------------------------------------------------------- lower code
@@ -160,18 +177,35 @@ def comps(dest):
     return [k for k in range(4) if (dest >> (3 - k)) & 1]
 
 
-def lower_code(ins, pc):
+def lower_code(ins, pc, vu=1):
     """C code for a non-branch lower instruction."""
     op = ins >> 25
+    qw = "vu1_qword" if vu == 1 else "vu_qword"
     it, is_, dest = FT(ins), FS(ins), dest_of(ins)
     if op == 0x00:  # LQ
-        if not it:
-            return "(void)vu_qword(vu, vu->vi[%d] + %d);" % (is_, imm11(ins))
+        if not it or not dest:
+            return ""
+        if dest == 15:
+            return "memcpy(&vu->vf[%d], %s(vu, vu->vi[%d] + %d), 16);" % (it, qw, is_, imm11(ins))
         body = "".join("vu->vf[%d].u[%d] = m.u[%d]; " % (it, k, k) for k in comps(dest))
-        return "{ VUReg m; memcpy(&m, vu_qword(vu, vu->vi[%d] + %d), 16); %s}" % (is_, imm11(ins), body)
+        return "{ VUReg m; memcpy(&m, %s(vu, vu->vi[%d] + %d), 16); %s}" % (qw, is_, imm11(ins), body)
     if op == 0x01:  # SQ
+        if dest == 15:
+            return "memcpy(%s(vu, vu->vi[%d] + %d), &vu->vf[%d], 16);" % (qw, it, imm11(ins), is_)
         body = "".join("memcpy(p + %d, &vu->vf[%d].u[%d], 4); " % (k * 4, is_, k) for k in comps(dest))
-        return "{ uint8_t *p = vu_qword(vu, vu->vi[%d] + %d); %s}" % (it, imm11(ins), body)
+        return "{ uint8_t *p = %s(vu, vu->vi[%d] + %d); %s}" % (qw, it, imm11(ins), body)
+    if op == 0x04:  # ILW: the last selected field wins
+        if not it or not dest:
+            return ""
+        k = comps(dest)[-1]
+        return "{ uint16_t v; memcpy(&v, %s(vu, vu->vi[%d] + %d) + %d, 2); set_vi(vu, %d, v); }" % (
+            qw, is_, imm11(ins), k * 4, it)
+    if op == 0x05:  # ISW
+        body = "".join("memcpy(p + %d, &v, 4); " % (k * 4) for k in comps(dest))
+        return "{ uint8_t *p = %s(vu, vu->vi[%d] + %d); uint32_t v = vu->vi[%d] & 0xFFFF; %s}" % (
+            qw, is_, imm11(ins), it, body)
+    if op in FLAG_OPS:
+        return FLAG_OPS[op](ins, it, is_)
     if op == 0x08:
         return "set_vi(vu, %d, vu->vi[%d] + %d);" % (it, is_, imm15(ins)) if it else ""
     if op == 0x09:
@@ -203,6 +237,38 @@ def lower_code(ins, pc):
                     return ""
                 body = "".join("vu->vf[%d].f[%d] = s.f[%d]; " % (it, k, (k + 1) & 3) for k in comps(dest))
                 return "{ VUReg s = vu->vf[%d]; %s}" % (is_, body)
+            if ext in (0x34, 0x36):  # LQI / LQD
+                pre = "set_vi(vu, %d, vu->vi[%d] - 1); " % (is_, is_) if ext == 0x36 else ""
+                post = "set_vi(vu, %d, vu->vi[%d] + 1); " % (is_, is_) if ext == 0x34 else ""
+                if it and dest:
+                    body = "".join("vu->vf[%d].u[%d] = m.u[%d]; " % (it, k, k) for k in comps(dest))
+                    mid = "VUReg m; memcpy(&m, %s(vu, vu->vi[%d]), 16); %s" % (qw, is_, body)
+                else:
+                    mid = ""
+                return "{ %s%s%s}" % (pre, mid, post)
+            if ext in (0x35, 0x37):  # SQI / SQD
+                pre = "set_vi(vu, %d, vu->vi[%d] - 1); " % (it, it) if ext == 0x37 else ""
+                post = "set_vi(vu, %d, vu->vi[%d] + 1); " % (it, it) if ext == 0x35 else ""
+                body = "".join("memcpy(p + %d, &vu->vf[%d].u[%d], 4); " % (k * 4, is_, k) for k in comps(dest))
+                return "{ %suint8_t *p = %s(vu, vu->vi[%d]); %s%s}" % (pre, qw, it, body, post)
+            if ext == 0x3E:  # ILWR
+                if not it or not dest:
+                    return ""
+                k = comps(dest)[-1]
+                return "{ uint16_t v; memcpy(&v, %s(vu, vu->vi[%d]) + %d, 2); set_vi(vu, %d, v); }" % (qw, is_, k * 4, it)
+            if ext == 0x3F:  # ISWR
+                body = "".join("memcpy(p + %d, &v, 4); " % (k * 4) for k in comps(dest))
+                return "{ uint8_t *p = %s(vu, vu->vi[%d]); uint32_t v = vu->vi[%d] & 0xFFFF; %s}" % (qw, is_, it, body)
+            if ext == 0x64:  # MFP
+                if not it:
+                    return ""
+                return "".join("vu->vf[%d].f[%d] = vu->p; " % (it, k) for k in comps(dest))
+            if ext == 0x68:
+                return "set_vi(vu, %d, g_vif1_top);" % it if it else ""
+            if ext == 0x69:
+                return "set_vi(vu, %d, g_vif1_itop);" % it if it else ""
+            if ext == 0x7B:
+                return "flush_p(vu);"
             if ext == 0x3B:
                 return "flush_q(vu);"
             if ext == 0x38:
@@ -221,6 +287,25 @@ def lower_code(ins, pc):
                 return "set_vi(vu, %d, vu->vf[%d].u[%d]);" % (it, is_, (ins >> 21) & 3) if it else ""
     return "lower(c, 0x%08Xu, 0x%04Xu);" % (ins, pc)
 
+
+def _fimm(ins):
+    return "0x%X" % (((ins >> 10) & 0x800) | (ins & 0x7FF))
+
+
+FLAG_OPS = {
+    0x10: lambda i, t, s: "set_vi(vu, 1, (vu->clip & 0xFFFFFF) == 0x%X);" % (i & 0xFFFFFF),
+    0x11: lambda i, t, s: "vu->clip = 0x%X;" % (i & 0xFFFFFF),
+    0x12: lambda i, t, s: "set_vi(vu, 1, (vu->clip & 0x%X) != 0);" % (i & 0xFFFFFF),
+    0x13: lambda i, t, s: "set_vi(vu, 1, ((vu->clip | 0x%X) & 0xFFFFFF) == 0xFFFFFF);" % (i & 0xFFFFFF),
+    0x14: lambda i, t, s: "set_vi(vu, %d, (vu->status & 0xFFF) == %s);" % (t, _fimm(i)),
+    0x15: lambda i, t, s: "vu->status = (vu->status & 0x3F) | (%s & 0xFC0);" % _fimm(i),
+    0x16: lambda i, t, s: "set_vi(vu, %d, vu->status & %s);" % (t, _fimm(i)),
+    0x17: lambda i, t, s: "set_vi(vu, %d, vu->status | %s);" % (t, _fimm(i)),
+    0x18: lambda i, t, s: "set_vi(vu, %d, (vu->mac & 0xFFFF) == (vu->vi[%d] & 0xFFFF));" % (t, s),
+    0x1A: lambda i, t, s: "set_vi(vu, %d, vu->mac & vu->vi[%d]);" % (t, s),
+    0x1B: lambda i, t, s: "set_vi(vu, %d, vu->mac | vu->vi[%d]);" % (t, s),
+    0x1C: lambda i, t, s: "set_vi(vu, %d, vu->clip & 0xFFF);" % t,
+}
 
 BRANCH_OPS = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
 FLAG_READS = {0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B}  # FS*, FM* lower ops
@@ -341,19 +426,47 @@ class Prog:
         ulo, uhi = reg_bits(uses)
         wlo, whi = reg_bits([lw, upper_vf_write(hi)])
         waitq = not ibit and (lo >> 25) == 0x40 and (lo & 0x3C) == 0x3C and upper_ext(lo) == 0x3B
-        out.append(ind + "// %04x: %08x %08x" % (pc, hi, lo))
+        out.append(ind + "{  // %04x: %08x %08x" % (pc, hi, lo))
+        ind0, ind = ind, ind + "    "
         if ulo or uhi:
             out.append(ind + "VU_STALL(0x%xull, 0x%xull);" % (ulo, uhi))
         if waitq:
             out.append(ind + "flush_q(vu);")
-        out.append(ind + "sync_pipes(vu);")
-        out.append(ind + "c.up_write = false;")
-        out.append(ind + "c.mac_set = false;")
-        uc = upper_code(hi, self.flags)
-        if uc:
-            out.append(ind + uc)
+        fm = upper_fmac(hi)
+        um = upper_misc(hi)
+        lc = None
+        if not ibit and (lo >> 25) not in BRANCH_OPS:
+            lc = lower_code(lo, pc, self.vu)
+        # Q/P results are applied lazily: only code that may read them syncs
+        # (the divider/EFU instructions sync themselves when busy)
+        need_sync = (fm is None and um is None and not upper_is_nop(hi)) or \
+            (fm is not None and fm[1] == "S_Q") or \
+            (lc is not None and (lc.startswith("lower(c,") or "vu->p" in lc))
+        if need_sync:
+            out.append(ind + "sync_pipes(vu);")
+        commit = []
+        if fm is not None:
+            o, src, acc = fm
+            dest = dest_of(hi)
+            out.append(ind + "__m128 ur = up_val<%s, %s>(vu, 0x%08Xu);" % (o, src, hi))
+            if acc or FD(hi):
+                commit.append("vu_store<%d>(%s, ur);" % (dest, "vu->acc.f" if acc else "vu->vf[%d].f" % FD(hi)))
+            if self.flags and o not in ("OP_MAX", "OP_MIN"):
+                commit.append("vu_flags(vu, ur, %d);" % dest)
+        elif um is not None:
+            pre, val, reg = um
+            if pre:
+                out.append(ind + pre)
+            if val and reg and dest_of(hi):
+                out.append(ind + "__m128 ur = %s;" % val)
+                commit.append("vu_store<%d>(vu->vf[%d].f, ur);" % (dest_of(hi), reg))
+        elif not upper_is_nop(hi):
+            out.append(ind + "c.up_write = false;")
+            out.append(ind + "c.mac_set = false;")
+            out.append(ind + "upper(c, 0x%08Xu);" % hi)
+            commit.append("commit_upper(c);")
         if ibit:
-            out.append(ind + "commit_upper(c);")
+            out += [ind + x for x in commit]
             out.append(ind + "{ uint32_t b = 0x%08Xu; memcpy(&vu->i, &b, 4); }" % lo)
         else:
             op = lo >> 25
@@ -376,14 +489,13 @@ class Prog:
                             0x2E: "(int16_t)vu->vi[%d] <= 0" % is_,
                             0x2F: "(int16_t)vu->vi[%d] >= 0" % is_}[op]
                     out.append(ind + "take = %s;" % cond)
-            else:
-                lc = lower_code(lo, pc)
-                if lc:
-                    out.append(ind + lc)
-            out.append(ind + "commit_upper(c);")
+            elif lc:
+                out.append(ind + lc)
+            out += [ind + x for x in commit]
         if wlo or whi:
             out.append(ind + "VU_SCORE(0x%xull, 0x%xull);" % (wlo, whi))
         out.append(ind + "vu->cycle++;")
+        out.append(ind0 + "}")
 
     def emit(self, name):
         out = ["void %s(VUState *vu, uint32_t entry) {" % name,

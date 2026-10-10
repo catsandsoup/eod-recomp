@@ -27,6 +27,9 @@ void iop_pad_vblank();
 extern "C" volatile int g_ee_irq_pending;
 volatile int g_ee_irq_pending;
 
+// time the EE spent asleep waiting for events (EOD_FPS statistics)
+std::atomic<uint64_t> g_ee_idle_us{0};
+
 namespace {
 
 constexpr int kMaxThreads = 256;
@@ -104,6 +107,11 @@ std::atomic<uint32_t> g_intc_stat{0};
 std::atomic<uint32_t> g_intc_new{0};
 uint32_t g_intc_mask = 0;
 std::atomic<uint32_t> g_dmac_pending{0};
+static void ee_sleep_us(uint32_t us) {
+    uint64_t t = platform_time_us();
+    platform_sleep_us(us);
+    g_ee_idle_us += platform_time_us() - t;
+}
 
 Alarm g_alarms[64];
 uint32_t g_syscall_override[256];
@@ -192,7 +200,7 @@ void idle_until_runnable() {
             if (a.used && a.due_us < next) next = a.due_us;
         if (next > now && !(g_intc_new.load() & g_intc_mask) && !g_dmac_pending.load()) {
             uint64_t d = next - now;
-            platform_sleep_us((uint32_t)(d > 2000 ? 2000 : d));
+            ee_sleep_us((uint32_t)(d > 2000 ? 2000 : d));
         }
         bool saved = g_ints_enabled;
         g_ints_enabled = true;  // the idle thread runs with interrupts on
@@ -318,7 +326,7 @@ void service_events(bool run_alarms) {
         // game counts them as time), up to a few frames; beyond that, resync.
         g_next_vblank_us += (uint64_t)kVblankPeriodUs;
         bool behind = g_next_vblank_us <= now;
-        if (now > g_next_vblank_us + 6 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
+        if (now > g_next_vblank_us + 12 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
         g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
         iop_pad_vblank();
@@ -1007,7 +1015,7 @@ extern "C" void ee_idle_poll(void) {
             if (a.used && a.due_us < next) next = a.due_us;
         if (next > now && !(g_intc_new.load() & g_intc_mask) && !g_dmac_pending.load()) {
             uint64_t d = next - now;
-            platform_sleep_us((uint32_t)(d > 500 ? 500 : d));
+            ee_sleep_us((uint32_t)(d > 500 ? 500 : d));
         }
     }
     ee_service_interrupts();
@@ -1063,7 +1071,7 @@ void kernel_yield() {
     g_ee_irq_pending = 1;
     ee_service_interrupts();
     g_ints_enabled = saved;
-    platform_sleep_us(100);
+    ee_sleep_us(100);
 }
 
 void kernel_dump_threads() {

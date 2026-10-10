@@ -19,11 +19,15 @@ void platform_fatal_message(const char *msg);
 bool platform_pump();
 
 // Displays a 32-bit (0xAABBGGRR little endian, i.e. bytes R,G,B,A) image.
+// Short status text shown after the window title (speed statistics).
+void platform_set_status(const char *text);
 void platform_present(const uint32_t *pixels, int width, int height, int stride);
 
 uint64_t platform_time_us();
 // Logical CPUs this process may run on (its affinity), at least 1.
 int platform_cpu_count();
+// Physical cores among them (fewer than platform_cpu_count() with hyper-threading).
+int platform_core_count();
 void platform_sleep_us(uint32_t us);
 
 // ------------------------------------------------------------------ input

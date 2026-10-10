@@ -50,6 +50,8 @@ uint64_t platform_time_us() {
 
 void platform_sleep_us(uint32_t us) { usleep(us); }
 
+int platform_core_count() { return platform_cpu_count(); }
+
 int platform_cpu_count() {
 #if defined(__linux__)
     cpu_set_t set;
@@ -71,6 +73,8 @@ void platform_get_pad(int port, HostPadState *out) {
 }
 
 void platform_set_vibration(int, uint8_t, uint8_t) {}
+
+void platform_set_status(const char *) {}
 
 bool platform_audio_open(int) { return true; }
 // EOD_WAV=file: the headless build writes the audio (48 kHz stereo) to a WAV file.

@@ -291,6 +291,22 @@ int platform_cpu_count() {
     return n > 0 ? n : 1;
 }
 
+int platform_core_count() {
+    // cores with at least one of our processors (GetLogicalProcessorInformation: XP SP3 and later)
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) proc = ~(DWORD_PTR)0;
+    DWORD len = 0;
+    GetLogicalProcessorInformation(nullptr, &len);
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
+    int n = 0;
+    if (len && GetLogicalProcessorInformation(info.data(), &len)) {
+        for (DWORD i = 0; i < len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION); i++)
+            if (info[i].Relationship == RelationProcessorCore && (info[i].ProcessorMask & proc)) n++;
+    }
+    int cpus = platform_cpu_count();
+    return n > 0 && n <= cpus ? n : cpus;
+}
+
 void platform_sleep_us(uint32_t us) {
     if (us >= 1000)
         Sleep(us / 1000);
@@ -368,6 +384,13 @@ void platform_get_pad(int port, HostPadState *out) {
                                        PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
     for (int i = 0; i < 12; i++)
         if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
+}
+
+void platform_set_status(const char *text) {
+    if (!g_hwnd) return;
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s - %s", g_cfg.title, text);
+    SetWindowTextA(g_hwnd, buf);
 }
 
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) {

@@ -34,6 +34,8 @@ Stats stats;
 // Game frames: the display buffer starts being drawn after other buffers
 // were (a flip, or a copy of the finished frame into a fixed display buffer).
 std::atomic<uint64_t> g_flips{0};
+// all game frames, drawn or skipped
+std::atomic<uint64_t> g_game_flips{0};
 // frame skipping: vblanks issued by the EE and composed by the GS thread
 std::atomic<uint64_t> g_ee_vblanks{0}, g_gs_vblanks{0};
 
@@ -682,7 +684,7 @@ enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 bool g_threaded;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
-uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 6;
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 12;
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
 // never destroyed: the worker may still be waiting on them when the process exits
 std::mutex &g_q_mtx = *new std::mutex;
@@ -1160,23 +1162,43 @@ void gs_vblank() {
         if (!g_pub.empty()) platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
     }
     {
+        // speed in the window title, every second
+        static uint64_t tt0, tf0, tv0;
+        uint64_t tnow = platform_time_us();
+        if (!tt0) tt0 = tnow, tf0 = g_flips, tv0 = g_frames;
+        if (tnow - tt0 >= 1000000) {
+            double sec = (double)(tnow - tt0) / 1e6;
+            char buf[96];
+            snprintf(buf, sizeof buf, "%.0f%% speed, %.0f fps", (double)(g_frames - tv0) / sec * (100.0 / 59.94),
+                     (double)(g_flips - tf0) / sec);
+            platform_set_status(buf);
+            tt0 = tnow, tf0 = g_flips, tv0 = g_frames;
+        }
+    }
+    {
         // EOD_FPS=1: print the game's frame rate every 5 seconds
         static bool show = getenv("EOD_FPS") != nullptr;
-        static uint64_t t0, f0, v0;
+        static uint64_t t0, f0, g0, v0, i0;
         if (show) {
+            extern std::atomic<uint64_t> g_ee_idle_us;
             uint64_t now = platform_time_us();
-            if (!t0) t0 = now, f0 = g_flips, v0 = g_frames;
+            if (!t0) t0 = now, f0 = g_flips, g0 = g_game_flips, v0 = g_frames, i0 = g_ee_idle_us;
             if (now - t0 >= 5000000) {
                 double sec = (double)(now - t0) / 1e6;
-                fprintf(stderr, "fps: %.1f vblank/s, %.1f frames/s, GS busy %.0f%%, EE waiting %.0f%% (%.0f%% in syncs)\n",
-                        (double)(g_frames - v0) / sec, (double)(g_flips - f0) / sec, g_gs_busy_us / (sec * 1e4),
+                fprintf(stderr,
+                        "fps: %.1f vblank/s, game %.1f frames/s, drawn %.1f frames/s, EE busy %.0f%%, GS busy %.0f%%, "
+                        "EE waiting %.0f%% (%.0f%% in syncs)\n",
+                        (double)(g_frames - v0) / sec, (double)(g_game_flips - g0) / sec, (double)(g_flips - f0) / sec,
+                        100.0 - (double)(g_ee_idle_us - i0) / (sec * 1e4), g_gs_busy_us / (sec * 1e4),
                         g_ee_wait_us / (sec * 1e4), g_ee_sync_us / (sec * 1e4));
                 g_ee_sync_us = 0;
                 g_gs_busy_us = 0;
                 g_ee_wait_us = 0;
                 t0 = now;
                 f0 = g_flips;
+                g0 = g_game_flips;
                 v0 = g_frames;
+                i0 = g_ee_idle_us;
             }
         }
     }

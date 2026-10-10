@@ -24,6 +24,7 @@
 #endif
 
 #include "../core/log.h"
+#include "../platform/platform.h"
 #include "gs_mem.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
@@ -31,7 +32,7 @@
 namespace gs {
 
 bool g_trace;  // log every primitive of one frame (EOD_GS_TRACE=frame)
-extern std::atomic<uint64_t> g_flips, g_ee_vblanks, g_gs_vblanks;
+extern std::atomic<uint64_t> g_flips, g_game_flips, g_ee_vblanks, g_gs_vblanks;
 bool g_skip_frame;  // frame skipping: primitives of the current game frame are dropped
 bool g_replaying;   // GS replay: never skip
 uint32_t g_reg_gen = 1;
@@ -322,7 +323,8 @@ void setup_env(uint32_t attr) {
         // Game frames end with drawing into the displayed buffer (a flip, or
         // a copy of the finished image).  When the next frame starts and the
         // GS thread trails the EE, the whole frame is skipped (EOD_FRAMESKIP=0
-        // disables; at most 3 frames in a row).
+        // disables; at most 7 frames in a row, so slow CPUs still see about
+        // 8 drawn frames per second while the game keeps its speed).
         static bool presenting;
         static int skipped;
         static const bool enabled = !getenv("EOD_FRAMESKIP") || atoi(getenv("EOD_FRAMESKIP")) != 0;
@@ -330,11 +332,12 @@ void setup_env(uint32_t attr) {
         uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
         if (fbp != e.fbp && fbp == shown) {
             if (!g_skip_frame) g_flips++;
+            g_game_flips++;
             presenting = true;
         } else if (fbp != shown && presenting) {
             presenting = false;
             uint64_t lag = g_ee_vblanks.load() - g_gs_vblanks.load();
-            g_skip_frame = enabled && !g_replaying && lag >= 2 && lag < (1u << 30) && skipped < 3;
+            g_skip_frame = enabled && !g_replaying && lag >= 2 && lag < (1u << 30) && skipped < 7;
             skipped = g_skip_frame ? skipped + 1 : 0;
             if (g_skip_frame) stats.skipped++;
         }
@@ -1191,6 +1194,10 @@ std::deque<Env> &g_env_arena = *new std::deque<Env>;
 std::atomic<uint32_t> g_dbg_sleeps, g_dbg_notifies, g_dbg_psleeps;
 uint64_t g_dbg_wait_ns;
 
+// How long waiting threads spin before sleeping: long on real cores, short
+// when they share cores (hyper-threading) with the EE and GS threads.
+int g_spin_us = 3000;
+
 // Spins until cond() holds or about `us` microseconds pass (thread wakeups
 // can take far longer than the gaps between jobs).
 template <class F>
@@ -1261,7 +1268,7 @@ void raster_worker(int id) {
     uint64_t idx = 0;
     for (;;) {
         if (g_head.load() == idx) {
-            spin_until([&] { return g_head.load() != idx; }, 3000);
+            spin_until([&] { return g_head.load() != idx; }, g_spin_us);
             if (g_head.load() == idx) {
                 std::unique_lock<std::mutex> lk(g_wmtx);
                 g_dbg_sleeps++;
@@ -1298,7 +1305,7 @@ uint64_t min_done() {
 // Waits until the workers have run all jobs up to `upto`.
 void wait_workers(uint64_t upto) {
     auto t0 = std::chrono::steady_clock::now();
-    if (spin_until([&] { return min_done() >= upto; }, 3000)) {
+    if (spin_until([&] { return min_done() >= upto; }, g_spin_us)) {
         g_dbg_wait_ns +=
             (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
         return;
@@ -1744,6 +1751,7 @@ void raster_start(int n) {
     if (n <= 0) return;
     g_ring = new Job[kRing];
     g_nw = n;
+    if (platform_core_count() < platform_cpu_count()) g_spin_us = 100;
     for (int i = 0; i < n; i++) std::thread(raster_worker, i).detach();
 }
 

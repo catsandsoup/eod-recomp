@@ -6,6 +6,8 @@
 // have a delay slot and the E bit ends the program after the next pair.
 #include "vu.h"
 
+#include <emmintrin.h>
+
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
@@ -1143,6 +1145,102 @@ struct VuProg {
 #if __has_include("vu_rec.inc")
 #define VU_REC 1
 namespace {
+// Helpers for the compiled programs: upper FMAC results as SSE vectors
+// (same IEEE single operations as apply_t, lanes with an Inf/NaN result
+// redone by the scalar code), committed under the dest mask.
+alignas(16) const uint32_t g_vu_dmask[16][4] = {
+#define M(d) {(d) & 8 ? ~0u : 0u, (d) & 4 ? ~0u : 0u, (d) & 2 ? ~0u : 0u, (d) & 1 ? ~0u : 0u}
+    M(0), M(1), M(2), M(3), M(4), M(5), M(6), M(7), M(8), M(9), M(10), M(11), M(12), M(13), M(14), M(15)
+#undef M
+};
+
+template <ArOp OP, int SRC>
+__attribute__((always_inline)) inline __m128 up_val(VUState *vu, uint32_t ins) {
+    __m128 a = _mm_loadu_ps(vu->vf[FS(ins)].f);
+    __m128 b;
+    if (SRC == S_VEC) b = _mm_loadu_ps(vu->vf[FT(ins)].f);
+    else b = _mm_set1_ps(SRC == S_BC ? vu->vf[FT(ins)].f[ins & 3] : SRC == S_Q ? vu->q : vu->i);
+    if (OP == OP_MAX || OP == OP_MIN) {
+        VUReg s, t, r;
+        _mm_storeu_ps(s.f, a);
+        _mm_storeu_ps(t.f, b);
+        for (int k = 0; k < 4; k++) r.f[k] = apply_t<OP>(0.0f, s.f[k], t.f[k]);
+        return _mm_loadu_ps(r.f);
+    }
+    __m128 acc = _mm_loadu_ps(vu->acc.f), r;
+    switch (OP) {
+    case OP_ADD: r = _mm_add_ps(a, b); break;
+    case OP_SUB: r = _mm_sub_ps(a, b); break;
+    case OP_MUL: r = _mm_mul_ps(a, b); break;
+    case OP_MADD: r = _mm_add_ps(acc, _mm_mul_ps(a, b)); break;
+    default: r = _mm_sub_ps(acc, _mm_mul_ps(a, b)); break;
+    }
+    const __m128 ex = _mm_castsi128_ps(_mm_set1_epi32(0x7F800000));
+    if (__builtin_expect(_mm_movemask_ps(_mm_cmpeq_ps(_mm_and_ps(r, ex), ex)) != 0, 0)) {
+        VUReg s, t, ac, o;
+        _mm_storeu_ps(s.f, a);
+        _mm_storeu_ps(t.f, b);
+        _mm_storeu_ps(ac.f, acc);
+        for (int k = 0; k < 4; k++) o.f[k] = apply(OP, ac.f[k], s.f[k], t.f[k]);
+        r = _mm_loadu_ps(o.f);
+    }
+    return r;
+}
+
+template <int DEST>
+__attribute__((always_inline)) inline void vu_store(float *dst, __m128 v) {
+    if (DEST == 15) {
+        _mm_storeu_ps(dst, v);
+    } else {
+        __m128 m = _mm_load_ps(reinterpret_cast<const float *>(g_vu_dmask[DEST]));
+        _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(m, v), _mm_andnot_ps(m, _mm_loadu_ps(dst))));
+    }
+}
+
+__attribute__((always_inline)) inline void vu_flags(VUState *vu, __m128 v, int dest) {
+    VUReg r;
+    _mm_storeu_ps(r.f, v);
+    vu->mac = mac_for(r, dest);
+    set_status_from_mac(vu, vu->mac);
+}
+
+// ITOF0/4/12/15, FTOI0/4/12/15 (saturating, truncating), ABS, CLIP
+__attribute__((always_inline)) inline __m128 vu_itof(VUState *vu, int fs, int n) {
+    static const float sc[4] = {1.0f, 1.0f / 16, 1.0f / 4096, 1.0f / 32768};
+    __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i *>(vu->vf[fs].f));
+    return _mm_mul_ps(_mm_cvtepi32_ps(s), _mm_set1_ps(sc[n]));
+}
+
+__attribute__((always_inline)) inline __m128 vu_ftoi(VUState *vu, int fs, int n) {
+    static const float sc[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+    __m128 f = _mm_mul_ps(_mm_loadu_ps(vu->vf[fs].f), _mm_set1_ps(sc[n]));
+    // cvttps gives 0x80000000 out of range (as the scalar conversion does
+    // for NaN and large negatives); large positives saturate to 0x7FFFFFFF
+    __m128i r = _mm_cvttps_epi32(f);
+    __m128i big = _mm_castps_si128(_mm_cmpge_ps(f, _mm_set1_ps(2147483647.0f)));
+    return _mm_castsi128_ps(_mm_xor_si128(r, big));
+}
+
+__attribute__((always_inline)) inline __m128 vu_abs(VUState *vu, int fs) {
+    return _mm_and_ps(_mm_loadu_ps(vu->vf[fs].f), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+}
+
+__attribute__((always_inline)) inline void vu_clip(VUState *vu, int fs, int ft) {
+    const VUReg &s = vu->vf[fs];
+    float w = fabsf(vu->vf[ft].f[3]);
+    uint32_t f = 0;
+    if (s.f[0] > w) f |= 0x01;
+    if (s.f[0] < -w) f |= 0x02;
+    if (s.f[1] > w) f |= 0x04;
+    if (s.f[1] < -w) f |= 0x08;
+    if (s.f[2] > w) f |= 0x10;
+    if (s.f[2] < -w) f |= 0x20;
+    vu->clip = ((vu->clip << 6) | f) & 0xFFFFFF;
+}
+
+// VU1 data memory (VU0 also maps VU1's registers, see vu_qword)
+inline uint8_t *vu1_qword(VUState *vu, uint32_t addr_qw) { return vu->mem + ((addr_qw * 16) & 0x3FFF); }
+
 #include "vu_rec.inc"
 }  // namespace
 #else
