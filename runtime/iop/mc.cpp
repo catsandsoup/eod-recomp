@@ -18,6 +18,7 @@
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "iop.h"
+#include "../core/cpu.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -115,12 +116,17 @@ void iop_mc_init() {
             uint8_t end[0xC0] = {};
             wr32(end + 0x00, 2);     // PS2 memory card
             wr32(end + 0x04, 8000);  // free clusters (KB)
-            wr32(end + 0x90, 1);     // formatted
+            wr32(end + 0x08, 1);     // formatted
+            wr32(end + 0x90, 1);
+            wr32(end + 0x94, 2);
+            wr32(end + 0x98, 8000);
+            wr32(end + 0x9C, 1);
             if (param) ee_write_block(param, end, sizeof end);
             port_root(port);
             r = g_seen[port] ? 0 : -1;  // -1: new (formatted) card
             g_seen[port] = true;
-            LOG(LOG_MC, "mc GetInfo port %d -> %d", port, r);
+            LOG(LOG_MC, "mc GetInfo port %d -> %d (param %08x, args %08x %08x %08x %08x %08x %08x %08x)", port, r, param,
+                rd32(buf), rd32(buf + 4), rd32(buf + 8), rd32(buf + 12), rd32(buf + 16), rd32(buf + 20), rd32(buf + 24));
             break;
         }
         case 0x02: {  // Open / Mkdir
@@ -129,6 +135,7 @@ void iop_mc_init() {
             char name[1024] = {};
             memcpy(name, buf + 0x18, 1023);
             r = mc_open(port, name, flags);
+            LOG(LOG_MC, "mc open/mkdir port %d '%s' flags %x -> %d", port, name, flags, r);
             break;
         }
         case 0x03: {  // Close(fd)

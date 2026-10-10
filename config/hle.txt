@@ -4,6 +4,7 @@
 
 003A60E0 wrap     # printf (newlib) - mirrored to the log
 00331DF0 wrap     # panic(fmt, ...) - game fatal error
+00331E48 replace  # debug printf (formats and discards in the release build) - logged with --log game
 0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
 

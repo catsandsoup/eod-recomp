@@ -96,7 +96,12 @@ std::vector<HostFiber *> g_zombies;
 std::vector<Handler> g_intc_handlers[15];
 std::vector<Handler> g_dmac_handlers[16];
 int g_next_handler_id = 1;
+// INTC_STAT as software sees it: a bit stays set until the program writes 1
+// to it (libgraph's sceGsSyncV clears the vblank bit and polls for it, with
+// interrupts enabled).  g_intc_new holds the events not yet dispatched to
+// handlers: every event runs the handlers once.
 std::atomic<uint32_t> g_intc_stat{0};
+std::atomic<uint32_t> g_intc_new{0};
 uint32_t g_intc_mask = 0;
 std::atomic<uint32_t> g_dmac_pending{0};
 
@@ -169,7 +174,7 @@ void switch_to(Thread *next) {
     delete_zombies();
 }
 
-void service_events();
+void service_events(bool run_alarms = true);
 void dispatch_interrupts();
 
 // Wait until some thread can run; runs interrupts in the meantime.
@@ -185,7 +190,7 @@ void idle_until_runnable() {
         uint64_t next = g_vblank_end_pending ? g_vblank_end_us : g_next_vblank_us;
         for (auto &a : g_alarms)
             if (a.used && a.due_us < next) next = a.due_us;
-        if (next > now && !(g_intc_stat.load() & g_intc_mask) && !g_dmac_pending.load()) {
+        if (next > now && !(g_intc_new.load() & g_intc_mask) && !g_dmac_pending.load()) {
             uint64_t d = next - now;
             platform_sleep_us((uint32_t)(d > 2000 ? 2000 : d));
         }
@@ -295,7 +300,10 @@ void debug_watch() {
     }
 }
 
-void service_events() {
+// Generates the timed events (vblank start/end set INTC_STAT even while
+// interrupts are disabled, as on hardware); alarm callbacks run only when
+// `run_alarms` (interrupts enabled).
+void service_events(bool run_alarms) {
     uint64_t now = platform_time_us();
     iop_sound_update();
     debug_watch();
@@ -325,7 +333,7 @@ void service_events() {
             exit(0);
         }
     }
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 64 && run_alarms; i++) {
         Alarm &a = g_alarms[i];
         if (a.used && now >= a.due_us) {
             a.used = false;
@@ -338,12 +346,12 @@ void service_events() {
 
 void dispatch_interrupts() {
     g_in_interrupt = true;
-    uint32_t pend = g_intc_stat.exchange(0);
+    uint32_t pend = g_intc_new.exchange(0);
     for (int cause = 0; cause < 15; cause++) {
         if (!(pend & (1u << cause))) continue;
         if (!(g_intc_mask & (1u << cause))) {
-            // masked: keep it latched in the status register
-            g_intc_stat |= 1u << cause;
+            // masked: dispatched once unmasked
+            g_intc_new |= 1u << cause;
             continue;
         }
         for (const Handler &h : g_intc_handlers[cause]) {
@@ -725,7 +733,7 @@ int handle_syscall(int num) {
     case 0x1A: {
         uint32_t was = (g_intc_mask >> a0) & 1;
         g_intc_mask |= 1u << a0;
-        if (g_intc_stat.load() & (1u << a0)) g_ee_irq_pending = 1;
+        if (g_intc_new.load() & (1u << a0)) g_ee_irq_pending = 1;
         return (int)was;
     }
     case 0x15:  // _DisableIntc
@@ -958,14 +966,21 @@ extern "C" void ee_syscall(uint32_t pc) {
 }
 
 extern "C" void ee_service_interrupts(void) {
-    if (g_in_interrupt || !g_ints_enabled) return;
+    if (g_in_interrupt) return;
+    if (!g_ints_enabled) {
+        // code polling INTC_STAT with interrupts disabled (libgraph's vsync
+        // wait) must still see vblanks; EI re-arms dispatch for what latched
+        g_ee_irq_pending = 0;
+        service_events(false);
+        return;
+    }
     g_ee_irq_pending = 0;
     g_in_interrupt = true;
     service_events();
     g_in_interrupt = false;
-    if (g_intc_stat.load() || g_dmac_pending.load()) dispatch_interrupts();
+    if (g_intc_new.load() || g_dmac_pending.load()) dispatch_interrupts();
     // anything raised while dispatching gets picked up next time
-    if (g_intc_stat.load() & g_intc_mask) g_ee_irq_pending = 1;
+    if (g_intc_new.load() & g_intc_mask) g_ee_irq_pending = 1;
     if (g_dmac_pending.load()) g_ee_irq_pending = 1;
     if (g_resched_pending) {
         g_resched_pending = false;
@@ -990,7 +1005,7 @@ extern "C" void ee_idle_poll(void) {
         uint64_t next = g_vblank_end_pending ? g_vblank_end_us : g_next_vblank_us;
         for (auto &a : g_alarms)
             if (a.used && a.due_us < next) next = a.due_us;
-        if (next > now && !(g_intc_stat.load() & g_intc_mask) && !g_dmac_pending.load()) {
+        if (next > now && !(g_intc_new.load() & g_intc_mask) && !g_dmac_pending.load()) {
             uint64_t d = next - now;
             platform_sleep_us((uint32_t)(d > 500 ? 500 : d));
         }
@@ -1000,6 +1015,7 @@ extern "C" void ee_idle_poll(void) {
 
 void intc_raise(int cause) {
     g_intc_stat |= 1u << cause;
+    g_intc_new |= 1u << cause;
     g_ee_irq_pending = 1;
 }
 
@@ -1010,16 +1026,22 @@ void dmac_raise(int channel) {
 
 uint32_t intc_stat() { return g_intc_stat.load(); }
 uint32_t intc_mask() { return g_intc_mask; }
-void intc_write_stat(uint32_t v) { g_intc_stat &= ~v; }
+void intc_write_stat(uint32_t v) {
+    g_intc_stat &= ~v;
+    // an acknowledge cancels events the CPU could not have taken yet; enabled
+    // ones would already have run their handlers on hardware
+    uint32_t cancel = g_ints_enabled ? (v & ~g_intc_mask) : v;
+    g_intc_new &= ~cancel;
+}
 void intc_write_mask(uint32_t v) {
     g_intc_mask ^= v;
-    if (g_intc_stat.load() & g_intc_mask) g_ee_irq_pending = 1;
+    if (g_intc_new.load() & g_intc_mask) g_ee_irq_pending = 1;
 }
 
 bool kernel_interrupts_enabled() { return g_ints_enabled; }
 void kernel_set_interrupts_enabled(bool on) {
     g_ints_enabled = on;
-    if (on && (g_intc_stat.load() || g_dmac_pending.load())) g_ee_irq_pending = 1;
+    if (on && (g_intc_new.load() || g_dmac_pending.load())) g_ee_irq_pending = 1;
 }
 bool kernel_in_interrupt() { return g_in_interrupt; }
 uint64_t kernel_vblank_count() { return g_vblank_count; }

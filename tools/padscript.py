@@ -6,7 +6,7 @@
 
 Each FRAME:BUTTONS taps the buttons for 10 vblanks; --hold A-B:BUTTONS holds
 them from vblank A to B.  Buttons: start select x o square triangle up down
-left right l1 r1 l2 r2, joined with '+'.  Example (Career mode with an
+left right l1 r1 l2 r2 (also tri, sq, circle, cross), joined with '+'.  Example (Career mode with an
 empty memory card, EOD_MEMCARD=/tmp/mc):
   EOD_PAD_SCRIPT=$(python3 tools/padscript.py 400:start 1500:start 1700:down \\
       1900:x 2200:x 2500:x 2800:x 3100:x) ./eod --data <disc folder>
@@ -15,7 +15,9 @@ import sys
 
 BUTTONS = {"select": 0x1, "start": 0x8, "up": 0x10, "right": 0x20, "down": 0x40, "left": 0x80,
            "l2": 0x100, "r2": 0x200, "l1": 0x400, "r1": 0x800, "triangle": 0x1000, "o": 0x2000,
-           "x": 0x4000, "square": 0x8000}
+           "x": 0x4000, "square": 0x8000,
+           # short names
+           "tri": 0x1000, "sq": 0x8000, "circle": 0x2000, "cross": 0x4000}
 
 
 def mask(names):
