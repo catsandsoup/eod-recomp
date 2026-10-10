@@ -10,7 +10,7 @@ bool g_log_enabled[LOG_CAT_COUNT];
 
 static const char *k_names[LOG_CAT_COUNT] = {
     "core", "kernel", "thread", "hw", "dma", "gs", "vif", "vu",
-    "sif", "iop", "file", "pad", "mc", "snd", "game",
+    "sif", "iop", "file", "pad", "mc", "snd", "game", "gsxfer",
 };
 
 static FILE *g_log_file;
@@ -43,8 +43,9 @@ void log_init(const char *spec) {
             on = false;
             tok++;
         }
-        if (!strcmp(tok, "all")) {
-            for (bool &b : g_log_enabled) b = on;
+        if (!strcmp(tok, "all")) {  // the verbose categories have to be named
+            for (int i = 0; i < LOG_CAT_COUNT; i++)
+                if (i != LOG_GSXFER) g_log_enabled[i] = on;
             continue;
         }
         for (int i = 0; i < LOG_CAT_COUNT; i++)

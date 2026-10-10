@@ -115,9 +115,9 @@ void xfer_start() {
         g_xfer.pend_n = 0;
         g_xfer.T = swizzle_table(dpsm, dbw);
         g_xfer.ry = -1;
-        LOG(LOG_GS, "transfer host->local bp=%x bw=%d psm=%x at %d,%d size %dx%d", dbp, dbw, dpsm, dx, dy, w, h);
+        LOG(LOG_GSXFER, "transfer host->local bp=%x bw=%d psm=%x at %d,%d size %dx%d", dbp, dbw, dpsm, dx, dy, w, h);
     } else if (dir == 2) {
-        LOG(LOG_GS, "transfer local->local %x(%x)->%x(%x) %dx%d", sbp, spsm, dbp, dpsm, w, h);
+        LOG(LOG_GSXFER, "transfer local->local %x(%x)->%x(%x) %dx%d", sbp, spsm, dbp, dpsm, w, h);
         // overlapping copies: go through a temporary buffer
         std::vector<uint32_t> tmp((size_t)w * h);
         for (int y = 0; y < h; y++)
@@ -127,7 +127,9 @@ void xfer_start() {
             for (int x = 0; x < w; x++)
                 write_pixel(dpsm, (dx + x) & 2047, (dy + y) & 2047, dbp, dbw, tmp[(size_t)y * w + x]);
     } else if (dir == 1) {
-        LOG(LOG_GS, "transfer local->host requested (%dx%d) - not supported yet", w, h);
+        static unsigned n;
+        if (++n <= 8 || g_log_enabled[LOG_GSXFER])
+            LOG(LOG_GS, "transfer local->host requested (%dx%d) - not supported yet", w, h);
     }
 }
 
@@ -757,6 +759,11 @@ void gs_frame_end(uint64_t frame) {
             if (stats.kind_px[k] / 60 > 5000)
                 LOG(LOG_GS, "  tri kind gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels per vblank", k & 1, (k >> 1) & 1,
                     (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, stats.kind_px[k] / 60);
+        if (hw::g_on && g_log_enabled[LOG_GS]) {  // totals over the last 60 vblanks
+            char line[512];
+            hw::stats_line(line, sizeof line);
+            LOG(LOG_GS, "  %s", line);
+        }
         stats = Stats();
     }
 }

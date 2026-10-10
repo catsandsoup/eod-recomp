@@ -19,6 +19,7 @@ enum LogCat {
     LOG_MC,
     LOG_SND,
     LOG_GAME,
+    LOG_GSXFER,  // every GS transfer (verbose: not part of "all")
     LOG_CAT_COUNT
 };
 

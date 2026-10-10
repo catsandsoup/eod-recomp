@@ -132,7 +132,7 @@ Put `eod.exe` in the folder with the disc files (or pass `--data <folder>`).
 | --- | --- |
 | `--data DIR` | folder containing `SLUS_209.10` and `DATA/` |
 | `--scale N` | initial window size (N × 320×240) |
-| `--log cats` / `--log-file F` | debug logging (`core,kernel,sif,file,gs,...` or `all`) |
+| `--log cats` / `--log-file F` | debug logging (`core,kernel,sif,file,gs,...` or `all`; `gsxfer` logs every GS transfer and has to be named) |
 | `--frames N` | exit after N frames (testing) |
 | `--screenshot-every N --screenshot-dir D` | dump frames as PPM |
 
@@ -151,7 +151,9 @@ Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
   `EOD_FRAMESKIP=0` disables frame skipping (when rendering falls behind,
   whole game frames are dropped so the game keeps running at full speed)
 * `--log gs` prints per-second renderer statistics (pixels, texture decoding,
-  raster jobs and barriers, pixels per triangle type)
+  raster jobs and barriers, pixels per triangle type; with Direct3D 11 also draw
+  calls, uploads, readbacks and texture cache use); `--log gsxfer` logs every
+  GS memory transfer (very large: movies alone write thousands per second)
 * `EOD_GS_CENSUS=file` tallies the GS features used (state combinations, rendered
   buffers read back as textures); `EOD_GS_REPLAY_TRACE=1` logs the primitives of a
   replay; `EOD_GS_REPLAY_STOP=n EOD_GS_REPLAY_DUMP=file` dumps GS memory after the
