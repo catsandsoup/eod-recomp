@@ -122,6 +122,50 @@ void set_status_from_mac(VUState *vu, uint32_t mac) {
     vu->status = (vu->status & ~0xFFFu) | (st & 0xFFF);
 }
 
+// Flag results in flight (micro mode): visible 4 cycles after issue.
+inline void flag_apply(VUState *vu, const VUFlagUpd &u) {
+    if (u.kind == 0) {
+        vu->mac = u.val;
+        set_status_from_mac(vu, u.val);
+    } else {
+        vu->clip = ((vu->clip << 6) | u.val) & 0xFFFFFF;
+    }
+}
+
+// Makes the flag results that have arrived by the current cycle visible.
+__attribute__((always_inline)) inline void vu_flag_sync(VUState *vu) {
+    while (vu->fq_n && vu->fq[vu->fq_head].ready <= vu->cycle) {
+        flag_apply(vu, vu->fq[vu->fq_head]);
+        vu->fq_head = (vu->fq_head + 1) & 7;
+        vu->fq_n--;
+    }
+}
+
+// End of a micro program: everything in flight arrives.
+inline void vu_flag_flush(VUState *vu) {
+    while (vu->fq_n) {
+        flag_apply(vu, vu->fq[vu->fq_head]);
+        vu->fq_head = (vu->fq_head + 1) & 7;
+        vu->fq_n--;
+    }
+}
+
+inline void vu_flag_push(VUState *vu, uint32_t kind, uint32_t val) {
+    VUFlagUpd u = {vu->cycle + 4, val, kind};
+    if (!vu->flag_pipe) {  // macro mode: no visible delay
+        flag_apply(vu, u);
+        return;
+    }
+    vu_flag_sync(vu);
+    if (vu->fq_n == 8) {  // (can't happen: at most 4 are in flight)
+        flag_apply(vu, vu->fq[vu->fq_head]);
+        vu->fq_head = (vu->fq_head + 1) & 7;
+        vu->fq_n--;
+    }
+    vu->fq[(vu->fq_head + vu->fq_n) & 7] = u;
+    vu->fq_n++;
+}
+
 // --------------------------------------------------------------- upper
 void upper_result(Ctx &c, int reg, const VUReg &v, int dest, bool acc) {
     c.up_write = true;
@@ -140,10 +184,7 @@ __attribute__((always_inline)) inline void commit_upper(Ctx &c) {
     if (c.up_acc || c.up_reg != 0)
         for (int k = 0; k < 4; k++)
             if (has(c.up_dest, k)) dst->f[k] = c.up_val.f[k];
-    if (c.mac_set) {
-        vu->mac = c.mac;
-        set_status_from_mac(vu, c.mac);
-    }
+    if (c.mac_set) vu_flag_push(vu, 0, c.mac);
     c.up_write = false;
     c.mac_set = false;
 }
@@ -425,7 +466,7 @@ void upper(Ctx &c, uint32_t ins) {
         if (s.f[1] < -w) f |= 0x08;
         if (s.f[2] > w) f |= 0x10;
         if (s.f[2] < -w) f |= 0x20;
-        vu->clip = ((vu->clip << 6) | f) & 0xFFFFFF;
+        vu_flag_push(vu, 1, f);
         return;
     }
     case 0x20: fmac(c, ins, OP_ADD, -1, &q, true); return;
@@ -1026,6 +1067,7 @@ static void vu_interp(VUState *vu, uint32_t pc) {
     int end_countdown = -1;
     uint64_t guard = 0;
     vu->running = 1;
+    vu->flag_pipe = 1;
     LOG(LOG_VU, "VU%d start at %04x", vu->index, pc);
     for (;;) {
         if (++guard > 50000000) {
@@ -1051,6 +1093,7 @@ static void vu_interp(VUState *vu, uint32_t pc) {
         }
         if (d.waitq) flush_q(vu);
         sync_pipes(vu);
+        vu_flag_sync(vu);
         const uint64_t lw_lo = d.lw_lo, lw_hi = d.lw_hi;
         // upper first (computed against old state), committed after lower
         c.up_write = false;
@@ -1099,6 +1142,8 @@ static void vu_interp(VUState *vu, uint32_t pc) {
     }
     flush_q(vu);
     flush_p(vu);
+    vu_flag_flush(vu);
+    vu->flag_pipe = 0;
     vu->tpc = pc;
     vu->running = 0;
 }
@@ -1200,8 +1245,7 @@ __attribute__((always_inline)) inline void vu_store(float *dst, __m128 v) {
 __attribute__((always_inline)) inline void vu_flags(VUState *vu, __m128 v, int dest) {
     VUReg r;
     _mm_storeu_ps(r.f, v);
-    vu->mac = mac_for(r, dest);
-    set_status_from_mac(vu, vu->mac);
+    vu_flag_push(vu, 0, mac_for(r, dest));
 }
 
 // ITOF0/4/12/15, FTOI0/4/12/15 (saturating, truncating), ABS, CLIP
@@ -1235,7 +1279,7 @@ __attribute__((always_inline)) inline void vu_clip(VUState *vu, int fs, int ft) 
     if (s.f[1] < -w) f |= 0x08;
     if (s.f[2] > w) f |= 0x10;
     if (s.f[2] < -w) f |= 0x20;
-    vu->clip = ((vu->clip << 6) | f) & 0xFFFFFF;
+    vu_flag_push(vu, 1, f);
 }
 
 // VU1 data memory (VU0 also maps VU1's registers, see vu_qword)

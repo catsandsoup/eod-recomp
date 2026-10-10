@@ -16,6 +16,13 @@ typedef union VUReg {
     int32_t s[4];
 } VUReg;
 
+/* a MAC/status or clip flag result on its way through the FMAC pipeline */
+struct VUFlagUpd {
+    uint64_t ready; /* cycle it becomes visible */
+    uint32_t val;   /* MAC flag, or the 6 new clip bits */
+    uint32_t kind;  /* 0 MAC (and status), 1 clip */
+};
+
 struct VUState {
     VUReg vf[32];
     uint32_t vi[32];        /* 0-15 integer regs; 16+ control registers */
@@ -42,6 +49,13 @@ struct VUState {
     int q_busy, p_busy;
     uint64_t q_ready, p_ready;
     uint64_t vf_ready[32][4];
+    /* micro mode: flag results become visible to the flag instructions
+       (FMAND, FCAND, ...) 4 cycles after issue, like register results, but
+       without interlocks; microcode relies on the delay (e.g. a back-face
+       sign test 4 instructions before the FMAND reading it) */
+    int flag_pipe;
+    int fq_head, fq_n;
+    struct VUFlagUpd fq[8];
 };
 
 typedef struct VUState VUState;

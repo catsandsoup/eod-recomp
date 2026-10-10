@@ -444,6 +444,9 @@ class Prog:
             (lc is not None and (lc.startswith("lower(c,") or "vu->p" in lc))
         if need_sync:
             out.append(ind + "sync_pipes(vu);")
+        # flag instructions see the flag results issued 4+ cycles earlier
+        if lc is not None and ((lo >> 25) in FLAG_OPS or lc.startswith("lower(c,")):
+            out.append(ind + "vu_flag_sync(vu);")
         commit = []
         if fm is not None:
             o, src, acc = fm
@@ -508,6 +511,7 @@ class Prog:
                "    (void)jr;",
                "    (void)sb;",
                "    vu->running = 1;",
+               "    vu->flag_pipe = 1;",
                "    switch (entry) {"]
         for e in self.entries:
             out.append("    case 0x%04X: goto L_%04X;" % (e, e))
@@ -550,6 +554,8 @@ class Prog:
         out.append("end:")
         out.append("    flush_q(vu);")
         out.append("    flush_p(vu);")
+        out.append("    vu_flag_flush(vu);")
+        out.append("    vu->flag_pipe = 0;")
         out.append("    vu->running = 0;")
         out.append("}")
         return out

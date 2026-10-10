@@ -28,7 +28,7 @@ N64Recomp/Zelda64Recomp:
    * `hw/` – DMA controller, timers, interrupt controller and the IPU
      (MPEG-2 macroblock decoding and colour conversion used by the movies)
    * `vu/` – VU0/VU1 interpreter (with the pipeline/stall timing the game's
-     microcode depends on) and VIF0/VIF1 (unpack, MPG, MSCAL, DIRECT, PATH3 masking).
+     microcode depends on, including the 4-cycle delay of the MAC/status/clip flags) and VIF0/VIF1 (unpack, MPG, MSCAL, DIRECT, PATH3 masking).
      The game's micro programs are also compiled ahead of time to C++ by
      **`tools/vurecomp.py`** (from the images in `config/vu/`); the
      interpreter runs anything that doesn't match them.
