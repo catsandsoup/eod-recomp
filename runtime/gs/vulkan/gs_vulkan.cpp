@@ -1006,7 +1006,7 @@ void deferred_schedule(uint32_t page) {
     g_dstats.scheduled++;
     if (g_deferred_merged_last[page] && deferred_kick_enabled()) {
         // Start the GPU on it now (asynchronously) so a later merge rarely waits.
-        g_dev->submit(false);
+        g_dev->submit(false, false);
         g_dstats.kicked++;
     }
 }
@@ -2603,8 +2603,8 @@ void stats_line(char *buf, size_t size) {
              g_stats.rb_reason[2], g_stats.rb_reason[3]);
     size_t used = strlen(buf);
     snprintf(buf + used, size > used ? size - used : 0,
-             "; submit %llu, GPU wait %.2f ms, pipeline creation %.2f ms (%zu pipelines)",
-             (unsigned long long)g_dev->submit_count, g_dev->wait_us / 1000.0, g_dev->pipeline_us / 1000.0,
+             "; submit %llu (%llu mid-frame), GPU wait %.2f ms, pipeline creation %.2f ms (%zu pipelines)",
+             (unsigned long long)g_dev->submit_count, (unsigned long long)g_dev->chunk_submits, g_dev->wait_us / 1000.0, g_dev->pipeline_us / 1000.0,
              g_dev->pipelines.size());
     used = strlen(buf);
     const uint64_t *e = g_dev->pass_ends;
@@ -2621,7 +2621,7 @@ void stats_line(char *buf, size_t size) {
     g_dstats = DeferredStats();
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
-    g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = 0;
+    g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = g_dev->chunk_submits = 0;
     g_stats = Stats();
 }
 
