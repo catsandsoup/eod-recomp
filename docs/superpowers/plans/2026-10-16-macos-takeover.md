@@ -14,7 +14,8 @@
 
 - Target PS2 SLUS_209.10 NTSC-U v1.00 on Apple Silicon; Xbox work stays parked.
 - Tests headless and muted. No visible windows or sound during automation.
-- Never commit disc files, generated recomp sources, captures or binaries. No publishing.
+- Never commit disc files, generated recomp sources, captures or binaries.
+  The owner authorized periodic source commits/pushes; no binary publication.
 - Reuse branches/worktrees `vulkan-gs`, `rockcandy-pad`, `mac-app`.
 - Two independent player ports, keyboard + controller and two controllers; Rock Candy 360 is the priority physical pad.
 - Mod implementation remains parked; completed PS2 scope report is retained.

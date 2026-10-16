@@ -114,4 +114,6 @@ PS2SDK research. No wholesale renderer or recompiler migration is required.
 The current local app lives at
 `~/Library/Application Support/TDEODRecomp/local-build/Eve of Destruction.app`.
 Use `-DEOD_MAC_APP=ON` to rebuild, and `tools/make_dmg.sh` for a personal local
-image. No source push or binary publication was performed during takeover.
+image. The owner subsequently authorized periodic source checkpoints; verified changes
+are pushed to the personal fork's `macos` branch. No binary publication was
+performed.
