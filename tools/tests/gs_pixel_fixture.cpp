@@ -55,6 +55,9 @@ int main(int argc, char **argv) {
     gs::write_pixel(gs::PSMCT32, 1, 0, textureBP, 1, rgba(4, 24, 44));
     gs::write_pixel(gs::PSMCT32, 0, 1, textureBP, 1, rgba(8, 28, 48));
     gs::write_pixel(gs::PSMCT32, 1, 1, textureBP, 1, rgba(12, 32, 52));
+    if (name == "state_cache")
+        for (int y=0;y<2;++y) for (int x=0;x<2;++x)
+            gs::write_pixel(gs::PSMCT32,x,y,textureBP+128,1,rgba(180,140,100));
     std::vector<Pair> regs, prelude;
     auto reg = [&](uint64_t id, uint64_t value) { regs.emplace_back(value, id); };
     auto sprite = [&](unsigned prim, uint64_t color, unsigned uv, unsigned z=1) {
@@ -65,7 +68,24 @@ int main(int argc, char **argv) {
         reg(3, uv | uint64_t(11) << 16);
         reg(5, xyz(40 * 16, 40 * 16,z));
     };
-    if (name == "flat")
+    if (name == "state_cache") {
+        state.pmode = 3ull | 1ull << 5 | 64ull << 8; // two display circuits, constant alpha
+        state.dispfb[1] = 8ull | 2ull << 9;
+        state.display[1] = state.display[0];
+        // Alternate target dimensions, clipping, sampler, texture view and FIX
+        // blending; repeated state spans a vblank and a second replay as well.
+        for (unsigned phase = 0; phase < 6; ++phase) {
+            const bool alternate = phase & 1;
+            reg(0x4c, (alternate ? 8ull : 0ull) | (alternate ? 2ull : 1ull) << 16);
+            reg(0x40, (alternate ? 23ull : 63ull) << 16 | (alternate ? 47ull : 63ull) << 48);
+            reg(0x14, alternate ? 0 : 1ull << 5); // TEX1 nearest/linear
+            reg(0x06, state.ctx[0].tex0 + (alternate ? 128ull : 0ull));
+            reg(0x42, 0x64ull | uint64_t(alternate ? 32 : 96) << 32);
+            sprite(6 | 1 << 4 | 1 << 6 | 1 << 8, rgba(128,128,128), 9);
+            sprite(6 | 1 << 4 | 1 << 6 | 1 << 8, rgba(128,128,128), 9);
+            if (phase == 1) prelude.swap(regs);
+        }
+    } else if (name == "flat")
         sprite(6, rgba(37, 83, 126), 0);
     else if (name == "filter")
         sprite(6 | 1 << 4 | 1 << 8, rgba(128, 128, 128), 9);

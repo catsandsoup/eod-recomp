@@ -32,24 +32,32 @@ before expanding quality. Priority is native accuracy/full speed, then LOD/draw
 distance and proper widescreen, then 2x/4x/6x resolution, then higher FPS. DLSS is
 last. Keep original simulation timing and disable enhancements for the baseline.
 
-**Action — what has been done.** Conservative alpha-test all-fail rejection
-passed all 39 CTests. Same-binary race and font comparisons retained byte-exact
-displayed images and full 4-MiB VRAM at both 1x and 6x. In the fixed five-frame
-replay, draws fell from 143,373 to 102,931 (28.2%). Alternating three runs per
-mode, with four replays per run and the cold first replay excluded, measured a
-warm median of 230.4 ms before and 184.3 ms after (20.0% lower). Baseline samples
-were 223.0–243.2 ms; optimized samples were 180.1–193.1 ms. See the renderer
-handoff for the final source checkpoint and packaged-app validation.
+**Action — what has been done.** Conservative alpha-test all-pass/all-fail
+proofs reduced the fixed five-frame native race replay from 143,373 to 102,931
+draws, and warm median time from 230.4 to 184.3 ms (20.0%) in its controlled
+comparison. A second change now avoids redundant Vulkan pipeline, dynamic-state
+and texture/sampler descriptor commands, following Granite's existing pattern.
+Its separate same-binary comparison, with alpha proofs enabled in both modes,
+measured 180.8 to 152.2 ms (15.8% lower), with unchanged draw count. Both changes
+retain byte-identical race/font displayed images and full 4-MiB VRAM at 1x and
+6x. These independent comparisons must not be presented as one matched combined
+full-game speedup. Cache reuse resets on every new command buffer; the new
+procedural differential exercises changing state and repeated submissions.
+All 41 CTests pass; the rebuilt installed app passes strict signature verification
+and headless retail replay.
+See the renderer handoff for the final source checkpoint and packaged-app checks.
 
-**Result — what is verified, and what remains.** The optimized native 1x/4:3
-two-player race reached 6,600 vblanks and exited with code 0 in 110.23 seconds.
-Race drawn/game-frame samples were 17.3–32.0 FPS (final sample 20.2), with GS at
-97–99% and EE waiting at 56–75%. The earlier baseline was roughly 13–25 drawn FPS,
-but scene/timing variation prevents a precise live-game speedup claim; the fixed
-replay supports the measured 20.0% reduction. Clean exit, exact comparisons and
-passing tests establish useful evidence, but **player success is not complete**.
-Full-game speed, visible input latency and exhaustive original-reference fidelity
-remain unproven.
+**Result — what is verified, and what remains.** The latest same-binary native
+1x/4:3 two-player checks both reached 6,600 vblanks and exited 0: cache off
+110.214 seconds with race drawn counters 17.5–36.5 FPS (final 36.5); cache on
+110.209 seconds with 22.4–33.8 FPS (final 32.0). Candidate GS worker occupancy
+was 97–99%, EE waiting 50–64%. Fixed replay supports the measured 15.8%
+reduction; scene variation prevents a precise native game speedup claim.
+Clean exit, exact comparisons and passing tests establish useful evidence, but
+**player success is not complete**. Full-game speed, visible input latency and
+exhaustive original-reference fidelity remain unproven. Logged game frames use
+a framebuffer-flip heuristic, and GS busy measures CPU worker occupancy. Host
+vblank cadence alone proves neither simulation speed nor hardware GPU utilization.
 
 **Open questions.** What cadence does the original game use in each tested
 mode? Does rejection retain correctness beyond the tested alpha/depth/framebuffer

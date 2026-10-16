@@ -122,3 +122,51 @@ The candidate also reached 6,600 native 1x/4:3 two-player vblanks, exit 0 in
 EE waiting 56–75%. This remains below player acceptance; original-reference
 cadence, hands-on latency/physics/fidelity, solo acceptance and thin-line
 comparisons are still open. Full-loop evidence: `work/alpha-native-race/`.
+
+## Native Vulkan command encoding — October 16 continuation
+
+**Situation/task:** heavy native 1x/4:3 races still miss original-speed player
+acceptance. Reduce renderer CPU command overhead while preserving every draw,
+transfer, image and timing rule; do not infer hardware GPU utilization from the
+GS worker's busy percentage.
+
+**Action:** reuse Granite's changed-state emission pattern in `vk_compat.h`.
+Pipeline, viewport, scissor, blend constants and pushed image/sampler descriptors
+are emitted only when changed. One common pipeline layout and dynamic-state
+configuration makes these states reusable across rendering breaks. Every fresh
+command buffer invalidates all cached bindings, including the two-flight pool
+swap. Resource handles stay alive through deferred fence-based destruction.
+`EOD_VK_STATE_CACHE=0` restores the same-binary command-emission baseline.
+Push constants already existed; shaders and primitive ordering are unchanged.
+See `RENDERER_REFERENCES.md` for pinned upstream/spec evidence.
+
+**Result:** alternating three runs per mode, four repetitions each with first
+replay excluded, reduced the fixed five-game-frame native race median from
+180.8 to 152.2 ms (15.8%). Samples: baseline 178.1–188.3 ms, candidate
+148.2–155.9 ms. Both modes issue 102,931 draws. Race/font displayed images and
+complete 4-MiB VRAM are byte-identical off/on at both 1x and 6x. Local evidence:
+`work/vk-state-cache/verification.json` and logs. The prior alpha optimization
+remains enabled in both modes. These are controlled replay measurements, not a
+claim of full-game original speed or exhaustive fidelity.
+
+Frame-rate log caveat: `GS busy` is the CPU renderer worker's occupancy, not
+hardware GPU utilization. The logged game-frame counter is a framebuffer-flip
+heuristic, not a simulation-update hook; the host vblank ticker staying near
+59.9 Hz does not establish original simulation/physics cadence. A matched
+original-game reference and hands-on latency/physics comparison remain required.
+
+Same-binary native two-player checks both reached 6,600 vblanks and exited 0,
+with 1x/4:3, FrameSkip=0 and enhancements off: cache off 110.214 s, race drawn
+counter 17.5–36.5 FPS (final 36.5); cache on 110.209 s, 22.4–33.8 FPS
+(final 32.0). Candidate GS worker busy was 97–99%, EE waiting 50–64%.
+The ticker bounds wall time and scene variation prevents a precise native
+speedup claim. These counters remain below player acceptance evidence.
+Local runs: `work/vk-state-cache/native-0/` and `native-1/`.
+
+Final validation: all 41 CTests passed (none skipped), including cache off/on
+full VRAM/display comparisons at 1x and 6x, varied target/scissor/filter/texture
+state and two-circuit constant-alpha composition across repeated submissions.
+The canonical app was rebuilt, replaced in `~/Applications`, passed strict deep
+signature verification and completed a headless muted retail Vulkan replay.
+The native GUI journey, visible thin lines/input latency and physical controllers
+remain unverified; packaging and headless replay do not complete those criteria.

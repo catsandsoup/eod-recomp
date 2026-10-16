@@ -189,6 +189,16 @@ struct Context {
     VkCommandBuffer cmd{};
     VkFence fence{};
     bool recording = false, rendering = false;
+    // All graphics pipelines share one layout and make these states dynamic.
+    // Like Granite's flush_render_state, emit only changed command state.
+    // Cache Vulkan handles, not wrapper addresses (which allocators may reuse).
+    bool cacheState = true;
+    VkPipeline boundPipeline{};
+    bool dynamicValid = false, imagesValid = false;
+    VkViewport boundViewport{};
+    VkRect2D boundScissor{};
+    float boundBlend[4]{};
+    VkDescriptorImageInfo boundImages[6]{};
     VkDescriptorSetLayout descriptors{};
     VkPipelineLayout layout{};
     PFN_vkCmdPushDescriptorSetKHR push{};
@@ -303,6 +313,10 @@ struct Context {
         b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         require(vkBeginCommandBuffer(cmd, &b), "begin commands");
         recording = true;
+        // A reset/recycled command buffer inherits no graphics state, including
+        // when the two in-flight command pools exchange ownership.
+        boundPipeline = VK_NULL_HANDLE;
+        dynamicValid = imagesValid = false;
     }
     void end_render() {
         if (rendering) {
@@ -747,17 +761,30 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdBeginRendering(cmd, &render);
         rendering = true;
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    if (!cacheState || boundPipeline != pipeline) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        boundPipeline = pipeline;
+    }
     VkViewport vp{viewport.TopLeftX, viewport.Height, -0.0f + viewport.Width, -viewport.Height, 0, 1};
-    vkCmdSetViewport(cmd, 0, 1, &vp);
+    if (!cacheState || !dynamicValid || memcmp(&boundViewport, &vp, sizeof vp)) {
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        boundViewport = vp;
+    }
     VkRect2D rect{{0, 0}, {target->desc.Width, target->desc.Height}};
     if (raster && raster->desc.ScissorEnable) {
         rect.offset = {std::max(0, scissor.left), std::max(0, scissor.top)};
         rect.extent = {(uint32_t)std::max(0, scissor.right - rect.offset.x),
                        (uint32_t)std::max(0, scissor.bottom - rect.offset.y)};
     }
-    vkCmdSetScissor(cmd, 0, 1, &rect);
-    vkCmdSetBlendConstants(cmd, blendFactor);
+    if (!cacheState || !dynamicValid || memcmp(&boundScissor, &rect, sizeof rect)) {
+        vkCmdSetScissor(cmd, 0, 1, &rect);
+        boundScissor = rect;
+    }
+    if (!cacheState || !dynamicValid || memcmp(boundBlend, blendFactor, sizeof boundBlend)) {
+        vkCmdSetBlendConstants(cmd, blendFactor);
+        memcpy(boundBlend, blendFactor, sizeof boundBlend);
+    }
+    dynamicValid = true;
     VkDescriptorImageInfo images[6]{};
     VkWriteDescriptorSet writes[6]{};
     for (int i = 0; i < 6; i++) {
@@ -773,7 +800,11 @@ inline void Context::Draw(UINT count, UINT first) {
         } else
             images[i].sampler = samplers[i - 4]->sampler;
     }
-    push(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 6, writes);
+    if (!cacheState || !imagesValid || memcmp(boundImages, images, sizeof images)) {
+        push(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 6, writes);
+        memcpy(boundImages, images, sizeof images);
+        imagesValid = true;
+    }
     Buffer *cb = constants[vs->id == 0 ? 0 : 1];
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        (uint32_t)cb->data.size(), cb->data.data());
@@ -787,6 +818,8 @@ inline void Context::Draw(UINT count, UINT first) {
 }
 inline bool Context::init(bool withWindow) {
     wantVsync = g_config.vsync;
+    const char *stateCache = getenv("EOD_VK_STATE_CACHE");
+    cacheState = !stateCache || stateCache[0] != '0';
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "TDEODRecomp";
     app.apiVersion = VK_API_VERSION_1_3;

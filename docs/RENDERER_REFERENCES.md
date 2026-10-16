@@ -107,3 +107,38 @@ Do not tune blind, skip preservation or start DLSS work to conceal this cost.
 
 Downloaded public source references are ignored under `work/references/`;
 no third-party implementation was copied into the production renderer here.
+
+## Command state reuse — October 16 continuation
+
+Rechecked Road Trip's pinned hardware GS above: it records through Granite's
+`CommandBuffer` abstraction, rather than EOD's small compatibility context.
+[Granite command buffer](https://github.com/Themaister/Granite/blob/fb178c8080d163419e8d20f10715c61c53c1ec9b/vulkan/command_buffer.cpp)
+(`fb178c8080d163419e8d20f10715c61c53c1ec9b`) supplies the applicable wheel:
+`flush_render_state` binds only changed pipelines and emits viewport/scissor
+only when dirty. Adapt that pattern locally rather than importing Granite's
+device/resource architecture. No third-party source was copied.
+
+Context7 `/khronosgroup/vulkan-docs` and the official
+[pipeline state rules](https://docs.vulkan.org/spec/latest/chapters/pipelines.html)
+confirm dynamic state persists in a command buffer until overwritten or
+invalidated by a pipeline that makes it static. EOD uses one shared pipeline
+layout and makes viewport/scissor/blend constants dynamic for every pipeline;
+no multiview or secondary command buffers are used.
+[Push descriptors](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html)
+are command-buffer state with compatible pipeline layouts. Cache actual image
+view/sampler handles; deferred resource destruction keeps them alive until the
+submission completes. Invalidate every cache at `vkBeginCommandBuffer`, including
+after either in-flight command pool is recycled. Rendering begin/end and transfer
+barriers do not invalidate these bindings. Future layout or dynamic-state changes
+must revisit these assumptions.
+
+Inspection rejected the proposed uniform-buffer-to-push-constant optimization:
+EOD already uses a 128-byte push range; `Map(Buffer*)` exposes CPU vector storage,
+and `Draw` already calls `vkCmdPushConstants`.
+
+The existing pre-alpha native CPU sample
+(`work/consolidated-native-race/race-cpu-sample.txt`) includes
+`MVKCommandEncoder::encode`, `MVKCmdPushDescriptorSet::setContent` and descriptor
+write cleanup, supporting command encoding as a candidate. It predates the
+alpha fix and cannot quantify its current share. The cache's same-binary
+on/off replay comparison establishes the measured improvement.
