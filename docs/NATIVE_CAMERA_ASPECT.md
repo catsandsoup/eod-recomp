@@ -1,7 +1,7 @@
 # Native camera aspect hook
 
 The host display aspect and the game's camera must agree. The PS2 game already
-has true widescreen projection and HUD/viewport handling. `src/hle_camera.cpp`
+has native widescreen projection and associated display handling. `src/hle_camera.cpp`
 wraps its display-mode setup rather than transforming rendered GS coordinates.
 
 ## Behavior
@@ -44,12 +44,17 @@ Local disassembly (`.venv/bin/python tools/dis.py -f ADDRESS`) establishes:
   `2 * atan(tan(inputFov / 2) / xScale)`. It also consults both base scales when
   deriving the projection. For a 67.5 degree input, this first adjustment gives
   approximately 83.396 degrees at 16:9 and 77.446 at 16:10.
-- `003634EC`–`00363520`: viewport setup saves the old x-scale, derives temporary
-  `oldScale * (baseWidth/baseHeight) / (viewportWidth/viewportHeight)`, and writes
-  it using setter `0034F488`. Other calls restore the saved value. This is why
-  forcing a constant scale at every projection call would break split-screen.
-- `0034F478`/`0034F498`: scale accessors. Native 2D/viewport code consumes these
-  scales too. Their visual HUD behavior remains subject to in-game verification.
+- `003634EC`–`00363520`: the enclosing `00363218` setup function saves the old
+  x-scale, derives `oldScale * (baseWidth/baseHeight) / (targetWidth/targetHeight)`,
+  and writes it using setter `0034F488`. Later calls restore the saved value.
+  However, this function computes power-of-two surface dimensions, and its only
+  discovered direct caller is `0035DA7C` in `0035DA30`, which clamps dimensions
+  to 320×512. This is evidence of temporary render-target aspect handling, likely
+  render-to-texture, **not proof of multiplayer split-screen camera setup**.
+  The hook leaves these writes untouched; actual multiplayer projection still
+  requires separate scene evidence.
+- `0034F478`/`0034F498`: scale accessors. Native display/render-target code consumes
+  these scales too. Visual HUD behavior remains subject to in-game verification.
 - `0032EC58`: boot console-widescreen query; hooking only this query would miss
   subsequent saved-option/display-mode calls (`0034FCDC`, `002A39E4`).
 
