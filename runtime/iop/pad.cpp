@@ -27,6 +27,7 @@ struct Port {
     bool open = false;
     uint32_t pad_area = 0;   // EE address of 2 x 128 bytes
     uint32_t iop_buf = 0;    // IOP address receiving EE actuator data
+    uint32_t actuator_frame = 0; // last consumed EE -> IOP DMA sequence
     uint32_t frame = 0;
     bool analog = true;      // DualShock analog mode
     bool pressure = false;   // pressure sensitive buttons enabled
@@ -43,6 +44,31 @@ uint32_t rd32(const uint8_t *p) {
     return v;
 }
 void wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+
+void set_actuators(int port, int slot, const uint8_t *data);
+
+void read_actuator_dma(int port, int slot) {
+    Port &p = g_ports[port][slot];
+    if (!p.iop_buf) return;
+    // The target SDK 2.8 libpad uses a separate 32-byte, double-buffered
+    // EE -> IOP packet, independent of the IOP -> EE pad status frame.
+    // 0x00390678: {sequence, command=1, length=6, actuator bytes[6]}.
+    // 0x0038F878 increments sequence and chooses destination (sequence & 1).
+    const uint8_t *newest = nullptr;
+    uint32_t sequence = p.actuator_frame;
+    for (int half = 0; half < 2; half++) {
+        const uint8_t *packet = g_iop_ram + p.iop_buf + half * 32;
+        uint32_t next = rd32(packet);
+        if ((int32_t)(next - sequence) <= 0) continue;
+        if (rd32(packet + 4) != 1 || rd32(packet + 8) != 6) continue;
+        sequence = next;
+        newest = packet;
+    }
+    if (newest) {
+        p.actuator_frame = sequence;
+        set_actuators(port, slot, newest + 12);
+    }
+}
 
 void write_pad_data(int port, int slot) {
     Port &p = g_ports[port][slot];
@@ -87,20 +113,11 @@ void write_pad_data(int port, int slot) {
     if (!hs.connected) d[1] = 0;
     ee_write_block(p.pad_area + (p.frame & 1) * 128, d, 128);
 
-    // vibration values the EE may DMA here (2 x 32 bytes); libpad 2.8 sends
-    // them with SET_ACTDIR instead (below), so this only reports a surprise
-    if (p.iop_buf) {
-        static bool reported;
-        const uint8_t *a = g_iop_ram + p.iop_buf;
-        for (int i = 0; i < 64 && !reported; i++)
-            if (a[i]) {
-                reported = true;
-                LOG(LOG_PAD, "pad %d: actuator data in the IOP buffer (unhandled)", port);
-            }
-    }
+    read_actuator_dma(port, slot);
 }
 
-// scePadSetActDirect: one byte per actuator slot, routed by the alignment
+// Actuator payload from SDK 2.8 DMA or the PS2SDK SET_ACTDIR RPC:
+// one byte per actuator slot, routed by the alignment
 // from scePadSetActAlign (0 = small motor, on/off; 1 = large motor, 0-255).
 void set_actuators(int port, int slot, const uint8_t *data) {
     Port &p = g_ports[port][slot];
@@ -129,12 +146,15 @@ void iop_pad_init() {
         int port = (int)(rd32(buf + 4) & 1);
         int slot = (int)(rd32(buf + 8) & 3);
         uint32_t result = 1;
+        uint32_t result_offset = 0xC;
         switch (cmd) {
         case 0x01: {  // OPEN(port, slot, padArea)
             Port &p = g_ports[port][slot];
             p.open = true;
             p.pad_area = rd32(buf + 0x10);
             if (!p.iop_buf) p.iop_buf = iop_alloc(64);
+            memset(g_iop_ram + p.iop_buf, 0, 64);
+            p.actuator_frame = 0;
             p.req_state = PAD_RSTAT_COMPLETE;
             LOG(LOG_PAD, "pad open port %d slot %d area %08x", port, rd32(buf + 8), p.pad_area);
             wr32(buf + 0x14, p.iop_buf);
@@ -149,11 +169,13 @@ void iop_pad_init() {
             LOG(LOG_PAD, "pad %d main mode %s lock %d", port, p.analog ? "analog" : "digital", p.lock);
             break;
         }
-        case 0x07:  // SET_ACTDIR(port, slot, data[6]): vibration
+        case 0x07:  // PS2SDK SET_ACTDIR(port, slot, data[6]): vibration
+            result_offset = 0x14;
             set_actuators(port, slot, buf + 0xC);
             g_ports[port][slot].req_state = PAD_RSTAT_COMPLETE;
             break;
         case 0x08: {  // SET_ACTALIGN(port, slot, align[6])
+            result_offset = 0x14; // target 0x003907C8 reads word 5, not word 3
             Port &p = g_ports[port][slot];
             memcpy(p.act_align, buf + 0xC, 6);
             p.req_state = PAD_RSTAT_COMPLETE;
@@ -191,7 +213,7 @@ void iop_pad_init() {
             LOG(LOG_PAD, "padman command %x", cmd);
         }
         (void)c;
-        wr32(buf + 0xC, result);
+        wr32(buf + result_offset, result);
         return 128;
     };
     iop_register_server(0x80000100, "padman", handler);
