@@ -170,3 +170,16 @@ The canonical app was rebuilt, replaced in `~/Applications`, passed strict deep
 signature verification and completed a headless muted retail Vulkan replay.
 The native GUI journey, visible thin lines/input latency and physical controllers
 remain unverified; packaging and headless replay do not complete those criteria.
+
+## Clean-start existing-renderer probe
+
+The default-off `EOD_GS_DUMP_COLD_START=N` capture now permits an exact initialized
+packet stream, bounded to 256 MiB and an explicit vblank count. The pinned Road
+Trip paraLLEl-GS oracle consumed real EOD boot/movie/title traffic on M2 Pro and
+produced actual images. An observed SetGsCrt(1,2,0), official PS2SDK mapping and
+Road Trip's CMOD=2/LC=32 bootstrap enable CRTC output. The completed title prefix
+is **not parity** and **not a speedup**: PGS warm 951.6 ms, EOD Vulkan 781.4 ms;
+frame/VRAM differences remain. See `GS_COLD_PACKET_REPLAY.md` for software
+comparison, scope and exact next experiment. All 41 CTests pass. The installed
+app retains b15d0d9's two verified performance changes; the added source hook is
+only a diagnostic. Player original-speed/latency acceptance remains incomplete.

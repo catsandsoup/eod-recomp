@@ -832,9 +832,13 @@ void gs_sync() {
 // EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count] records the GS
 // state and VRAM after that vblank, then the commands of the next `count`
 // vblanks; `eod --gs-replay file` replays them alone (renderer benchmarks).
+// EOD_GS_DUMP_COLD_START=N instead records before the first queued command
+// through vblank N (1..6600), capped at 256 MiB, for packet-backend experiments.
 namespace {
 FILE *g_dump;
 uint64_t g_dump_end;
+uint64_t g_cold_dump_bytes;
+bool g_cold_dump;
 const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
 
 void dump_state(FILE *f) {
@@ -870,13 +874,42 @@ bool load_state(FILE *f) {
 
 // Runs queued GS commands; returns the last vblank seen.
 uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
+    // A bounded clean-start stream can seed an independent packet GS without
+    // guessing how to import its private CLUT, vertex or transfer state.
+    static bool cold_attempted = false;
+    if (live && !cold_attempted) {
+        cold_attempted = true;
+        const char *count = getenv("EOD_GS_DUMP_COLD_START");
+        const char *path = getenv("EOD_GS_DUMP");
+        const uint64_t n = count ? strtoull(count, nullptr, 10) : 0;
+        if (path && n && n <= 6600) {
+            g_dump = fopen(path, "wb");
+            if (g_dump) {
+                dump_state(g_dump);
+                g_dump_end = n;
+                g_cold_dump = true;
+                g_cold_dump_bytes = (uint64_t)ftell(g_dump);
+            }
+        }
+    }
     uint64_t frames = 0;
     for (size_t p = 0; p < size;) {
         uint32_t h[4];
         memcpy(h, &c[p], 16);
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
-        if (live && g_dump) fwrite(&c[p], 1, len, g_dump);
+        if (live && g_dump) {
+            // Never let a diagnostic boot trace grow without a bound. Close at
+            // a command boundary so even a size-limited trace stays parseable.
+            if (g_cold_dump && g_cold_dump_bytes + len > 256ull * 1024 * 1024) {
+                fclose(g_dump);
+                g_dump = nullptr;
+                fprintf(stderr, "cold GS dump reached 256 MiB limit\n");
+            } else {
+                fwrite(&c[p], 1, len, g_dump);
+                g_cold_dump_bytes += len;
+            }
+        }
         switch (h[0]) {
         case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
         case CMD_PRIV: {
@@ -915,7 +948,10 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     std::string name = dump;
                     if (at_list.size() > 1) name += "." + std::to_string(h[1]);
                     g_dump = fopen(name.c_str(), "wb");
-                    if (g_dump) dump_state(g_dump);
+                    if (g_dump) {
+                        g_cold_dump = false;
+                        dump_state(g_dump);
+                    }
                     g_dump_end = h[1] + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
                 }
             }
