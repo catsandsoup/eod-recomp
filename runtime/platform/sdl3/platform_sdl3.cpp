@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "../../gs/gs_hw.h"
 #include "../pad_script.h"
 #include "../platform.h"
 
@@ -30,6 +31,7 @@ PlatformConfig g_cfg;
 std::atomic<int> g_aspect{0};  // display aspect (platform_set_aspect)
 bool g_headless;
 SDL_Window *g_window;
+bool g_vulkan_window;  // the Vulkan renderer draws into g_window (no SDL renderer)
 SDL_Renderer *g_renderer;
 SDL_Texture *g_texture;
 int g_tex_w, g_tex_h;
@@ -248,11 +250,16 @@ bool platform_init(const PlatformConfig &cfg) {
     if (g_headless) return true;
     SDL_WindowFlags wf = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (cfg.fullscreen) wf |= SDL_WINDOW_FULLSCREEN;
+#ifdef EOD_VULKAN
+    g_vulkan_window = g_config.renderer == "vulkan";
+    if (g_vulkan_window) wf |= SDL_WINDOW_VULKAN;
+#endif
     g_window = SDL_CreateWindow(cfg.title, cfg.width > 0 ? cfg.width : 1280, cfg.height > 0 ? cfg.height : 960, wf);
     if (!g_window) {
         fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return false;
     }
+    if (g_vulkan_window) return true;
     g_renderer = SDL_CreateRenderer(g_window, nullptr);
     if (!g_renderer) {
         fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
@@ -307,6 +314,17 @@ bool platform_pump() {
 }
 
 void platform_present(const uint32_t *pixels, int width, int height, int stride) {
+    if (g_vulkan_window && !gs::hw::g_on) {
+        // the Vulkan renderer didn't start: show the software renderer's frames
+        // in a new window with an SDL renderer
+        SDL_DestroyWindow(g_window);
+        SDL_WindowFlags wf = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        if (g_cfg.fullscreen) wf |= SDL_WINDOW_FULLSCREEN;
+        g_window = SDL_CreateWindow(g_cfg.title, g_cfg.width > 0 ? g_cfg.width : 1280, g_cfg.height > 0 ? g_cfg.height : 960, wf);
+        g_vulkan_window = false;
+        g_renderer = g_window ? SDL_CreateRenderer(g_window, nullptr) : nullptr;
+        if (g_renderer) SDL_SetRenderVSync(g_renderer, g_config.vsync ? 1 : 0);
+    }
     if (!g_renderer) return;
     if (!g_texture || g_tex_w != width || g_tex_h != height) {
         if (g_texture) SDL_DestroyTexture(g_texture);
@@ -347,7 +365,8 @@ void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
     *h = vh;
 }
 
-void *platform_native_window() { return nullptr; }
+// the SDL_Window for the Vulkan renderer's surface
+void *platform_native_window() { return g_vulkan_window ? g_window : nullptr; }
 
 void platform_set_fullscreen(bool on) {
     if (g_window) SDL_SetWindowFullscreen(g_window, on);
