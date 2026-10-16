@@ -23,6 +23,9 @@
 #include <vector>
 
 #include "../../core/config.h"
+#ifdef __APPLE__
+#include "../../app/macos_app.h"
+#endif
 #include "../pad_script.h"
 #include "../platform.h"
 
@@ -223,6 +226,7 @@ bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
+    g_keyboard_port = g_config.keyboard_port - 1;
     const char *kp = getenv("EOD_KEYBOARD_PORT");
     if (kp) g_keyboard_port = !strcmp(kp, "none") ? -1 : atoi(kp) - (atoi(kp) >= 1 ? 1 : 0);
     if (g_keyboard_port >= kPorts) g_keyboard_port = -1;
@@ -255,7 +259,7 @@ bool platform_init(const PlatformConfig &cfg) {
             fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
             return false;
         }
-        SDL_SetRenderVSync(g_renderer, 0);  // the game paces itself on its own vblank clock
+        SDL_SetRenderVSync(g_renderer, g_config.vsync ? 1 : 0);
         fprintf(stderr, "[video] SDL renderer: %s\n", SDL_GetRendererName(g_renderer));
     }
 
@@ -295,6 +299,22 @@ bool platform_pump() {
             pad_removed(e.gdevice.which);
             break;
         case SDL_EVENT_KEY_DOWN:
+#ifdef __APPLE__
+            if (!g_headless && !e.key.repeat && (e.key.scancode == SDL_SCANCODE_F1 ||
+                (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
+                if (mac_app_settings()) {
+                    build_key_map();
+                    g_volume = g_config.audio ? (float)g_config.volume / 100.0f : 0;
+                    if (g_audio) SDL_SetAudioStreamGain(g_audio, g_volume);
+                    g_cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
+                    g_cfg.smooth = g_config.smooth_display;
+                    if (g_texture) SDL_SetTextureScaleMode(g_texture, g_cfg.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+                    SDL_SetWindowSize(g_window, g_config.width, g_config.height);
+                    SDL_SetWindowFullscreen(g_window, g_config.fullscreen);
+                }
+                break;
+            }
+#endif
             // Cmd+F / F11: toggle fullscreen
             if (g_window && (e.key.scancode == SDL_SCANCODE_F11 ||
                              (e.key.scancode == SDL_SCANCODE_F && (e.key.mod & SDL_KMOD_GUI)))) {

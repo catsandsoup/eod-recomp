@@ -13,7 +13,11 @@ enum PadKey {
 
 struct Config {
     // [Video]
-    std::string renderer = "d3d11";  // d3d11 | software | warp (Direct3D 11 in software)
+#ifdef __APPLE__
+    std::string renderer = "software";
+#else
+    std::string renderer = "d3d11";
+#endif  // d3d11 | software | warp (Direct3D 11 in software)
     int adapter = 0;                 // DXGI adapter index
     bool fullscreen = false;         // borderless window covering the monitor
     int width = 1280, height = 960;  // window client size (windowed mode)
@@ -27,6 +31,7 @@ struct Config {
     int volume = 100;  // percent
     // [Input] keyboard bindings: key names separated by commas (see key_code)
     std::string keys[KEY_COUNT];
+    int keyboard_port = 1;           // 0: disabled, 1 or 2: player port
     bool vibration = true;
     // [System]
     std::string memcard_dir;  // empty: <game folder>/memcard
