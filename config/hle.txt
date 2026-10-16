@@ -6,9 +6,14 @@
 00331DF0 wrap     # panic(fmt, ...) - game fatal error
 00331E48 replace  # debug printf (formats and discards in the release build) - logged with --log game
 0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc
+0034D328 wrap     # native display mode paired with scoped menu/race presentation
+00114020 wrap     # actual race loop: native wide camera + ordered wide composition
+0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
 
 # Busy-wait loops on memory set by interrupt handlers: sleep until the next
 # event instead of spinning.
 0035C460 idle     # frame loop: wait for the vblank counter to change
 0035C528 idle     # frame loop: wait for the draw-done state (1 or 7)
+
+0039AFB0 wrap     # movie bit-buffer consume/refill: exact RAM fast path, generated fallback

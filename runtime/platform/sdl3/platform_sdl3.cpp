@@ -1,3 +1,5 @@
+#include "../display_rect.h"
+#include "../presentation.h"
 // platform_sdl3.cpp - window, audio and controllers through SDL3 (macOS;
 // also builds on Linux). Time, fibers, files and the ticker stay in
 // posix/platform_posix.cpp.
@@ -23,6 +25,12 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "audio_gain.h"
+#ifdef __APPLE__
+#include "../../app/macos_app.h"
+#endif
+#include "../../gs/gs_hw.h"
+
 #include "../../core/memory.h"
 #include "../keyboard_input.h"
 #include "../pad_script.h"
@@ -33,12 +41,18 @@ namespace {
 
 PlatformConfig g_cfg;
 bool g_headless;
+bool g_vulkan_window;
 SDL_Window *g_window;
 SDL_Renderer *g_renderer;
 SDL_Texture *g_texture;
 int g_tex_w, g_tex_h;
 SDL_AudioStream *g_audio;
 float g_volume = 1.0f;
+
+void update_audio_gain() {
+    g_volume = sdl_output_gain(g_config);
+    if (g_audio) SDL_SetAudioStreamGain(g_audio, g_volume);
+}
 
 std::vector<uint32_t> g_last_frame;
 int g_last_w, g_last_h;
@@ -178,11 +192,19 @@ void read_keyboard(HostPadState *out, keyboard_input::Context ctx) {
 
 }  // namespace
 
+void platform_configure_display(const PlatformConfig &cfg) {
+    g_cfg=cfg;
+    const char *headless=getenv("EOD_HEADLESS");
+    g_headless=cfg.headless || (headless && headless[0]=='1');
+}
+
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
-    sdl_input::set_keyboard_port(sdl_input::keyboard_port_from_env());
+    const char *keyboard_override = getenv("EOD_KEYBOARD_PORT");
+    sdl_input::set_keyboard_port(keyboard_override && keyboard_override[0]
+        ? sdl_input::keyboard_port_from_env() : g_config.keyboard_port - 1);
     sdl_input::set_controller_layout(g_config.controller_layout == "modern");
     sdl_input::set_hints();
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
@@ -192,23 +214,28 @@ bool platform_init(const PlatformConfig &cfg) {
         return false;
     }
     build_key_map();
-    g_volume = (float)g_config.volume / 100.0f;
+    update_audio_gain();
 
     if (!g_headless) {
         SDL_WindowFlags wf = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef EOD_VULKAN
+        if (g_config.renderer == "vulkan") { wf |= SDL_WINDOW_VULKAN; g_vulkan_window=true; }
+#endif
         if (cfg.fullscreen) wf |= SDL_WINDOW_FULLSCREEN;
         g_window = SDL_CreateWindow(cfg.title, cfg.width, cfg.height, wf);
         if (!g_window) {
             fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
             return false;
         }
+        if (!g_vulkan_window) {
         g_renderer = SDL_CreateRenderer(g_window, nullptr);
         if (!g_renderer) {
             fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
             return false;
         }
-        SDL_SetRenderVSync(g_renderer, 0);  // the game paces itself on its own vblank clock
+        SDL_SetRenderVSync(g_renderer, g_config.vsync ? 1 : 0);
         fprintf(stderr, "[video] SDL renderer: %s\n", SDL_GetRendererName(g_renderer));
+        }
     }
 
     int kb = sdl_input::keyboard_port();
@@ -248,6 +275,21 @@ bool platform_pump() {
             break;
         case SDL_EVENT_KEY_DOWN:
             time_key_event(e.key);
+#ifdef __APPLE__
+            if (!g_headless && !e.key.repeat && (e.key.scancode == SDL_SCANCODE_F1 ||
+                (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
+                if (mac_app_settings()) {
+                    build_key_map();
+                    update_audio_gain();
+                    // Aspect and camera projection both change on the next launch.
+                    g_cfg.smooth = g_config.smooth_display;
+                    if (g_texture) SDL_SetTextureScaleMode(g_texture, g_cfg.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+                    SDL_SetWindowSize(g_window, g_config.width, g_config.height);
+                    SDL_SetWindowFullscreen(g_window, g_config.fullscreen);
+                }
+                break;
+            }
+#endif
             // Cmd+F / F11: toggle fullscreen
             if (g_window && (e.key.scancode == SDL_SCANCODE_F11 ||
                              (e.key.scancode == SDL_SCANCODE_F && (e.key.mod & SDL_KMOD_GUI)))) {
@@ -264,22 +306,27 @@ bool platform_pump() {
 }
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    int vw = cw, vh = ch;
-    if (g_cfg.aspect != 2) {  // 4:3 or 16:9, letterboxed
-        int an = g_cfg.aspect == 1 ? 16 : 4, ad = g_cfg.aspect == 1 ? 9 : 3;
-        vh = cw * ad / an;
-        if (vh > ch) {
-            vh = ch;
-            vw = ch * an / ad;
-        }
-    }
-    *x = (cw - vw) / 2;
-    *y = (ch - vh) / 2;
-    *w = vw;
-    *h = vh;
+    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
+    *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 
 void platform_present(const uint32_t *pixels, int width, int height, int stride) {
+    // Hardware initialization can fail after SDL created its Vulkan window.
+    // Recreate that window for the software presenter on this main thread.
+    if (!g_headless && !g_renderer && g_vulkan_window && !gs::hw::g_on) {
+        SDL_DestroyWindow(g_window);
+        SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        if (g_cfg.fullscreen) flags |= SDL_WINDOW_FULLSCREEN;
+        g_window = SDL_CreateWindow(g_cfg.title, g_cfg.width, g_cfg.height, flags);
+        g_vulkan_window = false;
+        g_renderer = g_window ? SDL_CreateRenderer(g_window, nullptr) : nullptr;
+        if (!g_renderer) {
+            fprintf(stderr, "[video] software fallback display failed: %s\n", SDL_GetError());
+            return;
+        }
+        SDL_SetRenderVSync(g_renderer, g_config.vsync ? 1 : 0);
+        fprintf(stderr, "[video] software fallback: %s\n", SDL_GetRendererName(g_renderer));
+    }
     if (g_headless || !g_renderer) {
         g_last_frame.resize((size_t)width * height);
         for (int y = 0; y < height; y++)
@@ -317,7 +364,7 @@ bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {
     return true;
 }
 
-void *platform_native_window() { return nullptr; }  // no D3D11; the GS renderer is software here
+void *platform_native_window() { return g_vulkan_window ? g_window : nullptr; }
 
 void platform_set_status(const char *text) {
     if (!g_window) return;
@@ -363,7 +410,7 @@ bool platform_audio_open(int sample_rate) {
         fprintf(stderr, "SDL audio stream: %s\n", SDL_GetError());
         return false;
     }
-    SDL_SetAudioStreamGain(g_audio, g_volume);
+    update_audio_gain();
     SDL_ResumeAudioStreamDevice(g_audio);
     return true;
 }

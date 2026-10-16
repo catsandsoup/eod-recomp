@@ -105,7 +105,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "Width")) c.width = num(320, 16384);
             else if (ieq(k, "Height")) c.height = num(240, 16384);
             else if (ieq(k, "VSync")) c.vsync = to_bool(v);
-            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "stretch") ? "stretch" : "4:3";
+            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "16:10") ? "16:10" : ieq(v, "stretch") ? "stretch" : "4:3";
             else if (ieq(k, "RenderScale")) c.render_scale = num(0, 6);
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);
@@ -141,7 +141,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "Width=%d\n", c.width);
     fprintf(f, "Height=%d\n", c.height);
     fprintf(f, "VSync=%d\n", c.vsync ? 1 : 0);
-    fprintf(f, "AspectRatio=%s      ; 4:3, 16:9 or stretch\n", c.aspect.c_str());
+    fprintf(f, "AspectRatio=%s      ; 4:3, 16:9, 16:10 or stretch\n", c.aspect.c_str());
     fprintf(f, "RenderScale=%d        ; internal resolution: 0 = auto, 1 = 640x448 (PS2), 2 = 1280x896, ...\n", c.render_scale);
     fprintf(f, "SmoothDisplay=%d\n", c.smooth_display ? 1 : 0);
     fprintf(f, "FrameSkip=%d\n", c.frame_skip ? 1 : 0);

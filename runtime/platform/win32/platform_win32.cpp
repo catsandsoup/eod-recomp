@@ -1,3 +1,5 @@
+#include "../display_rect.h"
+#include "../presentation.h"
 // platform_win32.cpp - Windows backend (Windows 7 and later).
 //
 // Uses only components that ship with Windows 7: GDI for presentation,
@@ -200,6 +202,8 @@ DWORD WINAPI ticker_thread(LPVOID p) {
 }  // namespace
 
 // ================================================================= API
+void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
+
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
     QueryPerformanceFrequency(&g_qpf);
@@ -406,19 +410,8 @@ void platform_get_pad(int port, HostPadState *out) {
 }
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    int vw = cw, vh = ch;
-    if (g_cfg.aspect != 2) {  // 4:3 or 16:9, letterboxed
-        int an = g_cfg.aspect == 1 ? 16 : 4, ad = g_cfg.aspect == 1 ? 9 : 3;
-        vh = cw * ad / an;
-        if (vh > ch) {
-            vh = ch;
-            vw = ch * an / ad;
-        }
-    }
-    *x = (cw - vw) / 2;
-    *y = (ch - vh) / 2;
-    *w = vw;
-    *h = vh;
+    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
+    *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 
 void *platform_native_window() { return g_hwnd; }
