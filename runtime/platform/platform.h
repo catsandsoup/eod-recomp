@@ -36,6 +36,9 @@ int platform_cpu_count();
 // Physical cores among them (fewer than platform_cpu_count() with hyper-threading).
 int platform_core_count();
 void platform_sleep_us(uint32_t us);
+// Asks the OS to run the calling thread on a fast core (macOS: user-interactive
+// QoS, so the EE, GS and raster threads are not parked on efficiency cores).
+void platform_thread_fast();
 
 // ------------------------------------------------------------------ input
 // DualShock 2 button bits as reported by padman (active high here; the pad

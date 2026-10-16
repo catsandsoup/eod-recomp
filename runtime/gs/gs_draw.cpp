@@ -1315,6 +1315,7 @@ void run_job(const Job &j, int wid, int nw, WStats &ws) {
 }
 
 void raster_worker(int id) {
+    platform_thread_fast();
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-raster");
 #endif

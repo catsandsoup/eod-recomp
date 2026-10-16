@@ -52,6 +52,12 @@ In order of priority:
 
 ![Main menu](docs/img/main_menu_seq.png)
 
+## macOS (Apple Silicon)
+
+This fork adds a native arm64 macOS build (SDL3 window, audio and
+controllers; two player ports for split screen). Build steps, status and
+known gaps: [docs/MACOS.md](docs/MACOS.md).
+
 ## Game files
 
 To run the port you need your own copy of the disc. Copy the whole disc (at

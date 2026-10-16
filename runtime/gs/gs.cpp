@@ -990,6 +990,7 @@ int gs_replay(const char *path, int repeat) {
 }
 
 static void gs_worker() {
+    platform_thread_fast();
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-gs");
 #endif
@@ -1026,8 +1027,8 @@ void gs_thread_start() {
     // (EOD_GS_RASTER=n overrides, 0 disables)
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
-    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
     if (n > 4) n = 4;
+    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);  // an explicit count is not capped
     if (hw::g_on) n = 0;  // the GPU draws
     raster_start(n);
     LOG(LOG_GS, "GS runs on its own thread, %d raster workers", n > 0 ? n : 0);
