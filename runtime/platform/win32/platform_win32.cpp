@@ -1,4 +1,5 @@
 #include "../display_rect.h"
+#include "../presentation.h"
 // platform_win32.cpp - Windows backend (Windows 7 and later).
 //
 // Uses only components that ship with Windows 7: GDI for presentation,
@@ -409,7 +410,7 @@ void platform_get_pad(int port, HostPadState *out) {
 }
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    const DisplayRect rect=display_rect(g_cfg.aspect,cw,ch);
+    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
     *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 

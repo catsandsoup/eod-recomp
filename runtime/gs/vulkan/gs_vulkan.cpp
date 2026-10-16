@@ -18,6 +18,7 @@
 #include "../../core/log.h"
 #include "../../platform/platform.h"
 #include "../../platform/screenshot_size.h"
+#include "../../platform/presentation.h"
 #include "../gs_hw.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
@@ -1821,6 +1822,7 @@ int g_disp_w, g_disp_h;
 // the last composition (what read_display shows)
 Circuit g_last[2];
 bool g_have_last;
+int g_last_aspect = -1;
 
 // source of a display circuit: a surface or the CPU copy (uploaded)
 ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, float &y0, float &x1, float &y1, float &sw,
@@ -1974,7 +1976,10 @@ bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
     if(size.composed) {
         const float black[4]={0,0,0,1};
         g_ctx->ClearRenderTargetView(t->rtv,black);
+        const int queued_aspect=presentation::frame_aspect;
+        presentation::set(g_last_aspect); // capture the last composed frame's policy
         platform_display_rect(w,h,&x,&y,&draw_w,&draw_h);
+        presentation::set(queued_aspect);
     }
     compose(t->rtv,t->w*g_scale,t->h*g_scale,x,y,draw_w,draw_h,size.composed ? g_config.smooth_display : shot_scale>1);
     D3D11_TEXTURE2D_DESC td = {};
@@ -2037,6 +2042,7 @@ void present(bool vsync) {
     if (!g_on)
         return;
     flush();
+    g_last_aspect = presentation::frame_aspect;
     g_last[0] = read_circuit_regs(0);
     g_last[1] = read_circuit_regs(1);
     g_have_last = g_last[0].on || g_last[1].on;

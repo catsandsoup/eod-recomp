@@ -7,22 +7,35 @@ wraps its display-mode setup rather than transforming rendered GS coordinates.
 ## Behavior
 
 The wrapper snapshots `g_config.aspect` on its first call. Aspect settings apply
-on the next launch, including when the native options menu later requests another
-mode. Host 4:3 forces native mode 0; host 16:9 and 16:10 select native mode 1.
-Stretch preserves the native requested mode and its original scales. The wrapper
-calls the original function in every case, retaining its option, border, and
-other register side effects. For wide output it then writes both base scales:
+on the next launch. For explicit 16:9/16:10 output, original title/menu/movie
+art is presented at 4:3 and native mode 0 (both scale values 1, both border
+flags 0). This also keeps 3D car previews consistent with the menu presentation.
+The passthrough wrapper around the actual `00114020` race loop establishes
+native mode 1 and the selected wide base scale for the duration of that loop,
+then restores mode 0. In-race pause/modal overlays keep the underlying race's
+aspect. The wrapper changes only the five display globals; it does not call
+additional guest options/OSD routines or alter the original loop's EE-register
+effects. Native temporary render-target scale changes remain untouched.
 
-| Host aspect | Base scale |
-| --- | --- |
-| 4:3 | 1 (native mode 0) |
-| 16:9 | 0.75 |
-| 16:10 | 5/6 |
+| Context | Presentation | Native base scale |
+| --- | --- | --- |
+| Title, menu, movie, car preview | 4:3 | 1 |
+| Race with host 16:9 | 16:9 | 0.75 |
+| Race with host 16:10 | 16:10 | 5/6 |
 
-The general relation is `(4/3) / outputAspect`. The native 16:9 border policy is
-preserved. There is no change to game time, physics, graphics resolution, or
-rendering frequency. This hook is shared across host platforms; builds without a
-16:10 config option still support their existing 4:3/16:9/Stretch selections.
+The general relation is `(4/3) / outputAspect`. Host 4:3 retains mode 0;
+Stretch preserves the caller's native display mode and uses stretched output.
+There is no change to game time, physics, graphics resolution or rendering
+frequency. The race entry may follow earlier camera initialization; actual
+projection recomputation and first-frame behavior require a matched scene test.
+This mechanism alone is **not proof of visually correct widescreen gameplay**.
+
+The EE snapshots presentation into the unused second argument of each queued
+GS vblank command, using an explicit tag. The GS worker applies it in command
+order before composing/presenting. The software published frame carries its own
+aspect alongside its pixels. Thread-local aspect overrides keep EE software
+presentation separate from a later GS-worker frame. Captures store the tags;
+older captures with zero in that field retain their launch aspect.
 
 ## Verified target evidence
 
@@ -67,8 +80,9 @@ menu-edge artifacts, so border removal is also omitted.
 
 `NativeCamera-*` CTest cases call the production wrapper using a stubbed original
 native function and real EE RAM/register accessors. They check mode selection,
-both scale writes, original side effects, preservation of Stretch mode changes,
-and caching across later config mutations. The pass-through wrapper was first
+both scale writes and native mode/border flags, original side effects, preservation
+of Stretch mode changes, caching across later config mutations, paired race
+entry/exit and byte-for-byte retention of the original loop's EE-register effects. The pass-through wrapper was first
 shown to fail the wide-mode test before implementation. No retail game runs or
 visible windows were used for this change.
 
@@ -85,3 +99,17 @@ Parent integration must still compare matched single- and two-player scenes at
 4:3/16:9/16:10, with aspect-correct display composition, to verify framing, HUD
 proportions, borders, and menu coverage. Source and CPU tests establish the hook
 mechanism; they are not proof that every game screen is visually correct.
+
+The display CPU test also exercises tagged/legacy vblank policy decoding,
+menu-to-race rectangles at 3840×2400 and independence of EE/GS thread overrides.
+These tests do not establish font texture fidelity. The reported jagged car
+statistics labels require matched software/Vulkan captures from the same native
+asset before classifying the edges as texture content or a renderer defect.
+
+`EOD_CAMERA_TRACE=1` enables a pure passthrough wrapper around native projection
+setup `0034E530`. It logs at most eight nonrace and eight race calls separately,
+including the caller return address, near/far/FOV arguments, both scales, native
+mode/border flags and the scoped race flag. It makes no projection overrides.
+Use this trace with matched 4:3/wide scenes to establish projection recomputation
+after race entry and inspect actual horizontal framing; rectangle tests cannot
+establish a wider field of view. Trace counters are process-local.
