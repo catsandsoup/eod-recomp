@@ -175,6 +175,10 @@ struct Sampler : Ref {
 };
 struct Context {
     uint64_t submit_count = 0, wait_us = 0, pipeline_us = 0;
+    // Command-buffer serials: `serial` is the buffer being (or next) recorded;
+    // every serial <= `completed` has finished on the GPU. A fence signal
+    // covers all earlier submissions on this queue, so one wait suffices.
+    uint64_t serial = 1, completed = 0, spareSerial = 0;
     // Render-pass ends by cause: submit, upload, copy, clear, map, target change, layout.
     uint64_t pass_ends[7] = {}, passes = 0;
     static uint64_t now_us() {
@@ -373,6 +377,7 @@ struct Context {
                 uint64_t wait_start = now_us();
                 require(vkWaitForFences(device, 1, &spare.fence, VK_TRUE, UINT64_MAX), "finish GPU");
                 wait_us += now_us() - wait_start;
+                completed = std::max(completed, spareSerial);
             }
             return;
         }
@@ -395,6 +400,8 @@ struct Context {
         windowUploaded = false;
         ++submit_count;
         waitAcquire = signalPresent = false;
+        const uint64_t submitted = serial++;
+        uint64_t waited = submitted;
         bool wait = synchronous;
         if (!synchronous) {
             // The other frame owns its command pool, mapped upload chunks and
@@ -407,12 +414,15 @@ struct Context {
             chunks.swap(spare.chunks);
             garbage.swap(spare.garbage);
             wait = spare.submitted;
+            waited = spareSerial;
             spare.submitted = true;
+            spareSerial = submitted;
         }
         if (wait) {
             uint64_t wait_start = now_us();
             require(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "recycle GPU frame");
             wait_us += now_us() - wait_start;
+            completed = std::max(completed, waited);
         }
         vkResetFences(device, 1, &fence);
         vkResetCommandPool(device, pool, 0);
@@ -423,6 +433,36 @@ struct Context {
         for (auto &c : chunks)
             c.used = 0;
         chunkIndex = 0;
+    }
+    // Makes earlier transfer writes visible to host reads once this command
+    // buffer completes, without submitting it (see wait_serial).
+    void host_read_barrier() {
+        begin();
+        end_render(4);
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr,
+                             0, nullptr);
+    }
+    // Waits until command buffer `s` (recorded or already submitted) completes.
+    // Returns true when the CPU actually had to submit or block.
+    bool wait_serial(uint64_t s) {
+        if (s <= completed)
+            return false;
+        if (s >= serial) {
+            if (!recording)
+                return false;
+            submit(true);
+            return true;
+        }
+        if (spare.submitted && s <= spareSerial) {
+            uint64_t wait_start = now_us();
+            require(vkWaitForFences(device, 1, &spare.fence, VK_TRUE, UINT64_MAX), "deferred readback");
+            wait_us += now_us() - wait_start;
+            completed = std::max(completed, spareSerial);
+        }
+        return true;
     }
     std::pair<HostBuffer *, VkDeviceSize> upload(const void *p, size_t bytes) {
         begin();
@@ -564,6 +604,7 @@ struct Context {
         VkExtent3D sz{b->right - b->left, b->bottom - b->top, 1};
         if (d->host.buffer) {
             VkBufferImageCopy c{};
+            c.bufferOffset = ((VkDeviceSize)y * d->desc.Width + x) * 4; // destination texel (x, y)
             c.bufferRowLength = d->desc.Width;
             c.imageSubresource = {aspect, 0, 0, 1};
             c.imageOffset = {(int)b->left, (int)b->top, 0};
