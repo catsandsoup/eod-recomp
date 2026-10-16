@@ -288,6 +288,146 @@ def lower_code(ins, pc, vu=1):
     return "lower(c, 0x%08Xu, 0x%04Xu);" % (ins, pc)
 
 
+class Cache:
+    """VF registers (and ACC) held in locals within a block: r<N> / racc.
+
+    A register is loaded from vu->vf on its first read, written back at the
+    end of the block (if changed) and before the generic helpers that use
+    vu->vf directly."""
+
+    def __init__(self):
+        self.state = {}  # reg -> "clean" / "dirty"; absent: not loaded
+        self.used = set()
+
+    @staticmethod
+    def name(r):
+        return "racc" if r == "acc" else "r%d" % r
+
+    @staticmethod
+    def mem(r):
+        return "vu->acc.f" if r == "acc" else "vu->vf[%d].f" % r
+
+    def read(self, r, body):
+        if r not in self.state:
+            body.append("%s = _mm_loadu_ps(%s);" % (self.name(r), self.mem(r)))
+            self.state[r] = "clean"
+        self.used.add(r)
+        return self.name(r)
+
+    def write(self, r, expr, dest, body):
+        if r == 0 or not dest:
+            return
+        n = self.name(r)
+        if dest == 15:
+            body.append("%s = %s;" % (n, expr))
+        else:
+            self.read(r, body)
+            body.append("%s = vu_blend<%d>(%s, %s);" % (n, dest, n, expr))
+        self.state[r] = "dirty"
+        self.used.add(r)
+
+    def flush(self, body):
+        for r in sorted(self.state, key=str):
+            if self.state[r] == "dirty":
+                body.append("_mm_storeu_ps(%s, %s);" % (self.mem(r), self.name(r)))
+                self.state[r] = "clean"
+
+    def invalidate(self):
+        self.state = {}
+
+
+def bc(v, k):
+    """Component k of vector expression v broadcast."""
+    return "_mm_shuffle_ps(%s, %s, 0x%02X)" % (v, v, k * 0x55)
+
+
+def lower_code_c(ins, pc, vu, cache, body):
+    """Appends the code of a non-branch lower instruction using the register
+    cache; returns "generic" if it went through lower(c, ...)."""
+    op = ins >> 25
+    qw = "vu1_qword" if vu == 1 else "vu_qword"
+    it, is_, dest = FT(ins), FS(ins), dest_of(ins)
+
+    def load(addr):
+        cache.write(it, "_mm_loadu_ps(reinterpret_cast<const float *>(%s))" % addr, dest, body)
+
+    def store(addr):
+        v = cache.read(is_, body)
+        if dest == 15:
+            body.append("_mm_storeu_ps(reinterpret_cast<float *>(%s), %s);" % (addr, v))
+        else:
+            body.append("{ float *p = reinterpret_cast<float *>(%s); _mm_storeu_ps(p, vu_blend<%d>(_mm_loadu_ps(p), %s)); }"
+                        % (addr, dest, v))
+
+    if op == 0x00:  # LQ
+        if it and dest:
+            load("%s(vu, vu->vi[%d] + %d)" % (qw, is_, imm11(ins)))
+        return None
+    if op == 0x01:  # SQ
+        if dest:
+            store("%s(vu, vu->vi[%d] + %d)" % (qw, it, imm11(ins)))
+        return None
+    if op == 0x40 and (ins & 0x3F) >= 0x3C:
+        ext = upper_ext(ins)
+        if ext == 0x30:  # MOVE (and the lower NOP)
+            if it and dest:
+                cache.write(it, cache.read(is_, body), dest, body)
+            return None
+        if ext == 0x31:  # MR32
+            if it and dest:
+                s = cache.read(is_, body)
+                cache.write(it, "_mm_shuffle_ps(%s, %s, 0x39)" % (s, s), dest, body)
+            return None
+        if ext in (0x34, 0x36):  # LQI / LQD
+            if ext == 0x36:
+                body.append("set_vi(vu, %d, vu->vi[%d] - 1);" % (is_, is_))
+            if it and dest:
+                load("%s(vu, vu->vi[%d])" % (qw, is_))
+            if ext == 0x34:
+                body.append("set_vi(vu, %d, vu->vi[%d] + 1);" % (is_, is_))
+            return None
+        if ext in (0x35, 0x37):  # SQI / SQD
+            if ext == 0x37:
+                body.append("set_vi(vu, %d, vu->vi[%d] - 1);" % (it, it))
+            if dest:
+                store("%s(vu, vu->vi[%d])" % (qw, it))
+            if ext == 0x35:
+                body.append("set_vi(vu, %d, vu->vi[%d] + 1);" % (it, it))
+            return None
+        if ext in (0x38, 0x39, 0x3A):  # DIV / SQRT / RSQRT
+            fsf, ftf = (ins >> 21) & 3, (ins >> 23) & 3
+            fs_v = "vu_lane_f(%s, %d)" % (cache.read(is_, body), fsf) if ext != 0x39 else "0.0f"
+            ft_v = "vu_lane_f(%s, %d)" % (cache.read(it, body), ftf)
+            body.append("lower_div_f(vu, %d, %s, %s);" % (ext - 0x38, fs_v, ft_v))
+            return None
+        if ext == 0x3C:  # MTIR
+            if it:
+                body.append("set_vi(vu, %d, vu_lane_u(%s, %d));" % (it, cache.read(is_, body), (ins >> 21) & 3))
+            return None
+        if ext == 0x3D:  # MFIR
+            if it and dest:
+                cache.write(it, "_mm_castsi128_ps(_mm_set1_epi32((int16_t)vu->vi[%d]))" % is_, dest, body)
+            return None
+        if ext == 0x64:  # MFP
+            if it and dest:
+                cache.write(it, "_mm_set1_ps(vu->p)", dest, body)
+            return None
+        if ext >= 0x70 and ext != 0x7B:  # EFU
+            body.append("{ VUReg s; _mm_storeu_ps(s.f, %s); lower_efu(vu, 0x%08Xu, 0x%X, s); }"
+                        % (cache.read(is_, body), ins, ext))
+            return None
+    code = lower_code(ins, pc, vu)
+    if not code.startswith("lower(c,"):
+        # integer / flag / control instructions: no VF registers involved
+        if code:
+            body.append(code)
+        return None
+    cache.flush(body)
+    body.append(code)
+    cache.invalidate()
+    return "generic"
+
+
 def _fimm(ins):
     return "0x%X" % (((ins >> 10) & 0x800) | (ins & 0x7FF))
 
@@ -312,9 +452,9 @@ FLAG_READS = {0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B}  # FS*, FM* lower ops
 
 
 # helpers that read vu->cycle, and those that may advance it (stalls)
-CYC_CALLS = ("sync_pipes", "flush_q", "flush_p", "lower_div", "lower(c", "upper(c", "commit_upper", "vu_flags(",
-             "vu_clip(", "vu_flag_sync")
-CYC_ADVANCE = ("flush_q", "flush_p", "lower_div", "lower(c", "upper(c")
+CYC_CALLS = ("sync_pipes", "flush_q", "flush_p", "lower_div", "lower(c", "upper(c", "commit_upper", "vu_flags(", "lower_efu",
+             "vu_clip(", "vu_clip_v(", "vu_flag_sync")
+CYC_ADVANCE = ("flush_q", "flush_p", "lower_div", "lower(c", "upper(c", "lower_efu")
 
 
 def is_branch(lo, hi):
@@ -454,49 +594,82 @@ class Prog:
         for i in ctx["src"]:
             out.append(ind + "if (cyc < t%d + 4) cyc = t%d + 4;" % (i, i))
         body = []
+        cache = ctx["cache"]
         if waitq:
             body.append("flush_q(vu);")
         fm = upper_fmac(hi)
         um = upper_misc(hi)
-        lc = None
-        if not ibit and (lo >> 25) not in BRANCH_OPS:
-            lc = lower_code(lo, pc, self.vu)
+        up_generic = fm is None and um is None and not upper_is_nop(hi)
+        op = None if ibit else lo >> 25
+        lower_inline = op is not None and op not in BRANCH_OPS
+        lo_ext = upper_ext(lo) if lower_inline and op == 0x40 and (lo & 0x3F) >= 0x3C else None
+        lo_efu = lo_ext is not None and lo_ext >= 0x70 and lo_ext != 0x7B
+        lo_generic = lower_inline and not lo_efu and lower_code(lo, pc, self.vu).startswith("lower(c,")
         # Q/P results are applied lazily: only code that may read them syncs
         # (the divider/EFU instructions sync themselves when busy)
-        need_sync = (fm is None and um is None and not upper_is_nop(hi)) or \
-            (fm is not None and fm[1] == "S_Q") or \
-            (lc is not None and (lc.startswith("lower(c,") or "vu->p" in lc))
+        need_sync = up_generic or (fm is not None and fm[1] == "S_Q") or lo_generic or lo_ext == 0x64
         if need_sync:
             body.append("sync_pipes(vu);")
         # flag instructions see the flag results issued 4+ cycles earlier
-        if lc is not None and ((lo >> 25) in FLAG_OPS or lc.startswith("lower(c,")):
+        if lower_inline and (op in FLAG_OPS or lo_generic):
             body.append("vu_flag_sync(vu);")
-        commit = []
+        # upper: computed against the old registers, committed after the lower
+        commit = None
         if fm is not None:
             o, src, acc = fm
             dest = dest_of(hi)
-            body.append("__m128 ur = up_val<%s, %s>(vu, 0x%08Xu);" % (o, src, hi))
-            if acc or FD(hi):
-                commit.append("vu_store<%d>(%s, ur);" % (dest, "vu->acc.f" if acc else "vu->vf[%d].f" % FD(hi)))
-            if self.flags and o not in ("OP_MAX", "OP_MIN"):
-                commit.append("vu_flags(vu, ur, %d);" % dest)
+            a = cache.read(FS(hi), body)
+            if src == "S_VEC":
+                b = cache.read(FT(hi), body)
+            elif src == "S_BC":
+                b = bc(cache.read(FT(hi), body), hi & 3)
+            elif src == "S_Q":
+                b = "_mm_set1_ps(vu->q)"
+            else:
+                b = "_mm_set1_ps(vu->i)"
+            ac = cache.read("acc", body) if o in ("OP_MADD", "OP_MSUB") else "_mm_setzero_ps()"
+            body.append("__m128 ur = vu_fmac<%s>(%s, %s, %s);" % (o, a, b, ac))
+            commit = ("acc" if acc else FD(hi), dest, self.flags and o not in ("OP_MAX", "OP_MIN"))
+        elif (hi & 0x3F) == 0x2E or ((hi & 0x3F) >= 0x3C and upper_ext(hi) == 0x2E):  # OPMSUB / OPMULA
+            sub = (hi & 0x3F) == 0x2E
+            a, b = cache.read(FS(hi), body), cache.read(FT(hi), body)
+            ac = cache.read("acc", body) if sub else "_mm_setzero_ps()"
+            body.append("__m128 ur = vu_opm<%s>(%s, %s, %s);" % ("true" if sub else "false", a, b, ac))
+            commit = (FD(hi) if sub else "acc", 0xE, self.flags)
+            up_generic = False
         elif um is not None:
-            pre, val, reg = um
-            if pre:
-                body.append(pre)
-            if val and reg and dest_of(hi):
+            ext = upper_ext(hi)
+            fs_, ft_ = FS(hi), FT(hi)
+            if ext == 0x1F:  # CLIP
+                body.append("vu_clip_v(vu, %s, %s);" % (cache.read(fs_, body), cache.read(ft_, body)))
+            elif ft_ and dest_of(hi):
+                s = cache.read(fs_, body)
+                val = ("vu_itof_v(%s, %d)" % (s, ext & 3) if ext <= 0x13 else
+                       "vu_ftoi_v(%s, %d)" % (s, ext & 3) if ext <= 0x17 else "vu_abs_v(%s)" % s)
                 body.append("__m128 ur = %s;" % val)
-                commit.append("vu_store<%d>(vu->vf[%d].f, ur);" % (dest_of(hi), reg))
-        elif not upper_is_nop(hi):
+                commit = (ft_, dest_of(hi), False)
+        elif up_generic:
+            cache.flush(body)
             body.append("c.up_write = false;")
             body.append("c.mac_set = false;")
             body.append("upper(c, 0x%08Xu);" % hi)
-            commit.append("commit_upper(c);")
+
+        def do_commit():
+            if commit is not None:
+                reg, dest, flags = commit
+                if reg == "acc" or reg:
+                    cache.write(reg, "ur", dest, body)
+                if flags:
+                    body.append("vu_flags(vu, ur, %d);" % dest)
+            elif up_generic:
+                cache.flush(body)  # the lower's results first: the upper's win
+                body.append("commit_upper(c);")
+                cache.invalidate()
+
         if ibit:
-            body += commit
+            do_commit()
             body.append("{ uint32_t b = 0x%08Xu; memcpy(&vu->i, &b, 4); }" % lo)
         else:
-            op = lo >> 25
             if op in BRANCH_OPS:
                 it, is_ = FT(lo), FS(lo)
                 if op == 0x20:
@@ -516,9 +689,9 @@ class Prog:
                             0x2E: "(int16_t)vu->vi[%d] <= 0" % is_,
                             0x2F: "(int16_t)vu->vi[%d] >= 0" % is_}[op]
                     body.append("take = %s;" % cond)
-            elif lc:
-                body.append(lc)
-            body += commit
+            else:
+                lower_code_c(lo, pc, self.vu, cache, body)
+            do_commit()
         uses_cyc = any(any(k in b for k in CYC_CALLS) for b in body)
         advances = any(any(k in b for k in CYC_ADVANCE) for b in body)
         if uses_cyc:
@@ -592,11 +765,21 @@ class Prog:
                 src.append(s_)
                 needt.update(s_)
             out.append("L_%04X: {" % ld)
+            if os.environ.get("VUREC_COUNT"):  # profiling: block execution counts (see vu_blk_hit)
+                out.append('    vu_blk_hit("%s", 0x%04X, %d);' % (name, ld, n))
             out.append("    cyc = vu->cycle;")
             if needt:
                 out.append("    uint64_t %s;" % ", ".join("t%d = 0" % i for i in sorted(needt)))
+            cache = Cache()
+            code = []
             for j, pc in enumerate(pcs):
-                self.pair_code(pc, out, "    ", {"j": j, "n": n, "src": src[j], "needt": needt})
+                self.pair_code(pc, code, "    ", {"j": j, "n": n, "src": src[j], "needt": needt, "cache": cache})
+            if cache.used:
+                out.append("    __m128 %s;" % ", ".join(Cache.name(r) for r in sorted(cache.used, key=str)))
+            out += code
+            tail_code = []
+            cache.flush(tail_code)
+            out += ["    " + t for t in tail_code]
             out.append("    vu->cycle = cyc;")
             last = pcs[-2] if n >= 2 else pcs[-1]
             lo, hi = self.pair(last)

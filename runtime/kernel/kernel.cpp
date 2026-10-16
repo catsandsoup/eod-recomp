@@ -21,8 +21,12 @@
 #include "../iop/iop.h"
 #include "../iop/sif.h"
 #include "../platform/platform.h"
+#include "../core/prof.h"
+#include "../ui/overlay.h"
 
 void iop_pad_vblank();
+void game_patches_vblank();  // src/game_patches.cpp
+[[noreturn]] void app_exit(int code);  // main.cpp
 
 extern "C" volatile int g_ee_irq_pending;
 volatile int g_ee_irq_pending;
@@ -108,6 +112,7 @@ std::atomic<uint32_t> g_intc_new{0};
 uint32_t g_intc_mask = 0;
 std::atomic<uint32_t> g_dmac_pending{0};
 static void ee_sleep_us(uint32_t us) {
+    ProfScope prof(P_EE_IDLE);
     uint64_t t = platform_time_us();
     platform_sleep_us(us);
     g_ee_idle_us += platform_time_us() - t;
@@ -308,6 +313,22 @@ void debug_watch() {
     }
 }
 
+// The in-game menu holds the game: keep its window alive and the menu drawn,
+// then resume the timing as if no time had passed.
+static void hold_for_menu() {
+    ProfScope prof(P_EE_IDLE);
+    while (overlay_paused()) {
+        gs_overlay_redraw();
+        platform_sleep_us(16000);
+        if (!platform_pump()) {
+            LOG(LOG_CORE, "window closed - exiting");
+            app_exit(0);
+        }
+        overlay_frame();
+    }
+    g_next_vblank_us = platform_time_us() + (uint64_t)kVblankPeriodUs;
+}
+
 // Generates the timed events (vblank start/end set INTC_STAT even while
 // interrupts are disabled, as on hardware); alarm callbacks run only when
 // `run_alarms` (interrupts enabled).
@@ -330,6 +351,7 @@ void service_events(bool run_alarms) {
         g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
         iop_pad_vblank();
+        game_patches_vblank();
         gs_vblank();
         if (g_vsync_flag_addr) {
             ee_w32(g_vsync_flag_addr, 1);
@@ -338,8 +360,10 @@ void service_events(bool run_alarms) {
         intc_raise(INTC_VBLANK_S);
         if (!platform_pump()) {
             LOG(LOG_CORE, "window closed - exiting");
-            exit(0);
+            app_exit(0);
         }
+        overlay_frame();
+        if (overlay_paused()) hold_for_menu();
     }
     for (int i = 0; i < 64 && run_alarms; i++) {
         Alarm &a = g_alarms[i];
@@ -930,7 +954,7 @@ int handle_syscall(int num) {
         return (int)sif_get_reg(a0);
     case 0x7B:  // ExecOSD
         LOG(LOG_CORE, "ExecOSD - exiting");
-        exit(0);
+        app_exit(0);
     case 0x7C:  // Deci2Call
         return -1;
     case 0x7D:  // PSMode
@@ -1099,6 +1123,7 @@ void kernel_init(int, const char *const *) {
 }
 
 void kernel_run(uint32_t entry) {
+    prof_thread_begin(P_EE_GAME);
     g_threads[1].entry = entry;
     memset(&g_ee, 0, sizeof g_ee);
     g_ints_enabled = false;

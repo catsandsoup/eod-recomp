@@ -1,12 +1,17 @@
 // hle_movie.cpp - MoviePlay(name): plays data\video\<name>.pss with the
 // ezmpegstr player (libmpeg + IPU).  With EOD_SKIP_MOVIES=1 movies are
 // skipped the same way the game skips them when it is short of memory.
+#include <atomic>
 #include <cstdlib>
 
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "platform/platform.h"
 #include "funcs.h"
+
+// set while a movie plays (shown in 4:3 whatever the game's aspect setting)
+std::atomic<bool> g_movie_playing{false};
 
 extern "C" {
 
@@ -20,7 +25,11 @@ void f_003670C8(void) {
         return;
     }
     LOG(LOG_CORE, "playing movie %s", name);
+    g_movie_playing = true;
+    uint64_t t0 = platform_time_us();
     f_003670C8_orig();
+    g_movie_playing = false;
+    LOG(LOG_CORE, "movie %s ended after %.1f s", name, (platform_time_us() - t0) / 1e6);
 }
 
 }

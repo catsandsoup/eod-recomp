@@ -9,14 +9,18 @@
 #endif
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <dxgi.h>
 #include <shlobj.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "../../runtime/core/config.h"
+#include "../../runtime/core/eodsave.h"
+#include "../../runtime/core/ps2mc.h"
 
 namespace {
 
@@ -28,9 +32,11 @@ Config g_cfg;
 
 enum : int {
     ID_RENDERER = 100, ID_ADAPTER, ID_FULLSCREEN, ID_WINSIZE, ID_ASPECT, ID_SCALE, ID_VSYNC, ID_SMOOTH, ID_SKIP,
-    ID_AUDIO, ID_VOLUME, ID_VOLUME_LABEL, ID_VIBRATION, ID_CONTROLS, ID_MEMCARD, ID_MEMCARD_BROWSE, ID_DATA,
-    ID_DATA_BROWSE, ID_PLAY, ID_SAVE, ID_DEFAULTS, ID_EXIT,
-    ID_KEY_EDIT = 300, ID_KEY_BIND = 400, ID_KEYS_OK = 500, ID_KEYS_CANCEL, ID_KEYS_DEFAULTS
+    ID_AUDIO, ID_VOLUME, ID_VOLUME_LABEL, ID_VIBRATION, ID_DURABILITY, ID_CONTROLS, ID_MEMCARD, ID_MEMCARD_BROWSE, ID_DATA,
+    ID_DATA_BROWSE, ID_IMPORT_PCSX2, ID_EDIT_SAVE, ID_PLAY, ID_SAVE, ID_DEFAULTS, ID_EXIT,
+    ID_KEY_EDIT = 300, ID_KEY_BIND = 400, ID_KEYS_OK = 500, ID_KEYS_CANCEL, ID_KEYS_DEFAULTS,
+    ID_SE_MONEY = 600, ID_SE_REPA, ID_SE_REPB, ID_SE_REPP, ID_SE_REPTOTAL, ID_SE_REPMAX, ID_SE_LIST, ID_SE_VALUE,
+    ID_SE_VALUE_LABEL, ID_SE_SET, ID_SE_SAVE, ID_SE_CANCEL, ID_SE_SLOT  // ID_SE_SLOT + 0..3
 };
 
 struct Size {
@@ -200,7 +206,7 @@ void load_into_ui() {
         add(ws, b);
     }
     sel(ws, found);
-    sel(GetDlgItem(g_main, ID_ASPECT), g_cfg.aspect == "16:9" ? 1 : g_cfg.aspect == "stretch" ? 2 : 0);
+    sel(GetDlgItem(g_main, ID_ASPECT), g_cfg.aspect == "4:3" ? 1 : g_cfg.aspect == "16:9" ? 2 : g_cfg.aspect == "stretch" ? 3 : 0);
     sel(GetDlgItem(g_main, ID_SCALE), g_cfg.render_scale - 1);
     set_check(ID_VSYNC, g_cfg.vsync);
     set_check(ID_SMOOTH, g_cfg.smooth_display);
@@ -211,6 +217,7 @@ void load_into_ui() {
     snprintf(v, sizeof v, "%d%%", g_cfg.volume);
     SetDlgItemTextA(g_main, ID_VOLUME_LABEL, v);
     set_check(ID_VIBRATION, g_cfg.vibration);
+    set_check(ID_DURABILITY, g_cfg.car_durability);
     SetDlgItemTextA(g_main, ID_MEMCARD, g_cfg.memcard_dir.c_str());
     SetDlgItemTextA(g_main, ID_DATA, g_cfg.data_dir.c_str());
 }
@@ -224,7 +231,8 @@ void read_from_ui() {
         g_cfg.width = g_sizes[(size_t)s].w;
         g_cfg.height = g_sizes[(size_t)s].h;
     }
-    g_cfg.aspect = cur(ID_ASPECT) == 1 ? "16:9" : cur(ID_ASPECT) == 2 ? "stretch" : "4:3";
+    static const char *const aspects[] = {"auto", "4:3", "16:9", "stretch"};
+    g_cfg.aspect = aspects[std::max(0, std::min(3, (int)cur(ID_ASPECT)))];
     g_cfg.render_scale = cur(ID_SCALE) + 1;
     g_cfg.vsync = checked(ID_VSYNC);
     g_cfg.smooth_display = checked(ID_SMOOTH);
@@ -232,6 +240,7 @@ void read_from_ui() {
     g_cfg.audio = checked(ID_AUDIO);
     g_cfg.volume = (int)SendDlgItemMessageA(g_main, ID_VOLUME, TBM_GETPOS, 0, 0);
     g_cfg.vibration = checked(ID_VIBRATION);
+    g_cfg.car_durability = checked(ID_DURABILITY);
     g_cfg.memcard_dir = text_of(g_main, ID_MEMCARD);
     g_cfg.data_dir = text_of(g_main, ID_DATA);
 }
@@ -266,6 +275,335 @@ void browse(int edit_id, const char *title) {
     char path[MAX_PATH];
     if (SHGetPathFromIDListA(l, path)) SetDlgItemTextA(g_main, edit_id, path);
     CoTaskMemFree(l);
+}
+
+// The folder holding the memory card in port 0 (as the game finds it).
+std::string memcard_port0() {
+    std::string root = text_of(g_main, ID_MEMCARD);
+    if (root.empty()) {
+        std::string data = text_of(g_main, ID_DATA);
+        root = (data.empty() ? g_dir : data) + "\\memcard";
+    }
+    CreateDirectoryA(root.c_str(), nullptr);
+    return root + "\\port0";
+}
+
+// Deletes a save folder (its files, then the folder).
+void remove_save_dir(const std::string &dir) {
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileA((dir + "\\" + fd.cFileName).c_str());
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(dir.c_str());
+}
+
+// Copies the game's saves from a PCSX2 memory card image into port 0's folder.
+void import_pcsx2() {
+    const char *title = "Import PCSX2 save";
+    char file[MAX_PATH] = "";
+    OPENFILENAMEA of = {};
+    of.lStructSize = sizeof of;
+    of.hwndOwner = g_main;
+    of.lpstrFilter = "PS2 memory cards (*.ps2, *.bin, *.mcd)\0*.ps2;*.bin;*.mcd\0All files\0*.*\0";
+    of.lpstrFile = file;
+    of.nMaxFile = MAX_PATH;
+    of.lpstrTitle = "PCSX2 memory card (in PCSX2's memcards folder)";
+    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&of)) return;
+    std::vector<Ps2McSave> saves;
+    std::string err;
+    if (!ps2mc_read_saves(file, "BASLUS-20910", saves, err)) {
+        MessageBoxA(g_main, ("Could not read the memory card: " + err + ".").c_str(), title, MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (saves.empty()) {
+        MessageBoxA(g_main, "There is no Test Drive: Eve of Destruction save on this memory card.", title,
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::string dir = memcard_port0();
+    CreateDirectoryA(dir.c_str(), nullptr);
+    // the current save (also under the name older versions of the port used) is kept as <name>.bak
+    std::vector<std::string> existing;
+    for (const Ps2McSave &s : saves) {
+        for (const std::string &name : {s.dir, std::string("US-20910DRIVEN")}) {
+            DWORD a = GetFileAttributesA((dir + "\\" + name).c_str());
+            if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) existing.push_back(name);
+        }
+    }
+    if (!existing.empty()) {
+        std::string msg = "Replace the save in " + dir + " with the one from the PCSX2 memory card?\n\nThe current save is kept as " +
+                          existing[0] + ".bak.";
+        if (MessageBoxA(g_main, msg.c_str(), title, MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        for (const std::string &name : existing) {
+            std::string from = dir + "\\" + name, to = from + ".bak";
+            remove_save_dir(to);
+            if (!MoveFileA(from.c_str(), to.c_str())) {
+                MessageBoxA(g_main, ("Could not rename " + from + ".").c_str(), title, MB_OK | MB_ICONERROR);
+                return;
+            }
+        }
+    }
+    int n = ps2mc_write_saves(dir, saves, err);
+    if (n < (int)saves.size()) {
+        MessageBoxA(g_main, ("Could not copy the save: " + err + ".").c_str(), title, MB_OK | MB_ICONERROR);
+        return;
+    }
+    std::string msg = "Imported " + saves[0].dir + " into " + dir + ".";
+    MessageBoxA(g_main, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
+}
+
+// ------------------------------------------------------------ save editor
+EodSave g_save;
+std::string g_save_path;
+HWND g_save_wnd;
+
+void save_editor_total(HWND h) {
+    int32_t a = (int32_t)strtol(text_of(h, ID_SE_REPA).c_str(), nullptr, 10);
+    int32_t b = (int32_t)strtol(text_of(h, ID_SE_REPB).c_str(), nullptr, 10);
+    int32_t p = (int32_t)strtol(text_of(h, ID_SE_REPP).c_str(), nullptr, 10);
+    char t[64];
+    snprintf(t, sizeof t, "= %d reputation points", EodSave::reputation_total(a, b, p));
+    SetDlgItemTextA(h, ID_SE_REPTOTAL, t);
+}
+
+int save_editor_selected(HWND h) {
+    return (int)SendDlgItemMessageA(h, ID_SE_LIST, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+}
+
+bool parse_int(const std::string &s, int32_t &v) {
+    char *end;
+    long r = strtol(s.c_str(), &end, 10);
+    if (s.empty() || *end) return false;
+    v = (int32_t)r;
+    return true;
+}
+
+LRESULT CALLBACK save_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    const char *title = "Save editor";
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if ((id == ID_SE_REPA || id == ID_SE_REPB || id == ID_SE_REPP) && HIWORD(wp) == EN_CHANGE) {
+            save_editor_total(h);
+            return 0;
+        }
+        if (id == ID_SE_REPMAX) {  // the game's cap: the points that make the total 999999
+            int32_t a = 0, b = 0;
+            parse_int(text_of(h, ID_SE_REPA), a);
+            parse_int(text_of(h, ID_SE_REPB), b);
+            int64_t p = 999999 - (int64_t)a * 100 - (int64_t)b * 50;
+            SetDlgItemTextA(h, ID_SE_REPP, std::to_string(p < 0 ? 0 : p).c_str());
+            return 0;
+        }
+        if (id == ID_SE_SET) {
+            int i = save_editor_selected(h);
+            if (i < 0) return 0;
+            std::string err;
+            if (!g_save.set_option((size_t)i, text_of(h, ID_SE_VALUE), err)) {
+                MessageBoxA(h, (g_save.options()[(size_t)i].name + ": " + err + ".").c_str(), title, MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            LVITEMA it = {};
+            it.iSubItem = 2;
+            it.pszText = (char *)g_save.options()[(size_t)i].value.c_str();
+            SendDlgItemMessageA(h, ID_SE_LIST, LVM_SETITEMTEXTA, (WPARAM)i, (LPARAM)&it);
+            SetDlgItemTextA(h, ID_SE_VALUE, g_save.options()[(size_t)i].value.c_str());
+            return 0;
+        }
+        if (id == ID_SE_SAVE) {
+            int32_t money = 0, a = 0, b = 0, p = 0;
+            if (g_save.has_career() && !parse_int(text_of(h, ID_SE_MONEY), money)) {
+                MessageBoxA(h, "Money: enter a whole number.", title, MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            if (g_save.has_reputation() && (!parse_int(text_of(h, ID_SE_REPA), a) || !parse_int(text_of(h, ID_SE_REPB), b) ||
+                                            !parse_int(text_of(h, ID_SE_REPP), p) || a < 0 || b < 0 || p < 0)) {
+                MessageBoxA(h, "Reputation: enter whole numbers (0 or more).", title, MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            std::vector<std::pair<int, int>> looks = eodsave_parse_looks(g_cfg.car_looks);
+            if (g_save.has_career()) {
+                std::vector<int> shown;
+                for (int k = 0; k < g_save.car_count() && k < 4; k++) {
+                    int i = (int)SendDlgItemMessageA(h, ID_SE_SLOT + k, CB_GETCURSEL, 0, 0);
+                    shown.push_back(i < 0 ? eodsave_slot_shown(g_save, k, looks)
+                                          : (int)SendDlgItemMessageA(h, ID_SE_SLOT + k, CB_GETITEMDATA, (WPARAM)i, 0));
+                }
+                std::string err;
+                if (!shown.empty() && !eodsave_set_slots(g_save, shown, looks, err)) {
+                    MessageBoxA(h, ("Garage: " + err + ".").c_str(), title, MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                g_save.set_money(money);
+            }
+            if (g_save.has_reputation()) g_save.set_reputation(a, b, p);
+            std::string err, bak = g_save_path + ".bak";
+            CopyFileA(g_save_path.c_str(), bak.c_str(), FALSE);  // the previous save
+            if (!g_save.save(g_save_path, err)) {
+                MessageBoxA(h, ("Could not save: " + err + ".").c_str(), title, MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            std::string looks_text = eodsave_format_looks(looks);
+            if (looks_text != g_cfg.car_looks) {  // the cars shown as other vehicles (eod.ini)
+                g_cfg.car_looks = looks_text;
+                if (!config_save(g_dir + "\\eod.ini", g_cfg))
+                    MessageBoxA(h, ("Could not write " + g_dir + "\\eod.ini.").c_str(), title, MB_OK | MB_ICONERROR);
+            }
+            MessageBoxA(h, ("Saved. The previous save is kept as " + bak + ".").c_str(), title, MB_OK | MB_ICONINFORMATION);
+            DestroyWindow(h);
+            return 0;
+        }
+        if (id == ID_SE_CANCEL) {
+            DestroyWindow(h);
+            return 0;
+        }
+        break;
+    }
+    case WM_NOTIFY: {
+        NMHDR *n = (NMHDR *)lp;
+        if (n->idFrom == ID_SE_LIST && n->code == LVN_ITEMCHANGED) {
+            NMLISTVIEW *lv = (NMLISTVIEW *)lp;
+            if ((lv->uNewState & LVIS_SELECTED) && lv->iItem >= 0 && (size_t)lv->iItem < g_save.options().size()) {
+                const EodSaveOption &o = g_save.options()[(size_t)lv->iItem];
+                SetDlgItemTextA(h, ID_SE_VALUE, o.value.c_str());
+                static const char *const kinds[] = {"text or number", "yes or no", "whole number", "text", "number"};
+                std::string hint = o.name + " (" + kinds[o.type >= 0 && o.type <= 4 ? o.type : 0] + "):";
+                SetDlgItemTextA(h, ID_SE_VALUE_LABEL, hint.c_str());
+            }
+        }
+        break;
+    }
+    case WM_CTLCOLORSTATIC:
+        SetBkMode((HDC)wp, TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        g_save_wnd = nullptr;
+        EnableWindow(g_main, TRUE);
+        SetForegroundWindow(g_main);
+        return 0;
+    }
+    return DefWindowProcA(h, msg, wp, lp);
+}
+
+// Opens the save in port 0's folder in the editor window.
+void open_save_editor() {
+    const char *title = "Save editor";
+    g_save_path = memcard_port0() + "\\BASLUS-20910DRIVEN\\BASLUS-20910DRIVEN";
+    std::string err;
+    if (GetFileAttributesA(g_save_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxA(g_main, ("There is no save yet (" + g_save_path + ").\n\nSave in the game first, or import a PCSX2 save.").c_str(),
+                    title, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    g_save = EodSave();
+    if (!g_save.load(g_save_path, err)) {
+        MessageBoxA(g_main, ("Could not read the save: " + err + ".").c_str(), title, MB_OK | MB_ICONERROR);
+        return;
+    }
+    const int w = 560, hgt = 664;
+    RECT r = {0, 0, w, hgt};
+    AdjustWindowRect(&r, WS_CAPTION | WS_SYSMENU, FALSE);
+    RECT pr, wa;
+    GetWindowRect(g_main, &pr);
+    int x = pr.left + 20, top = pr.top + 20;
+    if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {  // keep it on screen (768-pixel tall laptops)
+        x = std::max((int)wa.left, std::min(x, (int)wa.right - (int)(r.right - r.left)));
+        top = std::max((int)wa.top, std::min(top, (int)wa.bottom - (int)(r.bottom - r.top)));
+    }
+    HWND d = CreateWindowExA(WS_EX_DLGMODALFRAME, "EodSetupSave", "Save editor", WS_CAPTION | WS_SYSMENU | WS_POPUP, x,
+                             top, r.right - r.left, r.bottom - r.top, g_main, nullptr, g_inst, nullptr);
+    g_save_wnd = d;
+    std::string who = "Player: " + g_save.player_name() + (g_save.checksum_ok() ? "" : "   (the save's checksum was wrong: saving fixes it)");
+    label(who.c_str(), 12, 8, w - 24, d);
+    label(g_save_path.c_str(), 12, 26, w - 24, d);
+
+    int y = 50;
+    group("Career", 12, y, w - 24, 112, d);
+    label("Money:", 28, y + 24, 90, d);
+    ctl("EDIT", std::to_string(g_save.money()).c_str(), ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 130, y + 22, 110, 22, d,
+        ID_SE_MONEY);
+    int32_t a, b, p;
+    g_save.reputation(a, b, p);
+    label("Reputation:", 28, y + 54, 90, d);
+    ctl("EDIT", std::to_string(a).c_str(), ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 130, y + 52, 60, 22, d, ID_SE_REPA);
+    label("x 100  +", 194, y + 54, 50, d);
+    ctl("EDIT", std::to_string(b).c_str(), ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 248, y + 52, 60, 22, d, ID_SE_REPB);
+    label("x 50  +", 312, y + 54, 44, d);
+    ctl("EDIT", std::to_string(p).c_str(), ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 358, y + 52, 80, 22, d, ID_SE_REPP);
+    ctl("BUTTON", "Max", BS_PUSHBUTTON | WS_TABSTOP, 446, y + 51, 90, 24, d, ID_SE_REPMAX);
+    ctl("STATIC", "", 0, 130, y + 84, 300, 16, d, ID_SE_REPTOTAL);
+    save_editor_total(d);
+    if (!g_save.has_career()) EnableWindow(GetDlgItem(d, ID_SE_MONEY), FALSE);
+
+    y += 124;
+    group("Garage", 12, y, w - 24, 176, d);
+    std::vector<std::pair<int, int>> looks = eodsave_parse_looks(g_cfg.car_looks);
+    for (int k = 0; k < 4; k++) {
+        label(("Slot " + std::to_string(k + 1) + ":").c_str(), 28, y + 26 + k * 30, 60, d);
+        HWND cb = combo(96, y + 22 + k * 30, w - 132, d, ID_SE_SLOT + k);
+        bool owned = g_save.has_career() && k < g_save.car_count();
+        if (!owned) {
+            add(cb, g_save.has_career() ? "(no car: buy one in the game first)" : "(no career)");
+            sel(cb, 0);
+            EnableWindow(cb, FALSE);
+            continue;
+        }
+        int shown = eodsave_slot_shown(g_save, k, looks), pick = -1;
+        for (const EodVehicle &v : eodsave_vehicles()) {
+            int i = (int)SendMessageA(cb, CB_ADDSTRING, 0, (LPARAM)eodsave_vehicle_label(v.id).c_str());
+            SendMessageA(cb, CB_SETITEMDATA, (WPARAM)i, (LPARAM)v.id);
+            if (v.id == shown) pick = i;
+        }
+        sel(cb, pick);
+    }
+    label("Career cars are written into the save. Action paint jobs and special vehicles", 28, y + 144, w - 56, d);
+    label("are shown by this port over the slot's career car (on a PS2 it stays as it is).", 28, y + 158, w - 56, d);
+
+    y += 188;
+    group("Game settings", 12, y, w - 24, 262, d);
+    HWND lv = ctl(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 24, y + 22,
+                  w - 48, 178, d, ID_SE_LIST);
+    SendMessageA(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    const char *cols[3] = {"Section", "Setting", "Value"};
+    const int widths[3] = {120, 200, 160};
+    for (int c = 0; c < 3; c++) {
+        LVCOLUMNA col = {};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.pszText = (char *)cols[c];
+        col.cx = widths[c];
+        SendMessageA(lv, LVM_INSERTCOLUMNA, (WPARAM)c, (LPARAM)&col);
+    }
+    for (size_t i = 0; i < g_save.options().size(); i++) {
+        const EodSaveOption &o = g_save.options()[i];
+        LVITEMA it = {};
+        it.mask = LVIF_TEXT;
+        it.iItem = (int)i;
+        it.pszText = (char *)eodsave_group_name(o.group);
+        SendMessageA(lv, LVM_INSERTITEMA, 0, (LPARAM)&it);
+        it.iSubItem = 1;
+        it.pszText = (char *)o.name.c_str();
+        SendMessageA(lv, LVM_SETITEMTEXTA, (WPARAM)i, (LPARAM)&it);
+        it.iSubItem = 2;
+        it.pszText = (char *)o.value.c_str();
+        SendMessageA(lv, LVM_SETITEMTEXTA, (WPARAM)i, (LPARAM)&it);
+    }
+    ctl("STATIC", "Select a setting to change it.", 0, 24, y + 210, w - 48, 16, d, ID_SE_VALUE_LABEL);
+    ctl("EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 24, y + 230, 300, 22, d, ID_SE_VALUE);
+    ctl("BUTTON", "Set", BS_PUSHBUTTON | WS_TABSTOP, 332, y + 229, 80, 24, d, ID_SE_SET);
+
+    int by = hgt - 40;
+    ctl("BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, w - 196, by, 88, 28, d, ID_SE_SAVE);
+    ctl("BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, w - 100, by, 88, 28, d, ID_SE_CANCEL);
+    EnableWindow(g_main, FALSE);
+    ShowWindow(d, SW_SHOW);
 }
 
 void play() {
@@ -310,8 +648,9 @@ void build_ui(HWND w) {
     combo(255, y + 82, 235, w, ID_WINSIZE);
     label("Aspect ratio:", 28, y + 116, 120, w);
     HWND a = combo(160, y + 114, 140, w, ID_ASPECT);
+    add(a, "Auto (game option)");
     add(a, "4:3 (original)");
-    add(a, "16:9");
+    add(a, "16:9 widescreen");
     add(a, "Stretch to window");
     label("Resolution:", 312, y + 116, 70, w);
     HWND s = combo(385, y + 114, 105, w, ID_SCALE);
@@ -327,7 +666,7 @@ void build_ui(HWND w) {
     label("Frame skipping keeps the game at full speed on slow computers.", 28, y + 178, W - 60, w);
 
     y += 224;
-    group("Sound and controls", 12, y, W - 24, 92, w);
+    group("Sound, controls and gameplay", 12, y, W - 24, 122, w);
     check("Sound", 28, y + 24, 80, w, ID_AUDIO);
     label("Volume:", 112, y + 24, 50, w);
     HWND v = ctl(TRACKBAR_CLASSA, "", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 165, y + 22, 180, 26, w, ID_VOLUME);
@@ -335,17 +674,22 @@ void build_ui(HWND w) {
     ctl("STATIC", "100%", 0, 350, y + 27, 50, 16, w, ID_VOLUME_LABEL);
     check("Controller vibration", 28, y + 56, 170, w, ID_VIBRATION);
     ctl("BUTTON", "Keyboard controls...", BS_PUSHBUTTON | WS_TABSTOP, 330, y + 54, 160, 26, w, ID_CONTROLS);
+    check("Car durability as rated in the menu (each car's damage_scale, unused by the game)", 28, y + 88, W - 60, w,
+          ID_DURABILITY);
 
-    y += 102;
-    group("Folders (leave empty for the defaults)", 12, y, W - 24, 88, w);
+    y += 132;
+    group("Folders (leave empty for the defaults)", 12, y, W - 24, 120, w);
     label("Memory card:", 28, y + 24, 90, w);
     ctl("EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 125, y + 22, 280, 22, w, ID_MEMCARD);
     ctl("BUTTON", "Browse...", BS_PUSHBUTTON | WS_TABSTOP, 412, y + 21, 78, 24, w, ID_MEMCARD_BROWSE);
     label("Game data:", 28, y + 54, 90, w);
     ctl("EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 125, y + 52, 280, 22, w, ID_DATA);
     ctl("BUTTON", "Browse...", BS_PUSHBUTTON | WS_TABSTOP, 412, y + 51, 78, 24, w, ID_DATA_BROWSE);
+    ctl("BUTTON", "Import PCSX2 save...", BS_PUSHBUTTON | WS_TABSTOP, 28, y + 83, 150, 26, w, ID_IMPORT_PCSX2);
+    ctl("BUTTON", "Edit save...", BS_PUSHBUTTON | WS_TABSTOP, 186, y + 83, 110, 26, w, ID_EDIT_SAVE);
+    label("(PCSX2 cards: .ps2 files)", 306, y + 88, W - 330, w);
 
-    y += 100;
+    y += 132;
     ctl("BUTTON", "Defaults", BS_PUSHBUTTON | WS_TABSTOP, 12, y, 90, 30, w, ID_DEFAULTS);
     ctl("BUTTON", "Play", BS_DEFPUSHBUTTON | WS_TABSTOP, W - 300, y, 90, 30, w, ID_PLAY);
     ctl("BUTTON", "Save", BS_PUSHBUTTON | WS_TABSTOP, W - 204, y, 90, 30, w, ID_SAVE);
@@ -367,6 +711,8 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case ID_MEMCARD_BROWSE: browse(ID_MEMCARD, "Folder for the memory card saves"); return 0;
         case ID_DATA_BROWSE: browse(ID_DATA, "Folder with the game disc files (SLUS_209.10 and DATA)"); return 0;
+        case ID_IMPORT_PCSX2: import_pcsx2(); return 0;
+        case ID_EDIT_SAVE: open_save_editor(); return 0;
         case ID_DEFAULTS:
             g_cfg = Config();
             load_into_ui();
@@ -403,7 +749,7 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     g_inst = inst;
-    INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_WIN95_CLASSES | ICC_BAR_CLASSES};
+    INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_WIN95_CLASSES | ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES};
     InitCommonControlsEx(&icc);
     CoInitialize(nullptr);
 
@@ -433,8 +779,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     wc.lpfnWndProc = keys_proc;
     wc.lpszClassName = "EodSetupKeys";
     RegisterClassA(&wc);
+    wc.lpfnWndProc = save_proc;
+    wc.lpszClassName = "EodSetupSave";
+    RegisterClassA(&wc);
 
-    RECT r = {0, 0, 520, 548};
+    RECT r = {0, 0, 520, 610};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;

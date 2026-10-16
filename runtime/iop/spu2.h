@@ -20,6 +20,8 @@ int spu2_voice_trans(int channel, int mode, uint32_t iop_addr, uint32_t spu_addr
 // Block transfer: AutoDMA PCM input from IOP memory (played in real time).
 int spu2_block_trans(int channel, int mode, uint32_t iop_addr, uint32_t size, uint32_t start);
 uint32_t spu2_block_trans_status(int channel);
+// The EE wrote IOP memory there (SIF DMA): refills of a streamed block transfer buffer.
+void spu2_iop_written(uint32_t addr, uint32_t size);
 // Direct sound RAM write (for HLE modules that stream into it).
 void spu2_sram_write(uint32_t spu_addr, const uint8_t *src, uint32_t size);
 

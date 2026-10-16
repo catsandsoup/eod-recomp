@@ -1,73 +1,138 @@
 # eod-recomp — Test Drive: Eve of Destruction, native PC port
 
-> **Work in progress.** The game boots and is playable from start to finish of
-> a race, but there are known bugs, performance is still being worked on and
-> several PC features are missing. See the [TODO](#todo) list below.
+**Version 1.0**
 
 This project turns the PlayStation 2 executable of **Test Drive: Eve of
 Destruction** (NTSC-U, `SLUS_209.10`, v1.00) into C/C++ source code that builds
-into a native Windows program (Windows 7 or later, 32- or 64-bit) by **static
-recompilation**, the approach used by projects like N64Recomp/Zelda64Recomp.
-It is not an emulator: the game's code is translated to C ahead of time and
-runs natively, on top of a runtime that replaces the PS2 hardware.
+into a native Windows program: Windows 7 or later, 32- or 64-bit, any SSE2 CPU
+(Core 2 Duo or newer). It uses **static recompilation**, the approach of
+N64Recomp/Zelda64Recomp. It is not an emulator: the game's code is translated
+to C ahead of time and runs natively, on top of a runtime that replaces the
+PS2 hardware.
 
 **No game files are included.** You need your own copy of the game disc.
 
 ![Title screen rendered by the port](docs/img/title_screen.png)
 
+## What you get
+
+* **The whole game:** menus, Career and Action modes, the garage, races
+  and the movies, with sound effects, music, speech and movie audio.
+* **Direct3D 11 renderer** at up to 6x the PS2 resolution, with frame
+  skipping so the game keeps full speed on slow PCs. A software renderer is
+  included for machines without Direct3D 10-class graphics.
+* **Real widescreen:** the game's own 16:9 mode with a wider 3D view and an
+  undistorted HUD, forced on from the start if you want it. Movies stay 4:3.
+* **In-game menu** (F1, or L3 + R3 on a controller): fullscreen, aspect ratio,
+  VSync, scaling, frame skipping, sound, volume, vibration and keyboard
+  bindings, changed while playing. Built with
+  [Dear ImGui](https://github.com/ocornut/imgui).
+* **Keyboard and XInput controllers**, with DualShock 2 pressure emulation.
+* **`eodsetup.exe`**, a settings program, with:
+  * **PCSX2 save import:** continue a game saved in PCSX2 (`.ps2` memory card).
+  * **Save editor:** career money, reputation (unlocks) and all 280 of the
+    game's settings.
+  * **Garage:** put any of the game's 274 vehicles in the four career slots.
+    All 130 dealer cars go into the save. Action mode paint jobs and the
+    special vehicles (Bus, Copcar, Hearse, Postal, Taxi, Ambulance) are shown
+    by the port over the slot's career car, and drive like that vehicle.
+  * **Car durability as rated in the menu** (optional): in the original game a
+    car's toughness comes only from its weight, and the durability ratings in
+    the menus are never used. This option applies the per-car durability
+    values found in the game's own car files, which those ratings follow. The
+    table of every car's damage, with and without the option, is in the
+    README.txt that comes with the builds (`dist/README.txt`).
+
 ## Status
 
 | Area | State |
 | --- | --- |
-| Recompiled code | Complete; boots through the SDK libraries and the game's init |
-| Graphics | Direct3D 11 renderer (feature level 10_0+, internal resolution up to 6x) and a software GS renderer |
-| Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
-| Memory card | Saves to `memcard/port0` next to the game data |
-| Sound | Sound effects, music and speech work; FMV audio is somewhat distorted |
-| FMV | Intro, attract and menu background movies play |
-| Gameplay | Menus, Career mode, the garage and races play |
-| Performance | Playable on a low-end laptop (Core i3-6006U, Intel HD 520); heavy race scenes are still CPU-bound |
-| Widescreen | Not yet: the 4:3 picture is stretched to the window |
+| Recompiled code | Complete: about 13,500 functions |
+| Graphics | Direct3D 11 (feature level 10_0+) and software GS renderers |
+| Sound | Effects, music, speech and movie audio |
+| Movies | All play (IPU / MPEG-2 emulation) |
+| Gameplay | Career and Action modes are playable |
+| Memory card | Saves in `memcard/port0` next to the game; PCSX2 saves can be imported |
+| Performance | Full speed in menus and most races on a low-end laptop (Core i3-6006U, Intel HD 520). The busiest race scenes are limited by the CPU; frame skipping keeps the game at full speed there |
+
+### Known issues and plans
+
+* **CPU use in heavy races.** The game's VU1 micro programs (geometry and
+  lighting) are compiled ahead of time to C++ but still take most of the CPU
+  time in busy scenes. Making them cheaper is the main remaining work.
+* Mouse and keyboard driving and mouselook are not supported.
+* `EOD_SKIP_MOVIES=1` (a testing switch) leaves the game silent.
+
+Bug reports are welcome on the
+[issue tracker](https://github.com/pareidolico/eod-recomp/issues).
 
 ![Boot sequence](docs/img/boot_sequence.png)
 
-## TODO
+## Game files
 
-In order of priority:
+Copy the whole disc (at least `SLUS_209.10`, `SYSTEM.CNF` and the `DATA`
+folder) into one folder and put `eod.exe` and `eodsetup.exe` there (or pass
+`--data <folder>`). The executable checks that `SLUS_209.10` is the exact
+version this code was generated from (NTSC-U v1.00).
 
-1. **VU1 performance.** The game's VU1 micro programs (geometry/lighting) are
-   compiled ahead of time to C++ but still take most of the CPU time in
-   races. Make them cheaper (only compute pipeline flags where they are read,
-   keep registers in locals, fewer scoreboard updates) so races run at full
-   frame rate on low-end CPUs.
-2. **FMV audio.** The audio of the movies plays somewhat distorted.
-3. **More intuitive setup controls.** Make `eodsetup.exe` (keyboard and
-   controller bindings, options) easier to understand and use.
-4. **PC features, further down the line:**
-   * real widescreen support (a wider field of view with correct proportions
-     instead of stretching the 4:3 image), possibly based on existing PS2
-     widescreen patches or SilentPatch-style fixes; FMVs keep playing in 4:3
-   * mouse and keyboard support
-   * mouselook
+## Running
+
+Run `eodsetup.exe` once to choose the settings (renderer, graphics adapter,
+window size or fullscreen, aspect ratio, internal resolution, VSync, sound,
+keyboard, folders, car durability). It writes them to `eod.ini` next to
+`eod.exe` and can start the game. `eod.exe` alone runs with the defaults.
+
+The window title shows the speed ("100% speed" = real time) and the drawn
+frames per second.
+
+| Option | Meaning |
+| --- | --- |
+| `--data DIR` | folder containing `SLUS_209.10` and `DATA/` |
+| `--renderer d3d11\|software\|warp` | renderer (`warp`: Direct3D 11 on Microsoft's software device) |
+| `--fullscreen` / `--windowed` | override the window mode |
+| `--scale N` | initial window size (N × 320×240) |
+| `--config FILE` | another settings file |
+| `--import-save CARD.ps2` | copy the game's save from a PCSX2 memory card |
+| `--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [slotN=VEHICLE] [setting=value]...` | edit a save (without arguments: list its values; `vehicles` lists the vehicle numbers) |
+| `--log cats` / `--log-file F` | debug logging (`core,kernel,sif,file,gs,...` or `all`) |
+| `--frames N` | exit after N frames (testing) |
+| `--screenshot-every N --screenshot-dir D` | dump frames as PPM |
+
+Keyboard: arrows = D-pad/left stick, X/Space = ✕, C = ○, Z = □, V = △,
+Q/E = L1/R1, A or 1 = L2, D or 3 = R2, Enter = Start, Backspace = Select,
+Alt+Enter or F11 = fullscreen, F1 = in-game menu. XInput controllers map to
+the DualShock layout.
+
+### Settings worth knowing
+
+* **Widescreen:** choose "Widescreen (16:9)" in the game's Options, or 16:9 in
+  `eodsetup.exe` / the in-game menu to keep the game in widescreen from the
+  start. "4:3" keeps it in the normal mode; "stretch" fills the window.
+* **Garage looks** are stored in `eod.ini` as `[Career] CarLooks=career
+  vehicle:vehicle,...` (e.g. `845:146`: the white career Durand looks and
+  drives like Durand Action paint 3). Without that line, or on a PS2, the
+  career car shows as it is.
+* **Car durability:** `[Gameplay] CarDurability=1`. The damage a car takes is
+  the event's damage setting × 4000 lb ÷ the car's weight × its upgrades'
+  factor (Chassis Reinforcement); the option multiplies in each car's
+  `damage_scale` (Bus 0.3, Durand 0.5, Limo 0.6, Postal 2.5...).
+
+### Reporting bugs and performance
+
+```bat
+set EOD_FPS=1
+eod.exe --log gs,core --log-file eod_log.txt 2> eod_fps.txt
+```
+
+Attach `eod_fps.txt` and `eod_log.txt` to the report.
 
 ![Main menu](docs/img/main_menu_seq.png)
 
-## Game files
-
-To run the port you need your own copy of the disc. Copy the whole disc (at
-least `SLUS_209.10`, `SYSTEM.CNF` and the `DATA` folder) into one folder and
-put `eod.exe` there (or pass `--data <folder>`). The executable checks that
-`SLUS_209.10` is the exact version this code was generated from (NTSC-U v1.00).
-
-To **build** the port, `tools/analyze.py` and `tools/recomp.py` also need a
-copy of `SLUS_209.10` in the repository root: the C translation in `gen/` is
-generated from it and is not part of the repository.
-
 ## Building
 
-Requirements: your own `SLUS_209.10` in the repository root (see above),
-CMake 3.16+, a C/C++17 compiler and Python 3 with `rabbitizer`
-(`pip install rabbitizer`) to generate `gen/`.
+Requirements: your own `SLUS_209.10` in the repository root (the C translation
+in `gen/` is generated from it and is not part of the repository), CMake 3.16+,
+a C/C++17 compiler and Python 3 with `rabbitizer` (`pip install rabbitizer`).
 
 ```sh
 # 1. generate the C translation (also done automatically on first configure)
@@ -92,45 +157,6 @@ cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -C
 
 The 32-bit Windows build targets SSE2 (Pentium 4 / Core 2 and newer) and
 imports only `kernel32`, `user32`, `gdi32`, `winmm` and `msvcrt`.
-
-## Running
-
-Work-in-progress builds for Windows (64- and 32-bit) and Linux are on the
-[Releases](https://github.com/pareidolico/eod-recomp/releases) page. They are
-built by the `Release builds` workflow (`.github/workflows/release.yml`) from
-the Actions tab or when a `v*` tag is pushed. The game is not included in
-them either.
-
-`eodsetup.exe` sets the options (renderer, adapter, window size or fullscreen,
-aspect ratio, internal resolution, vsync, sound, keyboard bindings, folders)
-and writes them to `eod.ini` next to `eod.exe`.
-
-The window title shows the speed ("100% speed" = real time) and the drawn
-frames per second.
-
-| Option | Meaning |
-| --- | --- |
-| `--data DIR` | folder containing `SLUS_209.10` and `DATA/` |
-| `--renderer d3d11\|software\|warp` | GS renderer (`warp`: Direct3D 11 on Microsoft's software device) |
-| `--scale N` | initial window size (N × 320×240) |
-| `--log cats` / `--log-file F` | debug logging (`core,kernel,sif,file,gs,...` or `all`; `gsxfer` logs every GS transfer and has to be named) |
-| `--frames N` | exit after N frames (testing) |
-| `--screenshot-every N --screenshot-dir D` | dump frames as PPM |
-
-Keyboard: arrows = D-pad/left stick, X/Space = ✕, C = ○, Z = □, V = △,
-Q/E = L1/R1, A or 1 = L2, D or 3 = R2, Enter = Start, Backspace = Select,
-Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
-
-### Reporting performance
-
-Run a race with
-
-```bat
-set EOD_FPS=1
-eod.exe --log gs,core --log-file eod_log.txt 2> eod_fps.txt
-```
-
-and attach `eod_fps.txt` and `eod_log.txt` to the report.
 
 ## How it works
 
@@ -181,12 +207,22 @@ N64Recomp/Zelda64Recomp:
 `config/symbols.txt` collects identified function names; `tools/dis.py` is an
 annotated disassembler used for reverse engineering.
 
+## Credits and licences
+
+The menu overlay uses [Dear ImGui](https://github.com/ocornut/imgui) 1.91.8
+(MIT licence, `third_party/imgui`). Test Drive: Eve of Destruction is a
+trademark of its owners. The game's executable and data files are not
+included: you need your own copy of the game to build and to run the port.
+
 ## Debugging aids
 
 * `EOD_GS_TRACE=<frame>` logs every primitive drawn in that frame
 * `EOD_FPS=1` prints vblanks/s (60 = full speed), game frames/s (drawn or
   skipped), drawn frames/s, how busy the EE and GS threads are and how long
-  the EE waits for the GS, every 5 s
+  the EE waits for the GS, every 5 s, followed by where each thread's time
+  went (EE: game code, VU programs, VIF, GIF, sound, movies, waiting, idle;
+  GS: command processing, drawing state, draws, texture lookups, new
+  textures, uploads, readbacks, conversions, present, idle)
 * `EOD_SKIP_MOVIES=1` skips the movies; `EOD_GS_THREAD=0` renders on the main thread;
   `EOD_GS_RASTER=n` sets the number of raster worker threads (0 = none);
   `EOD_FRAMESKIP=0` disables frame skipping (when rendering falls behind,
@@ -199,7 +235,9 @@ annotated disassembler used for reverse engineering.
   buffers read back as textures); `EOD_GS_REPLAY_TRACE=1` logs the primitives of a
   replay; `EOD_GS_REPLAY_STOP=n EOD_GS_REPLAY_DUMP=file` dumps GS memory after the
   n-th primitive (compare renderers with `--renderer d3d11|software`);
-  `EOD_D3D_SHOW=bp` displays another buffer; `--renderer warp` runs the Direct3D 11 renderer on Microsoft's
+  `EOD_D3D_SHOW=bp` displays another buffer; `EOD_D3D_NODRAW=1` skips the GPU draw calls (replay
+  benchmarks of the CPU side: `--gs-replay` prints the milliseconds per GS category); `EOD_D3D_SYNC_CLUT=1` waits for the GPU on every CLUT
+  load from a rendered buffer (by default such CLUTs come from the previous, non-blocking copy); `--renderer warp` runs the Direct3D 11 renderer on Microsoft's
   software device (WARP) instead of the graphics driver, to tell driver problems from renderer bugs
 * `EOD_VU1_THREAD=1` (experimental) runs VIF1/VU1, GIF DMA and the GS command stream on a worker thread;
   `EOD_GS_SKIPALL=1` makes the GS skip all drawing (benchmarks of the EE side)
@@ -208,6 +246,11 @@ annotated disassembler used for reverse engineering.
   fast VIF unpack paths
 * `EOD_VU_DUMP=dir` writes the VU micro programs that run (input for
   `tools/vurecomp.py`, see `config/vu/`); `EOD_VU_INTERP=1` disables the compiled ones
+* `EOD_VU_REC=file EOD_VU_REC_AT=vblank [EOD_VU_REC_N=runs]` records the state before each VU
+  micro program run; `eod --vu-bench file [--repeat N]` replays the recording and prints the
+  time spent in the micro programs and a hash of their results (the same with
+  `EOD_VU_INTERP=1` when the compiled code is right). `VUREC_COUNT=1 python3 tools/vurecomp.py`
+  adds block counters that `--vu-bench` prints (hot loops)
 * `EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count]` captures the GS state and
   command stream; `eod --gs-replay file [--repeat N]` replays it alone, prints the time and
   writes the final image to `file.ppm` (deterministic renderer benchmarks)
@@ -218,6 +261,8 @@ annotated disassembler used for reverse engineering.
 * `EOD_MEMCARD=dir` uses another memory card folder (e.g. an empty one for repeatable tests)
 * `EOD_WAV=file` (POSIX build) writes the audio output to a WAV file
 * `cmake -DEOD_TRACE_CALLS=ON` records the last EE function calls, printed on crashes
+* `EOD_DUMP_RAM=file` writes the 32 MB of EE RAM to a file when the game exits;
+  `EOD_POKE=addr=value,...` (hex) writes 32-bit words into EE RAM every vblank
 * `EOD_PAD_SCRIPT=frame:buttons,...` scripts controller input (port 0); `tools/padscript.py`
   builds it from button names (see its help for a Career-mode example)
 * `python3 tools/dis.py -f <addr>` disassembles a function with string/symbol annotations

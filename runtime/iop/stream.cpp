@@ -281,17 +281,36 @@ void start_channel(StreamChannel &c) {
     c.running = true;
 }
 
+// Follows the voice's play position (false: the voice was moved elsewhere).
+bool track_voice(StreamChannel &c) {
+    uint32_t nax = spu2_get_addr(voice_entry(c.voice, 0x2240));
+    if (nax < c.start || nax >= c.start + c.size) return false;
+    uint32_t play = (nax - c.start) & ~15u;
+    c.played += (play + c.size - c.last_play) % c.size;
+    c.last_play = play;
+    return true;
+}
+
+// Clearing a channel (a new song, or stopping the music when leaving a race)
+// also drops what the ring holds ahead of the voice: up to 2.6 s of music,
+// which would otherwise play on over the menu's.  The ring is rewritten from
+// just ahead of the voice.
+void drop_ahead(StreamChannel &c) {
+    if (!c.running || !track_voice(c)) return;
+    uint64_t keep = c.played + 0x200;
+    if (c.written <= keep) return;
+    LOG(LOG_SND, "stream: channel %d cleared, %u bytes ahead of the voice dropped", (int)(&c - g_chan),
+        (unsigned)(c.written - keep));
+    c.written = keep;
+}
+
 }  // namespace
 
 // Keeps the stream voices' ring buffers ahead of playback (called often).
 void iop_stream_update() {
     for (StreamChannel &c : g_chan) {
         if (!c.running) continue;
-        uint32_t nax = spu2_get_addr(voice_entry(c.voice, 0x2240));
-        if (nax < c.start || nax >= c.start + c.size) continue;  // voice was moved: leave it
-        uint32_t play = (nax - c.start) & ~15u;
-        c.played += (play + c.size - c.last_play) % c.size;
-        c.last_play = play;
+        if (!track_voice(c)) continue;  // voice was moved: leave it
         // writable: up to 0x200 bytes before the play position
         uint64_t limit = c.played + c.size - 0x200;
         uint32_t avail = limit > c.written ? (uint32_t)std::min<uint64_t>(limit - c.written, c.size) : 0;
@@ -346,9 +365,11 @@ void iop_stream_init() {
                 if (flags & 1) {
                     sc.queue.clear();
                     sc.done = 0;
+                    drop_ahead(sc);
                 }
                 if (lsn != 0xFFFFFFFFu && bytes && bytes != 0xFFFFFFFFu) sc.queue.push_back({lsn, bytes});
                 if (!sc.running && !sc.queue.empty()) start_channel(sc);
+                if (flags & 1) iop_stream_update();  // refill the dropped part now
             }
             return 0;
         }

@@ -78,6 +78,7 @@ struct Env {
     // address tables
     const SwizzleTab *fbT, *zT, *texT[7];
     uint32_t pal[256];  // CLUT expanded to RGBA for the current texture
+    uint64_t pal_hash;  // of pal (the entries the texture format uses)
     uint32_t fpsm_mem;  // frame buffer format as stored (may be a depth format)
     // decoded texture levels (linear RGBA) when tcached
     bool tcached;
@@ -91,6 +92,8 @@ struct Env {
 extern Env g_env;
 // bumped whenever g_env is recomputed
 extern uint32_t g_env_serial;
+// bumped whenever the CLUT buffer may have changed
+extern uint32_t g_clut_gen;
 // One texel of level lvl in RGBA (any format; slow, see decode helpers).
 uint32_t tex_fetch(const Env &e, int u, int v, int lvl);
 

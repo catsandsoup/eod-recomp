@@ -47,7 +47,13 @@ file(GLOB_RECURSE RUNTIME_SOURCES
   ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.c)
 list(APPEND RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/main.cpp)
 if(WIN32)
-  file(GLOB PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/win32/*.cpp ${CMAKE_SOURCE_DIR}/runtime/gs/d3d11/*.cpp)
+  file(GLOB PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/win32/*.cpp ${CMAKE_SOURCE_DIR}/runtime/gs/d3d11/*.cpp
+       ${CMAKE_SOURCE_DIR}/runtime/ui/*.cpp)
+  # Dear ImGui (the in-game menu, runtime/ui)
+  set(IMGUI_SOURCES ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
+      ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_widgets.cpp)
+  set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+  list(APPEND PLATFORM_SOURCES ${IMGUI_SOURCES})
 else()
   file(GLOB PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/posix/*.cpp)
 endif()
@@ -86,7 +92,9 @@ endif()
 
 if(WIN32)
   # Windows 7 is the minimum supported version.
-  target_compile_definitions(eod PRIVATE _WIN32_WINNT=0x0601 WINVER=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_definitions(eod PRIVATE _WIN32_WINNT=0x0601 WINVER=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX
+                             IMGUI_DISABLE_DEMO_WINDOWS IMGUI_DISABLE_DEBUG_TOOLS IMGUI_DISABLE_WIN32_DEFAULT_IME_FUNCTIONS
+                             IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
   target_link_libraries(eod PRIVATE d3d11 dxgi gdi32 user32 winmm)
   if(MINGW)
     target_link_options(eod PRIVATE -static -static-libgcc -static-libstdc++ -mwindows)
@@ -94,9 +102,10 @@ if(WIN32)
   # settings program (writes eod.ini, starts the game)
   enable_language(RC)
   add_executable(eodsetup WIN32 ${CMAKE_SOURCE_DIR}/tools/setup/eodsetup.cpp ${CMAKE_SOURCE_DIR}/tools/setup/eodsetup.rc
-                 ${CMAKE_SOURCE_DIR}/runtime/core/config.cpp)
+                 ${CMAKE_SOURCE_DIR}/runtime/core/config.cpp ${CMAKE_SOURCE_DIR}/runtime/core/ps2mc.cpp
+                 ${CMAKE_SOURCE_DIR}/runtime/core/eodsave.cpp)
   target_compile_definitions(eodsetup PRIVATE _WIN32_WINNT=0x0601 WINVER=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_link_libraries(eodsetup PRIVATE comctl32 dxgi ole32 shell32 gdi32 user32)
+  target_link_libraries(eodsetup PRIVATE comctl32 comdlg32 dxgi ole32 shell32 gdi32 user32)
   if(MINGW)
     target_link_options(eodsetup PRIVATE -static -static-libgcc -static-libstdc++ -mwindows)
   endif()
