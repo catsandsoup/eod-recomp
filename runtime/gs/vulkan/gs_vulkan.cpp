@@ -1769,19 +1769,26 @@ void draw_point(const Env &e, const Vertex &a) {
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     if (!g_on)
         return;
-    // A non-page-aligned BP does not necessarily touch the next physical page.
-    // Dropping an unrequested neighbor's owner loses its rendered pixels.
+    // All prior GPU primitives precede these actual CPU bytes. Do not invalidate
+    // ownership while a queued batch could later redraw older pixels over them.
+    flush();
     const PageCoverage written = page_coverage(bp, bw, psm, x, y, w, h);
     for (uint32_t i = 0; i < written.count; ++i) {
         uint32_t p = written.pages[i];
+        // A complete physical page can be discarded only when every storage bit
+        // is overwritten by the actual buffered chunk. Masked/partial writes
+        // preserve its GPU contents before the CPU modifies them.
+        if (g_owner[p] && !g_vram_ok[p] && written.complete[p] != 0xffffffffu) {
+            g_rb_reason = 0;
+            readback_pages(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+        }
         if (readback_trace_enabled()) {
             if(g_owner[p] && !g_vram_ok[p] && readback_trace_line())
                 fprintf(stderr,"[gs-readback] frame=%llu cpu-write-drops-owner request_bp=%x psm=%x rect=%d,%d,%d,%d page=%u owner_bp=%x owner_psm=%x drawn_blocks=%08x\n",
                     (unsigned long long)g_frame_no,bp,psm,x,y,w,h,p,g_owner[p]->bp,g_owner[p]->psm,g_diag_draw_blocks[p]);
             g_diag_draw_blocks[p]=0;
         }
-        // partial writes into rendered pages drop the rest of their GPU contents
-        // (the game only does that with buffers it redraws anyway)
+        // Remaining old contents are now preserved or provably overwritten.
         g_owner[p] = nullptr;
         g_vram_ok[p] = false;
     }
@@ -1821,6 +1828,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
 }
 
 void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    flush(); // CPU reads observe all earlier queued GS primitives.
     g_rb_reason = 0;
     readback_pages(bp, bw, psm, x, y, w, h);
 }
