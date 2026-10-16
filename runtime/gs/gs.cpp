@@ -25,6 +25,7 @@
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
 #include "gs_mem.h"
+#include "gs_replay_types.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
 
@@ -46,31 +47,8 @@ namespace {
 std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
 
 // ------------------------------------------------------------ GIF parsing
-struct PathState {
-    bool in_packet = false;
-    uint64_t tag_lo = 0, tag_hi = 0;
-    uint32_t nloop = 0;   // remaining loops
-    uint32_t nreg = 0;
-    uint32_t reg = 0;     // current register index within the loop
-    uint32_t flg = 0;
-    bool eop = false;
-};
 PathState g_path[4];
-
-// host -> local transfer state
-struct Transfer {
-    bool active = false;
-    uint32_t dbp, dbw, dpsm;
-    int x0, y0, w, h;
-    int x, y;
-    // partial pixel bytes for 24-bit and sub-word formats
-    uint8_t pend[16];
-    int pend_n = 0;
-    // address table and the current row
-    const SwizzleTab *T = nullptr;
-    int ry = -1;
-    uint32_t rb = 0, rc = 0;
-} g_xfer;
+Transfer g_xfer;
 
 void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog);
 
@@ -828,6 +806,13 @@ uint64_t g_dump_end;
 const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
 
 void dump_state(FILE *f) {
+    // Raster synchronization only drains CPU workers. Hardware-owned GS pages
+    // must also reach the CPU copy before serializing a replay's initial VRAM.
+    if (hw::g_on) {
+        hw::finish(); // Flush pending batches before consulting page ownership.
+        for (uint32_t p = 0; p < kPages; ++p)
+            hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+    }
     uint32_t sizes[3] = {(uint32_t)sizeof st, (uint32_t)sizeof g_path, (uint32_t)sizeof g_xfer};
     fwrite(kDumpMagic, 1, 8, f);
     fwrite(sizes, 4, 3, f);

@@ -28,6 +28,7 @@
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "gs_env.h"
+#include "gs_pixel_math.h"
 #include "gs_hw.h"
 #include "gs_mem.h"
 #include "gs_state.h"
@@ -812,9 +813,9 @@ __attribute__((always_inline)) inline void shade_px_t(const Env &e, int x, const
     }
     if (e.fge) {
         int fo = f.fog;
-        r = (fo * r + (255 - fo) * (int)e.fogr) >> 8;
-        g = (fo * g + (255 - fo) * (int)e.fogg) >> 8;
-        b = (fo * b + (255 - fo) * (int)e.fogb) >> 8;
+        r = fog_channel(r, (int)e.fogr, fo);
+        g = fog_channel(g, (int)e.fogg, fo);
+        b = fog_channel(b, (int)e.fogb, fo);
     }
     // ---- alpha test
     bool write_fb = true, write_z = ZW, write_alpha = true;

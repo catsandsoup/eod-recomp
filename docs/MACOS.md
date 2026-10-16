@@ -122,3 +122,35 @@ renderer code. Source references:
 - [MoltenVK presentation implementation](https://github.com/KhronosGroup/MoltenVK/blob/main/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm)
 - [Apple's matching host-time epoch](https://developer.apple.com/documentation/quartzcore/cacurrentmediatime())
 - [Road Trip's refresh-grid prior art](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/gs_pgs_presenter.cpp)
+
+### Original-scale GS fidelity checks
+
+Procedural 64×64 replays now exercise generated GS register packets without disc
+assets or game code. `GSPixelArithmetic` and `VulkanGSPixels` are CTest checks
+when Vulkan and testing are enabled. They demonstrate and guard these fixes:
+
+- Gouraud RGBA truncation: an interior pixel formerly `(11,21,32)` is now
+  `(10,21,31)`, matching the GS interpolation rule used by paraLLEl-GS.
+- Linear UV precision: two interpolated coordinates in one 1/16-texel bucket
+  formerly sampled 104 versus 96; both now sample 96.
+- Fog interpolation: source and fog colour both 128 with F=255 formerly became
+  127 in both software and Vulkan. Rounded interpolation about FogCol now
+  preserves 128. The arithmetic test covers every constant colour/coefficient.
+
+The original software-captured two-player fixture improves from RGB MAE
+1.641 to 1.499/255 (95th-percentile channel difference 4→3). This is comparison
+against our software renderer, not proof of exact PS2 output. In particular,
+a generated blended rectangle exposes an interior `(15,29,45)` Vulkan result
+where GS integer arithmetic gives `(14,28,44)`: fixed-function UNORM blending
+still rounds. Large residual differences also remain around detailed geometry.
+No complete 1:1 fidelity claim is justified yet; accurate GS/original-hardware
+comparison is still needed. Filter-output rounding is deliberately not changed
+merely to reduce software image error.
+
+Hardware captures now flush pending GPU batches and read owned GS pages back
+before serializing initial VRAM. Older captures taken from live Vulkan may
+contain stale initial VRAM; software-captured fixtures avoid that limitation.
+Replay state layout is unchanged and shared with the procedural generator.
+
+Primary implementation evidence: [paraLLEl-GS interpolants, UV snapping and
+fog counterexample](https://github.com/silentsudin/parallel-gs/blob/60e6cacead2dece90c4d85ebb5ae750d4aace143/gs/shaders/ubershader.comp).
