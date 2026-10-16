@@ -95,6 +95,15 @@ int main(int argc, char **argv) {
     } else if (name == "blend") {
         reg(0x42, 0x44); // (Cs-Cd)*As/128 + Cd
         sprite(6 | 1 << 6, rgba(6, 11, 19, 85), 0);
+    } else if (name == "alpha_overlap") {
+        // Native font shadows/fills use GEQUAL alpha with FB_ONLY failure.
+        // Both rectangles share state/depth and must remain in draw order:
+        // failed-alpha black shadow, then passing opaque cream foreground.
+        state.ctx[0].zbuf=4ull | 0xAull << 24; // separate Z16S buffer, writes on
+        state.ctx[0].test=1ull | 5ull << 1 | 96ull << 4 | 1ull << 12 | 1ull << 16 | 2ull << 17;
+        reg(0x42,0x44); // (Cs-Cd)*As/128 + Cd
+        sprite(6 | 1 << 6,rgba(0,0,0,64),0);
+        sprite(6 | 1 << 6,rgba(200,200,160,128),0);
     } else if (name == "fog") {
         reg(0x3D, rgba(128, 128, 128, 0));
         reg(0x0A, 255ull << 56);
