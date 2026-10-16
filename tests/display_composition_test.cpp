@@ -1,4 +1,6 @@
 #include "../runtime/platform/display_rect.h"
+#include "../runtime/platform/presentation.h"
+#include <thread>
 #include "../runtime/platform/screenshot_size.h"
 #include "../runtime/core/config.h"
 #include "../runtime/platform/platform.h"
@@ -20,6 +22,21 @@ static void rect(int aspect,int width,int height,DisplayRect expected) {
     }
 }
 int main() {
+    for(int launch=0;launch<=3;launch++) {
+        if(presentation::for_context(launch,true)!=launch) ++failures;
+        if(presentation::for_context(launch,false)!=((launch==1 || launch==3) ? 0 : launch)) ++failures;
+        if(presentation::from_tag(presentation::tag(launch))!=launch) ++failures;
+    }
+    if(presentation::from_tag(0)!=-1 || presentation::from_tag(0x41535007)!=-1) ++failures;
+    presentation::set(0);
+    bool independent=false;
+    std::thread worker([&] {
+        independent=presentation::current(3)==3; // EE override never leaks to GS thread
+        presentation::set(1);
+        independent=independent && presentation::current(3)==1;
+    });worker.join();
+    if(!independent || presentation::current(3)!=0) ++failures;
+    presentation::set(-1);
     rect(3,3840,2400,{0,0,3840,2400});
     rect(1,3840,2400,{0,120,3840,2160});
     rect(3,3840,2160,{192,0,3456,2160});
@@ -42,6 +59,13 @@ int main() {
     g_config.aspect="4:3"; // a later Settings save must not change this launch's camera/composition
     int x,y,w,h;platform_display_rect(3840,2400,&x,&y,&w,&h);
     if(x || y || w!=3840 || h!=2400) ++failures;
+    presentation::set(presentation::from_tag(presentation::tag(0))); // ordered menu frame
+    platform_display_rect(3840,2400,&x,&y,&w,&h);
+    if(x!=320 || y || w!=3200 || h!=2400) ++failures;
+    presentation::set(presentation::from_tag(presentation::tag(3))); // ordered race frame
+    platform_display_rect(3840,2400,&x,&y,&w,&h);
+    if(x || y || w!=3840 || h!=2400) ++failures;
+    presentation::set(-1);
 #endif
     std::string file=(std::filesystem::temp_directory_path()/"eod-aspect-config.XXXXXX").string();
     int fd=mkstemp(file.data());if(fd<0)return 2;close(fd);
