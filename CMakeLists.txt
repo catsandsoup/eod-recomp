@@ -141,9 +141,14 @@ target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMA
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(eod_alpha_tiles_test tools/tests/alpha_tiles_test.cpp)
+  target_include_directories(eod_alpha_tiles_test PRIVATE runtime)
+  add_test(NAME AlphaPassTiles COMMAND eod_alpha_tiles_test)
+  set_tests_properties(AlphaPassTiles PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   add_executable(eod_alpha_order_test tools/tests/alpha_order_test.cpp)
   target_include_directories(eod_alpha_order_test PRIVATE runtime)
   add_test(NAME AlphaPassOrder COMMAND eod_alpha_order_test)
+  set_tests_properties(AlphaPassOrder PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   add_executable(eod_native_camera_test tools/tests/native_camera_test.cpp
     src/hle_camera.cpp runtime/core/config.cpp)
   target_include_directories(eod_native_camera_test PRIVATE runtime runtime/include)
