@@ -57,13 +57,13 @@ int main(int argc, char **argv) {
     gs::write_pixel(gs::PSMCT32, 1, 1, textureBP, 1, rgba(12, 32, 52));
     std::vector<Pair> regs;
     auto reg = [&](uint64_t id, uint64_t value) { regs.emplace_back(value, id); };
-    auto sprite = [&](unsigned prim, uint64_t color, unsigned uv) {
+    auto sprite = [&](unsigned prim, uint64_t color, unsigned uv, unsigned z=1) {
         reg(0, prim);
         reg(1, color);
         reg(3, uv | uint64_t(11) << 16);
-        reg(5, xyz(8 * 16, 8 * 16));
+        reg(5, xyz(8 * 16, 8 * 16,z));
         reg(3, uv | uint64_t(11) << 16);
-        reg(5, xyz(40 * 16, 40 * 16));
+        reg(5, xyz(40 * 16, 40 * 16,z));
     };
     if (name == "flat")
         sprite(6, rgba(37, 83, 126), 0);
@@ -104,6 +104,13 @@ int main(int argc, char **argv) {
         reg(0x42,0x44); // (Cs-Cd)*As/128 + Cd
         sprite(6 | 1 << 6,rgba(0,0,0,64),0);
         sprite(6 | 1 << 6,rgba(200,200,160,128),0);
+    } else if (name == "alpha_depth_strict" || name == "alpha_depth_varying") {
+        state.ctx[0].zbuf=4ull | 0xAull << 24;
+        unsigned ztest=name=="alpha_depth_strict" ? 3 : 2;
+        state.ctx[0].test=1ull | 5ull << 1 | 96ull << 4 | 1ull << 12 | 1ull << 16 | uint64_t(ztest) << 17;
+        reg(0x42,0x44);
+        sprite(6 | 1 << 6,rgba(200,200,160,128),0,name=="alpha_depth_varying" ? 2 : 1);
+        sprite(6 | 1 << 6,rgba(50,50,40,128),0,1); // depth rejects this later rectangle
     } else if (name == "fog") {
         reg(0x3D, rgba(128, 128, 128, 0));
         reg(0x0A, 255ull << 56);

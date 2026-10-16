@@ -37,3 +37,29 @@ Run with an available Vulkan device:
 ```sh
 EOD_HEADLESS=1 EOD_MUTE=1 ctest --test-dir build-mac -R '^VulkanGSPixels$' --output-on-failure
 ```
+
+## Exact constant-depth FB_ONLY batching
+
+For FB_ONLY failure with identical vertex Z throughout a batch, depth writes can
+be deferred if the depth test is GEQUAL or ALWAYS and DATE is disabled. Color is
+written for both alpha-test outcomes. With GEQUAL, an earlier passing fragment
+can only change an accepted destination depth from at most Z to Z; every later
+fragment at that same Z keeps the same visibility. ALWAYS is independent of
+destination depth. The backend therefore draws all color in native primitive
+order with depth writes disabled, followed by an alpha-passing depth-only draw.
+This preserves both final color and depth. Strict GREATER, varying Z and other
+AFAIL actions retain ordered per-primitive passes.
+
+`AlphaPassOrder` compares native-order color/depth against deferred depth over
+50,000 deterministic randomized cases, including all eight alpha-test modes,
+16/32-bit Z ranges, coverage gaps, overlapping fragments and varying alpha.
+Concrete counterexamples show why strict GREATER and varying Z are excluded.
+Procedural Vulkan cases independently check these fallback paths.
+
+The local font replay remains byte-identical to the ordered fix while draw
+calls return from 2,204 to 52. The five-frame race replay remains byte-identical
+at both internal scale 1 and 6, but calls only fall from 183,923 to 183,879: most
+race geometry has varying Z and cannot use this fast path. A bounded three-run
+6x replay gave warmed best 261.9 ms before and 258.9 ms after; this does not establish
+an overall gameplay speed improvement. Further performance work must preserve
+the ordered fallback for overlapping primitives.
