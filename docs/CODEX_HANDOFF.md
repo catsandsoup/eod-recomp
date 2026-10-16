@@ -4,7 +4,12 @@
 widescreen/ultrawide culling are now HIGH priority, exempt from the otherwise
 deferred mods policy. Read the new priority section in MODDING_SCOPE.md. Aim for
 very far highest-available detail and minimal visible pop-in, scalable to stronger
-Macs. A dedicated fresh specialist is appropriate. Do not promise literal zero
+Macs and high-end PCs/RTX 5090-class hardware at 8K. Maximum/Extreme quality tiers
+may exceed the owner's full-speed hardware; retain a playable Mac preset and
+faithful baseline. Distinguish CPU submission/streaming from GPU pixel cost.
+DLSS is explicitly LAST per the owner's latest instruction. Do not spend work
+on it until the core port and quality work are complete. A dedicated fresh specialist
+is appropriate. Do not promise literal zero
 pop-in before tracing streaming, submission, LOD and frustum/visibility limits;
 do not just disable all culling or confuse 4K raster scale with new asset detail.
 
@@ -18,7 +23,8 @@ should remain after the handoff checkpoint finishes.
 Finish the PS2 native Apple Silicon Mac port. Prioritize solo custom games and
 local multiplayer, original physics/timing, 100% game speed and full 4K-or-higher
 internal rendering at genuinely proportioned 16:10/16:9. The owner tests career.
-Defer 120 Hz and mods. WASD/arrows driving, Space brake, Enter menu Accept,
+Defer 120 Hz and other mods; LOD/draw-distance/culling is explicitly prioritized.
+WASD/arrows driving, Space brake, Enter menu Accept,
 Esc back/pause. Give occasional real screenshots. Frequently commit and push
 verified source to origin/macos, keeping README and player journey current.
 Periodically hand off to fresh chats rather than growing old agents forever.
