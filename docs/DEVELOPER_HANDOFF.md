@@ -68,7 +68,10 @@ a retail command capture; a full game build still requires the owner's executabl
 
 Branded app checkpoint: all 30 main CTests passed, icon representations and plist
 validated, ad-hoc signature passed strict verification, and a relocated bundle
-replayed on the GPU using its own MoltenVK despite invalid external ICD overrides. The transfer branch
+replayed on the GPU using its own MoltenVK despite invalid external ICD overrides.
+The installed branded app also completed a headless/muted 600-frame native 1x/4:3
+startup using the installed disc and exited cleanly. This is a startup check, not
+full-race speed/fidelity acceptance. The transfer branch
 has 26 CTests, including 22 procedural full-VRAM software/Vulkan comparisons at
 both 1x and 6x. These test different branches and are not additive coverage.
 The source includes exact tests and commands; rerun on your machine.
