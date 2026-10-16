@@ -107,6 +107,7 @@ void xfer_start() {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 write_pixel(dpsm, (dx + x) & 2047, (dy + y) & 2047, dbp, dbw, tmp[(size_t)y * w + x]);
+        if (hw::g_on) hw::vram_write_complete();
     } else if (dir == 1) {
         static unsigned n;
         if (++n <= 8 || g_log_enabled[LOG_GSXFER])
@@ -178,6 +179,7 @@ void xfer_data(const uint8_t *p, uint32_t n) {
                 t.y++;
             }
         }
+        if (hw::g_on) hw::vram_write_complete();
         if (t.y >= t.h) t.active = false;
         return;
     }
@@ -211,6 +213,7 @@ void xfer_data(const uint8_t *p, uint32_t n) {
         }
         break;
     }
+    if (hw::g_on) hw::vram_write_complete();
     if (t.y >= t.h) t.active = false;
 }
 

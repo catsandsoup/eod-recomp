@@ -29,6 +29,17 @@ int main(int argc,char **argv){
     unsigned bw=multi?2:1, draw_w=multi?128:64, draw_h=multi?64:32;
     s.ctx[0].frame=uint64_t(bw)<<16;s.dispfb[0]=uint64_t(bw)<<9;
     s.ctx[0].scissor=uint64_t(draw_w-1)<<16|63ull<<48;
+    const bool gpu_blocks=name.rfind("gpu_blocks_",0)==0;
+    const bool gpu_depth=name.rfind("gpu_blocks_depth",0)==0;
+    if(gpu_blocks) {
+        draw_h=64;
+        uint64_t format=name.find("16s")!=std::string::npos?10:name.find("16")!=std::string::npos?2:name.find("24")!=std::string::npos?1:0;
+        if(gpu_depth) {
+            s.ctx[0].frame=8ull|1ull<<16;
+            s.ctx[0].zbuf=format<<24;
+            s.ctx[0].test=1ull<<16|1ull<<17; // ZTE, ALWAYS, depth writes on
+        } else s.ctx[0].frame=1ull<<16|format<<24;
+    }
     if(neighbor)s.dispfb[0]|=1;
     if(name=="localcopy")s.dispfb[0]|=3;
     gs::mem_init();
@@ -60,10 +71,10 @@ int main(int argc,char **argv){
     else if(name=="high4lo")psm=gs::PSMT4HL;
     else if(name=="high4hi")psm=gs::PSMT4HH;
     bool full=name=="full" || name=="interrupted" || name=="chunks";
-    unsigned w=multi?128:full?64:1,h=full?32:1;
+    unsigned w=multi?128:full||gpu_blocks?64:1,h=full||gpu_blocks?32:1;
     // Masked writes target the already-rendered interior; all others origin0.
     unsigned x=psm==gs::PSMCT32?0:16,y=psm==gs::PSMCT32?0:16;
-    reg(0x50,uint64_t(neighbor?4:0)<<32|uint64_t(bw)<<48|uint64_t(psm)<<56);
+    reg(0x50,uint64_t(neighbor||gpu_blocks?4:0)<<32|uint64_t(bw)<<48|uint64_t(psm)<<56);
     reg(0x51,uint64_t(x)<<32|uint64_t(y)<<48);reg(0x52,w|uint64_t(h)<<32);reg(0x53,0);
     command(f,draw);draw.clear();
     if(name=="interrupted"){
@@ -75,12 +86,35 @@ int main(int argc,char **argv){
         // the same transfer; each chunk is actual data, never a promise.
         image(f,std::vector<uint8_t>(16,0xff));
         image(f,std::vector<uint8_t>(64*32*4-16,0xff));
+    }else if(gpu_blocks){
+        std::vector<uint8_t> bytes(w*h*4);
+        for(size_t i=0;i<bytes.size();i+=2)bytes[i]=1; // 0x00010001, exact at32-bit float depth
+        image(f,bytes);
     }else if(multi){
         image(f,std::vector<uint8_t>(w*4,0xff));
     }else if(full){
         image(f,std::vector<uint8_t>(64*32*4,0xff));
     }else{
         reg(0x54,rgba(255,0,0,0x25));command(f,draw);
+    }
+    if(name=="gpu_blocks_color32_draw" || name=="gpu_blocks_color32_cpu_read") {
+        // Complete the four blocks left out of page0 by the unaligned upload.
+        // Together the two actual chunks prove every page0 CPU byte current.
+        draw.clear();
+        reg(0x50,1ull<<48);reg(0x51,0);reg(0x52,16ull|16ull<<32);reg(0x53,0);
+        command(f,draw);draw.clear();
+        std::vector<uint8_t> bytes(16*16*4);
+        for(size_t i=0;i<bytes.size();i+=2)bytes[i]=1;
+        image(f,bytes);
+        if(name=="gpu_blocks_color32_draw") {
+            // A later GPU write must invalidate the complete CPU-valid proof.
+            reg(0x4c,1ull<<16);reg(0x4e,1ull<<32);reg(0x47,0);
+            reg(0,6);reg(1,rgba(77,101,133));reg(5,xyz(0,0));reg(5,xyz(8*16,8*16));
+        } else {
+            // CLUT consumes the new CPU blocks; it must not pull old GPU data.
+            reg(0x06,128ull|1ull<<14|uint64_t(gs::PSMT8)<<20|6ull<<26|6ull<<30|1ull<<34|1ull<<61);
+        }
+        command(f,draw);
     }
     uint32_t end[4]={3,1,0,0};fwrite(end,1,16,f);fclose(f);free(gs::vram);
 }

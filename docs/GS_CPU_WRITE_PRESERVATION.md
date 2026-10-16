@@ -72,3 +72,23 @@ late samples ranged 12.2–29.1 drawn FPS. The preservation build also reached 6
 8.1–14.3 drawn FPS, final10.2 drawn /33.4 gameframes /60.2 vblanks persecond.
 The main Mac build is restored to the preceding renderer; this candidate remains
 available for correctness/performance development without making play slower.
+
+## Published experimental GPU transfer continuation
+
+Branch `macos-gpu-transfers` keeps complete physical 256-byte blocks on the GPU,
+using existing GS swizzle mappings and upload rectangles. A paired write-complete
+notification ensures uploads happen after CPU data is actually written. Partial,
+masked, unsupported or ambiguous ownership retains conservative preservation.
+CPU-known-block validity avoids unnecessary readbacks until GPU writes invalidate
+that proof. The latest texture lookup checks whether all requested mip storage is
+already CPU-current before acquiring a GPU view.
+
+Latest checkpoint: Release build and all 26 CTests pass, including 22 procedural
+full-4-MiB software/Vulkan comparisons at 1x and 6x plus the independent 1,904-case
+block mapping test. This is experimental source, not merged to `macos`. Earlier
+GPU patches moved stalls between CPU writes and texture reads without a material
+race speedup. The latest early texture-validity selection has not been measured
+on the retail race replay. Do not claim native full-game correctness or faster
+racing from these fixtures alone. EOD_GPU_UPLOADS=0 selects the same-binary host
+preservation baseline. See the main branch's docs/DEVELOPER_HANDOFF.md for current
+owner priorities, build instructions and branch map. No disc/capture data shipped.

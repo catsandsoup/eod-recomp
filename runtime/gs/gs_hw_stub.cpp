@@ -15,6 +15,7 @@ void draw_sprite(const Env &, const Vertex &, const Vertex &) {}
 void draw_line(const Env &, const Vertex &, const Vertex &) {}
 void draw_point(const Env &, const Vertex &) {}
 void vram_written(uint32_t, uint32_t, uint32_t, int, int, int, int) {}
+void vram_write_complete() {}
 void vram_needed(uint32_t, uint32_t, uint32_t, int, int, int, int) {}
 void present(bool) {}
 bool read_display(std::vector<uint32_t> &, int &, int &) { return false; }
