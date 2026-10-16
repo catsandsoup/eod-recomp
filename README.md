@@ -162,6 +162,9 @@ cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release && cmake --b
 
 # 2c. Linux (headless test build)
 cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -C build-linux
+
+# 2d. Linux or macOS with a window, keyboard, controllers and sound (SDL 3.2 or later)
+cmake -S . -B build-sdl -G Ninja -DCMAKE_BUILD_TYPE=Release -DEOD_SDL3=ON && ninja -C build-sdl
 ```
 
 The 32-bit Windows build targets SSE2 (Pentium 4 / Core 2 and newer) and
