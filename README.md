@@ -128,8 +128,9 @@ still under investigation. An experimental CPU-upload preservation candidate on
 readback cost worsens performance; it is not enabled on `macos`. See [current evidence and limits](docs/STATUS.md).
 
 Developer build steps, measured performance and known fidelity limits:
-[docs/MACOS.md](docs/MACOS.md). The next visual priority is much longer
-high-detail draw distances and correct widescreen/ultrawide culling, with
+[docs/MACOS.md](docs/MACOS.md). The immediate priority is an accurate, stable, full-speed native 1x baseline,
+then sequential 2x/4x/6x verification. After that, requested visual work includes
+much longer high-detail draw distances and correct widescreen/ultrawide culling, with
 quality settings for stronger Macs and high-end PCs at 8K. Maximum/Extreme tiers
 must not be limited to the owner's Mac; keep a playable Mac preset and a faithful
 baseline. CPU submission and asset streaming need separate work from GPU pixel

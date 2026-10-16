@@ -19,7 +19,11 @@ EOD_MUTE=1`, plus `--headless` for game runs). Coordinate GPU measurements:
 never run competing game/replay/build workloads during performance comparisons.
 Never commit disc data, generated game code, captures or binaries.
 
-Maintain faithful simulation/physics and a baseline. LOD/draw distance and
-widescreen/ultrawide culling are prioritized; scalable quality may exceed the
-owner's hardware. DLSS is explicitly the very last priority. Other mods and
+Latest owner priority: get the native 1x PS2-resolution baseline accurate,
+stable and full speed first; then verify 2x, 4x and 6x sequentially. Do not spend
+the baseline budget on higher-detail LOD or quality ceilings. Preserve faithful
+simulation/physics; verify solo/local multiplayer and real rendering outputs.
+LOD/draw-distance and wide-edge improvements remain requested after the baseline
+is sound. Scalable quality may exceed the owner's hardware. DLSS is explicitly
+the very last priority. Other mods and
 120 Hz remain deferred. Read `docs/CODEX_HANDOFF.md` for the current checkpoint.
