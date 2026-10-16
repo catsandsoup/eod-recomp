@@ -1,5 +1,11 @@
 # Fresh-chat continuation — 2026-10-16
 
+**LATEST OWNER PRIORITY (supersedes quality ordering below):** establish accurate,
+stable, full-speed native1x PS2 rendering first, then work sequentially through
+2x,4x,6x. Higher-detail LOD/quality-ceiling work is deferred until the native
+baseline is sound. Current HUD comparison is finishing; native1x solo/MP
+accuracy and performance are next, without frame skipping. DLSS stays last.
+
 **New owner steering after this handoff:** LOD/draw-distance overhaul and correct
 widescreen/ultrawide culling are now HIGH priority, exempt from the otherwise
 deferred mods policy. Read the new priority section in MODDING_SCOPE.md. Aim for
