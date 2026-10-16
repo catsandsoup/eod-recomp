@@ -84,3 +84,12 @@ stale background(32,64,96). That ownership-preservation bug is **not fixed by
 exact requested-page enumeration**. Preserving all GPU pages before CPU writes
 could be expensive; a declared full-page overwrite is not enough proof when a
 transfer can be interrupted. It needs a separate correctness/coverage design.
+
+The same conservative-range problem also affected CPU writes. A second generated
+fixture displays a GPU-colored neighboring page, then writes one CPU pixel at
+unaligned BP4 in the preceding page. Software retains the neighboring rectangle
+(37,83,126); baseline Vulkan returned stale(32,64,96) even though the CPU write
+address does not overlap that displayed page. `vram_written` now invalidates only
+pages in exact physical requested coverage, retaining the untouched neighbor.
+This adds no readback or waiting. The same-page partial-write problem described
+above remains separate and still needs actual-write preservation.
