@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(eod C CXX)
+# Enable Objective-C++ at the parent scope before SDL enables it in subdirs.
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -194,7 +198,6 @@ endif()
 
 # Optional personal macOS app; game data is never included in the bundle.
 if(APPLE)
-  enable_language(OBJCXX)
   target_sources(eod PRIVATE runtime/app/macos_app.mm runtime/app/disc_import.cpp runtime/app/iso9660.cpp)
   target_link_libraries(eod PRIVATE "-framework Cocoa")
   set_source_files_properties(runtime/app/macos_app.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
