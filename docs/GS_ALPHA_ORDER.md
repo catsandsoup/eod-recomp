@@ -63,3 +63,28 @@ race geometry has varying Z and cannot use this fast path. A bounded three-run
 6x replay gave warmed best 261.9 ms before and 258.9 ms after; this does not establish
 an overall gameplay speed improvement. Further performance work must preserve
 the ordered fallback for overlapping primitives.
+
+## Disjoint varying-depth groups
+
+The remaining two-pass primitives may share passes only while their conservative
+physical screen coverage occupies disjoint 16×16 pixel tiles. Bounds include the
+vertex shader's half-pixel shift and internal scale, expand by one physical
+pixel for raster precision/aliased line/point edges, and intersect the viewport
+scissor before integer conversion. Shared edges, crossings and tile overlap end
+the group. Rejected bounds never mutate the proof. Empty clipped geometry has
+no coverage. Every group is contiguous in native primitive order, and overlapping
+groups keep PASS/FAIL order. Bound textures remain the same immutable sources
+already selected for the original batch; grouping does not introduce feedback.
+`EOD_ALPHA_GROUP=0` retains the ordered per-primitive diagnostic path.
+
+`AlphaPassTiles` checks 128,000 randomized bound insertions plus 256 full image
+color/alpha/depth differentials with varying Z, strict/GE depth, all four AFAIL
+modes, destination-alpha blending, negative/clipped geometry, crossing bounds,
+shared edges and line expansion. Actual Vulkan procedural cases also pass.
+
+The local font image and 6x race output are byte-identical with grouping enabled
+and disabled in the same binary. The race capture's draw calls fall from 183,879
+to 135,695. In a bounded three-repeat 6x comparison, warmed best replay time falls
+from 249.2 ms to 227.6 ms for five captured frames. This is a limited replay gain,
+not evidence of 100% gameplay speed. Conservative triangle bounds still prevent
+many groups, so significant varying-depth overhead remains.
