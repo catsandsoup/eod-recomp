@@ -17,7 +17,7 @@ config = work / "pixels.ini"
 config.write_text("[Video]\nRenderScale=1\n")
 env = os.environ.copy()
 env.update(EOD_HEADLESS="1", EOD_MUTE="1", EOD_GS_RASTER="0")
-for key in ["EOD_GS_REPLAY_STOP", "EOD_GS_REPLAY_TRACE", "EOD_GS_DUMP", "EOD_GS_REPLAY_DUMP", "EOD_SCREENSHOT_SCALE"]:
+for key in ["EOD_GS_REPLAY_STOP", "EOD_GS_REPLAY_TRACE", "EOD_GS_DUMP", "EOD_GS_REPLAY_DUMP", "EOD_SCREENSHOT_SCALE", "EOD_SCREENSHOT_WIDTH", "EOD_SCREENSHOT_HEIGHT"]:
     env.pop(key, None)
 
 def render(case, renderer):
@@ -48,7 +48,9 @@ for renderer in ["software", "vulkan"]:
     uv = render("uvsnap", renderer)
     assert uv(16,16) == uv(16,40), (renderer, "UVs within one 1/16-texel bucket", uv(16,16), uv(16,40))
     assert max(uv(16,16)) - min(uv(16,16)) == 0
-    print(renderer + ": flat, truncated RGBA, constant fog, 1/16 UV bucket passed")
+    overlap = render("alpha_overlap", renderer)
+    assert overlap(16,16) == (200,200,160), (renderer, "alpha-fail shadow must precede foreground fill", overlap(16,16))
+    print(renderer + ": flat, truncated RGBA, constant fog, 1/16 UV bucket, alpha-fail ordering passed")
 
 # A diagnostic rather than a passing fidelity claim: hardware UNORM blending
 # still rounds where the GS integer equation truncates (no edge ambiguity).

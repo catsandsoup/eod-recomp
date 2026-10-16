@@ -553,9 +553,16 @@ void flush() {
     g_ctx->RSSetState(g_rs_scissor);
     D3D11_RECT r = {s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3]};
     g_ctx->RSSetScissorRects(1, &r);
-    draw_batch(s, first, count, false);
-    if (s.two_pass)
-        draw_batch(s, first, count, true);
+    if (s.two_pass) {
+        // Alpha-fail writes are part of each GS primitive, not a second layer
+        // over the whole batch. A later glyph fill must follow an earlier
+        // shadow's FB_ONLY pixels, including when the alpha test fails.
+        const UINT primitive_size=s.topology==0 ? 3 : s.topology==1 ? 2 : 1;
+        for(UINT offset=0;offset<count;offset+=primitive_size) {
+            draw_batch(s,first+offset,primitive_size,false);
+            draw_batch(s,first+offset,primitive_size,true);
+        }
+    } else draw_batch(s, first, count, false);
     g_stats.flushes++;
 }
 
