@@ -41,3 +41,35 @@ and custom keys. Original bindings remain independent of game context.
 The target state evidence above is disassembly evidence; actual full-game
 context-transition and physical keyboard checks are separate integration
 validation, not established by a pure mapper test.
+
+## Input latency diagnostics
+
+Host events must be pumped before publishing this vblank's IOP pad DMA. SDL's
+`SDL_GetKeyboardState` returns its last event-pump snapshot. The former order
+(Pad DMA, GS/present, event pump) therefore published a stale key state and
+could delay the next refresh behind GS work. The kernel now pumps once, then
+publishes pad DMA, then services GS and the existing vblank flags/IRQ. Quit
+returns before publishing pad data. `pad_rpc_test` models queued keydown and
+release events and reads the actual pad DMA halves: all three freshness/quit
+checks fail with the former order and pass with the corrected order.
+
+For a bounded next-launch measurement, set `EOD_INPUT_TIMING=1`. SDL logs native
+key event age and the age when the keyboard is sampled (up to 256 lines).
+On macOS the bundled SDL Cocoa driver derives these timestamps from NSEvent's
+timestamp. The kernel prints per-second maximum pump gap, combined pump/DMA
+duration, and time inside `gs_vblank` (up to 120 lines). These diagnostics
+measure event delivery/publication and GS blocking; they do not claim to
+measure physical-switch-to-visible-pixel latency or game physics response.
+No game input is predicted or interpolated.
+
+The target consumer `0x00332938` calls `scePadRead` at `0x00332A24` and converts
+the current reply directly into per-player state. SDK read `0x0038FF40` calls
+`0x0038FE90` to choose the latest pad-area half, then copies its data. This
+path is a current-state snapshot, not a queue of historical key events. UI
+edge events are separate from the race's current pad state.
+
+Rendering latency is independent: the GS queue originally allowed 12 vblanks
+of lag (`g_gs_max_lag` in `runtime/gs/gs.cpp`). That may add visible latency
+under rendering load, and changing it requires separate renderer validation.
+Fixing the stale host snapshot alone does not establish that the reported
+half-second input-to-image delay is fully resolved.

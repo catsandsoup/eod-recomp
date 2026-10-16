@@ -2,6 +2,7 @@
 #include "iop/iop.h"
 #include "core/log.h"
 #include "platform/platform.h"
+#include "kernel/vblank_input.h"
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -17,6 +18,13 @@ uint32_t iop_alloc(uint32_t) { return 128; }
 static RpcHandler handler;
 void iop_register_server(uint32_t, const char *, RpcHandler h) { handler = std::move(h); }
 static HostPadState pads[2];
+static bool pending_input, quit_input;
+static uint16_t pending_buttons;
+bool platform_pump() {
+    if (quit_input) return false;
+    if (pending_input) { pads[1].buttons = pending_buttons; pending_input = false; }
+    return true;
+}
 void platform_get_pad(int p, HostPadState *s) { *s = pads[p]; }
 static int rumble_port = -1;
 static uint8_t small, large;
@@ -107,6 +115,29 @@ int main() {
     iop_pad_vblank();
     CHECK(large == 63);
     call(0x0E, 1, 0);
+    // Model SDL's event-updated keyboard cache: a queued physical key only
+    // reaches platform_get_pad when platform_pump services that event. Test
+    // the production vblank step and inspect its actual SDK 2.8 DMA output.
+    uint32_t latency_open[] = {0, 1024};
+    pads[1].buttons = 0;
+    call(1, 1, 0, (uint8_t *)latency_open, sizeof latency_open);
+    auto latest = [&]() {
+        uint32_t a, b;
+        memcpy(&a, ram + 1024 + 0x58, 4); memcpy(&b, ram + 1152 + 0x58, 4);
+        return ram + 1024 + (b > a ? 128 : 0);
+    };
+    pending_input = true; pending_buttons = PAD_CROSS;
+    CHECK(vblank_poll_input());
+    d = latest();
+    CHECK((uint16_t)(d[2] | d[3] << 8) == (uint16_t)~PAD_CROSS);
+    pending_input = true; pending_buttons = 0;
+    CHECK(vblank_poll_input());
+    d = latest();
+    CHECK((uint16_t)(d[2] | d[3] << 8) == 0xFFFF);
+    uint8_t before_quit[256]; memcpy(before_quit, ram + 1024, sizeof before_quit);
+    quit_input = true;
+    CHECK(!vblank_poll_input());
+    CHECK(memcmp(before_quit, ram + 1024, sizeof before_quit) == 0);
     printf("pad RPC/EE pressure and actuator checks: %d failures\n", failures);
     return failures ? 1 : 0;
 }

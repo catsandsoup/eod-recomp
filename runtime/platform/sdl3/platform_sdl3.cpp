@@ -62,6 +62,21 @@ using sdl_input::kPorts;
 std::vector<keyboard_input::Binding> g_key_map;
 keyboard_input::Mapper g_keyboard;
 std::vector<std::pair<int, SDL_Scancode>> g_keyboard_scancodes;
+uint64_t g_key_event_ns;
+unsigned g_key_timing_lines;
+bool g_key_timing_pending;
+bool input_timing() { static const bool enabled = getenv("EOD_INPUT_TIMING") != nullptr; return enabled; }
+void time_key_event(const SDL_KeyboardEvent &event) {
+    if (!input_timing() || event.repeat) return;
+    g_key_event_ns = event.timestamp;
+    g_key_timing_pending = true;
+    if (g_key_timing_lines < 256) {
+        uint64_t now = SDL_GetTicksNS();
+        fprintf(stderr, "[input-timing] key=%d %s event_age_us=%llu\n", int(event.scancode), event.down ? "down" : "up",
+                (unsigned long long)(now >= event.timestamp ? (now - event.timestamp) / 1000 : 0));
+        ++g_key_timing_lines;
+    }
+}
 
 uint16_t pad_key_button(int k) {
     static const uint16_t b[KEY_COUNT] = {PAD_UP,  PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_CROSS,    PAD_CIRCLE,
@@ -165,6 +180,13 @@ void read_keyboard(HostPadState *out, keyboard_input::Context ctx) {
     keyboard_input::Keys keys{};
     for (const auto &m : g_keyboard_scancodes) keys[m.first] = physical[m.second];
     *out = g_keyboard.read(keys, ctx, g_config.keyboard_layout == "racing", g_key_map);
+    if (g_key_timing_pending && g_key_timing_lines < 256) {
+        uint64_t now = SDL_GetTicksNS();
+        fprintf(stderr, "[input-timing] keyboard_sample buttons=%04x event_age_us=%llu\n", out->buttons,
+                (unsigned long long)(now >= g_key_event_ns ? (now - g_key_event_ns) / 1000 : 0));
+        ++g_key_timing_lines;
+    }
+    g_key_timing_pending = false;
 }
 
 }  // namespace
@@ -247,7 +269,11 @@ bool platform_pump() {
         case SDL_EVENT_GAMEPAD_REMOVED:
             sdl_input::on_removed(e.gdevice.which);
             break;
+        case SDL_EVENT_KEY_UP:
+            time_key_event(e.key);
+            break;
         case SDL_EVENT_KEY_DOWN:
+            time_key_event(e.key);
 #ifdef __APPLE__
             if (!g_headless && !e.key.repeat && (e.key.scancode == SDL_SCANCODE_F1 ||
                 (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
