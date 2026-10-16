@@ -147,3 +147,38 @@ are stored but are not implemented in the mixing loop. Audio is driven from
 wall-clock time, with a 100 ms catch-up limit and a 200 ms output queue cap.
 Those approximations still require original-hardware or trusted-reference
 comparison before describing audio or FMV synchronization as 1:1.
+
+## Movie bitstream helper optimization
+
+The hot `0039AFB0` consume/refill helper has a native fast path for direct-RAM
+reader state and either a disjoint RAM ring or the game's linear-input
+`end=0xFFFFFFFF` sentinel. The sentinel path checks the exact next 1–8 bytes
+against RAM bounds and state overlap. Unusual layouts, aliases and malformed
+counts use the original generated function. Guest low/high register halves,
+state stores and original interrupt safe points are preserved; after an
+interrupt, a literal continuation uses ordinary guest memory accessors.
+
+Regenerate after the HLE registry change, then build and run the differential
+check (the reference is extracted locally into the ignored build directory):
+
+```sh
+.venv/bin/python tools/recomp.py
+cmake -S . -B build-mac -G Ninja
+cmake --build build-mac -j3
+ctest --test-dir build-mac --output-on-failure
+# Optional real movie bytes, read only; no fixture is saved:
+EOD_HEADLESS=1 EOD_MUTE=1 build-mac/movie_bits_test "/path/disc/DATA/VIDEO/LOGOS.PSS"
+```
+
+The 12,000-case test compares the entire EE state, RAM and interrupt-boundary
+snapshots against generated code, including ring wrap, linear sentinel,
+64-bit shifts, overlapping inputs, aliases, pending interrupts and handler
+mutations. A mixed-request 2-million-call microbenchmark measured roughly
+1.7x improvement locally. Matched 8-second intro CPU samples reduced the
+helper's self-sample share from about 34% to 21%, including wrapper overhead;
+5- and 10-second screen captures were byte-identical. This is a bounded helper
+cost improvement, not a proof of movie FPS, startup latency or full fidelity.
+
+The existing `game`/`drawn` FPS counters use a render-buffer-switch heuristic.
+Movies updating a fixed display buffer need not increment those counters, so
+those numbers must not be reported as decoded movie frame rates.
