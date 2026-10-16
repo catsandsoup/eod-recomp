@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <array>
+#include <deque>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -178,7 +179,7 @@ struct Context {
     // Command-buffer serials: `serial` is the buffer being (or next) recorded;
     // every serial <= `completed` has finished on the GPU. A fence signal
     // covers all earlier submissions on this queue, so one wait suffices.
-    uint64_t serial = 1, completed = 0, spareSerial = 0;
+    uint64_t serial = 1, completed = 0;
     // Render-pass ends by cause: submit, upload, copy, clear, map, target change, layout.
     uint64_t pass_ends[7] = {}, passes = 0;
     static uint64_t now_us() {
@@ -225,15 +226,27 @@ struct Context {
     std::vector<HostBuffer> chunks;
     size_t chunkIndex = 0;
     std::vector<std::function<void()>> garbage;
+    // Submitted command buffers still owned by the GPU, oldest first, and
+    // recycled ones. Each owns its pool, upload chunks and deferred destruction
+    // until its fence signals. Queue order keeps every image dependency.
     struct Flight {
         VkCommandPool pool{};
         VkCommandBuffer cmd{};
         VkFence fence{};
-        VkSemaphore acquired{};
         std::vector<HostBuffer> chunks;
         std::vector<std::function<void()>> garbage;
-        bool submitted = false;
-    } spare;
+        uint64_t serial = 0;
+    };
+    std::deque<Flight> inflight;
+    std::vector<Flight> idle;
+    VkSemaphore spareAcquired{};
+    // Serial of the last frame-end submission: the next frame end waits for it.
+    uint64_t frameSerial = 0;
+    // Mid-frame submissions (see Draw): after this many draws a new render pass
+    // first submits the commands recorded so far, so MoltenVK encodes them and
+    // the GPU runs them while the GS thread records the rest of the frame.
+    uint32_t chunkDraws = 0, drawsSinceSubmit = 0;
+    uint64_t chunk_submits = 0;
     std::vector<VkSemaphore> presentDone;
     bool wantVsync = true; // snapshotted once from the launch configuration
     bool displayTiming = false;
@@ -355,8 +368,15 @@ struct Context {
         dynamicValid = imagesValid = constantsValid = vertexValid = false;
         windowUploaded = false;
     }
+    // Diagnostic (EOD_VK_PASS_LOG=1): one stderr line per render pass.
+    int passLog = -1;
+    struct PassDiag { uint32_t w, h, rtf, ds, draws, verts, blend, spec, pass_ps, dwrite, sx0, sy0, sx1, sy1; } pd{};
     void end_render(int cause = 0) {
         if (rendering) {
+            if (passLog > 0)
+                fprintf(stderr, "PASS %llu c%d %ux%u rt%u ds%u draws %u verts %u blend %u atest %u passps %u zw %u sc %u,%u-%u,%u\n",
+                        (unsigned long long)passes, cause, pd.w, pd.h, pd.rtf, pd.ds, pd.draws, pd.verts, pd.blend,
+                        pd.spec, pd.pass_ps, pd.dwrite, pd.sx0, pd.sy0, pd.sx1, pd.sy1);
             ++pass_ends[cause];
             vkCmdEndRendering(cmd);
             rendering = false;
@@ -371,14 +391,62 @@ struct Context {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0,
                              nullptr, 0, nullptr);
     }
-    void submit(bool synchronous = true) {
-        if (!recording) {
-            if (synchronous && spare.submitted) {
+    // Recycles a completed flight: its commands, uploads and garbage are done.
+    void recycle(Flight &f) {
+        completed = std::max(completed, f.serial);
+        for (auto &g : f.garbage)
+            g();
+        f.garbage.clear();
+        for (auto &c : f.chunks)
+            c.used = 0;
+        vkResetFences(device, 1, &f.fence);
+        vkResetCommandPool(device, f.pool, 0);
+        idle.push_back(std::move(f));
+    }
+    // Retires submitted flights in order: every one with serial <= `upTo` is
+    // waited for, later ones only if already complete.
+    bool retire(uint64_t upTo) {
+        bool waited = false;
+        while (!inflight.empty()) {
+            Flight &f = inflight.front();
+            if (vkGetFenceStatus(device, f.fence) != VK_SUCCESS) {
+                if (f.serial > upTo)
+                    break;
                 uint64_t wait_start = now_us();
-                require(vkWaitForFences(device, 1, &spare.fence, VK_TRUE, UINT64_MAX), "finish GPU");
+                require(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX), "retire GPU work");
                 wait_us += now_us() - wait_start;
-                completed = std::max(completed, spareSerial);
+                waited = true;
             }
+            Flight done = std::move(inflight.front());
+            inflight.pop_front();
+            recycle(done);
+        }
+        return waited;
+    }
+    Flight new_flight() {
+        Flight f;
+        VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cp.queueFamilyIndex = family;
+        require(vkCreateCommandPool(device, &cp, nullptr, &f.pool), "command pool");
+        VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ca.commandPool = f.pool;
+        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ca.commandBufferCount = 1;
+        require(vkAllocateCommandBuffers(device, &ca, &f.cmd), "command buffer");
+        VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        require(vkCreateFence(device, &fc, nullptr, &f.fence), "fence");
+        return f;
+    }
+    // synchronous: submit and wait for all GPU work. Otherwise `frameEnd`
+    // submits and then waits for the previous frame end's submission (one frame
+    // in flight, as with two alternating command buffers); a mid-frame kick
+    // only submits. The recorded commands move to a flight the GPU owns.
+    void submit(bool synchronous = true, bool frameEnd = true) {
+        if (!recording) {
+            if (synchronous)
+                retire(UINT64_MAX);
+            else if (frameEnd)
+                retire(frameSerial);
             return;
         }
         end_render();
@@ -399,39 +467,44 @@ struct Context {
         require(vkQueueSubmit(queue, 1, &s, fence), "submit");
         windowUploaded = false;
         ++submit_count;
+        drawsSinceSubmit = 0;
+        const bool presented = waitAcquire || signalPresent;
         waitAcquire = signalPresent = false;
         const uint64_t submitted = serial++;
-        uint64_t waited = submitted;
-        bool wait = synchronous;
-        if (!synchronous) {
-            // The other frame owns its command pool, mapped upload chunks and
-            // deferred destruction until its fence completes. Queue order retains
-            // image dependencies while CPU encoding overlaps the previous frame.
-            std::swap(pool, spare.pool);
-            std::swap(cmd, spare.cmd);
-            std::swap(fence, spare.fence);
-            std::swap(acquired, spare.acquired);
-            chunks.swap(spare.chunks);
-            garbage.swap(spare.garbage);
-            wait = spare.submitted;
-            waited = spareSerial;
-            spare.submitted = true;
-            spareSerial = submitted;
-        }
-        if (wait) {
-            uint64_t wait_start = now_us();
-            require(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "recycle GPU frame");
-            wait_us += now_us() - wait_start;
-            completed = std::max(completed, waited);
-        }
-        vkResetFences(device, 1, &fence);
-        vkResetCommandPool(device, pool, 0);
         recording = false;
-        for (auto &f : garbage)
-            f();
-        garbage.clear();
-        for (auto &c : chunks)
-            c.used = 0;
+        Flight done;
+        done.pool = pool;
+        done.cmd = cmd;
+        done.fence = fence;
+        done.chunks.swap(chunks);
+        done.garbage.swap(garbage);
+        done.serial = submitted;
+        inflight.push_back(std::move(done));
+        if (synchronous)
+            retire(UINT64_MAX);
+        else if (frameEnd) {
+            // The acquire semaphore alternates by frame: the previous frame's
+            // present submission has completed before its semaphore is reused.
+            if (presented)
+                std::swap(acquired, spareAcquired);
+            const uint64_t previous = frameSerial;
+            frameSerial = submitted;
+            retire(previous);
+        } else
+            retire(0);
+        // Bound the GPU-owned command buffers and their upload memory.
+        while (inflight.size() > 32)
+            retire(inflight.front().serial);
+        Flight next;
+        if (!idle.empty()) {
+            next = std::move(idle.back());
+            idle.pop_back();
+        } else
+            next = new_flight();
+        pool = next.pool;
+        cmd = next.cmd;
+        fence = next.fence;
+        chunks.swap(next.chunks);
         chunkIndex = 0;
     }
     // Makes earlier transfer writes visible to host reads once this command
@@ -456,17 +529,8 @@ struct Context {
             submit(true);
             return true;
         }
-        if (spare.submitted && s <= spareSerial) {
-            if (vkGetFenceStatus(device, spare.fence) == VK_SUCCESS) {
-                completed = std::max(completed, spareSerial);
-                return false;
-            }
-            uint64_t wait_start = now_us();
-            require(vkWaitForFences(device, 1, &spare.fence, VK_TRUE, UINT64_MAX), "deferred readback");
-            wait_us += now_us() - wait_start;
-            completed = std::max(completed, spareSerial);
-        }
-        return true;
+        // A fence covers its submission and every earlier one on this queue.
+        return retire(s);
     }
     std::pair<HostBuffer *, VkDeviceSize> upload(const void *p, size_t bytes) {
         begin();
@@ -730,6 +794,12 @@ inline Texture::~Texture() {
 inline void Context::Draw(UINT count, UINT first) {
     if (!rt && !ds)
         return;
+    if (!rendering && chunkDraws && recording && drawsSinceSubmit >= chunkDraws && !waitAcquire && !signalPresent) {
+        // Between render passes: hand the commands so far to MoltenVK/the GPU.
+        ++chunk_submits;
+        submit(false, false);
+    }
+    ++drawsSinceSubmit;
     if (!rendering)
         barrier(); // Makes uploads, previous attachment writes and feedback copies
                    // visible.
@@ -854,6 +924,8 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdBeginRendering(cmd, &render);
         rendering = true;
         ++passes;
+        if (passLog < 0) { const char *e = getenv("EOD_VK_PASS_LOG"); passLog = e && *e == '1'; }
+        if (passLog > 0) { pd = {}; pd.w = target->desc.Width; pd.h = target->desc.Height; pd.rtf = rt ? rt->desc.Format : 0; pd.ds = ds != nullptr; pd.sx0 = pd.sy0 = ~0u; }
     }
     if (!cacheState || boundPipeline != pipeline) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -879,6 +951,12 @@ inline void Context::Draw(UINT count, UINT first) {
         memcpy(boundBlend, blendFactor, sizeof boundBlend);
     }
     dynamicValid = true;
+    if (passLog > 0) {
+        pd.draws++; pd.verts += count; pd.blend += b.BlendEnable; pd.spec += specialization != 0; pd.pass_ps += vs->id != 0;
+        pd.dwrite += z.DepthEnable && z.DepthWriteMask;
+        pd.sx0 = std::min<uint32_t>(pd.sx0, rect.offset.x); pd.sy0 = std::min<uint32_t>(pd.sy0, rect.offset.y);
+        pd.sx1 = std::max<uint32_t>(pd.sx1, rect.offset.x + rect.extent.width); pd.sy1 = std::max<uint32_t>(pd.sy1, rect.offset.y + rect.extent.height);
+    }
     VkDescriptorImageInfo images[6]{};
     VkWriteDescriptorSet writes[6]{};
     for (int i = 0; i < 6; i++) {
@@ -1061,11 +1139,10 @@ inline bool Context::init(bool withWindow) {
     require(vkAllocateCommandBuffers(device, &ca, &cmd), "command buffer");
     VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     require(vkCreateFence(device, &fc, nullptr, &fence), "fence");
-    // Two independent submissions allow CPU encoding and GPU rendering to overlap.
-    require(vkCreateCommandPool(device, &cp, nullptr, &spare.pool), "second command pool");
-    ca.commandPool = spare.pool;
-    require(vkAllocateCommandBuffers(device, &ca, &spare.cmd), "second command buffer");
-    require(vkCreateFence(device, &fc, nullptr, &spare.fence), "second fence");
+    if (const char *v = getenv("EOD_VK_CHUNK_DRAWS"))
+        chunkDraws = (uint32_t)std::max(0, atoi(v));
+    else
+        chunkDraws = 1024;
     VkDescriptorSetLayoutBinding bindings[6]{};
     for (int j = 0; j < 6; j++) {
         bindings[j].binding = j < 4 ? j : j + 4;
@@ -1097,7 +1174,7 @@ inline bool Context::init(bool withWindow) {
     if (surface) {
         VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         require(vkCreateSemaphore(device, &sc, nullptr, &acquired), "acquire semaphore");
-        require(vkCreateSemaphore(device, &sc, nullptr, &spare.acquired), "second acquire semaphore");
+        require(vkCreateSemaphore(device, &sc, nullptr, &spareAcquired), "second acquire semaphore");
         resize();
     }
     return true;
