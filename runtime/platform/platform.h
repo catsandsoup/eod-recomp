@@ -7,13 +7,15 @@
 struct PlatformConfig {
     int width = 1280, height = 960;  // window client size
     bool fullscreen = false;         // borderless window over the whole monitor
-    int aspect = 0;                  // displayed image: 0 = 4:3, 1 = 16:9, 2 = stretched to the window
+    int aspect = 0;                  // displayed image: 0 = 4:3, 1 = 16:9, 2 = stretch, 3 = 16:10
     bool smooth = true;              // bilinear scaling of the image
     bool headless = false;     // no window (tests)
     bool vsync_throttle = true;
     const char *title = "Eve of Destruction";
 };
 
+// Set display-only state without creating windows, audio or input devices (replays).
+void platform_configure_display(const PlatformConfig &cfg);
 bool platform_init(const PlatformConfig &cfg);
 void platform_shutdown();
 void platform_fatal_message(const char *msg);
