@@ -6,7 +6,9 @@ LOD, draw distance and correct widescreen/ultrawide culling are now a **high
 priority workstream**, explicitly promoted by the owner from the otherwise
 deferred mod list. Target very distant highest-available-detail rendering and
 eliminate visible model/quality pop-in where the engine/assets permit. Support
-scalable quality settings for Macs faster than the owner's M2 Pro. Preserve
+scalable Maximum/Extreme settings for faster Macs and high-end 8K PCs, beyond
+what the owner's M2 Pro can run at full speed. Retain a playable Mac preset.
+DLSS is explicitly the very last priority. Preserve
 original physics, AI and simulation timing; maintain a faithful baseline for
 comparison. Other mods and 120 Hz remain deferred.
 
@@ -195,8 +197,12 @@ presenter.
 * **Data edits** (overlay + archive repack). Best for camera FOV tables,
   texture swaps in the game's own format, and LOD distances (`lod.val`:
   `lod1 = 10 … lod4 = 500`, identical on both platforms). Raising the LOD
-  distances, or forcing the `draw_distance` option (`00212808`, factor at
-  `00495D58`) past its top setting, is a cheap "draw distance" mod.
+  distances is a candidate model-retention change. **Correction from the PS2
+  investigation:** `draw_distance` is an enum: 0→1150, 1→725, 2/default→300
+  (`1700*factor+300` at `00212808`, output `00495D58`). Raising the enum past
+  its supported values cannot extend distance. Car LOD, projection/fog range,
+  scene submission and residency require separate changes and validation.
+  See [current investigation](LOD_CULLING_INVESTIGATION.md).
 
 ### 1.4 Feasibility
 * G1 resolution: done upstream; port it. **High.**

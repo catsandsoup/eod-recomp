@@ -129,8 +129,10 @@ The new 6x, 3840x2400 diagnostic MP run reached vblank 6600. Its last sample was
 59.9 vblanks/s, 59.5 game frames/s and 44.8 drawn frames/s, before the ordered-alpha
 fix. This is not full rendering speed. That run also exposed a normal-exit race:
 the detached GS worker accessed a texture map during static destruction. Worker
-shutdown now drains and joins producers/workers; the full game clean-exit check
-must still be repeated on the integrated build.
+shutdown now drains and joins producers/workers; the integrated build has now completed a headless/muted 6600-vblank two-player
+run with exit status 0 (`work/continuation-6x/out.log`). Its late samples were
+12.2–29.1 drawn FPS, final 29.1 drawn /57.1 game frames /60.1 vblanks per second.
+That establishes this clean exit, not full-speed rendering or broad stability.
 
 Native projection tracing confirms race-mode recomputation with scale 5/6 for
 16:10. Menu artwork uses 4:3 composition; actual world and HUD proportions still
@@ -143,7 +145,14 @@ capture and is not evidence of ordinary input delay.
 Exact physical-page enumeration removes unrequested neighbour-page reads and
 ownership drops. A separate procedural test demonstrates lost pixels when a CPU
 write modifies part of a GPU-owned page; preservation of the remaining bytes is
-still being repaired. This is evidence of a renderer bug, not yet proof of the
+verified in the experimental `macos-cpu-preservation` branch. All 25 candidate
+CTests pass, including all 4 MiB VRAM comparisons for 12 fixtures at both 1x/6x.
+Font/race replay pixels are unchanged. However the 6x five-frame replay grows
+from 211–229 ms to 325–330 ms, adding 58 readbacks; a full 6600-vblank run exits
+0 but falls to 8.1–14.3 drawn FPS in late samples (final 10.2). The candidate is
+not merged into `macos`; the canonical app retains the preceding renderer. See
+`GS_CPU_WRITE_PRESERVATION.md`. Point scaling at 6x is a separate newly recorded
+limitation. This is evidence of a renderer bug, not yet proof of the
 specific black-line cause. Keep the full quality target while diagnosing these
 issues; do not hide them by reducing opponents, resolution or simulation speed.
 
