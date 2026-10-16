@@ -113,3 +113,45 @@ mode/border flags and the scoped race flag. It makes no projection overrides.
 Use this trace with matched 4:3/wide scenes to establish projection recomputation
 after race entry and inspect actual horizontal framing; rectangle tests cannot
 establish a wider field of view. Trace counters are process-local.
+
+## Matched rendered race check (2026-10-16)
+
+The actual 2P captures at vblank 4500 from
+`/private/tmp/eod-mp-4x3-reference-20261016/frame_04500.png` and
+`/private/tmp/eod-mp-diagnostics-20261016/frame_04500.png` use identical scripted
+inputs. Both composed images are 3840×2400; the 4:3 image occupies x=320..3519,
+while the 16:10 race fills the canvas and reveals additional scenery on both
+sides. Camera/car positions differ slightly because rendering performance
+changes when the EE consumes input, so these are not pixel-identical poses.
+
+A background-only comparison downsampled both images uniformly to 960×600,
+excluded the HUD and central cars/dust/flag, selected Harris corners and matched
+256-bit BRIEF descriptors with mutual matching and a 0.78 nearest/second ratio.
+There were 87 matches, with 46 affine-RANSAC inliers at a two-analysis-pixel
+threshold. The fitted X/Y magnifications were 1.0400/1.0388 (ratio 1.0011), with
+4.14 original-pixel RMS residual. A common zoom plus translation fit had
+4.92-pixel RMS; a forced 1.20 horizontal/vertical stretch ratio fit had
+26.96-pixel RMS, even allowing common zoom and translation. These measurements
+support wider horizontal framing with approximately preserved background
+proportions in this scene. The fitted ratio is not a precision calibration:
+pose differences, depth/parallax, matching and downsampling introduce error.
+It does not verify every car, HUD element, menu or alternate camera.
+
+There is also target evidence beyond the FOV setter. Native packet builder
+`0035B3D0` reads xScale at `0035B550`, forms `-0.9333334 / xScale` at
+`0035B564`–`0035B588`, and applies that extra factor to the Y matrix element
+(`0035B5D4`, and the combined coefficient at `0035B650`–`0035B694`). The X
+coefficient has no corresponding division. Thus native matrix construction
+compensates the vertical axis separately; the widened FOV is not simply
+applied as an equal X/Y zoom followed by host image stretching. Projection or
+viewport changes mark the native state dirty; `0035BA10` calls this builder
+at `0035BA2C`, which constructs the VIF packet including unpack command
+`6C104001` (`0035B490`). The recompiled engine and VU path retain these native
+calculations; the host camera hook does not alter the resulting GS vertices.
+
+The actual race projection trace supplies another part of that chain:
+callers `00212B2C`, `00212C0C`, `00214C10`, and `00214C28` enter projection
+setup with mode=1, xScale=base=5/6 and input FOV approximately 82.5 degrees
+(native adjustment approximately 92.9235 degrees). This establishes that the
+race recomputes projection after the scoped aspect switch. The rendered
+comparison, rather than this FOV value alone, supports the proportion result.
