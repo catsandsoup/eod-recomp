@@ -175,6 +175,8 @@ struct Sampler : Ref {
 };
 struct Context {
     uint64_t submit_count = 0, wait_us = 0, pipeline_us = 0;
+    // Render-pass ends by cause: submit, upload, copy, clear, map, target change, layout.
+    uint64_t pass_ends[7] = {}, passes = 0;
     static uint64_t now_us() {
         return std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -199,6 +201,20 @@ struct Context {
     VkRect2D boundScissor{};
     float boundBlend[4]{};
     VkDescriptorImageInfo boundImages[6]{};
+    // Push constants persist across binds of pipelines sharing one layout.
+    bool constantsValid = false;
+    uint32_t boundConstantBytes = 0;
+    uint8_t boundConstants[128]{};
+    // Vertex buffer binding and the batch window uploaded once for its draws.
+    bool vertexValid = false;
+    VkBuffer boundVertexBuffer{};
+    VkDeviceSize boundVertexOffset{};
+    Buffer *windowSource{};
+    UINT windowFirst = 0, windowCount = 0;
+    bool windowUploaded = false;
+    VkBuffer windowBuffer{};
+    VkDeviceSize windowOffset{};
+    uint32_t fragmentSpecialization = 0; // ps_draw constant_id 0 (alpha-test half)
     VkDescriptorSetLayout descriptors{};
     VkPipelineLayout layout{};
     PFN_vkCmdPushDescriptorSetKHR push{};
@@ -260,7 +276,23 @@ struct Context {
         return cadence.schedule(display_clock_ns(), wantVsync);
     }
     VkPhysicalDeviceMemoryProperties memories{};
-    std::unordered_map<std::string, VkPipeline> pipelines;
+    struct PipelineKey {
+        int32_t v[14];
+        bool operator==(const PipelineKey &o) const { return !memcmp(v, o.v, sizeof v); }
+    };
+    struct PipelineKeyHash {
+        size_t operator()(const PipelineKey &k) const {
+            uint64_t h = 1469598103934665603ull;
+            for (int32_t x : k.v)
+                h = (h ^ (uint32_t)x) * 1099511628211ull;
+            return (size_t)h;
+        }
+    };
+    std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines;
+    // Two-pass alpha draws alternate between two pipelines: check recent keys first.
+    PipelineKey recentKeys[4]{};
+    VkPipeline recentPipelines[4]{};
+    unsigned recentNext = 0;
     Texture *dummy[4]{}, *rt{}, *ds{}, *resources[4]{};
     Sampler *samplers[2]{};
     Shader *vs{}, *ps{};
@@ -316,17 +348,19 @@ struct Context {
         // A reset/recycled command buffer inherits no graphics state, including
         // when the two in-flight command pools exchange ownership.
         boundPipeline = VK_NULL_HANDLE;
-        dynamicValid = imagesValid = false;
+        dynamicValid = imagesValid = constantsValid = vertexValid = false;
+        windowUploaded = false;
     }
-    void end_render() {
+    void end_render(int cause = 0) {
         if (rendering) {
+            ++pass_ends[cause];
             vkCmdEndRendering(cmd);
             rendering = false;
         }
     }
-    void barrier() {
+    void barrier(int cause = 0) {
         begin();
-        end_render();
+        end_render(cause);
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -358,6 +392,7 @@ struct Context {
             s.pSignalSemaphores = &complete;
         }
         require(vkQueueSubmit(queue, 1, &s, fence), "submit");
+        windowUploaded = false;
         ++submit_count;
         waitAcquire = signalPresent = false;
         bool wait = synchronous;
@@ -403,7 +438,7 @@ struct Context {
     }
     void transition(Texture *t, VkImageLayout old, VkImageLayout next) {
         begin();
-        end_render();
+        end_render(6);
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = old == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -510,7 +545,7 @@ struct Context {
         return 0;
     }
     void UpdateSubresource(Texture *t, UINT level, const D3D11_BOX *b, const void *p, UINT pitch, UINT) {
-        barrier();
+        barrier(1);
         UINT w = b->right - b->left, h = b->bottom - b->top;
         std::vector<uint8_t> tight((size_t)w * h * 4);
         for (UINT y = 0; y < h; y++)
@@ -524,7 +559,7 @@ struct Context {
         vkCmdCopyBufferToImage(cmd, u.first->buffer, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
     void CopySubresourceRegion(Texture *d, UINT, UINT x, UINT y, UINT, Texture *s, UINT, const D3D11_BOX *b) {
-        barrier();
+        barrier(2);
         auto aspect = s->desc.Format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         VkExtent3D sz{b->right - b->left, b->bottom - b->top, 1};
         if (d->host.buffer) {
@@ -554,7 +589,7 @@ struct Context {
     }
     int Map(Texture *t, UINT, int, UINT, D3D11_MAPPED_SUBRESOURCE *m) {
         begin();
-        end_render();
+        end_render(4);
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -567,14 +602,14 @@ struct Context {
     }
     template <class T> void Unmap(T *, UINT) {}
     void ClearRenderTargetView(Texture *t, const float *c) {
-        barrier();
+        barrier(3);
         VkClearColorValue v;
         memcpy(v.float32, c, 16);
         VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     }
     void ClearDepthStencilView(Texture *t, int, float depth, UINT) {
-        barrier();
+        barrier(3);
         VkClearDepthStencilValue v{depth, 0};
         VkImageSubresourceRange r{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         vkCmdClearDepthStencilImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
@@ -582,7 +617,7 @@ struct Context {
     void OMSetRenderTargets(UINT n, Texture *const *t, Texture *z) {
         auto *color = n ? *t : nullptr;
         if (rt != color || ds != z)
-            end_render();
+            end_render(5);
         rt = color;
         ds = z;
     }
@@ -600,6 +635,15 @@ struct Context {
     void IASetInputLayout(void *) {}
     void IASetVertexBuffers(UINT, UINT, Buffer *const *b, const UINT *, const UINT *) { vertices = *b; }
     void VSSetShader(Shader *s, void *, UINT) { vs = s; }
+    // Vertices [first, first + count) of b are final until the next window: their
+    // draws share one upload and binding (vkCmdDraw firstVertex selects a range).
+    void SetVertexWindow(Buffer *b, UINT first, UINT count) {
+        windowSource = b;
+        windowFirst = first;
+        windowCount = count;
+        windowUploaded = false;
+    }
+    void PSSetSpecialization(uint32_t value) { fragmentSpecialization = value; }
     void PSSetShader(Shader *s, void *, UINT) { ps = s; }
     void VSSetConstantBuffers(UINT n, UINT, Buffer *const *b) { constants[n] = *b; }
     void PSSetConstantBuffers(UINT n, UINT, Buffer *const *b) { constants[n] = *b; }
@@ -644,103 +688,107 @@ inline void Context::Draw(UINT count, UINT first) {
     if (!rendering)
         barrier(); // Makes uploads, previous attachment writes and feedback copies
                    // visible.
-    std::string key;
-    auto add = [&](auto v) { key.append((const char *)&v, sizeof v); };
-    add(vs->id);
-    add(ps->id);
-    add(topology);
-    add(rt ? rt->desc.Format : VK_FORMAT_UNDEFINED);
-    add(ds ? ds->desc.Format : VK_FORMAT_UNDEFINED);
     const auto &b = blend->desc.RenderTarget[0];
     const auto &z = depth->desc;
-    add(b.BlendEnable);
-    add(b.SrcBlend);
-    add(b.DestBlend);
-    add(b.BlendOp);
-    add(b.RenderTargetWriteMask);
-    add(z.DepthEnable);
-    add(z.DepthWriteMask);
-    add(z.DepthFunc);
-    VkPipeline pipeline;
-    auto found = pipelines.find(key);
-    if (found != pipelines.end())
-        pipeline = found->second;
-    else {
-        uint64_t pipeline_start = now_us();
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        for (int i = 0; i < 2; i++) {
-            auto *s = i ? ps : vs;
-            stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-            stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-            stages[i].module = s->module;
-            stages[i].pName = s->entry;
+    const uint32_t specialization = ps->id == 1 ? fragmentSpecialization : 0;
+    const PipelineKey key{{vs->id, ps->id, topology, (int32_t)(rt ? rt->desc.Format : VK_FORMAT_UNDEFINED),
+                           (int32_t)(ds ? ds->desc.Format : VK_FORMAT_UNDEFINED), b.BlendEnable, b.SrcBlend,
+                           b.DestBlend, b.BlendOp, b.RenderTargetWriteMask, z.DepthEnable, z.DepthWriteMask,
+                           z.DepthFunc, (int32_t)specialization}};
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    for (unsigned i = 0; i < 4 && !pipeline; i++)
+        if (recentPipelines[i] && recentKeys[i] == key)
+            pipeline = recentPipelines[i];
+    if (!pipeline) {
+        auto found = pipelines.find(key);
+        if (found != pipelines.end())
+            pipeline = found->second;
+        else {
+            uint64_t pipeline_start = now_us();
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            for (int i = 0; i < 2; i++) {
+                auto *s = i ? ps : vs;
+                stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+                stages[i].module = s->module;
+                stages[i].pName = s->entry;
+            }
+            VkSpecializationMapEntry specEntry{0, 0, sizeof specialization};
+            VkSpecializationInfo specInfo{1, &specEntry, sizeof specialization, &specialization};
+            if (ps->id == 1)
+                stages[1].pSpecializationInfo = &specInfo;
+            VkVertexInputBindingDescription binding{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
+            VkVertexInputAttributeDescription attrs[] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+                                                         {1, 0, VK_FORMAT_R32_UINT, 8},
+                                                         {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 12},
+                                                         {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 16},
+                                                         {4, 0, VK_FORMAT_R32_SFLOAT, 28}};
+            VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            if (vs->id == 0) {
+                input.vertexBindingDescriptionCount = 1;
+                input.pVertexBindingDescriptions = &binding;
+                input.vertexAttributeDescriptionCount = 5;
+                input.pVertexAttributeDescriptions = attrs;
+            }
+            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            ia.topology = (VkPrimitiveTopology)topology;
+            VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            vp.viewportCount = vp.scissorCount = 1;
+            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rs.depthClampEnable = VK_TRUE;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_NONE;
+            rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth = 1;
+            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo dz{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            dz.depthTestEnable = z.DepthEnable;
+            dz.depthWriteEnable = z.DepthWriteMask;
+            dz.depthCompareOp = (VkCompareOp)z.DepthFunc;
+            VkPipelineColorBlendAttachmentState cb{};
+            cb.blendEnable = b.BlendEnable;
+            cb.srcColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.SrcBlend : VK_BLEND_FACTOR_ONE;
+            cb.dstColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.DestBlend : VK_BLEND_FACTOR_ZERO;
+            cb.colorBlendOp = (VkBlendOp)b.BlendOp;
+            cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            cb.alphaBlendOp = VK_BLEND_OP_ADD;
+            cb.colorWriteMask = b.RenderTargetWriteMask;
+            VkPipelineColorBlendStateCreateInfo blendInfo{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            blendInfo.attachmentCount = rt ? 1 : 0;
+            blendInfo.pAttachments = &cb;
+            VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                    VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+            VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dynamic.dynamicStateCount = 3;
+            dynamic.pDynamicStates = dyn;
+            VkFormat color = rt ? rt->desc.Format : VK_FORMAT_UNDEFINED;
+            VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+            renderingInfo.colorAttachmentCount = rt ? 1 : 0;
+            renderingInfo.pColorAttachmentFormats = &color;
+            renderingInfo.depthAttachmentFormat = ds ? ds->desc.Format : VK_FORMAT_UNDEFINED;
+            VkGraphicsPipelineCreateInfo p{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            p.pNext = &renderingInfo;
+            p.stageCount = 2;
+            p.pStages = stages;
+            p.pVertexInputState = &input;
+            p.pInputAssemblyState = &ia;
+            p.pViewportState = &vp;
+            p.pRasterizationState = &rs;
+            p.pMultisampleState = &ms;
+            p.pDepthStencilState = &dz;
+            p.pColorBlendState = &blendInfo;
+            p.pDynamicState = &dynamic;
+            p.layout = layout;
+            require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &p, nullptr, &pipeline),
+                    "graphics pipeline");
+            pipeline_us += now_us() - pipeline_start;
+            pipelines.emplace(key, pipeline);
         }
-        VkVertexInputBindingDescription binding{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
-        VkVertexInputAttributeDescription attrs[] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
-                                                     {1, 0, VK_FORMAT_R32_UINT, 8},
-                                                     {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 12},
-                                                     {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 16},
-                                                     {4, 0, VK_FORMAT_R32_SFLOAT, 28}};
-        VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-        if (vs->id == 0) {
-            input.vertexBindingDescriptionCount = 1;
-            input.pVertexBindingDescriptions = &binding;
-            input.vertexAttributeDescriptionCount = 5;
-            input.pVertexAttributeDescriptions = attrs;
-        }
-        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        ia.topology = (VkPrimitiveTopology)topology;
-        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        vp.viewportCount = vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        rs.depthClampEnable = VK_TRUE;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth = 1;
-        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo dz{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        dz.depthTestEnable = z.DepthEnable;
-        dz.depthWriteEnable = z.DepthWriteMask;
-        dz.depthCompareOp = (VkCompareOp)z.DepthFunc;
-        VkPipelineColorBlendAttachmentState cb{};
-        cb.blendEnable = b.BlendEnable;
-        cb.srcColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.SrcBlend : VK_BLEND_FACTOR_ONE;
-        cb.dstColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.DestBlend : VK_BLEND_FACTOR_ZERO;
-        cb.colorBlendOp = (VkBlendOp)b.BlendOp;
-        cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        cb.alphaBlendOp = VK_BLEND_OP_ADD;
-        cb.colorWriteMask = b.RenderTargetWriteMask;
-        VkPipelineColorBlendStateCreateInfo blendInfo{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-        blendInfo.attachmentCount = rt ? 1 : 0;
-        blendInfo.pAttachments = &cb;
-        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = 3;
-        dynamic.pDynamicStates = dyn;
-        VkFormat color = rt ? rt->desc.Format : VK_FORMAT_UNDEFINED;
-        VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-        renderingInfo.colorAttachmentCount = rt ? 1 : 0;
-        renderingInfo.pColorAttachmentFormats = &color;
-        renderingInfo.depthAttachmentFormat = ds ? ds->desc.Format : VK_FORMAT_UNDEFINED;
-        VkGraphicsPipelineCreateInfo p{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        p.pNext = &renderingInfo;
-        p.stageCount = 2;
-        p.pStages = stages;
-        p.pVertexInputState = &input;
-        p.pInputAssemblyState = &ia;
-        p.pViewportState = &vp;
-        p.pRasterizationState = &rs;
-        p.pMultisampleState = &ms;
-        p.pDepthStencilState = &dz;
-        p.pColorBlendState = &blendInfo;
-        p.pDynamicState = &dynamic;
-        p.layout = layout;
-        require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &p, nullptr, &pipeline), "graphics pipeline");
-        pipeline_us += now_us() - pipeline_start;
-        pipelines.emplace(key, pipeline);
+        recentKeys[recentNext] = key;
+        recentPipelines[recentNext] = pipeline;
+        recentNext = (recentNext + 1) % 4;
     }
     auto *target = rt ? rt : ds;
     if (!rendering) {
@@ -760,6 +808,7 @@ inline void Context::Draw(UINT count, UINT first) {
         render.pDepthAttachment = ds ? &dep : nullptr;
         vkCmdBeginRendering(cmd, &render);
         rendering = true;
+        ++passes;
     }
     if (!cacheState || boundPipeline != pipeline) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -806,13 +855,42 @@ inline void Context::Draw(UINT count, UINT first) {
         imagesValid = true;
     }
     Buffer *cb = constants[vs->id == 0 ? 0 : 1];
-    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       (uint32_t)cb->data.size(), cb->data.data());
+    const uint32_t constantBytes = (uint32_t)cb->data.size();
+    if (!cacheState || !constantsValid || constantBytes != boundConstantBytes ||
+        memcmp(boundConstants, cb->data.data(), constantBytes)) {
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, constantBytes,
+                           cb->data.data());
+        memcpy(boundConstants, cb->data.data(), constantBytes);
+        boundConstantBytes = constantBytes;
+        constantsValid = true;
+    }
     if (vs->id == 0) {
-        size_t bytes = (size_t)count * 32;
-        auto u = upload(vertices->data.data() + (size_t)first * 32, bytes);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &u.first->buffer, &u.second);
-        vkCmdDraw(cmd, count, 1, 0, 0);
+        VkBuffer buffer;
+        VkDeviceSize offset;
+        UINT start = 0;
+        if (cacheState && windowSource == vertices && first >= windowFirst &&
+            (uint64_t)first + count <= (uint64_t)windowFirst + windowCount) {
+            if (!windowUploaded) {
+                auto u = upload(vertices->data.data() + (size_t)windowFirst * 32, (size_t)windowCount * 32);
+                windowBuffer = u.first->buffer;
+                windowOffset = u.second;
+                windowUploaded = true;
+            }
+            buffer = windowBuffer;
+            offset = windowOffset;
+            start = first - windowFirst;
+        } else {
+            auto u = upload(vertices->data.data() + (size_t)first * 32, (size_t)count * 32);
+            buffer = u.first->buffer;
+            offset = u.second;
+        }
+        if (!cacheState || !vertexValid || boundVertexBuffer != buffer || boundVertexOffset != offset) {
+            vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
+            boundVertexBuffer = buffer;
+            boundVertexOffset = offset;
+            vertexValid = true;
+        }
+        vkCmdDraw(cmd, count, 1, start, 0);
     } else
         vkCmdDraw(cmd, count, 1, first, 0);
 }

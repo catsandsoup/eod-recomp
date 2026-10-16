@@ -171,6 +171,46 @@ signature verification and completed a headless muted retail Vulkan replay.
 The native GUI journey, visible thin lines/input latency and physical controllers
 remain unverified; packaging and headless replay do not complete those criteria.
 
+## Native GS per-draw command cost — October 16 continuation (STAR)
+
+**Situation:** the native 1x/4:3 two-player race stutters because the GS worker
+needs ~25 ms per game frame. The fixed capture `work/claude-native/race2p-5000.gsd`
+(2 game frames, 36,365 draws) replayed in ~49 ms. An earlier "~42 ms GPU busy per
+replay" reading was wrong: it summed every process's Metal intervals. Filtered to
+`eod`, depth 0, the GPU is busy ~5 ms per warm replay (10% of wall time);
+surfaces are only 640x512/320x512. The cost is CPU recording, MoltenVK encoding at
+`vkQueueSubmit` and 19 synchronous CPU-write-preservation readbacks.
+
+**Task:** cut per-draw Vulkan command cost without changing any draw, ordering,
+transfer or timing, pixel-exact.
+
+**Action** (PCSX2 GSDeviceVK pattern, see `RENDERER_REFERENCES.md`): the two-pass
+alpha-test half is now a `ps_draw` specialization constant (`c_atest_select`,
+Vulkan build only) instead of push-constant flags; push constants are skipped when
+byte-identical; each batch's vertices are uploaded and bound once
+(`SetVertexWindow`, draws use `firstVertex`); the std::string pipeline key is a
+POD key with a 4-entry recent cache. Per draw this removes ~35k push-constant and
+~36k vertex-bind commands per replay. Kept the render-pass end-cause counters
+(`render passes N, ended by ...` in the stats line).
+
+**Result (measured):** alternating same-capture runs, 4x6 replays, first excluded:
+median 49.05 -> 41.45 ms per replay (-15.5%); GPU busy ~5.0 -> ~4.1 ms per warm
+replay (Metal System Trace, eod only). Draws/batches/readbacks/submits unchanged
+(36,365/1,013/19/22). Race and font fixtures: display image and full 4 MiB VRAM
+byte-identical to the pre-change binary at RenderScale 1 and 6, in default,
+`EOD_GPU_UPLOADS=1` and `EOD_VK_STATE_CACHE=0` modes. All 43 CTests pass. No new
+switch: the change is default because it is exact; `EOD_VK_STATE_CACHE=0` still
+restores per-draw push/bind emission.
+
+**Remaining:** 41 ms per 2 frames is still above the 33 ms needed for 60 fps.
+Biggest cost is now the 19 sync readback fence waits (~17 ms, ~41% of replay):
+mostly per-command-buffer round-trip latency (~0.3 ms minimum each) plus the
+accumulated GPU work, not GPU throughput. Next: avoid or defer the
+CPU-write-preservation readbacks into the PSMZ16 surface (see
+`GS_CPU_WRITE_PRESERVATION.md`), then MoltenVK encode (~16%). Ruled out:
+MVK prefill/argument-buffer/async-submit config, early draw-count kicks.
+Native full-game run not repeated here.
+
 ## Clean-start existing-renderer probe
 
 The default-off `EOD_GS_DUMP_COLD_START=N` capture now permits an exact initialized

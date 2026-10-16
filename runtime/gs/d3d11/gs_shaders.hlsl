@@ -137,8 +137,19 @@ float4 sample_tex(float2 tc, int lvl, bool linear_filter) {
     return t_tex.Load(int3(ip, lvl));
 }
 
+#ifdef VK
+// Vulkan selects the alpha-test pass/fail half of a two-pass draw by pipeline
+// specialization (F_ATEST_PASS/F_ATEST_FAIL), so both halves share one set of
+// push constants. 0 leaves c_flags unchanged.
+[[vk::constant_id(0)]] const uint c_atest_select = 0;
+#endif
+
 PSOut ps_draw(VSOut i) {
+#ifdef VK
+    uint f = c_flags | c_atest_select;
+#else
     uint f = c_flags;
+#endif
 #ifdef VK
     // GS interpolants are truncated, not rounded to nearest.
     int4 c = (int4)floor(i.color * 255.0 + 0.0001);

@@ -522,9 +522,10 @@ void bind_targets(Surface *rt, Surface *ds);
 void acquire(Surface *s, int x0, int y0, int x1, int y1);
 
 void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
-    DrawCB cb = s.cb;
-    if (s.two_pass)
-        cb.flags |= fail_pass ? 0x800u : 0x400u;
+    // The alpha-test half (F_ATEST_PASS/F_ATEST_FAIL) is a ps_draw pipeline
+    // specialization: both halves of a two-pass group share the constants.
+    g_ctx->PSSetSpecialization(s.two_pass ? (fail_pass ? 0x800u : 0x400u) : 0u);
+    const DrawCB &cb = s.cb;
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(CHECK(g_ctx->Map(g_cb_draw, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))) {
         memcpy(m.pData, &cb, sizeof cb);
@@ -603,6 +604,7 @@ void flush() {
     g_ctx->Unmap(g_vb, 0);
     UINT first = g_vb_pos / sizeof(HwVertex), count = (UINT)verts.size();
     g_vb_pos += bytes;
+    g_ctx->SetVertexWindow(g_vb, first, count); // one upload for this batch's draws
 
     bind_targets(s.rt, s.ds);
     UINT stride = sizeof(HwVertex), offset = 0;
@@ -2275,6 +2277,15 @@ void stats_line(char *buf, size_t size) {
              "; submit %llu, GPU wait %.2f ms, pipeline creation %.2f ms (%zu pipelines)",
              (unsigned long long)g_dev->submit_count, g_dev->wait_us / 1000.0, g_dev->pipeline_us / 1000.0,
              g_dev->pipelines.size());
+    used = strlen(buf);
+    const uint64_t *e = g_dev->pass_ends;
+    snprintf(buf + used, size > used ? size - used : 0,
+             "; render passes %llu, ended by submit %llu upload %llu copy %llu clear %llu map %llu target %llu layout %llu",
+             (unsigned long long)g_dev->passes, (unsigned long long)e[0], (unsigned long long)e[1],
+             (unsigned long long)e[2], (unsigned long long)e[3], (unsigned long long)e[4], (unsigned long long)e[5],
+             (unsigned long long)e[6]);
+    g_dev->passes = 0;
+    std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = 0;
     g_stats = Stats();
 }
