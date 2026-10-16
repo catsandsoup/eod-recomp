@@ -1726,10 +1726,11 @@ void draw_point(const Env &e, const Vertex &a) {
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     if (!g_on)
         return;
-    uint32_t first, count;
-    page_range(bp, bw, psm, x, y, w, h, first, count);
-    for (uint32_t k = 0; k < count; k++) {
-        uint32_t p = (first + k) % kPages;
+    // A non-page-aligned BP does not necessarily touch the next physical page.
+    // Dropping an unrequested neighbor's owner loses its rendered pixels.
+    const PageCoverage written = page_coverage(bp, bw, psm, x, y, w, h);
+    for (uint32_t i = 0; i < written.count; ++i) {
+        uint32_t p = written.pages[i];
         if (readback_trace_enabled()) {
             if(g_owner[p] && !g_vram_ok[p] && readback_trace_line())
                 fprintf(stderr,"[gs-readback] frame=%llu cpu-write-drops-owner request_bp=%x psm=%x rect=%d,%d,%d,%d page=%u owner_bp=%x owner_psm=%x drawn_blocks=%08x\n",
