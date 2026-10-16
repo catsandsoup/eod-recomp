@@ -86,6 +86,16 @@ target_include_directories(eod_gen PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include $
 add_executable(eod ${RUNTIME_SOURCES} ${PLATFORM_SOURCES} $<TARGET_OBJECTS:eod_gen>)
 target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_SOURCE_DIR}/runtime ${GEN_DIR})
 
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(eod_native_camera_test tools/tests/native_camera_test.cpp
+    src/hle_camera.cpp runtime/core/config.cpp)
+  target_include_directories(eod_native_camera_test PRIVATE runtime runtime/include)
+  foreach(camera_aspect "4:3" "16:9" "16:10" "stretch")
+    add_test(NAME NativeCamera-${camera_aspect} COMMAND eod_native_camera_test "${camera_aspect}")
+  endforeach()
+endif()
+
 if(EOD_VULKAN)
   target_compile_definitions(eod PRIVATE EOD_VULKAN)
   target_link_libraries(eod PRIVATE Vulkan::Vulkan)
