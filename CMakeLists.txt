@@ -113,3 +113,22 @@ else()
   find_package(Threads REQUIRED)
   target_link_libraries(eod PRIVATE Threads::Threads m)
 endif()
+
+# ----------------------------------------------------------------------- tests
+# cmake -DBUILD_TESTING=ON, then ctest. They need gen/ (the generated code is
+# the reference) and are not part of the normal build.
+if(BUILD_TESTING AND Python3_FOUND)
+  enable_testing()
+  # src/movie_bits.cpp against the generated f_0039AFB0, extracted from gen/
+  set(MOVIE_BITS_REFERENCE ${CMAKE_CURRENT_BINARY_DIR}/movie_bits_reference.c)
+  add_custom_command(OUTPUT ${MOVIE_BITS_REFERENCE}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/extract_movie_bits_reference.py ${GEN_DIR} ${MOVIE_BITS_REFERENCE}
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/extract_movie_bits_reference.py ${GEN_SOURCES} VERBATIM)
+  add_executable(movie_bits_test tests/movie_bits_test.cpp src/movie_bits.cpp ${MOVIE_BITS_REFERENCE})
+  target_include_directories(movie_bits_test PRIVATE runtime/include runtime)
+  target_compile_definitions(movie_bits_test PRIVATE EOD_MOVIE_BITS_TEST)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(movie_bits_test PRIVATE -fwrapv -fno-strict-aliasing)
+  endif()
+  add_test(NAME movie_bits COMMAND movie_bits_test)
+endif()

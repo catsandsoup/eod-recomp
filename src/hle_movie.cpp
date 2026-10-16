@@ -9,11 +9,17 @@
 #include "core/memory.h"
 #include "platform/platform.h"
 #include "funcs.h"
+#include "movie_bits.h"
 
 // set while a movie plays (shown in 4:3 whatever the game's aspect setting)
 std::atomic<bool> g_movie_playing{false};
 
 extern "C" {
+
+// the movie player's bit reader, called for every few bits of the MPEG stream
+void f_0039AFB0(void) {
+    if (!movie_bits_advance_fast()) f_0039AFB0_orig();
+}
 
 void f_003670C8(void) {
     static bool skip = getenv("EOD_SKIP_MOVIES") && atoi(getenv("EOD_SKIP_MOVIES"));
