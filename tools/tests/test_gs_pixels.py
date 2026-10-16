@@ -50,7 +50,10 @@ for renderer in ["software", "vulkan"]:
     assert max(uv(16,16)) - min(uv(16,16)) == 0
     overlap = render("alpha_overlap", renderer)
     assert overlap(16,16) == (200,200,160), (renderer, "alpha-fail shadow must precede foreground fill", overlap(16,16))
-    print(renderer + ": flat, truncated RGBA, constant fog, 1/16 UV bucket, alpha-fail ordering passed")
+    for case in ["alpha_depth_strict", "alpha_depth_varying"]:
+        depth = render(case, renderer)
+        assert depth(16,16) == (200,200,160), (renderer, case, "later depth must reject", depth(16,16))
+    print(renderer + ": flat, RGBA, fog, UV bucket, alpha ordering and depth fallback passed")
 
 # A diagnostic rather than a passing fidelity claim: hardware UNORM blending
 # still rounds where the GS integer equation truncates (no edge ambiguity).
