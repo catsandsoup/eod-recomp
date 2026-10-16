@@ -95,6 +95,7 @@ void fiber_delete(HostFiber *f);
 // ---------------------------------------------------------- timer thread
 // Calls cb() from a background thread roughly every period_us.
 void platform_start_ticker(void (*cb)(), unsigned period_us);
+void platform_stop_ticker();
 
 // --------------------------------------------------------------- files
 // Case-insensitive lookup of a relative path under a root directory.

@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
     }
 #endif
     platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.
-    if (replay) return gs_replay(replay, repeat);
+    if (replay) { int result = gs_replay(replay, repeat); gs_shutdown(); return result; }
 
 #ifdef HAVE_SSE
     // The EE FPU flushes denormals to zero.
@@ -248,6 +248,7 @@ int main(int argc, char **argv) {
     debug_watch_init();
 #endif
     kernel_run(entry);
+    gs_shutdown();
     platform_shutdown();
     return 0;
 }

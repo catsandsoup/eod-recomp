@@ -6,6 +6,8 @@
 enum { GIF_PATH1 = 1, GIF_PATH2 = 2, GIF_PATH3 = 3 };
 
 void gs_init();
+// EE-thread shutdown: stop producers, drain GS/raster work, join all workers.
+void gs_shutdown();
 // Feeds qwc quadwords of GIF data on a path (packets may span calls).
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc);
 uint32_t gif_reg_read(uint32_t off);

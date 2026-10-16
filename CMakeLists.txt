@@ -314,3 +314,13 @@ if(BUILD_TESTING AND NOT WIN32)
   add_test(NAME display_composition_cpu COMMAND display_composition_test)
   set_tests_properties(display_composition_cpu PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
 endif()
+
+if(BUILD_TESTING AND NOT WIN32)
+  add_executable(eod_worker_shutdown_test tools/tests/worker_shutdown_test.cpp
+    runtime/hw/offload.cpp runtime/platform/posix/platform_posix.cpp)
+  target_include_directories(eod_worker_shutdown_test PRIVATE runtime/include runtime)
+  target_compile_definitions(eod_worker_shutdown_test PRIVATE EOD_SDL3)
+  target_link_libraries(eod_worker_shutdown_test PRIVATE Threads::Threads)
+  add_test(NAME WorkerShutdown COMMAND eod_worker_shutdown_test)
+  set_tests_properties(WorkerShutdown PROPERTIES TIMEOUT 10 ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
+endif()
