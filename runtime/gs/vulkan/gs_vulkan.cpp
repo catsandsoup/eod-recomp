@@ -20,6 +20,7 @@
 #include "../../platform/screenshot_size.h"
 #include "../../platform/presentation.h"
 #include "alpha_order.h"
+#include "alpha_tiles.h"
 #include "../gs_hw.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
@@ -573,10 +574,27 @@ void flush() {
         // over the whole batch. A later glyph fill must follow an earlier
         // shadow's FB_ONLY pixels, including when the alpha test fails.
         const UINT primitive_size=s.topology==0 ? 3 : s.topology==1 ? 2 : 1;
+        static const bool group_disjoint=std::getenv("EOD_ALPHA_GROUP") ? std::atoi(std::getenv("EOD_ALPHA_GROUP"))!=0 : true;
+        alpha_order::Tiles tiles(s.rt->w*sc,s.rt->h*sc);
+        const alpha_order::Bounds clip{s.scissor[0],s.scissor[1],s.scissor[2],s.scissor[3]};
+        UINT group_first=0;
+        auto draw_group=[&](UINT end) {
+            if(end==group_first) return;
+            draw_batch(s,first+group_first,end-group_first,false);
+            draw_batch(s,first+group_first,end-group_first,true);
+        };
         for(UINT offset=0;offset<count;offset+=primitive_size) {
-            draw_batch(s,first+offset,primitive_size,false);
-            draw_batch(s,first+offset,primitive_size,true);
+            float x0=verts[offset].x,y0=verts[offset].y,x1=x0,y1=y0;
+            for(UINT i=1;i<primitive_size;i++) {
+                const auto &v=verts[offset+i];
+                x0=std::min(x0,v.x);y0=std::min(y0,v.y);x1=std::max(x1,v.x);y1=std::max(y1,v.y);
+            }
+            const auto coverage=alpha_order::bounds(x0,y0,x1,y1,sc,clip);
+            if(!group_disjoint || !tiles.append(coverage)) {
+                draw_group(offset);group_first=offset;tiles.clear();tiles.append(coverage);
+            }
         }
+        draw_group(count);
     } else draw_batch(s, first, count, false);
     g_stats.flushes++;
 }
