@@ -8,7 +8,10 @@ if len(sys.argv)>2:
     (app/'Contents/MacOS/eod').chmod(0o755)
     shutil.copyfile(pathlib.Path(__file__).with_name('Info.plist.in'),app/'Contents/Info.plist')
 exe=app/'Contents/MacOS/eod'
-frameworks=app/'Contents/Frameworks'; frameworks.mkdir(exist_ok=True)
+frameworks=app/'Contents/Frameworks'
+# Rebuilding with static SDL or another backend must not retain stale dylibs.
+if frameworks.exists(): shutil.rmtree(frameworks)
+frameworks.mkdir()
 def run(*args): return subprocess.check_output(args,text=True)
 def rpaths(path):
     lines=run('otool','-l',str(path)).splitlines(); result=[]
