@@ -109,6 +109,42 @@ PS2SDK research. No wholesale renderer or recompiler migration is required.
 
 ## Remaining hands-on validation
 
+### Owner-reported defects under active investigation
+
+The owner's October 16 playtest exposed stretched menus/gameplay, hollow font
+interiors, thin black lines, slowdown when opponent cars appear, and delayed
+keyboard response. None of these reports is dismissed as original artwork or
+accepted as complete based on unit tests alone.
+
+Matched software/Vulkan replay reproduced the font defect. Vulkan grouped all
+alpha-pass primitives before all alpha-fail primitives, allowing earlier shadow
+edges to overwrite later glyph fills. Ordered passes restore the captured font.
+A proven constant-depth FB_ONLY optimization retains that exact corrected output
+with the original menu draw count; variable-depth race batching remains expensive.
+See `GS_ALPHA_ORDER.md` for the regression and performance limits.
+
+The new 6x, 3840x2400 diagnostic MP run reached vblank 6600. Its last sample was
+59.9 vblanks/s, 59.5 game frames/s and 44.8 drawn frames/s, before the ordered-alpha
+fix. This is not full rendering speed. That run also exposed a normal-exit race:
+the detached GS worker accessed a texture map during static destruction. Worker
+shutdown now drains and joins producers/workers; the full game clean-exit check
+must still be repeated on the integrated build.
+
+Native projection tracing confirms race-mode recomputation with scale 5/6 for
+16:10. Menu artwork uses 4:3 composition; actual world and HUD proportions still
+require matched visual confirmation. Headless scripted input cannot establish
+keyboard-event-to-visible-image latency. Excluding screenshot/dump intervals,
+the diagnostic race's worst observed pump gap was 35.6 ms, GS block 26.1 ms and
+pump-plus-pad-DMA 59 microseconds. The 367 ms peak coincided with intentional GS
+capture and is not evidence of ordinary input delay.
+
+Exact physical-page enumeration removes unrequested neighbour-page reads and
+ownership drops. A separate procedural test demonstrates lost pixels when a CPU
+write modifies part of a GPU-owned page; preservation of the remaining bytes is
+still being repaired. This is evidence of a renderer bug, not yet proof of the
+specific black-line cause. Keep the full quality target while diagnosing these
+issues; do not hide them by reducing opponents, resolution or simulation speed.
+
 - Physical Rock Candy detection, trigger feel and motors (no controller was
   connected during automated diagnostics).
 - Native first-run/settings UI and resize/fullscreen. High-refresh work is deferred.
