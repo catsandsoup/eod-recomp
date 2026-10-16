@@ -696,6 +696,11 @@ ID3D11ShaderResourceView *g_raw_srv;
 ID3D11Texture2D *g_rb_tex,
     *g_rb_staging; // readback target and staging (R32_UINT 2048x2048)
 ID3D11RenderTargetView *g_rb_rtv;
+// Deferred CPU-write preservation copies (see deferred_schedule).
+constexpr int kSlotPixels = 64;  // a slot holds one owner page rectangle (<= 64x64 GS pixels)
+constexpr int kSlots = 256;
+ID3D11Texture2D *g_drb_staging;   // kSlots slots of 64x64 R32 values, stacked vertically
+std::vector<int> g_free_slots;
 
 bool create_raw_textures() {
     D3D11_TEXTURE2D_DESC td = {};
@@ -717,14 +722,24 @@ bool create_raw_textures() {
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    return SUCCEEDED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_rb_staging)));
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_rb_staging))))
+        return false;
+    td.Width = kSlotPixels;
+    td.Height = kSlotPixels * kSlots;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_drb_staging))))
+        return false;
+    for (int i = kSlots - 1; i >= 0; --i)
+        g_free_slots.push_back(i);
+    return true;
 }
 
 // Uploads rectangle (x, y, w, h) of the surface from gs::vram.
+void deferred_before_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why);
 void upload_rect(Surface *s, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0)
         return;
     flush();
+    deferred_before_read(s->bp, s->bw, s->psm, x, y, w, h, "upload");
     const SwizzleTab *T = swizzle_table(s->psm, s->bw);
     std::vector<uint32_t> raw((size_t)w * h);
     for (int r = 0; r < h; r++) {
@@ -754,10 +769,9 @@ void upload_rect(Surface *s, int x, int y, int w, int h) {
     g_stats.uploads++;
 }
 
-// Writes rectangle (x, y, w, h) of the surface back to gs::vram.
-void readback_rect(Surface *s, int x, int y, int w, int h) {
-    if (w <= 0 || h <= 0)
-        return;
+// GPU half of a readback: raw GS values of rectangle (x, y, w, h) of the surface
+// into g_rb_tex texels (0, 0, w, h).
+void readback_record(Surface *s, int x, int y, int w, int h) {
     flush();
     unbind_all();
     g_ctx->OMSetRenderTargets(1, &g_rb_rtv, nullptr);
@@ -776,6 +790,13 @@ void readback_rect(Surface *s, int x, int y, int w, int h) {
              (x + w) * sc, (y + h) * sc, cb);
     unbind_all();
     g_bound_rt = g_bound_ds = nullptr;
+}
+
+// Writes rectangle (x, y, w, h) of the surface back to gs::vram.
+void readback_rect(Surface *s, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0)
+        return;
+    readback_record(s, x, y, w, h);
     D3D11_BOX box = {0, 0, 0, (UINT)w, (UINT)h, 1};
     g_ctx->CopySubresourceRegion(g_rb_staging, 0, 0, 0, 0, g_rb_tex, 0, &box);
     D3D11_MAPPED_SUBRESOURCE m;
@@ -801,6 +822,243 @@ void readback_rect(Surface *s, int x, int y, int w, int h) {
     vram_mark(s->bp, s->bw, s->psm, x, y, w, h);
     g_stats.readbacks++;
     g_stats.rb_reason[g_rb_reason & 3]++;
+}
+
+// ------------------------------------------- deferred CPU-write preservation
+// A CPU write into part of a GPU-owned page used to read the whole page back
+// synchronously before the write (submit + fence wait per page). The deferred
+// form records the identical readback pass at the identical command position,
+// copies its result into a private staging slot and lets the CPU write proceed.
+// Ownership metadata changes exactly as before. The page's other bytes stay
+// stale in gs::vram until a CPU consumer reads a storage block that still holds
+// a bit the CPU has not rewritten since; that read first waits for the copy and
+// merges it bit-exactly (GPU value where the CPU has not written, CPU value
+// where it has), which is the byte image the synchronous order would produce.
+// Bits the CPU rewrites completely never need the GPU copy at all.
+// EOD_DEFER_PRESERVE=0 restores the synchronous readback for comparison.
+bool deferred_preserve_enabled() {
+    static const bool enabled = [] { const char *v = getenv("EOD_DEFER_PRESERVE"); return !v || atoi(v) != 0; }();
+    return enabled;
+}
+struct DeferredPart { uint32_t bp, bw, psm; int x, y, w, h, slot; };
+struct DeferredPage {
+    uint64_t serial = 0;              // command buffer holding the copies
+    std::vector<DeferredPart> parts;  // in the synchronous readback order
+    uint8_t written[8192];            // storage bits the CPU wrote since (per byte)
+    uint32_t pending_blocks = ~0u;    // 256-byte blocks with a bit still awaiting the GPU
+};
+DeferredPage *g_deferred[kPages];
+uint32_t g_deferred_count;
+struct DeferredStats { uint32_t scheduled, merged, waited, overwritten; } g_dstats;
+
+void deferred_free(uint32_t page) {
+    DeferredPage *d = g_deferred[page];
+    for (const DeferredPart &q : d->parts)
+        g_free_slots.push_back(q.slot);
+    delete d;
+    g_deferred[page] = nullptr;
+    --g_deferred_count;
+}
+
+// Completes page `page`: waits for its copies and merges the untouched bits.
+void deferred_resolve(uint32_t page, const char *why = "") {
+    DeferredPage *d = g_deferred[page];
+    if (!d)
+        return;
+    if (readback_trace_enabled() && readback_trace_line())
+        fprintf(stderr, "[gs-readback] frame=%llu deferred-merge %s page=%u pending=%08x serial=%llu current=%llu completed=%llu\n",
+                (unsigned long long)g_frame_no, why, page, d->pending_blocks, (unsigned long long)d->serial,
+                (unsigned long long)g_dev->serial, (unsigned long long)g_dev->completed);
+    if (g_dev->wait_serial(d->serial))
+        g_dstats.waited++;
+    const uint8_t *base = (const uint8_t *)g_drb_staging->host.map;
+    for (const DeferredPart &q : d->parts) {
+        const SwizzleTab *T = swizzle_table(q.psm, q.bw);
+        const bool b16 = bpp_of(q.psm) == 16, b24 = (q.psm & 0xF) == 0x1;
+        const uint32_t *slot = (const uint32_t *)(base + (size_t)q.slot * kSlotPixels * kSlotPixels * 4);
+        for (int r = 0; r < q.h; r++) {
+            const uint32_t *src = slot + (size_t)r * kSlotPixels;
+            int py = q.y + r;
+            uint32_t rb = T->row_base(q.bp, py), rc = T->rowC[py & 2047];
+            for (int c = 0; c < q.w; c++) {
+                uint32_t a = T->addr_row(rb, rc, q.x + c), v = src[c];
+                // The value readback_rect would store, as bytes at `addr`.
+                uint32_t addr, n;
+                if (b16) {
+                    addr = (a & 0x1FFFFF) * 2;
+                    n = 2;
+                } else {
+                    addr = (a & 0xFFFFF) * 4;
+                    n = 4;
+                    if (b24)
+                        v = (word(a) & 0xFF000000u) | (v & 0xFFFFFF);
+                }
+                for (uint32_t k = 0; k < n; k++) {
+                    uint8_t &b = vram[addr + k];
+                    const uint32_t off = (addr + k) - page * 8192;
+                    const uint8_t keep = off < 8192 ? d->written[off] : 0;
+                    b = (uint8_t)((b & keep) | ((v >> (8 * k)) & ~keep & 0xFF));
+                }
+            }
+        }
+    }
+    g_dstats.merged++;
+    deferred_free(page);
+}
+
+void deferred_resolve_all() {
+    for (uint32_t p = 0; p < kPages && g_deferred_count; ++p)
+        if (g_deferred[p])
+            deferred_resolve(p);
+}
+
+// A CPU consumer is about to read the blocks under this rectangle.
+void deferred_before_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why) {
+    if (!g_deferred_count)
+        return;
+    const PageCoverage c = page_coverage(bp, bw, psm, x, y, w, h);
+    for (uint32_t i = 0; i < c.count; ++i) {
+        uint32_t p = c.pages[i];
+        if (g_deferred[p] && (c.touched[p] & g_deferred[p]->pending_blocks)) {
+            if (readback_trace_enabled() && readback_trace_line())
+                fprintf(stderr, "[gs-readback] deferred read %s bp=%x bw=%u psm=%x rect=%d,%d,%d,%d touched=%08x\n", why, bp,
+                        bw, psm, x, y, w, h, c.touched[p]);
+            deferred_resolve(p, why);
+        }
+    }
+}
+
+// True when every bit a texture decode of this level reads (conservatively the
+// whole storage unit of each texel) is already final in gs::vram, i.e. not in a
+// deferred page or rewritten by the CPU since the deferral.
+bool deferred_texels_final(uint32_t bp, uint32_t bw, uint32_t psm, int w, int h) {
+    if (!g_deferred_count)
+        return true;
+    const SwizzleTab *T = swizzle_table(psm, bw);
+    for (int y = 0; y < h; y++) {
+        uint32_t rb = T->row_base(bp, y), rc = T->rowC[y & 2047];
+        for (int x = 0; x < w; x++) {
+            uint32_t a = T->addr_row(rb, rc, x), addr, n = 1;
+            uint8_t m = 0xFF;
+            switch (psm) {
+            case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: addr = (a & 0x1FFFFF) * 2; n = 2; break;
+            case PSMT8: addr = a & 0x3FFFFF; break;
+            case PSMT4: addr = (a >> 1) & 0x3FFFFF; m = (a & 1) ? 0xF0 : 0x0F; break;
+            case PSMCT32: case PSMZ32: case PSMCT24: case PSMZ24: case PSMT8H: case PSMT4HL: case PSMT4HH:
+                addr = (a & 0xFFFFF) * 4; n = 4; break;
+            default: return false;
+            }
+            const DeferredPage *d = g_deferred[addr / 8192];
+            if (!d)
+                continue;
+            for (uint32_t k = 0; k < n; k++)
+                if ((d->written[(addr + k) % 8192] & m) != m)
+                    return false;
+        }
+    }
+    return true;
+}
+
+// Same synchronization as readback_pages(p * 32, 1, PSMCT32, 0, 0, 64, 32) for
+// an owned page, with the host wait and the gs::vram store deferred.
+void deferred_schedule(uint32_t page) {
+    Surface *o = g_owner[page];
+    std::vector<PageRect> pages;
+    surface_pages(o, o->h, pages);
+    DeferredPage *d = nullptr;
+    for (const PageRect &q : pages) {
+        if (q.page != page || q.w <= 0 || q.h <= 0)
+            continue;
+        if (g_free_slots.empty())
+            deferred_resolve_all();
+        if (!d) {
+            d = new DeferredPage;
+            memset(d->written, 0, sizeof d->written);
+            g_deferred[page] = d;
+            ++g_deferred_count;
+        }
+        const int slot = g_free_slots.back();
+        g_free_slots.pop_back();
+        readback_record(o, q.x, q.y, q.w, q.h);
+        D3D11_BOX box = {0, 0, 0, (UINT)q.w, (UINT)q.h, 1};
+        g_ctx->CopySubresourceRegion(g_drb_staging, 0, 0, (UINT)(slot * kSlotPixels), 0, g_rb_tex, 0, &box);
+        d->parts.push_back({o->bp, o->bw, o->psm, q.x, q.y, q.w, q.h, slot});
+        vram_mark(o->bp, o->bw, o->psm, q.x, q.y, q.w, q.h);
+        g_stats.readbacks++;
+        g_stats.rb_reason[g_rb_reason & 3]++;
+    }
+    if (!d) { // not part of the surface's rows (shouldn't happen): give up the page
+        g_owner[page] = nullptr;
+        return;
+    }
+    g_ctx->host_read_barrier();
+    d->serial = g_dev->serial;
+    g_vram_ok[page] = true;
+    g_cpu_valid_blocks[page] = 0xffffffffu;
+    g_dstats.scheduled++;
+}
+
+// The CPU is about to store these pixels: their bits no longer need GPU data.
+void deferred_cpu_written(const PageCoverage &cov, uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
+                          int h) {
+    bool any = false;
+    for (uint32_t i = 0; i < cov.count && !any; ++i)
+        any = g_deferred[cov.pages[i]] != nullptr;
+    if (!any)
+        return;
+    switch (psm) {
+    case PSMCT32: case PSMZ32: case PSMCT24: case PSMZ24: case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S:
+    case PSMT8: case PSMT4: case PSMT8H: case PSMT4HL: case PSMT4HH:
+        break;
+    default: // no exact bit model for this format: complete the pages first
+        for (uint32_t i = 0; i < cov.count; ++i)
+            deferred_resolve(cov.pages[i]);
+        return;
+    }
+    const SwizzleTab *T = swizzle_table(psm, bw);
+    for (int r = 0; r < h; r++) {
+        int py = y + r;
+        uint32_t rb = T->row_base(bp, py), rc = T->rowC[py & 2047];
+        for (int c = 0; c < w; c++) {
+            uint32_t a = T->addr_row(rb, rc, x + c), addr = 0, n = 1;
+            uint8_t m = 0xFF;
+            switch (psm) {
+            case PSMCT32: case PSMZ32: addr = (a & 0xFFFFF) * 4; n = 4; break;
+            case PSMCT24: case PSMZ24: addr = (a & 0xFFFFF) * 4; n = 3; break;
+            case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: addr = (a & 0x1FFFFF) * 2; n = 2; break;
+            case PSMT8: addr = a & 0x3FFFFF; break;
+            case PSMT4: addr = (a >> 1) & 0x3FFFFF; m = (a & 1) ? 0xF0 : 0x0F; break;
+            case PSMT8H: addr = (a & 0xFFFFF) * 4 + 3; break;
+            case PSMT4HL: addr = (a & 0xFFFFF) * 4 + 3; m = 0x0F; break;
+            case PSMT4HH: addr = (a & 0xFFFFF) * 4 + 3; m = 0xF0; break;
+            }
+            DeferredPage *d = g_deferred[addr / 8192];
+            if (!d)
+                continue;
+            for (uint32_t k = 0; k < n; k++)
+                d->written[(addr + k) % 8192] |= m;
+        }
+    }
+    for (uint32_t i = 0; i < cov.count; ++i) {
+        uint32_t p = cov.pages[i];
+        DeferredPage *d = g_deferred[p];
+        if (!d)
+            continue;
+        uint32_t pending = 0;
+        for (int b = 0; b < 32; b++) {
+            const uint8_t *blk = d->written + b * 256;
+            for (int k = 0; k < 256; k++)
+                if (blk[k] != 0xFF) {
+                    pending |= 1u << b;
+                    break;
+                }
+        }
+        d->pending_blocks = pending;
+        if (!pending) { // every bit rewritten by the CPU: the copy is never needed
+            g_dstats.overwritten++;
+            deferred_free(p);
+        }
+    }
 }
 
 // ------------------------------------------------------------ conversions
@@ -1181,6 +1439,9 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) 
     if (ck != g_tex_check.end() && ck->second.clock >= newest) {
         key = ck->second.key;
     } else {
+        // The content key may hash stale bytes of deferred pages: the key only
+        // has to change whenever a decoded texel does, and decode below never
+        // reads a bit still awaiting deferred GPU data.
         key = desc;
         for (int i = 0; i < levels; i++)
             key = mix64(key, hash_level(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i),
@@ -1208,6 +1469,11 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) 
     D3D11_SUBRESOURCE_DATA init[7];
     uint32_t bytes = 0;
     alpha_order::Range decoded_alpha{255,0};
+    for (int i = 0; i < levels; i++)
+        if (!deferred_texels_final(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i),
+                                   std::max(1, (int)e.th >> i)))
+            deferred_before_read(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0, std::max(1, (int)e.tw >> i),
+                                 std::max(1, (int)e.th >> i), "texture decode");
     for (int i = 0; i < levels; i++) {
         int w = std::max(1, (int)e.tw >> i), h = std::max(1, (int)e.th >> i);
         decode_level(e, i, w, h, data[(size_t)i]);
@@ -1860,7 +2126,10 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
                 fprintf(stderr, "[gs-readback] cpu-write-preserve bp=%x bw=%u psm=%x rect=%d,%d,%d,%d page=%u owner=%x/%u/%x depth=%d\n",
                         bp,bw,psm,x,y,w,h,p,g_owner[p]->bp,g_owner[p]->bw,g_owner[p]->psm,int(g_owner[p]->depth));
             g_rb_reason = 0;
-            readback_pages(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+            if (deferred_preserve_enabled())
+                deferred_schedule(p);
+            else
+                readback_pages(p * 32, 1, PSMCT32, 0, 0, 64, 32);
         }
         if (readback_trace_enabled()) {
             if(g_owner[p] && !g_vram_ok[p] && readback_trace_line())
@@ -1873,6 +2142,8 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
         g_vram_ok[p] = false;
         g_cpu_valid_blocks[p] = 0;
     }
+    if (g_deferred_count)
+        deferred_cpu_written(written, bp, bw, psm, x, y, w, h);
     g_state_valid = false;
 }
 
@@ -1912,6 +2183,11 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
     if (!g_on)
         return;
     const PageCoverage requested = page_coverage(bp, bw, psm, x, y, w, h);
+    for (uint32_t i = 0; i < requested.count && g_deferred_count; ++i) {
+        uint32_t p = requested.pages[i];
+        if (g_deferred[p] && (requested.touched[p] & g_deferred[p]->pending_blocks))
+            deferred_resolve(p, "cpu read");
+    }
     const bool trace = readback_trace_enabled();
     // page_range is deliberately conservative, adding an extra page for any
     // unaligned BP. Only actual physical GS blocks can require synchronization.
@@ -2261,6 +2537,10 @@ void reset() {
         return;
     flush();
     g_pending_uploads.clear();
+    // GS memory was replaced: deferred preservation data is obsolete.
+    for (uint32_t p = 0; p < kPages && g_deferred_count; ++p)
+        if (g_deferred[p])
+            deferred_free(p);
     memset(g_owner, 0, sizeof g_owner);
     memset(g_vram_ok, 0, sizeof g_vram_ok);
     memset(g_cpu_valid_blocks, 0, sizeof g_cpu_valid_blocks);
@@ -2300,6 +2580,11 @@ void stats_line(char *buf, size_t size) {
              (unsigned long long)g_dev->passes, (unsigned long long)e[0], (unsigned long long)e[1],
              (unsigned long long)e[2], (unsigned long long)e[3], (unsigned long long)e[4], (unsigned long long)e[5],
              (unsigned long long)e[6]);
+    used = strlen(buf);
+    snprintf(buf + used, size > used ? size - used : 0,
+             "; deferred preservation %u (merged %u, waited %u, overwritten %u, open %u)", g_dstats.scheduled,
+             g_dstats.merged, g_dstats.waited, g_dstats.overwritten, g_deferred_count);
+    g_dstats = DeferredStats();
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = 0;
