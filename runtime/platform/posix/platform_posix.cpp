@@ -60,6 +60,11 @@ void platform_get_pad(int port, HostPadState *out) {
 
 void platform_set_vibration(int, uint8_t, uint8_t) {}
 
+int platform_list_pads(int) {
+    printf("built without SDL3: no controller support (scripted pads only)\n");
+    return 1;
+}
+
 void platform_set_status(const char *) {}
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {

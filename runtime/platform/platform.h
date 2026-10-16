@@ -71,6 +71,10 @@ struct HostPadState {
 
 void platform_get_pad(int port, HostPadState *out);
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor);
+// `eod --list-pads [--watch N]`: prints the controllers the host sees (no game
+// data needed); with watch_seconds > 0 then shows each player's input live.
+// Returns the process exit code.
+int platform_list_pads(int watch_seconds);
 
 // ------------------------------------------------------------------ audio
 // 48 kHz signed 16-bit stereo interleaved.

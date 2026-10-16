@@ -439,6 +439,19 @@ void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) 
     pXInputSetState((DWORD)port, &v);
 }
 
+int platform_list_pads(int) {
+    load_xinput();
+    if (!pXInputGetState) {
+        printf("XInput not available\n");
+        return 1;
+    }
+    for (DWORD i = 0; i < 4; i++) {
+        XINPUT_STATE_ xs;
+        printf("XInput slot %lu: %s\n", (unsigned long)i, pXInputGetState(i, &xs) == 0 ? "connected" : "-");
+    }
+    return 0;
+}
+
 // ------------------------------------------------------------------ audio
 bool platform_audio_open(int sample_rate) {
     InitializeCriticalSection(&g_audio_cs);
