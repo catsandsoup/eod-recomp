@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Copy the linked non-system dylib closure and sign a personal .app locally."""
-import pathlib, shutil, subprocess, sys, plistlib, re
+import pathlib, shutil, subprocess, sys, plistlib, re, json, os
 app=pathlib.Path(sys.argv[1]).resolve()
 if len(sys.argv)>2:
     (app/'Contents/MacOS').mkdir(parents=True,exist_ok=True)
@@ -20,6 +20,23 @@ def rpaths(path):
             result.append(lines[i+2].strip().split(' (offset')[0].removeprefix('path '))
     return result
 seen={}; pending=[(exe,exe)]
+resources=app/'Contents/Resources'; resources.mkdir(exist_ok=True)
+vulkan_resources=resources/'vulkan'
+if vulkan_resources.exists(): shutil.rmtree(vulkan_resources)
+# MoltenVK is dlopened by the Vulkan loader: it does not appear in its linked
+# dependency closure, so a Vulkan build must explicitly package the ICD too.
+if 'libvulkan' in run('otool','-L',str(exe)).lower():
+    molten=pathlib.Path(os.environ.get('EOD_MOLTENVK_LIBRARY','/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib')).resolve()
+    if not molten.is_file(): raise RuntimeError('Vulkan app requires MoltenVK; set EOD_MOLTENVK_LIBRARY to its dylib')
+    driver=frameworks/'libMoltenVK.dylib'
+    shutil.copyfile(molten,driver); driver.chmod(0o755)
+    seen[driver.name]=molten; pending.append((molten,driver))
+    subprocess.run(['install_name_tool','-id','@rpath/'+driver.name,str(driver)],check=True)
+    icd_dir=vulkan_resources/'icd.d'; icd_dir.mkdir(parents=True)
+    manifest={'file_format_version':'1.0.0','ICD': {
+        'library_path':'../../../Frameworks/libMoltenVK.dylib',
+        'api_version':'1.3.0','is_portability_driver':True}}
+    (icd_dir/'MoltenVK_icd.json').write_text(json.dumps(manifest,indent=2)+'\n')
 while pending:
     src,dst=pending.pop()
     paths=rpaths(src)+rpaths(exe)

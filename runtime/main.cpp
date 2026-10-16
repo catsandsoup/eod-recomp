@@ -21,6 +21,7 @@
 #include "core/config.h"
 #ifdef __APPLE__
 #include "app/macos_app.h"
+#include "app/macos_vulkan.h"
 #endif
 #include "core/cpu.h"
 #include "core/log.h"
@@ -108,6 +109,9 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
+#endif
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 #ifdef SIGQUIT
