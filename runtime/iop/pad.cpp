@@ -2,7 +2,8 @@
 // "libpad" (protocol version 4).
 //
 // Commands arrive as a 128-byte block with the command code in word 0 and
-// the result returned in word 3.  After scePadPortOpen the IOP writes a
+// the result returned in word 3 (words 4, 5 or 7 for the commands that
+// read it there, see iop_pad_init).  After scePadPortOpen the IOP writes a
 // 128-byte pad_data structure into one of the two halves of the EE pad
 // area every frame (the EE picks the half with the newer frame counter):
 //   0x00 data[32]      raw controller reply (mode id, buttons, sticks...)
@@ -146,7 +147,7 @@ void iop_pad_init() {
         int port = (int)(rd32(buf + 4) & 1);
         int slot = (int)(rd32(buf + 8) & 3);
         uint32_t result = 1;
-        uint32_t result_offset = 0xC;
+        uint32_t result_off = 0xC;  // where the game's libpad reads this command's result
         switch (cmd) {
         case 0x01: {  // OPEN(port, slot, padArea)
             Port &p = g_ports[port][slot];
@@ -162,7 +163,7 @@ void iop_pad_init() {
             break;
         }
         case 0x06: {  // SET_MMODE(port, slot, mode, lock)
-            result_offset = 0x14; // target 0x0039062C
+            result_off = 0x14;  // read at 0039062C
             Port &p = g_ports[port][slot];
             p.analog = rd32(buf + 0xC) != 0;
             p.lock = (uint8_t)rd32(buf + 0x10);
@@ -171,12 +172,12 @@ void iop_pad_init() {
             break;
         }
         case 0x07:  // PS2SDK SET_ACTDIR(port, slot, data[6]): vibration
-            result_offset = 0x14;
+            result_off = 0x14;
             set_actuators(port, slot, buf + 0xC);
             g_ports[port][slot].req_state = PAD_RSTAT_COMPLETE;
             break;
         case 0x08: {  // SET_ACTALIGN(port, slot, align[6])
-            result_offset = 0x14; // target 0x003907C8 reads word 5, not word 3
+            result_off = 0x14;  // read at 003907C8
             Port &p = g_ports[port][slot];
             memcpy(p.act_align, buf + 0xC, 6);
             p.req_state = PAD_RSTAT_COMPLETE;
@@ -186,7 +187,7 @@ void iop_pad_init() {
             result = 0x3FFFF;
             break;
         case 0x0A: {  // SET_BTNINFO: enables pressure sensitive buttons
-            result_offset = 0x10; // target 0x00390930
+            result_off = 0x10;  // read at 00390930
             Port &p = g_ports[port][slot];
             p.pressure = rd32(buf + 0xC) != 0;
             p.req_state = PAD_RSTAT_COMPLETE;
@@ -194,7 +195,7 @@ void iop_pad_init() {
             break;
         }
         case 0x0B:  // SET_VREF
-            result_offset = 0x1C; // target 0x00390B0C
+            result_off = 0x1C;  // read at 00390B0C
             break;
         case 0x0C:  // GET_PORTMAX
             result = 2;
@@ -216,7 +217,7 @@ void iop_pad_init() {
             LOG(LOG_PAD, "padman command %x", cmd);
         }
         (void)c;
-        wr32(buf + result_offset, result);
+        wr32(buf + result_off, result);
         return 128;
     };
     iop_register_server(0x80000100, "padman", handler);
