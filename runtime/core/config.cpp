@@ -99,14 +99,14 @@ bool config_load(const std::string &path, Config &c) {
             return n < lo ? lo : n > hi ? hi : n;
         };
         if (ieq(section, "Video")) {
-            if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "warp") ? "warp" : "d3d11";
+            if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "warp") ? "warp" : ieq(v, "vulkan") ? "vulkan" : "d3d11";
             else if (ieq(k, "Adapter")) c.adapter = num(0, 15);
             else if (ieq(k, "Fullscreen")) c.fullscreen = to_bool(v);
             else if (ieq(k, "Width")) c.width = num(320, 16384);
             else if (ieq(k, "Height")) c.height = num(240, 16384);
             else if (ieq(k, "VSync")) c.vsync = to_bool(v);
             else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "stretch") ? "stretch" : "4:3";
-            else if (ieq(k, "RenderScale")) c.render_scale = num(1, 6);
+            else if (ieq(k, "RenderScale")) c.render_scale = num(0, 6);
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);
         } else if (ieq(section, "Audio")) {
@@ -130,14 +130,14 @@ bool config_save(const std::string &path, const Config &c) {
     if (!f) return false;
     fprintf(f, "; Test Drive: Eve of Destruction - PC port settings (written by eodsetup)\n\n");
     fprintf(f, "[Video]\n");
-    fprintf(f, "Renderer=%s        ; d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
+    fprintf(f, "Renderer=%s        ; vulkan, d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
     fprintf(f, "Adapter=%d\n", c.adapter);
     fprintf(f, "Fullscreen=%d\n", c.fullscreen ? 1 : 0);
     fprintf(f, "Width=%d\n", c.width);
     fprintf(f, "Height=%d\n", c.height);
     fprintf(f, "VSync=%d\n", c.vsync ? 1 : 0);
     fprintf(f, "AspectRatio=%s      ; 4:3, 16:9 or stretch\n", c.aspect.c_str());
-    fprintf(f, "RenderScale=%d        ; internal resolution: 1 = 640x448 (PS2), 2 = 1280x896, ...\n", c.render_scale);
+    fprintf(f, "RenderScale=%d        ; internal resolution: 0 = auto, 1 = 640x448 (PS2), 2 = 1280x896, ...\n", c.render_scale);
     fprintf(f, "SmoothDisplay=%d\n", c.smooth_display ? 1 : 0);
     fprintf(f, "FrameSkip=%d\n", c.frame_skip ? 1 : 0);
     fprintf(f, "\n[Audio]\n");

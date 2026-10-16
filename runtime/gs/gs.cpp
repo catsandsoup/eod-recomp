@@ -935,7 +935,7 @@ int gs_replay(const char *path, int repeat) {
     std::vector<uint8_t> cmds((size_t)(end - start));
     fseek(f, start, SEEK_SET);
     if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
-    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp") && hw::start(false)) fprintf(stderr, "replaying with Direct3D 11\n");
+    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") && hw::start(false)) fprintf(stderr, "replaying with %s\n",g_config.renderer.c_str());
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
@@ -1039,11 +1039,11 @@ void gs_init() {
     memset(&st, 0, sizeof st);
     st.imr = 0xFF00;
     st.prmodecont = 1;
-    if (g_config.renderer == "d3d11" || g_config.renderer == "warp") {
+    if (g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") {
         if (hw::start(platform_native_window() != nullptr && !getenv("EOD_D3D_NOWINDOW")))
-            LOG(LOG_GS, "Direct3D 11 renderer");
+            LOG(LOG_GS, "%s renderer",g_config.renderer.c_str());
         else
-            LOG(LOG_GS, "Direct3D 11 is not available - using the software renderer");
+            LOG(LOG_GS, "%s is not available - using the software renderer",g_config.renderer.c_str());
     }
     gs_thread_start();
 }
