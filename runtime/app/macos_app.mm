@@ -81,7 +81,7 @@ bool mac_app_settings() {
     [a addButtonWithTitle:@"Save"]; [a addButtonWithTitle:@"Cancel"];
     struct Field { std::string label; std::string value; };
     std::vector<Field> fields = {
-        {"Renderer",g_config.renderer}, {"Internal resolution (1–6)",std::to_string(g_config.render_scale)},
+        {"Renderer",g_config.renderer}, {"Internal resolution (0 auto, 1–6)",std::to_string(g_config.render_scale)},
         {"Width",std::to_string(g_config.width)}, {"Height",std::to_string(g_config.height)},
         {"Fullscreen",std::to_string(g_config.fullscreen)}, {"VSync",std::to_string(g_config.vsync)},
         {"Aspect (4:3, 16:9, stretch)",g_config.aspect}, {"Smooth display",std::to_string(g_config.smooth_display)},
@@ -121,7 +121,7 @@ bool mac_app_settings() {
         return std::string(input.stringValue.UTF8String);
     };
     auto number=[&](int i,int lo,int hi){return std::max(lo,std::min(hi,atoi(value(i).c_str())));};
-    c.renderer=value(0); c.render_scale=number(1,1,6); c.width=number(2,320,16384); c.height=number(3,240,16384);
+    c.renderer=value(0); c.render_scale=number(1,0,6); c.width=number(2,320,16384); c.height=number(3,240,16384);
     c.fullscreen=number(4,0,1); c.vsync=number(5,0,1); c.aspect=value(6);
     c.smooth_display=number(7,0,1); c.frame_skip=number(8,0,1); c.audio=number(9,0,1); c.volume=number(10,0,100);
     c.keyboard_port=number(11,0,2); c.vibration=number(12,0,1); c.memcard_dir=value(13); c.data_dir=value(14);
