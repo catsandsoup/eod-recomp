@@ -146,6 +146,15 @@ if(EOD_VULKAN)
   if(BUILD_TESTING)
     add_executable(eod_present_timing_test tools/tests/present_timing_test.cpp)
     add_test(NAME VulkanPresentTiming COMMAND eod_present_timing_test)
+    add_executable(eod_gs_pixel_math_test tools/tests/gs_pixel_math_test.cpp)
+    add_test(NAME GSPixelArithmetic COMMAND eod_gs_pixel_math_test)
+    add_executable(eod_gs_pixel_fixture tools/tests/gs_pixel_fixture.cpp runtime/gs/gs_mem.cpp)
+    if(Python3_FOUND)
+      add_test(NAME VulkanGSPixels COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_pixels.py --eod $<TARGET_FILE:eod>
+        --generator $<TARGET_FILE:eod_gs_pixel_fixture> --work-dir ${CMAKE_BINARY_DIR}/gs-pixel-test)
+      set_tests_properties(VulkanGSPixels PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
 endif()
 
