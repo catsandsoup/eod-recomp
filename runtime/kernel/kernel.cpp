@@ -350,6 +350,12 @@ void service_events(bool run_alarms) {
         if (now > g_next_vblank_us + 12 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
         g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
+        // Pump first: the keyboard state comes from window messages, so the
+        // pad data of this vblank then has the keys pressed since the last one.
+        if (!platform_pump()) {
+            LOG(LOG_CORE, "window closed - exiting");
+            app_exit(0);
+        }
         iop_pad_vblank();
         game_patches_vblank();
         gs_vblank();
@@ -358,10 +364,6 @@ void service_events(bool run_alarms) {
             if (g_vsync_flag_cnt_addr) MEM_SD(g_vsync_flag_cnt_addr, g_vblank_count);
         }
         intc_raise(INTC_VBLANK_S);
-        if (!platform_pump()) {
-            LOG(LOG_CORE, "window closed - exiting");
-            app_exit(0);
-        }
         overlay_frame();
         if (overlay_paused()) hold_for_menu();
     }
