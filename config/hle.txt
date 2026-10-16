@@ -9,6 +9,14 @@
 0034D328 wrap     # native display mode paired with scoped menu/race presentation
 00114020 wrap     # actual race loop: native wide camera + ordered wide composition
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
+0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
+0021C6E0 wrap     # bounded single-car selection trace
+00218E68 wrap     # bounded batch selection/submission trace
+0034E308 wrap     # bounded actual CPU sphere visibility trace
+
+# Semantic native HUD rows: scoped edge anchors, centred UI and world untouched.
+00119888 wrap     # left position/lap/damage rows in each supported race viewport
+00119F40 wrap     # right speed rows in each supported race viewport
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
 
 # Busy-wait loops on memory set by interrupt handlers: sleep until the next

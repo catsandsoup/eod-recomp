@@ -139,8 +139,12 @@ other mods remain deferred.
 
 The [LOD/culling investigation](docs/LOD_CULLING_INVESTIGATION.md) identifies
 per-car load-time thresholds and the native CPU visibility test. These are
-implementation targets; expanded draw distance and quality tiers are not yet
-enabled.
+implementation targets. An opt-in car LOD threshold experiment now validates
+20 real loaded tables in both original and 2x runs; matched visual acceptance is
+still pending. Track draw distance and quality tiers are not yet enabled. Native
+widescreen HUD edge anchors are implemented and CPU-tested; rendered checking
+is pending. See [LOD experiment](docs/LOD_RUNTIME.md) and
+[HUD anchor work](docs/HUD_EDGE_ANCHORS.md).
 
 ## Game files
 

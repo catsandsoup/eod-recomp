@@ -174,3 +174,31 @@ LOD/culling static investigation: `LOD_CULLING_INVESTIGATION.md` (a6445db).
 Start with read-only loaded-table/handle/selection/visibility traces before
 enabling the load-time threshold multiplier. The correct draw_distance enum
 mapping is 0→1150, 1→725, 2→300; raising it beyond 2 cannot extend distance.
+
+
+## Current continuation checkpoint — LOD and HUD
+
+- User explicitly flags HUD inset in widescreen: world Hor+ proof is not full
+  HUD correctness. Native semantic left/right HUD row wrappers now shift only
+  the relevant per-player anchor while producing draws, restore exact bits,
+  preserve shapes/overscan and leave centered UI/menu/movie paths untouched.
+  `EOD_HUD_EDGE_ANCHORS=0` is the same-binary baseline; actual game captures
+  with `EOD_HUD_TRACE=1` are the immediate next acceptance.
+- `LOD_RUNTIME.md` corrects previous layout assumptions: count pointer+0x224,
+  active handle pointer+0x21C and cloned shared tables matter. Loader-only
+  `EOD_CAR_LOD_MULTIPLIER` validates own storage and scales positive thresholds
+  transactionally. Baseline and2x each ran5000 vblanks, exit0,20/20 valid tables.
+  Captures differ in camera/motion, so do not claim a matched visual improvement.
+- Main build30/30 CTests pass; `work/hud-build.log`, `work/hud-ctest.log`.
+  Native wrappers generated with normal tools; unchanged output timestamps
+  were retained to avoid recompiling unchanged generated translation units.
+- Independent online recon in `RECOMP_RENDERER_RECON.md`: no proven matching
+  Monster Games recomp found. PCSX2 Metal/emulator, upstream paraLLEl-GS, Play!
+  Vulkan and OpenGOAL are distinct references with explicitly recorded limits.
+  Road Trip is not assumed correct or counted as independent of its dependencies.
+- Renderer work is isolated in `../eod-recomp-vk`, branch`macos-gpu-transfers`,
+  based on the preservation candidate. Reusing GPU-authoritative uploads for
+  proven complete physical blocks, with a strict fallback for partial/masked
+  data. Actual readback trace shows CPU32 uploads alias16-bit color/depth owners.
+  Direct uploads alone only moved the stalls; explicit CPU-known-block validity
+  is being tested. No renderer change has been merged into main yet.
