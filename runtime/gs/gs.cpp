@@ -676,6 +676,9 @@ namespace {
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 
 bool g_threaded;
+bool g_gs_stop; // guarded by g_q_mtx
+std::thread g_gs_worker;
+bool g_shutdown_complete;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
 // Keep the Mac input-to-display queue short. This is a pacing/backpressure
@@ -687,7 +690,7 @@ constexpr uint64_t kDefaultGsLag = 12;
 #endif
 uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : kDefaultGsLag;
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
-// never destroyed: the worker may still be waiting on them when the process exits
+// Process-lifetime queue storage; normal exits drain and join its worker.
 std::mutex &g_q_mtx = *new std::mutex;
 std::condition_variable &g_q_cv = *new std::condition_variable, &g_q_cv_done = *new std::condition_variable;
 // a command chunk: growing it doesn't zero the bytes about to be copied in
@@ -994,7 +997,8 @@ static void gs_worker() {
         Chunk c;
         {
             std::unique_lock<std::mutex> lk(g_q_mtx);
-            g_q_cv.wait(lk, [] { return !g_q.empty(); });
+            g_q_cv.wait(lk, [] { return g_gs_stop || !g_q.empty(); });
+            if (g_gs_stop && g_q.empty()) break;
             c = std::move(g_q.front());
             g_q.pop_front();
         }
@@ -1009,14 +1013,17 @@ static void gs_worker() {
         }
         g_q_cv_done.notify_all();
     }
+    raster_sync();
+    if (hw::g_on) hw::finish(); // Finish rendering on its owning thread.
 }
 
 void gs_thread_start() {
     const char *e = getenv("EOD_GS_THREAD");
     bool want = e ? atoi(e) != 0 : platform_cpu_count() >= 2;
     if (!want) return;
+    g_gs_stop = false;
     g_threaded = true;
-    std::thread(gs_worker).detach();
+    g_gs_worker = std::thread(gs_worker);
     offload_start();
     // raster workers on the cores left after the EE and GS threads
     // (EOD_GS_RASTER=n overrides, 0 disables)
@@ -1027,6 +1034,30 @@ void gs_thread_start() {
     if (hw::g_on) n = 0;  // the GPU draws
     raster_start(n);
     LOG(LOG_GS, "GS runs on its own thread, %d raster workers", n > 0 ? n : 0);
+}
+
+void gs_shutdown() {
+    if (g_shutdown_complete) return;
+    g_shutdown_complete = true;
+    // Called by normal exit paths before static destruction. The EE has
+    // stopped issuing work. Stop its ticker, then the VIF/GIF producer before
+    // draining the GS stream; GS may still reference raster jobs and caches.
+    platform_stop_ticker();
+    offload_shutdown();
+    if (g_threaded) {
+        gs_sync();
+        {
+            std::lock_guard<std::mutex> lk(g_q_mtx);
+            g_gs_stop = true;
+        }
+        g_q_cv.notify_all();
+        g_gs_worker.join();
+        g_threaded = false;
+    } else {
+        raster_sync();
+        if (hw::g_on) hw::finish();
+    }
+    raster_shutdown();
 }
 
 void gs_init() {
@@ -1353,6 +1384,7 @@ void gs_vblank() {
     }
     if (g_opt_frames && (int)g_frames >= g_opt_frames) {
         LOG(LOG_CORE, "reached %d frames - exiting", g_opt_frames);
+        gs_shutdown();
         exit(0);
     }
 }
