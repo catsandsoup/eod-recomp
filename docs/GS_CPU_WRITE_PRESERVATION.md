@@ -102,3 +102,70 @@ host preservation path. Complete-block GPU uploads require `EOD_GPU_UPLOADS=1`;
 at 1x and 6x. Historical branch names above identify experiments only; developers
 do not need to merge or check out those branches. Alpha-range proofs are now integrated; see `docs/GS_ALPHA_ORDER.md` for measured
 all-pass/all-fail draw elimination and unchanged preservation read counts.
+
+## Native 1x transfer follow-up after command caching — October 16
+
+**Success first.** The player still needs heavy carnage at original timing and
+full speed, native 1x/4:3, with FrameSkip=0. This investigation's narrower gate
+was fewer forced CPU/GPU readback dependencies with identical displayed pixels
+and all 4 MiB of VRAM, plus an isolated replay/native improvement. Reduced
+readback counts alone do not establish that outcome.
+
+**Situation.** At source `b15d0d9`, alpha rejection and Vulkan command caching
+are enabled. The complete-block transfer experiment remains off by default.
+An isolated same-binary comparison collected nine warm measurements per mode
+(three alternating mode rounds, four replays per process, first discarded).
+Conservative preservation measured 165.4 ms median; `EOD_GPU_UPLOADS=1`
+measured 174.4 ms. Readbacks fell from 58 to 24 and submits from 65 to 31,
+but this sample did not become faster. These measurements are separate from
+the command-cache comparison and must not be combined into one speedup.
+
+**Task and action.** Trace the remaining 24 reads before designing another
+optimization. All were CPU-write preservation for indexed uploads aliasing a
+PSMZ16 surface. A group of three 16x16 PSMT4 rectangles and one 8x8 PSMT8
+rectangle recurred six times in the fixed five-game-frame capture. A throwaway
+planner proved actual supplied physical bits formed
+complete owner pixels even when they did not fill a 256-byte block. Its CPU
+storage oracle passed the two retail-shaped aliases and rejected partial owner
+pixels. The renderer used existing `upload_rect`, retaining all other GPU data.
+
+**Result.** This prototype merely moved the dependency: subsequent 8x8 PSMT4
+writes supplied partial owner pixels, and texture consumers could not prove
+sub-block CPU equality. It still made 24 reads (18 CPU preservation, six texture
+reads), 31 submits and 102,931 game draw calls. Its nine warm samples measured
+177.2 ms median. The prototype was removed; no unproven optimization or new
+runtime flag shipped. Ignored investigation logs, timings and rejected patch
+are under `work/transfer-followup/`. The default remains conservative host
+preservation, and the existing complete-block mode remains opt-in.
+
+The existing complete-block on/off modes retained byte-identical race/font
+images and complete 4-MiB VRAM at both 1x and 6x in this follow-up. The prior
+`b15d0d9` baseline already passed all 41 CTests; the final change here is only
+this evidence/handoff documentation. No app replacement was needed.
+
+The existing complete-block opt-in also completed an isolated native 1x/4:3
+two-player run: 6,600 vblanks, exit 0, 110.788 seconds, race drawn samples
+17.6–35.1 FPS (final 17.9). Late GS worker occupancy was 99%, EE waiting
+76–77%. Scene variation prevents a matched native speed claim. These counters
+remain framebuffer-flip heuristics/CPU occupancy, not original-cadence proof or
+hardware GPU utilization. Native full-speed player acceptance remains unmet.
+
+**Reuse decision and next decisive test.** Rechecked Road Trip's pinned
+[paraLLEl packet backend](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/gs_pgs_backend.cpp):
+original GIF/register traffic reaches `GSInterface`; CPU primitive, CLUT and
+image-upload callbacks are empty, and the CPU read boundary synchronizes GPU
+VRAM. This avoids reconstructing masked storage ownership in another custom
+GS. Reuse the existing local M2 Pro oracle for a cold-boot packet replay spike,
+then verify pixel/VRAM fidelity and native timing before adopting a backend.
+The current oracle supports canonical procedural state only and deliberately
+rejects retail CLUT, partial GIF, queued vertices and transfer continuation;
+feeding an arbitrary mid-race EOD dump to it is not a valid comparison.
+
+PCSX2's pinned [Metal download implementation](https://github.com/PCSX2/pcsx2/blob/685637d/pcsx2/GS/Renderers/Metal/GSTextureMTL.mm)
+separates scheduling a copy from waiting at its CPU-consumption boundary.
+EOD's preservation path immediately consumes the old bytes before writing new
+ones, so splitting its copy/wait functions alone does not remove the dependency.
+Local-to-local GPU copies also do not address the 24 observed CPU-upload reads.
+A custom masked merge would require exact per-bit ownership and preservation
+at each scaled pixel, plus finer CPU-validity proofs; it was not stacked onto
+this unsuccessful prototype.

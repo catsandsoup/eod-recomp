@@ -59,6 +59,19 @@ exhaustive original-reference fidelity remain unproven. Logged game frames use
 a framebuffer-flip heuristic, and GS busy measures CPU worker occupancy. Host
 vblank cadence alone proves neither simulation speed nor hardware GPU utilization.
 
+**Transfer follow-up.** With the command cache enabled, another isolated
+same-binary comparison measured 165.4 ms median with conservative preservation
+and 174.4 ms with the existing complete-block upload experiment. Reads fell
+58→24 and submits 65→31, without a replay improvement. A complete-owner-pixel
+prototype merely moved waits to later partial-nibble uploads and texture reads;
+it still needed 24 reads and measured 177.2 ms, so it was removed. An opt-in
+native 1x/4:3 two-player check reached 6,600 vblanks and exited 0 in 110.788
+seconds; race drawn samples were 17.6–35.1 FPS, final 17.9, with late GS worker
+occupancy 99% and EE waiting 76–77%. Scene variation prevents a matched native
+speed claim. The experiment remains off by default. The next renderer reuse
+spike is a cold-boot packet replay through the existing paraLLEl-GS oracle;
+see `GS_CPU_WRITE_PRESERVATION.md` for the dependency trace and fidelity gates.
+
 **Open questions.** What cadence does the original game use in each tested
 mode? Does rejection retain correctness beyond the tested alpha/depth/framebuffer
 cases and consistently improve heavy full-game runs? Are thin lines and visible control delay still
