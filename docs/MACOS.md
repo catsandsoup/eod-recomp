@@ -108,3 +108,21 @@ tools/make_dmg.sh
 
 Native dialogs are compile-verified only; automated tests never open visible
 windows or play audio. The app and DMG are personal builds only.
+
+Vulkan app bundles also include `libMoltenVK.dylib` and
+`Contents/Resources/vulkan/icd.d/MoltenVK_icd.json`. MoltenVK is loaded
+indirectly, so packaging includes it explicitly rather than relying only on
+linked dependencies. Set `EOD_MOLTENVK_LIBRARY` at packaging time for a custom
+driver path. Bundled launches set Vulkan driver discovery and SDL's Vulkan
+loader path relative to the executable before both replay and normal startup;
+copying the app requires neither Homebrew nor an external ICD configuration.
+Plain command-line builds preserve the caller's Vulkan environment.
+
+Test a relocated signed Vulkan app with intentionally invalid external ICD
+overrides and an otherwise isolated environment:
+
+```sh
+tools/test_app_vulkan.sh "/path/Eve of Destruction.app" /path/race2p.gsd /tmp/app-vulkan.log
+```
+
+The script stays headless/muted and fails if replay falls back to software.
