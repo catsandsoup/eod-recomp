@@ -1,5 +1,14 @@
 # Project working rules
 
+Before opening or starting any issue, project or task, define success from the
+player's point of view: the observable experience, acceptance criteria, evidence
+needed to prove them, and known limits. Keep this ahead of implementation steps.
+Use a STAR handoff (Situation, Task, Action, Result) for the next developer,
+separating verified outcomes from candidates, plans and remaining acceptance.
+Include open questions and the next decisive test; tests passing alone do not
+establish player success. See `docs/PLAYER_SUCCESS_AND_STAR.md` for the current
+native baseline and reusable handoff format.
+
 The owner's standing rule is: **Never reinvent the wheel if you can find someone
 else's wheel first.** Before designing a fix or subsystem, check relevant
 existing recomp projects online, especially

@@ -34,6 +34,7 @@ int main() {
             unsigned va=v.low+random()%(v.high-v.low+1),ta=t.low+random()%(t.high-t.low+1),a=alpha(va,ta,tme,tcc,fx);
             check(a>=r.low && a<=r.high,"all interpolated alpha values bounded");
             if(all_pass(test,ref,r))check(pass(test,a,ref),"all-pass never accepts failing fragment");
+            if(all_fail(test,ref,r))check(!pass(test,a,ref),"all-fail never rejects passing fragment");
         }
     }
     check(all_pass(5,96,source_alpha(vertex_range(128,128),{128,128},true,true,0)),"opaque MODULATE pass proven");

@@ -88,3 +88,56 @@ to 135,695. In a bounded three-repeat 6x comparison, warmed best replay time fal
 from 249.2 ms to 227.6 ms for five captured frames. This is a limited replay gain,
 not evidence of 100% gameplay speed. Conservative triangle bounds still prevent
 many groups, so significant varying-depth overhead remains.
+
+## Whole-batch alpha outcome proof (main, October 16)
+
+The Vulkan backend now applies the existing alpha-range helpers to actual draw
+batches. This adapts PCSX2's `CalcAlphaMinMax` / `TryAlphaTest` approach from
+[`GSState.cpp`, revision 685637d30b5eaa8e5d7a587673a17577a92dcb88](https://github.com/PCSX2/pcsx2/blob/685637d30b5eaa8e5d7a587673a17577a92dcb88/pcsx2/GS/GSState.cpp#L6417).
+Bounds include every decoded texel in every active mip, after palette/TEXA/AEM
+expansion, and live with the immutable cached texture. Rendered/unknown sources
+retain 0–255. Vertex and texture bounds have a one-byte interpolation/filtering
+guard; the TCC/TFX equation produces conservative final-alpha bounds.
+
+If every fragment passes, one ordinary draw replaces the ordered pass/fail
+sequence. If every fragment fails, one draw with the original fail color mask,
+blend and depth state replaces it. Mixed/uncertain ranges keep the existing
+ordered fallback. Geometry, shader color calculations, simulation, resolution
+and frame presentation are unchanged. `EOD_ALPHA_RANGE=0` selects the same-binary
+baseline; the proof is enabled by default. All-pass alone removed no draws in
+the retail capture; the useful reduction came from proven all-fail batches.
+
+`VulkanGSAlphaRange1x` and `VulkanGSAlphaRange6x` compare all 4 MiB of VRAM with
+proof disabled/enabled. They assert actual draw reduction for flat/textured
+constant outcomes, FB_ONLY/ZB_ONLY/RGB_ONLY failures and strict/varying depth,
+and unchanged draw counts for mixed-alpha and conflicting active-mip ranges.
+The test was observed failing before integration (8 draws versus expected
+reduction), then passing. The CPU range test independently checks all 524,288
+TCC/TFX byte pairs and 100,000 randomized bounds against fragment predicates.
+The complete Release build and all 39 CTests pass, including GPU-upload modes
+at both 1x and 6x. Independent read-only review found no correctness issue.
+
+The fixed five-game-frame retail race capture at native 1x drops from 143,373 to
+102,931 draw calls (28.2%). In alternating, isolated, same-binary measurements
+(three runs per mode, four replays each, first replay excluded), warm median
+falls from 230.4 to 184.3 ms (20.0% less time). Baseline warm samples were
+223.0–243.2 ms; candidate 180.1–193.1 ms. Readbacks remain 58 and submits remain
+65. The full displayed race and font images and all 4 MiB of final VRAM are
+byte-identical off/on at internal scale 1 and 6. This is evidence for those
+captures only, not complete GS fidelity or full-speed gameplay.
+
+Ignored evidence: `work/alpha-range/results.json`, `measured-race-*.log`,
+`verify-*.log`, raw comparison VRAM/images and `work/alpha-ctest.log`. Retail
+assets, captures and binaries are not shipped. The remaining varying-alpha,
+overlapping varying-Z draws and synchronous CPU preservation reads still cost
+substantial time. Higher resolution, LOD, widescreen and higher FPS remain
+deferred until native play meets the player's acceptance criteria.
+
+The candidate's native 1x/4:3 scripted two-player loop reached 6,600 vblanks and
+exited 0 in 110.23 seconds, using isolated memory cards and sparse captures,
+headless and muted. Race game/drawn samples were 17.3–32.0 FPS (final 20.2), with
+GS busy 97–99% and EE waiting 56–75%. The preceding consolidated run was roughly
+13–25 FPS (one 11.2 sample during the transition). These full-loop samples are
+not an exact matched-scene performance ratio; use the fixed replay above for
+that comparison. Full-speed heavy racing remains unmet, and headless scripted
+input cannot establish visible control latency or original-reference fidelity.
