@@ -24,7 +24,9 @@
 #include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
+#include "../platform/presentation.h"
 #include "gs_mem.h"
+#include "gs_replay_types.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
 
@@ -46,31 +48,8 @@ namespace {
 std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
 
 // ------------------------------------------------------------ GIF parsing
-struct PathState {
-    bool in_packet = false;
-    uint64_t tag_lo = 0, tag_hi = 0;
-    uint32_t nloop = 0;   // remaining loops
-    uint32_t nreg = 0;
-    uint32_t reg = 0;     // current register index within the loop
-    uint32_t flg = 0;
-    bool eop = false;
-};
 PathState g_path[4];
-
-// host -> local transfer state
-struct Transfer {
-    bool active = false;
-    uint32_t dbp, dbw, dpsm;
-    int x0, y0, w, h;
-    int x, y;
-    // partial pixel bytes for 24-bit and sub-word formats
-    uint8_t pend[16];
-    int pend_n = 0;
-    // address table and the current row
-    const SwizzleTab *T = nullptr;
-    int ry = -1;
-    uint32_t rb = 0, rc = 0;
-} g_xfer;
+Transfer g_xfer;
 
 void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog);
 
@@ -685,7 +664,7 @@ extern std::string g_opt_screenshot_dir;
 void priv_apply(uint32_t off, uint64_t v);
 void gs_flush();
 void gs_sync();
-void gs_frame_end(uint64_t frame);
+void gs_frame_end(uint64_t frame, int aspect);
 
 // ------------------------------------------------------------ GS thread
 // With a second CPU core the GIF stream is executed on a worker thread:
@@ -699,7 +678,14 @@ enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 bool g_threaded;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
-uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 12;
+// Keep the Mac input-to-display queue short. This is a pacing/backpressure
+// bound, not a change to guest time or the game update frequency.
+#if defined(__APPLE__)
+constexpr uint64_t kDefaultGsLag = 2;
+#else
+constexpr uint64_t kDefaultGsLag = 12;
+#endif
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : kDefaultGsLag;
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
 // never destroyed: the worker may still be waiting on them when the process exits
 std::mutex &g_q_mtx = *new std::mutex;
@@ -732,7 +718,7 @@ uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mt
 // last composed frame (presented on the EE thread)
 std::mutex &g_pub_mtx = *new std::mutex;
 std::vector<uint32_t> g_pub;
-int g_pub_w, g_pub_h;
+int g_pub_w, g_pub_h, g_pub_aspect = -1;
 
 void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t size) {
     uint32_t h[4] = {kind, a, b, size};
@@ -746,7 +732,8 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 }  // namespace
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
-void gs_frame_end(uint64_t frame) {
+void gs_frame_end(uint64_t frame, int aspect) {
+    presentation::set(aspect);
     if (hw::g_on) {
         if (display_changed()) {
             // no vsync wait while the GS thread trails the EE
@@ -759,6 +746,7 @@ void gs_frame_end(uint64_t frame) {
         g_pub.swap(g_frame);
         g_pub_w = g_frame_w;
         g_pub_h = g_frame_h;
+        g_pub_aspect = aspect;
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
@@ -828,6 +816,13 @@ uint64_t g_dump_end;
 const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
 
 void dump_state(FILE *f) {
+    // Raster synchronization only drains CPU workers. Hardware-owned GS pages
+    // must also reach the CPU copy before serializing a replay's initial VRAM.
+    if (hw::g_on) {
+        hw::finish(); // Flush pending batches before consulting page ownership.
+        for (uint32_t p = 0; p < kPages; ++p)
+            hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+    }
     uint32_t sizes[3] = {(uint32_t)sizeof st, (uint32_t)sizeof g_path, (uint32_t)sizeof g_xfer};
     fwrite(kDumpMagic, 1, 8, f);
     fwrite(sizes, 4, 3, f);
@@ -870,7 +865,7 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         }
         case CMD_VBLANK:
             g_gs_vblanks = h[1];
-            gs_frame_end(h[1]);
+            gs_frame_end(h[1], presentation::from_tag(h[2]));
             frames = h[1];
             if (live) {
                 // EOD_GS_DUMP_AT may list several vblanks (a,b,c): one file per
@@ -935,7 +930,7 @@ int gs_replay(const char *path, int repeat) {
     std::vector<uint8_t> cmds((size_t)(end - start));
     fseek(f, start, SEEK_SET);
     if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
-    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp") && hw::start(false)) fprintf(stderr, "replaying with Direct3D 11\n");
+    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") && hw::start(false)) fprintf(stderr, "replaying with %s\n",g_config.renderer.c_str());
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
@@ -1039,11 +1034,11 @@ void gs_init() {
     memset(&st, 0, sizeof st);
     st.imr = 0xFF00;
     st.prmodecont = 1;
-    if (g_config.renderer == "d3d11" || g_config.renderer == "warp") {
+    if (g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") {
         if (hw::start(platform_native_window() != nullptr && !getenv("EOD_D3D_NOWINDOW")))
-            LOG(LOG_GS, "Direct3D 11 renderer");
+            LOG(LOG_GS, "%s renderer",g_config.renderer.c_str());
         else
-            LOG(LOG_GS, "Direct3D 11 is not available - using the software renderer");
+            LOG(LOG_GS, "%s is not available - using the software renderer",g_config.renderer.c_str());
     }
     gs_thread_start();
 }
@@ -1282,8 +1277,9 @@ void gs_vblank() {
     log_frame(g_frames);
     if (g_threaded) {
         uint64_t f = g_frames;
-        offload_run([f] {
-            push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
+        const uint32_t aspect = presentation::tag(eod_presentation_aspect());
+        offload_run([f, aspect] {
+            push_cmd(CMD_VBLANK, (uint32_t)f, aspect, nullptr, 0);
             gs_flush();
         });
         // don't let the GS thread fall more than a couple of frames behind
@@ -1292,11 +1288,14 @@ void gs_vblank() {
         g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
         g_ee_wait_us += platform_time_us() - t;
     } else {
-        gs_frame_end(g_frames);
+        gs_frame_end(g_frames, eod_presentation_aspect());
     }
     {
         std::lock_guard<std::mutex> lk(g_pub_mtx);
-        if (!g_pub.empty()) platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        if (!g_pub.empty()) {
+            presentation::set(g_pub_aspect);
+            platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        }
     }
     {
         // speed in the window title, every second

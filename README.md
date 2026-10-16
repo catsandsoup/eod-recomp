@@ -20,14 +20,14 @@ runs natively, on top of a runtime that replaces the PS2 hardware.
 | Area | State |
 | --- | --- |
 | Recompiled code | Complete; boots through the SDK libraries and the game's init |
-| Graphics | Direct3D 11 renderer (feature level 10_0+, internal resolution up to 6x) and a software GS renderer |
-| Controller | Keyboard and XInput pads (DualShock 2 emulation incl. pressure) |
+| Graphics | Direct3D 11, native Mac Vulkan/MoltenVK (up to 6x internal resolution), and software GS |
+| Controller | Keyboard, Windows XInput and Mac SDL pads (DualShock 2 pressure); physical Rock Candy validation pending |
 | Memory card | Saves to `memcard/port0` next to the game data |
 | Sound | Sound effects, music and speech work; FMV audio is somewhat distorted |
 | FMV | Intro, attract and menu background movies play |
 | Gameplay | Menus, Career mode, the garage and races play |
 | Performance | Playable on a low-end laptop (Core i3-6006U, Intel HD 520); heavy race scenes are still CPU-bound |
-| Widescreen | Not yet: the 4:3 picture is stretched to the window |
+| Widescreen | Native Mac camera selection for 16:9/16:10 is under validation; legacy stretch remains available |
 
 ![Boot sequence](docs/img/boot_sequence.png)
 
@@ -54,9 +54,42 @@ In order of priority:
 
 ## macOS (Apple Silicon)
 
-This fork adds a native arm64 macOS build (SDL3 window, audio and
-controllers; two player ports for split screen). Build steps, status and
-known gaps: [docs/MACOS.md](docs/MACOS.md).
+This fork adds a native arm64 Mac app with Vulkan/MoltenVK graphics, SDL3
+audio and two independent player ports for split screen. It is still a work
+in progress; [the player journey](docs/PLAYER_JOURNEY.md) distinguishes tested
+outcomes from remaining gaps.
+
+Open the locally built **Eve of Destruction.app** and select your own North
+American v1.00 PS2 ISO or disc folder when prompted. The app installs a local
+copy with progress and remembers it for later launches. No game files are
+included. The app bundles its runtime libraries; players do not need Homebrew
+or Xcode.
+
+The default **Racing** keyboard preset uses **WASD or arrows** to drive,
+**Space** to brake, and **Esc** to pause. In menus, WASD/arrows navigate,
+**Enter** accepts, and **Esc** goes back. Enter starts the title screen.
+**Original** keyboard layout preserves the per-PS2-button bindings. Mouse
+interaction is available in native dialogs; mouse steering/camera is unfinished.
+
+During play, **F1** or **Cmd+,** opens native settings for display size,
+fullscreen, aspect, smoothing, resolution scale, VSync, sound/volume,
+keyboard bindings/player port, vibration and save/disc locations. Settings
+are stored in `~/Library/Application Support/TDEODRecomp/eod.ini`; saves and
+the installed disc are beside it. The settings dialog identifies changes
+that require a relaunch. The current settings use standard Mac controls;
+game-themed presentation remains unfinished.
+
+With the default keyboard on player 1, the first controller takes player 2.
+For two controllers in plug order, set **Keyboard port** to **0** and restart.
+**Controller layout** offers Original (the default PS2 mapping) and Modern
+(analog RT gas / LT brake through Cross/Square pressure); restart after changing
+it. Modern is intended for the game's classic control schemes. Changing the
+game's own bindings can change which actions those inputs perform.
+Scripted two-player racing and virtual pads are verified; physical Rock Candy
+USB detection, trigger feel and rumble still need a connected device.
+
+Developer build steps, measured performance and known fidelity limits:
+[docs/MACOS.md](docs/MACOS.md). High-refresh and mod work remain deferred.
 
 ## Game files
 
@@ -123,7 +156,7 @@ frames per second.
 | `--frames N` | exit after N frames (testing) |
 | `--screenshot-every N --screenshot-dir D` | dump frames as PPM |
 
-Keyboard: arrows = D-pad/left stick, X/Space = ✕, C = ○, Z = □, V = △,
+Windows / Original keyboard layout: arrows = D-pad/left stick, X/Space = ✕, C = ○, Z = □, V = △,
 Q/E = L1/R1, A or 1 = L2, D or 3 = R2, Enter = Start, Backspace = Select,
 Alt+Enter or F11 = fullscreen. XInput controllers map to the DualShock layout.
 

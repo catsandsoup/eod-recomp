@@ -19,6 +19,11 @@
 #endif
 
 #include "core/config.h"
+#include "platform/display_rect.h"
+#ifdef __APPLE__
+#include "app/macos_app.h"
+#include "app/macos_vulkan.h"
+#endif
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
@@ -105,6 +110,9 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
+#endif
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 #ifdef SIGQUIT
@@ -114,13 +122,16 @@ int main(int argc, char **argv) {
     std::string data_dir;
     // settings: eod.ini next to the executable (--config overrides the path)
     std::string config_path = dir_of(argv[0]) + "/eod.ini";
+#ifdef __APPLE__
+    config_path = mac_app_support() + "/eod.ini";
+#endif
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
     config_load(config_path);
     cfg.width = g_config.width;
     cfg.height = g_config.height;
     cfg.fullscreen = g_config.fullscreen;
-    cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
+    cfg.aspect = display_aspect(g_config.aspect);
     cfg.smooth = g_config.smooth_display;
     if (!g_config.data_dir.empty()) data_dir = g_config.data_dir;
     const char *log_spec = getenv("EOD_LOG");
@@ -158,7 +169,7 @@ int main(int argc, char **argv) {
         else if (a == "--list-pads") list_pads = true;
         else if (a == "--watch") watch_pads = atoi(next());
         else if (a == "--help" || a == "-h") {
-            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
+            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
@@ -169,6 +180,23 @@ int main(int argc, char **argv) {
     }
     log_init(log_spec);
     if (list_pads || watch_pads > 0) return platform_list_pads(watch_pads);
+#ifdef __APPLE__
+    if (!replay) {
+        // Honor an explicit environment path before trying local disc discovery.
+        if (data_dir.empty()) {
+            const char *env_data = getenv("EOD_DATA");
+            if (env_data && env_data[0]) data_dir = env_data;
+        }
+        bool headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
+        if (headless && data_dir.empty()) {
+            for (const auto &candidate : {dir_of(argv[0]), std::string(".")}) {
+                if (disc_check_folder(candidate, {ee_elf_size, ee_elf_crc32}).ok()) { data_dir = candidate; break; }
+            }
+        }
+        if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32})) return 1;
+    }
+#endif
+    platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.
     if (replay) return gs_replay(replay, repeat);
 
 #ifdef HAVE_SSE

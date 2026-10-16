@@ -1,3 +1,5 @@
+#include "../display_rect.h"
+#include "../presentation.h"
 // platform_posix.cpp - Linux/macOS backend used for development and
 // automated testing.  Runs headless (frames can be dumped to disk).
 #include <dirent.h>
@@ -29,6 +31,8 @@
 // Headless backend (no SDL3): frames are kept for screenshots, audio can go
 // to a WAV file, input comes only from the pad scripts.
 static PlatformConfig g_cfg;
+
+void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
 
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
@@ -68,9 +72,8 @@ int platform_list_pads(int) {
 void platform_set_status(const char *) {}
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    *x = *y = 0;
-    *w = cw;
-    *h = ch;
+    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
+    *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 
 void *platform_native_window() { return nullptr; }
