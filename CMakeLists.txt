@@ -141,6 +141,10 @@ target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMA
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(eod_alpha_range_test tools/tests/alpha_range_test.cpp)
+  target_include_directories(eod_alpha_range_test PRIVATE runtime)
+  add_test(NAME AlphaPassRange COMMAND eod_alpha_range_test)
+  set_tests_properties(AlphaPassRange PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   add_executable(eod_alpha_tiles_test tools/tests/alpha_tiles_test.cpp)
   target_include_directories(eod_alpha_tiles_test PRIVATE runtime)
   add_test(NAME AlphaPassTiles COMMAND eod_alpha_tiles_test)
