@@ -62,6 +62,19 @@ else()
   endif()
 endif()
 
+if(NOT WIN32)
+  option(EOD_VULKAN "Build the Vulkan GS backend" ON)
+  if(EOD_VULKAN)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND AND SDL3_FOUND)
+      list(REMOVE_ITEM RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/gs/gs_hw_stub.cpp)
+    else()
+      set(EOD_VULKAN OFF)
+      message(STATUS "Vulkan GS disabled (requires Vulkan headers/loader and SDL3)")
+    endif()
+  endif()
+endif()
+
 option(EOD_TRACE_CALLS "record recent EE function calls for debugging" OFF)
 
 add_library(eod_gen OBJECT ${GEN_SOURCES})
@@ -72,6 +85,11 @@ target_include_directories(eod_gen PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include $
 
 add_executable(eod ${RUNTIME_SOURCES} ${PLATFORM_SOURCES} $<TARGET_OBJECTS:eod_gen>)
 target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_SOURCE_DIR}/runtime ${GEN_DIR})
+
+if(EOD_VULKAN)
+  target_compile_definitions(eod PRIVATE EOD_VULKAN)
+  target_link_libraries(eod PRIVATE Vulkan::Vulkan)
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   # Generated code relies on wrapping arithmetic and type punning.

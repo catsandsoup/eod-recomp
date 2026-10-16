@@ -13,13 +13,22 @@ enum PadKey {
 
 struct Config {
     // [Video]
-    std::string renderer = "d3d11";  // d3d11 | software | warp (Direct3D 11 in software)
+#if defined(__APPLE__) && defined(EOD_VULKAN)
+    std::string renderer = "vulkan";
+#else
+    std::string renderer = "d3d11";
+#endif
+    // vulkan | d3d11 | software | warp (Direct3D 11 in software)
     int adapter = 0;                 // DXGI adapter index
     bool fullscreen = false;         // borderless window covering the monitor
     int width = 1280, height = 960;  // window client size (windowed mode)
     bool vsync = true;
     std::string aspect = "4:3";      // 4:3 | 16:9 | stretch
-    int render_scale = 2;            // internal resolution multiplier (d3d11 renderer)
+#ifdef __APPLE__
+    int render_scale = 0;  // auto: enough GS samples to cover the window pixel height
+#else
+    int render_scale = 2;
+#endif
     bool smooth_display = true;      // bilinear filtering when scaling the image to the window
     bool frame_skip = true;          // drop frames when drawing can't keep up (the game keeps its speed)
     // [Audio]
