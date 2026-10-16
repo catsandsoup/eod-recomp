@@ -18,7 +18,9 @@ namespace {
 
 bool g_on;
 std::thread::id g_worker;
-// never destroyed: the worker may still be waiting on them when the process exits
+std::thread g_thread;
+bool g_stop; // guarded by g_m
+// Process-lifetime queue storage; normal exits drain and join its worker.
 std::mutex &g_m = *new std::mutex;
 std::condition_variable &g_cv_work = *new std::condition_variable;  // jobs queued
 std::condition_variable &g_cv_done = *new std::condition_variable;  // progress (jobs run, channels done)
@@ -36,7 +38,8 @@ void worker() {
             std::unique_lock<std::mutex> lk(g_m);
             g_running = false;
             g_cv_done.notify_all();
-            g_cv_work.wait(lk, [] { return !g_q.empty(); });
+            g_cv_work.wait(lk, [] { return g_stop || !g_q.empty(); });
+            if (g_stop && g_q.empty()) return;
             batch.swap(g_q);
             g_running = true;
         }
@@ -54,9 +57,9 @@ void offload_start() {
     const char *e = getenv("EOD_VU1_THREAD");
     bool want = e && atoi(e) != 0 && platform_cpu_count() >= 3;
     if (!want) return;
-    std::thread t(worker);
-    g_worker = t.get_id();
-    t.detach();
+    g_stop = false;
+    g_thread = std::thread(worker);
+    g_worker = g_thread.get_id();
     g_on = true;
     LOG(LOG_CORE, "VIF1/VU1 and the GS command stream run on their own thread");
 }
@@ -99,4 +102,17 @@ bool offload_busy() {
     if (!g_on) return false;
     std::lock_guard<std::mutex> lk(g_m);
     return !g_q.empty() || g_running;
+}
+
+void offload_shutdown() {
+    if (!g_on) return;
+    offload_sync();
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        g_stop = true;
+    }
+    g_cv_work.notify_all();
+    g_thread.join();
+    g_on = false;
+    g_worker = {};
 }

@@ -1225,6 +1225,8 @@ struct Job {
 
 constexpr uint64_t kRing = 4096;
 Job *g_ring;
+std::vector<std::thread> g_raster_threads;
+std::atomic<bool> g_raster_stop{false};
 std::atomic<uint64_t> g_head{0};  // jobs published
 struct alignas(64) WorkerSync {
     std::atomic<uint64_t> done{0};
@@ -1323,13 +1325,14 @@ void raster_worker(int id) {
     t_wid = id + 1;
     uint64_t idx = 0;
     for (;;) {
+        if (g_raster_stop.load()) return;
         if (g_head.load() == idx) {
-            spin_until([&] { return g_head.load() != idx; }, g_spin_us);
+            spin_until([&] { return g_raster_stop.load() || g_head.load() != idx; }, g_spin_us);
             if (g_head.load() == idx) {
                 std::unique_lock<std::mutex> lk(g_wmtx);
                 g_dbg_sleeps++;
                 g_sleepers++;
-                g_wcv.wait(lk, [&] { return g_head.load() != idx; });
+                g_wcv.wait(lk, [&] { return g_raster_stop.load() || g_head.load() != idx; });
                 g_sleepers--;
             }
             continue;
@@ -1851,13 +1854,32 @@ void clut_load(uint64_t tex0) {
 void raster_start(int n) {
     if (n > kMaxWorkers) n = kMaxWorkers;
     if (n <= 0) return;
+    if (g_nw) return;
+    g_raster_stop = false;
+    g_head = 0;
+    for (int i = 0; i < n; ++i) g_wsync[i].done = 0;
     g_ring = new Job[kRing];
     g_nw = n;
     if (platform_core_count() < platform_cpu_count()) g_spin_us = 100;
-    for (int i = 0; i < n; i++) std::thread(raster_worker, i).detach();
+    for (int i = 0; i < n; i++) g_raster_threads.emplace_back(raster_worker, i);
 }
 
 void raster_sync() { barrier(); }
+
+void raster_shutdown() {
+    if (!g_nw) return;
+    barrier(); // No producer remains; finish every job before stopping workers.
+    {
+        std::lock_guard<std::mutex> lk(g_wmtx);
+        g_raster_stop = true;
+    }
+    g_wcv.notify_all();
+    for (auto &thread : g_raster_threads) thread.join();
+    g_raster_threads.clear();
+    g_nw = 0;
+    delete[] g_ring;
+    g_ring = nullptr;
+}
 
 void raster_reset() {
     barrier();

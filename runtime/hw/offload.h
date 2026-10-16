@@ -12,6 +12,8 @@
 #include <functional>
 
 void offload_start();
+// Drain submitted work, stop and join the producer. Called on the EE thread.
+void offload_shutdown();
 bool offload_active();
 // true on the worker thread itself
 bool offload_in_worker();

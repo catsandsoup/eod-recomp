@@ -291,13 +291,23 @@ HostFiber *fiber_current() { return g_current_fiber; }
 void fiber_delete(HostFiber *f) { delete f; }
 
 // ------------------------------------------------------------------ ticker
+namespace {
+std::thread g_ticker_thread;
+std::atomic<bool> g_ticker_stop{false};
+}
+void platform_stop_ticker() {
+    g_ticker_stop = true;
+    if (g_ticker_thread.joinable()) g_ticker_thread.join();
+}
 void platform_start_ticker(void (*cb)(), unsigned period_us) {
-    std::thread([cb, period_us] {
-        for (;;) {
+    platform_stop_ticker();
+    g_ticker_stop = false;
+    g_ticker_thread = std::thread([cb, period_us] {
+        while (!g_ticker_stop.load()) {
             usleep(period_us);
-            cb();
+            if (!g_ticker_stop.load()) cb();
         }
-    }).detach();
+    });
 }
 
 // ------------------------------------------------------------------- files
