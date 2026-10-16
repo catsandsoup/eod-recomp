@@ -6,6 +6,7 @@
 // Interrupts are delivered only at safe points: loop back-edges in
 // recompiled code (IRQ_CHECK), syscalls and the idle loop.
 #include "kernel.h"
+#include "vblank_input.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -329,17 +330,40 @@ void service_events(bool run_alarms) {
         if (now > g_next_vblank_us + 12 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
         g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
-        iop_pad_vblank();
+        // SDL refreshes keyboard/gamepad state while pumping events. Publish
+        // that fresh state before GS backpressure or this vblank's IRQ.
+        static const bool input_timing = getenv("EOD_INPUT_TIMING") != nullptr;
+        static uint64_t previous_input_us, last_timing_us, max_gap, max_pump_dma, max_gs_block;
+        static unsigned timing_lines;
+        uint64_t input_begin = input_timing ? platform_time_us() : 0;
+        if (!vblank_poll_input()) {
+            LOG(LOG_CORE, "window closed - exiting");
+            exit(0);
+        }
+        uint64_t input_end = input_timing ? platform_time_us() : 0;
         gs_vblank();
+        if (input_timing) {
+            uint64_t gs_end = platform_time_us();
+            uint64_t gap = previous_input_us ? input_begin - previous_input_us : 0;
+            if (gap > max_gap) max_gap = gap;
+            if (input_end - input_begin > max_pump_dma) max_pump_dma = input_end - input_begin;
+            if (gs_end - input_end > max_gs_block) max_gs_block = gs_end - input_end;
+            if (!last_timing_us) last_timing_us = input_begin;
+            if (timing_lines < 120 && input_begin - last_timing_us >= 1000000) {
+                fprintf(stderr, "[input-timing] vblank=%llu max_pump_gap_us=%llu max_pump_dma_us=%llu max_gs_block_us=%llu\n",
+                        (unsigned long long)g_vblank_count, (unsigned long long)max_gap,
+                        (unsigned long long)max_pump_dma, (unsigned long long)max_gs_block);
+                ++timing_lines;
+                last_timing_us = input_begin;
+                max_gap = max_pump_dma = max_gs_block = 0;
+            }
+            previous_input_us = input_begin;
+        }
         if (g_vsync_flag_addr) {
             ee_w32(g_vsync_flag_addr, 1);
             if (g_vsync_flag_cnt_addr) MEM_SD(g_vsync_flag_cnt_addr, g_vblank_count);
         }
         intc_raise(INTC_VBLANK_S);
-        if (!platform_pump()) {
-            LOG(LOG_CORE, "window closed - exiting");
-            exit(0);
-        }
     }
     for (int i = 0; i < 64 && run_alarms; i++) {
         Alarm &a = g_alarms[i];
