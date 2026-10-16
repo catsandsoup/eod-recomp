@@ -8,12 +8,13 @@ Faithful physics, damage, AI and progression remain required within these flows.
 distance and widescreen/ultrawide visibility to a high priority workstream;
 preserve a faithful baseline alongside scalable quality up to high-end 8K PCs.
 
-The owner's latest priority is custom single-player matches and local multiplayer
-at 100% game speed, with 4K-or-higher internal rendering and correctly proportioned
-16:10/16:9 presentation. Career testing is now owned by the user. Keyboard controls
-must follow racing conventions: WASD/arrows to drive, Space to brake, Enter to
-accept menus, and Esc to go back/pause. Screenshot milestones and verified source
-checkpoints should be shared periodically.
+The owner's latest priority is 1:1 native 1x PS2 resolution and original 4:3,
+correct original timing, stability and full speed without frame skipping. Next:
+LOD/draw distance and properly anchored widescreen; then higher resolutions in
+sequence; then higher FPS. DLSS is last. Custom single-player and local multiplayer
+are the main automated journeys; the owner tests career. Keyboard controls follow
+racing conventions: WASD/arrows drive, Space brakes, Enter accepts menus, and Esc
+goes back/pauses. Share real screenshots and verified source checkpoints.
 
 | Journey | Acceptance | Evidence and remaining work |
 | --- | --- | --- |

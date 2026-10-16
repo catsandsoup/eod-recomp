@@ -1,5 +1,10 @@
 # macOS (Apple Silicon) port — status
 
+> Current acceptance and branch map: [DEVELOPER_HANDOFF.md](DEVELOPER_HANDOFF.md).
+> Historical speed samples below describe their specific builds/scenes. They do
+> not establish current full-game 1:1 accuracy or full-speed heavy multiplayer.
+> Current goal is native 1x/4:3 with no frame skipping before enhancements.
+
 Branch `macos` of catsandsoup/eod-recomp. Native arm64 build of the same
 recompiled game code; no emulator, no Rosetta.
 
@@ -124,8 +129,8 @@ cmake --build build-mac -j3
 
 The plain `build-mac/eod` remains available. The `eod_app` target creates
 `~/Library/Application Support/TDEODRecomp/local-build/Eve of Destruction.app`
-with its non-system dylib dependency closure, local rpaths, generic macOS
-placeholder icon, and ad-hoc signature. `EOD_APP_OUTPUT` chooses another output
+with its non-system dylib dependency closure, local rpaths, the TDEOD
+app icon, and ad-hoc signature. `EOD_APP_OUTPUT` chooses another output
 directory. Use a directory outside iCloud/FileProvider: Finder metadata can
 invalidate code signing inside synced Documents folders. The minimum macOS
 version in Info.plist is derived from the executable and bundled dependencies

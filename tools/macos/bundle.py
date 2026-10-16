@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Copy the linked non-system dylib closure and sign a personal .app locally."""
-import pathlib, shutil, subprocess, sys, plistlib, re, json, os
+import pathlib, shutil, subprocess, sys, plistlib, re, json, os, tempfile
 app=pathlib.Path(sys.argv[1]).resolve()
 if len(sys.argv)>2:
     (app/'Contents/MacOS').mkdir(parents=True,exist_ok=True)
@@ -61,8 +61,19 @@ while pending:
             pending.append((actual,target))
         subprocess.run(['install_name_tool','-change',dep,'@rpath/'+target.name,str(dst)],check=True)
 resources=app/'Contents/Resources'; resources.mkdir(exist_ok=True)
-icon=pathlib.Path('/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns')
-if icon.exists(): shutil.copyfile(icon,resources/'AppIcon.icns')
+# Build the standard macOS icon representations from the checked-in source art.
+# iconutil/sips ship with macOS; no extra image library or generated binary in Git.
+icon=pathlib.Path(__file__).with_name('assets')/'AppIcon.png'
+if not icon.is_file(): raise RuntimeError(f'Missing app icon source: {icon}')
+with tempfile.TemporaryDirectory(prefix='eod-icon-') as temp:
+    iconset=pathlib.Path(temp)/'AppIcon.iconset'; iconset.mkdir()
+    for size in (16,32,128,256,512):
+        for scale in (1,2):
+            suffix='@2x' if scale==2 else ''
+            subprocess.run(['sips','-z',str(size*scale),str(size*scale),str(icon),
+                '--out',str(iconset/f'icon_{size}x{size}{suffix}.png')],
+                check=True,stdout=subprocess.DEVNULL)
+    subprocess.run(['iconutil','-c','icns',str(iconset),'-o',str(resources/'AppIcon.icns')],check=True)
 licenses=resources/'Licenses'; licenses.mkdir(exist_ok=True)
 # Prefer the license belonging to the pinned SDL source actually compiled.
 sdl_license=pathlib.Path(sys.argv[2]).resolve().parent/'_deps/sdl3-src/LICENSE.txt' if len(sys.argv)>2 else pathlib.Path('/opt/homebrew/opt/sdl3/LICENSE.txt')
