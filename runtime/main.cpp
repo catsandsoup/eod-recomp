@@ -177,6 +177,11 @@ int main(int argc, char **argv) {
     if (list_pads || watch_pads > 0) return platform_list_pads(watch_pads);
 #ifdef __APPLE__
     if (!replay) {
+        // Honor an explicit environment path before trying local disc discovery.
+        if (data_dir.empty()) {
+            const char *env_data = getenv("EOD_DATA");
+            if (env_data && env_data[0]) data_dir = env_data;
+        }
         bool headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
         if (headless && data_dir.empty()) {
             for (const auto &candidate : {dir_of(argv[0]), std::string(".")}) {
