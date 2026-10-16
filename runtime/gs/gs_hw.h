@@ -32,6 +32,9 @@ void draw_point(const Env &e, const Vertex &a);
 // The CPU is about to write these actual buffered pixels atomically. For a
 // host transfer this is each supplied chunk, not its declared TRXREG extent.
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
+// All prepared CPU bytes are now supplied; upload proven complete storage
+// blocks into retained GPU owners without reading their untouched pixels back.
+void vram_write_complete();
 // The CPU is about to read GS memory there (transfer source, CLUT load):
 // rendered contents are copied back to gs::vram first.
 void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);

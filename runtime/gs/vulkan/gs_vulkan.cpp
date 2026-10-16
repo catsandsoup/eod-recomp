@@ -27,6 +27,7 @@
 #include "../gs_swizzle.h"
 #include "vk_compat.h"
 #include "gs_page_coverage.h"
+#include "gpu_upload_blocks.h"
 
 namespace gs {
 namespace hw {
@@ -232,6 +233,16 @@ Surface *g_owner[kPages]; // nullptr: the CPU copy is current
 bool g_vram_ok[kPages];   // a surface owns the page and gs::vram also holds its
                           // contents
 uint64_t g_frame_no;
+// Proof of CPU/GPU equality for every storage bit in these physical blocks.
+// Actual complete CPU uploads add bits; any later GPU draw acquisition clears
+// them conservatively. These are independent of diagnostic drawn footprints.
+uint32_t g_cpu_valid_blocks[kPages]{};
+struct PendingUpload { Surface *owner; uint32_t page, valid_blocks; UploadBlockRect rect; };
+std::vector<PendingUpload> g_pending_uploads;
+bool gpu_uploads_enabled() {
+    static const bool enabled = [] { const char *v = getenv("EOD_GPU_UPLOADS"); return !v || atoi(v) != 0; }();
+    return enabled;
+}
 
 // Diagnostic-only, conservative GS block footprints. These never decide
 // ownership, synchronization, or whether a required readback is performed.
@@ -962,6 +973,7 @@ void acquire(Surface *s, int x0, int y0, int x1, int y1) {
     for (const PageRect &p : pages) {
         g_owner[p.page] = s;
         g_vram_ok[p.page] = false; // about to be drawn: the CPU copy goes stale
+        g_cpu_valid_blocks[p.page] = 0;
     }
     if (readback_trace_enabled())
         diagnostic_blocks(s->bp,s->bw,s->psm,x0,y0,x1-x0,y1-y0,
@@ -1282,6 +1294,28 @@ struct TexSource {
 TexSource texture_for(const Env &e, Surface *target) {
     TexSource ts;
     int levels = tex_levels(e);
+    // A page may still contain unrelated GPU-owned pixels while every block
+    // this texture requests was completely supplied by the CPU. Decode that
+    // current CPU data directly; acquiring a GPU texture view would discard
+    // the validity proof and can force a later, unnecessary palette readback.
+    bool cpu_current = true;
+    for (int i = 0; i < levels && cpu_current; ++i) {
+        const PageCoverage requested = page_coverage(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0,
+            std::max(1, (int)e.tw >> i), std::max(1, (int)e.th >> i));
+        for (uint32_t n = 0; n < requested.count; ++n) {
+            uint32_t p = requested.pages[n];
+            if (g_owner[p] && !g_vram_ok[p] && (requested.touched[p] & ~g_cpu_valid_blocks[p])) {
+                cpu_current = false;
+                break;
+            }
+        }
+    }
+    if (cpu_current) {
+        ts.srv = vram_texture(e);
+        ts.w = (float)e.tw;
+        ts.h = (float)e.th;
+        return ts;
+    }
     // a surface drawn at the texture's address (the usual render-to-texture case)
     Surface *owner = nullptr;
     bool mixed = false, gpu = false;
@@ -1779,6 +1813,20 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
         // is overwritten by the actual buffered chunk. Masked/partial writes
         // preserve its GPU contents before the CPU modifies them.
         if (g_owner[p] && !g_vram_ok[p] && written.complete[p] != 0xffffffffu) {
+            // Only storage blocks proven supplied by this chunk can be patched
+            // without a host read. Partial/masked blocks keep the fallback.
+            std::vector<UploadBlockRect> patches;
+            Surface *owner = g_owner[p];
+            if (gpu_uploads_enabled() && written.complete[p] == written.touched[p] &&
+                gpu_upload_blocks(owner->bp, owner->bw, owner->psm, owner->w, owner->h,
+                                  p, written.complete[p], patches)) {
+                for (const auto &rect : patches) g_pending_uploads.push_back({owner, p, written.complete[p], rect});
+                g_vram_ok[p] = false;
+                continue;
+            }
+            if (readback_trace_enabled() && readback_trace_line())
+                fprintf(stderr, "[gs-readback] cpu-write-preserve bp=%x bw=%u psm=%x rect=%d,%d,%d,%d page=%u owner=%x/%u/%x depth=%d\n",
+                        bp,bw,psm,x,y,w,h,p,g_owner[p]->bp,g_owner[p]->bw,g_owner[p]->psm,int(g_owner[p]->depth));
             g_rb_reason = 0;
             readback_pages(p * 32, 1, PSMCT32, 0, 0, 64, 32);
         }
@@ -1791,6 +1839,39 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
         // Remaining old contents are now preserved or provably overwritten.
         g_owner[p] = nullptr;
         g_vram_ok[p] = false;
+        g_cpu_valid_blocks[p] = 0;
+    }
+    g_state_valid = false;
+}
+
+void vram_write_complete() {
+    if (!g_on || g_pending_uploads.empty()) return;
+    // A later region in this same chunk may have invalidated an earlier owner.
+    // Patch only owners still retained. All actual CPU bytes are now present.
+    std::vector<PendingUpload> pending;
+    pending.swap(g_pending_uploads);
+    std::vector<Surface *> owners;
+    for (const auto &p : pending)
+        if (g_owner[p.page] == p.owner && std::find(owners.begin(), owners.end(), p.owner) == owners.end())
+            owners.push_back(p.owner);
+    for (Surface *owner : owners) {
+        std::vector<PageRect> rects;
+        for (const auto &p : pending)
+            if (p.owner == owner && g_owner[p.page] == owner)
+                rects.push_back({p.page, p.rect.x, p.rect.y, p.rect.w, p.rect.h});
+        std::sort(rects.begin(), rects.end(), [](const PageRect &a, const PageRect &b) {
+            if (a.y != b.y) return a.y < b.y;
+            if (a.x != b.x) return a.x < b.x;
+            if (a.w != b.w) return a.w < b.w;
+            return a.h < b.h;
+        });
+        rects.erase(std::unique(rects.begin(), rects.end(), [](const PageRect &a, const PageRect &b) {
+            return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+        }), rects.end());
+        for_rects(rects, [&](int x, int y, int w, int h) { upload_rect(owner, x, y, w, h); });
+        ++owner->version; // rendered-texture conversions must observe the patch
+        for (const auto &p : pending)
+            if (p.owner == owner && g_owner[p.page] == owner) g_cpu_valid_blocks[p.page] |= p.valid_blocks;
     }
     g_state_valid = false;
 }
@@ -1806,7 +1887,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
     for (uint32_t i = 0; i < requested.count; ++i) {
         uint32_t p = requested.pages[i];
         Surface *o = g_owner[p];
-        if (!o || g_vram_ok[p])
+        if (!o || g_vram_ok[p] || !(requested.touched[p] & ~g_cpu_valid_blocks[p]))
             continue;
         if (trace && readback_trace_line())
             fprintf(stderr,"[gs-readback] frame=%llu cpu-read reason=%d request_bp=%x psm=%x rect=%d,%d,%d,%d page=%u owner_bp=%x owner_psm=%x requested_blocks=%08x drawn_blocks=%08x overlap=%08x\n",
@@ -1818,6 +1899,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
             if (q.page == p) {
                 readback_rect(o, q.x, q.y, q.w, q.h);
                 g_vram_ok[p] = true;
+                g_cpu_valid_blocks[p] = 0xffffffffu;
                 if (trace) g_diag_draw_blocks[p] = 0;
             }
         if (!g_vram_ok[p]) { // not part of the surface's rows (shouldn't happen):
@@ -2130,8 +2212,10 @@ void reset() {
     if (!g_on)
         return;
     flush();
+    g_pending_uploads.clear();
     memset(g_owner, 0, sizeof g_owner);
     memset(g_vram_ok, 0, sizeof g_vram_ok);
+    memset(g_cpu_valid_blocks, 0, sizeof g_cpu_valid_blocks);
     memset(g_diag_draw_blocks, 0, sizeof g_diag_draw_blocks);
     g_state_valid = false;
     for (TempTex &t : g_temp)
