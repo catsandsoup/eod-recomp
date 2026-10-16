@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-#include <xmmintrin.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__aarch64__)
+#include "sse_compat.h"  // MXCSR on x86, FPCR.FZ on arm64
 #define HAVE_SSE 1
 #endif
 

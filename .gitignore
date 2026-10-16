@@ -11,3 +11,4 @@ SLUS_209.10
 system.cnf
 SYSTEM.CNF
 release/
+.venv/

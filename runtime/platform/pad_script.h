@@ -1,41 +1,83 @@
-// pad_script.h - scripted controller input for automated testing:
-// EOD_PAD_SCRIPT="frame:buttons_hex,frame:buttons_hex,..." (active-high
-// PadButton bits; each entry holds from its vblank on).
+// pad_script.h - scripted controller input for automated testing.
+//
+//   EOD_PAD_SCRIPT  = port 0 (player 1)
+//   EOD_PAD_SCRIPT1 = port 1 (player 2)
+//
+// Each is "frame:buttons_hex[:lx:ly],frame:buttons_hex[:lx:ly],..." with
+// active-high PadButton bits and optional left stick bytes (0..255, 128 =
+// centre); each entry holds from its vblank on. Two scripts together drive
+// both player ports, which is how 2-player split screen is tested without
+// two physical pads.
 #pragma once
 #include <cstdint>
 #include <cstdlib>
 #include <string>
-#include <utility>
 #include <vector>
+
+#include "platform.h"
 
 extern uint64_t kernel_vblank_count();
 
-// Buttons the script holds now; false when no script is set.
-inline bool pad_script_buttons(uint16_t &buttons) {
-    static std::vector<std::pair<uint64_t, uint16_t>> script;
-    static bool parsed, active;
+struct PadScriptEntry {
+    uint64_t frame;
+    uint16_t buttons;
+    uint8_t lx, ly;
+};
+
+// Fills out (buttons, left stick, pressure) from the port's script; false
+// when no script is set for that port.
+inline bool pad_script_state(int port, HostPadState *out) {
+    static std::vector<PadScriptEntry> script[2];
+    static bool parsed, active[2];
     if (!parsed) {
         parsed = true;
-        if (const char *s = getenv("EOD_PAD_SCRIPT")) {
-            active = true;
+        const char *names[2] = {"EOD_PAD_SCRIPT", "EOD_PAD_SCRIPT1"};
+        for (int p = 0; p < 2; p++) {
+            const char *s = getenv(names[p]);
+            if (!s) continue;
+            active[p] = true;
             std::string str(s);
             size_t pos = 0;
             while (pos < str.size()) {
                 size_t comma = str.find(',', pos);
                 std::string tok = str.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-                size_t colon = tok.find(':');
-                if (colon != std::string::npos)
-                    script.push_back({strtoull(tok.c_str(), nullptr, 10),
-                                      (uint16_t)strtoul(tok.c_str() + colon + 1, nullptr, 16)});
+                PadScriptEntry e = {0, 0, 128, 128};
+                char *end = nullptr;
+                e.frame = strtoull(tok.c_str(), &end, 10);
+                if (end && *end == ':') {
+                    e.buttons = (uint16_t)strtoul(end + 1, &end, 16);
+                    if (end && *end == ':') {
+                        e.lx = (uint8_t)strtoul(end + 1, &end, 10);
+                        if (end && *end == ':') e.ly = (uint8_t)strtoul(end + 1, &end, 10);
+                    }
+                    script[p].push_back(e);
+                }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
         }
     }
-    if (!active) return false;
+    if (port < 0 || port > 1 || !active[port]) return false;
     uint64_t f = kernel_vblank_count();
-    buttons = 0;
-    for (auto &e : script)
-        if (f >= e.first) buttons = e.second;
+    PadScriptEntry cur = {0, 0, 128, 128};
+    for (auto &e : script[port])
+        if (f >= e.frame) cur = e;
+    *out = HostPadState();
+    out->connected = true;
+    out->buttons = cur.buttons;
+    out->lx = cur.lx;
+    out->ly = cur.ly;
+    static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
+                                       PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
+    for (int i = 0; i < 12; i++)
+        if (out->buttons & order[i]) out->pressure[i] = 255;
+    return true;
+}
+
+// Port 0's buttons only (the Win32 backend's original interface).
+inline bool pad_script_buttons(uint16_t &buttons) {
+    HostPadState s;
+    if (!pad_script_state(0, &s)) return false;
+    buttons = s.buttons;
     return true;
 }
