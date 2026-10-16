@@ -28,6 +28,8 @@ struct Port {
     bool open = false;
     uint32_t pad_area = 0;   // EE address of 2 x 128 bytes
     uint32_t iop_buf = 0;    // IOP address receiving EE actuator data
+    uint32_t act_seq = 0;    // sequence number of the last actuator packet applied
+    uint8_t motors[2] = {};  // small, large as last sent to the host
     uint32_t frame = 0;
     bool analog = true;      // DualShock analog mode
     bool pressure = false;   // pressure sensitive buttons enabled
@@ -44,6 +46,39 @@ uint32_t rd32(const uint8_t *p) {
     return v;
 }
 void wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+
+void set_motors(int port, int slot, uint8_t small, uint8_t large) {
+    Port &p = g_ports[port][slot];
+    if (slot != 0 || (p.motors[0] == small && p.motors[1] == large)) return;  // no multitap
+    p.motors[0] = small;
+    p.motors[1] = large;
+    LOG(LOG_PAD, "pad %d vibration small %d large %d", port, small, large);
+    platform_set_vibration(port, small, large);
+}
+
+// scePadSetActDirect (00390678) puts {sequence, 1, 6, actData[6]} in a
+// 32-byte packet and 0038F878 increments the sequence and DMAs it to
+// iop_buf + (sequence & 1) * 32.  Apply the newest packet not applied yet;
+// actData[i] drives the motor that scePadSetActAlign assigned to slot i
+// (0 = small, on/off; 1 = large, 0-255).
+void read_actuators(int port, int slot) {
+    Port &p = g_ports[port][slot];
+    const uint8_t *newest = nullptr;
+    for (int half = 0; half < 2; half++) {
+        const uint8_t *a = g_iop_ram + p.iop_buf + half * 32;
+        uint32_t seq = rd32(a);
+        if ((int32_t)(seq - p.act_seq) <= 0 || rd32(a + 4) != 1 || rd32(a + 8) != 6) continue;
+        if (!newest || (int32_t)(seq - rd32(newest)) > 0) newest = a;
+    }
+    if (!newest) return;
+    p.act_seq = rd32(newest);
+    uint8_t small = 0, large = 0;
+    for (int i = 0; i < 6; i++) {
+        if (p.act_align[i] == 0) small = newest[12 + i] ? 1 : 0;
+        else if (p.act_align[i] == 1) large = newest[12 + i];
+    }
+    set_motors(port, slot, small, large);
+}
 
 void write_pad_data(int port, int slot) {
     Port &p = g_ports[port][slot];
@@ -88,11 +123,7 @@ void write_pad_data(int port, int slot) {
     if (!hs.connected) d[1] = 0;
     ee_write_block(p.pad_area + (p.frame & 1) * 128, d, 128);
 
-    // vibration values the EE sent with scePadSetActDirect (2 x 32 bytes)
-    if (p.iop_buf) {
-        const uint8_t *a = g_iop_ram + p.iop_buf + ((p.frame - 1) & 1) * 32;
-        (void)a;
-    }
+    if (p.iop_buf) read_actuators(port, slot);
 }
 
 }  // namespace
@@ -117,6 +148,8 @@ void iop_pad_init() {
             p.open = true;
             p.pad_area = rd32(buf + 0x10);
             if (!p.iop_buf) p.iop_buf = iop_alloc(64);
+            memset(g_iop_ram + p.iop_buf, 0, 64);  // the EE's packet sequence starts over
+            p.act_seq = 0;
             p.req_state = PAD_RSTAT_COMPLETE;
             LOG(LOG_PAD, "pad open port %d slot %d area %08x", port, rd32(buf + 8), p.pad_area);
             wr32(buf + 0x14, p.iop_buf);
@@ -163,6 +196,7 @@ void iop_pad_init() {
             break;
         case 0x0E:  // CLOSE
             g_ports[port][slot].open = false;
+            set_motors(port, slot, 0, 0);
             break;
         case 0x0F:  // END
         case 0x10:  // INIT
