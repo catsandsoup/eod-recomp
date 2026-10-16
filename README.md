@@ -123,7 +123,9 @@ USB detection, trigger feel and rumble still need a connected device.
 Current rendering work: menu font interiors are corrected, and matched race
 captures support added horizontal scenery with preserved proportions. Full-speed
 4K multiplayer, the reported thin black lines and visible keyboard latency are
-still under investigation. See [current evidence and limits](docs/STATUS.md).
+still under investigation. An experimental CPU-upload preservation candidate on
+`macos-cpu-preservation` passes full-VRAM comparisons at 1x/6x, but its
+readback cost worsens performance; it is not enabled on `macos`. See [current evidence and limits](docs/STATUS.md).
 
 Developer build steps, measured performance and known fidelity limits:
 [docs/MACOS.md](docs/MACOS.md). The next visual priority is much longer
@@ -134,6 +136,11 @@ baseline. CPU submission and asset streaming need separate work from GPU pixel
 cost. DLSS is deferred until the very last stage. This is planned work, not a claim of zero
 pop-in today. See [LOD/culling scope](docs/MODDING_SCOPE.md). High-refresh and
 other mods remain deferred.
+
+The [LOD/culling investigation](docs/LOD_CULLING_INVESTIGATION.md) identifies
+per-car load-time thresholds and the native CPU visibility test. These are
+implementation targets; expanded draw distance and quality tiers are not yet
+enabled.
 
 ## Game files
 

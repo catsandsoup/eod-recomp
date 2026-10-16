@@ -75,3 +75,35 @@ exposed a concrete rumble issue: the target's actuator function at 0x00390678
 uses a sequenced DMA packet, unlike the newer SDK's RPC route. Target-derived
 packet tests are the evidence for the fix, rather than assuming current SDK
 source exactly matches the 2004 game.
+
+## Readback-cost follow-up and standing reuse rule — October 16, 2026
+
+The owner explicitly requires checking existing projects online, Context7 and
+SDK sources before designing replacements. This is now in root `AGENTS.md`.
+Rechecked Road Trip's live third-party listing: PS2Recomp still pins
+`818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4`.
+
+The [accurate backend](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/gs_pgs_backend.cpp)
+mirrors GIF packets through `gif_transfer`; CPU primitive/image-upload callbacks
+are empty. `BeginTransfer` pulls GPU VRAM for local-to-host reads; `ReadVram`
+and snapshots also synchronize. Reuse this packet-mirror/CPU-read boundary as
+the next comparison target, building on the existing local paraLLEl-GS oracle.
+It avoids designing another complete GS. Arbitrary EOD replay-state import,
+M2 Pro performance and the required resolution still need verification.
+
+The [hardware backend](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/hw/gs_hw_backend.cpp)
+reports render-target local-to-local copies and local-to-host reads as
+unsupported in `BeginTransfer`. Its CPU upload/version-hash approach is useful
+reference, but it cannot establish EOD transfer fidelity. The slower candidate
+is therefore retained separately rather than replaced blindly by this path.
+
+Context7 `/khronosgroup/moltenvk` was queried again for submission/readback
+behavior. Its [configuration reference](https://github.com/KhronosGroup/MoltenVK/blob/main/Docs/MoltenVK_Configuration_Parameters.md)
+explains synchronous queue processing and prefilled command-buffer limits.
+These affect scheduling; they do not remove required data dependencies.
+EOD's current `vk_compat.h::Map(Texture*)` submits and waits per map. Changing
+configuration alone is not evidence that 58 required readbacks become cheap.
+Do not tune blind, skip preservation or start DLSS work to conceal this cost.
+
+Downloaded public source references are ignored under `work/references/`;
+no third-party implementation was copied into the production renderer here.
