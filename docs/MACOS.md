@@ -97,6 +97,14 @@ Both sticks use a dead zone and the full 0..255 range. These mappings expose
 PS2 L2/R2 pressure; the game's selected control scheme determines the actual
 throttle and brake bindings.
 
+Native settings also expose an opt-in Modern controller layout, persisted as
+`[Input] ControllerLayout=modern` (default `original`). After relaunch, RT feeds
+Cross pressure and LT feeds Square pressure, which the game's classic schemes
+read as analog gas/brake. It suppresses the triggers' L2/R2 actions to avoid
+double actions. Face buttons/keyboard keep full pressure even when a partial
+trigger is held. Virtual tests cover partial/released triggers and two-port
+isolation; physical driving feel remains unverified.
+
 Hardware-free checks (headless and muted):
 
 ```sh

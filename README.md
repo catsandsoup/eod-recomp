@@ -54,9 +54,36 @@ In order of priority:
 
 ## macOS (Apple Silicon)
 
-This fork adds a native arm64 macOS build (SDL3 window, audio and
-controllers; two player ports for split screen). Build steps, status and
-known gaps: [docs/MACOS.md](docs/MACOS.md).
+This fork adds a native arm64 Mac app with Vulkan/MoltenVK graphics, SDL3
+audio and two independent player ports for split screen. It is still a work
+in progress; [the player journey](docs/PLAYER_JOURNEY.md) distinguishes tested
+outcomes from remaining gaps.
+
+Open the locally built **Eve of Destruction.app** and select your own North
+American v1.00 PS2 ISO or disc folder when prompted. The app installs a local
+copy with progress and remembers it for later launches. No game files are
+included. The app bundles its runtime libraries; players do not need Homebrew
+or Xcode.
+
+During play, **F1** or **Cmd+,** opens native settings for display size,
+fullscreen, aspect, smoothing, resolution scale, VSync, sound/volume,
+keyboard bindings/player port, vibration and save/disc locations. Settings
+are stored in `~/Library/Application Support/TDEODRecomp/eod.ini`; saves and
+the installed disc are beside it. The settings dialog identifies changes
+that require a relaunch. The current settings use standard Mac controls;
+game-themed presentation remains unfinished.
+
+With the default keyboard on player 1, the first controller takes player 2.
+For two controllers in plug order, set **Keyboard port** to **0** and restart.
+**Controller layout** offers Original (the default PS2 mapping) and Modern
+(analog RT gas / LT brake through Cross/Square pressure); restart after changing
+it. Modern is intended for the game's classic control schemes. Changing the
+game's own bindings can change which actions those inputs perform.
+Scripted two-player racing and virtual pads are verified; physical Rock Candy
+USB detection, trigger feel and rumble still need a connected device.
+
+Developer build steps, measured performance and known fidelity limits:
+[docs/MACOS.md](docs/MACOS.md). High-refresh and mod work remain deferred.
 
 ## Game files
 
