@@ -19,6 +19,7 @@
 #include "../../platform/platform.h"
 #include "../../platform/screenshot_size.h"
 #include "../../platform/presentation.h"
+#include "alpha_order.h"
 #include "../gs_hw.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
@@ -422,6 +423,7 @@ struct DrawState {
     uint32_t depth_key;           // see depth_state()
     int scissor[4];
     bool two_pass; // alpha test with a fail mode that still writes something
+    bool fb_only_alpha_failure; // candidate for exact constant-depth batching
     uint32_t fail_blend_key, fail_depth_key;
     DrawCB cb;
 };
@@ -530,11 +532,13 @@ void flush() {
     // take the pages under the batch (not the whole scissor: buffers share memory
     // with textures)
     float mx0 = 1e9f, my0 = 1e9f, mx1 = -1e9f, my1 = -1e9f;
+    uint32_t min_z=UINT32_MAX,max_z=0;
     for (const HwVertex &v : verts) {
         mx0 = std::min(mx0, v.x);
         my0 = std::min(my0, v.y);
         mx1 = std::max(mx1, v.x);
         my1 = std::max(my1, v.y);
+        min_z=std::min(min_z,v.z);max_z=std::max(max_z,v.z);
     }
     int sc = g_scale;
     int bx0 = std::max((int)floorf(mx0) - 1, s.scissor[0] / sc),
@@ -588,7 +592,18 @@ void flush() {
     g_ctx->RSSetState(g_rs_scissor);
     D3D11_RECT r = {s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3]};
     g_ctx->RSSetScissorRects(1, &r);
-    if (s.two_pass) {
+    const auto ztest=((s.depth_key>>1)&15)==D3D11_COMPARISON_GREATER_EQUAL ? alpha_order::Test::GreaterEqual :
+                     ((s.depth_key>>1)&15)==D3D11_COMPARISON_ALWAYS ? alpha_order::Test::Always : alpha_order::Test::Other;
+    if (s.two_pass && alpha_order::defer_depth(s.fb_only_alpha_failure,s.depth_key&32,ztest,min_z,max_z)) {
+        // FB_ONLY writes color for both alpha outcomes. With a constant Z and
+        // GEQUAL/ALWAYS, earlier depth writes cannot change later visibility.
+        // Keep ALL color draws in native order, then write passing depth only.
+        DrawState color=s;color.two_pass=false;color.depth_key&=~32u;
+        draw_batch(color,first,count,false);
+        DrawState depth=s;depth.two_pass=false;depth.cb.flags|=0x400u;
+        depth.blend_key&=~(15u<<14);
+        draw_batch(depth,first,count,false);
+    } else if (s.two_pass) {
         // Alpha-fail writes are part of each GS primitive, not a second layer
         // over the whole batch. A later glyph fill must follow an earlier
         // shadow's FB_ONLY pixels, including when the alpha test fails.
@@ -1535,6 +1550,7 @@ void build_state(const Env &e, int topology) {
             s.cb.flags |= 0x400; // keep passing pixels only
         } else {
             s.two_pass = true;
+            s.fb_only_alpha_failure=fb_only && !e.date;
             uint32_t fmask = fb_only ? mask : zb_only ? 0 : (mask & 7);
             s.fail_blend_key = (bkey & ~(15u << 14)) | (fmask << 14);
             s.fail_depth_key = zb_only ? dkey : (dkey & ~32u);
