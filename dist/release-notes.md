@@ -21,8 +21,9 @@ The game is **not** included: you need your own copy of the NTSC-U disc (`SLUS_2
 
 ## Fixes in this version
 
-* Race music no longer plays over the menu music after leaving a race
-* Movie audio no longer repeats stale sound when decoding falls behind
-* The widescreen picture no longer returns to stretched 4:3 after the first movie
+* The game's controller setup now completes: the pad driver returns each command's result where the game reads it, so the "Set actAlign" error path (vibration setup) is no longer taken (#4, thanks catsandsoup)
+* The game's Exit call and a returning entry point now shut down cleanly like the other exits (#3, thanks catsandsoup)
+
+Fixed in 1.0: race music playing over the menu music after leaving a race; stale movie audio when decoding falls behind; widescreen returning to stretched 4:3 after the first movie.
 
 Known issues and bug reports: https://github.com/pareidolico/eod-recomp/issues
