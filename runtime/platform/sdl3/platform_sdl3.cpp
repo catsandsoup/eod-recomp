@@ -143,6 +143,7 @@ bool platform_init(const PlatformConfig &cfg) {
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
     sdl_input::set_keyboard_port(sdl_input::keyboard_port_from_env());
+    sdl_input::set_controller_layout(g_config.controller_layout == "modern");
     sdl_input::set_hints();
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
     if (!g_headless) flags |= SDL_INIT_VIDEO;
