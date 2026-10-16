@@ -162,6 +162,7 @@ void iop_pad_init() {
             break;
         }
         case 0x06: {  // SET_MMODE(port, slot, mode, lock)
+            result_offset = 0x14; // target 0x0039062C
             Port &p = g_ports[port][slot];
             p.analog = rd32(buf + 0xC) != 0;
             p.lock = (uint8_t)rd32(buf + 0x10);
@@ -185,6 +186,7 @@ void iop_pad_init() {
             result = 0x3FFFF;
             break;
         case 0x0A: {  // SET_BTNINFO: enables pressure sensitive buttons
+            result_offset = 0x10; // target 0x00390930
             Port &p = g_ports[port][slot];
             p.pressure = rd32(buf + 0xC) != 0;
             p.req_state = PAD_RSTAT_COMPLETE;
@@ -192,6 +194,7 @@ void iop_pad_init() {
             break;
         }
         case 0x0B:  // SET_VREF
+            result_offset = 0x1C; // target 0x00390B0C
             break;
         case 0x0C:  // GET_PORTMAX
             result = 2;
