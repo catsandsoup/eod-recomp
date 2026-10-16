@@ -1,5 +1,7 @@
 // platform_posix.cpp - Linux/macOS backend used for development and
 // automated testing.  Runs headless (frames can be dumped to disk).
+// With EOD_SDL3, sdl3/platform_sdl3.cpp provides the window, input and audio
+// and this file only time, fibers, the ticker and files.
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -21,6 +23,7 @@
 #include <thread>
 #include "../pad_script.h"
 
+#if !defined(EOD_SDL3)
 static PlatformConfig g_cfg;
 
 bool platform_init(const PlatformConfig &cfg) {
@@ -43,6 +46,7 @@ void platform_present(const uint32_t *pixels, int width, int height, int stride)
     g_last_w = width;
     g_last_h = height;
 }
+#endif  // !EOD_SDL3
 
 uint64_t platform_time_us() {
     timespec ts;
@@ -66,6 +70,7 @@ int platform_cpu_count() {
     return n ? (int)n : 1;
 }
 
+#if !defined(EOD_SDL3)
 // Input: only scripted (EOD_PAD_SCRIPT, see pad_script.h).
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
@@ -118,6 +123,7 @@ void platform_audio_submit(const int16_t *samples, int frames) {
     fseek(f, pos, SEEK_SET);
 }
 int platform_audio_queued_frames() { return 0; }
+#endif  // !EOD_SDL3
 
 // ------------------------------------------------------------------ fibers
 #if defined(__aarch64__)
@@ -313,6 +319,7 @@ bool platform_find_file(const char *root, const char *rel, char *out, size_t out
 
 bool platform_mkdir(const char *path) { return mkdir(path, 0755) == 0; }
 
+#if !defined(EOD_SDL3)
 // Exposes the last presented frame for screenshots in headless mode.
 bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {
     if (g_last_frame.empty()) return false;
@@ -321,6 +328,7 @@ bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {
     h = g_last_h;
     return true;
 }
+#endif
 
 bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out) {
     DIR *d = opendir(path);
