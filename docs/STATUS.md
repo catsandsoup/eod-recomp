@@ -63,10 +63,12 @@ from changing the game simulation rate. Mod implementation remains parked;
 All three component branches are merged locally into `macos`. Controller source
 includes the target SDK 2.8 sequenced DMA rumble route (`1325441`) as well as the
 RPC path, with producer-derived regression tests and independent code review.
-The combined native build passes ten CTests: virtual input, pad RPC/DMA,
+The combined native build passes eighteen CTests: virtual input, pad RPC/DMA,
 memory-card persistence across processes, ISO9660/import, headless Mac startup,
 relocated Vulkan path selection, offline audio volume, procedural GS pixel arithmetic and actual Vulkan pixels,
-and the deferred refresh-cadence policy.
+native camera selection (four aspect cases), keyboard context, scripted analog
+pressure, movie full-state differential behavior, display composition and the
+deferred refresh-cadence policy.
 
 The signed app contains static SDL, libusb, the Vulkan loader, MoltenVK and an
 app-relative ICD manifest. Linked dependency audit found no Homebrew absolute
@@ -96,8 +98,11 @@ shows different trajectories and each viewport responding independently.
 Current priority follows the player's journey in `docs/PLAYER_JOURNEY.md`,
 adapting the owner's Xbox-era product documents to the PS2/MoltenVK target.
 120 Hz and mods are deferred. Experimental refresh-grid scheduling is off by
-default. Save/relaunch, effective trigger driving and media behavior are higher
-priority than small renderer error metrics alone.
+default. Custom single-player/MP matches, normal racing keyboard controls, 100% game
+speed and 4K-or-higher 16:10/16:9 rendering are the latest priority. A basic
+changed-name career save/load completed across processes; further career testing
+belongs to the owner. Effective trigger driving and match presentation have
+priority over further career exploration.
 
 See `docs/RENDERER_REFERENCES.md` for Context7, Road Trip, paraLLEl-GS and public
 PS2SDK research. No wholesale renderer or recompiler migration is required.

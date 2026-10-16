@@ -88,12 +88,24 @@ The owner's later product documents are applied through `docs/PLAYER_JOURNEY.md`
 - [x] Correct target SDK memory-card filename offsets and pad replies; test persistence across processes.
 - [x] Correct double volume attenuation through the actual offline audio pipeline.
 - [x] Correct demonstrated GS fog/interpolation errors and GPU capture synchronization.
-- [ ] Save a named career in the game, quit, and load it in a new process.
+- [x] Save a named career in the game, quit, and load it in a new process; further career testing belongs to the owner.
 - [ ] Offer and verify usable analog trigger driving without losing original control mappings.
-- [ ] Optimize measured intro bitstream bottleneck while preserving full guest state and interrupt behavior.
-- [ ] Compare procedural GS output with an independent accurate renderer.
+- [x] Optimize measured intro bitstream bottleneck while preserving full guest state and interrupt behavior; integrated, awaiting combined build.
+- [x] Compare procedural GS output with an independent accurate renderer.
 - [ ] Rebuild and verify the final relocated local app after follow-on fixes.
 - [ ] Validate native UI and physical controller behavior when permitted/available.
 
 High-refresh presentation and mods remain deferred. Known GS blending and audio
 model approximations prevent a complete 1:1 claim.
+
+
+## Current priority — custom matches / local MP
+
+- [ ] Normal racing keyboard controls with authoritative menu/driving context.
+- [ ] Native 16:9/16:10 camera selection preserving split-screen viewport math.
+- [ ] Shared display composition and explicit 3840×2400/2160 offscreen captures.
+- [ ] Integrated 6x custom MP run with independent partial/full throttle and a measured steady race segment.
+- [ ] Signed local app and periodic source push after combined checks.
+
+The owner requested an interactive keyboard trial; that was launched separately
+from headless/muted automated tests. Do not interrupt an active player session.

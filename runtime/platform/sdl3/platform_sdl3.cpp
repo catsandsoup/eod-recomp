@@ -169,7 +169,11 @@ void read_keyboard(HostPadState *out, keyboard_input::Context ctx) {
 
 }  // namespace
 
-void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
+void platform_configure_display(const PlatformConfig &cfg) {
+    g_cfg=cfg;
+    const char *headless=getenv("EOD_HEADLESS");
+    g_headless=cfg.headless || (headless && headless[0]=='1');
+}
 
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
