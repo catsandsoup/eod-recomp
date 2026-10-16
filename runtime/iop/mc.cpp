@@ -5,7 +5,7 @@
 //   descParam (48 bytes): +0 fd/port, +4 port/slot, +8 slot, +0xC size,
 //     +0x10 offset/free flag, +0x14 origin/type flag/mis, +0x18 buffer,
 //     +0x1C EE address of the 0xC0-byte "end parameter" block, +0x20 data
-//   nameParam (0x414 bytes): +0 port, +4 slot, +8 flags, +0x18 name
+//   nameParam (0x414 bytes): +0 port, +4 slot, +8 flags, +0x14 name
 // All calls complete immediately; the reply word is the result.
 #include <cstdlib>
 #include <sys/stat.h>
@@ -136,7 +136,7 @@ void iop_mc_init() {
             int port = (int)rd32(buf) & 1;
             uint32_t flags = rd32(buf + 8);
             char name[1024] = {};
-            memcpy(name, buf + 0x18, 1023);
+            memcpy(name, buf + 0x14, 1023);
             r = mc_open(port, name, flags);
             LOG(LOG_MC, "mc open/mkdir port %d '%s' flags %x -> %d", port, name, flags, r);
             break;
@@ -201,7 +201,7 @@ void iop_mc_init() {
         case 0x0F: {  // Delete(port, slot, name)
             int port = (int)rd32(buf) & 1;
             char name[1024] = {};
-            memcpy(name, buf + 0x18, 1023);
+            memcpy(name, buf + 0x14, 1023);
             std::string p = host_path(port, name);
             r = (remove(p.c_str()) == 0) ? 0 : MC_NOENTRY;
             LOG(LOG_MC, "mc delete '%s' -> %d", name, r);
