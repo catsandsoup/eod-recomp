@@ -7,8 +7,14 @@
 #include "core/log.h"
 #include "core/memory.h"
 #include "funcs.h"
+#include "movie_bits.h"
 
 extern "C" {
+
+void f_0039AFB0_orig(void);
+void f_0039AFB0(void) {
+    if (!movie_bits_advance_fast()) f_0039AFB0_orig();
+}
 
 void f_003670C8(void) {
     static bool skip = getenv("EOD_SKIP_MOVIES") && atoi(getenv("EOD_SKIP_MOVIES"));
