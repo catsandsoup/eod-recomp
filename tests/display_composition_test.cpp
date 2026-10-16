@@ -54,25 +54,25 @@ int main() {
        screenshot_size(640,448,6,"3840x","2400").valid || screenshot_size(640,448,6,"0","2400").valid) ++failures;
     if(display_aspect("4:3")!=0 || display_aspect("16:9")!=1 || display_aspect("stretch")!=2 || display_aspect("16:10")!=3) ++failures;
 #ifdef EOD_DISPLAY_BACKEND_TEST
-    PlatformConfig startup;startup.aspect=3;
+    PlatformConfig startup;startup.aspect=1;
     platform_configure_display(startup); // no SDL_Init, window, audio or controller discovery
     g_config.aspect="4:3"; // a later Settings save must not change this launch's camera/composition
     int x,y,w,h;platform_display_rect(3840,2400,&x,&y,&w,&h);
-    if(x || y || w!=3840 || h!=2400) ++failures;
+    if(x || y!=120 || w!=3840 || h!=2160) ++failures;
     presentation::set(presentation::from_tag(presentation::tag(0))); // ordered menu frame
     platform_display_rect(3840,2400,&x,&y,&w,&h);
     if(x!=320 || y || w!=3200 || h!=2400) ++failures;
-    presentation::set(presentation::from_tag(presentation::tag(3))); // ordered race frame
+    presentation::set(presentation::from_tag(presentation::tag(1))); // ordered widescreen frame
     platform_display_rect(3840,2400,&x,&y,&w,&h);
-    if(x || y || w!=3840 || h!=2400) ++failures;
+    if(x || y!=120 || w!=3840 || h!=2160) ++failures;
     presentation::set(-1);
 #endif
     std::string file=(std::filesystem::temp_directory_path()/"eod-aspect-config.XXXXXX").string();
     int fd=mkstemp(file.data());if(fd<0)return 2;close(fd);
     Config saved,loaded;
-    if(saved.aspect!="4:3") ++failures;
-    saved.aspect="16:10";saved.render_scale=6;saved.width=1920;saved.height=1200;
-    if(!config_save(file,saved) || !config_load(file,loaded) || loaded.aspect!="16:10" || loaded.render_scale!=6) ++failures;
+    if(saved.aspect!="auto") ++failures;  // upstream 1.0: the game's own widescreen option
+    saved.aspect="16:9";saved.render_scale=6;saved.width=1920;saved.height=1200;
+    if(!config_save(file,saved) || !config_load(file,loaded) || loaded.aspect!="16:9" || loaded.render_scale!=6) ++failures;
     std::filesystem::remove(file);
     if(failures) { fprintf(stderr,"display composition: %d failure(s)\n",failures);return 1; }
     puts("4K/MBP aspect rectangles, output capture dimensions, and 16:10 config round-trip passed (CPU only)");

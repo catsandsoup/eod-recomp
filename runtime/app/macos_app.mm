@@ -111,7 +111,7 @@ bool mac_app_settings() {
                 [popup addItemsWithTitles:@[@"Original (PS2)",@"Modern (analog triggers)"]];
                 [popup selectItemAtIndex:fields[i].value=="modern" ? 1 : 0];
             } else {
-                [popup addItemsWithTitles:i==0 ? @[@"software",@"vulkan"] : @[@"4:3",@"16:9",@"16:10",@"stretch"]];
+                [popup addItemsWithTitles:i==0 ? @[@"software",@"vulkan"] : @[@"auto",@"4:3",@"16:9",@"stretch"]];
                 [popup selectItemWithTitle:ns(fields[i].value)];
             }
             input=popup;
@@ -139,7 +139,7 @@ bool mac_app_settings() {
     c.keyboard_port=number(11,0,2); c.vibration=number(12,0,1); c.memcard_dir=value(13); c.data_dir=value(14);
     c.controller_layout=value(15);c.keyboard_layout=value(16);
     for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(17+i);
-    if (c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="16:10" && c.aspect!="stretch") { error("Aspect must be 4:3, 16:9, 16:10 or stretch."); return false; }
+    if (c.aspect!="auto" && c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="stretch") { error("Aspect must be auto (the game's Widescreen option), 4:3, 16:9 or stretch."); return false; }
     if (c.renderer!="software" && c.renderer!="vulkan") { error("Renderer must be software (or vulkan in a build with Vulkan support)."); return false; }
     if (!config_save(config_path,c)) { error("Could not save settings. Check the settings folder permissions."); return false; }
     g_config=c; return true;

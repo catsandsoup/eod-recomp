@@ -17,6 +17,7 @@
 //   IPU_BP   +0x20  BP 0-6, IFC 8-11, FP 16-17
 //   IPU_TOP  +0x30  next 32 bits of the bitstream (+0x34 bit 31 = BUSY)
 #include "ipu.h"
+#include "../core/prof.h"
 
 #include <algorithm>
 #include <cstring>
@@ -797,6 +798,7 @@ void ipu_fiber_main(void *) {
 void run() {
     if (!g_running || fiber_current() == g_fiber) return;
     g_caller = fiber_current();
+    ProfScope prof(P_EE_IPU);
     fiber_switch(g_fiber);
 }
 

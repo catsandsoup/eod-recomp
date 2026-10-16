@@ -1941,7 +1941,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
     }
 }
 
-void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *) {
     flush(); // CPU reads observe all earlier queued GS primitives.
     g_rb_reason = 0;
     readback_pages(bp, bw, psm, x, y, w, h);
@@ -2199,6 +2199,7 @@ void vblank() {
     }
 }
 
+namespace { void show(bool vsync); }
 void present(bool vsync) {
     if (!g_on)
         return;
@@ -2209,6 +2210,20 @@ void present(bool vsync) {
     g_have_last = g_last[0].on || g_last[1].on;
     g_frame_no++;
     g_state_valid = false;
+    show(vsync);
+}
+
+// Presents the last composed image again (upstream's in-game menu pauses the game).
+void redraw() {
+    if (!g_on)
+        return;
+    flush();
+    g_state_valid = false;
+    show(true);
+}
+
+namespace {
+void show(bool vsync) {
     if (g_dev->surface) {
         if (auto *back = g_dev->acquire(vsync)) {
             float black[4] = {0, 0, 0, 1};
@@ -2223,6 +2238,7 @@ void present(bool vsync) {
     } else
         g_dev->submit(false);
 }
+}  // namespace
 
 bool read_display(std::vector<uint32_t> &rgba, int &w, int &h) {
     if (!g_on)

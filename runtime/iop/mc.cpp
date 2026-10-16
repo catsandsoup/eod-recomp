@@ -5,7 +5,8 @@
 //   descParam (48 bytes): +0 fd/port, +4 port/slot, +8 slot, +0xC size,
 //     +0x10 offset/free flag, +0x14 origin/type flag/mis, +0x18 buffer,
 //     +0x1C EE address of the 0xC0-byte "end parameter" block, +0x20 data
-//   nameParam (0x414 bytes): +0 port, +4 slot, +8 flags, +0x14 name
+//   nameParam (0x414 bytes): +0 port, +4 slot, +8 flags, +0xC max entries,
+//     +0x10 table address, +0x14 name
 // All calls complete immediately; the reply word is the result.
 #include <cstdlib>
 #include <sys/stat.h>
@@ -47,6 +48,13 @@ McFile g_fds[32];
 bool g_seen[2];
 std::string g_cwd[2] = {"/", "/"};
 
+bool exists(const std::string &p, bool *is_dir = nullptr) {
+    struct stat s;
+    if (stat(p.c_str(), &s) != 0) return false;
+    if (is_dir) *is_dir = (s.st_mode & S_IFDIR) != 0;
+    return true;
+}
+
 std::string port_root(int port) {
     // EOD_MEMCARD=dir puts the cards elsewhere (e.g. a fresh card for tests)
     const char *env = getenv("EOD_MEMCARD");
@@ -56,6 +64,19 @@ std::string port_root(int port) {
     mkdir_host(r.c_str());
     r += port ? "/port1" : "/port0";
     mkdir_host(r.c_str());
+    // Earlier versions read names 4 bytes too far and saved under
+    // "US-20910DRIVEN/US-20910DRIVEN": move such a save to its real name.
+    static bool migrated[2];
+    if (!migrated[port & 1]) {
+        migrated[port & 1] = true;
+        std::string old_dir = r + "/US-20910DRIVEN", new_dir = r + "/BASLUS-20910DRIVEN";
+        bool d;
+        if (exists(old_dir, &d) && d && !exists(new_dir)) {
+            rename((old_dir + "/US-20910DRIVEN").c_str(), (old_dir + "/BASLUS-20910DRIVEN").c_str());
+            if (rename(old_dir.c_str(), new_dir.c_str()) == 0)
+                LOG(LOG_MC, "memory card: moved the save in %s to %s", old_dir.c_str(), new_dir.c_str());
+        }
+    }
     return r;
 }
 
@@ -65,13 +86,6 @@ std::string host_path(int port, const char *name) {
     for (char &c : n)
         if (c == '\\') c = '/';
     return port_root(port & 1) + n;
-}
-
-bool exists(const std::string &p, bool *is_dir = nullptr) {
-    struct stat s;
-    if (stat(p.c_str(), &s) != 0) return false;
-    if (is_dir) *is_dir = (s.st_mode & S_IFDIR) != 0;
-    return true;
 }
 
 int mc_open(int port, const char *name, uint32_t flags) {
@@ -103,6 +117,9 @@ int mc_open(int port, const char *name, uint32_t flags) {
 }
 
 }  // namespace
+
+// The host folder holding the card in a port (for importing saves).
+std::string mc_port_dir(int port) { return port_root(port & 1); }
 
 void iop_mc_init() {
     iop_register_server(0x80000400, "mcserv", [](const RpcCall &c, uint8_t *buf) -> uint32_t {

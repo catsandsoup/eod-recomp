@@ -1,8 +1,13 @@
 // Per-composed-frame aspect. Only the EE chooses game context; the GS worker
 // receives its snapshot in command order, without reading guest RAM.
 #pragma once
+#include <atomic>
 #include <cstdint>
 namespace presentation {
+// The displayed aspect the game wants now: set by platform_set_aspect (from
+// src/game_patches.cpp, EE thread) on the non-Windows platforms; -1 = the
+// launch setting.
+inline std::atomic<int> requested{-1};
 inline thread_local int frame_aspect = -1;
 inline int current(int startup_aspect) { return frame_aspect < 0 ? startup_aspect : frame_aspect; }
 inline void set(int aspect) { frame_aspect = aspect >= 0 && aspect <= 3 ? aspect : -1; }

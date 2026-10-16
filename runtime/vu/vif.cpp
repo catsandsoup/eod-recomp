@@ -13,6 +13,7 @@
 #include "../gs/gs.h"
 #include "../kernel/kernel.h"
 #include "vu.h"
+#include "../core/prof.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
 extern uint32_t g_vu_micro_gen[2];  // vu.cpp
@@ -427,6 +428,7 @@ void vif_init() {
 }
 
 void vif_write(int n, const uint32_t *words, uint32_t count) {
+    ProfScope prof(P_EE_VIF);
     Vif &v = g_vif[n & 1];
     if (avail(v) == 0) {
         // nothing pending: run straight from the caller's buffer, keep a partial command

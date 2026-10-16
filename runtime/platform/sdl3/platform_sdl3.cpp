@@ -402,6 +402,23 @@ void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) 
 
 int platform_list_pads(int watch_seconds) { return sdl_input::list_pads(watch_seconds); }
 
+// The game controller alone, without the keyboard (upstream's in-game menu API).
+void platform_get_controller(int port, HostPadState *out) {
+    *out = HostPadState();
+    if (port < 0 || port >= kPorts) return;
+    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out);
+}
+
+// The game's display mode (src/game_patches.cpp, EE thread). The GS command
+// stream carries it per frame (eod_presentation_aspect, presentation.h), so the
+// composed image switches aspect in step with the frames that use it.
+void platform_set_aspect(int aspect) { presentation::requested.store(aspect, std::memory_order_relaxed); }
+
+void platform_set_fullscreen(bool on) {
+    if (g_window) SDL_SetWindowFullscreen(g_window, on);
+}
+bool platform_fullscreen() { return g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0; }
+
 // ------------------------------------------------------------------ audio
 bool platform_audio_open(int sample_rate) {
     const char *m = getenv("EOD_MUTE");

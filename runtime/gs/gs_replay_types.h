@@ -28,6 +28,13 @@ struct Transfer {
     const SwizzleTab *T = nullptr;
     int ry = -1;
     uint32_t rb = 0, rc = 0;
+    // 32-bit: within a block row, pixels 2m and 2m+1 are adjacent words (pairs stored at once);
+    // 16, 8 and 4-bit: even pixels and the next one are adjacent in memory
+    bool pairs = false;
+    // 32-bit: the pairs of rows 2r and 2r+1 at the same x make aligned 16-byte groups
+    bool quads = false;
 };
+// The capture format stores Transfer raw: the two flags live in former tail padding.
+static_assert(sizeof(void *) != 8 || sizeof(Transfer) == 88, "GS capture layout changed");
 
 } // namespace gs

@@ -14,6 +14,9 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #if defined(__linux__)
 #include <pthread.h>
 #endif
@@ -32,6 +35,8 @@
 #include "gs_transfer_chunk.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
+#include "../core/prof.h"
+#include "../ui/overlay.h"
 
 namespace gs {
 extern bool g_trace;
@@ -61,6 +66,49 @@ void write_reg(uint32_t reg, uint64_t v);
 uint32_t gif_reg_ctrl, gif_reg_mode;
 
 // --------------------------------------------------------------- transfer
+// Host->local transfers: on Windows (Direct3D 11) the declared TRXREG extent is
+// reported when the transfer starts, as upstream does; the other backends
+// report each supplied chunk from xfer_data (docs/GS_CPU_WRITE_PRESERVATION.md).
+#ifdef _WIN32
+constexpr bool kChunkedHostWrites = false;
+#else
+constexpr bool kChunkedHostWrites = true;
+#endif
+
+// Which fast paths the destination's swizzle allows (xfer_small, the 32-bit pair/quad stores).
+void xfer_layout(Transfer &t) {
+    t.pairs = false;
+    t.quads = false;
+    if (bits_per_pixel(t.dpsm) == 32 && t.dpsm != PSMCT24 && t.dpsm != PSMZ24) {
+        const SwizzleTab *T = t.T;
+        bool ok = T->colB[0] == T->colB[7];
+        for (int r = 0; r < 8 && ok; r++)
+            for (int m = 0; m < 8; m += 2) {
+                uint32_t a = T->colT[T->rowC[r] + T->colC[m]], b = T->colT[T->rowC[r] + T->colC[m + 1]];
+                if ((a & 1) || b != a + 1 || T->colC[m] != (uint16_t)m || T->colC[m + 1] != (uint16_t)(m + 1)) ok = false;
+            }
+        t.pairs = ok;
+        for (int y = 0; y < 64 && ok; y += 2) {
+            ok = T->rowB[y] == T->rowB[y + 1];
+            for (int m = 0; m < 8 && ok; m += 2) {
+                uint32_t a = T->colT[T->rowC[y] + T->colC[m]], b = T->colT[T->rowC[y + 1] + T->colC[m]];
+                ok = (a & 3) == 0 && b == a + 2;
+            }
+        }
+        t.quads = ok;
+    } else if (t.dpsm == PSMCT16 || t.dpsm == PSMCT16S || t.dpsm == PSMZ16 || t.dpsm == PSMZ16S || t.dpsm == PSMT8 ||
+               t.dpsm == PSMT4) {
+        const SwizzleTab *T = t.T;
+        bool ok = true;
+        for (int y = 0; y < 64 && ok; y++)
+            for (int x = 0; x < 128 && ok; x += 2) {
+                uint32_t a = T->addr(0, x, y);
+                ok = (a & 1) == 0 && T->addr(0, x + 1, y) == a + 1;
+            }
+        t.pairs = ok;
+    }
+}
+
 void xfer_start() {
     if (replay_frozen()) {
         g_xfer.active = false;
@@ -75,12 +123,12 @@ void xfer_start() {
     stats.transfers++;
     census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
     if (hw::g_on) {
-        if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h);
-        if (dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
+        if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h, dir == 1 ? "local->host" : "local->local");
+        if ((dir == 0 && !kChunkedHostWrites) || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
     }
     if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
     if (dir == 1) raster_sync();
-    if (dir == 2) {
+    if ((dir == 0 && !kChunkedHostWrites) || dir == 2) {
         raster_vram_write(dbp, dbw, dpsm, dx, dy, w, h);
         vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
     }
@@ -98,6 +146,7 @@ void xfer_start() {
         g_xfer.pend_n = 0;
         g_xfer.T = swizzle_table(dpsm, dbw);
         g_xfer.ry = -1;
+        xfer_layout(g_xfer);
         LOG(LOG_GSXFER, "transfer host->local bp=%x bw=%d psm=%x at %d,%d size %dx%d", dbp, dbw, dpsm, dx, dy, w, h);
     } else if (dir == 2) {
         LOG(LOG_GSXFER, "transfer local->local %x(%x)->%x(%x) %dx%d", sbp, spsm, dbp, dpsm, w, h);
@@ -144,36 +193,124 @@ inline void xfer_put(uint32_t v) {
     }
 }
 
+// 16, 8 and 4-bit formats: runs of a row at a time, pixel pairs where they are adjacent
+template <int BPP>
+void xfer_small(Transfer &t, const uint8_t *p, uint32_t n) {
+    uint32_t total = n * 8 / BPP, k = 0;
+    while (k < total && t.y < t.h) {
+        int py = (t.y0 + t.y) & 2047;
+        if (py != t.ry) {
+            t.ry = py;
+            t.rb = t.T->row_base(t.dbp, py);
+            t.rc = t.T->rowC[py];
+        }
+        int run = std::min<int>(t.w - t.x, (int)(total - k));
+        int px = t.x0 + t.x, j = 0;
+        if (t.pairs && ((px | k) & 1) == 0) {
+            for (; j + 2 <= run; j += 2) {
+                uint32_t a = t.T->addr_row(t.rb, t.rc, px + j);
+                if (BPP == 4) vram[(a >> 1) & 0x3FFFFF] = p[(k + j) >> 1];
+                if (BPP == 8) memcpy(&byte(a), p + k + j, 2);
+                if (BPP == 16) memcpy(&half(a), p + (k + j) * 2, 4);
+            }
+        }
+        for (; j < run; j++) {
+            uint32_t a = t.T->addr_row(t.rb, t.rc, px + j), i = k + j;
+            if (BPP == 4) set_nibble(a, (p[i >> 1] >> ((i & 1) * 4)) & 0xF);
+            if (BPP == 8) byte(a) = p[i];
+            if (BPP == 16) half(a) = (uint16_t)(p[i * 2] | (p[i * 2 + 1] << 8));
+        }
+        k += (uint32_t)run;
+        t.x += run;
+        if (t.x >= t.w) {
+            t.x = 0;
+            t.y++;
+        }
+    }
+    if (t.y >= t.h) t.active = false;
+}
+
 void xfer_data(const uint8_t *p, uint32_t n) {
     Transfer &t = g_xfer;
     if (!t.active) return;
     // Source bytes are available now, unlike TRXREG's promised transfer size.
     // Preserve partial GPU pages before writing, and invalidate caches/raster
     // dependencies for every chunk (including an interrupted IMAGE packet).
-    unsigned bpp = bits_per_pixel(t.dpsm);
-    uint64_t pixels = transfer_pixels_supplied(bpp, n, t.pend_n);
-    const auto regions = transfer_write_regions(t.x0, t.y0, t.w, t.h, t.x, t.y, pixels);
-    for (unsigned i = 0; i < regions.count; ++i) {
-        const auto &r = regions.rects[i];
-        if (hw::g_on) hw::vram_written(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
-        raster_vram_write(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
-        vram_mark(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+    if (kChunkedHostWrites) {
+        unsigned bpp = bits_per_pixel(t.dpsm);
+        uint64_t pixels = transfer_pixels_supplied(bpp, n, t.pend_n);
+        const auto regions = transfer_write_regions(t.x0, t.y0, t.w, t.h, t.x, t.y, pixels);
+        for (unsigned i = 0; i < regions.count; ++i) {
+            const auto &r = regions.rects[i];
+            if (hw::g_on) hw::vram_written(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            raster_vram_write(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            vram_mark(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+        }
+    }
+    bool small = true;
+    switch (t.dpsm) {
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: xfer_small<16>(t, p, n & ~1u); break;
+    case PSMT8: xfer_small<8>(t, p, n); break;
+    case PSMT4: xfer_small<4>(t, p, n); break;
+    default: small = false; break;
+    }
+    if (small) {
+        if (hw::g_on) hw::vram_write_complete();
+        return;
     }
     if (t.dpsm == PSMCT32 || t.dpsm == PSMZ32) {
         // whole runs of a row at a time
         uint32_t i = 0;
         while (i + 4 <= n && t.y < t.h) {
             int py = (t.y0 + t.y) & 2047;
+#if defined(__SSE2__)
+            if (t.quads && t.x == 0 && !(py & 1) && !(t.x0 & 7) && !(t.w & 7) && t.y + 1 < t.h &&
+                n - i >= (uint32_t)t.w * 8) {
+                // two whole rows: 16-byte stores of two pixels from each
+                uint32_t rb = t.T->row_base(t.dbp, py);
+                const uint16_t *ct = t.T->colT + t.T->rowC[py];
+                const uint8_t *r0 = p + i, *r1 = p + i + t.w * 4;
+                for (int x = 0; x < t.w; x += 8) {
+                    uint32_t base = (rb + (uint32_t)t.T->colB[(t.x0 + x) & 2047]) << t.T->shift;
+                    for (int m = 0; m < 8; m += 2) {
+                        __m128i a = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(r0 + (x + m) * 4));
+                        __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(r1 + (x + m) * 4));
+                        _mm_storeu_si128(reinterpret_cast<__m128i *>(vram + (((base + ct[m]) & 0xFFFFF) << 2)),
+                                         _mm_unpacklo_epi64(a, b));
+                    }
+                }
+                i += (uint32_t)t.w * 8;
+                t.y += 2;
+                continue;
+            }
+#endif
             if (py != t.ry) {
                 t.ry = py;
                 t.rb = t.T->row_base(t.dbp, py);
                 t.rc = t.T->rowC[py];
             }
             int run = std::min<int>(t.w - t.x, (int)((n - i) / 4));
-            for (int k = 0; k < run; k++, i += 4) {
+            for (int k = 0; k < run;) {
+                int px = (t.x0 + t.x + k) & 2047;
+                if (t.pairs && (px & 7) == 0 && run - k >= 8) {
+                    // a whole block row: four word pairs
+                    uint32_t base = ((t.rb + (uint32_t)t.T->colB[px]) << t.T->shift);
+                    const uint16_t *ct = t.T->colT + t.rc;
+                    uint64_t *v64 = reinterpret_cast<uint64_t *>(vram);
+                    for (int m = 0; m < 8; m += 2) {
+                        uint64_t d;
+                        memcpy(&d, p + i + m * 4, 8);
+                        v64[((base + ct[m]) & 0xFFFFF) >> 1] = d;
+                    }
+                    k += 8;
+                    i += 32;
+                    continue;
+                }
                 uint32_t v;
                 memcpy(&v, p + i, 4);
-                word(t.T->addr_row(t.rb, t.rc, (t.x0 + t.x + k) & 2047)) = v;
+                word(t.T->addr_row(t.rb, t.rc, px)) = v;
+                k++;
+                i += 4;
             }
             t.x += run;
             if (t.x >= t.w) {
@@ -220,14 +357,23 @@ void xfer_data(const uint8_t *p, uint32_t n) {
 }
 
 // ------------------------------------------------------------- registers
+// A drawing state register: only a different value counts as a state change
+// (the game resends whole register sets with each object).
+inline void set_state(uint64_t &r, uint64_t v) {
+    if (r != v) {
+        r = v;
+        g_reg_gen++;
+    }
+}
+
 void tex0_write(int c, uint64_t v) {
-    st.ctx[c].tex0 = v;
+    set_state(st.ctx[c].tex0, v);
     clut_load(v);
 }
 
 void write_reg(uint32_t reg, uint64_t v) {
-    // vertex data and image transfer words don't affect the drawing state
-    if (reg > 0x05 && reg != 0x0A && reg != 0x0C && reg != 0x0D && reg != 0x54) g_reg_gen++;
+    // vertex data, image transfer words and the drawing state registers (below) don't count as changes here
+    if (reg >= 0x3F && reg != 0x54 && !(reg >= 0x40 && reg <= 0x4F)) g_reg_gen++;
     switch (reg) {
     case 0x00:  // PRIM
         st.prim = v;
@@ -245,50 +391,50 @@ void write_reg(uint32_t reg, uint64_t v) {
     case 0x05: vertex_kick(true, v, false, 0); break;                   // XYZ2
     case 0x06: tex0_write(0, v); break;
     case 0x07: tex0_write(1, v); break;
-    case 0x08: st.ctx[0].clamp = v; break;
-    case 0x09: st.ctx[1].clamp = v; break;
+    case 0x08: set_state(st.ctx[0].clamp, v); break;
+    case 0x09: set_state(st.ctx[1].clamp, v); break;
     case 0x0A: st.fog = v; break;
     case 0x0C: vertex_kick(false, v, true, (uint8_t)(v >> 56)); break;  // XYZF3
     case 0x0D: vertex_kick(false, v, false, 0); break;                  // XYZ3
-    case 0x14: st.ctx[0].tex1 = v; break;
-    case 0x15: st.ctx[1].tex1 = v; break;
+    case 0x14: set_state(st.ctx[0].tex1, v); break;
+    case 0x15: set_state(st.ctx[1].tex1, v); break;
     case 0x16:
     case 0x17: {  // TEX2: PSM, CBP, CPSM, CSM, CSA, CLD of TEX0
         int c = reg - 0x16;
         const uint64_t mask = 0xFFFFFFE003F00000ull;
-        st.ctx[c].tex2 = v;
+        set_state(st.ctx[c].tex2, v);
         tex0_write(c, (st.ctx[c].tex0 & ~mask) | (v & mask));
         break;
     }
-    case 0x18: st.ctx[0].xyoffset = v; break;
-    case 0x19: st.ctx[1].xyoffset = v; break;
-    case 0x1A: st.prmodecont = v; break;
-    case 0x1B: st.prmode = v; break;
-    case 0x1C: st.texclut = v; break;
-    case 0x22: st.scanmsk = v; break;
-    case 0x34: st.ctx[0].miptbp1 = v; break;
-    case 0x35: st.ctx[1].miptbp1 = v; break;
-    case 0x36: st.ctx[0].miptbp2 = v; break;
-    case 0x37: st.ctx[1].miptbp2 = v; break;
-    case 0x3B: st.texa = v; break;
-    case 0x3D: st.fogcol = v; break;
+    case 0x18: set_state(st.ctx[0].xyoffset, v); break;
+    case 0x19: set_state(st.ctx[1].xyoffset, v); break;
+    case 0x1A: set_state(st.prmodecont, v); break;
+    case 0x1B: set_state(st.prmode, v); break;
+    case 0x1C: set_state(st.texclut, v); break;
+    case 0x22: set_state(st.scanmsk, v); break;
+    case 0x34: set_state(st.ctx[0].miptbp1, v); break;
+    case 0x35: set_state(st.ctx[1].miptbp1, v); break;
+    case 0x36: set_state(st.ctx[0].miptbp2, v); break;
+    case 0x37: set_state(st.ctx[1].miptbp2, v); break;
+    case 0x3B: set_state(st.texa, v); break;
+    case 0x3D: set_state(st.fogcol, v); break;
     case 0x3F: break;  // TEXFLUSH
-    case 0x40: st.ctx[0].scissor = v; break;
-    case 0x41: st.ctx[1].scissor = v; break;
-    case 0x42: st.ctx[0].alpha = v; break;
-    case 0x43: st.ctx[1].alpha = v; break;
-    case 0x44: st.dimx = v; break;
-    case 0x45: st.dthe = v; break;
-    case 0x46: st.colclamp = v; break;
-    case 0x47: st.ctx[0].test = v; break;
-    case 0x48: st.ctx[1].test = v; break;
-    case 0x49: st.pabe = v; break;
-    case 0x4A: st.ctx[0].fba = v; break;
-    case 0x4B: st.ctx[1].fba = v; break;
-    case 0x4C: st.ctx[0].frame = v; break;
-    case 0x4D: st.ctx[1].frame = v; break;
-    case 0x4E: st.ctx[0].zbuf = v; break;
-    case 0x4F: st.ctx[1].zbuf = v; break;
+    case 0x40: set_state(st.ctx[0].scissor, v); break;
+    case 0x41: set_state(st.ctx[1].scissor, v); break;
+    case 0x42: set_state(st.ctx[0].alpha, v); break;
+    case 0x43: set_state(st.ctx[1].alpha, v); break;
+    case 0x44: set_state(st.dimx, v); break;
+    case 0x45: set_state(st.dthe, v); break;
+    case 0x46: set_state(st.colclamp, v); break;
+    case 0x47: set_state(st.ctx[0].test, v); break;
+    case 0x48: set_state(st.ctx[1].test, v); break;
+    case 0x49: set_state(st.pabe, v); break;
+    case 0x4A: set_state(st.ctx[0].fba, v); break;
+    case 0x4B: set_state(st.ctx[1].fba, v); break;
+    case 0x4C: set_state(st.ctx[0].frame, v); break;
+    case 0x4D: set_state(st.ctx[1].frame, v); break;
+    case 0x4E: set_state(st.ctx[0].zbuf, v); break;
+    case 0x4F: set_state(st.ctx[1].zbuf, v); break;
     case 0x50: st.bitbltbuf = v; break;
     case 0x51: st.trxpos = v; break;
     case 0x52: st.trxreg = v; break;
@@ -535,11 +681,11 @@ void gif_process(int path, const uint8_t *data, uint32_t qwc) {
             }
             break;
         }
-        default: { // IMAGE: coalesce only contiguous, actually supplied qwords.
-            uint32_t run = std::min(ps.nloop, qwc - i);
-            xfer_data(q, run * 16);
-            ps.nloop -= run;
-            i += run - 1;
+        default: {  // IMAGE: all the qwords of the packet that are here at once
+            uint32_t m = std::min(ps.nloop, qwc - i);
+            xfer_data(q, m * 16);
+            ps.nloop -= m;
+            i += m - 1;
             break;
         }
         }
@@ -685,6 +831,7 @@ extern std::string g_opt_screenshot_dir;
 void priv_apply(uint32_t off, uint64_t v);
 void gs_flush();
 void gs_sync();
+[[noreturn]] void app_exit(int code);  // main.cpp
 void gs_frame_end(uint64_t frame, int aspect);
 
 // ------------------------------------------------------------ GS thread
@@ -694,7 +841,7 @@ void gs_frame_end(uint64_t frame, int aspect);
 // it when it reads state the worker produces.
 namespace {
 
-enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW };
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -759,7 +906,8 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 void gs_frame_end(uint64_t frame, int aspect) {
     presentation::set(aspect);
     if (hw::g_on) {
-        if (display_changed()) {
+        bool changed = display_changed();
+        if (overlay_changed() || changed) {  // (the in-game menu or frame counter changed too)
             // no vsync wait while the GS thread trails the EE
             uint64_t lag = g_ee_vblanks.load() - frame;
             hw::present(g_config.vsync && lag < 2);
@@ -823,6 +971,7 @@ void gs_sync() {
     if (!g_threaded) return;
     offload_sync();  // (the command stream's producer, when it runs on its own thread)
     gs_flush();
+    ProfScope prof(P_EE_WAIT);
     uint64_t t = platform_time_us();
     std::unique_lock<std::mutex> lk(g_q_mtx);
     g_q_cv_done.wait(lk, [] { return g_done == g_pushed; });
@@ -873,8 +1022,13 @@ template <typename Read> bool load_state_read(Read read) {
         return false;
     bool ok = read(&st, sizeof st) == sizeof st && read(g_path, sizeof g_path) == sizeof g_path &&
               read(&g_xfer, sizeof g_xfer) == sizeof g_xfer && read(vram, kVramSize) == kVramSize;
-    if (g_xfer.active) g_xfer.T = swizzle_table(g_xfer.dpsm, g_xfer.dbw);
+    if (g_xfer.active) {
+        g_xfer.T = swizzle_table(g_xfer.dpsm, g_xfer.dbw);
+        xfer_layout(g_xfer);  // (not trusted from the capture: older ones have padding there)
+    }
     g_xfer.ry = -1;
+    g_clut_gen++;
+    g_reg_gen++;
     return ok;
 }
 bool load_state(FILE *f) {
@@ -1003,6 +1157,9 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         case CMD_PATH_RESET:
             for (auto &ps : g_path) ps = PathState();
             break;
+        case CMD_REDRAW:
+            if (hw::g_on) hw::redraw();
+            break;
         }
         p += len;
     }
@@ -1067,7 +1224,8 @@ int gs_replay(const char *path, int repeat) {
         // EOD_GS_REPLAY_TRACE: log every primitive of the first replay
         static const bool replay_trace = getenv("EOD_GS_REPLAY_TRACE") != nullptr;
         gs::g_trace = replay_trace && r == 0;
-        uint64_t t0 = platform_time_us();
+        uint64_t t0 = platform_time_us(), tk0 = prof_ticks();
+        prof_thread_begin(P_GS_CMDS);
         if (!streaming) run_cmds(cmds.data(), cmds.size(), false);
         else if (measure_env && stop_env) {
             // Only the short measured interval is buffered. Parsing/decompression
@@ -1148,6 +1306,17 @@ int gs_replay(const char *path, int repeat) {
                     (unsigned long long)measure_at, (unsigned long long)last_vblank, dispatch_us / 1000.0);
         }
         raster_sync();
+        prof_switch(P_GS_IDLE);
+        {
+            // time per GS category for the commands (before waiting for the GPU)
+            double us = (double)(platform_time_us() - t0), per_ms = (double)(prof_ticks() - tk0) / (us / 1000.0);
+            static const char *names[] = {"commands", "state", "draws", "textures", "new textures", "uploads",
+                                          "readbacks", "conversions", "present"};
+            fprintf(stderr, "  commands %.1f ms:", us / 1000.0);
+            for (int c = P_GS_CMDS; c < P_GS_IDLE; c++)
+                fprintf(stderr, " %s %.1f", names[c - P_GS_CMDS], (double)g_prof[c].exchange(0) / per_ms);
+            fprintf(stderr, "\n");
+        }
         if (const char *dump = getenv("EOD_GS_REPLAY_DUMP")) {  // the GS memory after the replay
             if (hw::g_on)
                 for (uint32_t p = 0; p < kPages; p++) hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
@@ -1190,9 +1359,11 @@ static void gs_worker() {
     pthread_setname_np(pthread_self(), "eod-gs");
 #endif
     hw::bind_thread();
+    prof_thread_begin(P_GS_CMDS);
     for (;;) {
         Chunk c;
         {
+            ProfScope prof(P_GS_IDLE);
             std::unique_lock<std::mutex> lk(g_q_mtx);
             g_q_cv.wait(lk, [] { return g_gs_stop || !g_q.empty(); });
             if (g_gs_stop && g_q.empty()) break;
@@ -1274,6 +1445,7 @@ void gs_init() {
 }
 
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc) {
+    ProfScope prof(P_EE_GIF);
     if (!g_threaded) {
         gif_process(path, data, qwc);
         return;
@@ -1327,6 +1499,7 @@ bool g_p3_vif_mask, g_p3_mode_mask;
 }  // namespace
 
 void gif_path3_enqueue(const uint8_t *data, uint32_t qwc) {
+    ProfScope prof(P_EE_GIF);
     if (!gif_path3_pending() && !g_p3_vif_mask && !g_p3_mode_mask) {
         // not masked and nothing queued: what gif_path3_run would release right away
         size_t end = (size_t)qwc * 16;
@@ -1342,6 +1515,7 @@ bool gif_path3_pending() { return g_p3pos < g_p3q.size(); }
 void gif_set_path3_mask(bool masked) { g_p3_vif_mask = masked; }
 
 bool gif_path3_run(int max_packets) {
+    ProfScope prof(P_EE_GIF);
     if (g_p3_vif_mask || g_p3_mode_mask) return !gif_path3_pending();
     int done = 0;
     size_t start = g_p3pos;
@@ -1497,6 +1671,21 @@ bool gs_screenshot(const char *path) {
     return true;
 }
 
+uint64_t gs_drawn_frames() { return g_flips.load(); }
+
+// Shows the last image again with the overlay (the game is paused in the in-game menu).
+void gs_overlay_redraw() {
+    if (!hw::g_on) return;
+    if (g_threaded) {
+        offload_run([] {
+            push_cmd(CMD_REDRAW, 0, 0, nullptr, 0);
+            gs_flush();
+        });
+    } else {
+        hw::redraw();
+    }
+}
+
 void gs_vblank() {
     // VSINT, field toggle
     g_csr |= 8;
@@ -1513,6 +1702,7 @@ void gs_vblank() {
             gs_flush();
         });
         // don't let the GS thread fall more than a couple of frames behind
+        ProfScope prof(P_EE_WAIT);
         uint64_t t = platform_time_us();
         std::unique_lock<std::mutex> lk(g_q_mtx);
         g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
@@ -1557,6 +1747,9 @@ void gs_vblank() {
                         (double)(g_frames - v0) / sec, (double)(g_game_flips - g0) / sec, (double)(g_flips - f0) / sec,
                         100.0 - (double)(g_ee_idle_us - i0) / (sec * 1e4), g_gs_busy_us / (sec * 1e4),
                         g_ee_wait_us / (sec * 1e4), g_ee_sync_us / (sec * 1e4));
+                char ee[256], gsl[256];
+                prof_report(ee, sizeof ee, gsl, sizeof gsl);
+                fprintf(stderr, "%s\n%s\n", ee, gsl);
                 g_ee_sync_us = 0;
                 g_gs_busy_us = 0;
                 g_ee_wait_us = 0;
@@ -1583,7 +1776,6 @@ void gs_vblank() {
     }
     if (g_opt_frames && (int)g_frames >= g_opt_frames) {
         LOG(LOG_CORE, "reached %d frames - exiting", g_opt_frames);
-        gs_shutdown();
-        exit(0);
+        app_exit(0);
     }
 }

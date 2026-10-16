@@ -6,18 +6,19 @@
 00331DF0 wrap     # panic(fmt, ...) - game fatal error
 00331E48 replace  # debug printf (formats and discards in the release build) - logged with --log game
 0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc
-0034D328 wrap     # native display mode paired with scoped menu/race presentation
-00114020 wrap     # actual race loop: native wide camera + ordered wide composition
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
 0021C6E0 wrap     # bounded single-car selection trace
 00218E68 wrap     # bounded batch selection/submission trace
 0034E308 wrap     # bounded actual CPU sphere visibility trace
 
-# Semantic native HUD rows: scoped edge anchors, centred UI and world untouched.
+# Semantic native HUD rows: opt-in edge anchors (EOD_HUD_EDGE_ANCHORS=1), centred UI and world untouched.
 00119888 wrap     # left position/lap/damage rows in each supported race viewport
 00119F40 wrap     # right speed rows in each supported race viewport
+
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
+0034D328 wrap     # display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it
+0018AFE0 wrap     # car setup: computes the damage multiplier (car+0x4B0) from the chassis mass - DamageScale
 
 # Busy-wait loops on memory set by interrupt handlers: sleep until the next
 # event instead of spinning.

@@ -5,6 +5,28 @@ The upstream game recompilation is the foundation; the Mac work does not replace
 that contribution. Source is published in catsandsoup/eod-recomp. No game data,
 generated game C/C++, retail command captures or compiled apps are distributed.
 
+## Upstream 1.0 merged (2026-10-16)
+
+`main` now contains pareidolico/eod-recomp 1.0 (044bdf8 + release workflow 2eed33f).
+Upstream won every conflict in shared code. Windows files stay as upstream ships them:
+`runtime/platform/win32/platform_win32.cpp`, `runtime/gs/d3d11/gs_shaders.hlsl` and
+`gs_d3d11.cpp` are byte-identical to 1.0. The fork's extra platform hooks
+(`platform_configure_display`, `platform_thread_fast`, `platform_stop_ticker`,
+`platform_list_pads`) are non-Windows only, with inline no-ops on Windows (`platform.h`).
+The Vulkan shaders now build from their own copy, `runtime/gs/vulkan/gs_shaders_vk.hlsl`
+(same SPIR-V as before). Windows keeps upstream's input order (pump after the
+vblank IRQ) and host->local transfer reporting; SDL3 builds keep the fork's.
+
+Widescreen follows upstream: `AspectRatio=auto|4:3|16:9|stretch` drives the game's
+own display mode (`src/game_patches.cpp`); SDL3 `platform_set_aspect` feeds the
+per-frame composition. The fork's race-only wide camera and 16:10 option are retired.
+Not on Mac yet: the imgui F1 overlay (Direct3D 11 only; stubbed by upstream's
+`overlay.h` outside Windows). Regenerate `gen/` after pulling (hle.txt/VU changed).
+
+Checked: build-mac builds, `ctest` 43/43, headless boot to title and the scripted
+2P race (`tools/test_2p_race.sh`), and `race2p-5000.gsd` replays byte-identical
+(display + VRAM) to the pre-merge binary at RenderScale 1 and 6.
+
 ## One maintained branch
 
 Use **`main`** in catsandsoup/eod-recomp for all work and developer review.

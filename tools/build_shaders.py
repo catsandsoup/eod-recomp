@@ -12,7 +12,8 @@ SRC = os.path.join(ROOT, "runtime", "gs", "d3d11", "gs_shaders.hlsl")
 OUT = os.path.join(ROOT, "runtime", "gs", "d3d11", "gs_shaders.inc")
 ENTRIES = ["vs_draw:vs_4_0", "ps_draw:ps_4_0", "vs_pass:vs_4_0", "ps_convert_color:ps_4_0",
            "ps_convert_depth:ps_4_0", "ps_upload_color:ps_4_0", "ps_upload_depth:ps_4_0",
-           "ps_readback_color:ps_4_0", "ps_readback_depth:ps_4_0", "ps_copy:ps_4_0"]
+           "ps_readback_color:ps_4_0", "ps_readback_depth:ps_4_0", "ps_copy:ps_4_0",
+           "vs_overlay:vs_4_0", "ps_overlay:ps_4_0"]
 
 
 def main():

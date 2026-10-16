@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "../core/log.h"
+#include "spu2.h"
 #include "../hw/hw.h"
 #include "../kernel/kernel.h"
 #include "iop.h"
@@ -350,6 +351,7 @@ uint32_t sif_set_dma(uint32_t list, int count) {
             if (size >= 16) handle_command(pkt.data(), size);
         } else if (dest + size <= IOP_RAM_SIZE) {
             ee_read_block(src, g_iop_ram + dest, size);
+            spu2_iop_written(dest, size);  // (movie sound is streamed this way)
         } else {
             WARN("SIF: DMA to bad IOP address %08x size %x", dest, size);
         }

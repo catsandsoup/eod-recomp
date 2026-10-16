@@ -26,6 +26,7 @@
 
 #include "../core/config.h"
 #include "../core/log.h"
+#include "../core/prof.h"
 #include "../platform/platform.h"
 #include "gs_env.h"
 #include "gs_pixel_math.h"
@@ -43,6 +44,7 @@ bool g_replaying;   // GS replay: never skip
 uint32_t g_reg_gen = 1;
 Env g_env;
 uint32_t g_env_serial;
+uint32_t g_clut_gen = 1;
 // EOD_GS_REPLAY_STOP=n (replays): primitives after the n-th and later transfers are dropped, so the GS
 // memory at that point can be dumped (EOD_GS_REPLAY_DUMP) and compared between renderers
 uint64_t g_prim_counter;
@@ -170,9 +172,7 @@ TexEntry *tex_lookup(const Env &e, int lvl) {
     bool four = e.tpsm == PSMT4 || e.tpsm == PSMT4HL || e.tpsm == PSMT4HH;
     bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
     if (four || eight) {
-        uint32_t hsh = 2166136261u;
-        for (int i = 0, n = four ? 16 : 256; i < n; i++) hsh = (hsh ^ e.pal[i]) * 16777619u;
-        k.pal_hash = hsh;
+        k.pal_hash = (uint32_t)(e.pal_hash ^ (e.pal_hash >> 32));
     } else if (e.tpsm != PSMCT32 && e.tpsm != PSMZ32) {
         k.texa = e.ta0 | (e.ta1 << 8) | ((uint32_t)e.aem << 16);
     }
@@ -255,6 +255,7 @@ void setup_env(uint32_t attr) {
     g_env_gen = g_reg_gen;
     g_env_serial++;
     stats.env_setups++;
+    ProfScope prof(P_GS_STATE);
     g_env_snap = nullptr;
     Env &e = g_env;
     if (g_draw_dirty) {
@@ -269,7 +270,8 @@ void setup_env(uint32_t attr) {
         // 8 drawn frames per second while the game keeps its speed).
         static bool presenting;
         static int skipped;
-        static const bool enabled = getenv("EOD_FRAMESKIP") ? atoi(getenv("EOD_FRAMESKIP")) != 0 : g_config.frame_skip;
+        static const int forced = getenv("EOD_FRAMESKIP") ? atoi(getenv("EOD_FRAMESKIP")) != 0 : -1;
+        const bool enabled = forced >= 0 ? forced != 0 : g_config.frame_skip;  // (the in-game menu changes it)
         uint32_t fbp = bits(st.ctx[(attr >> 9) & 1].frame, 0, 9) * 32;
         uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
         if (fbp != e.fbp && fbp == shown) {
@@ -396,8 +398,25 @@ void setup_env(uint32_t attr) {
         for (int i = 0; i <= levels && i < 7; i++) e.texT[i] = swizzle_table(e.tpsm, e.mip_tbw[i]);
         bool four = e.tpsm == PSMT4 || e.tpsm == PSMT4HL || e.tpsm == PSMT4HH;
         bool eight = e.tpsm == PSMT8 || e.tpsm == PSMT8H;
-        if (four || eight)
-            for (uint32_t i = 0, n = four ? 16 : 256; i < n; i++) e.pal[i] = clut_lookup(i, e, four);
+        if (four || eight) {
+            // the expanded palette only changes with the CLUT buffer and what selects / expands its entries
+            static uint32_t pal_gen;
+            static uint64_t pal_sel = ~0ull;
+            uint64_t sel = (uint64_t)e.cpsm | (uint64_t)e.csa << 4 | (uint64_t)four << 9 | (uint64_t)e.ta0 << 10 |
+                           (uint64_t)e.ta1 << 18 | (uint64_t)e.aem << 26;
+            if (pal_gen != g_clut_gen || pal_sel != sel) {
+                pal_gen = g_clut_gen;
+                pal_sel = sel;
+                uint32_t n = four ? 16 : 256;
+                uint64_t h = 0x9E3779B97F4A7C15ull;
+                for (uint32_t i = 0; i < n; i++) {
+                    e.pal[i] = clut_lookup(i, e, four);
+                    h = (h ^ e.pal[i]) * 0x100000001B3ull;
+                    h ^= h >> 29;
+                }
+                e.pal_hash = h;
+            }
+        }
         if (hw::g_on) {  // the hardware renderer keeps its own textures
             e.tcached = false;
             return;
@@ -1814,14 +1833,16 @@ void clut_load(uint64_t tex0) {
     }
     if (g_trace)
         log_write(LOG_GS, "CLUT load cld=%u cbp=%x cpsm=%x csm=%u csa=%u psm=%x", cld, cbp, cpsm, csm, csa, psm);
+    g_clut_gen++;
+    g_reg_gen++;  // the drawing state uses the CLUT
     int n = eight ? 256 : 16;
     uint32_t off = four ? csa * 16 : 0;
     uint32_t cbw = bits(st.texclut, 0, 6), cou = bits(st.texclut, 6, 6), cov = bits(st.texclut, 12, 10);
     if (hw::g_on) {  // the CLUT may have been rendered
         if (csm == 0)
-            hw::vram_needed(cbp, 1, cpsm == PSMCT24 ? PSMCT32 : cpsm, 0, 0, eight ? 16 : 8, eight ? 16 : 2);
+            hw::vram_needed(cbp, 1, cpsm == PSMCT24 ? PSMCT32 : cpsm, 0, 0, eight ? 16 : 8, eight ? 16 : 2, "clut");
         else
-            hw::vram_needed(cbp, cbw, cpsm == PSMCT24 ? PSMCT32 : cpsm, (int)cou * 16, (int)cov, n, 1);
+            hw::vram_needed(cbp, cbw, cpsm == PSMCT24 ? PSMCT32 : cpsm, (int)cou * 16, (int)cov, n, 1, "clut");
     }
     for (int i = 0; i < n; i++) {
         int x, y;

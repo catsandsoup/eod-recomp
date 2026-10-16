@@ -7,6 +7,11 @@
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
 #include <csignal>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +32,8 @@
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
+#include "core/eodsave.h"
+#include "core/ps2mc.h"
 #include "gs/gs.h"
 #include "hw/hw.h"
 #include "hw/ipu.h"
@@ -38,6 +45,119 @@
 #include "vu.h"
 
 void vu_init();
+int vu_bench(const char *path, int repeat);
+void gs_sync();
+std::string mc_port_dir(int port);  // iop/mc.cpp
+
+// Ends the program from the EE thread: lets the GS thread finish what it was
+// given, then leaves without running static destructors under the threads
+// that are still running (the GS thread, sound).
+// --save-edit FILE [money=N] [rep=A,B,POINTS] [slotN=VEHICLE] [option=value]...:
+// shows or changes values in a save file (memcard/port0/BASLUS-20910DRIVEN/
+// BASLUS-20910DRIVEN); "vehicles" lists the vehicle numbers.
+static int save_edit(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "--save-edit: save file expected\n");
+        return 1;
+    }
+    EodSave sv;
+    std::string err;
+    if (!sv.load(argv[0], err)) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    bool changed = false, looks_changed = false;
+    std::vector<std::pair<int, int>> looks = eodsave_parse_looks(g_config.car_looks);
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "vehicles") {
+            for (const EodVehicle &v : eodsave_vehicles()) printf("%4d  %s\n", v.id, eodsave_vehicle_label(v.id).c_str());
+            return 0;
+        }
+        size_t eq = a.find('=');
+        if (eq == std::string::npos) {
+            fprintf(stderr, "expected name=value: %s\n", a.c_str());
+            return 1;
+        }
+        std::string k = a.substr(0, eq), v = a.substr(eq + 1);
+        if (k == "money") {
+            sv.set_money((int32_t)strtol(v.c_str(), nullptr, 10));
+        } else if (k == "rep") {
+            int ra = 0, rb = 0, rp = 0;
+            if (sscanf(v.c_str(), "%d,%d,%d", &ra, &rb, &rp) != 3) {
+                fprintf(stderr, "rep=A,B,POINTS expected\n");
+                return 1;
+            }
+            sv.set_reputation(ra, rb, rp);
+        } else if (k.size() == 5 && k.compare(0, 4, "slot") == 0 && k[4] >= '1' && k[4] <= '4') {
+            std::vector<int> shown;
+            for (int s = 0; s < sv.car_count(); s++) shown.push_back(eodsave_slot_shown(sv, s, looks));
+            if (k[4] - '1' >= (int)shown.size()) {
+                fprintf(stderr, "%s: no car in that slot\n", k.c_str());
+                return 1;
+            }
+            shown[(size_t)(k[4] - '1')] = atoi(v.c_str());
+            if (!eodsave_set_slots(sv, shown, looks, err)) {
+                fprintf(stderr, "%s: %s\n", k.c_str(), err.c_str());
+                return 1;
+            }
+            looks_changed = true;
+        } else {
+            size_t idx = sv.options().size();
+            for (size_t j = 0; j < sv.options().size(); j++)
+                if (sv.options()[j].name == k) {
+                    idx = j;  // (names repeat per controller layout: the first one)
+                    break;
+                }
+            if (idx == sv.options().size() || !sv.set_option(idx, v, err)) {
+                fprintf(stderr, "%s: %s\n", k.c_str(), idx == sv.options().size() ? "no such setting" : err.c_str());
+                return 1;
+            }
+        }
+        changed = true;
+    }
+    if (changed && !sv.save(argv[0], err)) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    if (looks_changed) {
+        g_config.car_looks = eodsave_format_looks(looks);
+        if (!config_save(g_config_path)) fprintf(stderr, "can't write %s\n", g_config_path.c_str());
+    }
+    int32_t ra, rb, rp;
+    sv.reputation(ra, rb, rp);
+    printf("player %s, checksum %s\n", sv.player_name().c_str(), sv.checksum_ok() ? "ok" : "BAD");
+    if (sv.has_career()) {
+        printf("money %d\n", sv.money());
+        for (int k = 0; k < sv.car_count(); k++) {
+            int shown = eodsave_slot_shown(sv, k, looks), car = sv.slot_vehicle(k);
+            printf("slot%d %d (%s)", k + 1, shown, eodsave_vehicle_label(shown).c_str());
+            if (shown != car) printf(" over career car %d (%s)", car, eodsave_vehicle_label(car).c_str());
+            printf("\n");
+        }
+    }
+    if (sv.has_reputation())
+        printf("reputation %d x100 + %d x50 + %d = %d\n", ra, rb, rp, EodSave::reputation_total(ra, rb, rp));
+    if (!changed)
+        for (const EodSaveOption &o : sv.options())
+            printf("  %-14s %-20s %s\n", eodsave_group_name(o.group), o.name.c_str(), o.value.c_str());
+    return 0;
+}
+
+[[noreturn]] void app_exit(int code) {
+    gs_shutdown();  // drains and joins the GS worker (docs/WORKER_SHUTDOWN.md)
+    if (const char *path = getenv("EOD_DUMP_RAM")) {  // EE main memory at exit (debugging)
+        if (FILE *f = fopen(path, "wb")) {
+            std::vector<uint8_t> buf(32u << 20);
+            ee_read_block(0, buf.data(), (uint32_t)buf.size());
+            fwrite(buf.data(), 1, buf.size(), f);
+            fclose(f);
+        }
+    }
+    platform_shutdown();
+    fflush(nullptr);
+    _exit(code);
+}
 
 namespace {
 
@@ -136,9 +256,13 @@ int main(int argc, char **argv) {
     if (!g_config.data_dir.empty()) data_dir = g_config.data_dir;
     const char *log_spec = getenv("EOD_LOG");
     const char *replay = nullptr;
+    const char *vu_bench_file = nullptr;
+    const char *import_card = nullptr;
     int repeat = 3;
+#ifndef _WIN32
     bool list_pads = false;
     int watch_pads = 0;
+#endif
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * {
@@ -165,23 +289,42 @@ int main(int argc, char **argv) {
         else if (a == "--screenshot-every") g_opt_screenshot_every = atoi(next());
         else if (a == "--screenshot-dir") g_opt_screenshot_dir = next();
         else if (a == "--gs-replay") replay = next();
+        else if (a == "--vu-bench") vu_bench_file = next();
+        else if (a == "--import-save") import_card = next();
+        else if (a == "--save-edit") return save_edit(argc - i - 1, argv + i + 1);
         else if (a == "--repeat") repeat = atoi(next());
+#ifndef _WIN32
         else if (a == "--list-pads") list_pads = true;
         else if (a == "--watch") watch_pads = atoi(next());
+#endif
         else if (a == "--help" || a == "-h") {
-            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|d3d11|software] [--fullscreen|--windowed]\n"
+#ifdef _WIN32
+            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
+                   "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
+                   "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
+                   argv[0]);
+#else
+            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
+                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
+                   "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
+                   "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
                    "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
                    argv[0], argv[0]);
+#endif
             return 0;
         }
     }
     log_init(log_spec);
+#ifndef _WIN32
     if (list_pads || watch_pads > 0) return platform_list_pads(watch_pads);
+#endif
 #ifdef __APPLE__
-    if (!replay) {
+    if (!replay && !vu_bench_file) {
         // Honor an explicit environment path before trying local disc discovery.
         if (data_dir.empty()) {
             const char *env_data = getenv("EOD_DATA");
@@ -198,6 +341,10 @@ int main(int argc, char **argv) {
 #endif
     platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.
     if (replay) { int result = gs_replay(replay, repeat); gs_shutdown(); return result; }
+    if (vu_bench_file) {
+        vu_init();
+        return vu_bench(vu_bench_file, repeat);
+    }
 
 #ifdef HAVE_SSE
     // The EE FPU flushes denormals to zero.
@@ -229,6 +376,17 @@ int main(int argc, char **argv) {
               crc, ee_elf_crc32);
     g_game_root = root;
     LOG(LOG_CORE, "game root: %s", root.c_str());
+    if (import_card) {  // copy this game's saves from a PCSX2 memory card into port 0's folder
+        std::vector<Ps2McSave> saves;
+        std::string err;
+        if (!ps2mc_read_saves(import_card, "BASLUS-20910", saves, err)) fatal("%s", err.c_str());
+        std::string dir = mc_port_dir(0);
+        int n = ps2mc_write_saves(dir, saves, err);
+        for (const Ps2McSave &s : saves) printf("imported %s (%zu files) into %s\n", s.dir.c_str(), s.files.size(), dir.c_str());
+        if (saves.empty()) printf("no Eve of Destruction saves on %s\n", import_card);
+        if (n < (int)saves.size()) fatal("%s", err.c_str());
+        return 0;
+    }
 
     if (!platform_init(cfg)) fatal("platform initialisation failed");
     platform_thread_fast();  // the EE runs on this thread
