@@ -4,7 +4,9 @@ The owner's GOALS.md, PRODUCT_RULES.md and MODDING_IDEAS.md from `TDEOD RECOMP`
 define the player outcome. Their Xbox/NV2A implementation details are historical;
 the active target is PS2 SLUS_209.10 on Apple Silicon through Vulkan/MoltenVK.
 Faithful physics, damage, AI and progression remain required within these flows.
-120 Hz and all mod ideas stay deferred until the ordinary game works well.
+120 Hz and other mods stay deferred. The owner explicitly promoted LOD/draw
+distance and widescreen/ultrawide visibility to a high priority workstream;
+preserve a faithful baseline alongside scalable quality up to high-end 8K PCs.
 
 The owner's latest priority is custom single-player matches and local multiplayer
 at 100% game speed, with 4K-or-higher internal rendering and correctly proportioned

@@ -128,7 +128,10 @@ still under investigation. See [current evidence and limits](docs/STATUS.md).
 Developer build steps, measured performance and known fidelity limits:
 [docs/MACOS.md](docs/MACOS.md). The next visual priority is much longer
 high-detail draw distances and correct widescreen/ultrawide culling, with
-quality settings for stronger Macs. This is planned work, not a claim of zero
+quality settings for stronger Macs and high-end PCs at 8K. Maximum/Extreme tiers
+must not be limited to the owner's Mac; keep a playable Mac preset and a faithful
+baseline. CPU submission and asset streaming need separate work from GPU pixel
+cost. DLSS is deferred until the very last stage. This is planned work, not a claim of zero
 pop-in today. See [LOD/culling scope](docs/MODDING_SCOPE.md). High-refresh and
 other mods remain deferred.
 
