@@ -233,6 +233,40 @@ CPU-write-preservation readbacks into the PSMZ16 surface (see
 MVK prefill/argument-buffer/async-submit config, early draw-count kicks.
 Native full-game run not repeated here.
 
+## Native 2P race at 60 fps — October 16 continuation
+
+**Cause:** the GS worker was CPU-bound: 19 synchronous CPU-write-preservation
+readbacks per two frames (HUD textures streamed into the split-screen Z16
+surface's memory), each a submit + fence wait, then MoltenVK command encoding
+inside `vkQueueSubmit`. The EE blocked on the GS queue and caught up missed
+vblanks (the visible jumping).
+
+**Changes (all exact, Vulkan/macOS only):**
+- Deferred preservation (`deferred_schedule`/`deferred_resolve` in `gs_vulkan.cpp`):
+  the readback pass and copy are recorded at the same command position into a
+  staging slot without submitting; ownership metadata is unchanged. A per-page
+  bit mask tracks CPU-rewritten storage bits; before any CPU read of a block
+  still holding a GPU-owed bit (readback_pages consumers, surface uploads,
+  texture decode of the exact texels) the copy is waited for and merged
+  bit-exactly. Pages the CPU rewrites completely never wait (18 of 19 here).
+  `EOD_DEFER_PRESERVE=0` restores the synchronous path.
+- Pages whose last deferral needed a merge submit early (`EOD_DEFER_KICK=0` off).
+- `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0` (unless the user set it): MoltenVK
+  encodes on its own queue thread.
+
+**Gate:** display PPM and 4 MiB VRAM byte-identical to the pre-change binary at
+RenderScale 1 and 6 for race2p-5000, race2p, codex-native2p and three heavy
+late-race captures; 43/43 CTests (the CPU-write fixtures exercise the merge).
+
+**Result:** race2p-5000 warm replay 49 -> 23 ms per 2 frames at 1x (loaded
+machine; ~38 ms idle baseline), 60 -> 33 ms at 4x, 64 -> 36 ms at 5x. Live
+scripted 2P race (`tools/test_2p_race.sh` input, 1x): 5 s windows 30-39 ->
+59.9 fps, vblank catch-ups ~11/s -> 0, worst vblank debt 77 -> <17 ms. At 4x
+(~3024x1964) median 59.7 with dips to ~36-57 in heavy/start windows; at 5x
+(~4K) median ~53: GPU fragment work dominates there. A one-off ~35 ms GS hitch
+remains at race load (first decode of ~64 MB of textures). The stats line
+prints `deferred preservation N (merged, waited, overwritten, kicked, open)`.
+
 ## Clean-start existing-renderer probe
 
 The default-off `EOD_GS_DUMP_COLD_START=N` capture now permits an exact initialized
