@@ -9,6 +9,7 @@ namespace sdl_input {
 namespace {
 
 int g_keyboard_port = 0;
+bool g_modern_layout = false;
 SDL_JoystickID g_port_pad[kPorts];
 SDL_Gamepad *g_port_gamepad[kPorts];
 
@@ -94,6 +95,8 @@ int keyboard_port_from_env() {
     if (n == 0) return 0;  // older scripts used 0-based "0" for player 1
     return n <= kPorts ? n - 1 : -1;
 }
+
+void set_controller_layout(bool modern) { g_modern_layout = modern; }
 
 void set_keyboard_port(int port) { g_keyboard_port = port >= 0 && port < kPorts ? port : -1; }
 int keyboard_port() { return g_keyboard_port; }
@@ -191,14 +194,25 @@ void read_gamepad(SDL_Gamepad *gp, HostPadState *out) {
     out->connected = true;
     for (const auto &m : map)
         if (SDL_GetGamepadButton(gp, m.b)) out->buttons |= m.btn;
-    // Triggers are analog: L2/R2 pressure is the trigger travel (the game
-    // reads pressure for throttle and brake), plus the digital bit.
+    // Original mirrors PS2 L2/R2. Modern feeds the game's classic analog
+    // throttle/brake channels (Cross/Square) and leaves L2/R2 released so
+    // pulling a trigger cannot also invoke its original shoulder action.
     uint8_t lt = trigger_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
     uint8_t rt = trigger_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-    if (lt > kTriggerDigital) out->buttons |= PAD_L2;
-    if (rt > kTriggerDigital) out->buttons |= PAD_R2;
-    if (lt > out->pressure[10]) out->pressure[10] = lt;
-    if (rt > out->pressure[11]) out->pressure[11] = rt;
+    int left_pressure = g_modern_layout ? 7 : 10;
+    int right_pressure = g_modern_layout ? 6 : 11;
+    uint16_t left_button = g_modern_layout ? PAD_SQUARE : PAD_L2;
+    uint16_t right_button = g_modern_layout ? PAD_CROSS : PAD_R2;
+    // Physical face buttons and a keyboard sharing this player are full
+    // travel; a partial trigger must not reduce their existing pressure.
+    if (g_modern_layout) {
+        if (out->buttons & PAD_CROSS) out->pressure[6] = 255;
+        if (out->buttons & PAD_SQUARE) out->pressure[7] = 255;
+    }
+    if (lt > kTriggerDigital) out->buttons |= left_button;
+    if (rt > kTriggerDigital) out->buttons |= right_button;
+    if (lt > out->pressure[left_pressure]) out->pressure[left_pressure] = lt;
+    if (rt > out->pressure[right_pressure]) out->pressure[right_pressure] = rt;
     // SDL's Y axes point down like the DualShock's (0 = up); a centred stick
     // leaves the keyboard's steering alone when both share a port
     uint8_t lx = stick_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX));
@@ -250,7 +264,7 @@ void format_state(const HostPadState &s, char *buf, size_t size) {
             if (btn[0]) strncat(btn, "+", sizeof btn - strlen(btn) - 1);
             strncat(btn, names[i], sizeof btn - strlen(btn) - 1);
         }
-    snprintf(buf, size, "%s L2=%3d R2=%3d left=(%3d,%3d) right=(%3d,%3d)%s", btn[0] ? btn : "-", s.pressure[10],
+    snprintf(buf, size, "%s Cross=%3d Square=%3d L2=%3d R2=%3d left=(%3d,%3d) right=(%3d,%3d)%s", btn[0] ? btn : "-", s.pressure[6], s.pressure[7], s.pressure[10],
              s.pressure[11], s.lx, s.ly, s.rx, s.ry, s.connected ? "" : " (disconnected)");
 }
 
@@ -266,7 +280,8 @@ void log_state(int port, const HostPadState &s) {
     bool changed = !seen[port] || s.connected != o.connected || s.buttons != o.buttons ||
                    moved(s.lx, o.lx, 128) || moved(s.ly, o.ly, 128) || moved(s.rx, o.rx, 128) ||
                    moved(s.ry, o.ry, 128) || moved(s.pressure[10], o.pressure[10], 0) ||
-                   moved(s.pressure[11], o.pressure[11], 0);
+                   moved(s.pressure[11], o.pressure[11], 0) || moved(s.pressure[6], o.pressure[6], 0) ||
+                   moved(s.pressure[7], o.pressure[7], 0);
     if (!changed) return;
     seen[port] = true;
     last[port] = s;

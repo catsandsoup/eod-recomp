@@ -64,3 +64,23 @@ The persistence test proves the host-backed RPC path across processes. It
 is not proof of an actual career save/load through the game's menus.
 Known remaining MC approximations include fixed free space, directory
 listing/metadata commands, formatting and current-directory handling.
+
+## Explicit controller layouts
+
+The application setting `[Input] ControllerLayout=original|modern` defaults
+to `original`. Original retains the PS2 mapping; Modern maps RT to Cross
+pressure (gas) and LT to Square pressure (brake), releasing their native
+L2/R2 roles. Source inspection of `0x00332D64` and `0x002AA490` established
+that the game's classic analog throttle/brake read Cross/Square pressure,
+while its third layout uses digital shoulders. Exposing L2/R2 pressure
+alone therefore does not meet the modern analog driving requirement.
+
+Virtual joystick tests cover partial and light trigger travel, releases,
+independent players, return to Original, and face-button/shared-keyboard
+priority. A held face button/key retains full pressure even when a trigger
+is partly pulled. The platform's final digital-pressure fill only supplies
+255 when a pressed button has zero pressure, preserving partial travel.
+Input logs include Cross/Square pressure changes as well as L2/R2.
+
+These hardware-free mapping tests do not verify a physical Rock Candy pad
+or claim a complete actual-game analog-trigger driving test.
