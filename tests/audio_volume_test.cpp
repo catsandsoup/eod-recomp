@@ -37,6 +37,7 @@ static int render(int volume) {
 }
 int main() {
     setenv("EOD_HEADLESS","1",1); setenv("EOD_MUTE","1",1);
+    setenv("EOD_TIMING_TRACE","1",1);
     // SDL streams run offline; no SDL audio subsystem or device is started.
     std::vector<uint8_t> ram(IOP_RAM_SIZE,0); g_iop_ram=ram.data();
     for (int block=0;block<2;block++) for (int i=0;i<128;i++) {
@@ -49,5 +50,29 @@ int main() {
     if (full<11000 || std::abs(half*2-full)>2 || zero!=0) return 1;
     g_config.audio=false;
     if(sdl_output_gain(g_config)!=0) return 1;
+    // A delayed producer and an overfull sink are different discontinuities.
+    // Exercise real spu2_update accounting with an offline SDL stream only.
+    g_config.audio=true; g_config.volume=100;
+    SDL_AudioSpec format{SDL_AUDIO_S16LE,2,48000};
+    stream=SDL_CreateAudioStream(&format,&format);
+    if (!stream) return 1;
+    eod_timing::state() = {};
+    g_t0=1000; g_produced=0; g_audio_open=true; fake_now=251000;
+    spu2_update(); // 12000 due; 4800 mixed, 7200 discarded by existing policy.
+    auto &trace = eod_timing::state();
+    if (trace.audio_debt_max != 12000 || trace.audio_mixed != 4800 ||
+        trace.audio_debt_dropped != 7200 || trace.audio_queue_suppressed != 0) return 1;
+    std::vector<int16_t> silence(19200,0);
+    SDL_PutAudioStreamData(stream,silence.data(),38400); // >=200ms already queued
+    fake_now=253000;
+    spu2_update();
+    if (trace.audio_mixed != 4896 || trace.audio_queue_suppressed != 96) return 1;
+    SDL_DestroyAudioStream(stream); stream=nullptr;
+    eod_timing::Trace bounded;
+    if (bounded.report_due(1000) || bounded.report_due(1000999)) return 1;
+    if (!bounded.report_due(1001000) || bounded.report_due(1001001)) return 1;
+    for (unsigned i=1; i<120; ++i)
+        if (!bounded.report_due(1001000ull + i*1000000ull)) return 1;
+    if (bounded.report_due(200000000)) return 1;
     return 0;
 }
