@@ -9,6 +9,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <atomic>
 #include <windows.h>
 #include <mmsystem.h>
 
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "../../ui/overlay.h"
 #include "../platform.h"
 #include "../pad_script.h"
 
@@ -26,6 +28,7 @@ void build_key_map();
 namespace {
 
 PlatformConfig g_cfg;
+std::atomic<int> g_aspect{0};  // display aspect (platform_set_aspect)
 HWND g_hwnd;
 bool g_quit;
 bool g_fullscreen;
@@ -118,6 +121,7 @@ void paint(HDC dc) {
 }
 
 LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (overlay_wndproc(h, msg, wp, lp)) return 0;  // the in-game menu
     switch (msg) {
     case WM_CLOSE:
         g_quit = true;
@@ -202,6 +206,7 @@ DWORD WINAPI ticker_thread(LPVOID p) {
 // ================================================================= API
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
+    g_aspect = cfg.aspect;
     QueryPerformanceFrequency(&g_qpf);
     timeBeginPeriod(1);
     load_xinput();
@@ -357,6 +362,47 @@ void platform_get_pad(int port, HostPadState *out) {
         if (out->buttons & PAD_UP) out->ly = 0;
         if (out->buttons & PAD_DOWN) out->ly = 255;
     }
+    HostPadState c;
+    platform_get_controller(port, &c);
+    if (c.connected) {
+        out->connected = true;
+        out->buttons |= c.buttons;
+        if (c.lx != 128) out->lx = c.lx;  // (the stick outside its dead zone)
+        if (c.ly != 128) out->ly = c.ly;
+        out->rx = c.rx;
+        out->ry = c.ry;
+        out->pressure[10] = c.pressure[10];
+        out->pressure[11] = c.pressure[11];
+    }
+    // the in-game menu has the input
+    if (overlay_menu_open()) {
+        *out = HostPadState();
+        out->connected = true;
+    }
+    // EOD_PAD_SCRIPT (automated testing) replaces port 0's input
+    uint16_t sb;
+    if (port == 0 && pad_script_buttons(sb)) {
+        *out = HostPadState();
+        out->connected = true;
+        out->buttons = sb;
+    }
+    // pressure for digital buttons
+    static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
+                                       PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
+    for (int i = 0; i < 12; i++)
+        if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
+}
+
+void platform_get_controller(int port, HostPadState *out) {
+    // (asked by the game and by the in-game menu every vblank: XInput is read once)
+    static HostPadState last[4];
+    static uint64_t when[4];
+    uint64_t now = platform_time_us();
+    if (port >= 0 && port < 4 && when[port] && now - when[port] < 4000) {
+        *out = last[port];
+        return;
+    }
+    *out = HostPadState();
     if (pXInputGetState) {
         XINPUT_STATE_ xs;
         if (pXInputGetState((DWORD)port, &xs) == 0) {
@@ -389,24 +435,18 @@ void platform_get_pad(int port, HostPadState *out) {
             out->pressure[11] = xs.Gamepad.bRightTrigger;
         }
     }
-    // EOD_PAD_SCRIPT (automated testing) replaces port 0's input
-    uint16_t sb;
-    if (port == 0 && pad_script_buttons(sb)) {
-        *out = HostPadState();
-        out->connected = true;
-        out->buttons = sb;
+    if (port >= 0 && port < 4) {
+        last[port] = *out;
+        when[port] = now;
     }
-    // pressure for digital buttons
-    static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
-                                       PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
-    for (int i = 0; i < 12; i++)
-        if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
 }
 
+void platform_set_aspect(int aspect) { g_aspect = aspect; }
+
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    int vw = cw, vh = ch;
-    if (g_cfg.aspect != 2) {  // 4:3 or 16:9, letterboxed
-        int an = g_cfg.aspect == 1 ? 16 : 4, ad = g_cfg.aspect == 1 ? 9 : 3;
+    int vw = cw, vh = ch, aspect = g_aspect;
+    if (aspect != 2) {  // 4:3 or 16:9, letterboxed
+        int an = aspect == 1 ? 16 : 4, ad = aspect == 1 ? 9 : 3;
         vh = cw * ad / an;
         if (vh > ch) {
             vh = ch;
@@ -420,6 +460,12 @@ void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
 }
 
 void *platform_native_window() { return g_hwnd; }
+
+void platform_set_fullscreen(bool on) {
+    if (g_hwnd && on != g_fullscreen) toggle_fullscreen();
+}
+
+bool platform_fullscreen() { return g_fullscreen; }
 
 void platform_set_status(const char *text) {
     if (!g_hwnd) return;

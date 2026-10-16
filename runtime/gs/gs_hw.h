@@ -33,11 +33,13 @@ void draw_point(const Env &e, const Vertex &a);
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 // The CPU is about to read GS memory there (transfer source, CLUT load):
 // rendered contents are copied back to gs::vram first.
-void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
+void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why = "transfer");
 
 // Composes and presents the displayed image (GS thread, at vblank when the
 // display changed).  vsync: wait for the monitor.
 void present(bool vsync);
+// Presents the last composed image again (the game is paused in the in-game menu).
+void redraw();
 // The last composed image (screenshots, replays): RGBA, false if none.
 bool read_display(std::vector<uint32_t> &rgba, int &w, int &h);
 // The calling thread renders from now on (the GS thread, when there is one).

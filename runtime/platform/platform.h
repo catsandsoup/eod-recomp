@@ -21,10 +21,15 @@ void platform_fatal_message(const char *msg);
 // Pumps OS events. Returns false when the user closed the window.
 bool platform_pump();
 
+// Display aspect ratio, changeable while running: 0 = 4:3, 1 = 16:9, 2 = stretched to the window.
+void platform_set_aspect(int aspect);
 // Where the image goes in a client area of cw x ch (aspect ratio setting).
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h);
 // The native window (HWND on Windows; null when headless).
 void *platform_native_window();
+// Borderless fullscreen (window thread).
+void platform_set_fullscreen(bool on);
+bool platform_fullscreen();
 // Short status text shown after the window title (speed statistics).
 void platform_set_status(const char *text);
 // Displays a 32-bit (0xAABBGGRR little endian, i.e. bytes R,G,B,A) image.
@@ -67,6 +72,8 @@ struct HostPadState {
 };
 
 void platform_get_pad(int port, HostPadState *out);
+// The game controller alone (no keyboard), also while the in-game menu holds the game's input.
+void platform_get_controller(int port, HostPadState *out);
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor);
 
 // ------------------------------------------------------------------ audio

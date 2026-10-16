@@ -76,7 +76,10 @@ std::string key_name(int code) {
     return "";
 }
 
+std::string g_config_path = "eod.ini";
+
 bool config_load(const std::string &path, Config &c) {
+    if (&c == &g_config) g_config_path = path;
     FILE *f = fopen(path.c_str(), "r");
     if (!f) return false;
     char line[1024];
@@ -105,10 +108,11 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "Width")) c.width = num(320, 16384);
             else if (ieq(k, "Height")) c.height = num(240, 16384);
             else if (ieq(k, "VSync")) c.vsync = to_bool(v);
-            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "stretch") ? "stretch" : "4:3";
+            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "stretch") ? "stretch" : ieq(v, "4:3") ? "4:3" : "auto";
             else if (ieq(k, "RenderScale")) c.render_scale = num(1, 6);
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);
+            else if (ieq(k, "ShowFps")) c.show_fps = to_bool(v);
         } else if (ieq(section, "Audio")) {
             if (ieq(k, "Enabled")) c.audio = to_bool(v);
             else if (ieq(k, "Volume")) c.volume = num(0, 100);
@@ -116,9 +120,14 @@ bool config_load(const std::string &path, Config &c) {
             if (ieq(k, "Vibration")) c.vibration = to_bool(v);
             for (int i = 0; i < KEY_COUNT; i++)
                 if (ieq(k, kPadKeyNames[i])) c.keys[i] = v;
+        } else if (ieq(section, "Gameplay")) {
+            if (ieq(k, "CarDurability")) c.car_durability = to_bool(v);
+        } else if (ieq(section, "Career")) {
+            if (ieq(k, "CarLooks")) c.car_looks = v;
         } else if (ieq(section, "System")) {
             if (ieq(k, "MemoryCard")) c.memcard_dir = v;
             else if (ieq(k, "DataPath")) c.data_dir = v;
+            else if (ieq(k, "PauseInMenu")) c.pause_in_menu = to_bool(v);
         }
     }
     fclose(f);
@@ -128,7 +137,7 @@ bool config_load(const std::string &path, Config &c) {
 bool config_save(const std::string &path, const Config &c) {
     FILE *f = fopen(path.c_str(), "w");
     if (!f) return false;
-    fprintf(f, "; Test Drive: Eve of Destruction - PC port settings (written by eodsetup)\n\n");
+    fprintf(f, "; Test Drive: Eve of Destruction - PC port settings (written by eodsetup and the in-game menu)\n\n");
     fprintf(f, "[Video]\n");
     fprintf(f, "Renderer=%s        ; d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
     fprintf(f, "Adapter=%d\n", c.adapter);
@@ -136,19 +145,27 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "Width=%d\n", c.width);
     fprintf(f, "Height=%d\n", c.height);
     fprintf(f, "VSync=%d\n", c.vsync ? 1 : 0);
-    fprintf(f, "AspectRatio=%s      ; 4:3, 16:9 or stretch\n", c.aspect.c_str());
+    fprintf(f, "AspectRatio=%s      ; auto (the game's Widescreen option), 4:3, 16:9 (sets the game's option) or stretch\n",
+            c.aspect.c_str());
     fprintf(f, "RenderScale=%d        ; internal resolution: 1 = 640x448 (PS2), 2 = 1280x896, ...\n", c.render_scale);
     fprintf(f, "SmoothDisplay=%d\n", c.smooth_display ? 1 : 0);
     fprintf(f, "FrameSkip=%d\n", c.frame_skip ? 1 : 0);
+    fprintf(f, "ShowFps=%d\n", c.show_fps ? 1 : 0);
     fprintf(f, "\n[Audio]\n");
     fprintf(f, "Enabled=%d\n", c.audio ? 1 : 0);
     fprintf(f, "Volume=%d\n", c.volume);
     fprintf(f, "\n[Input]\n; keyboard keys for each PS2 button, separated by commas\n");
     for (int i = 0; i < KEY_COUNT; i++) fprintf(f, "%s=%s\n", kPadKeyNames[i], c.keys[i].c_str());
     fprintf(f, "Vibration=%d\n", c.vibration ? 1 : 0);
+    fprintf(f, "\n[Gameplay]\n");
+    fprintf(f, "CarDurability=%d      ; 1: each car's durability from its files (damage_scale) on top of its weight\n",
+            c.car_durability ? 1 : 0);
+    fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
+    fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());
     fprintf(f, "\n[System]\n");
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
     fprintf(f, "DataPath=%s\n", c.data_dir.c_str());
+    fprintf(f, "PauseInMenu=%d        ; the game stops while the in-game menu (F1) is open\n", c.pause_in_menu ? 1 : 0);
     fclose(f);
     return true;
 }

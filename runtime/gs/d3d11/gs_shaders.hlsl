@@ -297,3 +297,34 @@ float4 ps_copy(PassOut i) : SV_Target {
     float4 c = (p_fmt.z & P_POINT) ? t_src.SampleLevel(s_point, uv, 0) : t_src.SampleLevel(s_linear, uv, 0);
     return float4(c.rgb, p_color.a);
 }
+
+// ---------------------------------------------------------------- overlay
+// The in-game menu (Dear ImGui): positions in window pixels, the font
+// texture (or white), vertex colours.
+cbuffer OverlayConsts : register(b2) {
+    float4 o_scale;  // xy: 2 / window size
+};
+
+struct OverlayIn {
+    float2 pos : POSITION;
+    float2 uv : TEXCOORD;
+    float4 col : COLOR;
+};
+
+struct OverlayOut {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD;
+    float4 col : COLOR;
+};
+
+OverlayOut vs_overlay(OverlayIn i) {
+    OverlayOut o;
+    o.pos = float4(i.pos.x * o_scale.x - 1.0, 1.0 - i.pos.y * o_scale.y, 0.0, 1.0);
+    o.uv = i.uv;
+    o.col = i.col;
+    return o;
+}
+
+float4 ps_overlay(OverlayOut i) : SV_Target {
+    return i.col * t_src.Sample(s_linear, i.uv);
+}
