@@ -364,3 +364,15 @@ Replay display configuration is initialized without opening SDL devices.
 CPU tests cover 4K/MBP rectangles, capture-size validation, startup aspect
 persistence after a later settings save, and 16:10 config round-trip. Actual
 GPU composition validation belongs to the combined camera/display build.
+
+
+### Keyboard racing preset
+
+The default **Racing (WASD + arrows)** keyboard layout uses WASD or arrow keys
+for menus; Enter accepts and Escape goes back. In races, W/Up accelerates,
+S/Down or **Space brakes**, A/D or Left/Right steers, and Escape pauses.
+Enter starts the title screen and has no driving action. Release held keys
+when changing screens. Opposite steering keys cancel to center.
+Select **Original (PS2 keys)** to use the per-button key bindings instead;
+`[Input] KeyboardLayout=racing|original` persists this choice. Gamepad layout
+is a separate setting. Target-state evidence is in [KEYBOARD_CONTEXT.md](KEYBOARD_CONTEXT.md).
