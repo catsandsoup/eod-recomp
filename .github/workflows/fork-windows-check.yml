@@ -1,0 +1,126 @@
+# Fork-only build check: compiles and links the Windows (64/32-bit) and
+# headless Linux targets the same way release.yml does, for any branch, tag
+# or commit, without publishing anything.
+#
+# release.yml generates gen/ from SLUS_209.10, which it downloads from a
+# private repository this fork has no access to. This workflow never has the
+# game executable. Instead it writes a stub gen/: funcs.h and table.c declare
+# and define (as empty functions) only the f_XXXXXXXX symbols the runtime
+# itself references or wraps (config/hle.txt), so every runtime, platform,
+# D3D11 and eodsetup source is compiled and linked exactly as in a release
+# build. The resulting binaries cannot run the game and are not uploaded.
+#
+# Run it from the Actions tab or:
+#   gh workflow run fork-windows-check.yml -R catsandsoup/eod-recomp -f ref=<branch|sha>
+
+name: Fork Windows check
+run-name: Windows check ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build"
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win64
+            toolchain: cmake/mingw-x86_64.cmake
+          - target: win32
+            toolchain: cmake/mingw-i686.cmake
+          - target: linux-x86_64
+            toolchain: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          if [ "${{ matrix.target }}" != linux-x86_64 ]; then
+            sudo apt-get install -y --no-install-recommends mingw-w64
+          fi
+
+      - name: Commit
+        run: |
+          echo "ref ${{ inputs.ref }} = $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          git log -1 --format='%h %s' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stub gen/ (no game executable)
+        run: |
+          python - <<'EOF'
+          import os, re, pathlib
+          hle = {}
+          for line in pathlib.Path("config/hle.txt").read_text().splitlines():
+              f = line.split("#", 1)[0].split()
+              if len(f) >= 2 and re.fullmatch(r"[0-9A-Fa-f]{8}", f[0]):
+                  hle[f[0].upper()] = f[1]
+          refs, defined = set(), set()
+          for top in ("runtime", "src"):
+              for dirpath, _, files in os.walk(top):
+                  for name in files:
+                      if not name.endswith((".c", ".cpp", ".h", ".inc")):
+                          continue
+                      text = pathlib.Path(dirpath, name).read_text(errors="replace")
+                      refs.update(m.upper() for m in re.findall(r"\bf_([0-9A-Fa-f]{8})(?:_orig)?\b", text))
+                      defined.update(m.upper() for m in re.findall(r"\bvoid\s+f_([0-9A-Fa-f]{8})\s*\(\s*(?:void)?\s*\)\s*\{", text))
+          funcs = sorted(refs | {a for a, k in hle.items() if k in ("wrap", "replace")})
+          orig = sorted(a for a, k in hle.items() if k == "wrap")
+          os.makedirs("gen", exist_ok=True)
+          with open("gen/funcs.h", "w") as h:
+              h.write("/* stub for the fork CI build check */\n#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n")
+              h.writelines(f"void f_{a}(void);\n" for a in funcs)
+              h.writelines(f"void f_{a}_orig(void);\n" for a in orig)
+              h.write("#ifdef __cplusplus\n}\n#endif\n")
+          with open("gen/table.c", "w") as c:
+              c.write('/* stub for the fork CI build check */\n#include "ee.h"\n#include "funcs.h"\n\n')
+              c.writelines(f"void f_{a}(void) {{}}\n" for a in funcs if a not in defined and hle.get(a) not in ("wrap", "replace"))
+              c.writelines(f"void f_{a}_orig(void) {{}}\n" for a in orig)
+              c.write("\nconst EEFuncEntry ee_func_table[] = {\n")
+              c.writelines(f"  {{ 0x{a}, f_{a} }},\n" for a in funcs)
+              c.write("};\n")
+              c.write(f"const unsigned ee_func_table_size = {len(funcs)};\n")
+              c.write("const uint32_t ee_elf_crc32 = 0;\nconst uint32_t ee_elf_size = 0;\n")
+          # no compiled VU programs: the interpreter runs everything
+          with open("gen/vu_rec.inc", "w") as v:
+              v.write("// stub for the fork CI build check\nconst VuProg g_vu_progs[1] = {{-1, 0, nullptr, 0, nullptr}};\nconst int g_vu_nprogs = 0;\n")
+          print(f"stub gen/: {len(funcs)} functions, {len(orig)} wrapped originals, {len(defined)} defined by the runtime")
+          EOF
+
+      - name: Configure
+        run: |
+          # no Python for CMake: it must not try to regenerate gen/
+          args="-DCMAKE_BUILD_TYPE=Release -DCMAKE_DISABLE_FIND_PACKAGE_Python3=ON"
+          if [ -n "${{ matrix.toolchain }}" ]; then
+            args="$args -DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }}"
+          fi
+          cmake -S . -B build -G Ninja $args
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Check outputs
+        run: |
+          if [ "${{ matrix.target }}" = linux-x86_64 ]; then
+            ls -l build/eod
+            build/eod --help
+          else
+            ls -l build/eod.exe build/eodsetup.exe
+          fi
