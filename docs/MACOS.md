@@ -204,3 +204,31 @@ tools/test_app_vulkan.sh "/path/Eve of Destruction.app" /path/race2p.gsd /tmp/ap
 ```
 
 The script stays headless/muted and fails if replay falls back to software.
+
+### Refresh-grid presentation (optional driver support)
+
+When `VK_GOOGLE_display_timing` is advertised, the Vulkan presenter now learns
+its refresh phase from completed presentation feedback and requests future
+images near a fixed refresh grid. A 120 Hz display normally uses two refreshes
+per guest image. The original 59.94 Hz game clock remains unchanged: on an
+exactly 120 Hz fixed-rate display an occasional extra refresh is mathematically
+necessary; missed deadlines also re-anchor instead of accumulating latency.
+`EOD_PRESENT_TIMING=0` disables this optional path. Missing/invalid timing data
+keeps ordinary FIFO presentation. Swapchain/refresh changes reset the schedule,
+and no-vsync/catch-up sends no future presentation deadline.
+
+This adds no sleep, device lock, or GPU fence wait. It cannot prevent the Vulkan
+swapchain/driver's existing acquire/present calls from blocking. Visible cadence,
+ProMotion's actual chosen refresh rate and GPU deadline misses still require an
+interactive measurement; headless runs cannot verify this window-only path.
+`tools/test_present_timing.sh` checks the pure scheduling logic without a Vulkan
+or SDL device, including 120 Hz jitter, 59.94 Hz, rate mismatch, stalls and resets.
+
+The approach was identified in Road Trip's `schedulePresent()`/`waitForDrawable()`;
+our implementation is original, using the public extension rather than copied
+renderer code. Source references:
+
+- [Vulkan presentation timestamps](https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentTimeGOOGLE.html)
+- [MoltenVK presentation implementation](https://github.com/KhronosGroup/MoltenVK/blob/main/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm)
+- [Apple's matching host-time epoch](https://developer.apple.com/documentation/quartzcore/cacurrentmediatime())
+- [Road Trip's refresh-grid prior art](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/gs_pgs_presenter.cpp)
