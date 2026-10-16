@@ -26,7 +26,20 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
     if (ec) { fprintf(stderr, "Application Support: %s\n", ec.message().c_str()); return false; }
     if (g_config.memcard_dir.empty()) g_config.memcard_dir = support + "/memcard";
     if (const char *p = getenv("EOD_DATA")) if (data.empty()) data = p;
-    if (!data.empty()) return true; // explicit data remains suitable for automation
+    if (!data.empty()) {
+        // Validate before main's fatal-error path: platform_init has not yet
+        // established whether SDL dialogs are allowed for this launch.
+        DiscResult r = disc_check_folder(data, id);
+        if (r.ok()) return true;
+        if (headless) fprintf(stderr, "%s\n", r.message.c_str());
+        else {
+            [NSApplication sharedApplication];
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            [NSApp activateIgnoringOtherApps:YES];
+            error(r.message);
+        }
+        return false;
+    }
     data = support + "/disc";
     if (disc_check_folder(data, id).ok()) return true;
     if (headless) { fprintf(stderr, "No valid installed disc. Pass --data DIR or EOD_DATA; headless mode never opens dialogs.\n"); return false; }
