@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "audio_gain.h"
 #ifdef __APPLE__
 #include "../../app/macos_app.h"
 #endif
@@ -42,6 +43,11 @@ SDL_Texture *g_texture;
 int g_tex_w, g_tex_h;
 SDL_AudioStream *g_audio;
 float g_volume = 1.0f;
+
+void update_audio_gain() {
+    g_volume = sdl_output_gain(g_config);
+    if (g_audio) SDL_SetAudioStreamGain(g_audio, g_volume);
+}
 
 std::vector<uint32_t> g_last_frame;
 int g_last_w, g_last_h;
@@ -158,7 +164,7 @@ bool platform_init(const PlatformConfig &cfg) {
         return false;
     }
     build_key_map();
-    g_volume = (float)g_config.volume / 100.0f;
+    update_audio_gain();
 
     if (!g_headless) {
         SDL_WindowFlags wf = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -219,8 +225,7 @@ bool platform_pump() {
                 (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
                 if (mac_app_settings()) {
                     build_key_map();
-                    g_volume = g_config.audio ? (float)g_config.volume / 100.0f : 0;
-                    if (g_audio) SDL_SetAudioStreamGain(g_audio, g_volume);
+                    update_audio_gain();
                     g_cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
                     g_cfg.smooth = g_config.smooth_display;
                     if (g_texture) SDL_SetTextureScaleMode(g_texture, g_cfg.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
@@ -360,7 +365,7 @@ bool platform_audio_open(int sample_rate) {
         fprintf(stderr, "SDL audio stream: %s\n", SDL_GetError());
         return false;
     }
-    SDL_SetAudioStreamGain(g_audio, g_volume);
+    update_audio_gain();
     SDL_ResumeAudioStreamDevice(g_audio);
     return true;
 }
