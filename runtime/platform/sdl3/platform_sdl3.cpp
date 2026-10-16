@@ -156,6 +156,7 @@ bool platform_init(const PlatformConfig &cfg) {
     const char *keyboard_override = getenv("EOD_KEYBOARD_PORT");
     sdl_input::set_keyboard_port(keyboard_override && keyboard_override[0]
         ? sdl_input::keyboard_port_from_env() : g_config.keyboard_port - 1);
+    sdl_input::set_controller_layout(g_config.controller_layout == "modern");
     sdl_input::set_hints();
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
     if (!g_headless) flags |= SDL_INIT_VIDEO;
