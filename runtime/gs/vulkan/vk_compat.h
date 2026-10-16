@@ -854,7 +854,8 @@ inline bool Context::init(bool withWindow) {
     if (surface)
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     const char *timing = getenv("EOD_PRESENT_TIMING");
-    displayTiming = surface && has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && !(timing && *timing == '0');
+    // Fidelity bring-up uses ordinary presentation; high-refresh scheduling is opt-in.
+    displayTiming = surface && has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && timing && *timing == '1';
     if (displayTiming)
         dext.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     float priority = 1;

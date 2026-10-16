@@ -58,8 +58,56 @@ Keep the game's original timing. ProMotion/120 Hz display pacing is distinct
 from changing the game simulation rate. Mod implementation remains parked;
 `docs/MODDING_SCOPE.md` is the completed research handoff.
 
-## Integration in progress
+## Integrated results
 
-See `docs/superpowers/plans/2026-10-16-macos-takeover.md`. Component branches
-are reviewed and merged locally before a final integrated build, input/import
-tests, offscreen GPU replay comparison, bundle audit and two-player run.
+All three component branches are merged locally into `macos`. Controller source
+includes the target SDK 2.8 sequenced DMA rumble route (`1325441`) as well as the
+RPC path, with producer-derived regression tests and independent code review.
+The combined native build passes six CTests: virtual input, pad RPC/DMA,
+ISO9660/import, headless Mac startup, relocated Vulkan path selection, and the
+deferred refresh-cadence policy.
+
+The signed app contains static SDL, libusb, the Vulkan loader, MoltenVK and an
+app-relative ICD manifest. Linked dependency audit found no Homebrew absolute
+references. A relocated app under a path containing spaces passed actual GPU
+replay with an isolated environment and invalid external ICD overrides; the
+log confirms Apple M2 Pro Vulkan rather than silent software fallback.
+
+An isolated integrated 5x two-player run completed all 6600 frames. The last five
+samples were 57.1–59.5 drawn frames/s, 59.3–59.5 game frames/s. Earlier race/loading
+samples dropped as low as 36.8 drawn frames/s. Do not describe this as a locked
+60 FPS result. The run included screenshot readbacks and a GS capture.
+
+A new nine-frame race capture from that run was replayed without competing
+builds: software 258.3 ms, Vulkan 1x 108.0 ms, Vulkan 5x 115.2 ms (12.8 ms/frame).
+At 1x the RGB MAE against software was 1.837/255, p95 channel difference 4,
+p99 11. Close visual agreement is demonstrated; bit-exact parity is not.
+The 5x screenshot is 3200×2240. Captures/logs stay in ignored `work/`.
+
+The original two-player script left idle P2 against a barrier; SELECT cannot
+reset an on-track car there. The current script makes both accelerate while
+only P2 steers left for the first two seconds. The complete 6600-frame run
+shows different trajectories and each viewport responding independently.
+
+Current priority follows the player's journey in `docs/PLAYER_JOURNEY.md`,
+adapting the owner's Xbox-era product documents to the PS2/MoltenVK target.
+120 Hz and mods are deferred. Experimental refresh-grid scheduling is off by
+default. Save/relaunch, effective trigger driving and media behavior are higher
+priority than small renderer error metrics alone.
+
+See `docs/RENDERER_REFERENCES.md` for Context7, Road Trip, paraLLEl-GS and public
+PS2SDK research. No wholesale renderer or recompiler migration is required.
+
+## Remaining hands-on validation
+
+- Physical Rock Candy detection, trigger feel and motors (no controller was
+  connected during automated diagnostics).
+- Native first-run/settings UI, resize/fullscreen and actual 120 Hz presentation.
+  Automated runs deliberately opened no windows and played no sound.
+- Extended event-mode/career/save/audio parity. Intro decoding and transient
+  loading dips remain distinct from the verified late-race rendering.
+
+The current local app lives at
+`~/Library/Application Support/TDEODRecomp/local-build/Eve of Destruction.app`.
+Use `-DEOD_MAC_APP=ON` to rebuild, and `tools/make_dmg.sh` for a personal local
+image. No source push or binary publication was performed during takeover.
