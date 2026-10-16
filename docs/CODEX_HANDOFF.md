@@ -104,21 +104,22 @@ normal game ghosting; do not classify from appearance alone.
 
 ## Saved, UNVERIFIED next work — do not blindly merge
 
-1. `vulkan-gs` WIP `62652c5`: actual-chunk CPU transfer preservation. Read its
-   `docs/GS_CPU_WRITE_WIP.md` in the vk worktree. Moves notification/barriers to
-   bytes actually supplied, coalesces IMAGE payload, flushes prior GPU draws,
-   preserves partial/masked pages, skips preservation only for actual complete
-   storage coverage. CPU GSPageCoverage520 + GSTransferChunks5000 passed;
-   candidate objects and generator compile. Eleven public fixtures exist.
-   NO full executable/GPU/full-VRAM comparison/performance validation. Test
-   pending-order, partial, full, split, interrupted, CT24/high8/high4 cases.
-   Rebase/cherry-pick carefully: its gs.cpp predates the main shutdown changes.
+1. `vulkan-gs` WIP `62652c5` was tested carefully in this continuation,
+   preserving main shutdown/presentation/alpha changes. Its verified but slower
+   successor is saved on `macos-cpu-preservation`, NOT merged into `macos`. Full Mac build and all
+   25 CTests pass, including complete 4 MiB software/Vulkan comparisons for 12
+   public transfer fixtures at 1x/6x. Font and five-frame race images are unchanged.
+   Read `GS_CPU_WRITE_PRESERVATION.md`: isolated 6x replay grows 211–229ms to
+   325–330ms with 58 additional CPU readbacks. Exact-page grouping did not reduce
+   the cost and was removed. Correctness is verified for those fixtures;
+   efficient preservation remains open. Point scaling at 6x is a separate newly
+   recorded limitation. This is not proof of the black-line cause.
 2. `mac-app` WIP `2608d02`: alpha_range.h and CPU proofs only. Whole decoded
    texture alpha bounds across all active mip levels can prove an alpha test
    always passes and avoid the expensive two-pass fallback. NO production
    integration/GPU validation. Read the helpers/tests, incorporate TEXA/AEM,
    palette, TCC/TFX and vertex-alpha bounds. Unknown rendered textures retain
-   0..255. Require same-binary switch-off/on pixel equality at1x/6x, procedural
+   0..255. Require same-binary switch-off/on pixel equality at 1x/6x, procedural
    strict/variable-Z fallbacks and measured race improvement. Do not approximate.
 
 ## Local fixtures and practical next checks
@@ -141,7 +142,7 @@ normal game ghosting; do not classify from appearance alone.
   font-after.png, widescreen-camera-comparison.png. Copy needed deliverables
   into the fresh chat's outputs before linking there. No fabricated game images.
 - Short next validation: combined build/CTest; replay public fixtures and font;
-  fix/measure alpha and CPU-write WIPs; one isolated6x MP6600 with few captures
+  fix/measure alpha and CPU-write WIPs; one isolated 6x MP6600 with few captures
   to verify full exit, speed, proportions and lines. Then useful user play build
   with native keyboard-event timing if needed, keeping tests headless/muted.
 - Read docs/RENDERER_REFERENCES.md for Context7, RoadTripAdventure-recomp,
@@ -153,3 +154,14 @@ The handoff checkpoint's exact build/CTest outcome is in main ignored
 work/codex-build-handoff.log and work/codex-ctest-handoff.log. Read the result;
 do not inherit a passing claim without checking it. README and source must be
 committed/pushed before this old chat finishes the transfer.
+
+Candidate build/25 CTest logs: `work/codex-build-cpu-final.log` and
+`work/codex-ctest-cpu-final.log`. Baseline 6x MP 6600 clean exit is recorded in
+`work/continuation-6x/`; preservation-build run is in `work/cpu-write-mp6x/` (exit0, late8–14 drawnFPS).
+The canonical app and main build are restored to `macos`; final main22CTest
+logs are `work/codex-ctest-restored-main.log`. No game/GPU job remains.
+F2 Controls/player2 is implemented; native dialog still needs a hands-on check.
+LOD/culling static investigation: `LOD_CULLING_INVESTIGATION.md` (a6445db).
+Start with read-only loaded-table/handle/selection/visibility traces before
+enabling the load-time threshold multiplier. The correct draw_distance enum
+mapping is 0→1150, 1→725, 2→300; raising it beyond 2 cannot extend distance.
