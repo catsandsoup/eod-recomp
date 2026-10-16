@@ -457,6 +457,10 @@ struct Context {
             return true;
         }
         if (spare.submitted && s <= spareSerial) {
+            if (vkGetFenceStatus(device, spare.fence) == VK_SUCCESS) {
+                completed = std::max(completed, spareSerial);
+                return false;
+            }
             uint64_t wait_start = now_us();
             require(vkWaitForFences(device, 1, &spare.fence, VK_TRUE, UINT64_MAX), "deferred readback");
             wait_us += now_us() - wait_start;
