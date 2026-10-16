@@ -1,4 +1,5 @@
 #include "../display_rect.h"
+#include "../presentation.h"
 // platform_sdl3.cpp - window, audio and controllers through SDL3 (macOS;
 // also builds on Linux). Time, fibers, files and the ticker stay in
 // posix/platform_posix.cpp.
@@ -279,7 +280,7 @@ bool platform_pump() {
 }
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    const DisplayRect rect=display_rect(g_cfg.aspect,cw,ch);
+    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
     *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 

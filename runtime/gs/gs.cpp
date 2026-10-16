@@ -24,6 +24,7 @@
 #include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
+#include "../platform/presentation.h"
 #include "gs_mem.h"
 #include "gs_replay_types.h"
 #include "gs_state.h"
@@ -663,7 +664,7 @@ extern std::string g_opt_screenshot_dir;
 void priv_apply(uint32_t off, uint64_t v);
 void gs_flush();
 void gs_sync();
-void gs_frame_end(uint64_t frame);
+void gs_frame_end(uint64_t frame, int aspect);
 
 // ------------------------------------------------------------ GS thread
 // With a second CPU core the GIF stream is executed on a worker thread:
@@ -677,7 +678,14 @@ enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET };
 bool g_threaded;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
-uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 12;
+// Keep the Mac input-to-display queue short. This is a pacing/backpressure
+// bound, not a change to guest time or the game update frequency.
+#if defined(__APPLE__)
+constexpr uint64_t kDefaultGsLag = 2;
+#else
+constexpr uint64_t kDefaultGsLag = 12;
+#endif
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : kDefaultGsLag;
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
 // never destroyed: the worker may still be waiting on them when the process exits
 std::mutex &g_q_mtx = *new std::mutex;
@@ -710,7 +718,7 @@ uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mt
 // last composed frame (presented on the EE thread)
 std::mutex &g_pub_mtx = *new std::mutex;
 std::vector<uint32_t> g_pub;
-int g_pub_w, g_pub_h;
+int g_pub_w, g_pub_h, g_pub_aspect = -1;
 
 void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t size) {
     uint32_t h[4] = {kind, a, b, size};
@@ -724,7 +732,8 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 }  // namespace
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
-void gs_frame_end(uint64_t frame) {
+void gs_frame_end(uint64_t frame, int aspect) {
+    presentation::set(aspect);
     if (hw::g_on) {
         if (display_changed()) {
             // no vsync wait while the GS thread trails the EE
@@ -737,6 +746,7 @@ void gs_frame_end(uint64_t frame) {
         g_pub.swap(g_frame);
         g_pub_w = g_frame_w;
         g_pub_h = g_frame_h;
+        g_pub_aspect = aspect;
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
@@ -855,7 +865,7 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         }
         case CMD_VBLANK:
             g_gs_vblanks = h[1];
-            gs_frame_end(h[1]);
+            gs_frame_end(h[1], presentation::from_tag(h[2]));
             frames = h[1];
             if (live) {
                 // EOD_GS_DUMP_AT may list several vblanks (a,b,c): one file per
@@ -1267,8 +1277,9 @@ void gs_vblank() {
     log_frame(g_frames);
     if (g_threaded) {
         uint64_t f = g_frames;
-        offload_run([f] {
-            push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
+        const uint32_t aspect = presentation::tag(eod_presentation_aspect());
+        offload_run([f, aspect] {
+            push_cmd(CMD_VBLANK, (uint32_t)f, aspect, nullptr, 0);
             gs_flush();
         });
         // don't let the GS thread fall more than a couple of frames behind
@@ -1277,11 +1288,14 @@ void gs_vblank() {
         g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
         g_ee_wait_us += platform_time_us() - t;
     } else {
-        gs_frame_end(g_frames);
+        gs_frame_end(g_frames, eod_presentation_aspect());
     }
     {
         std::lock_guard<std::mutex> lk(g_pub_mtx);
-        if (!g_pub.empty()) platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        if (!g_pub.empty()) {
+            presentation::set(g_pub_aspect);
+            platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        }
     }
     {
         // speed in the window title, every second

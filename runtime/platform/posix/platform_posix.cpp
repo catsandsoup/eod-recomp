@@ -1,4 +1,5 @@
 #include "../display_rect.h"
+#include "../presentation.h"
 // platform_posix.cpp - Linux/macOS backend used for development and
 // automated testing.  Runs headless (frames can be dumped to disk).
 #include <dirent.h>
@@ -71,7 +72,7 @@ int platform_list_pads(int) {
 void platform_set_status(const char *) {}
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    const DisplayRect rect=display_rect(g_cfg.aspect,cw,ch);
+    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
     *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 
