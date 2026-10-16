@@ -30,6 +30,25 @@ offline replay spike before adopting it. Keep the working EOD renderer while
 measuring an optional accurate backend. No Road Trip or paraLLEl-GS source was
 copied into EOD during this comparison.
 
+### Independent M2 Pro oracle
+
+A separate scratch executable now builds the pinned paraLLEl-GS/Granite code
+with Road Trip's existing Darwin timer shim and initializes it headlessly through
+MoltenVK on the M2 Pro. Seven generated 64×64 fixtures import canonical register
+state and VRAM, replay GIF packets and inspect the resulting VRAM. This does not
+import arbitrary retail replay state or prove whole-game parity.
+
+The oracle confirms the corrected Gouraud truncation and fog arithmetic. It
+also confirms hardware filter rounding (the UV bucket fixture gives 96, where
+EOD software gives 95) and a rounded varying fog coefficient. Matching software
+alone would have encouraged incorrect changes in both cases. A blended interior
+pixel gives `(14,28,44)` in paraLLEl-GS versus `(15,29,45)` in the existing Vulkan
+backend, establishing a real fixed-function blend precision gap.
+
+Keep this independent oracle for future generated texture/blend/depth fixtures.
+Any production exact-blend path must handle ordered destination reads, alpha
+tests, depth tests and writes together; an RGB bias cannot fix the general case.
+
 ## Narrow ideas to reuse
 
 - [Road Trip presenter](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/gs_pgs_presenter.cpp):
