@@ -29,6 +29,9 @@
 #include "../../app/macos_app.h"
 #endif
 #include "../../gs/gs_hw.h"
+
+#include "../../core/memory.h"
+#include "../keyboard_input.h"
 #include "../pad_script.h"
 #include "../platform.h"
 #include "sdl_input.h"
@@ -56,11 +59,9 @@ int g_last_w, g_last_h;
 // ---------------------------------------------------------------- input
 using sdl_input::kPorts;
 
-struct KeyBind {
-    SDL_Scancode sc;
-    uint16_t btn;
-};
-std::vector<KeyBind> g_key_map;
+std::vector<keyboard_input::Binding> g_key_map;
+keyboard_input::Mapper g_keyboard;
+std::vector<std::pair<int, SDL_Scancode>> g_keyboard_scancodes;
 
 uint16_t pad_key_button(int k) {
     static const uint16_t b[KEY_COUNT] = {PAD_UP,  PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_CROSS,    PAD_CIRCLE,
@@ -121,36 +122,58 @@ SDL_Scancode vk_to_scancode(int vk) {
 
 void build_key_map() {
     g_key_map.clear();
+    g_keyboard = {};
+    g_keyboard_scancodes.clear();
+    for (int vk = 1; vk < 256; ++vk) {
+        auto sc = vk_to_scancode(vk);
+        if (sc != SDL_SCANCODE_UNKNOWN) g_keyboard_scancodes.push_back({vk, sc});
+    }
     for (int k = 0; k < KEY_COUNT; k++) {
         const std::string &list = g_config.keys[k];
         size_t pos = 0;
         while (pos <= list.size()) {
             size_t comma = list.find(',', pos);
             std::string name = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            SDL_Scancode sc = vk_to_scancode(key_code(name));
-            if (sc != SDL_SCANCODE_UNKNOWN) g_key_map.push_back({sc, pad_key_button(k)});
+            int vk = key_code(name);
+            if (vk > 0 && vk < 256 && vk_to_scancode(vk) != SDL_SCANCODE_UNKNOWN)
+                g_key_map.push_back({vk, pad_key_button(k)});
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }
     }
 }
 
-void read_keyboard(HostPadState *out) {
+keyboard_input::Context keyboard_context() {
+    auto word = [](uint32_t address) { uint32_t v = 0; if (g_ram) memcpy(&v, g_ram + address, sizeof v); return v; };
+    uint32_t title = word(0x003D7BB8), alternate = word(0x003D7BBC);
+    uint32_t race = word(0x00437BB8), modal = word(0x004A1AD4);
+    auto ctx = keyboard_input::context(title, alternate, race, modal);
+    static int last = -1;
+    if (sdl_input::log_enabled() && int(ctx) != last) {
+        fprintf(stderr, "[input] keyboard context=%s title=%08x alt=%08x game_loop=%u modal=%08x\n",
+                ctx == keyboard_input::Context::Title ? "title" : ctx == keyboard_input::Context::Driving ? "driving" : "menu",
+                title, alternate, race, modal);
+        last = int(ctx);
+    }
+    return ctx;
+}
+
+void read_keyboard(HostPadState *out, keyboard_input::Context ctx) {
     out->connected = true;
     if (g_headless) return;
-    const bool *keys = SDL_GetKeyboardState(nullptr);
-    for (const KeyBind &m : g_key_map)
-        if (keys[m.sc]) out->buttons |= m.btn;
-    // the direction keys also move the left stick (steering)
-    if (out->buttons & PAD_LEFT) out->lx = 0;
-    if (out->buttons & PAD_RIGHT) out->lx = 255;
-    if (out->buttons & PAD_UP) out->ly = 0;
-    if (out->buttons & PAD_DOWN) out->ly = 255;
+    const bool *physical = SDL_GetKeyboardState(nullptr);
+    keyboard_input::Keys keys{};
+    for (const auto &m : g_keyboard_scancodes) keys[m.first] = physical[m.second];
+    *out = g_keyboard.read(keys, ctx, g_config.keyboard_layout == "racing", g_key_map);
 }
 
 }  // namespace
 
-void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
+void platform_configure_display(const PlatformConfig &cfg) {
+    g_cfg=cfg;
+    const char *headless=getenv("EOD_HEADLESS");
+    g_headless=cfg.headless || (headless && headless[0]=='1');
+}
 
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
@@ -194,6 +217,7 @@ bool platform_init(const PlatformConfig &cfg) {
 
     int kb = sdl_input::keyboard_port();
     fprintf(stderr, "[input] keyboard: %s\n", kb < 0 ? "off" : kb == 0 ? "player 1" : "player 2");
+    fprintf(stderr, "[input] keyboard layout: %s\n", g_config.keyboard_layout.c_str());
     sdl_input::assign_waiting();
     return true;
 }
@@ -325,7 +349,8 @@ void platform_set_status(const char *text) {
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     if (port < 0 || port >= kPorts) return;
-    if (port == sdl_input::keyboard_port()) read_keyboard(out);
+    auto ctx = keyboard_context(); // also observed in headless/scripted tests
+    if (port == sdl_input::keyboard_port()) read_keyboard(out, ctx);
     if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out);
     // EOD_PAD_SCRIPT / EOD_PAD_SCRIPT1 (automated tests) replace the port
     if (!pad_script_state(port, out)) {
