@@ -7,6 +7,7 @@
 #include <fstream>
 #include <unistd.h>
 #ifdef EOD_DISPLAY_BACKEND_TEST
+extern "C" { uint8_t *g_ram = nullptr; }
 uint64_t kernel_vblank_count() { return 0; }
 uint64_t platform_time_us() { return 0; }
 bool mac_app_settings() { return false; }
@@ -42,7 +43,8 @@ int main() {
     int x,y,w,h;platform_display_rect(3840,2400,&x,&y,&w,&h);
     if(x || y || w!=3840 || h!=2400) ++failures;
 #endif
-    char file[]="/private/tmp/eod-aspect-config.XXXXXX";int fd=mkstemp(file);if(fd<0)return 2;close(fd);
+    std::string file=(std::filesystem::temp_directory_path()/"eod-aspect-config.XXXXXX").string();
+    int fd=mkstemp(file.data());if(fd<0)return 2;close(fd);
     Config saved,loaded;
     if(saved.aspect!="4:3") ++failures;
     saved.aspect="16:10";saved.render_scale=6;saved.width=1920;saved.height=1200;
