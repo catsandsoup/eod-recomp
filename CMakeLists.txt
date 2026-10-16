@@ -141,6 +141,10 @@ target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMA
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(eod_alpha_range_test tools/tests/alpha_range_test.cpp)
+  target_include_directories(eod_alpha_range_test PRIVATE runtime)
+  add_test(NAME AlphaPassRange COMMAND eod_alpha_range_test)
+  set_tests_properties(AlphaPassRange PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   add_executable(eod_hud_edge_test tools/tests/hud_edge_test.cpp src/hle_hud.cpp)
   target_include_directories(eod_hud_edge_test PRIVATE runtime runtime/include)
   add_test(NAME HUDEdges COMMAND eod_hud_edge_test)
@@ -181,6 +185,28 @@ if(EOD_VULKAN)
     add_test(NAME GSPixelArithmetic COMMAND eod_gs_pixel_math_test)
     add_executable(eod_gs_page_coverage_test tools/tests/gs_page_coverage_test.cpp runtime/gs/gs_mem.cpp)
     add_test(NAME GSPageCoverage COMMAND eod_gs_page_coverage_test)
+    add_executable(eod_gpu_upload_blocks_test tools/tests/gpu_upload_blocks_test.cpp runtime/gs/gs_mem.cpp)
+    add_test(NAME GPUUploadBlocks COMMAND eod_gpu_upload_blocks_test)
+    add_executable(eod_gs_transfer_chunk_test tools/tests/gs_transfer_chunk_test.cpp)
+    add_test(NAME GSTransferChunks COMMAND eod_gs_transfer_chunk_test)
+    add_executable(eod_gs_cpu_write_fixture tools/tests/gs_cpu_write_fixture.cpp runtime/gs/gs_mem.cpp)
+    if(Python3_FOUND)
+      add_test(NAME VulkanGSCPUWrites COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_cpu_writes.py --eod $<TARGET_FILE:eod>
+        --generator $<TARGET_FILE:eod_gs_cpu_write_fixture> --work-dir ${CMAKE_BINARY_DIR}/gs-cpu-write-test)
+      set_tests_properties(VulkanGSCPUWrites PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME VulkanGSCPUWrites6x COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_cpu_writes.py --eod $<TARGET_FILE:eod>
+        --generator $<TARGET_FILE:eod_gs_cpu_write_fixture> --scale 6 --work-dir ${CMAKE_BINARY_DIR}/gs-cpu-write-test-6x)
+      set_tests_properties(VulkanGSCPUWrites6x PROPERTIES SKIP_RETURN_CODE 77)
+      foreach(upload_scale 1 6)
+        add_test(NAME VulkanGSUploads${upload_scale}x COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_cpu_writes.py --eod $<TARGET_FILE:eod>
+          --generator $<TARGET_FILE:eod_gs_cpu_write_fixture> --scale ${upload_scale}
+          --gpu-uploads 1 --work-dir ${CMAKE_BINARY_DIR}/gs-upload-test-${upload_scale}x)
+        set_tests_properties(VulkanGSUploads${upload_scale}x PROPERTIES SKIP_RETURN_CODE 77)
+      endforeach()
+    endif()
     add_executable(eod_gs_pixel_fixture tools/tests/gs_pixel_fixture.cpp runtime/gs/gs_mem.cpp)
     if(Python3_FOUND)
       add_test(NAME VulkanGSPixels COMMAND ${Python3_EXECUTABLE}

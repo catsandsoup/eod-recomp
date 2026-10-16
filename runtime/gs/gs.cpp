@@ -27,6 +27,7 @@
 #include "../platform/presentation.h"
 #include "gs_mem.h"
 #include "gs_replay_types.h"
+#include "gs_transfer_chunk.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
 
@@ -73,11 +74,11 @@ void xfer_start() {
     census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
     if (hw::g_on) {
         if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h);
-        if (dir == 0 || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
+        if (dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
     }
     if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
     if (dir == 1) raster_sync();
-    if (dir == 0 || dir == 2) {
+    if (dir == 2) {
         raster_vram_write(dbp, dbw, dpsm, dx, dy, w, h);
         vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
     }
@@ -106,6 +107,7 @@ void xfer_start() {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 write_pixel(dpsm, (dx + x) & 2047, (dy + y) & 2047, dbp, dbw, tmp[(size_t)y * w + x]);
+        if (hw::g_on) hw::vram_write_complete();
     } else if (dir == 1) {
         static unsigned n;
         if (++n <= 8 || g_log_enabled[LOG_GSXFER])
@@ -143,6 +145,18 @@ inline void xfer_put(uint32_t v) {
 void xfer_data(const uint8_t *p, uint32_t n) {
     Transfer &t = g_xfer;
     if (!t.active) return;
+    // Source bytes are available now, unlike TRXREG's promised transfer size.
+    // Preserve partial GPU pages before writing, and invalidate caches/raster
+    // dependencies for every chunk (including an interrupted IMAGE packet).
+    unsigned bpp = bits_per_pixel(t.dpsm);
+    uint64_t pixels = transfer_pixels_supplied(bpp, n, t.pend_n);
+    const auto regions = transfer_write_regions(t.x0, t.y0, t.w, t.h, t.x, t.y, pixels);
+    for (unsigned i = 0; i < regions.count; ++i) {
+        const auto &r = regions.rects[i];
+        if (hw::g_on) hw::vram_written(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+        raster_vram_write(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+        vram_mark(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+    }
     if (t.dpsm == PSMCT32 || t.dpsm == PSMZ32) {
         // whole runs of a row at a time
         uint32_t i = 0;
@@ -165,6 +179,7 @@ void xfer_data(const uint8_t *p, uint32_t n) {
                 t.y++;
             }
         }
+        if (hw::g_on) hw::vram_write_complete();
         if (t.y >= t.h) t.active = false;
         return;
     }
@@ -198,6 +213,7 @@ void xfer_data(const uint8_t *p, uint32_t n) {
         }
         break;
     }
+    if (hw::g_on) hw::vram_write_complete();
     if (t.y >= t.h) t.active = false;
 }
 
@@ -517,10 +533,13 @@ void gif_process(int path, const uint8_t *data, uint32_t qwc) {
             }
             break;
         }
-        default:  // IMAGE
-            xfer_data(q, 16);
-            ps.nloop--;
+        default: { // IMAGE: coalesce only contiguous, actually supplied qwords.
+            uint32_t run = std::min(ps.nloop, qwc - i);
+            xfer_data(q, run * 16);
+            ps.nloop -= run;
+            i += run - 1;
             break;
+        }
         }
         if (ps.nloop == 0 && ps.eop) ps.in_packet = false;
     }

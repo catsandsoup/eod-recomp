@@ -1626,6 +1626,8 @@ void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, in
     readback_pages(bp, bw, psm, x, y, w, h);
 }
 
+void vram_write_complete() {} // D3D11 retains its existing synchronous uploads.
+
 // ----------------------------------------------------------------- display
 namespace {
 

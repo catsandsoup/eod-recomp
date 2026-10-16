@@ -54,7 +54,7 @@ In order of priority:
 
 ## macOS (Apple Silicon)
 
-Developer review/build instructions and experimental branch map: [contribution handoff](docs/DEVELOPER_HANDOFF.md).
+All Mac work is consolidated on **`main`**. Developer review/build instructions: [contribution handoff](docs/DEVELOPER_HANDOFF.md).
 
 This fork adds a native arm64 Mac app with Vulkan/MoltenVK graphics, SDL3
 audio and two independent player ports for split screen. It is still a work
@@ -125,9 +125,10 @@ USB detection, trigger feel and rumble still need a connected device.
 Current rendering work: menu font interiors are corrected, and matched race
 captures support added horizontal scenery with preserved proportions. Full-speed
 4K multiplayer, the reported thin black lines and visible keyboard latency are
-still under investigation. An experimental CPU-upload preservation candidate on
-`macos-cpu-preservation` passes full-VRAM comparisons at 1x/6x, but its
-readback cost worsens performance; it is not enabled on `macos`. See [current evidence and limits](docs/STATUS.md).
+still under investigation. CPU-upload preservation is now integrated for correctness; its full-game speed
+still needs acceptance. Complete-block GPU transfers are included but require
+`EOD_GPU_UPLOADS=1` until validated as a useful optimization. No separate branch
+assembly is required. See [current handoff and limits](docs/DEVELOPER_HANDOFF.md).
 
 Developer build steps, measured performance and known fidelity limits:
 [docs/MACOS.md](docs/MACOS.md). The immediate priority is an accurate, stable, full-speed native 1x baseline,

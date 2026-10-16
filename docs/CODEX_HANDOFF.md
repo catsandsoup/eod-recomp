@@ -1,5 +1,10 @@
 # Fresh-chat continuation — 2026-10-16
 
+**CONSOLIDATED CHECKPOINT:** use `main`, not the historical branch assignments
+below. All component source is integrated; GPU transfers remain opt-in with
+`EOD_GPU_UPLOADS=1`. `DEVELOPER_HANDOFF.md` is the current build/acceptance guide.
+The branch notes below are historical evidence, not an assembly checklist.
+
 **LATEST OWNER PRIORITY (supersedes historical ordering below):** native 1x,
 original 4:3, 1:1 behavior, full speed and stability without frame skipping first;
 then LOD/draw distance and proper widescreen; then higher resolutions sequentially;

@@ -5,7 +5,7 @@
 > not establish current full-game 1:1 accuracy or full-speed heavy multiplayer.
 > Current goal is native 1x/4:3 with no frame skipping before enhancements.
 
-Branch `macos` of catsandsoup/eod-recomp. Native arm64 build of the same
+Branch `main` of catsandsoup/eod-recomp. Native arm64 build of the same
 recompiled game code; no emulator, no Rosetta.
 
 ## Building

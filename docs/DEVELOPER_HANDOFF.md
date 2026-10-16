@@ -5,27 +5,32 @@ The upstream game recompilation is the foundation; the Mac work does not replace
 that contribution. Source is published in catsandsoup/eod-recomp. No game data,
 generated game C/C++, retail command captures or compiled apps are distributed.
 
-## Source branches
+## One maintained branch
 
-| Branch | Purpose | Integration status |
-| --- | --- | --- |
-| `macos` | Native arm64 runtime, SDL input/audio, Vulkan/MoltenVK, app/disc importer, saves, camera/HUD and opt-in car LOD | Main Mac contribution; incomplete fidelity/performance acceptance |
-| `macos-cpu-preservation` | Correct preservation around actual CPU VRAM writes | Verified procedural cases; slower, not merged |
-| `macos-gpu-transfers` | Full physical-block GPU patches and CPU-validity tracking | Experimental continuation; not merged or a proven speedup |
-| `vulkan-gs` | Earlier preservation WIP checkpoint | Historical, superseded by preservation branches |
-| `mac-app` | Alpha-range proof helpers/tests | WIP, no production integration; name predates current work |
-| `rockcandy-pad` | Input/camera component history | Much already integrated; not a separate finished feature set |
+Use **`main`** in catsandsoup/eod-recomp for all work and developer review.
+The former `macos`, `mac-app`, `rockcandy-pad`, `vulkan-gs`,
+`macos-cpu-preservation` and `macos-gpu-transfers` branches are consolidated into
+its history; no branch assembly is required. Their remote branch names are retired.
 
-Review `macos` against upstream `main`. Review experimental branches separately;
-do not merge all branches together. The broad Mac port should be reviewed in
-subsystems: platform/arm64, app/disc handling, input/saves, then graphics fidelity
-and performance. No upstream approval or Windows regression result is implied.
+Main includes exact CPU-write preservation and the complete-block GPU upload
+implementation. The latter is **off by default**: `EOD_GPU_UPLOADS=1` opts into
+it for comparison. Both paths preserve partial/masked data conservatively and
+have procedural full-VRAM comparisons at 1x and 6x. Experimental alpha-range
+helpers have CPU tests but are not used to change production draw decisions.
+The alternate CPU texture-source shortcut is gated by the same opt-in switch,
+so it cannot change default scaled render-to-texture selection. Do not enable an
+optimization just because its source is included.
+
+Review `main` against pareidolico/eod-recomp `main`. Suggested subsystem order:
+platform/arm64, app/disc handling, input/saves, then graphics fidelity/performance.
+No upstream approval or Windows regression result is implied. Git history retains
+the earlier component checkpoints without requiring separate maintained branches.
 
 ## Reproduce a personal Mac build
 
 Use Apple Silicon, Xcode command line tools, Homebrew and your own North American
 v1.00 disc (SLUS_209.10: 3,368,996 bytes, CRC32 75BB93EE). Do not upload the disc.
-From a clone checked out to `macos`:
+From a clone checked out to `main`:
 
 ```sh
 brew install cmake ninja libusb molten-vk vulkan-loader vulkan-headers
@@ -66,15 +71,15 @@ a retail command capture; a full game build still requires the owner's executabl
 
 ## Evidence and remaining acceptance
 
-Branded app checkpoint: all 30 main CTests passed, icon representations and plist
-validated, ad-hoc signature passed strict verification, and a relocated bundle
-replayed on the GPU using its own MoltenVK despite invalid external ICD overrides.
-The installed branded app also completed a headless/muted 600-frame native 1x/4:3
-startup using the installed disc and exited cleanly. This is a startup check, not
-full-race speed/fidelity acceptance. The transfer branch
-has 26 CTests, including 22 procedural full-VRAM software/Vulkan comparisons at
-both 1x and 6x. These test different branches and are not additive coverage.
-The source includes exact tests and commands; rerun on your machine.
+Consolidated main: Release Mac build and all 37 CTests passed. The suite includes
+CPU preservation and opt-in GPU upload modes at both 1x and 6x, each comparing
+22 complete 4-MiB VRAM fixtures against software. It also includes alpha-range,
+LOD/HUD, input, save and worker lifecycle tests. No test was skipped.
+
+Previous branded app packaging passed icon/plist and strict signature validation,
+a relocated bundled-MoltenVK replay and a native 600-frame startup. Those earlier
+app checks precede consolidation; rerun them on the consolidated output before
+claiming installed-app acceptance.
 
 Actual games reached race completion/clean exit in bounded headless runs; LOD
 loader tracing validated 20 tables in each baseline/2x run. Camera comparisons
@@ -84,7 +89,7 @@ and split-screen state restoration. None proves exhaustive 1:1 rendering.
 Open: thin black HUD/world lines, visible keyboard latency, native full-game
 fidelity/speed acceptance, physical controller/motor checks, native dialog journey,
 and original movie/audio accuracy. Heavy 6x multiplayer previously ran roughly
-12–29 drawn FPS; the accurate preservation branch was slower. The latest GPU
+12–29 drawn FPS; the accurate preservation branch was slower. The opt-in GPU
 texture-validity change is not yet retail-benchmarked. Do not describe these as
 flawless, full-speed 4K or an established transfer speedup. Windows/D3D11 was not
 run during this Mac session. Achievements are not implemented by this work.
