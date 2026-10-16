@@ -8,7 +8,7 @@ extern "C" void f_0034D328_orig();
 
 extern "C" void f_0034D328() {
     // Settings are restart-only. Never consult a newly edited aspect while
-    // the game has temporarily changed x-scale for a split-screen viewport.
+    // the game has temporarily changed x-scale for a render target.
     static const std::string launch_aspect = g_config.aspect;
     const bool wide = launch_aspect == "16:9" || launch_aspect == "16:10";
     if (wide)
@@ -19,7 +19,7 @@ extern "C" void f_0034D328() {
     f_0034D328_orig();
     if (wide) {
         // Set only the base values here. Native viewport setup derives and
-        // restores a temporary x-scale from them for each split-screen view.
+        // restores a temporary x-scale for render targets. MP is tested separately.
         const float scale = launch_aspect == "16:10" ? 5.0f / 6.0f : 0.75f;
         uint32_t bits;
         std::memcpy(&bits, &scale, sizeof bits);
