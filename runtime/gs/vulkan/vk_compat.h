@@ -939,6 +939,14 @@ inline bool Context::init(bool withWindow) {
     wantVsync = g_config.vsync;
     const char *stateCache = getenv("EOD_VK_STATE_CACHE");
     cacheState = !stateCache || stateCache[0] != '0';
+#ifdef __APPLE__
+    // MoltenVK encodes the whole Metal command buffer inside vkQueueSubmit. Its
+    // asynchronous submission mode runs that encoding on MoltenVK's own queue
+    // thread, overlapping the GS thread's recording of the next commands.
+    // Queue order, fences and presentation semantics are unchanged; a user
+    // setting of the variable still wins.
+    setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "TDEODRecomp";
     app.apiVersion = VK_API_VERSION_1_3;
