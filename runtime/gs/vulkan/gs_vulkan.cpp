@@ -1029,42 +1029,61 @@ void deferred_cpu_written(const PageCoverage &cov, uint32_t bp, uint32_t bw, uin
         return;
     }
     const SwizzleTab *T = swizzle_table(psm, bw);
-    for (int r = 0; r < h; r++) {
-        int py = y + r;
-        uint32_t rb = T->row_base(bp, py), rc = T->rowC[py & 2047];
-        for (int c = 0; c < w; c++) {
-            uint32_t a = T->addr_row(rb, rc, x + c), addr = 0, n = 1;
-            uint8_t m = 0xFF;
-            switch (psm) {
-            case PSMCT32: case PSMZ32: addr = (a & 0xFFFFF) * 4; n = 4; break;
-            case PSMCT24: case PSMZ24: addr = (a & 0xFFFFF) * 4; n = 3; break;
-            case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: addr = (a & 0x1FFFFF) * 2; n = 2; break;
-            case PSMT8: addr = a & 0x3FFFFF; break;
-            case PSMT4: addr = (a >> 1) & 0x3FFFFF; m = (a & 1) ? 0xF0 : 0x0F; break;
-            case PSMT8H: addr = (a & 0xFFFFF) * 4 + 3; break;
-            case PSMT4HL: addr = (a & 0xFFFFF) * 4 + 3; m = 0x0F; break;
-            case PSMT4HH: addr = (a & 0xFFFFF) * 4 + 3; m = 0xF0; break;
-            }
-            DeferredPage *d = g_deferred[addr / 8192];
-            if (!d)
-                continue;
-            for (uint32_t k = 0; k < n; k++)
-                d->written[(addr + k) % 8192] |= m;
+    auto mark_pixel = [&](int px, int py) {
+        uint32_t a = T->addr(bp, px, py), addr = 0, n = 1;
+        uint8_t m = 0xFF;
+        switch (psm) {
+        case PSMCT32: case PSMZ32: addr = (a & 0xFFFFF) * 4; n = 4; break;
+        case PSMCT24: case PSMZ24: addr = (a & 0xFFFFF) * 4; n = 3; break;
+        case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: addr = (a & 0x1FFFFF) * 2; n = 2; break;
+        case PSMT8: addr = a & 0x3FFFFF; break;
+        case PSMT4: addr = (a >> 1) & 0x3FFFFF; m = (a & 1) ? 0xF0 : 0x0F; break;
+        case PSMT8H: addr = (a & 0xFFFFF) * 4 + 3; break;
+        case PSMT4HL: addr = (a & 0xFFFFF) * 4 + 3; m = 0x0F; break;
+        case PSMT4HH: addr = (a & 0xFFFFF) * 4 + 3; m = 0xF0; break;
         }
-    }
+        DeferredPage *d = g_deferred[addr / 8192];
+        if (!d)
+            return;
+        for (uint32_t k = 0; k < n; k++)
+            d->written[(addr + k) % 8192] |= m;
+    };
+    // Block by block (as page_coverage): a block-aligned block inside the
+    // rectangle of a whole-storage format replaces all 256 bytes of its block.
+    int block_w, block_h, unit_bits;
+    block_dims(psm, block_w, block_h, unit_bits);
+    const bool whole_storage = psm != PSMCT24 && psm != PSMZ24 && psm != PSMT8H && psm != PSMT4HL && psm != PSMT4HH;
+    const int x0 = x & ~(block_w - 1), y0 = y & ~(block_h - 1);
+    for (int by = y0; by < y + h; by += block_h)
+        for (int bx = x0; bx < x + w; bx += block_w) {
+            if (whole_storage && bx >= x && by >= y && bx + block_w <= x + w && by + block_h <= y + h) {
+                const uint32_t address = uint32_t(uint64_t(T->addr(bp, bx, by)) * unit_bits / 8) % kVramSize;
+                if (DeferredPage *d = g_deferred[address / 8192])
+                    memset(d->written + (address % 8192 & ~255u), 0xFF, 256);
+                continue;
+            }
+            for (int py = std::max(by, y); py < std::min(by + block_h, y + h); py++)
+                for (int px = std::max(bx, x); px < std::min(bx + block_w, x + w); px++)
+                    mark_pixel(px, py);
+        }
     for (uint32_t i = 0; i < cov.count; ++i) {
         uint32_t p = cov.pages[i];
         DeferredPage *d = g_deferred[p];
         if (!d)
             continue;
-        uint32_t pending = 0;
-        for (int b = 0; b < 32; b++) {
+        uint32_t pending = d->pending_blocks;
+        for (uint32_t b = 0; b < 32; b++) {
+            if (!(pending & cov.touched[p] & (1u << b)))
+                continue;
+            uint64_t all = ~0ull;
             const uint8_t *blk = d->written + b * 256;
-            for (int k = 0; k < 256; k++)
-                if (blk[k] != 0xFF) {
-                    pending |= 1u << b;
-                    break;
-                }
+            for (int k = 0; k < 256; k += 8) {
+                uint64_t v;
+                memcpy(&v, blk + k, 8);
+                all &= v;
+            }
+            if (all == ~0ull)
+                pending &= ~(1u << b);
         }
         d->pending_blocks = pending;
         if (!pending) { // every bit rewritten by the CPU: the copy is never needed
