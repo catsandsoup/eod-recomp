@@ -4,9 +4,11 @@
 # GOALS: 2-player split screen with two independent controllers. Without two
 # physical pads this proves it with two scripted pads, headless and muted:
 # ACTION > RACE > MULTI, both players join on their own ports, DENNISON,
-# event 1. Player 1 holds throttle (X) from vblank 4300, player 2 only from
-# 5400, so in the contact sheet the top viewport moves first and the bottom
-# one stays at 0 MPH until its own pad accelerates.
+# event 1. Both players accelerate from vblank 4300; only player 2 steers
+# left for the first two seconds. The contact sheet must show distinct paths:
+# P1 continues straight while P2 turns. A rolling start means an idle player's
+# nonzero speed alone cannot prove input; leaving P2 idle also traps it against
+# a barrier before a delayed throttle press can visibly move the car.
 set -e
 DISC=${1:?usage: tools/test_2p_race.sh <disc folder> [outdir]}
 OUT=${2:-work/test_2p}
@@ -15,7 +17,7 @@ PY=${PYTHON:-python3}
 mkdir -p "$OUT/mc"
 P0=$($PY tools/padscript.py 400:start 1500:start 1800:x 2100:x 2350:down 2450:x 2600:x 2900:x \
      3200:x 3500:x 3950:x --hold 4300-6600:x)
-P1=$($PY tools/padscript.py 2750:x 3050:x --hold 5400-6600:x)
+P1=$($PY tools/padscript.py 2750:x 3050:x --hold 4300-6600:x --hold 4300-4420:left)
 # Optional renderer/config overrides make identical software and native-scale
 # hardware benchmark runs repeatable without changing the user's eod.ini.
 set -- --headless --data "$DISC" --frames 6600

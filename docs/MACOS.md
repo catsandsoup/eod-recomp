@@ -6,7 +6,7 @@ recompiled game code; no emulator, no Rosetta.
 ## Building
 
 ```sh
-brew install cmake ninja sdl3 libusb molten-vk vulkan-loader vulkan-headers
+brew install cmake ninja libusb molten-vk vulkan-loader vulkan-headers molten-vk vulkan-loader vulkan-headers
 python3 -m venv .venv && .venv/bin/pip install rabbitizer
 cp "<your disc folder>/SLUS_209.10" .          # NTSC-U v1.00, never committed
 .venv/bin/python tools/analyze.py && .venv/bin/python tools/recomp.py && .venv/bin/python tools/vurecomp.py
@@ -207,13 +207,14 @@ The script stays headless/muted and fails if replay falls back to software.
 
 ### Refresh-grid presentation (optional driver support)
 
-When `VK_GOOGLE_display_timing` is advertised, the Vulkan presenter now learns
+Experimental and **off by default** while 1:1 fidelity is the priority. With
+`EOD_PRESENT_TIMING=1` and `VK_GOOGLE_display_timing` advertised, the presenter learns
 its refresh phase from completed presentation feedback and requests future
 images near a fixed refresh grid. A 120 Hz display normally uses two refreshes
 per guest image. The original 59.94 Hz game clock remains unchanged: on an
 exactly 120 Hz fixed-rate display an occasional extra refresh is mathematically
 necessary; missed deadlines also re-anchor instead of accumulating latency.
-`EOD_PRESENT_TIMING=0` disables this optional path. Missing/invalid timing data
+The default `EOD_PRESENT_TIMING=0` keeps this path deferred. Missing/invalid timing data
 keeps ordinary FIFO presentation. Swapchain/refresh changes reset the schedule,
 and no-vsync/catch-up sends no future presentation deadline.
 

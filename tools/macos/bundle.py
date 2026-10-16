@@ -64,7 +64,10 @@ resources=app/'Contents/Resources'; resources.mkdir(exist_ok=True)
 icon=pathlib.Path('/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns')
 if icon.exists(): shutil.copyfile(icon,resources/'AppIcon.icns')
 licenses=resources/'Licenses'; licenses.mkdir(exist_ok=True)
-for name,license_path in [('SDL3','/opt/homebrew/opt/sdl3/LICENSE.txt'),('libusb','/opt/homebrew/opt/libusb/COPYING'),('MoltenVK','/opt/homebrew/opt/molten-vk/LICENSE')]:
+# Prefer the license belonging to the pinned SDL source actually compiled.
+sdl_license=pathlib.Path(sys.argv[2]).resolve().parent/'_deps/sdl3-src/LICENSE.txt' if len(sys.argv)>2 else pathlib.Path('/opt/homebrew/opt/sdl3/LICENSE.txt')
+if not sdl_license.is_file(): sdl_license=pathlib.Path('/opt/homebrew/opt/sdl3/LICENSE.txt')
+for name,license_path in [('SDL3',str(sdl_license)),('libusb','/opt/homebrew/opt/libusb/COPYING'),('MoltenVK','/opt/homebrew/opt/molten-vk/LICENSE')]:
     source=pathlib.Path(license_path)
     if source.exists(): shutil.copyfile(source,licenses/(name+'.txt'))
 # The local SDK/Homebrew binaries can impose a newer minimum than our source.
