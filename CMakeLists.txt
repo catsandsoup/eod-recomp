@@ -141,6 +141,9 @@ target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMA
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(eod_alpha_order_test tools/tests/alpha_order_test.cpp)
+  target_include_directories(eod_alpha_order_test PRIVATE runtime)
+  add_test(NAME AlphaPassOrder COMMAND eod_alpha_order_test)
   add_executable(eod_native_camera_test tools/tests/native_camera_test.cpp
     src/hle_camera.cpp runtime/core/config.cpp)
   target_include_directories(eod_native_camera_test PRIVATE runtime runtime/include)
