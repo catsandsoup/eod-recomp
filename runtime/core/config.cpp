@@ -99,7 +99,7 @@ bool config_load(const std::string &path, Config &c) {
             return n < lo ? lo : n > hi ? hi : n;
         };
         if (ieq(section, "Video")) {
-            if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "warp") ? "warp" : "d3d11";
+            if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "vulkan") ? "vulkan" : ieq(v, "warp") ? "warp" : "d3d11";
             else if (ieq(k, "Adapter")) c.adapter = num(0, 15);
             else if (ieq(k, "Fullscreen")) c.fullscreen = to_bool(v);
             else if (ieq(k, "Width")) c.width = num(320, 16384);
@@ -113,7 +113,8 @@ bool config_load(const std::string &path, Config &c) {
             if (ieq(k, "Enabled")) c.audio = to_bool(v);
             else if (ieq(k, "Volume")) c.volume = num(0, 100);
         } else if (ieq(section, "Input")) {
-            if (ieq(k, "Vibration")) c.vibration = to_bool(v);
+            if (ieq(k, "KeyboardPort")) c.keyboard_port = num(0, 2);
+            else if (ieq(k, "Vibration")) c.vibration = to_bool(v);
             for (int i = 0; i < KEY_COUNT; i++)
                 if (ieq(k, kPadKeyNames[i])) c.keys[i] = v;
         } else if (ieq(section, "System")) {
@@ -145,6 +146,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "Volume=%d\n", c.volume);
     fprintf(f, "\n[Input]\n; keyboard keys for each PS2 button, separated by commas\n");
     for (int i = 0; i < KEY_COUNT; i++) fprintf(f, "%s=%s\n", kPadKeyNames[i], c.keys[i].c_str());
+    fprintf(f, "KeyboardPort=%d\n", c.keyboard_port);
     fprintf(f, "Vibration=%d\n", c.vibration ? 1 : 0);
     fprintf(f, "\n[System]\n");
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
