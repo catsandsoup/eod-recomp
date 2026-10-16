@@ -24,6 +24,10 @@
 #endif
 
 #include "core/config.h"
+#ifdef EOD_MACOS_APP
+#include "app/macos_app.h"
+#include "app/macos_vulkan.h"
+#endif
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
@@ -225,6 +229,9 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char **argv) {
+#ifdef EOD_MACOS_APP
+    mac_app_init_vulkan();  // inside an .app: its own Vulkan loader and MoltenVK
+#endif
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 #ifdef SIGQUIT
@@ -234,6 +241,9 @@ int main(int argc, char **argv) {
     std::string data_dir;
     // settings: eod.ini next to the executable (--config overrides the path)
     std::string config_path = dir_of(argv[0]) + "/eod.ini";
+#ifdef EOD_MACOS_APP
+    config_path = mac_app_support() + "/eod.ini";  // macOS: ~/Library/Application Support/TDEODRecomp
+#endif
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
     config_load(config_path);
@@ -290,6 +300,14 @@ int main(int argc, char **argv) {
         }
     }
     log_init(log_spec);
+#ifdef EOD_MACOS_APP
+    // the installed disc in Application Support (asks for it on the first run), memory cards there too
+    if (!replay && !vu_bench_file) {
+        const char *h = getenv("EOD_HEADLESS");
+        if (!mac_app_prepare(data_dir, config_path, cfg.headless || (h && h[0] == '1'), {ee_elf_size, ee_elf_crc32}))
+            return 1;
+    }
+#endif
     if (replay) return gs_replay(replay, repeat);
     if (vu_bench_file) {
         vu_init();

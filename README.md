@@ -165,6 +165,7 @@ cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -C
 
 # 2d. Linux or macOS with a window, keyboard, controllers and sound (SDL 3.2 or later)
 cmake -S . -B build-sdl -G Ninja -DCMAKE_BUILD_TYPE=Release -DEOD_SDL3=ON && ninja -C build-sdl
+# (macOS with the Vulkan renderer and an .app: docs/MACOS.md)
 ```
 
 The 32-bit Windows build targets SSE2 (Pentium 4 / Core 2 and newer) and

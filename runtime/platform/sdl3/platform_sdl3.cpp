@@ -22,6 +22,9 @@
 
 #include "../../core/config.h"
 #include "../../gs/gs_hw.h"
+#ifdef EOD_MACOS_APP
+#include "../../app/macos_app.h"
+#endif
 #include "../pad_script.h"
 #include "../platform.h"
 
@@ -235,6 +238,14 @@ bool platform_init(const PlatformConfig &cfg) {
     g_headless = cfg.headless || (h && h[0] == '1');
     // controllers keep working while the window is in the background (as XInput)
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef EOD_SDL_LIBUSB
+    // wired Xbox 360 pads through SDL's HIDAPI driver over libusb (EOD_BUNDLED_SDL)
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    SDL_SetHint(SDL_HINT_HIDAPI_LIBUSB, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX_360, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX_360_PLAYER_LED, "1");
+#endif
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
     if (!g_headless) flags |= SDL_INIT_VIDEO;
     if (!SDL_Init(flags)) {
@@ -299,6 +310,21 @@ bool platform_pump() {
             pad_removed(e.gdevice.which);
             break;
         case SDL_EVENT_KEY_DOWN:
+#ifdef EOD_MACOS_APP
+            // F1 or Cmd+,: the settings dialog
+            if (g_window && !e.key.repeat && (e.key.scancode == SDL_SCANCODE_F1 ||
+                                              (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
+                if (mac_app_settings()) {
+                    build_key_map();
+                    g_cfg.smooth = g_config.smooth_display;
+                    if (g_texture)
+                        SDL_SetTextureScaleMode(g_texture, g_cfg.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+                    SDL_SetWindowSize(g_window, g_config.width, g_config.height);
+                    SDL_SetWindowFullscreen(g_window, g_config.fullscreen);
+                }
+                break;
+            }
+#endif
             // F11 or Alt+Enter: fullscreen (as on Windows)
             if (!e.key.repeat && (e.key.scancode == SDL_SCANCODE_F11 ||
                                   (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))))

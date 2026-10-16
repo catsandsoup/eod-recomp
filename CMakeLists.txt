@@ -59,8 +59,51 @@ else()
   # window, keyboard, controllers and audio through SDL3 (default: the headless test backend)
   option(EOD_SDL3 "SDL3 platform backend (Linux, macOS)" OFF)
   if(EOD_SDL3)
-    find_package(SDL3 REQUIRED CONFIG)
+    if(APPLE)
+      enable_language(OBJCXX)  # runtime/app/macos_app.mm (and SDL's own sources)
+    endif()
+    # EOD_BUNDLED_SDL: SDL3 built from source with HIDAPI over libusb, linked
+    # statically. macOS has no driver for wired Xbox 360 pads (and third-party
+    # ones such as PDP's); SDL reaches them through libusb, which installed SDL3
+    # builds (e.g. Homebrew's) don't use. Needs libusb (brew install libusb).
+    option(EOD_BUNDLED_SDL "build SDL3 from source with HIDAPI over libusb (Xbox 360 pads on macOS)" OFF)
+    if(EOD_BUNDLED_SDL)
+      include(FetchContent)
+      set(EOD_SDL_VERSION 3.4.18)
+      foreach(prefix /opt/homebrew/opt/libusb /usr/local/opt/libusb)
+        if(EXISTS ${prefix}/include/libusb-1.0/libusb.h)
+          list(APPEND CMAKE_PREFIX_PATH ${prefix})
+          set(LibUSB_ROOT ${prefix})
+        endif()
+      endforeach()
+      set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+      set(SDL_STATIC ON CACHE BOOL "" FORCE)
+      set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+      set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+      set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+      set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+      set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
+      set(SDL_HIDAPI_JOYSTICK ON CACHE BOOL "" FORCE)
+      set(SDL_HIDAPI_LIBUSB ON CACHE BOOL "" FORCE)
+      set(SDL_HIDAPI_LIBUSB_SHARED OFF CACHE BOOL "" FORCE)  # link libusb (otool -L shows it, bundle.py copies it)
+      FetchContent_Declare(SDL3
+        URL https://github.com/libsdl-org/SDL/releases/download/release-${EOD_SDL_VERSION}/SDL3-${EOD_SDL_VERSION}.tar.gz
+        URL_HASH SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      FetchContent_MakeAvailable(SDL3)
+      get_directory_property(_sdl_libusb DIRECTORY ${sdl3_SOURCE_DIR} DEFINITION HAVE_HIDAPI_LIBUSB)
+      if(NOT _sdl_libusb)
+        message(FATAL_ERROR "SDL3 was configured without libusb: install libusb (brew install libusb)")
+      endif()
+    else()
+      find_package(SDL3 REQUIRED CONFIG)
+    endif()
     list(APPEND PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/platform_sdl3.cpp)
+    if(APPLE)  # Application Support, disc install, settings dialog
+      list(APPEND PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/app/macos_app.mm
+           ${CMAKE_SOURCE_DIR}/runtime/app/macos_vulkan.cpp ${CMAKE_SOURCE_DIR}/runtime/app/disc_import.cpp
+           ${CMAKE_SOURCE_DIR}/runtime/app/iso9660.cpp)
+    endif()
   endif()
   # Vulkan GS renderer (runtime/gs/vulkan) in place of the stub; it draws into the SDL3 window
   option(EOD_VULKAN "Vulkan GS renderer (Linux, macOS with MoltenVK; needs EOD_SDL3)" OFF)
@@ -135,6 +178,24 @@ else()
   if(EOD_SDL3)
     target_compile_definitions(eod PRIVATE EOD_SDL3)
     target_link_libraries(eod PRIVATE SDL3::SDL3)
+    if(EOD_BUNDLED_SDL)
+      target_compile_definitions(eod PRIVATE EOD_SDL_LIBUSB)
+    endif()
+    if(APPLE)
+      target_compile_definitions(eod PRIVATE EOD_MACOS_APP)
+      target_link_libraries(eod PRIVATE "-framework Cocoa")
+      set_source_files_properties(${CMAKE_SOURCE_DIR}/runtime/app/macos_app.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+      # EOD_MAC_APP: also <build>/Eve of Destruction.app, with the libraries it
+      # uses (SDL3, libusb, the Vulkan loader and MoltenVK) copied in and
+      # ad-hoc signed (tools/macos/bundle.py). The game's files are not included.
+      option(EOD_MAC_APP "build Eve of Destruction.app (macOS)" OFF)
+      if(EOD_MAC_APP)
+        add_custom_target(eod_app ALL
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/macos/bundle.py
+                  "${CMAKE_BINARY_DIR}/Eve of Destruction.app" $<TARGET_FILE:eod>
+          DEPENDS eod VERBATIM)
+      endif()
+    endif()
   endif()
   if(EOD_VULKAN)
     target_compile_definitions(eod PRIVATE EOD_VULKAN)
@@ -163,4 +224,11 @@ if(BUILD_TESTING AND Python3_FOUND)
   add_executable(gs_transfer_chunk_test tests/gs_transfer_chunk_test.cpp)
   target_include_directories(gs_transfer_chunk_test PRIVATE runtime)
   add_test(NAME gs_transfer_chunks COMMAND gs_transfer_chunk_test)
+endif()
+
+# disc image reader and disc install test (cmake -DBUILD_TESTING=ON, then ctest)
+if(BUILD_TESTING AND NOT WIN32)
+  enable_testing()
+  add_executable(iso9660_test tests/iso9660_test.cpp runtime/app/iso9660.cpp runtime/app/disc_import.cpp)
+  add_test(NAME iso9660 COMMAND iso9660_test)
 endif()
