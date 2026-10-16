@@ -47,6 +47,30 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
 3. Intro movie decoding is slower than gameplay on arm64; investigate IPU
    separately. All event types and career persistence still need extended play.
 
+1. **Rendering speed.** The software GS draws ~27–34 fps in a 2P race
+   (`--gs-replay` of a captured race frame: ~29 ms/frame with 4 raster
+   workers; more workers do not help, the workers mostly wait on each other
+   between primitive batches). The game itself runs at 60. Fix: a Vulkan GS
+   renderer running on macOS through MoltenVK (the route other PS2 recomps
+   take first, for compatibility), ported from `runtime/gs/d3d11/` with the
+   same design (GPU surfaces owning GS pages, one pipeline shader). The
+   existing HLSL shader compiles to SPIR-V, so D3D11 and Vulkan share one
+   shader source. It also gives Retina internal resolution. A native Metal
+   backend can come later if MoltenVK costs too much.
+2. **Xbox 360 wired pads (Rock Candy).** macOS has no 360 driver; SDL reaches
+   them through HIDAPI over libusb, but Homebrew's SDL3 is built without
+   libusb. Needs SDL3 built from source with `SDL_HIDAPI_LIBUSB=ON` (bundled
+   in the app), then a test with the physical pad.
+3. Player-facing packaging: `.app` bundle / DMG, first-run "choose your disc"
+   flow, settings UI (the Windows `eodsetup.exe` equivalent).
+4. Intro playback still needs fidelity/performance work. A bounded 8-second
+   Apple Silicon CPU sample during `logos.pss` found the translated bitstream
+   consume/refill helper `0039AFB0` at about 35% of main-thread self samples,
+   with peek/consume wrapper `0039B048` at about 13%. Native IPU IDCT was below
+   1% of self samples. This points to translated bitstream parsing as the first
+   optimization target for that sampled segment; it does not establish the
+   bottleneck for every movie or justify changing playback timing.
+
 ## Controllers and Rock Candy Xbox 360 wired pads
 
 On macOS `EOD_BUNDLED_SDL=ON` is the default. CMake downloads pinned SDL
@@ -233,3 +257,19 @@ renderer code. Source references:
 - [MoltenVK presentation implementation](https://github.com/KhronosGroup/MoltenVK/blob/main/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm)
 - [Apple's matching host-time epoch](https://developer.apple.com/documentation/quartzcore/cacurrentmediatime())
 - [Road Trip's refresh-grid prior art](https://github.com/silentsudin/PS2Recomp/blob/818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4/ps2xRuntime/src/lib/gs/gs_pgs_presenter.cpp)
+
+## Audio fidelity check
+
+User volume is applied once by the shared SPU2 mixer. The SDL output stream
+uses unity gain (or zero when disabled), so the Mac path no longer attenuates
+50% volume twice. `audio_volume_offline` feeds constant planar stereo PCM
+through the actual SPU2 AutoDMA/mixer and an unbound SDL stream, retrieves the
+samples into memory, and checks 100%/50%/0% amplitudes of 11998/5999/0. It never
+opens an audio device, window, or plays sound.
+
+This fixes an output-level regression, not the whole PS2 sound model. The
+current voice resampler is linear; noise/pitch-modulation and reverb fields
+are stored but are not implemented in the mixing loop. Audio is driven from
+wall-clock time, with a 100 ms catch-up limit and a 200 ms output queue cap.
+Those approximations still require original-hardware or trusted-reference
+comparison before describing audio or FMV synchronization as 1:1.
