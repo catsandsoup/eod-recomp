@@ -116,6 +116,15 @@ int wrap_coord(int c, int size, int mode) {
 }
 
 float4 sample_tex(float2 tc, int lvl, bool linear_filter) {
+#ifdef VK
+    if (linear_filter && c_tex_scale == 1.0) {
+        // The GS quantizes UV at 1/16 texel of the selected mip level. Keep
+        // hardware filtering/rounding; continuous float UV causes visible
+        // differences within textured surfaces, not just at primitive edges.
+        float mip = (float)(1 << lvl);
+        tc = floor(tc * (16.0 / mip)) * (mip / 16.0);
+    }
+#endif
     if (linear_filter) {
         float2 uv = tc / c_tex_size;
         return lvl > 0 ? t_tex.SampleLevel(s_min, uv, lvl) : t_tex.SampleLevel(s_mag, uv, 0);
@@ -130,7 +139,12 @@ float4 sample_tex(float2 tc, int lvl, bool linear_filter) {
 
 PSOut ps_draw(VSOut i) {
     uint f = c_flags;
+#ifdef VK
+    // GS interpolants are truncated, not rounded to nearest.
+    int4 c = (int4)floor(i.color * 255.0 + 0.0001);
+#else
     int4 c = (int4)round(i.color * 255.0);
+#endif
     if (f & F_TME) {
         float2 tc;
         int lvl = 0;
@@ -168,7 +182,13 @@ PSOut ps_draw(VSOut i) {
     }
     if (f & F_FGE) {
         int fo = (int)round(i.fog * 255.0);
+#ifdef VK
+        // Interpolate about FogCol with /256 precision and rounded output.
+        // Equal source/fog colours must remain equal (including F=255).
+        c.rgb = (int3)c_fog.rgb + (((c.rgb - (int3)c_fog.rgb) * fo + 128) >> 8);
+#else
         c.rgb = (fo * c.rgb + (255 - fo) * (int3)c_fog.rgb) >> 8;
+#endif
     }
     if (f & (F_ATEST_PASS | F_ATEST_FAIL)) {
         uint a = (uint)c.a, r = c_aref;
