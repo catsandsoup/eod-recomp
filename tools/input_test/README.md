@@ -84,3 +84,14 @@ Input logs include Cross/Square pressure changes as well as L2/R2.
 
 These hardware-free mapping tests do not verify a physical Rock Candy pad
 or claim a complete actual-game analog-trigger driving test.
+
+## Scripted analog pressure for game captures
+
+Existing `frame:buttons[:lx:ly]` entries retain their digital 0/255 pressure.
+Tests may append independent Cross/Square pressure bytes:
+`frame:buttons:lx:ly:cross:square`. For example,
+`4300:4000:128:128:96:0` holds the Cross digital bit with 96/255 gas pressure;
+`4300:0000:128:128:0:128` supplies half Square pressure without a digital bit.
+Explicit zero stays zero. A malformed, negative or greater-than-255 pressure
+rejects that entry; it does not wrap. The `pad_script` CTest covers these
+cases, omitted fields, stick compatibility and independent player ports.
