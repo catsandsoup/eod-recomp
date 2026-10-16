@@ -2,12 +2,38 @@
 // Shader model 4.0 (feature level 10_0 and later).  Compiled ahead of time
 // to gs_shaders.inc by tools/build_shaders.py (needs Wine).
 //
+// The Vulkan renderer (runtime/gs/vulkan) compiles the same source to SPIR-V
+// with -DVK and -DVK_DRAW / -DVK_PASS (tools/build_vk_shaders.py): the macros
+// below then give the cbuffers as push constants and the resources their
+// descriptor bindings (t0-t3 -> 0-3, s0/s1 -> 8/9); for Direct3D they are empty.
+//
 // Colour render targets are R8G8B8A8_UNORM holding the GS 8-bit channels
 // (alpha as stored by the GS: 0x80 = 1.0); depth buffers are D32_FLOAT
 // holding z / 2^bits of the depth format.
 
+#ifdef VK
+#define VK_PUSH [[vk::push_constant]]
+#define CB_REG(r)
+#define VK_BIND(n) [[vk::binding(n, 0)]]
+#define VK_LOC(n) [[vk::location(n)]]
+// dual-source output: location 0 index 1 (glslang has no vk::index; the build
+// script moves this location-1 output there in the SPIR-V)
+#define VK_DUAL [[vk::location(1)]]
+#define VK_POINT_SIZE , [[vk::builtin("PointSize")]] out float psize : PSIZE
+#define VK_SET_POINT_SIZE psize = 1.0;
+#else
+#define VK_PUSH
+#define CB_REG(r) : register(r)
+#define VK_BIND(n)
+#define VK_LOC(n)
+#define VK_DUAL
+#define VK_POINT_SIZE
+#define VK_SET_POINT_SIZE
+#endif
+
+#if !defined(VK) || defined(VK_DRAW)
 // ===================================================================== draw
-cbuffer Draw : register(b0) {
+VK_PUSH cbuffer Draw CB_REG(b0) {
     float2 c_vp_scale;   // GS pixel -> clip space: ndc = (p + 0.5) * scale + offset
     float2 c_vp_offset;
     float c_zscale;      // 1 / 2^(depth bits)
@@ -49,16 +75,16 @@ cbuffer Draw : register(b0) {
 #define TFX(f) (((f) >> 16) & 3)
 #define ATST(f) (((f) >> 20) & 7)
 
-Texture2D<float4> t_tex : register(t0);
-SamplerState s_mag : register(s0);
-SamplerState s_min : register(s1);
+VK_BIND(0) Texture2D<float4> t_tex : register(t0);
+VK_BIND(8) SamplerState s_mag : register(s0);
+VK_BIND(9) SamplerState s_min : register(s1);
 
 struct VSIn {
-    float2 pos : POSITION;
-    uint z : DEPTH;
-    float4 color : COLOR;
-    float3 stq : TEXCOORD0;
-    float fog : FOG;
+    VK_LOC(0) float2 pos : POSITION;
+    VK_LOC(1) uint z : DEPTH;
+    VK_LOC(2) float4 color : COLOR;
+    VK_LOC(3) float3 stq : TEXCOORD0;
+    VK_LOC(4) float fog : FOG;
 };
 
 struct VSOut {
@@ -68,8 +94,9 @@ struct VSOut {
     float fog : FOG;
 };
 
-VSOut vs_draw(VSIn v) {
+VSOut vs_draw(VSIn v VK_POINT_SIZE) {
     VSOut o;
+    VK_SET_POINT_SIZE
     float z = min((float)v.z, c_zmax) * c_zscale;
     o.pos = float4((v.pos + 0.5) * c_vp_scale + c_vp_offset, z, 1.0);
     o.color = v.color;
@@ -79,8 +106,8 @@ VSOut vs_draw(VSIn v) {
 }
 
 struct PSOut {
-    float4 color : SV_Target0;
-    float4 factors : SV_Target1;  // dual-source blend factors: rgb = destination, a = source
+    VK_LOC(0) float4 color : SV_Target0;
+    VK_DUAL float4 factors : SV_Target1;  // dual-source blend factors: rgb = destination, a = source
 };
 
 int wrap_coord(int c, int size, int mode) {
@@ -178,10 +205,12 @@ PSOut ps_draw(VSOut i) {
     o.factors = float4(abs(cd), abs(cd), abs(cd), abs(cs));
     return o;
 }
+#endif  // draw
 
+#if !defined(VK) || defined(VK_PASS)
 // =================================================================== passes
 // Full-rectangle passes over a destination rectangle (6 vertices, no buffer).
-cbuffer PassConsts : register(b1) {
+VK_PUSH cbuffer PassConsts CB_REG(b1) {
     float4 p_dst;        // destination rectangle in clip space: x0, y0, x1, y1
     float4 p_src;        // source rectangle in source texels: x0, y0, x1, y1
     float4 p_misc;       // x: depth scale (2^bits) of the source, y: of the destination, z: dst scale, w: src scale
@@ -196,12 +225,12 @@ cbuffer PassConsts : register(b1) {
 #define P_TEXA      0x2   // produce texture colours (16/24-bit alpha from TEXA)
 #define P_POINT     0x4   // copy: point sampling
 
-Texture2D<float4> t_src : register(t0);
-Texture2D<float> t_depth : register(t1);
-Texture2D<uint> t_raw : register(t2);
-Texture2D<uint2> t_remap : register(t3);  // within a page: destination pixel -> source pixel
-SamplerState s_point : register(s0);
-SamplerState s_linear : register(s1);
+VK_BIND(0) Texture2D<float4> t_src : register(t0);
+VK_BIND(1) Texture2D<float> t_depth : register(t1);
+VK_BIND(2) Texture2D<uint> t_raw : register(t2);
+VK_BIND(3) Texture2D<uint2> t_remap : register(t3);  // within a page: destination pixel -> source pixel
+VK_BIND(8) SamplerState s_point : register(s0);
+VK_BIND(9) SamplerState s_linear : register(s1);
 
 struct PassOut {
     float4 pos : SV_Position;
@@ -297,3 +326,4 @@ float4 ps_copy(PassOut i) : SV_Target {
     float4 c = (p_fmt.z & P_POINT) ? t_src.SampleLevel(s_point, uv, 0) : t_src.SampleLevel(s_linear, uv, 0);
     return float4(c.rgb, p_color.a);
 }
+#endif  // passes
