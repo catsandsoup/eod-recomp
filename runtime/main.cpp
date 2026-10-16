@@ -19,6 +19,9 @@
 #endif
 
 #include "core/config.h"
+#ifdef __APPLE__
+#include "app/macos_app.h"
+#endif
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
@@ -114,6 +117,9 @@ int main(int argc, char **argv) {
     std::string data_dir;
     // settings: eod.ini next to the executable (--config overrides the path)
     std::string config_path = dir_of(argv[0]) + "/eod.ini";
+#ifdef __APPLE__
+    config_path = mac_app_support() + "/eod.ini";
+#endif
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
     config_load(config_path);
@@ -162,6 +168,17 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+#ifdef __APPLE__
+    if (!replay) {
+        bool headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
+        if (headless && data_dir.empty()) {
+            for (const auto &candidate : {dir_of(argv[0]), std::string(".")}) {
+                if (disc_check_folder(candidate, {ee_elf_size, ee_elf_crc32}).ok()) { data_dir = candidate; break; }
+            }
+        }
+        if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32})) return 1;
+    }
+#endif
     log_init(log_spec);
     if (replay) return gs_replay(replay, repeat);
 

@@ -58,3 +58,53 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
    flow, settings UI (the Windows `eodsetup.exe` equivalent).
 4. Movie decode is slow during the intro (EE 100% busy, few movie frames/s)
    — check the IPU path on arm64.
+
+## Personal Mac app
+
+The app requires your own North American SLUS-20910 v1.00 disc. No game
+files are bundled. Generate and build as above, then enable packaging:
+
+```sh
+cmake -S . -B build-mac -G Ninja -DEOD_MAC_APP=ON
+cmake --build build-mac -j3
+```
+
+The plain `build-mac/eod` remains available. The `eod_app` target creates
+`~/Library/Application Support/TDEODRecomp/local-build/Eve of Destruction.app`
+with its non-system dylib dependency closure, local rpaths, generic macOS
+placeholder icon, and ad-hoc signature. `EOD_APP_OUTPUT` chooses another output
+directory. Use a directory outside iCloud/FileProvider: Finder metadata can
+invalidate code signing inside synced Documents folders. The minimum macOS
+version in Info.plist is derived from the executable and bundled dependencies
+(at least 13.0); local Homebrew builds may require the current OS.
+
+First launch offers a native ISO or disc-folder picker. It verifies the exact
+SLUS_209.10 size and CRC before copying SLUS_209.10, SYSTEM.CNF (if present),
+and DATA into Application Support/TDEODRecomp/disc. Progress and friendly
+errors appear in native windows. An existing valid disc skips the picker.
+Imports stage separately, and failed/cancelled copies preserve the old disc.
+The built-in ISO9660 reader supports plain ISO and raw Mode 1/2 BIN/CUE.
+
+`eod.ini` and `memcard/` also live in Application Support/TDEODRecomp.
+Press **F1** or **Cmd+,** during play for native settings: video size,
+fullscreen, aspect, smoothing, frame skip, VSync, volume/audio, every keyboard
+binding, keyboard port, vibration, renderer and internal resolution, plus
+save/disc locations. Renderer, internal resolution, VSync, audio enable, frame skip, keyboard port
+and file locations take effect on next launch. The software renderer has no internal
+resolution scaling; Vulkan selection requires a build with that backend.
+
+Automation must set `EOD_HEADLESS=1 EOD_MUTE=1` and pass `--headless`.
+`--data DIR`/`EOD_DATA`, `--config FILE` and `EOD_APP_SUPPORT` override paths.
+Missing data in headless mode returns an error without opening dialogs.
+
+```sh
+ctest --test-dir build-mac --output-on-failure
+# Read-only source; import only to a scratch destination:
+build-mac/disc_import_cli /path/game.iso /tmp/eod-test/disc 3368996 75BB93EE
+EOD_HEADLESS=1 EOD_MUTE=1 "$HOME/Library/Application Support/TDEODRecomp/local-build/Eve of Destruction.app/Contents/MacOS/eod" --headless --data /tmp/eod-test/disc --frames 600
+# Build a DMG locally; never upload or distribute:
+tools/make_dmg.sh
+```
+
+Native dialogs are compile-verified only; automated tests never open visible
+windows or play audio. The app and DMG are personal builds only.

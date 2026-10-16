@@ -127,3 +127,28 @@ else()
     target_link_libraries(eod PRIVATE SDL3::SDL3)
   endif()
 endif()
+
+# Optional personal macOS app; game data is never included in the bundle.
+if(APPLE)
+  enable_language(OBJCXX)
+  target_sources(eod PRIVATE runtime/app/macos_app.mm runtime/app/disc_import.cpp runtime/app/iso9660.cpp)
+  target_link_libraries(eod PRIVATE "-framework Cocoa")
+  set_source_files_properties(runtime/app/macos_app.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  option(EOD_MAC_APP "Build a local, ad-hoc signed macOS application bundle" OFF)
+  if(EOD_MAC_APP)
+    set(EOD_APP_OUTPUT "$ENV{HOME}/Library/Application Support/TDEODRecomp/local-build"
+      CACHE PATH "Local app output directory (use a non-cloud-synced directory for codesign)")
+    add_custom_target(eod_app ALL
+      COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/macos/bundle.py"
+        "${EOD_APP_OUTPUT}/Eve of Destruction.app" "$<TARGET_FILE:eod>"
+      DEPENDS eod VERBATIM)
+  endif()
+endif()
+include(CTest)
+if(BUILD_TESTING AND NOT WIN32)
+  add_executable(iso9660_test tests/iso9660_test.cpp runtime/app/iso9660.cpp runtime/app/disc_import.cpp)
+  add_test(NAME iso9660 COMMAND iso9660_test)
+endif()
+if(BUILD_TESTING AND NOT WIN32)
+  add_executable(disc_import_cli tests/disc_import_cli.cpp runtime/app/iso9660.cpp runtime/app/disc_import.cpp)
+endif()
