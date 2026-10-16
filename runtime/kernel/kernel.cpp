@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "../core/cpu.h"
+#include "../core/config.h"
+#include "../core/timing_trace.h"
 #include "../core/log.h"
 #include "../core/memory.h"
 #include "../gs/gs.h"
@@ -314,6 +316,8 @@ void debug_watch() {
 // `run_alarms` (interrupts enabled).
 void service_events(bool run_alarms) {
     uint64_t now = platform_time_us();
+    const bool timing_trace = eod_timing::enabled();
+    if (timing_trace) eod_timing::service(now);
     iop_sound_update();
     debug_watch();
     if (!g_next_vblank_us) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
@@ -322,6 +326,12 @@ void service_events(bool run_alarms) {
         intc_raise(INTC_VBLANK_E);
     }
     if (now >= g_next_vblank_us && !g_vblank_end_pending) {
+        if (timing_trace) {
+            auto &s = eod_timing::state();
+            s.vblank_debt_max = std::max(s.vblank_debt_max, now - g_next_vblank_us);
+            if (now > g_next_vblank_us + 13 * (uint64_t)kVblankPeriodUs) ++s.resyncs;
+            if (g_next_vblank_us + (uint64_t)kVblankPeriodUs <= now) ++s.catchups;
+        }
         g_vblank_count++;
         // Vblanks missed while the EE was busy are delivered back to back (the
         // game counts them as time), up to a few frames; beyond that, resync.
@@ -341,8 +351,12 @@ void service_events(bool run_alarms) {
             gs_shutdown();
             exit(0);
         }
-        uint64_t input_end = input_timing ? platform_time_us() : 0;
+        uint64_t input_end = (input_timing || timing_trace) ? platform_time_us() : 0;
         gs_vblank();
+        if (timing_trace) {
+            auto &s = eod_timing::state();
+            s.gs_block_max = std::max(s.gs_block_max, platform_time_us() - input_end);
+        }
         if (input_timing) {
             uint64_t gs_end = platform_time_us();
             uint64_t gap = previous_input_us ? input_begin - previous_input_us : 0;
@@ -366,6 +380,7 @@ void service_events(bool run_alarms) {
         }
         intc_raise(INTC_VBLANK_S);
     }
+    if (timing_trace) eod_timing::report(platform_time_us(), g_vblank_count, g_config.frame_skip);
     for (int i = 0; i < 64 && run_alarms; i++) {
         Alarm &a = g_alarms[i];
         if (a.used && now >= a.due_us) {

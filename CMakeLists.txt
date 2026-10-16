@@ -139,8 +139,22 @@ target_include_directories(eod_gen PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include $
 add_executable(eod ${RUNTIME_SOURCES} ${PLATFORM_SOURCES} $<TARGET_OBJECTS:eod_gen>)
 target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_SOURCE_DIR}/runtime ${GEN_DIR})
 
+# Optional standard gzip transport for bounded diagnostic cold captures.
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+  target_link_libraries(eod PRIVATE ZLIB::ZLIB)
+  target_compile_definitions(eod PRIVATE EOD_HAVE_ZLIB)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
+  if(ZLIB_FOUND)
+    add_executable(eod_gs_capture_io_test tools/tests/gs_capture_io_test.cpp)
+    target_link_libraries(eod_gs_capture_io_test PRIVATE ZLIB::ZLIB)
+    target_compile_definitions(eod_gs_capture_io_test PRIVATE EOD_HAVE_ZLIB)
+    add_test(NAME GSCaptureIO COMMAND eod_gs_capture_io_test)
+    set_tests_properties(GSCaptureIO PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
+  endif()
   add_executable(eod_alpha_range_test tools/tests/alpha_range_test.cpp)
   target_include_directories(eod_alpha_range_test PRIVATE runtime)
   add_test(NAME AlphaPassRange COMMAND eod_alpha_range_test)
@@ -209,6 +223,13 @@ if(EOD_VULKAN)
     endif()
     add_executable(eod_gs_pixel_fixture tools/tests/gs_pixel_fixture.cpp runtime/gs/gs_mem.cpp)
     if(Python3_FOUND)
+      if(ZLIB_FOUND)
+        add_test(NAME GSCaptureReplay COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_capture_replay.py --eod $<TARGET_FILE:eod>
+          --generator $<TARGET_FILE:eod_gs_pixel_fixture>
+          --work-dir ${CMAKE_BINARY_DIR}/gs-capture-replay-test)
+        set_tests_properties(GSCaptureReplay PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
+      endif()
       add_test(NAME VulkanGSPixels COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_pixels.py --eod $<TARGET_FILE:eod>
         --generator $<TARGET_FILE:eod_gs_pixel_fixture> --work-dir ${CMAKE_BINARY_DIR}/gs-pixel-test)
