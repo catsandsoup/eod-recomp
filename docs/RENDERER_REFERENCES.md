@@ -142,3 +142,45 @@ The existing pre-alpha native CPU sample
 write cleanup, supporting command encoding as a candidate. It predates the
 alpha fix and cannot quantify its current share. The cache's same-binary
 on/off replay comparison establishes the measured improvement.
+
+## Per-draw command cost and GPU-time check — October 16 continuation
+
+Measurement correction first: an earlier Metal System Trace reading of "~42 ms
+GPU busy per replay" summed the whole system's GPU intervals (WindowServer,
+browser and desktop-app helpers were in the same trace) and nested interval
+depths. Filtering `metal-gpu-intervals` to the `eod` process and depth 0 gives
+~6.5 ms GPU per warm 2-game-frame race replay, 10% of wall time; surfaces in that
+capture are 640x512 and 320x512, so full-surface render areas are not the cost.
+The GS worker is bound by CPU recording/encoding and synchronous readback round
+trips, not by GPU fragment throughput.
+
+Applied wheels (concepts only, no source copied):
+
+- PCSX2 Vulkan hardware renderer, pinned
+  [`685637d`](https://github.com/PCSX2/pcsx2/blob/685637d30b5eaa8e5d7a587673a17577a92dcb88/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp):
+  the alpha-test second pass is a different pipeline selector, and constant
+  buffers are re-uploaded only when their cached contents change; vertices are
+  written once to a stream buffer and draws select them with `firstVertex`.
+  EOD now does the same: `ps_draw` has `[[vk::constant_id(0)]] c_atest_select`
+  OR'd into `c_flags` (Vulkan build only, D3D11 unchanged), the pass/fail half is
+  a pipeline specialization, push constants are skipped when byte-identical, and
+  each batch's vertices are uploaded and bound once (`SetVertexWindow`).
+- Vulkan spec, [pipeline layout compatibility](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html#descriptorsets-compatibility):
+  push constants stay valid across binds of pipelines with an identical push
+  range/layout; vertex buffer bindings are command-buffer state. Both caches are
+  invalidated at every `vkBeginCommandBuffer`; the vertex window is also
+  invalidated at every submit (its upload chunk is recycled with the flight).
+- Vulkan spec, [specialization constants](https://docs.vulkan.org/spec/latest/chapters/pipelines.html#pipelines-specialization-constants).
+
+Ruled out with measurements on the race capture (same binary, alternating):
+
+- MoltenVK 1.4.2 config: `MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1/2`,
+  `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0` and
+  `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0` were within noise (async submits only
+  move ~9 ms of Metal encoding into the fence wait).
+- Dolphin-style early command-buffer kicks (async submit after N draws, at pass
+  boundaries or mid-pass): at most ~1.5 ms better at pass boundaries; mid-pass
+  kicks every 250–1000 draws were slower (59–64 ms) because each extra Metal
+  command buffer costs a ~0.2–0.3 ms round trip on this M2 Pro. Not shipped.
+- `EOD_GPU_UPLOADS=1` reduces readbacks 19 to 7 but not wait time (bigger
+  batches per sync); see `GS_CPU_WRITE_PRESERVATION.md`.
