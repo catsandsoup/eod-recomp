@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 #include "platform/sdl3/sdl_input.h"
 
@@ -302,6 +303,53 @@ void test_keyboard_on_player_2() {
     sdl_input::close_all();
 }
 
+void test_modern_triggers() {
+    sdl_input::set_controller_layout(true);
+    sdl_input::set_keyboard_port(0);
+    Pad a, b;
+    attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    attach(b, 0x045E, 0x028E, "Xbox 360 Controller");
+    for (Pad *p : {&a, &b}) {
+        set_axis(*p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, kTriggerRest);
+        set_axis(*p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kTriggerRest);
+    }
+    set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0); // half travel, P2
+    HostPadState s = read_port(1);
+    CHECK(s.buttons == PAD_CROSS && s.pressure[6] > 100 && s.pressure[6] < 160, "RT half is analog Cross");
+    CHECK(s.pressure[10] == 0 && s.pressure[11] == 0, "modern has no original L2/R2 pressure");
+    CHECK(read_port(0).buttons == 0 && read_port(0).pressure[6] == 0, "P1 unaffected by P2 trigger");
+    set_axis(b, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
+    HostPadState other = read_port(0);
+    CHECK(other.buttons == PAD_SQUARE && other.pressure[7] == 255 && other.pressure[6] == 0, "P1 LT brakes independently");
+    set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -30000);
+    s = read_port(1);
+    CHECK(s.buttons == 0 && s.pressure[6] > 0 && s.pressure[6] <= sdl_input::kTriggerDigital, "light RT pressure without digital Cross");
+    set_button(a, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    CHECK(read_port(1).pressure[6] == 255, "physical A stays full pressure with light RT");
+    set_button(a, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    set_axis(a, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 0);
+    set_button(a, SDL_GAMEPAD_BUTTON_WEST, true);
+    CHECK(read_port(1).pressure[7] == 255, "physical X stays full pressure with partial LT");
+    set_button(a, SDL_GAMEPAD_BUTTON_WEST, false);
+    HostPadState keyboard;
+    keyboard.connected = true;
+    keyboard.buttons = PAD_CROSS | PAD_SQUARE;
+    sdl_input::read_gamepad(sdl_input::port_gamepad(1), &keyboard);
+    CHECK(keyboard.pressure[6] == 255 && keyboard.pressure[7] == 255, "shared keyboard stays at full pressure");
+    s = read_port(1);
+    CHECK(s.pressure[6] > 0 && s.pressure[6] < 31 && s.pressure[7] > 100 && s.pressure[7] < 160,
+          "released face/keyboard input returns to partial triggers");
+    set_axis(a, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, kTriggerRest);
+    set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kTriggerRest);
+    s = read_port(1);
+    CHECK(s.buttons == 0 && s.pressure[6] == 0 && s.pressure[7] == 0, "released triggers return to neutral");
+    sdl_input::set_controller_layout(false);
+    set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
+    s = read_port(1);
+    CHECK(s.buttons == PAD_R2 && s.pressure[11] == 255 && s.pressure[6] == 0, "switching back restores Original PS2 mapping");
+    detach(a); detach(b); sdl_input::close_all();
+}
+
 }  // namespace
 
 int main() {
@@ -317,6 +365,7 @@ int main() {
     test_rock_candy_with_keyboard();
     test_two_pads_no_keyboard();
     test_keyboard_on_player_2();
+    test_modern_triggers();
     SDL_Quit();
     printf("%d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

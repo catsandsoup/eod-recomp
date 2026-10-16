@@ -30,6 +30,9 @@ constexpr int kPorts = 2;
 // SDL hints for HIDAPI (Xbox 360 pads over libusb on macOS); call before SDL_Init.
 void set_hints();
 
+// Explicit persisted app setting: false = Original PS2, true = Modern RT/LT gas/brake.
+void set_controller_layout(bool modern);
+
 void set_keyboard_port(int port);  // 0 or 1, -1 = none
 // EOD_KEYBOARD_PORT: "1" (default) or "2" = that player, "none" = no keyboard player
 int keyboard_port_from_env();
@@ -44,7 +47,8 @@ SDL_Gamepad *port_gamepad(int port);
 int port_of(SDL_JoystickID id);  // -1 when not on a port
 
 // SDL gamepad -> DualShock 2: buttons, 0..255 sticks (dead zone), triggers as
-// L2/R2 pressure plus the digital bit.
+// L2/R2 pressure plus the digital bit (Original), or Cross/Square pressure
+// for analog throttle/brake (Modern).
 void read_gamepad(SDL_Gamepad *gp, HostPadState *out);
 uint8_t stick_byte(Sint16 v);    // -32768..32767 -> 0..255, centre 128, dead zone
 uint8_t trigger_byte(Sint16 v);  // 0..32767 -> 0..255
