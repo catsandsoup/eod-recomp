@@ -31,7 +31,10 @@ static void call(uint32_t cmd, int port, int slot, const uint8_t *payload = null
     memcpy(buf, words, sizeof words);
     if (payload) memcpy(buf + 12, payload, n);
     CHECK(handler(RpcCall{}, buf) == 128);
-    if (cmd == 7 || cmd == 8) { uint32_t result; memcpy(&result, buf + 0x14, 4); CHECK(result == 1); }
+    uint32_t offset = cmd == 0x0A ? 0x10 : cmd == 0x0B ? 0x1C : 0x14;
+    if (cmd == 6 || cmd == 7 || cmd == 8 || cmd == 0x0A || cmd == 0x0B) {
+        uint32_t result; memcpy(&result, buf + offset, 4); CHECK(result == 1);
+    }
 }
 int main() {
     iop_pad_init();
@@ -42,6 +45,10 @@ int main() {
     pads[1].pressure[10] = 19;
     pads[1].lx = 25;
     call(1, 1, 0, (uint8_t *)open, sizeof open);
+    uint32_t analog[] = {1, 0}; // unlocked: old handler returned lock=0 as failure
+    call(6, 1, 0, (uint8_t *)analog, sizeof analog);
+    uint8_t reference[12] = {};
+    call(0x0B, 1, 0, reference, sizeof reference);
     uint32_t pressure = 1;
     call(0x0A, 1, 0, (uint8_t *)&pressure, 4);
     iop_pad_vblank();
