@@ -121,7 +121,11 @@ captures support added horizontal scenery with preserved proportions. Full-speed
 still under investigation. See [current evidence and limits](docs/STATUS.md).
 
 Developer build steps, measured performance and known fidelity limits:
-[docs/MACOS.md](docs/MACOS.md). High-refresh and mod work remain deferred.
+[docs/MACOS.md](docs/MACOS.md). The next visual priority is much longer
+high-detail draw distances and correct widescreen/ultrawide culling, with
+quality settings for stronger Macs. This is planned work, not a claim of zero
+pop-in today. See [LOD/culling scope](docs/MODDING_SCOPE.md). High-refresh and
+other mods remain deferred.
 
 ## Game files
 

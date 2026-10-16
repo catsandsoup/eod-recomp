@@ -1,5 +1,32 @@
 # Modding Scope: Test Drive: Eve of Destruction (feasibility study)
 
+## Owner priority update — October 16, 2026
+
+LOD, draw distance and correct widescreen/ultrawide culling are now a **high
+priority workstream**, explicitly promoted by the owner from the otherwise
+deferred mod list. Target very distant highest-available-detail rendering and
+eliminate visible model/quality pop-in where the engine/assets permit. Support
+scalable quality settings for Macs faster than the owner's M2 Pro. Preserve
+original physics, AI and simulation timing; maintain a faithful baseline for
+comparison. Other mods and 120 Hz remain deferred.
+
+Do not equate disabling all culling with correct wide-aspect visibility. Trace
+frustum construction, per-camera aspect, bounding-volume tests, distance/LOD
+selection, scene submission and asset streaming separately. Correct edge
+visibility while retaining valid visibility tests; measure costs per player in
+split screen. Use reproducible camera sweeps, distant opponent/track objects,
+wide-edge captures and frame-time/geometry/memory measurements. A dedicated
+fresh specialist agent is appropriate for this research/implementation stream.
+
+Zero pop-in is an acceptance ambition, **not an established feasible guarantee**.
+First establish whether highest-detail assets exist, remain resident, and can
+be submitted beyond original engine limits. More internal render pixels alone
+do not create higher-resolution textures or more detailed meshes. Document
+engine bounds and any loading/streaming limits before promising removal.
+
+The historical planning-only note below remains context for other mod ideas;
+it does not override this newer LOD/culling priority.
+
 > **Status: planning only.** Modding is parked until the macOS port of this PS2
 > recompilation reaches 1:1 parity and passes the 2-player split-screen
 > requirement (see `TDEOD RECOMP/GOALS.md` §0 and `docs/MODDING_IDEAS.md` there).

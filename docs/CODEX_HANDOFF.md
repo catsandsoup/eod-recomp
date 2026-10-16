@@ -1,5 +1,13 @@
 # Fresh-chat continuation — 2026-10-16
 
+**New owner steering after this handoff:** LOD/draw-distance overhaul and correct
+widescreen/ultrawide culling are now HIGH priority, exempt from the otherwise
+deferred mods policy. Read the new priority section in MODDING_SCOPE.md. Aim for
+very far highest-available detail and minimal visible pop-in, scalable to stronger
+Macs. A dedicated fresh specialist is appropriate. Do not promise literal zero
+pop-in before tracing streaming, submission, LOD and frustum/visibility limits;
+do not just disable all culling or confuse 4K raster scale with new asset detail.
+
 Read this and README first. This is a compact handoff, not a requirement to load
 old chat history. The owner explicitly requested fresh chats and stopped old
 agents to save context. All previous agents are stopped; no game/build/GPU job
