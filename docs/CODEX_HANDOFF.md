@@ -25,9 +25,11 @@ Periodically hand off to fresh chats rather than growing old agents forever.
 
 The latest request specifically asks what “Press X for player 2” means on Mac.
 README now traces device assignment and Cross/Enter/bottom-face-button mapping.
-The original game still displays PS2 artwork. Device-aware in-game Mac hints and
-clear missing-P2-device guidance are unfinished; trace the journey, not only the
-pad packet implementation. One keyboard is currently assigned to one player.
+The original game still displays PS2 artwork. F2 now opens Controls and player 2
+with current SDL device assignments, Accept bindings and missing-P2 guidance;
+menu window titles and Settings mention it. Reopen after hot-plugging. The native
+dialog needs a hands-on visual check and automatic PS2 prompt replacement remains
+unfinished. One keyboard is currently assigned to one player.
 
 ## Workspace and safety preferences
 

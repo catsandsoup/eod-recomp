@@ -101,6 +101,46 @@ void set_controller_layout(bool modern) { g_modern_layout = modern; }
 void set_keyboard_port(int port) { g_keyboard_port = port >= 0 && port < kPorts ? port : -1; }
 int keyboard_port() { return g_keyboard_port; }
 
+std::string help_text(bool racing_keyboard, const std::string &cross_keys) {
+    std::string text = "The game's X means PS2 Cross, the Accept button.\n\n";
+    for (int p = 0; p < kPorts; ++p) {
+        text += "Player " + std::to_string(p + 1) + ": ";
+        bool keyboard = p == g_keyboard_port;
+        if (keyboard) text += "Keyboard - " + (racing_keyboard ? std::string("Enter") :
+            cross_keys.empty() ? std::string("no Cross key bound; set one in F1 Settings") : cross_keys);
+        if (SDL_Gamepad *gp = port_gamepad(p)) {
+            if (keyboard) text += "; or ";
+            const char *name = SDL_GetGamepadName(gp);
+            text += std::string(name ? name : "Controller") + " - bottom face button";
+            switch (SDL_GetGamepadButtonLabel(gp, SDL_GAMEPAD_BUTTON_SOUTH)) {
+            case SDL_GAMEPAD_BUTTON_LABEL_A: text += " (A)"; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_B: text += " (B)"; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_X: text += " (X)"; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_Y: text += " (Y)"; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_CROSS: text += " (Cross)"; break;
+            default: break;
+            }
+        } else if (!keyboard) text += "No device - connect a controller";
+        text += "\n";
+    }
+    text += "\nLocal race: ACTION > RACE > MULTI. Player 2 joins with their own Accept button; "
+            "each player confirms their own car. For a solo race choose SINGLE.\n";
+    if (g_keyboard_port != 1 && !port_gamepad(1)) {
+        text += "\nPlayer 2 has no device. Connect a controller, or set Keyboard port to 2 in F1 Settings "
+                "and restart (player 1 then needs a controller). One keyboard controls one player.\n";
+        if (racing_keyboard && g_keyboard_port == 0)
+            text += "Enter belongs to player 1 and cannot join player 2.\n";
+    }
+    if (racing_keyboard && g_keyboard_port >= 0)
+        text += "\nRacing keyboard: WASD/arrows navigate, Enter accepts, Esc goes back. "
+                "Enter starts the title screen. Driving: W/Up gas, S/Down/Space brake, "
+                "A/D or Left/Right steer, Esc pauses.\n";
+    text += "\nF1 or Cmd+, opens Settings. Keyboard port: 0 off, 1 player 1, 2 player 2; "
+            "restart after changing it. With keyboard off, controllers fill players in connection order. "
+            "Reopen F2 after connecting or unplugging a controller to refresh these assignments.";
+    return text;
+}
+
 SDL_Gamepad *port_gamepad(int port) { return port >= 0 && port < kPorts ? g_port_gamepad[port] : nullptr; }
 
 int port_of(SDL_JoystickID id) {

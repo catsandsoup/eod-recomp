@@ -275,6 +275,11 @@ bool platform_pump() {
             break;
         case SDL_EVENT_KEY_DOWN:
             time_key_event(e.key);
+            if (!g_headless && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F2) {
+                const std::string help = sdl_input::help_text(g_config.keyboard_layout == "racing", g_config.keys[KEY_CROSS]);
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Controls and player 2", help.c_str(), g_window);
+                break;
+            }
 #ifdef __APPLE__
             if (!g_headless && !e.key.repeat && (e.key.scancode == SDL_SCANCODE_F1 ||
                 (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
@@ -368,8 +373,9 @@ void *platform_native_window() { return g_vulkan_window ? g_window : nullptr; }
 
 void platform_set_status(const char *text) {
     if (!g_window) return;
-    char buf[256];
-    snprintf(buf, sizeof buf, "%s - %s", g_cfg.title, text);
+    char buf[512];
+    const char *help = keyboard_context() == keyboard_input::Context::Driving ? "" : " - F2: Controls / player 2";
+    snprintf(buf, sizeof buf, "%s - %s%s", g_cfg.title, text, help);
     SDL_SetWindowTitle(g_window, buf);
 }
 

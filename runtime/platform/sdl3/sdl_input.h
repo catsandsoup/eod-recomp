@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 #include "../platform.h"
 
@@ -37,6 +38,9 @@ void set_keyboard_port(int port);  // 0 or 1, -1 = none
 // EOD_KEYBOARD_PORT: "1" (default) or "2" = that player, "none" = no keyboard player
 int keyboard_port_from_env();
 int keyboard_port();
+
+// Current live assignments and menu Accept controls, for the in-game help.
+std::string help_text(bool racing_keyboard, const std::string &cross_keys);
 
 void on_added(SDL_JoystickID id);    // SDL_EVENT_GAMEPAD_ADDED
 void on_removed(SDL_JoystickID id);  // SDL_EVENT_GAMEPAD_REMOVED
