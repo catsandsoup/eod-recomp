@@ -106,3 +106,14 @@ cmake --build build-mac --target eod eod_input_test eod_pad_rpc_test
 EOD_HEADLESS=1 EOD_MUTE=1 ctest --test-dir build-mac --output-on-failure
 EOD_HEADLESS=1 EOD_MUTE=1 tools/test_2p_race.sh "$HOME/Library/Application Support/TDEODRecomp/disc"
 ```
+
+### Keyboard racing preset
+
+The default **Racing (WASD + arrows)** keyboard layout uses WASD or arrow keys
+for menus; Enter accepts and Escape goes back. In races, W/Up accelerates,
+S/Down or **Space brakes**, A/D or Left/Right steers, and Escape pauses.
+Enter starts the title screen and has no driving action. Release held keys
+when changing screens. Opposite steering keys cancel to center.
+Select **Original (PS2 keys)** to use the per-button key bindings instead;
+`[Input] KeyboardLayout=racing|original` persists this choice. Gamepad layout
+is a separate setting. Target-state evidence is in [KEYBOARD_CONTEXT.md](KEYBOARD_CONTEXT.md).
