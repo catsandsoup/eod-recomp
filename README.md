@@ -68,6 +68,15 @@ Bug reports are welcome on the
 
 ![Boot sequence](docs/img/boot_sequence.png)
 
+## Downloads
+
+Builds for Windows (64- and 32-bit) and Linux are on the
+[Releases](https://github.com/pareidolico/eod-recomp/releases) page. They are
+made by the `Release builds` workflow (`.github/workflows/release.yml`), which
+needs the `EOD_DECOMP_TOKEN` secret to read the game's executable for the code
+generation; the executable is deleted before building and is in no archive.
+The game itself is not included.
+
 ## Game files
 
 Copy the whole disc (at least `SLUS_209.10`, `SYSTEM.CNF` and the `DATA`
