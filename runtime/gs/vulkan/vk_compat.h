@@ -2,6 +2,7 @@
 // from gs_d3d11.cpp. These are CPU state descriptions, not a Direct3D runtime:
 // all allocation, synchronization and drawing below use Vulkan exclusively.
 #pragma once
+#include "present_timing.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <array>
@@ -9,12 +10,22 @@
 #include <stdexcept>
 #include <string>
 #include <vulkan/vulkan.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#else
+#include <time.h>
+#endif
 
 using UINT = uint32_t;
 using UINT8 = uint8_t;
 using HRESULT = int;
 using BOOL = bool;
-constexpr bool TRUE = true, FALSE = false;
+#ifndef TRUE
+constexpr bool TRUE = true;
+#endif
+#ifndef FALSE
+constexpr bool FALSE = false;
+#endif
 constexpr int S_OK = 0;
 #define SUCCEEDED(x) ((x) == 0)
 #define FAILED(x) ((x) != 0)
@@ -195,6 +206,49 @@ struct Context {
     } spare;
     std::vector<VkSemaphore> presentDone;
     bool wantVsync = true, swapVsync = true;
+    bool displayTiming = false;
+    PFN_vkGetRefreshCycleDurationGOOGLE refreshDuration{};
+    PFN_vkGetPastPresentationTimingGOOGLE pastPresentation{};
+    PresentCadence cadence;
+    uint32_t presentSequence = 0, refreshQueryCountdown = 0;
+    static uint64_t display_clock_ns() {
+#ifdef __APPLE__
+        // MoltenVK passes desiredPresentTime to Metal's presentAtTime. Apple's
+        // CACurrentMediaTime uses this mach_absolute_time epoch, in seconds.
+        static const mach_timebase_info_data_t scale = [] {
+            mach_timebase_info_data_t value;
+            mach_timebase_info(&value);
+            return value;
+        }();
+        const uint64_t ticks = mach_absolute_time();
+        return (ticks / scale.denom) * scale.numer + (ticks % scale.denom) * scale.numer / scale.denom;
+#else
+        timespec time{};
+        clock_gettime(CLOCK_MONOTONIC, &time);
+        return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
+#endif
+    }
+    uint64_t presentation_deadline() {
+        if (!displayTiming)
+            return 0;
+        if (!refreshQueryCountdown) {
+            VkRefreshCycleDurationGOOGLE duration{};
+            cadence.refresh(refreshDuration(device, swap, &duration) == VK_SUCCESS ? duration.refreshDuration : 0);
+            refreshQueryCountdown = 119;
+        } else
+            --refreshQueryCountdown;
+        // Nonblocking feedback: the extension returns only completed presents.
+        uint32_t count = 0;
+        if (pastPresentation(device, swap, &count, nullptr) == VK_SUCCESS && count) {
+            std::vector<VkPastPresentationTimingGOOGLE> times(std::min(count, 256u));
+            count = (uint32_t)times.size();
+            auto result = pastPresentation(device, swap, &count, times.data());
+            if (result == VK_SUCCESS || result == VK_INCOMPLETE)
+                for (uint32_t i = 0; i < count; ++i)
+                    cadence.observe(times[i].actualPresentTime);
+        }
+        return cadence.schedule(display_clock_ns(), wantVsync);
+    }
     VkPhysicalDeviceMemoryProperties memories{};
     std::unordered_map<std::string, VkPipeline> pipelines;
     Texture *dummy[4]{}, *rt{}, *ds{}, *resources[4]{};
@@ -799,6 +853,10 @@ inline bool Context::init(bool withWindow) {
         dext.push_back("VK_KHR_portability_subset");
     if (surface)
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    const char *timing = getenv("EOD_PRESENT_TIMING");
+    displayTiming = surface && has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && !(timing && *timing == '0');
+    if (displayTiming)
+        dext.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     float priority = 1;
     VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     q.queueFamilyIndex = family;
@@ -815,6 +873,15 @@ inline bool Context::init(bool withWindow) {
     d.ppEnabledExtensionNames = dext.data();
     require(vkCreateDevice(physical, &d, nullptr, &device), "device");
     vkGetDeviceQueue(device, family, 0, &queue);
+    if (displayTiming) {
+        refreshDuration = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
+            vkGetDeviceProcAddr(device, "vkGetRefreshCycleDurationGOOGLE"));
+        pastPresentation = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
+            vkGetDeviceProcAddr(device, "vkGetPastPresentationTimingGOOGLE"));
+        displayTiming = refreshDuration && pastPresentation;
+        if (displayTiming)
+            fprintf(stderr, "[vulkan] refresh-grid presentation timing enabled\n");
+    }
     push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
     if (!push)
         throw std::runtime_error("push descriptors unavailable");
@@ -870,6 +937,8 @@ inline bool Context::init(bool withWindow) {
     return true;
 }
 inline bool Context::resize() {
+    cadence = {};
+    refreshQueryCountdown = 0;
     submit();
     vkQueueWaitIdle(queue);
     for (auto sem : presentDone)
@@ -990,6 +1059,13 @@ inline void Context::present() {
     p.swapchainCount = 1;
     p.pSwapchains = &swap;
     p.pImageIndices = &backIndex;
+    VkPresentTimeGOOGLE time{++presentSequence, presentation_deadline()};
+    VkPresentTimesInfoGOOGLE timing{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+    if (displayTiming) {
+        timing.swapchainCount = 1;
+        timing.pTimes = &time;
+        p.pNext = &timing;
+    }
     auto r = vkQueuePresentKHR(queue, &p);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         resize();

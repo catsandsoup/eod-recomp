@@ -89,6 +89,11 @@ target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMA
 if(EOD_VULKAN)
   target_compile_definitions(eod PRIVATE EOD_VULKAN)
   target_link_libraries(eod PRIVATE Vulkan::Vulkan)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_executable(eod_present_timing_test tools/tests/present_timing_test.cpp)
+    add_test(NAME VulkanPresentTiming COMMAND eod_present_timing_test)
+  endif()
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
