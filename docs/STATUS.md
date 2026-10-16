@@ -63,9 +63,11 @@ from changing the game simulation rate. Mod implementation remains parked;
 All three component branches are merged locally into `macos`. Controller source
 includes the target SDK 2.8 sequenced DMA rumble route (`1325441`) as well as the
 RPC path, with producer-derived regression tests and independent code review.
-The combined native build passes six CTests: virtual input, pad RPC/DMA,
-ISO9660/import, headless Mac startup, relocated Vulkan path selection, and the
-deferred refresh-cadence policy.
+The combined native build passes eight CTests: virtual input, pad RPC/DMA,
+memory-card persistence across processes, ISO9660/import, headless Mac startup,
+relocated Vulkan path selection, offline audio volume, and the deferred
+refresh-cadence policy. Additional GS precision regressions are integrated and
+await the next combined build.
 
 The signed app contains static SDL, libusb, the Vulkan loader, MoltenVK and an
 app-relative ICD manifest. Linked dependency audit found no Homebrew absolute
@@ -82,7 +84,10 @@ A new nine-frame race capture from that run was replayed without competing
 builds: software 258.3 ms, Vulkan 1x 108.0 ms, Vulkan 5x 115.2 ms (12.8 ms/frame).
 At 1x the RGB MAE against software was 1.837/255, p95 channel difference 4,
 p99 11. Close visual agreement is demonstrated; bit-exact parity is not.
-The 5x screenshot is 3200×2240. Captures/logs stay in ignored `work/`.
+The 5x screenshot is 3200×2240. That live Vulkan capture predates the initial
+VRAM synchronization fix and may begin with stale GPU-owned pages; its metrics
+are diagnostic, not fidelity evidence. The original software-captured fixture
+avoids this limitation. Captures/logs stay in ignored `work/`.
 
 The original two-player script left idle P2 against a barrier; SELECT cannot
 reset an on-track car there. The current script makes both accelerate while
@@ -102,7 +107,7 @@ PS2SDK research. No wholesale renderer or recompiler migration is required.
 
 - Physical Rock Candy detection, trigger feel and motors (no controller was
   connected during automated diagnostics).
-- Native first-run/settings UI, resize/fullscreen and actual 120 Hz presentation.
+- Native first-run/settings UI and resize/fullscreen. High-refresh work is deferred.
   Automated runs deliberately opened no windows and played no sound.
 - Extended event-mode/career/save/audio parity. Intro decoding and transient
   loading dips remain distinct from the verified late-race rendering.
