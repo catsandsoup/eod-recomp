@@ -125,6 +125,24 @@ A proven constant-depth FB_ONLY optimization retains that exact corrected output
 with the original menu draw count; variable-depth race batching remains expensive.
 See `GS_ALPHA_ORDER.md` for the regression and performance limits.
 
+Race HUD artifacts, 2026-10-17. The thin dark vertical line at native x 574-575
+of each 2P viewport (and the dark last column at x 639) appeared only above
+RenderScale 1, in the Vulkan and D3D11 renderers alike. The game's full-target
+passes are 32-pixel sprites ending at 319.1/639.1; the GS fills the last scissor
+pixel, but upscaled rasterisation covered only the sub-pixels left of 319.1. The
+2P shadow pass clears its PSMCT16 stencil with Z=0 writes through a PSMZ16 Z
+buffer at the same address, and Z column 319 is colour column 287 (block
+arrangements differ), so stale stencil sub-pixels became the line. Sprites now
+fill whole native pixels at the scissor edges when upscaled
+(`runtime/gs/gs_sprite_edges.h`); 1x output is byte-identical.
+
+The dark semi-transparent band over the bottom 32 rows of each 2P viewport is
+the same pass at native resolution and matches the software (reference) GS: the
+2P stencil is 320x224, and the Z16 clear covers colour rows 0-191 and 224-255,
+never 192-223, which keep accumulated shadow counts. 1P (320x448, whole pages)
+has no band. It is the game's own command stream on the GS memory layout, so it
+is left as is; hiding it would be a deliberate deviation (an opt-in patch).
+
 The new 6x, 3840x2400 diagnostic MP run reached vblank 6600. Its last sample was
 59.9 vblanks/s, 59.5 game frames/s and 44.8 drawn frames/s, before the ordered-alpha
 fix. This is not full rendering speed. That run also exposed a normal-exit race:

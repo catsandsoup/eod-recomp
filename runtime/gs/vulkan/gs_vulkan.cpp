@@ -23,6 +23,7 @@
 #include "alpha_tiles.h"
 #include "alpha_range.h"
 #include "../gs_hw.h"
+#include "../gs_sprite_edges.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
 #include "../gs_swizzle.h"
@@ -1989,6 +1990,30 @@ inline HwVertex hv(const Env &e, const Vertex &v, uint32_t rgba) {
     return o;
 }
 
+// Upscaled sprites cover whole native pixels at the scissor edges
+// (gs_sprite_edges.h). false: no sliver is needed, draw the plain quad.
+bool push_sprite_slivers(const Env &e, const HwVertex &v0, const HwVertex &v1, const Vertex &a, const Vertex &b) {
+    SpriteSegment xs[3], ys[3];
+    const int nx = sprite_axis_segments(a.x, b.x, v0.s, v1.s, std::max(0, e.scx0),
+                                        std::min(e.scx1, g_state.rt->w - 1), g_scale, xs);
+    const int ny = sprite_axis_segments(a.y, b.y, v0.t, v1.t, std::max(0, e.scy0),
+                                        std::min(e.scy1, g_state.rt->h - 1), g_scale, ys);
+    if (nx == 1 && ny == 1) return false;
+    for (int j = 0; j < ny; j++)
+        for (int i = 0; i < nx; i++) {
+            HwVertex c[4];  // top left, top right, bottom left, bottom right
+            for (int k = 0; k < 4; k++) {
+                c[k] = v0;
+                c[k].x = (k & 1) ? xs[i].p1 : xs[i].p0;
+                c[k].s = (k & 1) ? xs[i].c1 : xs[i].c0;
+                c[k].y = (k & 2) ? ys[j].p1 : ys[j].p0;
+                c[k].t = (k & 2) ? ys[j].c1 : ys[j].c0;
+            }
+            for (int k : {0, 1, 2, 1, 3, 2}) g_verts.push_back(c[k]);
+        }
+    return true;
+}
+
 } // namespace
 
 // ================================================================ interface
@@ -2102,6 +2127,8 @@ void draw_sprite(const Env &e, const Vertex &a, const Vertex &b) {
     v0.fog = v1.fog;
     if (!e.fst)
         v0.q = v1.q;
+    if (push_sprite_slivers(e, v0, v1, a, b))
+        return;
     HwVertex v2 = v0, v3 = v0;
     v2.x = v1.x; // top right
     v2.s = v1.s;

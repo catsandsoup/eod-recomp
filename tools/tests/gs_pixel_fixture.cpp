@@ -158,6 +158,44 @@ int main(int argc, char **argv) {
         }
         sprite(6 | (textured ? (1<<4 | 1<<8) : 0),rgba(200,200,160,alpha),9,2);
         sprite(6 | (textured ? (1<<4 | 1<<8) : 0),rgba(50,50,40,alpha),9,1);
+    } else if (name == "edge_sliver") {
+        // Ends 1/8 pixel past the last scissor pixel's centre, like the game's
+        // full-target strips (..319.1): the GS fills column/row 63 completely.
+        reg(0, 6);
+        reg(1, rgba(200, 40, 40));
+        reg(5, xyz(8 * 16, 8 * 16));
+        reg(5, xyz(63 * 16 + 2, 63 * 16 + 2));
+    } else if (name == "zclear_relayout") {
+        // The game's 2P shadow pass clears its PSMCT16 stencil by writing Z=0
+        // through a PSMZ16 Z buffer at the same address (sprite to 319.1). The
+        // block arrangements differ: Z column 63 of a page is colour column 31.
+        for (int y = 0; y < 64; y++)
+            for (int x = 0; x < 64; x++) gs::write_pixel(gs::PSMCT16, x, y, 16 * 32, 1, 0x7FFF);
+        reg(0x47, 1ull << 16 | 1ull << 17);                // Z test ALWAYS
+        reg(0x4c, 20ull | 1ull << 16);                     // FRAME: page 20 CT32
+        reg(0x4e, 16ull | 2ull << 24);                     // ZBUF: page 16 PSMZ16, writes on
+        reg(0, 6);
+        reg(1, rgba(0, 0, 0));
+        reg(5, xyz(0, 0, 0));
+        reg(5, xyz(63 * 16 + 2, 63 * 16 + 2, 0));
+        // draw into it as PSMCT16 (the shadow volumes), then use it as a CT16
+        // texture in the displayed CT32 frame (the composite)
+        reg(0x4c, 16ull | 1ull << 16 | 2ull << 24);
+        reg(0x4e, 24ull | 1ull << 32);
+        reg(0, 6);
+        reg(1, rgba(0, 0, 0));
+        reg(5, xyz(0, 0, 0));
+        reg(5, xyz(16, 16, 0));
+        reg(0x4c, 1ull << 16);                             // FRAME: page 0 CT32
+        reg(0x4e, 24ull | 1ull << 32);
+        reg(0x06, 16ull * 32 | 1ull << 14 | 2ull << 20 | 6ull << 26 | 6ull << 30 | 1ull << 34 | 1ull << 35);
+        reg(0x14, 0);                                      // nearest
+        reg(0, 6 | 1 << 4 | 1 << 8);
+        reg(1, rgba(128, 128, 128));
+        reg(3, 0);
+        reg(5, xyz(0, 0, 0));
+        reg(3, 64 * 16 | uint64_t(64 * 16) << 16);
+        reg(5, xyz(64 * 16, 64 * 16, 0));
     } else if (name == "fog") {
         reg(0x3D, rgba(128, 128, 128, 0));
         reg(0x0A, 255ull << 56);
