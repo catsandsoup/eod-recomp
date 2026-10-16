@@ -355,6 +355,5 @@ int main(int argc, char **argv) {
     debug_watch_init();
 #endif
     kernel_run(entry);
-    platform_shutdown();
-    return 0;
+    app_exit(0);
 }
