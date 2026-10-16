@@ -142,8 +142,8 @@ The built-in ISO9660 reader supports plain ISO and raw Mode 1/2 BIN/CUE.
 Press **F1** or **Cmd+,** during play for native settings: video size,
 fullscreen, aspect, smoothing, frame skip, VSync, volume/audio, every keyboard
 binding, keyboard port, vibration, renderer and internal resolution, plus
-save/disc locations. Renderer, internal resolution, VSync, audio enable, frame skip, keyboard port
-and file locations take effect on next launch. The software renderer has no internal
+save/disc locations. Aspect ratio and camera projection, renderer, internal resolution, VSync, audio
+enable, frame skip, keyboard port and file locations take effect on next launch. The software renderer has no internal
 resolution scaling; Vulkan selection requires a build with that backend.
 
 Automation must set `EOD_HEADLESS=1 EOD_MUTE=1` and pass `--headless`.
@@ -333,3 +333,34 @@ cost improvement, not a proof of movie FPS, startup latency or full fidelity.
 The existing `game`/`drawn` FPS counters use a render-buffer-switch heuristic.
 Movies updating a fixed display buffer need not increment those counters, so
 those numbers must not be reported as decoded movie frame rates.
+
+## Display aspect and explicit output captures
+
+Native settings support 4:3, 16:9, 16:10 and Stretch. Aspect changes are saved
+for the next launch so composition and camera projection change together.
+The default remains 4:3. Window width/height are macOS logical points; a
+Retina drawable can contain more physical pixels. Internal scale 6 renders
+640×448 GS content at 3840×2688; it does not force a physical monitor into a
+3840×2160 or 3840×2400 output mode.
+
+Live presentation and explicit output captures share the same centered aspect
+rectangle. For example, 16:10 fills 3840×2400; on a 3024×1964 drawable it uses
+3024×1890 with 37-pixel top/bottom bars. This preserves a 16:10 rectangle rather
+than stretching into the extra display area.
+
+For developer verification, set **both** output dimensions in physical pixels:
+
+```sh
+EOD_HEADLESS=1 EOD_MUTE=1 EOD_SCREENSHOT_WIDTH=3840 EOD_SCREENSHOT_HEIGHT=2400 \
+  build-mac/eod --headless --config /path/16-10.ini --renderer vulkan \
+  --gs-replay /path/race2p.gsd --repeat 1
+```
+
+Use `[Video] AspectRatio=16:10` and `RenderScale=6` in that test config. The
+capture includes the aspect rectangle and black letterboxing at exactly the
+requested size. Each dimension must be 1–8192. Without these variables, the
+existing native-GS screenshot/`EOD_SCREENSHOT_SCALE` behavior is unchanged.
+Replay display configuration is initialized without opening SDL devices.
+CPU tests cover 4K/MBP rectangles, capture-size validation, startup aspect
+persistence after a later settings save, and 16:10 config round-trip. Actual
+GPU composition validation belongs to the combined camera/display build.

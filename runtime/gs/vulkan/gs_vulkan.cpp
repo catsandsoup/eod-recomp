@@ -17,6 +17,7 @@
 #include "../../core/config.h"
 #include "../../core/log.h"
 #include "../../platform/platform.h"
+#include "../../platform/screenshot_size.h"
 #include "../gs_hw.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
@@ -1892,7 +1893,7 @@ bool g_shot_wanted, g_shot_done;
 std::vector<uint32_t> g_shot;
 int g_shot_w, g_shot_h;
 
-// renders the last composition at the GS display size and reads it back
+// Reads back the native GS image, or an explicitly sized display composition.
 bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
     if (!g_have_last)
         return false;
@@ -1902,13 +1903,25 @@ bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
     int shot_scale = 1;
     if (const char *scale = getenv("EOD_SCREENSHOT_SCALE"))
         shot_scale = std::clamp(atoi(scale), 1, g_scale);
-    w = c.w * shot_scale;
-    h = c.h * shot_scale;
-    flush();
-    TempTex *t = temp_texture(c.w, c.h); // Covers the requested screenshot scale.
-    if (!t)
+    const ScreenshotSize size=screenshot_size(c.w,c.h,shot_scale,getenv("EOD_SCREENSHOT_WIDTH"),getenv("EOD_SCREENSHOT_HEIGHT"));
+    if (!size.valid) {
+        WARN("Vulkan screenshot: set both EOD_SCREENSHOT_WIDTH/HEIGHT to pixel dimensions from 1 to 8192");
         return false;
-    compose(t->rtv, t->w * g_scale, t->h * g_scale, 0, 0, w, h, shot_scale > 1);
+    }
+    w=size.width;h=size.height;
+    flush();
+    // TempTex dimensions are multiplied by internal scale. Round up only for
+    // an explicit output size so the copy region fits without upscaling the
+    // requested output dimensions a second time.
+    TempTex *t = size.composed ? temp_texture((w+g_scale-1)/g_scale,(h+g_scale-1)/g_scale) : temp_texture(c.w,c.h);
+    if (!t) return false;
+    int x=0,y=0,draw_w=w,draw_h=h;
+    if(size.composed) {
+        const float black[4]={0,0,0,1};
+        g_ctx->ClearRenderTargetView(t->rtv,black);
+        platform_display_rect(w,h,&x,&y,&draw_w,&draw_h);
+    }
+    compose(t->rtv,t->w*g_scale,t->h*g_scale,x,y,draw_w,draw_h,size.composed ? g_config.smooth_display : shot_scale>1);
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)w;
     td.Height = (UINT)h;
