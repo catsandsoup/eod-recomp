@@ -12,3 +12,5 @@
 # event instead of spinning.
 0035C460 idle     # frame loop: wait for the vblank counter to change
 0035C528 idle     # frame loop: wait for the draw-done state (1 or 7)
+
+0039AFB0 wrap     # movie bit-buffer consume/refill: exact RAM fast path, generated fallback
