@@ -13,7 +13,11 @@ enum PadKey {
 
 struct Config {
     // [Video]
+#ifdef EOD_VULKAN
+    std::string renderer = "vulkan";  // vulkan | software (builds with the Vulkan renderer)
+#else
     std::string renderer = "d3d11";  // d3d11 | software | warp (Direct3D 11 in software)
+#endif
     int adapter = 0;                 // DXGI adapter index
     bool fullscreen = false;         // borderless window covering the monitor
     int width = 1280, height = 960;  // window client size (windowed mode)
