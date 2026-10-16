@@ -115,6 +115,8 @@ bool config_load(const std::string &path, Config &c) {
         } else if (ieq(section, "Input")) {
             if (ieq(k, "KeyboardPort")) c.keyboard_port = num(0, 2);
             else if (ieq(k, "Vibration")) c.vibration = to_bool(v);
+            else if (ieq(k, "ControllerLayout") && (ieq(v, "original") || ieq(v, "modern")))
+                c.controller_layout = ieq(v, "modern") ? "modern" : "original";
             for (int i = 0; i < KEY_COUNT; i++)
                 if (ieq(k, kPadKeyNames[i])) c.keys[i] = v;
         } else if (ieq(section, "System")) {
@@ -148,6 +150,7 @@ bool config_save(const std::string &path, const Config &c) {
     for (int i = 0; i < KEY_COUNT; i++) fprintf(f, "%s=%s\n", kPadKeyNames[i], c.keys[i].c_str());
     fprintf(f, "KeyboardPort=%d\n", c.keyboard_port);
     fprintf(f, "Vibration=%d\n", c.vibration ? 1 : 0);
+    fprintf(f, "ControllerLayout=%s\n", c.controller_layout.c_str());
     fprintf(f, "\n[System]\n");
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
     fprintf(f, "DataPath=%s\n", c.data_dir.c_str());
