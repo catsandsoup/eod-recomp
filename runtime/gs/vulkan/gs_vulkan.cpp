@@ -229,6 +229,40 @@ bool g_vram_ok[kPages];   // a surface owns the page and gs::vram also holds its
                           // contents
 uint64_t g_frame_no;
 
+// Diagnostic-only, conservative GS block footprints. These never decide
+// ownership, synchronization, or whether a required readback is performed.
+uint32_t g_diag_draw_blocks[kPages]{};
+void block_dims(uint32_t psm, int &bw, int &bh, int &unit_bits);
+bool readback_trace_enabled() {
+    static const bool enabled = [] {
+        const char *v = getenv("EOD_GS_READBACK_TRACE");
+        return v && atoi(v) > 0;
+    }();
+    return enabled;
+}
+bool readback_trace_line() {
+    static uint64_t lines = 0;
+    static const uint64_t limit = [] {
+        const char *v = getenv("EOD_GS_READBACK_TRACE");
+        return uint64_t(v && atoi(v) > 1 ? std::min(atoi(v), 1000000) : 4096);
+    }();
+    return lines++ < limit;
+}
+template <class Fn>
+void diagnostic_blocks(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, Fn fn) {
+    int block_w, block_h, unit_bits;
+    block_dims(psm, block_w, block_h, unit_bits);
+    const SwizzleTab *tab = swizzle_table(psm, bw);
+    if (w <= 0 || h <= 0)
+        return;
+    const int x0 = x & ~(block_w - 1), y0 = y & ~(block_h - 1);
+    for (int py = y0; py < y + h; py += block_h)
+        for (int px = x0; px < x + w; px += block_w) {
+            uint32_t byte_address = uint32_t(uint64_t(tab->addr(bp, px, py)) * unit_bits / 8) % kVramSize;
+            fn(byte_address / 8192, 1u << ((byte_address / 256) % 32));
+        }
+}
+
 bool create_surface_texture(Surface *s) {
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)(s->w * g_scale);
@@ -887,6 +921,9 @@ void acquire(Surface *s, int x0, int y0, int x1, int y1) {
         g_owner[p.page] = s;
         g_vram_ok[p.page] = false; // about to be drawn: the CPU copy goes stale
     }
+    if (readback_trace_enabled())
+        diagnostic_blocks(s->bp,s->bw,s->psm,x0,y0,x1-x0,y1-y0,
+            [](uint32_t page,uint32_t mask){g_diag_draw_blocks[page] |= mask;});
 }
 
 Surface *get_surface(uint32_t bp, uint32_t bw, uint32_t psm, bool depth, int rows) {
@@ -1612,7 +1649,7 @@ bool start(bool with_window) {
         memset(g_owner, 0, sizeof g_owner);
         memset(g_vram_ok, 0, sizeof g_vram_ok);
         g_on = true;
-        LOG(LOG_GS, "vulkan: render scale %d%s", g_scale, with_window ? " FIFO presentation" : " offscreen");
+        LOG(LOG_GS, "vulkan: render scale %d%s", g_scale, with_window ? (g_dev->wantVsync ? " launch VSync on (FIFO)" : " launch VSync off (immediate/mailbox when available)") : " offscreen");
         return true;
     } catch (const std::exception &e) {
         WARN("vulkan: %s", e.what());
@@ -1693,6 +1730,12 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
     page_range(bp, bw, psm, x, y, w, h, first, count);
     for (uint32_t k = 0; k < count; k++) {
         uint32_t p = (first + k) % kPages;
+        if (readback_trace_enabled()) {
+            if(g_owner[p] && !g_vram_ok[p] && readback_trace_line())
+                fprintf(stderr,"[gs-readback] frame=%llu cpu-write-drops-owner request_bp=%x psm=%x rect=%d,%d,%d,%d page=%u owner_bp=%x owner_psm=%x drawn_blocks=%08x\n",
+                    (unsigned long long)g_frame_no,bp,psm,x,y,w,h,p,g_owner[p]->bp,g_owner[p]->psm,g_diag_draw_blocks[p]);
+            g_diag_draw_blocks[p]=0;
+        }
         // partial writes into rendered pages drop the rest of their GPU contents
         // (the game only does that with buffers it redraws anyway)
         g_owner[p] = nullptr;
@@ -1704,6 +1747,13 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     if (!g_on)
         return;
+    uint32_t requested_blocks[kPages];
+    const bool trace = readback_trace_enabled();
+    if (trace) {
+        std::fill_n(requested_blocks, kPages, 0);
+        diagnostic_blocks(bp, bw, psm, x, y, w, h,
+                          [&](uint32_t page, uint32_t mask) { requested_blocks[page] |= mask; });
+    }
     uint32_t first, count;
     page_range(bp, bw, psm, x, y, w, h, first, count);
     for (uint32_t k = 0; k < count; k++) {
@@ -1711,12 +1761,17 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
         Surface *o = g_owner[p];
         if (!o || g_vram_ok[p])
             continue;
+        if (trace && readback_trace_line())
+            fprintf(stderr,"[gs-readback] frame=%llu cpu-read reason=%d request_bp=%x psm=%x rect=%d,%d,%d,%d page=%u owner_bp=%x owner_psm=%x requested_blocks=%08x drawn_blocks=%08x overlap=%08x\n",
+                (unsigned long long)g_frame_no,g_rb_reason,bp,psm,x,y,w,h,p,o->bp,o->psm,
+                requested_blocks[p],g_diag_draw_blocks[p],requested_blocks[p]&g_diag_draw_blocks[p]);
         std::vector<PageRect> pages;
         surface_pages(o, o->h, pages);
         for (const PageRect &q : pages)
             if (q.page == p) {
                 readback_rect(o, q.x, q.y, q.w, q.h);
                 g_vram_ok[p] = true;
+                if (trace) g_diag_draw_blocks[p] = 0;
             }
         if (!g_vram_ok[p]) { // not part of the surface's rows (shouldn't happen):
                              // give up the page
@@ -2024,6 +2079,7 @@ void reset() {
     flush();
     memset(g_owner, 0, sizeof g_owner);
     memset(g_vram_ok, 0, sizeof g_vram_ok);
+    memset(g_diag_draw_blocks, 0, sizeof g_diag_draw_blocks);
     g_state_valid = false;
     for (TempTex &t : g_temp)
         t.src = nullptr;

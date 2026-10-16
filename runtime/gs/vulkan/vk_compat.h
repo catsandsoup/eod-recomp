@@ -205,7 +205,7 @@ struct Context {
         bool submitted = false;
     } spare;
     std::vector<VkSemaphore> presentDone;
-    bool wantVsync = true, swapVsync = true;
+    bool wantVsync = true; // snapshotted once from the launch configuration
     bool displayTiming = false;
     PFN_vkGetRefreshCycleDurationGOOGLE refreshDuration{};
     PFN_vkGetPastPresentationTimingGOOGLE pastPresentation{};
@@ -786,6 +786,7 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdDraw(cmd, count, 1, first, 0);
 }
 inline bool Context::init(bool withWindow) {
+    wantVsync = g_config.vsync;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "TDEODRecomp";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -1000,7 +1001,6 @@ inline bool Context::resize() {
                 break;
             }
     }
-    swapVsync = wantVsync;
     s.clipped = VK_TRUE;
     require(vkCreateSwapchainKHR(device, &s, nullptr, &swap), "swapchain");
     vkGetSwapchainImagesKHR(device, swap, &n, nullptr);
@@ -1027,13 +1027,17 @@ inline bool Context::resize() {
     }
     return true;
 }
-inline Texture *Context::acquire(bool vsync) {
-    wantVsync = vsync;
+inline Texture *Context::acquire(bool /*frameVsync*/) {
+    // gs.cpp may disable frame pacing transiently while catching up. A Vulkan
+    // present-mode change requires swapchain replacement and a queue drain:
+    // rebuilding on every late/on-time oscillation is more costly than the
+    // missed frame. Honor the user's launch VSync setting for this swapchain;
+    // frame skipping and the game's clock remain under the existing GS policy.
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     if (w <= 0 || h <= 0)
         return nullptr;
-    if (!swap || swapVsync != wantVsync || (uint32_t)w != extent.width || (uint32_t)h != extent.height)
+    if (!swap || (uint32_t)w != extent.width || (uint32_t)h != extent.height)
         if (!resize())
             return nullptr;
     auto r = vkAcquireNextImageKHR(device, swap, UINT64_MAX, acquired, VK_NULL_HANDLE, &backIndex);
