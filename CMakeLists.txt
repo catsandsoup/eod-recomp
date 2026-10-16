@@ -219,6 +219,11 @@ if(EOD_VULKAN)
           --generator $<TARGET_FILE:eod_gs_pixel_fixture> --scale ${alpha_scale}
           --work-dir ${CMAKE_BINARY_DIR}/gs-alpha-range-${alpha_scale}x)
         set_tests_properties(VulkanGSAlphaRange${alpha_scale}x PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME VulkanGSStateCache${alpha_scale}x COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_state_cache.py --eod $<TARGET_FILE:eod>
+          --generator $<TARGET_FILE:eod_gs_pixel_fixture> --scale ${alpha_scale}
+          --work-dir ${CMAKE_BINARY_DIR}/gs-state-cache-${alpha_scale}x)
+        set_tests_properties(VulkanGSStateCache${alpha_scale}x PROPERTIES SKIP_RETURN_CODE 77)
       endforeach()
     endif()
   endif()
