@@ -20,7 +20,8 @@ static HostPadState pads[2];
 void platform_get_pad(int p, HostPadState *s) { *s = pads[p]; }
 static int rumble_port = -1;
 static uint8_t small, large;
-void platform_set_vibration(int p, uint8_t s, uint8_t l) { rumble_port = p; small = s; large = l; }
+static int rumble_calls;
+void platform_set_vibration(int p, uint8_t s, uint8_t l) { rumble_port = p; small = s; large = l; rumble_calls++; }
 extern void iop_pad_vblank();
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -30,6 +31,7 @@ static void call(uint32_t cmd, int port, int slot, const uint8_t *payload = null
     memcpy(buf, words, sizeof words);
     if (payload) memcpy(buf + 12, payload, n);
     CHECK(handler(RpcCall{}, buf) == 128);
+    if (cmd == 7 || cmd == 8) { uint32_t result; memcpy(&result, buf + 0x14, 4); CHECK(result == 1); }
 }
 int main() {
     iop_pad_init();
@@ -54,8 +56,50 @@ int main() {
     CHECK(rumble_port == 1 && small == 1 && large == 173);
     call(7, 0, 1, motors, 6);  // absent multitap cannot vibrate a host pad
     CHECK(rumble_port == 1 && small == 1 && large == 173);
+    // SLUS_209.10's 0x00390678 (SDK 2.8) produces DMA, unlike current
+    // open-source PS2SDK's RPC implementation. At +0 sequence, +4 command=1,
+    // +8 length=6, +12 actuator bytes; 0x0038F878 increments the sequence and
+    // transfers 32 bytes to iop_buf + ((sequence & 1) * 32).
+    // Reconstruct that producer's packet rather than invoking SET_ACTDIR.
+    auto dma = [&](uint32_t sequence, uint32_t command, uint32_t length, uint8_t motor) {
+        uint8_t packet[32] = {};
+        uint32_t header[] = {sequence, command, length};
+        memcpy(packet, header, sizeof header);
+        packet[12] = motor; // alignment above maps slot 0 to large motor
+        memcpy(iop + 128 + (sequence & 1) * 32, packet, sizeof packet);
+    };
+    dma(1, 1, 6, 91);
+    iop_pad_vblank();
+    CHECK(rumble_port == 1 && small == 0 && large == 91);
+    // Both halves may change between vblanks. Consume only the newest.
+    dma(2, 1, 6, 120);
+    dma(3, 1, 6, 201);
+    iop_pad_vblank();
+    CHECK(large == 201);
+    int calls = rumble_calls;
+    iop_pad_vblank();
+    CHECK(rumble_calls == calls);
+    CHECK(large == 201); // stale other half must not overwrite newer state
+    dma(4, 1, 6, 0);
+    iop_pad_vblank();
+    CHECK(small == 0 && large == 0);
+    dma(5, 1, 7, 255); // invalid actuator length cannot command a motor
+    iop_pad_vblank();
+    CHECK(large == 0);
+    dma(6, 2, 6, 255); // unknown DMA operation
+    iop_pad_vblank();
+    CHECK(large == 0);
     call(0x0E, 1, 0);
     CHECK(rumble_port == 1 && small == 0 && large == 0);
+    // A new OPEN starts a fresh producer sequence and clears old DMA halves.
+    call(1, 1, 0, (uint8_t *)open, sizeof open);
+    calls = rumble_calls;
+    iop_pad_vblank();
+    CHECK(rumble_calls == calls && large == 0);
+    dma(1, 1, 6, 63);
+    iop_pad_vblank();
+    CHECK(large == 63);
+    call(0x0E, 1, 0);
     printf("pad RPC/EE pressure and actuator checks: %d failures\n", failures);
     return failures ? 1 : 0;
 }
