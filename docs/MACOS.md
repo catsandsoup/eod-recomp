@@ -376,3 +376,11 @@ when changing screens. Opposite steering keys cancel to center.
 Select **Original (PS2 keys)** to use the per-button key bindings instead;
 `[Input] KeyboardLayout=racing|original` persists this choice. Gamepad layout
 is a separate setting. Target-state evidence is in [KEYBOARD_CONTEXT.md](KEYBOARD_CONTEXT.md).
+
+Explicit wide aspect settings preserve original menu/title/movie art at 4:3.
+The native camera and display mode switch together only for the actual race
+loop; pause overlays inside that loop retain its aspect. Per-frame presentation
+is carried in GS queue order, including output captures. Matched 4:3/wide 3D
+scene comparisons are still required to validate horizontal field of view and
+object proportions. On macOS the GS queue defaults to at most two outstanding
+vblanks for lower input latency; `EOD_GS_LAG` remains a developer override.
