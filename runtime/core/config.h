@@ -40,6 +40,7 @@ struct Config {
     std::string keys[KEY_COUNT];
     int keyboard_port = 1;           // 0: disabled, 1 or 2: player port
     bool vibration = true;
+    std::string keyboard_layout = "racing"; // racing (context-aware WASD/arrows) | original (Key_* bindings)
     std::string controller_layout = "original"; // original | modern (RT Cross, LT Square pressure)
     // [System]
     std::string memcard_dir;  // empty: <game folder>/memcard
