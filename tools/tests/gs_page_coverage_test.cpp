@@ -4,16 +4,23 @@
 #include <cstdlib>
 #include <map>
 #include <random>
+#include <set>
 using namespace gs;
 static void check(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     const SwizzleTab *tab = swizzle_table(psm,bw);
     auto actual = hw::page_coverage(bp,bw,psm,x,y,w,h);
     std::array<uint32_t,kPages> expected{};
     int unit = psm==PSMCT16 || psm==PSMCT16S || psm==PSMZ16 || psm==PSMZ16S ? 16 : psm==PSMT8 ? 8 : psm==PSMT4 ? 4 : 32;
+    std::map<uint32_t,std::set<uint32_t>> written_units;
+    const bool whole = psm!=PSMCT24 && psm!=PSMZ24 && psm!=PSMT8H && psm!=PSMT4HL && psm!=PSMT4HH;
     for (int py=y;py<y+h;py++) for(int px=x;px<x+w;px++) {
         uint32_t byte=uint32_t(uint64_t(tab->addr(bp,px,py))*unit/8)%kVramSize;
         expected[byte/8192] |= 1u<<((byte/256)%32);
+        if(whole) written_units[byte/256].insert(tab->addr(bp,px,py) % (kVramSize*8/unit));
     }
+    for(uint32_t page=0;page<kPages;page++) for(unsigned block=0;block<32;block++)
+        if(actual.complete[page] & (1u<<block))
+            if(!whole || written_units[page*32+block].size()!=unsigned(256*8/unit))std::exit(8);
     std::array<bool,kPages> seen{};
     for(unsigned i=0;i<actual.count;i++) {
         if(seen[actual.pages[i]] || !actual.touched[actual.pages[i]])std::exit(6);
@@ -31,9 +38,9 @@ int main() {
     unsigned pages=0;for(auto mask:palette.touched)pages+=mask!=0;
     if(pages!=1 || palette.touched[(0x2fc4>>5)+1])return 2;
     auto full=hw::page_coverage(0,1,PSMCT32,0,0,64,32);
-    if(full.touched[0]!=0xffffffffu)return 3;
+    if(full.touched[0]!=0xffffffffu || full.complete[0]!=0xffffffffu)return 3;
     auto partial=hw::page_coverage(0,1,PSMCT32,0,0,1,1);
-    if(partial.touched[0]!=1)return 4;
+    if(partial.touched[0]!=1 || partial.complete[0])return 4;
     uint32_t first,count;
     page_range(0x2fc4,1,PSMCT32,0,0,16,16,first,count);
     if(count!=2)return 5; // The old conservative API remains unchanged for other callers.

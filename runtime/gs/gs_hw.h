@@ -29,7 +29,8 @@ void draw_sprite(const Env &e, const Vertex &a, const Vertex &b);
 void draw_line(const Env &e, const Vertex &a, const Vertex &b);
 void draw_point(const Env &e, const Vertex &a);
 
-// The CPU is about to write GS memory (host->local or local->local transfer).
+// The CPU is about to write these actual buffered pixels atomically. For a
+// host transfer this is each supplied chunk, not its declared TRXREG extent.
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 // The CPU is about to read GS memory there (transfer source, CLUT load):
 // rendered contents are copied back to gs::vram first.
