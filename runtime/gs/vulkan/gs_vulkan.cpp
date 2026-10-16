@@ -2634,6 +2634,13 @@ void stats_line(char *buf, size_t size) {
              (unsigned long long)g_dev->submit_count, (unsigned long long)g_dev->chunk_submits, g_dev->wait_us / 1000.0, g_dev->pipeline_us / 1000.0,
              g_dev->pipelines.size());
     used = strlen(buf);
+    if (g_dev->specializer) {
+        std::lock_guard<std::mutex> lock(g_dev->specializer->mutex);
+        snprintf(buf + used, size > used ? size - used : 0, "; specialized %llu in background (%.1f ms)",
+                 (unsigned long long)g_dev->specializer->compiled, g_dev->specializer->compile_us / 1000.0);
+        g_dev->specializer->compiled = g_dev->specializer->compile_us = 0;
+        used = strlen(buf);
+    }
     const uint64_t *e = g_dev->pass_ends;
     snprintf(buf + used, size > used ? size - used : 0,
              "; render passes %llu, ended by submit %llu upload %llu copy %llu clear %llu map %llu target %llu layout %llu",
