@@ -9,6 +9,7 @@
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
 0034D328 wrap     # display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it
 0018AFE0 wrap     # car setup: computes the damage multiplier (car+0x4B0) from the chassis mass - DamageScale
+0021ABF8 wrap     # car model loader: reads the LOD switch distances - EOD_CAR_LOD_MULTIPLIER
 
 # Busy-wait loops on memory set by interrupt handlers: sleep until the next
 # event instead of spinning.
