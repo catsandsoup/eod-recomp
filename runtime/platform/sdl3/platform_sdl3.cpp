@@ -3,13 +3,13 @@
 // posix/platform_posix.cpp.
 //
 // The window shows the software GS output through an SDL renderer (Metal on
-// macOS). Input has two player ports: the keyboard sits on EOD_KEYBOARD_PORT
-// (default port 0, "none" to disable) and game controllers fill the ports in
-// the order they are plugged in, hot-plug included. So "keyboard + pad" and
-// "two pads" both give two independent players. Xbox 360 wired pads (Rock
-// Candy and other third-party ones) have no driver on macOS; SDL reaches them
-// through its HIDAPI driver over libusb (brew install libusb), which is
-// enabled below.
+// macOS). Controllers and the two player ports are in sdl_input.cpp: the
+// keyboard sits on EOD_KEYBOARD_PORT (default player 1, "none" to disable)
+// and game controllers fill the ports in the order they are plugged in,
+// hot-plug included, so "keyboard + pad" and "two pads" both give two
+// independent players. Xbox 360 wired pads (Rock Candy and other third-party
+// ones) have no driver on macOS; SDL reaches them through its HIDAPI driver
+// over libusb, which needs the SDL3 built by EOD_BUNDLED_SDL.
 //
 // EOD_HEADLESS=1 (or --headless): no window and no audio device; frames are
 // kept for screenshots. EOD_MUTE=1: no audio device.
@@ -25,6 +25,7 @@
 #include "../../core/config.h"
 #include "../pad_script.h"
 #include "../platform.h"
+#include "sdl_input.h"
 
 namespace {
 
@@ -41,11 +42,7 @@ std::vector<uint32_t> g_last_frame;
 int g_last_w, g_last_h;
 
 // ---------------------------------------------------------------- input
-constexpr int kPorts = 2;
-int g_keyboard_port = 0;  // -1: keyboard not used as a pad
-// The controller on each port (0 = none). Kept in plug-in order.
-SDL_JoystickID g_port_pad[kPorts];
-SDL_Gamepad *g_port_gamepad[kPorts];
+using sdl_input::kPorts;
 
 struct KeyBind {
     SDL_Scancode sc;
@@ -126,84 +123,6 @@ void build_key_map() {
     }
 }
 
-const char *pad_name(SDL_JoystickID id) {
-    const char *n = SDL_GetGamepadNameForID(id);
-    return n ? n : "controller";
-}
-
-// A newly connected controller takes the first port that has neither the
-// keyboard nor another controller on it.
-void pad_added(SDL_JoystickID id) {
-    for (int p = 0; p < kPorts; p++)
-        if (g_port_pad[p] == id) return;
-    for (int p = 0; p < kPorts; p++) {
-        if (p == g_keyboard_port || g_port_pad[p]) continue;
-        SDL_Gamepad *gp = SDL_OpenGamepad(id);
-        if (!gp) {
-            fprintf(stderr, "[input] cannot open %s: %s\n", pad_name(id), SDL_GetError());
-            return;
-        }
-        g_port_pad[p] = id;
-        g_port_gamepad[p] = gp;
-        Uint16 vid = SDL_GetGamepadVendor(gp), pid = SDL_GetGamepadProduct(gp);
-        fprintf(stderr, "[input] player %d: %s (%04x:%04x)\n", p + 1, pad_name(id), vid, pid);
-        return;
-    }
-    fprintf(stderr, "[input] %s connected, but both player ports are taken\n", pad_name(id));
-}
-
-void pad_removed(SDL_JoystickID id) {
-    for (int p = 0; p < kPorts; p++)
-        if (g_port_pad[p] == id) {
-            SDL_CloseGamepad(g_port_gamepad[p]);
-            g_port_pad[p] = 0;
-            g_port_gamepad[p] = nullptr;
-            fprintf(stderr, "[input] player %d: controller removed\n", p + 1);
-        }
-}
-
-uint8_t axis_byte(Sint16 v) {
-    int a = (v + 32768) >> 8;
-    return (uint8_t)(a < 0 ? 0 : a > 255 ? 255 : a);
-}
-
-uint8_t trigger_byte(Sint16 v) {  // SDL triggers are 0..32767
-    int a = v >> 7;
-    return (uint8_t)(a < 0 ? 0 : a > 255 ? 255 : a);
-}
-
-void read_gamepad(SDL_Gamepad *gp, HostPadState *out) {
-    struct Map {
-        SDL_GamepadButton b;
-        uint16_t btn;
-    } map[] = {
-        {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_UP},         {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_DOWN},
-        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_LEFT},     {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_RIGHT},
-        {SDL_GAMEPAD_BUTTON_START, PAD_START},        {SDL_GAMEPAD_BUTTON_BACK, PAD_SELECT},
-        {SDL_GAMEPAD_BUTTON_LEFT_STICK, PAD_L3},      {SDL_GAMEPAD_BUTTON_RIGHT_STICK, PAD_R3},
-        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, PAD_L1},   {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_R1},
-        {SDL_GAMEPAD_BUTTON_SOUTH, PAD_CROSS},        {SDL_GAMEPAD_BUTTON_EAST, PAD_CIRCLE},
-        {SDL_GAMEPAD_BUTTON_WEST, PAD_SQUARE},        {SDL_GAMEPAD_BUTTON_NORTH, PAD_TRIANGLE},
-    };
-    out->connected = true;
-    for (const Map &m : map)
-        if (SDL_GetGamepadButton(gp, m.b)) out->buttons |= m.btn;
-    // Triggers are analog: L2/R2 pressure is the trigger travel (the game
-    // reads pressure for throttle and brake), the digital bit past 30/255.
-    uint8_t lt = trigger_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
-    uint8_t rt = trigger_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-    if (lt > 30) out->buttons |= PAD_L2;
-    if (rt > 30) out->buttons |= PAD_R2;
-    out->pressure[10] = lt;
-    out->pressure[11] = rt;
-    uint8_t lx = axis_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX));
-    uint8_t ly = axis_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY));
-    if (lx < 112 || lx > 144) out->lx = lx;  // dead zone, as the Win32 backend
-    if (ly < 112 || ly > 144) out->ly = ly;
-    out->rx = axis_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX));
-    out->ry = axis_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY));
-}
-
 void read_keyboard(HostPadState *out) {
     out->connected = true;
     if (g_headless) return;
@@ -223,16 +142,8 @@ bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
-    const char *kp = getenv("EOD_KEYBOARD_PORT");
-    if (kp) g_keyboard_port = !strcmp(kp, "none") ? -1 : atoi(kp) - (atoi(kp) >= 1 ? 1 : 0);
-    if (g_keyboard_port >= kPorts) g_keyboard_port = -1;
-
-    // Xbox 360 wired pads over libusb (no macOS driver), and the other
-    // HIDAPI drivers; SDL loads libusb at run time when it is installed.
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
-    SDL_SetHint(SDL_HINT_HIDAPI_LIBUSB, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX_360, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    sdl_input::set_keyboard_port(sdl_input::keyboard_port_from_env());
+    sdl_input::set_hints();
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
     if (!g_headless) flags |= SDL_INIT_VIDEO;
     if (!SDL_Init(flags)) {
@@ -259,19 +170,15 @@ bool platform_init(const PlatformConfig &cfg) {
         fprintf(stderr, "[video] SDL renderer: %s\n", SDL_GetRendererName(g_renderer));
     }
 
-    int n = 0;
-    SDL_JoystickID *ids = SDL_GetGamepads(&n);
-    for (int i = 0; i < n; i++) pad_added(ids[i]);
-    SDL_free(ids);
-    fprintf(stderr, "[input] keyboard: %s\n",
-            g_keyboard_port < 0 ? "off" : g_keyboard_port == 0 ? "player 1" : "player 2");
+    int kb = sdl_input::keyboard_port();
+    fprintf(stderr, "[input] keyboard: %s\n", kb < 0 ? "off" : kb == 0 ? "player 1" : "player 2");
+    sdl_input::assign_waiting();
     return true;
 }
 
 void platform_shutdown() {
     if (g_audio) SDL_DestroyAudioStream(g_audio);
-    for (int p = 0; p < kPorts; p++)
-        if (g_port_gamepad[p]) SDL_CloseGamepad(g_port_gamepad[p]);
+    sdl_input::close_all();
     if (g_texture) SDL_DestroyTexture(g_texture);
     if (g_renderer) SDL_DestroyRenderer(g_renderer);
     if (g_window) SDL_DestroyWindow(g_window);
@@ -289,10 +196,10 @@ bool platform_pump() {
         case SDL_EVENT_QUIT:
             return false;
         case SDL_EVENT_GAMEPAD_ADDED:
-            pad_added(e.gdevice.which);
+            sdl_input::on_added(e.gdevice.which);
             break;
         case SDL_EVENT_GAMEPAD_REMOVED:
-            pad_removed(e.gdevice.which);
+            sdl_input::on_removed(e.gdevice.which);
             break;
         case SDL_EVENT_KEY_DOWN:
             // Cmd+F / F11: toggle fullscreen
@@ -306,6 +213,7 @@ bool platform_pump() {
             break;
         }
     }
+    sdl_input::update_rumble();
     return true;
 }
 
@@ -375,21 +283,24 @@ void platform_set_status(const char *text) {
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     if (port < 0 || port >= kPorts) return;
-    if (port == g_keyboard_port) read_keyboard(out);
-    if (g_port_gamepad[port]) read_gamepad(g_port_gamepad[port], out);
+    if (port == sdl_input::keyboard_port()) read_keyboard(out);
+    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out);
     // EOD_PAD_SCRIPT / EOD_PAD_SCRIPT1 (automated tests) replace the port
-    if (pad_script_state(port, out)) return;
-    static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
-                                       PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
-    for (int i = 0; i < 12; i++)
-        if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
+    if (!pad_script_state(port, out)) {
+        static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
+                                           PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
+        for (int i = 0; i < 12; i++)
+            if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
+    }
+    if (sdl_input::log_enabled()) sdl_input::log_state(port, *out);
 }
 
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) {
-    if (port < 0 || port >= kPorts || !g_port_gamepad[port] || !g_config.vibration) return;
-    // the small motor is on/off on a DualShock 2
-    SDL_RumbleGamepad(g_port_gamepad[port], (Uint16)(large_motor * 257), small_motor ? 0xFFFF : 0, 200);
+    if (!g_config.vibration) small_motor = large_motor = 0;
+    sdl_input::rumble(port, small_motor, large_motor);
 }
+
+int platform_list_pads(int watch_seconds) { return sdl_input::list_pads(watch_seconds); }
 
 // ------------------------------------------------------------------ audio
 bool platform_audio_open(int sample_rate) {
