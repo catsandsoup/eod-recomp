@@ -19,6 +19,7 @@
 #endif
 
 #include "core/config.h"
+#include "platform/display_rect.h"
 #ifdef __APPLE__
 #include "app/macos_app.h"
 #include "app/macos_vulkan.h"
@@ -130,7 +131,7 @@ int main(int argc, char **argv) {
     cfg.width = g_config.width;
     cfg.height = g_config.height;
     cfg.fullscreen = g_config.fullscreen;
-    cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
+    cfg.aspect = display_aspect(g_config.aspect);
     cfg.smooth = g_config.smooth_display;
     if (!g_config.data_dir.empty()) data_dir = g_config.data_dir;
     const char *log_spec = getenv("EOD_LOG");
@@ -195,6 +196,7 @@ int main(int argc, char **argv) {
         if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32})) return 1;
     }
 #endif
+    platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.
     if (replay) return gs_replay(replay, repeat);
 
 #ifdef HAVE_SSE

@@ -23,9 +23,9 @@ struct Config {
     // vulkan | d3d11 | software | warp (Direct3D 11 in software)
     int adapter = 0;                 // DXGI adapter index
     bool fullscreen = false;         // borderless window covering the monitor
-    int width = 1280, height = 960;  // window client size (windowed mode)
+    int width = 1280, height = 960;  // window size (SDL logical points on macOS)
     bool vsync = true;
-    std::string aspect = "4:3";      // 4:3 | 16:9 | stretch
+    std::string aspect = "4:3";      // 4:3 | 16:9 | 16:10 | stretch
 #ifdef __APPLE__
     int render_scale = 0;  // auto: enough GS samples to cover the window pixel height
 #else

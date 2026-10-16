@@ -1,3 +1,4 @@
+#include "../display_rect.h"
 // platform_sdl3.cpp - window, audio and controllers through SDL3 (macOS;
 // also builds on Linux). Time, fibers, files and the ticker stay in
 // posix/platform_posix.cpp.
@@ -149,6 +150,8 @@ void read_keyboard(HostPadState *out) {
 
 }  // namespace
 
+void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
+
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
     const char *h = getenv("EOD_HEADLESS");
@@ -227,7 +230,7 @@ bool platform_pump() {
                 if (mac_app_settings()) {
                     build_key_map();
                     update_audio_gain();
-                    g_cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
+                    // Aspect and camera projection both change on the next launch.
                     g_cfg.smooth = g_config.smooth_display;
                     if (g_texture) SDL_SetTextureScaleMode(g_texture, g_cfg.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
                     SDL_SetWindowSize(g_window, g_config.width, g_config.height);
@@ -252,19 +255,8 @@ bool platform_pump() {
 }
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    int vw = cw, vh = ch;
-    if (g_cfg.aspect != 2) {  // 4:3 or 16:9, letterboxed
-        int an = g_cfg.aspect == 1 ? 16 : 4, ad = g_cfg.aspect == 1 ? 9 : 3;
-        vh = cw * ad / an;
-        if (vh > ch) {
-            vh = ch;
-            vw = ch * an / ad;
-        }
-    }
-    *x = (cw - vw) / 2;
-    *y = (ch - vh) / 2;
-    *w = vw;
-    *h = vh;
+    const DisplayRect rect=display_rect(g_cfg.aspect,cw,ch);
+    *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 
 void platform_present(const uint32_t *pixels, int width, int height, int stride) {
