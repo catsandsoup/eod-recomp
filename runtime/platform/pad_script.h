@@ -3,11 +3,13 @@
 //   EOD_PAD_SCRIPT  = port 0 (player 1)
 //   EOD_PAD_SCRIPT1 = port 1 (player 2)
 //
-// Each is "frame:buttons_hex[:lx:ly],frame:buttons_hex[:lx:ly],..." with
+// Each is "frame:buttons_hex[:lx:ly[:cross:square]],..." with
 // active-high PadButton bits and optional left stick bytes (0..255, 128 =
 // centre); each entry holds from its vblank on. Two scripts together drive
 // both player ports, which is how 2-player split screen is tested without
-// two physical pads.
+// two physical pads. Optional Cross/Square pressures are independent of the
+// digital mask and must be 0..255; omitted fields retain digital 0/255.
+// Invalid pressure fields reject that entry rather than wrapping the value.
 #pragma once
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +24,7 @@ struct PadScriptEntry {
     uint64_t frame;
     uint16_t buttons;
     uint8_t lx, ly;
+    int cross = -1, square = -1; // -1: derive pressure from the digital mask
 };
 
 // Fills out (buttons, left stick, pressure) from the port's script; false
@@ -50,7 +53,18 @@ inline bool pad_script_state(int port, HostPadState *out) {
                         e.lx = (uint8_t)strtoul(end + 1, &end, 10);
                         if (end && *end == ':') e.ly = (uint8_t)strtoul(end + 1, &end, 10);
                     }
-                    script[p].push_back(e);
+                    bool valid = true;
+                    auto pressure = [&](int &value) {
+                        const char *start = end + 1;
+                        long n = strtol(start, &end, 10);
+                        if (end == start || n < 0 || n > 255 || (*end && *end != ':')) return false;
+                        value = (int)n;
+                        return true;
+                    };
+                    if (end && *end == ':') valid = pressure(e.cross);
+                    if (valid && end && *end == ':') valid = pressure(e.square);
+                    if (end && *end == ':') valid = false; // no additional pressure fields
+                    if (valid) script[p].push_back(e);
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
@@ -71,6 +85,8 @@ inline bool pad_script_state(int port, HostPadState *out) {
                                        PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
     for (int i = 0; i < 12; i++)
         if (out->buttons & order[i]) out->pressure[i] = 255;
+    if (cur.cross >= 0) out->pressure[6] = (uint8_t)cur.cross;
+    if (cur.square >= 0) out->pressure[7] = (uint8_t)cur.square;
     return true;
 }
 
