@@ -28,3 +28,25 @@ Screenshots, offline audio dumps, protocol tests and process-restart tests are
 useful evidence; unit tests alone do not establish the complete player journey.
 No copyrighted disc/generated game data belongs in source or public downloads.
 All current builds are personal local builds.
+
+## Local multiplayer: translating the original prompt
+
+The Mac journey must explain the assigned device before showing “Press X for
+player 2.” Here X is PS2 Cross/Accept, not the Mac X key. The Racing keyboard's
+menu Accept is Enter; a pad's Accept is its bottom face button (Xbox A / PS ✕).
+Input is routed to one assigned player, not whichever join prompt is visible.
+
+1. Choose keyboard+pad, pad+keyboard or two pads before launching. Keyboard port
+   1 reserves P1, port 2 reserves P2, and 0 disables keyboard play. Restart after
+   changing assignment; pads fill the other available ports in connection order.
+2. P1 navigates ACTION → RACE → MULTI. At P2 join, P2 presses Accept on their
+   own device. Both players confirm their own car selections, then follow the
+   original event/track screens. SOLO uses SINGLE and needs no P2 device.
+3. If no P2 device exists, the journey must direct the player back to SINGLE
+   or explain connection/assignment. One keyboard cannot currently drive both
+   players. A raw PS2 prompt alone leaves Mac keyboard users at a dead end.
+
+README now gives the concrete mappings. Next UI work should surface equivalent
+device-aware Mac hints in-game and explain missing-controller states, including
+the case where the keyboard belongs to P1 and Enter therefore cannot join P2.
+Do not claim this prompt UX is finished because the scripted input test passes.
