@@ -7,6 +7,10 @@
 #include <ucontext.h>
 #endif
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -112,6 +116,12 @@ uint64_t platform_time_us() {
 }
 
 void platform_sleep_us(uint32_t us) { usleep(us); }
+
+void platform_thread_fast() {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
 
 int platform_core_count() { return platform_cpu_count(); }
 

@@ -314,6 +314,8 @@ void platform_sleep_us(uint32_t us) {
         Sleep(0);
 }
 
+void platform_thread_fast() {}
+
 // ------------------------------------------------------------------ input
 static inline bool key(int vk) { return g_keys[vk & 255]; }
 

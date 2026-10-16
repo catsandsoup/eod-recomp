@@ -197,6 +197,7 @@ int main(int argc, char **argv) {
     LOG(LOG_CORE, "game root: %s", root.c_str());
 
     if (!platform_init(cfg)) fatal("platform initialisation failed");
+    platform_thread_fast();  // the EE runs on this thread
     mem_init();
     cpu_init();
     hw_init();

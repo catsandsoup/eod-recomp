@@ -26,6 +26,7 @@ std::deque<std::function<void()>> &g_q = *new std::deque<std::function<void()>>;
 bool g_running;  // the worker is executing jobs taken from the queue (guarded by g_m)
 
 void worker() {
+    platform_thread_fast();
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-vu1");
 #endif
