@@ -742,7 +742,7 @@ int handle_syscall(int num) {
     case 0x04:  // Exit
         LOG(LOG_CORE, "Exit(%d)", (int)a0);
         if (a0) cpu_dump_state();
-        exit((int)a0);
+        app_exit((int)a0);
     case 0x06:  // LoadExecPS2
     case 0x07: {  // ExecPS2
         char name[256];
