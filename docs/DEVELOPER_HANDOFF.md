@@ -106,3 +106,19 @@ RENDERER_REFERENCES.md: pinned PCSX2, Road Trip/PS2Recomp/paraLLEl-GS, Play! and
 SDK references include applicability limits. Reuse proven approaches and verify
 against this game's actual outputs; another project's success is not correctness
 proof for this runtime.
+
+## Native alpha-outcome optimization — October 16 continuation
+
+`main` enables conservative whole-batch all-pass/all-fail alpha proofs by default;
+`EOD_ALPHA_RANGE=0` keeps the same-binary baseline. Cached decoded bounds include
+all active mips; rendered texture bounds remain unknown. Native retail replay
+median falls 230.4 to 184.3 ms (20.0%) across alternating 3×4 repetitions, with
+143,373 to 102,931 draw calls and exact off/on race/font images and complete VRAM
+at both 1x and 6x. All 39 CTests pass. Readbacks/submits remain 58/65; full speed
+and visible input latency are not established by these replay checks. See
+`docs/GS_ALPHA_ORDER.md` for proof, reuse source, fixtures and measurement scope.
+The candidate also reached 6,600 native 1x/4:3 two-player vblanks, exit 0 in
+110.23 s; race samples were 17.3–32.0 drawn/game FPS, final 20.2, GS 97–99% and
+EE waiting 56–75%. This remains below player acceptance; original-reference
+cadence, hands-on latency/physics/fidelity, solo acceptance and thin-line
+comparisons are still open. Full-loop evidence: `work/alpha-native-race/`.

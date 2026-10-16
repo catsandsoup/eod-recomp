@@ -100,5 +100,5 @@ All source above is now included in `main`. The default uses the conservative
 host preservation path. Complete-block GPU uploads require `EOD_GPU_UPLOADS=1`;
 `0` or unset keeps them off. The unified CTest suite explicitly tests both modes
 at 1x and 6x. Historical branch names above identify experiments only; developers
-do not need to merge or check out those branches. Alpha-range helpers remain
-CPU-tested building blocks with no production draw integration.
+do not need to merge or check out those branches. Alpha-range proofs are now integrated; see `docs/GS_ALPHA_ORDER.md` for measured
+all-pass/all-fail draw elimination and unchanged preservation read counts.

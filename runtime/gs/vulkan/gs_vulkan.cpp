@@ -21,6 +21,7 @@
 #include "../../platform/presentation.h"
 #include "alpha_order.h"
 #include "alpha_tiles.h"
+#include "alpha_range.h"
 #include "../gs_hw.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
@@ -434,6 +435,7 @@ struct DrawState {
     uint32_t blend_key;           // see blend_state()
     uint32_t depth_key;           // see depth_state()
     int scissor[4];
+    alpha_order::Range texture_alpha;
     bool two_pass; // alpha test with a fail mode that still writes something
     bool fb_only_alpha_failure; // candidate for exact constant-depth batching
     uint32_t fail_blend_key, fail_depth_key;
@@ -540,17 +542,33 @@ void flush() {
         return;
     std::vector<HwVertex> verts;
     verts.swap(g_verts); // (the passes below flush too)
-    const DrawState s = g_state;
+    DrawState s = g_state;
     // take the pages under the batch (not the whole scissor: buffers share memory
     // with textures)
     float mx0 = 1e9f, my0 = 1e9f, mx1 = -1e9f, my1 = -1e9f;
     uint32_t min_z=UINT32_MAX,max_z=0;
+    unsigned min_alpha=255,max_alpha=0;
     for (const HwVertex &v : verts) {
         mx0 = std::min(mx0, v.x);
         my0 = std::min(my0, v.y);
         mx1 = std::max(mx1, v.x);
         my1 = std::max(my1, v.y);
         min_z=std::min(min_z,v.z);max_z=std::max(max_z,v.z);
+        min_alpha=std::min(min_alpha,v.rgba>>24);max_alpha=std::max(max_alpha,v.rgba>>24);
+    }
+    static const bool alpha_range_enabled=std::getenv("EOD_ALPHA_RANGE") ? std::atoi(std::getenv("EOD_ALPHA_RANGE"))!=0 : true;
+    // PCSX2 CalcAlphaMinMax/TryAlphaTest: a uniform outcome needs only its
+    // original write state. Mixed ranges retain native pass/fail ordering.
+    if(s.two_pass && alpha_range_enabled) {
+        const auto source=alpha_order::source_alpha(alpha_order::vertex_range(min_alpha,max_alpha),
+            s.texture_alpha,s.cb.flags&1,s.cb.flags&4,(s.cb.flags>>16)&3);
+        const unsigned test=(s.cb.flags>>20)&7;
+        if(alpha_order::all_pass(test,s.cb.aref,source)) s.two_pass=false;
+        else if(alpha_order::all_fail(test,s.cb.aref,source)) {
+            s.two_pass=false;
+            s.blend_key=s.fail_blend_key;
+            s.depth_key=s.fail_depth_key;
+        }
     }
     int sc = g_scale;
     int bx0 = std::max((int)floorf(mx0) - 1, s.scissor[0] / sc),
@@ -1035,6 +1053,7 @@ struct TexObj {
     ID3D11Texture2D *tex = nullptr;
     ID3D11ShaderResourceView *srv = nullptr;
     uint32_t bytes = 0;
+    alpha_order::Range alpha;
     uint64_t last_use = 0;
 };
 std::unordered_map<uint64_t, TexObj> g_tex;
@@ -1130,7 +1149,7 @@ void decode_level(const Env &e, int lvl, int w, int h, std::vector<uint32_t> &ou
 
 int tex_levels(const Env &e) { return (e.mmin >= 2 && e.mxl > 0) ? std::min(e.mxl, 6) + 1 : 1; }
 
-ID3D11ShaderResourceView *vram_texture(const Env &e) {
+ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) {
     int levels = tex_levels(e);
     // description key: what identifies the texture apart from the memory contents
     uint64_t desc = mix64(0, e.tpsm | (e.tw << 8) | ((uint64_t)e.th << 20) | ((uint64_t)levels << 40));
@@ -1170,6 +1189,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
     if (it != g_tex.end()) {
         it->second.last_use = g_frame_no;
         g_stats.tex_hit++;
+        alpha=it->second.alpha;
         return it->second.srv;
     }
     // decode and upload
@@ -1185,9 +1205,14 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
     std::vector<std::vector<uint32_t>> data((size_t)levels);
     D3D11_SUBRESOURCE_DATA init[7];
     uint32_t bytes = 0;
+    alpha_order::Range decoded_alpha{255,0};
     for (int i = 0; i < levels; i++) {
         int w = std::max(1, (int)e.tw >> i), h = std::max(1, (int)e.th >> i);
         decode_level(e, i, w, h, data[(size_t)i]);
+        for(uint32_t pixel:data[(size_t)i]) {
+            decoded_alpha.low=std::min(decoded_alpha.low,pixel>>24);
+            decoded_alpha.high=std::max(decoded_alpha.high,pixel>>24);
+        }
         init[i].pSysMem = data[(size_t)i].data();
         init[i].SysMemPitch = (UINT)w * 4;
         init[i].SysMemSlicePitch = 0;
@@ -1197,6 +1222,8 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
     if (FAILED(CHECK(g_dev->CreateTexture2D(&td, init, &t.tex))))
         return nullptr;
     CHECK(g_dev->CreateShaderResourceView(t.tex, nullptr, &t.srv));
+    // Guard normalized filtering/conversion truncation at byte boundaries.
+    t.alpha=alpha=alpha_order::vertex_range(decoded_alpha.low,decoded_alpha.high);
     t.bytes = bytes;
     t.last_use = g_frame_no;
     g_tex_bytes += bytes;
@@ -1284,6 +1311,7 @@ void exact_pages(uint32_t bp, uint32_t bw, uint32_t psm, int w, int h, std::vect
 
 // texture source for the current env: SRV plus how to sample it
 struct TexSource {
+    alpha_order::Range alpha;
     ID3D11ShaderResourceView *srv = nullptr;
     float w = 1,
           h = 1;        // GS texels covered by the texture (for normalised coordinates)
@@ -1312,7 +1340,7 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (cpu_current) {
-        ts.srv = vram_texture(e);
+        ts.srv = vram_texture(e,ts.alpha);
         ts.w = (float)e.tw;
         ts.h = (float)e.th;
         return ts;
@@ -1363,7 +1391,7 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (!gpu) {
-        ts.srv = vram_texture(e);
+        ts.srv = vram_texture(e,ts.alpha);
         ts.w = (float)e.tw;
         ts.h = (float)e.th;
         return ts;
@@ -1428,7 +1456,7 @@ TexSource texture_for(const Env &e, Surface *target) {
         readback_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0, std::max(1, (int)e.tw >> i),
                        std::max(1, (int)e.th >> i));
     g_rb_reason = 0;
-    ts.srv = vram_texture(e);
+    ts.srv = vram_texture(e,ts.alpha);
     ts.w = (float)e.tw;
     ts.h = (float)e.th;
     return ts;
@@ -1469,6 +1497,7 @@ void build_state(const Env &e, int topology) {
     if (e.tme)
         tex = texture_for(e, s.rt);
 
+    s.texture_alpha=tex.alpha; // Assign after DrawState memset, including unknown 0..255.
     DrawCB &cb = s.cb;
     cb.vp_scale[0] = 2.0f / (float)s.rt->w;
     cb.vp_scale[1] = -2.0f / (float)s.rt->h;

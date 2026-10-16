@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
     gs::write_pixel(gs::PSMCT32, 1, 0, textureBP, 1, rgba(4, 24, 44));
     gs::write_pixel(gs::PSMCT32, 0, 1, textureBP, 1, rgba(8, 28, 48));
     gs::write_pixel(gs::PSMCT32, 1, 1, textureBP, 1, rgba(12, 32, 52));
-    std::vector<Pair> regs;
+    std::vector<Pair> regs, prelude;
     auto reg = [&](uint64_t id, uint64_t value) { regs.emplace_back(value, id); };
     auto sprite = [&](unsigned prim, uint64_t color, unsigned uv, unsigned z=1) {
         reg(0, prim);
@@ -111,6 +111,33 @@ int main(int argc, char **argv) {
         reg(0x42,0x44);
         sprite(6 | 1 << 6,rgba(200,200,160,128),0,name=="alpha_depth_varying" ? 2 : 1);
         sprite(6 | 1 << 6,rgba(50,50,40,128),0,1); // depth rejects this later rectangle
+    } else if (name == "alpha_range_rendered" || name == "alpha_range_fail_rgb" || name == "alpha_range_fail_zb" || name == "alpha_range_texture_fail" || name == "alpha_range_fail" || name == "alpha_range_flat" || name == "alpha_range_texture" || name == "alpha_range_mixed" || name == "alpha_range_mip") {
+        state.ctx[0].zbuf=4ull | 0xAull << 24;
+        state.ctx[0].test=1ull | 5ull << 1 | 96ull << 4 | 1ull << 12 | 1ull << 16 | 3ull << 17;
+        const bool textured=name=="alpha_range_rendered" || name=="alpha_range_texture" || name=="alpha_range_texture_fail" || name=="alpha_range_mixed" || name=="alpha_range_mip";
+        const bool failing=name=="alpha_range_fail" || name=="alpha_range_fail_rgb" || name=="alpha_range_fail_zb";
+        const unsigned alpha=failing ? 64 : 128;
+        if(name=="alpha_range_fail_rgb")state.ctx[0].test=(state.ctx[0].test&~(3ull<<12)) | 3ull<<12;
+        if(name=="alpha_range_fail_zb")state.ctx[0].test=(state.ctx[0].test&~(3ull<<12)) | 2ull<<12;
+        if(name=="alpha_range_texture_fail")
+            for(int y=0;y<2;y++)for(int x=0;x<2;x++)gs::write_pixel(gs::PSMCT32,x,y,textureBP,1,rgba(1,21,41,64));
+        if(name=="alpha_range_mixed") gs::write_pixel(gs::PSMCT32,0,0,textureBP,1,rgba(1,21,41,0));
+        if(name=="alpha_range_mip") {
+            // Base level passes; active second level fails. Bounds must include both.
+            state.ctx[0].tex1=1ull | 1ull<<2 | 2ull<<6;
+            state.ctx[0].miptbp1=256ull | 1ull<<14;
+            gs::write_pixel(gs::PSMCT32,0,0,256,1,rgba(1,21,41,0));
+        }
+        if(name=="alpha_range_rendered") {
+            // A GPU-owned source must keep unknown bounds, even if its old CPU
+            // copy was opaque. Use the same backing page later as the texture.
+            reg(0x47,0);reg(0x4e,1ull<<32);reg(0x4c,4ull | 1ull<<16);
+            sprite(6,rgba(20,40,60,0),0);
+            prelude.swap(regs); // A vblank below submits this target before sampling it.
+            reg(0x4c,state.ctx[0].frame);reg(0x4e,state.ctx[0].zbuf);reg(0x47,state.ctx[0].test);
+        }
+        sprite(6 | (textured ? (1<<4 | 1<<8) : 0),rgba(200,200,160,alpha),9,2);
+        sprite(6 | (textured ? (1<<4 | 1<<8) : 0),rgba(50,50,40,alpha),9,1);
     } else if (name == "fog") {
         reg(0x3D, rgba(128, 128, 128, 0));
         reg(0x0A, 255ull << 56);
@@ -130,6 +157,13 @@ int main(int argc, char **argv) {
     std::fwrite(paths, 1, sizeof paths, f);
     std::fwrite(&transfer, 1, sizeof transfer, f);
     std::fwrite(gs::vram, 1, gs::kVramSize, f);
+    if(!prelude.empty()) {
+        std::vector<Pair> packet;
+        packet.emplace_back(prelude.size() | 1ull<<15 | 1ull<<60,0xE);
+        packet.insert(packet.end(),prelude.begin(),prelude.end());
+        command(f,1,3,packet.data(),packet.size()*16);
+        command(f,3,1,nullptr,0);
+    }
     std::vector<Pair> gif;
     gif.emplace_back(regs.size() | 1ull << 15 | 1ull << 60, 0xE);
     gif.insert(gif.end(), regs.begin(), regs.end());

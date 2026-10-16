@@ -213,6 +213,13 @@ if(EOD_VULKAN)
         ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_pixels.py --eod $<TARGET_FILE:eod>
         --generator $<TARGET_FILE:eod_gs_pixel_fixture> --work-dir ${CMAKE_BINARY_DIR}/gs-pixel-test)
       set_tests_properties(VulkanGSPixels PROPERTIES SKIP_RETURN_CODE 77)
+      foreach(alpha_scale 1 6)
+        add_test(NAME VulkanGSAlphaRange${alpha_scale}x COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_alpha_range.py --eod $<TARGET_FILE:eod>
+          --generator $<TARGET_FILE:eod_gs_pixel_fixture> --scale ${alpha_scale}
+          --work-dir ${CMAKE_BINARY_DIR}/gs-alpha-range-${alpha_scale}x)
+        set_tests_properties(VulkanGSAlphaRange${alpha_scale}x PROPERTIES SKIP_RETURN_CODE 77)
+      endforeach()
     endif()
   endif()
 endif()

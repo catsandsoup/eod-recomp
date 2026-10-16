@@ -22,4 +22,8 @@ inline bool all_pass(unsigned test,unsigned ref,Range a) {
     default:return ref<a.low || ref>a.high;
     }
 }
+inline bool all_fail(unsigned test,unsigned ref,Range a) {
+    constexpr unsigned inverse[8]={1,0,5,6,7,2,3,4};
+    return all_pass(inverse[test&7],ref,a);
+}
 }
