@@ -46,7 +46,11 @@ Input is routed to one assigned player, not whichever join prompt is visible.
    or explain connection/assignment. One keyboard cannot currently drive both
    players. A raw PS2 prompt alone leaves Mac keyboard users at a dead end.
 
-README now gives the concrete mappings. Next UI work should surface equivalent
-device-aware Mac hints in-game and explain missing-controller states, including
-the case where the keyboard belongs to P1 and Enter therefore cannot join P2.
-Do not claim this prompt UX is finished because the scripted input test passes.
+README gives the concrete mappings. F2 now opens Controls and player 2 during
+play, listing the live SDL assignments, bottom face button labels and the
+keyboard's actual Accept binding. An empty P2 port explains connecting a pad,
+keyboard reassignment/restart and SINGLE, including why P1 Enter cannot join P2.
+Reopen F2 after hot-plugging to refresh. Menu window titles and Settings mention
+F2. Virtual-controller checks cover those assignments and unplugging, but the
+native dialog still needs a hands-on visual check. Automatic context-sensitive
+replacement of PS2 artwork remains unfinished.

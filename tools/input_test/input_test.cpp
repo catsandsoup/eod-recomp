@@ -144,6 +144,10 @@ void test_rock_candy_with_keyboard() {
           (int)SDL_GetGamepadTypeForID(rc.id));
     CHECK(sdl_input::port_of(rc.id) == 1, "keyboard + pad: pad is player 2 (port %d)", sdl_input::port_of(rc.id));
     CHECK(!sdl_input::port_gamepad(0), "keyboard port has no pad");
+    auto help = sdl_input::help_text(true, "X,Space");
+    CHECK(help.find("Player 1: Keyboard - Enter") != std::string::npos, "help identifies the keyboard's actual port");
+    CHECK(help.find("Player 2: PDP Xbox 360 Rock Candy - bottom face button (A)") != std::string::npos,
+          "help identifies the assigned P2 controller and physical Accept button");
 
     // at rest
     set_axis(rc, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, kTriggerRest);
@@ -267,6 +271,11 @@ void test_rock_candy_with_keyboard() {
     CHECK(!sdl_input::port_gamepad(1), "player 2 empty after unplug");
     HostPadState gone = read_port(1);
     CHECK(!gone.connected, "empty port reads disconnected (keyboard is on player 1)");
+    help = sdl_input::help_text(true, "X,Space");
+    CHECK(help.find("Player 2: No device") != std::string::npos && help.find("SINGLE") != std::string::npos,
+          "unplugged P2 has actionable single-player guidance");
+    CHECK(help.find("Enter belongs to player 1") != std::string::npos,
+          "P1 Enter cannot join the now empty P2 port");
     // re-plugging gets player 2 back
     attach(rc, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     CHECK(sdl_input::port_of(rc.id) == 1, "re-plugged pad is player 2 again (port %d)", sdl_input::port_of(rc.id));
@@ -285,6 +294,10 @@ void test_two_pads_no_keyboard() {
     attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     attach(b, 0x045E, 0x028E, "Xbox 360 Controller");
     CHECK(sdl_input::port_of(a.id) == 0 && sdl_input::port_of(b.id) == 1, "no keyboard: pads are P1, P2 in plug order");
+    auto help = sdl_input::help_text(true, "X,Space");
+    CHECK(help.find("Player 1: PDP Xbox 360 Rock Candy") != std::string::npos &&
+          help.find("Player 2: Xbox 360 Controller") != std::string::npos &&
+          help.find("Keyboard - Enter") == std::string::npos, "two-pad help follows plug order with keyboard off");
     detach(a);
     CHECK(sdl_input::port_of(b.id) == 1, "P2 stays P2 when P1 unplugs");
     attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
@@ -299,6 +312,12 @@ void test_keyboard_on_player_2() {
     Pad a;
     attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     CHECK(sdl_input::port_of(a.id) == 0, "EOD_KEYBOARD_PORT=2: pad is player 1");
+    CHECK(sdl_input::help_text(true, "X,Space").find("Player 2: Keyboard - Enter") != std::string::npos,
+          "P2 keyboard joins with Enter");
+    auto original = sdl_input::help_text(false, "Z,C");
+    CHECK(original.find("Player 2: Keyboard - Z,C") != std::string::npos &&
+          original.find("Keyboard - Enter") == std::string::npos,
+          "Original preset help respects custom Cross bindings");
     detach(a);
     sdl_input::close_all();
 }

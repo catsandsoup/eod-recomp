@@ -86,7 +86,12 @@ For two controllers in plug order, set **Keyboard port** to **0** and restart.
 
 The original game's **“Press X for player 2”** means **PS2 Cross (✕)**, its
 Accept button. It does **not** mean the letter X on a Mac keyboard. The game
-still shows PS2 button artwork; Mac-specific in-game prompts remain unfinished.
+still shows PS2 button artwork. Press **F2** during play for **Controls and
+player 2**: it lists the currently assigned devices and each player's menu
+Accept button, including custom Original keyboard bindings. Reopen it after
+connecting or unplugging a pad to refresh the assignments. Menu window titles
+and Settings also point to F2; automatic replacement of PS2 artwork remains
+unfinished.
 
 | Your setup | Settings before launch | What player two presses |
 | --- | --- | --- |

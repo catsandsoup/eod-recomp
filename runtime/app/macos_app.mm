@@ -77,7 +77,7 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
 bool mac_app_settings() {
     [NSApplication sharedApplication];
     NSAlert *a = [NSAlert new]; a.messageText = @"Settings";
-    a.informativeText = @"Window size, fullscreen, smoothing, volume and key bindings apply now. Aspect ratio, camera projection and other changes apply on the next launch. PS2 key fields below apply only to the Original keyboard preset. Multiple keys may be separated by commas.";
+    a.informativeText = @"Press F2 during play for Controls and player 2 help, including current device assignments. Window size, fullscreen, smoothing, volume and key bindings apply now. Aspect ratio, camera projection and other changes apply on the next launch. PS2 key fields below apply only to the Original keyboard preset. Multiple keys may be separated by commas.";
     [a addButtonWithTitle:@"Save"]; [a addButtonWithTitle:@"Cancel"];
     struct Field { std::string label; std::string value; };
     std::vector<Field> fields = {
