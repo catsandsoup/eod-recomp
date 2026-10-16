@@ -96,3 +96,26 @@ to verified player acceptance.
 - **Action:** changes actually made, source checkpoint and validation performed.
 - **Result:** measured outcomes against acceptance; explicitly state unmet
   criteria, uncertainties and the next decisive test. Keep proposed work separate.
+
+## Existing renderer reuse spike — completed scope, unmet player outcome
+
+**Situation/task:** native carnage still misses full-speed player acceptance.
+Test the existing Road Trip paraLLEl-GS wheel against real EOD traffic before
+considering a large live-backend change.
+
+**Action:** added a default-off, bounded capture before the first queued GS
+command; extended the existing independent scratch oracle to all four command
+kinds from pristine initialization. Reused Road Trip's explicit NTSC CRTC fields
+only after observing the actual SetGsCrt call and checking official PS2SDK.
+
+**Result:** real boot/movie/title traffic executes on M2 Pro and produces
+inspectable native images; tiny fixture/early boot and movie VRAM match Vulkan.
+The completed title prefix does not establish parity: its images and full VRAM
+differ from both EOD software and Vulkan. PGS's warm prefix took 951.6 ms versus
+Vulkan 781.4 ms, with different scanout work, so there is no speedup claim.
+Release rebuild and 41 CTests pass. The installed player renderer retains the
+two earlier verified performance changes. Full race speed, reference fidelity
+and visible latency remain open. Next success is a bounded compressed/streaming
+clean-start race replay, traced image differences and matched warmed native
+race timing before live integration. Detailed evidence and limits:
+`GS_COLD_PACKET_REPLAY.md`.
