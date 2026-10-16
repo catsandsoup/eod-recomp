@@ -2,8 +2,8 @@
 //
 // Voices play 4-bit ADPCM ("VAG") from the 2MB sound RAM with pitch,
 // ADSR envelope and volume; the AutoDMA input plays 16-bit PCM streamed
-// from IOP memory by block transfers (interleaved 0x100 bytes left /
-// 0x100 bytes right), raising a transfer interrupt every half buffer.
+// from IOP memory by block transfers (interleaved 0x200 bytes left /
+// 0x200 bytes right), raising a transfer interrupt every half buffer.
 // Audio is produced at 48kHz in step with the wall clock.
 #include "spu2.h"
 
@@ -16,6 +16,7 @@
 #include "../core/config.h"
 #include "../core/timing_trace.h"
 #include "../platform/platform.h"
+#include "../core/prof.h"
 
 namespace {
 
@@ -94,6 +95,12 @@ struct BlockTrans {
     bool active = false, loop = false;
     uint32_t base = 0, size = 0;  // IOP memory buffer
     uint32_t pos = 0;             // stereo samples played
+    // streaming (the buffer is refilled while it plays): the 1KB blocks
+    // written since they were last played; a block the game didn't refill in
+    // time is played as silence rather than as the previous lap's sound
+    bool streaming = false;
+    std::vector<uint8_t> fresh;
+    bool mute = false;  // the current block wasn't refilled
 };
 
 struct Core {
@@ -229,11 +236,17 @@ void adma_sample(Core &c, int ch, int &l, int &r) {
     l = r = 0;
     if (!t.active || t.size < 1024) return;
     uint32_t total = t.size / 4;  // stereo samples in the buffer
-    uint32_t blk = t.pos / 128, i = t.pos % 128;
-    uint32_t a = t.base + blk * 512 + i * 2;
-    if (a + 258 <= IOP_RAM_SIZE) {
+    // blocks of 256 left samples followed by 256 right samples
+    uint32_t blk = t.pos / 256, i = t.pos % 256;
+    uint32_t a = t.base + blk * 1024 + i * 2;
+    if (i == 0 && blk < t.fresh.size()) {
+        t.mute = t.streaming && !t.fresh[blk];
+        if (t.mute) LOG(LOG_SND, "spu2: stream block %u not refilled in time", blk);
+        t.fresh[blk] = 0;
+    }
+    if (!t.mute && a + 514 <= IOP_RAM_SIZE) {
         l = (int16_t)(g_iop_ram[a] | (g_iop_ram[a + 1] << 8));
-        r = (int16_t)(g_iop_ram[a + 256] | (g_iop_ram[a + 257] << 8));
+        r = (int16_t)(g_iop_ram[a + 512] | (g_iop_ram[a + 513] << 8));
     }
     t.pos++;
     if (t.pos == total / 2 || t.pos >= total) {
@@ -464,19 +477,34 @@ int spu2_block_trans(int channel, int mode, uint32_t iop_addr, uint32_t size, ui
     t.base = iop_addr;
     t.size = size & ~1023u;
     t.pos = 0;
-    if (op == 3 && start >= iop_addr && start < iop_addr + size) t.pos = (start - iop_addr) / 512 * 128;
+    t.streaming = false;
+    t.mute = false;
+    t.fresh.assign(t.size / 1024, 1);  // (filled before the transfer starts)
+    if (op == 3 && start >= iop_addr && start < iop_addr + size) t.pos = (start - iop_addr) / 1024 * 256;
     LOG(LOG_SND, "spu2: block transfer ch%d iop %06x size %x%s", channel, iop_addr, size, t.loop ? " loop" : "");
     return 0;
+}
+
+void spu2_iop_written(uint32_t addr, uint32_t size) {
+    for (Core &c : g_core) {
+        BlockTrans &t = c.adma;
+        if (!t.active || addr + size <= t.base || addr >= t.base + t.size) continue;
+        t.streaming = true;
+        uint32_t first = addr > t.base ? (addr - t.base) / 1024 : 0;
+        uint32_t last = std::min(addr + size - t.base, t.size) - 1;
+        for (uint32_t b = first; b <= last / 1024 && b < t.fresh.size(); b++) t.fresh[b] = 1;
+    }
 }
 
 uint32_t spu2_block_trans_status(int channel) {
     BlockTrans &t = g_core[channel & 1].adma;
     if (!t.active) return 0;
     uint32_t half = t.pos >= t.size / 8 ? 1 : 0;
-    return (half << 24) | ((t.base + t.pos / 128 * 512) & 0xFFFFFF);
+    return (half << 24) | ((t.base + t.pos / 256 * 1024) & 0xFFFFFF);
 }
 
 void spu2_update() {
+    ProfScope prof(P_EE_SOUND);
     uint64_t now = platform_time_us();
     const bool timing_trace = eod_timing::enabled();
     if (timing_trace) eod_timing::audio_call(now);
@@ -503,7 +531,13 @@ void spu2_update() {
         int v = g_config.volume * 256 / 100;
         for (int16_t &x : buf) x = (int16_t)((x * v) >> 8);
     }
-    const bool submit = g_audio_open && platform_audio_queued_frames() < kRate / 5;
+    // (Sound can be switched on and off in the in-game menu)
+    static bool tried = g_audio_open;
+    if (!g_audio_open && !tried && g_config.audio) {
+        tried = true;
+        g_audio_open = platform_audio_open(kRate);
+    }
+    const bool submit = g_audio_open && g_config.audio && platform_audio_queued_frames() < kRate / 5;
     if (submit) platform_audio_submit(buf.data(), frames);
     if (timing_trace) {
         auto &s = eod_timing::state();

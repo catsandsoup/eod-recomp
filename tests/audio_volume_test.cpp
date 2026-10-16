@@ -40,10 +40,11 @@ int main() {
     setenv("EOD_TIMING_TRACE","1",1);
     // SDL streams run offline; no SDL audio subsystem or device is started.
     std::vector<uint8_t> ram(IOP_RAM_SIZE,0); g_iop_ram=ram.data();
-    for (int block=0;block<2;block++) for (int i=0;i<128;i++) {
+    // AutoDMA layout (upstream 1.0): 0x200 bytes of left samples, then 0x200 of right
+    for (int i=0;i<256;i++) {
         int16_t left=12000,right=-12000;
-        memcpy(g_iop_ram+block*512+i*2,&left,2);
-        memcpy(g_iop_ram+block*512+256+i*2,&right,2);
+        memcpy(g_iop_ram+i*2,&left,2);
+        memcpy(g_iop_ram+512+i*2,&right,2);
     }
     int full=render(100),half=render(50),zero=render(0);
     printf("offline SPU2/SDL output amplitudes: 100%%=%d 50%%=%d 0%%=%d\n",full,half,zero);

@@ -28,6 +28,11 @@ SSEC_INLINE __m128 _mm_set1_ps(float f) { return vdupq_n_f32(f); }
 SSEC_INLINE __m128i _mm_set1_epi32(int v) { return vdupq_n_s32(v); }
 SSEC_INLINE __m128i _mm_set1_epi16(short v) { return vreinterpretq_s32_s16(vdupq_n_s16(v)); }
 SSEC_INLINE __m128i _mm_setzero_si128(void) { return vdupq_n_s32(0); }
+SSEC_INLINE __m128 _mm_setzero_ps(void) { return vdupq_n_f32(0.0f); }
+SSEC_INLINE __m128i _mm_setr_epi32(int a, int b, int c, int d) {
+    const int32_t v[4] = {a, b, c, d};
+    return vld1q_s32(v);
+}
 SSEC_INLINE __m128i _mm_cvtsi32_si128(int v) { return vsetq_lane_s32(v, vdupq_n_s32(0), 0); }
 SSEC_INLINE int _mm_cvtsi128_si32(__m128i v) { return vgetq_lane_s32(v, 0); }
 
@@ -47,10 +52,18 @@ SSEC_INLINE __m128 _mm_and_ps(__m128 a, __m128 b) { return SSEC_F(vandq_u32(SSEC
 SSEC_INLINE __m128 _mm_or_ps(__m128 a, __m128 b) { return SSEC_F(vorrq_u32(SSEC_U(a), SSEC_U(b))); }
 SSEC_INLINE __m128 _mm_andnot_ps(__m128 a, __m128 b) { return SSEC_F(vbicq_u32(SSEC_U(b), SSEC_U(a))); }
 SSEC_INLINE __m128i _mm_xor_si128(__m128i a, __m128i b) { return veorq_s32(a, b); }
+SSEC_INLINE __m128i _mm_and_si128(__m128i a, __m128i b) { return vandq_s32(a, b); }
+// lanes 0-1 from a, 2-3 from b, each picked by two bits of imm (a constant)
+#define _mm_shuffle_ps(a, b, imm) \
+    ((__m128)__builtin_shufflevector((__m128)(a), (__m128)(b), (imm) & 3, ((imm) >> 2) & 3, \
+                                     (((imm) >> 4) & 3) + 4, (((imm) >> 6) & 3) + 4))
 
 // ---- compares (all-ones lanes), movemask
 SSEC_INLINE __m128 _mm_cmpeq_ps(__m128 a, __m128 b) { return SSEC_F(vceqq_f32(a, b)); }
 SSEC_INLINE __m128 _mm_cmpge_ps(__m128 a, __m128 b) { return SSEC_F(vcgeq_f32(a, b)); }
+SSEC_INLINE __m128 _mm_cmpgt_ps(__m128 a, __m128 b) { return SSEC_F(vcgtq_f32(a, b)); }
+SSEC_INLINE __m128 _mm_cmplt_ps(__m128 a, __m128 b) { return SSEC_F(vcltq_f32(a, b)); }
+SSEC_INLINE __m128i _mm_cmpeq_epi32(__m128i a, __m128i b) { return vreinterpretq_s32_u32(vceqq_s32(a, b)); }
 SSEC_INLINE int _mm_movemask_ps(__m128 v) {
     uint32x4_t s = vshrq_n_u32(SSEC_U(v), 31);
     return (int)(vgetq_lane_u32(s, 0) | (vgetq_lane_u32(s, 1) << 1) |

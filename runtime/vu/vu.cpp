@@ -5,6 +5,7 @@
 // instruction, Q/P results become visible after their latency, branches
 // have a delay slot and the E bit ends the program after the next pair.
 #include "vu.h"
+#include "../core/prof.h"
 
 #include "sse_compat.h"
 
@@ -13,6 +14,11 @@
 #include <initializer_list>
 #include <set>
 #include <utility>
+#include <algorithm>
+#include <map>
+#include <string>
+#include <chrono>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 
@@ -124,7 +130,7 @@ void set_status_from_mac(VUState *vu, uint32_t mac) {
 }
 
 // Flag results in flight (micro mode): visible 4 cycles after issue.
-inline void flag_apply(VUState *vu, const VUFlagUpd &u) {
+__attribute__((always_inline)) inline void flag_apply(VUState *vu, const VUFlagUpd &u) {
     if (u.kind == 0) {
         vu->mac = u.val;
         set_status_from_mac(vu, u.val);
@@ -517,7 +523,7 @@ inline void set_vi(VUState *vu, int r, uint32_t v) {
 
 inline int16_t vis(VUState *vu, int r) { return (int16_t)vu->vi[r]; }
 
-void sync_pipes(VUState *vu) {
+__attribute__((always_inline)) inline void sync_pipes(VUState *vu) {
     if (vu->q_busy && vu->cycle >= vu->q_ready) {
         vu->q = vu->q_pending;
         vu->q_busy = 0;
@@ -564,9 +570,10 @@ void flush_p(VUState *vu) {
     }
 }
 
-void lower_div(VUState *vu, uint32_t ins, int kind) {
-    int fsf = (ins >> 21) & 3, ftf = (ins >> 23) & 3;
-    float fs = vu_clamp(vu->vf[FS(ins)].f[fsf]), ft = vu_clamp(vu->vf[FT(ins)].f[ftf]);
+// DIV / SQRT / RSQRT on the selected fields' values
+void lower_div_f(VUState *vu, int kind, float fs, float ft) {
+    fs = vu_clamp(fs);
+    ft = vu_clamp(ft);
     float r;
     vu->status &= ~0x30u;
     if (kind == 0) {  // DIV
@@ -594,6 +601,11 @@ void lower_div(VUState *vu, uint32_t ins, int kind) {
         q_pipeline_set(vu, r, 13);
     }
     vu->status |= (vu->status & 0x30) << 6;
+}
+
+void lower_div(VUState *vu, uint32_t ins, int kind) {
+    int fsf = (ins >> 21) & 3, ftf = (ins >> 23) & 3;
+    lower_div_f(vu, kind, vu->vf[FS(ins)].f[fsf], vu->vf[FT(ins)].f[ftf]);
 }
 
 bool g_vu_mute_kick;  // EOD_VU_CHECK: the second run of a program sends nothing
@@ -638,6 +650,8 @@ uint32_t rand_next(uint32_t r) {
     r ^= x ^ y;
     return (r & 0x7FFFFF) | 0x3F800000;
 }
+
+void lower_efu(VUState *vu, uint32_t ins, uint32_t ext, const VUReg &s);
 
 void lower_ext(Ctx &c, uint32_t ins, uint32_t ext) {
     VUState *vu = c.vu;
@@ -750,8 +764,11 @@ void lower_ext(Ctx &c, uint32_t ins, uint32_t ext) {
     default:
         break;
     }
-    // EFU
-    const VUReg &s = vu->vf[fs];
+    lower_efu(vu, ins, ext, vu->vf[fs]);
+}
+
+// EFU instructions (ESUM, ERSQRT, ...) on the value of fs
+void lower_efu(VUState *vu, uint32_t ins, uint32_t ext, const VUReg &s) {
     int fsf = (ins >> 21) & 3;
     float x = vu_clamp(s.f[0]), y = vu_clamp(s.f[1]), z = vu_clamp(s.f[2]), w = vu_clamp(s.f[3]);
     float v = vu_clamp(s.f[fsf]);
@@ -1239,11 +1256,17 @@ __attribute__((always_inline)) inline __m128 up_val(VUState *vu, uint32_t ins) {
     if (SRC == S_VEC) b = _mm_loadu_ps(vu->vf[FT(ins)].f);
     else b = _mm_set1_ps(SRC == S_BC ? vu->vf[FT(ins)].f[ins & 3] : SRC == S_Q ? vu->q : vu->i);
     if (OP == OP_MAX || OP == OP_MIN) {
-        VUReg s, t, r;
-        _mm_storeu_ps(s.f, a);
-        _mm_storeu_ps(t.f, b);
-        for (int k = 0; k < 4; k++) r.f[k] = apply_t<OP>(0.0f, s.f[k], t.f[k]);
-        return _mm_loadu_ps(r.f);
+        // compare the clamped values (Inf/NaN patterns are +-FLT_MAX), return the operand's bits
+        const __m128i ex = _mm_set1_epi32(0x7F800000);
+        const __m128 sign = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
+        const __m128 big = _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF));
+        auto clamp = [&](__m128 x) {
+            __m128 sp = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(x), ex), ex));
+            __m128 c = _mm_or_ps(_mm_and_ps(x, sign), big);
+            return _mm_or_ps(_mm_and_ps(sp, c), _mm_andnot_ps(sp, x));
+        };
+        __m128 m = OP == OP_MAX ? _mm_cmpgt_ps(clamp(a), clamp(b)) : _mm_cmplt_ps(clamp(a), clamp(b));
+        return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b));
     }
     __m128 acc = _mm_loadu_ps(vu->acc.f), r;
     switch (OP) {
@@ -1315,6 +1338,124 @@ __attribute__((always_inline)) inline void vu_clip(VUState *vu, int fs, int ft) 
     vu_flag_push(vu, 1, f);
 }
 
+// Helpers on register values: the compiled programs keep the VF registers
+// they use in locals for the length of a block.
+template <ArOp OP>
+__attribute__((always_inline)) inline __m128 vu_fmac(__m128 a, __m128 b, __m128 acc) {
+    if (OP == OP_MAX || OP == OP_MIN) {
+        const __m128i ex = _mm_set1_epi32(0x7F800000);
+        const __m128 sign = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
+        const __m128 big = _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF));
+        auto clamp = [&](__m128 x) {
+            __m128 sp = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(x), ex), ex));
+            __m128 c = _mm_or_ps(_mm_and_ps(x, sign), big);
+            return _mm_or_ps(_mm_and_ps(sp, c), _mm_andnot_ps(sp, x));
+        };
+        __m128 m = OP == OP_MAX ? _mm_cmpgt_ps(clamp(a), clamp(b)) : _mm_cmplt_ps(clamp(a), clamp(b));
+        return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b));
+    }
+    __m128 r;
+    switch (OP) {
+    case OP_ADD: r = _mm_add_ps(a, b); break;
+    case OP_SUB: r = _mm_sub_ps(a, b); break;
+    case OP_MUL: r = _mm_mul_ps(a, b); break;
+    case OP_MADD: r = _mm_add_ps(acc, _mm_mul_ps(a, b)); break;
+    default: r = _mm_sub_ps(acc, _mm_mul_ps(a, b)); break;
+    }
+    const __m128 ex = _mm_castsi128_ps(_mm_set1_epi32(0x7F800000));
+    if (__builtin_expect(_mm_movemask_ps(_mm_cmpeq_ps(_mm_and_ps(r, ex), ex)) != 0, 0)) {
+        VUReg s, t, ac, o;
+        _mm_storeu_ps(s.f, a);
+        _mm_storeu_ps(t.f, b);
+        _mm_storeu_ps(ac.f, acc);
+        for (int k = 0; k < 4; k++) o.f[k] = apply(OP, ac.f[k], s.f[k], t.f[k]);
+        r = _mm_loadu_ps(o.f);
+    }
+    return r;
+}
+
+// OPMULA (acc = fs x ft) / OPMSUB (fd = acc - fs x ft), x/y/z
+template <bool SUB>
+__attribute__((always_inline)) inline __m128 vu_opm(__m128 a, __m128 b, __m128 acc) {
+    VUReg s, t, ac, r;
+    _mm_storeu_ps(s.f, a);
+    _mm_storeu_ps(t.f, b);
+    _mm_storeu_ps(ac.f, acc);
+    if (SUB) {
+        r.f[0] = vu_clamp(ac.f[0] - s.f[1] * t.f[2]);
+        r.f[1] = vu_clamp(ac.f[1] - s.f[2] * t.f[0]);
+        r.f[2] = vu_clamp(ac.f[2] - s.f[0] * t.f[1]);
+    } else {
+        r.f[0] = vu_clamp(s.f[1] * t.f[2]);
+        r.f[1] = vu_clamp(s.f[2] * t.f[0]);
+        r.f[2] = vu_clamp(s.f[0] * t.f[1]);
+    }
+    r.f[3] = 0.0f;
+    return _mm_loadu_ps(r.f);
+}
+
+template <int DEST>
+__attribute__((always_inline)) inline __m128 vu_blend(__m128 old, __m128 v) {
+    if (DEST == 15) return v;
+    const __m128 m = _mm_castsi128_ps(_mm_setr_epi32(DEST & 8 ? -1 : 0, DEST & 4 ? -1 : 0, DEST & 2 ? -1 : 0,
+                                                     DEST & 1 ? -1 : 0));
+    return _mm_or_ps(_mm_and_ps(m, v), _mm_andnot_ps(m, old));
+}
+
+__attribute__((always_inline)) inline uint32_t vu_lane_u(__m128 v, int k) {
+    VUReg r;
+    _mm_storeu_ps(r.f, v);
+    return r.u[k];
+}
+
+__attribute__((always_inline)) inline float vu_lane_f(__m128 v, int k) {
+    VUReg r;
+    _mm_storeu_ps(r.f, v);
+    return r.f[k];
+}
+
+__attribute__((always_inline)) inline __m128 vu_itof_v(__m128 s, int n) {
+    static const float sc[4] = {1.0f, 1.0f / 16, 1.0f / 4096, 1.0f / 32768};
+    return _mm_mul_ps(_mm_cvtepi32_ps(_mm_castps_si128(s)), _mm_set1_ps(sc[n]));
+}
+
+__attribute__((always_inline)) inline __m128 vu_ftoi_v(__m128 s, int n) {
+    static const float sc[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+    __m128 f = _mm_mul_ps(s, _mm_set1_ps(sc[n]));
+    __m128i r = _mm_cvttps_epi32(f);
+    __m128i big = _mm_castps_si128(_mm_cmpge_ps(f, _mm_set1_ps(2147483647.0f)));
+    return _mm_castsi128_ps(_mm_xor_si128(r, big));
+}
+
+__attribute__((always_inline)) inline __m128 vu_abs_v(__m128 s) {
+    return _mm_and_ps(s, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+}
+
+__attribute__((always_inline)) inline void vu_clip_v(VUState *vu, __m128 sv, __m128 tv) {
+    VUReg s;
+    _mm_storeu_ps(s.f, sv);
+    float w = fabsf(vu_lane_f(tv, 3));
+    uint32_t f = 0;
+    if (s.f[0] > w) f |= 0x01;
+    if (s.f[0] < -w) f |= 0x02;
+    if (s.f[1] > w) f |= 0x04;
+    if (s.f[1] < -w) f |= 0x08;
+    if (s.f[2] > w) f |= 0x10;
+    if (s.f[2] < -w) f |= 0x20;
+    vu_flag_push(vu, 1, f);
+}
+
+// VUREC_COUNT=1 tools/vurecomp.py: counts block executions (printed by --vu-bench)
+struct BlkStat {
+    uint64_t hits, pairs;
+};
+std::map<std::pair<std::string, uint32_t>, BlkStat> g_blk_stats;
+inline void vu_blk_hit(const char *prog, uint32_t pc, int n) {
+    BlkStat &b = g_blk_stats[{prog, pc}];
+    b.hits++;
+    b.pairs += n;
+}
+
 // VU1 data memory (VU0 also maps VU1's registers, see vu_qword)
 inline uint8_t *vu1_qword(VUState *vu, uint32_t addr_qw) { return vu->mem + ((addr_qw * 16) & 0x3FFF); }
 
@@ -1373,8 +1514,45 @@ static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
     return true;
 }
 
+// EOD_VU_REC=file [EOD_VU_REC_AT=vblank] [EOD_VU_REC_N=n]: records the state
+// before each micro program run (n runs from that vblank on) for
+// --vu-bench, which replays them and times the micro programs alone.
+extern uint64_t kernel_vblank_count();
+namespace {
+struct VuRecHdr {
+    uint32_t magic, index, pc, top, itop, micro_follows;
+};
+const uint32_t kVuRecMagic = 0x31525556;  // "VUR1"
+
+void vu_rec_hook(VUState *vu, uint32_t pc) {
+    static const char *path = getenv("EOD_VU_REC");
+    if (!path) return;
+    static FILE *f = fopen(path, "wb");
+    static uint64_t at = getenv("EOD_VU_REC_AT") ? strtoull(getenv("EOD_VU_REC_AT"), nullptr, 0) : 0;
+    static long left = getenv("EOD_VU_REC_N") ? atol(getenv("EOD_VU_REC_N")) : 5000;
+    static uint32_t gen[2] = {~0u, ~0u};
+    if (!f || left <= 0) return;
+    if (kernel_vblank_count() < at) return;
+    VuRecHdr h = {kVuRecMagic, (uint32_t)vu->index, pc, g_vif1_top, g_vif1_itop, 0};
+    h.micro_follows = gen[vu->index] != g_vu_micro_gen[vu->index];
+    gen[vu->index] = g_vu_micro_gen[vu->index];
+    fwrite(&h, sizeof h, 1, f);
+    fwrite(vu, sizeof *vu, 1, f);
+    fwrite(&g_score[vu->index], sizeof(Scoreboard), 1, f);
+    fwrite(vu->mem, 1, vu->mem_mask + 1, f);
+    if (h.micro_follows) fwrite(vu->micro, 1, vu->micro_mask + 1, f);
+    if (--left == 0) {
+        fclose(f);
+        f = nullptr;
+        LOG(LOG_VU, "EOD_VU_REC: done");
+    }
+}
+}  // namespace
+
 void vu_execute(VUState *vu, uint32_t start_pc) {
+    ProfScope prof(P_EE_VU);
     uint32_t pc = start_pc & vu->micro_mask & ~7u;
+    vu_rec_hook(vu, pc);
     vu_dump(vu, pc);
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
@@ -1457,6 +1635,106 @@ extern "C" void vu0_macro(uint32_t ins) {
     }
     flush_q(vu);
     flush_p(vu);
+}
+
+// --vu-bench FILE [--repeat N]: replays an EOD_VU_REC recording and prints
+// the time spent in the micro programs and a hash of their results.
+int vu_bench(const char *path, int repeat) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "vu-bench: cannot open %s\n", path);
+        return 1;
+    }
+    struct Rec {
+        VuRecHdr h;
+        VUState st;
+        Scoreboard sb;
+        std::vector<uint8_t> mem, micro;
+    };
+    std::vector<Rec> recs;
+    for (;;) {
+        Rec r;
+        if (fread(&r.h, sizeof r.h, 1, f) != 1) break;
+        if (r.h.magic != kVuRecMagic || r.h.index > 1 || fread(&r.st, sizeof r.st, 1, f) != 1 ||
+            fread(&r.sb, sizeof r.sb, 1, f) != 1) {
+            fprintf(stderr, "vu-bench: bad record %zu\n", recs.size());
+            return 1;
+        }
+        r.mem.resize(r.st.mem_mask + 1);
+        if (fread(r.mem.data(), 1, r.mem.size(), f) != r.mem.size()) break;
+        if (r.h.micro_follows) {
+            r.micro.resize(r.st.micro_mask + 1);
+            if (fread(r.micro.data(), 1, r.micro.size(), f) != r.micro.size()) break;
+        }
+        recs.push_back(std::move(r));
+    }
+    fclose(f);
+    _mm_setcsr(_mm_getcsr() | 0x8040);  // as the game runs (EE FPU flushes denormals)
+    g_vu_mute_kick = true;
+    size_t calls[2] = {0, 0};
+    uint64_t cycles[2] = {0, 0};
+    double ns[2] = {0, 0};
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](const void *p, size_t n) {
+        const uint8_t *b = static_cast<const uint8_t *>(p);
+        for (size_t k = 0; k < n; k++) hash = (hash ^ b[k]) * 1099511628211ull;
+    };
+    std::vector<double> pass;  // VU1 time of each pass
+    for (int rep = 0; rep < repeat; rep++) {
+        double before = ns[1];
+        for (const Rec &r : recs) {
+            VUState *vu = r.h.index ? &g_vu1 : &g_vu0;
+            uint8_t *mem = vu->mem, *micro = vu->micro;
+            *vu = r.st;
+            vu->mem = mem;
+            vu->micro = micro;
+            memcpy(mem, r.mem.data(), r.mem.size());
+            if (r.h.micro_follows) {
+                memcpy(micro, r.micro.data(), r.micro.size());
+                g_vu_micro_gen[r.h.index]++;
+            }
+            g_score[r.h.index] = r.sb;
+            g_vif1_top = r.h.top;
+            g_vif1_itop = r.h.itop;
+            uint64_t c0 = vu->cycle;
+            auto t0 = std::chrono::steady_clock::now();
+            vu_execute(vu, r.h.pc);
+            auto t1 = std::chrono::steady_clock::now();
+            ns[r.h.index] += std::chrono::duration<double, std::nano>(t1 - t0).count();
+            calls[r.h.index]++;
+            cycles[r.h.index] += vu->cycle - c0;
+            if (rep == 0) {
+                mix(vu->vf, sizeof vu->vf);
+                mix(vu->vi, 16 * 4);
+                mix(&vu->acc, sizeof vu->acc);
+                mix(&vu->clip, 4);
+                mix(&vu->cycle, 8);
+                mix(mem, r.mem.size());
+            }
+        }
+        pass.push_back(ns[1] - before);
+    }
+    std::sort(pass.begin(), pass.end());
+    if (!g_blk_stats.empty()) {
+        std::vector<std::pair<uint64_t, std::string>> top;
+        uint64_t total = 0;
+        for (auto &kv : g_blk_stats) {
+            total += kv.second.pairs;
+            char line[200];
+            snprintf(line, sizeof line, "%s %04x: %llu runs, %llu pairs", kv.first.first.c_str(), kv.first.second,
+                     (unsigned long long)kv.second.hits, (unsigned long long)kv.second.pairs);
+            top.push_back({kv.second.pairs, line});
+        }
+        std::sort(top.rbegin(), top.rend());
+        for (size_t k = 0; k < top.size() && k < 40; k++)
+            printf("  %5.1f%%  %s\n", 100.0 * top[k].first / total, top[k].second.c_str());
+    }
+    printf("vu-bench: %zu records x %d: VU0 %zu runs %.3f ms, VU1 %zu runs %.3f ms; VU1 per pass: fastest %.3f ms, "
+           "median %.3f ms (%.2f ns per VU1 cycle); result hash %016llx\n",
+           recs.size(), repeat, calls[0], ns[0] / 1e6, calls[1], ns[1] / 1e6, pass.empty() ? 0 : pass[0] / 1e6,
+           pass.empty() ? 0 : pass[pass.size() / 2] / 1e6, cycles[1] ? ns[1] / cycles[1] : 0.0,
+           (unsigned long long)hash);
+    return 0;
 }
 
 extern "C" void vu0_sync(void) {}

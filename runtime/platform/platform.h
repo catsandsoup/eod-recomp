@@ -15,7 +15,10 @@ struct PlatformConfig {
 };
 
 // Set display-only state without creating windows, audio or input devices (replays).
+// (Non-Windows backends; on Windows these optional hooks are no-ops, see the end.)
+#ifndef _WIN32
 void platform_configure_display(const PlatformConfig &cfg);
+#endif
 bool platform_init(const PlatformConfig &cfg);
 void platform_shutdown();
 void platform_fatal_message(const char *msg);
@@ -23,10 +26,15 @@ void platform_fatal_message(const char *msg);
 // Pumps OS events. Returns false when the user closed the window.
 bool platform_pump();
 
+// Display aspect ratio, changeable while running: 0 = 4:3, 1 = 16:9, 2 = stretched to the window.
+void platform_set_aspect(int aspect);
 // Where the image goes in a client area of cw x ch (aspect ratio setting).
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h);
 // The native window (HWND on Windows; null when headless).
 void *platform_native_window();
+// Borderless fullscreen (window thread).
+void platform_set_fullscreen(bool on);
+bool platform_fullscreen();
 // Short status text shown after the window title (speed statistics).
 void platform_set_status(const char *text);
 // Displays a 32-bit (0xAABBGGRR little endian, i.e. bytes R,G,B,A) image.
@@ -40,7 +48,9 @@ int platform_core_count();
 void platform_sleep_us(uint32_t us);
 // Asks the OS to run the calling thread on a fast core (macOS: user-interactive
 // QoS, so the EE, GS and raster threads are not parked on efficiency cores).
+#ifndef _WIN32
 void platform_thread_fast();
+#endif
 
 // ------------------------------------------------------------------ input
 // DualShock 2 button bits as reported by padman (active high here; the pad
@@ -72,11 +82,15 @@ struct HostPadState {
 };
 
 void platform_get_pad(int port, HostPadState *out);
+// The game controller alone (no keyboard), also while the in-game menu holds the game's input.
+void platform_get_controller(int port, HostPadState *out);
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor);
 // `eod --list-pads [--watch N]`: prints the controllers the host sees (no game
 // data needed); with watch_seconds > 0 then shows each player's input live.
-// Returns the process exit code.
+// Returns the process exit code. (Non-Windows backends only.)
+#ifndef _WIN32
 int platform_list_pads(int watch_seconds);
+#endif
 
 // ------------------------------------------------------------------ audio
 // 48 kHz signed 16-bit stereo interleaved.
@@ -95,7 +109,10 @@ void fiber_delete(HostFiber *f);
 // ---------------------------------------------------------- timer thread
 // Calls cb() from a background thread roughly every period_us.
 void platform_start_ticker(void (*cb)(), unsigned period_us);
+// Stops and joins the ticker before shutdown (non-Windows backends).
+#ifndef _WIN32
 void platform_stop_ticker();
+#endif
 
 // --------------------------------------------------------------- files
 // Case-insensitive lookup of a relative path under a root directory.
@@ -111,3 +128,11 @@ struct DirEntryInfo {
 // Lists a directory (without "." and ".."). Returns false if it can't be read.
 #include <vector>
 bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out);
+
+#ifdef _WIN32
+// Hooks only the non-Windows (SDL3 / POSIX) backends implement; the Win32
+// backend keeps upstream's behaviour.
+inline void platform_configure_display(const PlatformConfig &) {}
+inline void platform_thread_fast() {}
+inline void platform_stop_ticker() {}
+#endif

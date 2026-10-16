@@ -43,8 +43,10 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "../../core/prof.h"
 #include "../../core/log.h"
 #include "../../platform/platform.h"
+#include "../../ui/overlay.h"
 #include "../gs_hw.h"
 #include "../gs_mem.h"
 #include "../gs_state.h"
@@ -98,15 +100,28 @@ ID3D11SamplerState *g_point_clamp, *g_linear_clamp;
 ID3D11RasterizerState *g_rs_scissor, *g_rs_noscissor;
 ID3D11DepthStencilState *g_ds_off, *g_ds_write_always;
 ID3D11BlendState *g_bs_opaque, *g_bs_none, *g_bs_alpha;
+// the in-game menu / frame counter (ui/overlay.h)
+ID3D11VertexShader *g_vs_overlay;
+ID3D11PixelShader *g_ps_overlay;
+ID3D11InputLayout *g_layout_overlay;
+ID3D11BlendState *g_bs_overlay;
+ID3D11Buffer *g_cb_overlay, *g_vb_overlay, *g_ib_overlay;
+size_t g_vb_overlay_size, g_ib_overlay_size;
+ID3D11Texture2D *g_font_tex;
+ID3D11ShaderResourceView *g_font_srv;
+uint32_t g_font_gen;
 
 std::thread::id g_gs_thread;
 bool g_gs_thread_known;
 
 struct Stats {
-    uint32_t draws, prims, flushes, uploads, readbacks, converts, tex_new, tex_hit, tex_rt, tex_bytes, presents;
+    uint32_t draws, prims, states, flushes, uploads, readbacks, async_readbacks, converts, tex_new, tex_hit, tex_rt, tex_bytes, presents;
     uint32_t rb_reason[4];  // vram_needed from: 0 CPU (CLUT, transfers), 1 textures, 2 acquire, 3 display
 } g_stats;
 int g_rb_reason;
+const char *g_rb_what = "?";  // what wanted the CPU copy (statistics)
+bool g_rb_clut;  // readback_pages for a CLUT load
+bool g_async_clut = getenv("EOD_D3D_SYNC_CLUT") == nullptr;
 
 // --------------------------------------------------------------- formats
 enum Fmt : uint32_t { FMT_32 = 0, FMT_24 = 1, FMT_16 = 2, FMT_DEPTH = 3 };
@@ -151,6 +166,8 @@ bool create_shaders() {
         {k_ps_readback_color, sizeof k_ps_readback_color, "ps_readback_color", false, (void **)&g_ps_readback_color},
         {k_ps_readback_depth, sizeof k_ps_readback_depth, "ps_readback_depth", false, (void **)&g_ps_readback_depth},
         {k_ps_copy, sizeof k_ps_copy, "ps_copy", false, (void **)&g_ps_copy},
+        {k_vs_overlay, sizeof k_vs_overlay, "vs_overlay", true, (void **)&g_vs_overlay},
+        {k_ps_overlay, sizeof k_ps_overlay, "ps_overlay", false, (void **)&g_ps_overlay},
     };
     // Precompiled bytecode; if a driver refuses it, compile the embedded
     // source with d3dcompiler_47/43 when the system has one.
@@ -191,6 +208,12 @@ bool create_shaders() {
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"FOG", 0, DXGI_FORMAT_R32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
+    D3D11_INPUT_ELEMENT_DESC ol[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    CHECK(g_dev->CreateInputLayout(ol, 3, k_vs_overlay, sizeof k_vs_overlay, &g_layout_overlay));
     return SUCCEEDED(CHECK(g_dev->CreateInputLayout(il, 5, k_vs_draw, sizeof k_vs_draw, &g_layout)));
 }
 
@@ -455,12 +478,14 @@ void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
     float zero[4] = {0, 0, 0, 0};
     g_ctx->OMSetBlendState(blend_state(fail_pass ? s.fail_blend_key : s.blend_key), zero, 0xFFFFFFFF);
     g_ctx->OMSetDepthStencilState(depth_state(fail_pass ? s.fail_depth_key : s.depth_key), 0);
-    g_ctx->Draw(count, first);
+    static const bool no_draw = getenv("EOD_D3D_NODRAW") != nullptr;  // benchmarks: CPU side only
+    if (!no_draw) g_ctx->Draw(count, first);
     g_stats.draws++;
 }
 
 void flush() {
     if (g_verts.empty()) return;
+    ProfScope prof(P_GS_DRAW);
     std::vector<HwVertex> verts;
     verts.swap(g_verts);  // (the passes below flush too)
     const DrawState s = g_state;
@@ -578,6 +603,7 @@ bool create_raw_textures() {
 // Uploads rectangle (x, y, w, h) of the surface from gs::vram.
 void upload_rect(Surface *s, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
+    ProfScope prof(P_GS_UPLOAD);
     flush();
     const SwizzleTab *T = swizzle_table(s->psm, s->bw);
     std::vector<uint32_t> raw((size_t)w * h);
@@ -607,9 +633,9 @@ void upload_rect(Surface *s, int x, int y, int w, int h) {
     g_stats.uploads++;
 }
 
-// Writes rectangle (x, y, w, h) of the surface back to gs::vram.
-void readback_rect(Surface *s, int x, int y, int w, int h) {
-    if (w <= 0 || h <= 0) return;
+// Renders rectangle (x, y, w, h) of the surface as raw GS values into
+// g_rb_tex and copies it to the staging texture `stg` (at 0, 0).
+void readback_gpu(Surface *s, int x, int y, int w, int h, ID3D11Texture2D *stg) {
     flush();
     unbind_all();
     g_ctx->OMSetRenderTargets(1, &g_rb_rtv, nullptr);
@@ -628,15 +654,18 @@ void readback_rect(Surface *s, int x, int y, int w, int h) {
     unbind_all();
     g_bound_rt = g_bound_ds = nullptr;
     D3D11_BOX box = {0, 0, 0, (UINT)w, (UINT)h, 1};
-    g_ctx->CopySubresourceRegion(g_rb_staging, 0, 0, 0, 0, g_rb_tex, 0, &box);
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(CHECK(g_ctx->Map(g_rb_staging, 0, D3D11_MAP_READ, 0, &m)))) return;
-    const SwizzleTab *T = swizzle_table(s->psm, s->bw);
-    bool b16 = bpp_of(s->psm) == 16, b24 = (s->psm & 0xF) == 0x1;
+    g_ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, g_rb_tex, 0, &box);
+}
+
+// Writes mapped readback data (w x h raw values) to gs::vram at (x, y) of buffer (bp, bw, psm).
+void readback_store(const D3D11_MAPPED_SUBRESOURCE &m, uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
+                    int h) {
+    const SwizzleTab *T = swizzle_table(psm, bw);
+    bool b16 = bpp_of(psm) == 16, b24 = (psm & 0xF) == 0x1;
     for (int r = 0; r < h; r++) {
         const uint32_t *src = (const uint32_t *)((const uint8_t *)m.pData + (size_t)r * m.RowPitch);
         int py = y + r;
-        uint32_t rb = T->row_base(s->bp, py), rc = T->rowC[py & 2047];
+        uint32_t rb = T->row_base(bp, py), rc = T->rowC[py & 2047];
         for (int c = 0; c < w; c++) {
             uint32_t a = T->addr_row(rb, rc, x + c), v = src[c];
             if (b16)
@@ -647,10 +676,89 @@ void readback_rect(Surface *s, int x, int y, int w, int h) {
                 word(a) = v;
         }
     }
+}
+
+// Writes rectangle (x, y, w, h) of the surface back to gs::vram.
+void readback_rect(Surface *s, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    ProfScope prof(P_GS_READBACK);
+    readback_gpu(s, x, y, w, h, g_rb_staging);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(CHECK(g_ctx->Map(g_rb_staging, 0, D3D11_MAP_READ, 0, &m)))) return;
+    readback_store(m, s->bp, s->bw, s->psm, x, y, w, h);
     g_ctx->Unmap(g_rb_staging, 0);
     vram_mark(s->bp, s->bw, s->psm, x, y, w, h);
     g_stats.readbacks++;
     g_stats.rb_reason[g_rb_reason & 3]++;
+}
+
+// CLUT loads from pages a surface has drawn (the game loads palettes from
+// its shadow buffer every frame): waiting for the GPU there stalls the whole
+// pipeline, so the copy is started and the CLUT gets what the previous copy of
+// the page brought back (a frame or so old).
+struct AsyncReadback {
+    ID3D11Texture2D *stg = nullptr;  // 64x64 R32_UINT staging
+    Surface *src = nullptr;          // what it was read from (not dereferenced later)
+    uint32_t bp = 0, bw = 0, psm = 0;
+    int x = 0, y = 0, w = 0, h = 0;
+    bool busy = false;  // copy in flight
+};
+AsyncReadback g_async_rb[kPages];  // per page
+bool g_async_rb_seen[kPages];      // a synchronous readback was done once
+
+// Stores the copies that have arrived (if the page still belongs to the same surface).
+void async_readback_poll() {
+    for (uint32_t p = 0; p < kPages; p++) {
+        AsyncReadback &a = g_async_rb[p];
+        if (!a.busy) continue;
+        D3D11_MAPPED_SUBRESOURCE m;
+        HRESULT hr = g_ctx->Map(a.stg, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+        a.busy = false;
+        if (FAILED(hr)) continue;
+        bool store = g_owner[p] == a.src && !g_vram_ok[p];
+        if (store) readback_store(m, a.bp, a.bw, a.psm, a.x, a.y, a.w, a.h);
+        g_ctx->Unmap(a.stg, 0);
+        if (store) vram_mark(a.bp, a.bw, a.psm, a.x, a.y, a.w, a.h);
+    }
+}
+
+// Readback for a CLUT load of page p (rectangle q of surface o).
+void clut_readback(uint32_t p, Surface *o, const PageRect &q) {
+    AsyncReadback &a = g_async_rb[p];
+    if (!g_async_rb_seen[p] || q.w > 64 || q.h > 64) {  // first time: exact
+        g_async_rb_seen[p] = true;
+        readback_rect(o, q.x, q.y, q.w, q.h);
+        return;
+    }
+    ProfScope prof(P_GS_READBACK);
+    if (a.busy) return;  // the previous copy is still on its way
+    if (!a.stg) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = 64;
+        td.Height = 64;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R32_UINT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &a.stg)))) {
+            readback_rect(o, q.x, q.y, q.w, q.h);
+            return;
+        }
+    }
+    readback_gpu(o, q.x, q.y, q.w, q.h, a.stg);
+    a.src = o;
+    a.bp = o->bp;
+    a.bw = o->bw;
+    a.psm = o->psm;
+    a.x = q.x;
+    a.y = q.y;
+    a.w = q.w;
+    a.h = q.h;
+    a.busy = true;
+    g_stats.async_readbacks++;
 }
 
 // ------------------------------------------------------------ conversions
@@ -713,6 +821,7 @@ bool convertible(const Surface *src, const Surface *dst) {
 void convert_rect(Surface *src, ID3D11RenderTargetView *dst_rtv, ID3D11DepthStencilView *dst_dsv, uint32_t dst_psm,
                   uint32_t dst_bw, int dst_w, int dst_h, int x, int y, int w, int h, bool texa, const Env *e) {
     flush();
+    ProfScope prof(P_GS_CONVERT);
     unbind_all();
     if (dst_dsv)
         g_ctx->OMSetRenderTargets(0, nullptr, dst_dsv);
@@ -901,15 +1010,21 @@ uint64_t hash_level(uint32_t tbp, uint32_t tbw, uint32_t psm, int w, int h) {
     const SwizzleTab *T = swizzle_table(psm, tbw);
     int bw, bh, ub;
     block_dims(psm, bw, bh, ub);
-    uint64_t hash = 0x84222325CBF29CE4ull;
+    // four independent lanes (the multiplies overlap)
+    uint64_t h0 = 0x84222325CBF29CE4ull, h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full, h3 = 0x165667B19E3779F9ull;
     for (int y = 0; y < h; y += bh)
         for (int x = 0; x < w; x += bw) {
             uint32_t a = T->addr(tbp, x, y);
             uint32_t byte_addr = ub == 32 ? a * 4 : ub == 16 ? a * 2 : ub == 8 ? a : a / 2;
             const uint64_t *p = reinterpret_cast<const uint64_t *>(vram + ((byte_addr & ~255u) & (kVramSize - 1)));
-            for (int k = 0; k < 32; k++) hash = mix64(hash, p[k]);
+            for (int k = 0; k < 32; k += 4) {
+                h0 = mix64(h0, p[k]);
+                h1 = mix64(h1, p[k + 1]);
+                h2 = mix64(h2, p[k + 2]);
+                h3 = mix64(h3, p[k + 3]);
+            }
         }
-    return hash;
+    return mix64(mix64(mix64(h0, h1), h2), h3);
 }
 
 // RGBA texels of a level
@@ -940,19 +1055,16 @@ void decode_level(const Env &e, int lvl, int w, int h, std::vector<uint32_t> &ou
 int tex_levels(const Env &e) { return (e.mmin >= 2 && e.mxl > 0) ? std::min(e.mxl, 6) + 1 : 1; }
 
 ID3D11ShaderResourceView *vram_texture(const Env &e) {
+    ProfScope prof(P_GS_TEX);
     int levels = tex_levels(e);
-    // description key: what identifies the texture apart from the memory contents
-    uint64_t desc = mix64(0, e.tpsm | (e.tw << 8) | ((uint64_t)e.th << 20) | ((uint64_t)levels << 40));
-    for (int i = 0; i < levels; i++) desc = mix64(desc, e.mip_tbp[i] | ((uint64_t)e.mip_tbw[i] << 32));
+    // what identifies the texture apart from its address and the memory contents: the game streams
+    // textures into alternating areas, so the same texture is found again wherever it was loaded
+    uint64_t form = mix64(0, e.tpsm | (e.tw << 8) | ((uint64_t)e.th << 20) | ((uint64_t)levels << 40));
+    for (int i = 0; i < levels; i++)
+        form = mix64(form, ((e.mip_tbp[i] - e.tbp) & 0x3FFF) | ((uint64_t)e.mip_tbw[i] << 32));
     bool pal = e.tpsm == PSMT8 || e.tpsm == PSMT4 || e.tpsm == PSMT8H || e.tpsm == PSMT4HL || e.tpsm == PSMT4HH;
-    if (pal) {
-        int n = (e.tpsm == PSMT8 || e.tpsm == PSMT8H) ? 256 : 16;
-        uint64_t ph = 0;
-        for (int i = 0; i < n; i += 2) ph = mix64(ph, e.pal[i] | ((uint64_t)e.pal[i + 1] << 32));
-        desc = mix64(desc, ph);
-    } else {
-        desc = mix64(desc, e.ta0 | (e.ta1 << 8) | ((uint32_t)e.aem << 16));
-    }
+    form = mix64(form, pal ? e.pal_hash : (e.ta0 | (e.ta1 << 8) | ((uint32_t)e.aem << 16)));
+    uint64_t desc = mix64(form, e.tbp);  // ... and where it is
     // memory unchanged since the last check: same contents
     uint32_t newest = 0;
     for (int i = 0; i < levels; i++) {
@@ -966,7 +1078,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
     if (ck != g_tex_check.end() && ck->second.clock >= newest) {
         key = ck->second.key;
     } else {
-        key = desc;
+        key = form;
         for (int i = 0; i < levels; i++)
             key = mix64(key, hash_level(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i),
                                         std::max(1, (int)e.th >> i)));
@@ -979,6 +1091,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
         return it->second.srv;
     }
     // decode and upload
+    ProfScope prof_new(P_GS_TEXNEW);
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = e.tw;
     td.Height = e.th;
@@ -1010,6 +1123,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e) {
     // evict textures unused for a while when the cache is large
     if (g_tex_bytes > (256u << 20)) {
         flush();
+        if (g_tex_check.size() > 65536) g_tex_check.clear();
         for (auto i = g_tex.begin(); i != g_tex.end();) {
             if (i->second.last_use + 2 < g_frame_no) {
                 g_tex_bytes -= i->second.bytes;
@@ -1121,11 +1235,19 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (!owner) {
-    std::vector<uint32_t> pages;
     for (int i = 0; i < levels; i++) {
-        exact_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i), std::max(1, (int)e.th >> i),
-                    pages);
-        for (uint32_t p : pages) {
+        // (the pages of a texture only depend on where it is and its size: remembered)
+        static std::unordered_map<uint64_t, std::vector<uint32_t>> known;
+        uint32_t lw = std::max(1, (int)e.tw >> i), lh = std::max(1, (int)e.th >> i);
+        uint64_t k = (uint64_t)e.mip_tbp[i] | (uint64_t)e.mip_tbw[i] << 14 | (uint64_t)e.tpsm << 20 |
+                     (uint64_t)lw << 26 | (uint64_t)lh << 38;
+        auto kp = known.find(k);
+        if (kp == known.end()) {
+            if (known.size() > 4096) known.clear();
+            kp = known.emplace(k, std::vector<uint32_t>()).first;
+            exact_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, (int)lw, (int)lh, kp->second);
+        }
+        for (uint32_t p : kp->second) {
             Surface *o = g_owner[p];
             if (!o || g_vram_ok[p]) continue;
             gpu = true;
@@ -1204,6 +1326,8 @@ TexSource texture_for(const Env &e, Surface *target) {
 uint32_t g_reg_gen_seen;  // g_env_serial the state was built for
 
 void build_state(const Env &e, int topology) {
+    ProfScope prof(P_GS_STATE);
+    g_stats.states++;
     DrawState s;
     memset(&s, 0, sizeof s);  // (compared bytewise below)
     s.topology = topology;
@@ -1532,6 +1656,7 @@ bool start(bool with_window) {
     memset(g_owner, 0, sizeof g_owner);
     memset(g_vram_ok, 0, sizeof g_vram_ok);
     g_on = true;
+    if (g_swap) overlay_enable();  // the in-game menu can be drawn
     LOG(LOG_GS, "d3d11: feature level %x, render scale %d%s", (unsigned)g_level, g_scale, warp ? " (WARP)" : "");
     return true;
 }
@@ -1610,23 +1735,31 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
         if (!o || g_vram_ok[p]) continue;
         std::vector<PageRect> pages;
         surface_pages(o, o->h, pages);
+        bool found = false;
         for (const PageRect &q : pages)
             if (q.page == p) {
-                readback_rect(o, q.x, q.y, q.w, q.h);
-                g_vram_ok[p] = true;
+                found = true;
+                if (g_rb_clut) {
+                    clut_readback(p, o, q);
+                } else {
+                    readback_rect(o, q.x, q.y, q.w, q.h);
+                    g_vram_ok[p] = true;
+                }
             }
-        if (!g_vram_ok[p]) {  // not part of the surface's rows (shouldn't happen): give up the page
+        if (!found) {  // not part of the surface's rows (shouldn't happen): give up the page
             g_owner[p] = nullptr;
         }
     }
 }
 
-void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why) {
     g_rb_reason = 0;
+    g_rb_what = why;
+    g_rb_clut = strcmp(why, "clut") == 0 && g_async_clut;
+    if (g_rb_clut) async_readback_poll();
     readback_pages(bp, bw, psm, x, y, w, h);
+    g_rb_clut = false;
 }
-
-void vram_write_complete() {} // D3D11 retains its existing synchronous uploads.
 
 // ----------------------------------------------------------------- display
 namespace {
@@ -1845,14 +1978,113 @@ void vblank() {
     }
 }
 
-void present(bool vsync) {
-    if (!g_on) return;
-    flush();
-    g_last[0] = read_circuit_regs(0);
-    g_last[1] = read_circuit_regs(1);
-    g_have_last = g_last[0].on || g_last[1].on;
-    g_frame_no++;
-    g_state_valid = false;
+namespace {
+// Draws the in-game menu / frame counter (ui/overlay.h) into the back buffer.
+void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
+    static OverlayDraw d;
+    if (!g_layout_overlay || !overlay_latest(d) || d.w <= 0 || d.h <= 0) return;
+    int fw, fh;
+    uint32_t gen;
+    const uint32_t *font = overlay_font(fw, fh, gen);
+    if (!font) return;
+    if (!g_font_srv || gen != g_font_gen) {
+        release(g_font_srv);
+        release(g_font_tex);
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)fw;
+        td.Height = (UINT)fh;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init = {font, (UINT)fw * 4, 0};
+        if (FAILED(CHECK(g_dev->CreateTexture2D(&td, &init, &g_font_tex)))) return;
+        CHECK(g_dev->CreateShaderResourceView(g_font_tex, nullptr, &g_font_srv));
+        g_font_gen = gen;
+    }
+    if (!g_bs_overlay) {
+        D3D11_BLEND_DESC bl = {};
+        D3D11_RENDER_TARGET_BLEND_DESC &rt = bl.RenderTarget[0];
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        rt.BlendOp = D3D11_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D11_BLEND_ONE;
+        rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        CHECK(g_dev->CreateBlendState(&bl, &g_bs_overlay));
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_cb_overlay));
+    }
+    // vertex / index buffers (grown as needed)
+    auto fill = [](ID3D11Buffer *&b, size_t &cap, UINT bind, const void *data, size_t bytes) {
+        if (bytes > cap) {
+            release(b);
+            cap = std::max<size_t>(bytes * 2, 64 * 1024);
+            D3D11_BUFFER_DESC bd = {};
+            bd.ByteWidth = (UINT)cap;
+            bd.Usage = D3D11_USAGE_DYNAMIC;
+            bd.BindFlags = bind;
+            bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(CHECK(g_dev->CreateBuffer(&bd, nullptr, &b)))) {
+                cap = 0;
+                return false;
+            }
+        }
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(CHECK(g_ctx->Map(b, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))) return false;
+        memcpy(m.pData, data, bytes);
+        g_ctx->Unmap(b, 0);
+        return true;
+    };
+    if (!fill(g_vb_overlay, g_vb_overlay_size, D3D11_BIND_VERTEX_BUFFER, d.verts.data(),
+              d.verts.size() * sizeof(OverlayVertex)) ||
+        !fill(g_ib_overlay, g_ib_overlay_size, D3D11_BIND_INDEX_BUFFER, d.indices.data(), d.indices.size() * 2))
+        return;
+    float scale[4] = {2.0f / (float)d.w, 2.0f / (float)d.h, 0, 0};
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(CHECK(g_ctx->Map(g_cb_overlay, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))) return;
+    memcpy(m.pData, scale, sizeof scale);
+    g_ctx->Unmap(g_cb_overlay, 0);
+
+    unbind_all();
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    set_viewport(tw, th);
+    UINT stride = sizeof(OverlayVertex), offset = 0;
+    g_ctx->IASetInputLayout(g_layout_overlay);
+    g_ctx->IASetVertexBuffers(0, 1, &g_vb_overlay, &stride, &offset);
+    g_ctx->IASetIndexBuffer(g_ib_overlay, DXGI_FORMAT_R16_UINT, 0);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(g_vs_overlay, nullptr, 0);
+    g_ctx->VSSetConstantBuffers(2, 1, &g_cb_overlay);
+    g_ctx->PSSetShader(g_ps_overlay, nullptr, 0);
+    g_ctx->PSSetShaderResources(0, 1, &g_font_srv);
+    ID3D11SamplerState *ss[2] = {g_point_clamp, g_linear_clamp};
+    g_ctx->PSSetSamplers(0, 2, ss);
+    float factor[4] = {0, 0, 0, 0};
+    g_ctx->OMSetBlendState(g_bs_overlay, factor, 0xFFFFFFFF);
+    g_ctx->OMSetDepthStencilState(g_ds_off, 0);
+    g_ctx->RSSetState(g_rs_scissor);
+    float sx = (float)tw / (float)d.w, sy = (float)th / (float)d.h;
+    for (const OverlayCmd &c : d.cmds) {
+        D3D11_RECT r = {(LONG)(c.clip[0] * sx), (LONG)(c.clip[1] * sy), (LONG)(c.clip[2] * sx + 0.5f),
+                        (LONG)(c.clip[3] * sy + 0.5f)};
+        g_ctx->RSSetScissorRects(1, &r);
+        g_ctx->DrawIndexed(c.index_count, c.first_index, (INT)c.base_vertex);
+    }
+    unbind_all();
+    g_bound_rt = g_bound_ds = nullptr;
+}
+
+// Composes the last display image (and the overlay) into the window and presents it.
+void show(bool vsync) {
     if (g_swap) {
         RECT rc;
         GetClientRect(g_hwnd, &rc);
@@ -1878,12 +2110,34 @@ void present(bool vsync) {
             int x, y, w, h;
             platform_display_rect(g_back_w, g_back_h, &x, &y, &w, &h);
             if (g_have_last) compose(g_back_rtv, g_back_w, g_back_h, x, y, w, h, g_config.smooth_display);
+            draw_overlay(g_back_rtv, g_back_w, g_back_h);
             HRESULT hr = CHECK(g_swap->Present(vsync ? 1 : 0, 0));
             g_stats.presents++;
             if (FAILED(hr) && g_fails_logged < 50)
                 WARN("d3d11: device removed reason %08lx", (unsigned long)g_dev->GetDeviceRemovedReason());
         }
     }
+}
+}  // namespace
+
+void present(bool vsync) {
+    ProfScope prof(P_GS_PRESENT);
+    if (!g_on) return;
+    flush();
+    async_readback_poll();
+    g_last[0] = read_circuit_regs(0);
+    g_last[1] = read_circuit_regs(1);
+    g_have_last = g_last[0].on || g_last[1].on;
+    g_frame_no++;
+    g_state_valid = false;
+    show(vsync);
+}
+
+void redraw() {
+    if (!g_on) return;
+    flush();
+    g_state_valid = false;
+    show(true);
 }
 
 bool read_display(std::vector<uint32_t> &rgba, int &w, int &h) {
@@ -1922,13 +2176,13 @@ void finish() {
 
 void stats_line(char *buf, size_t size) {
     snprintf(buf, size,
-             "d3d11: %u presents, %u draw calls, %u batches, %u prims, %u uploads, %u readbacks, %u conversions, textures %u new "
+             "d3d11: %u presents, %u draw calls, %u batches, %u prims, %u states, %u uploads, %u readbacks, %u conversions, textures %u new "
              "(%u KB) %u cached %u rendered, %u surfaces, %u MB textures; readbacks for CPU %u textures %u targets %u "
-             "display %u",
-             g_stats.presents, g_stats.draws, g_stats.flushes, g_stats.prims, g_stats.uploads, g_stats.readbacks, g_stats.converts,
+             "display %u, CLUT readbacks without waiting %u",
+             g_stats.presents, g_stats.draws, g_stats.flushes, g_stats.prims, g_stats.states, g_stats.uploads, g_stats.readbacks, g_stats.converts,
              g_stats.tex_new, g_stats.tex_bytes / 1024, g_stats.tex_hit, g_stats.tex_rt, (unsigned)g_surfaces.size(),
              (unsigned)(g_tex_bytes >> 20), g_stats.rb_reason[0], g_stats.rb_reason[1], g_stats.rb_reason[2],
-             g_stats.rb_reason[3]);
+             g_stats.rb_reason[3], g_stats.async_readbacks);
     g_stats = Stats();
 }
 

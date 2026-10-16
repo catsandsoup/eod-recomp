@@ -71,12 +71,17 @@ int platform_list_pads(int) {
 
 void platform_set_status(const char *) {}
 
+void platform_set_aspect(int aspect) { presentation::requested.store(aspect, std::memory_order_relaxed); }
+
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
     const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
     *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
 }
 
 void *platform_native_window() { return nullptr; }
+void platform_set_fullscreen(bool) {}
+bool platform_fullscreen() { return false; }
+void platform_get_controller(int, HostPadState *out) { *out = HostPadState(); }
 
 bool platform_audio_open(int) { return true; }
 // EOD_WAV=file: the headless build writes the audio (48 kHz stereo) to a WAV file.

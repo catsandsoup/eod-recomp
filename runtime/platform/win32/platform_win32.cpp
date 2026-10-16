@@ -1,5 +1,3 @@
-#include "../display_rect.h"
-#include "../presentation.h"
 // platform_win32.cpp - Windows backend (Windows 7 and later).
 //
 // Uses only components that ship with Windows 7: GDI for presentation,
@@ -11,6 +9,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <atomic>
 #include <windows.h>
 #include <mmsystem.h>
 
@@ -20,6 +19,7 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "../../ui/overlay.h"
 #include "../platform.h"
 #include "../pad_script.h"
 
@@ -28,6 +28,7 @@ void build_key_map();
 namespace {
 
 PlatformConfig g_cfg;
+std::atomic<int> g_aspect{0};  // display aspect (platform_set_aspect)
 HWND g_hwnd;
 bool g_quit;
 bool g_fullscreen;
@@ -120,6 +121,7 @@ void paint(HDC dc) {
 }
 
 LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (overlay_wndproc(h, msg, wp, lp)) return 0;  // the in-game menu
     switch (msg) {
     case WM_CLOSE:
         g_quit = true;
@@ -189,26 +191,22 @@ void audio_pump() {
 
 // ------------------------------------------------------------- ticker
 void (*g_tick_cb)();
-HANDLE g_tick_thread;
-volatile LONG g_tick_stop;
 DWORD WINAPI ticker_thread(LPVOID p) {
     unsigned period = (unsigned)(uintptr_t)p;
     DWORD ms = period / 1000;
     if (ms == 0) ms = 1;
-    while (!InterlockedCompareExchange(&g_tick_stop, 0, 0)) {
+    for (;;) {
         Sleep(ms);
-        if (!InterlockedCompareExchange(&g_tick_stop, 0, 0)) g_tick_cb();
+        g_tick_cb();
     }
-    return 0;
 }
 
 }  // namespace
 
 // ================================================================= API
-void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
-
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
+    g_aspect = cfg.aspect;
     QueryPerformanceFrequency(&g_qpf);
     timeBeginPeriod(1);
     load_xinput();
@@ -321,8 +319,6 @@ void platform_sleep_us(uint32_t us) {
         Sleep(0);
 }
 
-void platform_thread_fast() {}
-
 // ------------------------------------------------------------------ input
 static inline bool key(int vk) { return g_keys[vk & 255]; }
 
@@ -366,6 +362,47 @@ void platform_get_pad(int port, HostPadState *out) {
         if (out->buttons & PAD_UP) out->ly = 0;
         if (out->buttons & PAD_DOWN) out->ly = 255;
     }
+    HostPadState c;
+    platform_get_controller(port, &c);
+    if (c.connected) {
+        out->connected = true;
+        out->buttons |= c.buttons;
+        if (c.lx != 128) out->lx = c.lx;  // (the stick outside its dead zone)
+        if (c.ly != 128) out->ly = c.ly;
+        out->rx = c.rx;
+        out->ry = c.ry;
+        out->pressure[10] = c.pressure[10];
+        out->pressure[11] = c.pressure[11];
+    }
+    // the in-game menu has the input
+    if (overlay_menu_open()) {
+        *out = HostPadState();
+        out->connected = true;
+    }
+    // EOD_PAD_SCRIPT (automated testing) replaces port 0's input
+    uint16_t sb;
+    if (port == 0 && pad_script_buttons(sb)) {
+        *out = HostPadState();
+        out->connected = true;
+        out->buttons = sb;
+    }
+    // pressure for digital buttons
+    static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
+                                       PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
+    for (int i = 0; i < 12; i++)
+        if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
+}
+
+void platform_get_controller(int port, HostPadState *out) {
+    // (asked by the game and by the in-game menu every vblank: XInput is read once)
+    static HostPadState last[4];
+    static uint64_t when[4];
+    uint64_t now = platform_time_us();
+    if (port >= 0 && port < 4 && when[port] && now - when[port] < 4000) {
+        *out = last[port];
+        return;
+    }
+    *out = HostPadState();
     if (pXInputGetState) {
         XINPUT_STATE_ xs;
         if (pXInputGetState((DWORD)port, &xs) == 0) {
@@ -398,26 +435,37 @@ void platform_get_pad(int port, HostPadState *out) {
             out->pressure[11] = xs.Gamepad.bRightTrigger;
         }
     }
-    // EOD_PAD_SCRIPT (automated testing) replaces port 0's input
-    uint16_t sb;
-    if (port == 0 && pad_script_buttons(sb)) {
-        *out = HostPadState();
-        out->connected = true;
-        out->buttons = sb;
+    if (port >= 0 && port < 4) {
+        last[port] = *out;
+        when[port] = now;
     }
-    // pressure for digital buttons
-    static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
-                                       PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
-    for (int i = 0; i < 12; i++)
-        if ((out->buttons & order[i]) && out->pressure[i] == 0) out->pressure[i] = 255;
 }
 
+void platform_set_aspect(int aspect) { g_aspect = aspect; }
+
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    const DisplayRect rect=display_rect(presentation::current(g_cfg.aspect),cw,ch);
-    *x=rect.x;*y=rect.y;*w=rect.width;*h=rect.height;
+    int vw = cw, vh = ch, aspect = g_aspect;
+    if (aspect != 2) {  // 4:3 or 16:9, letterboxed
+        int an = aspect == 1 ? 16 : 4, ad = aspect == 1 ? 9 : 3;
+        vh = cw * ad / an;
+        if (vh > ch) {
+            vh = ch;
+            vw = ch * an / ad;
+        }
+    }
+    *x = (cw - vw) / 2;
+    *y = (ch - vh) / 2;
+    *w = vw;
+    *h = vh;
 }
 
 void *platform_native_window() { return g_hwnd; }
+
+void platform_set_fullscreen(bool on) {
+    if (g_hwnd && on != g_fullscreen) toggle_fullscreen();
+}
+
+bool platform_fullscreen() { return g_fullscreen; }
 
 void platform_set_status(const char *text) {
     if (!g_hwnd) return;
@@ -433,19 +481,6 @@ void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) 
     v.wLeftMotorSpeed = (WORD)(large_motor * 257);
     v.wRightMotorSpeed = small_motor ? 0xFFFF : 0;
     pXInputSetState((DWORD)port, &v);
-}
-
-int platform_list_pads(int) {
-    load_xinput();
-    if (!pXInputGetState) {
-        printf("XInput not available\n");
-        return 1;
-    }
-    for (DWORD i = 0; i < 4; i++) {
-        XINPUT_STATE_ xs;
-        printf("XInput slot %lu: %s\n", (unsigned long)i, pXInputGetState(i, &xs) == 0 ? "connected" : "-");
-    }
-    return 0;
 }
 
 // ------------------------------------------------------------------ audio
@@ -535,18 +570,12 @@ void fiber_delete(HostFiber *f) {
     delete f;
 }
 
-void platform_stop_ticker() {
-    InterlockedExchange(&g_tick_stop, 1);
-    if (g_tick_thread) { WaitForSingleObject(g_tick_thread, INFINITE); CloseHandle(g_tick_thread); g_tick_thread = nullptr; }
-}
 void platform_start_ticker(void (*cb)(), unsigned period_us) {
-    platform_stop_ticker();
-    InterlockedExchange(&g_tick_stop, 0);
     g_tick_cb = cb;
     HANDLE t = CreateThread(nullptr, 0, ticker_thread, (LPVOID)(uintptr_t)period_us, 0, nullptr);
     if (t) {
         SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
-        g_tick_thread = t;
+        CloseHandle(t);
     }
 }
 

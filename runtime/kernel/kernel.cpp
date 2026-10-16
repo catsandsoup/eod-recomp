@@ -24,8 +24,12 @@
 #include "../iop/iop.h"
 #include "../iop/sif.h"
 #include "../platform/platform.h"
+#include "../core/prof.h"
+#include "../ui/overlay.h"
 
 void iop_pad_vblank();
+void game_patches_vblank();  // src/game_patches.cpp
+[[noreturn]] void app_exit(int code);  // main.cpp
 
 extern "C" volatile int g_ee_irq_pending;
 volatile int g_ee_irq_pending;
@@ -111,6 +115,7 @@ std::atomic<uint32_t> g_intc_new{0};
 uint32_t g_intc_mask = 0;
 std::atomic<uint32_t> g_dmac_pending{0};
 static void ee_sleep_us(uint32_t us) {
+    ProfScope prof(P_EE_IDLE);
     uint64_t t = platform_time_us();
     platform_sleep_us(us);
     g_ee_idle_us += platform_time_us() - t;
@@ -311,6 +316,22 @@ void debug_watch() {
     }
 }
 
+// The in-game menu holds the game: keep its window alive and the menu drawn,
+// then resume the timing as if no time had passed.
+static void hold_for_menu() {
+    ProfScope prof(P_EE_IDLE);
+    while (overlay_paused()) {
+        gs_overlay_redraw();
+        platform_sleep_us(16000);
+        if (!platform_pump()) {
+            LOG(LOG_CORE, "window closed - exiting");
+            app_exit(0);
+        }
+        overlay_frame();
+    }
+    g_next_vblank_us = platform_time_us() + (uint64_t)kVblankPeriodUs;
+}
+
 // Generates the timed events (vblank start/end set INTC_STAT even while
 // interrupts are disabled, as on hardware); alarm callbacks run only when
 // `run_alarms` (interrupts enabled).
@@ -340,17 +361,22 @@ void service_events(bool run_alarms) {
         if (now > g_next_vblank_us + 12 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
         g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
-        // SDL refreshes keyboard/gamepad state while pumping events. Publish
-        // that fresh state before GS backpressure or this vblank's IRQ.
         static const bool input_timing = getenv("EOD_INPUT_TIMING") != nullptr;
         static uint64_t previous_input_us, last_timing_us, max_gap, max_pump_dma, max_gs_block;
         static unsigned timing_lines;
         uint64_t input_begin = input_timing ? platform_time_us() : 0;
-        if (!vblank_poll_input()) {
+#ifdef _WIN32
+        iop_pad_vblank();
+#else
+        // SDL refreshes keyboard/gamepad state while pumping events. Publish
+        // that fresh state before GS backpressure or this vblank's IRQ.
+        // (Windows pumps after the IRQ, below; the SDL3 port pumps first for latency.)
+        if (!vblank_poll_input()) {  // platform_pump + iop_pad_vblank
             LOG(LOG_CORE, "window closed - exiting");
-            gs_shutdown();
-            exit(0);
+            app_exit(0);
         }
+#endif
+        game_patches_vblank();
         uint64_t input_end = (input_timing || timing_trace) ? platform_time_us() : 0;
         gs_vblank();
         if (timing_trace) {
@@ -379,6 +405,14 @@ void service_events(bool run_alarms) {
             if (g_vsync_flag_cnt_addr) MEM_SD(g_vsync_flag_cnt_addr, g_vblank_count);
         }
         intc_raise(INTC_VBLANK_S);
+#ifdef _WIN32
+        if (!platform_pump()) {
+            LOG(LOG_CORE, "window closed - exiting");
+            app_exit(0);
+        }
+#endif
+        overlay_frame();
+        if (overlay_paused()) hold_for_menu();
     }
     if (timing_trace) eod_timing::report(platform_time_us(), g_vblank_count, g_config.frame_skip);
     for (int i = 0; i < 64 && run_alarms; i++) {
@@ -971,8 +1005,7 @@ int handle_syscall(int num) {
         return (int)sif_get_reg(a0);
     case 0x7B:  // ExecOSD
         LOG(LOG_CORE, "ExecOSD - exiting");
-        gs_shutdown();
-        exit(0);
+        app_exit(0);
     case 0x7C:  // Deci2Call
         return -1;
     case 0x7D:  // PSMode
@@ -1141,6 +1174,7 @@ void kernel_init(int, const char *const *) {
 }
 
 void kernel_run(uint32_t entry) {
+    prof_thread_begin(P_EE_GAME);
     g_threads[1].entry = entry;
     memset(&g_ee, 0, sizeof g_ee);
     g_ints_enabled = false;
