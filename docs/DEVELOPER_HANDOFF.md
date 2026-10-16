@@ -279,3 +279,37 @@ frame/VRAM differences remain. See `GS_COLD_PACKET_REPLAY.md` for software
 comparison, scope and exact next experiment. All 41 CTests pass. The installed
 app retains b15d0d9's two verified performance changes; the added source hook is
 only a diagnostic. Player original-speed/latency acceptance remains incomplete.
+
+## 2P race at 60 fps at RenderScale 4 and 5 — October 17 continuation
+
+**Cause:** at 4x the race-start dip was not GPU throughput (GPU ~43% busy) but
+serialization: MoltenVK encodes a whole command buffer before the GPU starts,
+and the frame-end submit waited for the previous frame's encode + GPU time. At
+5x the GPU itself was the limit: `ps_draw` (one shader branching on push-constant
+flags) cost ~15 ms of fragment time per frame in heavy race frames; one draw of
+large blended quads over P1's view took ~5.5 ms of it. Windowed play also never
+got MoltenVK's async submits (SDL loaded MoltenVK before the setting was made).
+
+**Changes (all exact, Vulkan/macOS only):**
+- Mid-frame submits (`vk_compat.h`): submitted command buffers go to a queue of
+  flights recycled when their fence signals; after 1024 draws
+  (`EOD_VK_CHUNK_DRAWS`, 0 = off) a render-pass boundary submits without
+  waiting. Frame ends still wait for the previous frame end (one frame in flight).
+- Specialized `ps_draw` pipelines: spec constants `c_flags_value`/`c_flags_known`
+  fold the flag tests; a low-QoS background thread builds the variant on first
+  use while the generic pipeline draws (`EOD_VK_SPECIALIZE` 0 off, 1 background,
+  2 synchronous). Pipeline creation is a function of the key (`create_pipeline`).
+- `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0` is set by a static initializer.
+- Diagnostic: `EOD_VK_PASS_LOG=1` prints one line per render pass/submit.
+
+**Gate:** display PPM and 4 MiB VRAM identical to the pre-change build at
+RenderScale 1, 4 and 6 for race2p-5000, race2p, codex-native2p, three heavy
+late-race captures and race2p-start (specializer modes 0/1/2); ctest 44/44.
+
+**Result (live scripted 2P race, headless muted, 5 s windows from the
+countdown):** 1x 59.9 median / 56.5 min, 4x 59.9 / 56.3, 5x 59.9 / 56.9 (the
+countdown windows run at ~57 at every scale: the game's own rate). Before: 4x
+59.8 / 45, 5x 51.7 / 38.6. Windowed muted 4x: 59.9 median, countdown 57.
+Not done: the one-off race-load texture decode (no longer causes vblank debt
+> 2 ms), the two-pass alpha draws (still ~2x fragment work for alpha-tested
+geometry), full-surface conversion passes.
