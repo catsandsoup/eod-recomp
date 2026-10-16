@@ -697,6 +697,10 @@ ID3D11Texture2D *g_rb_tex,
     *g_rb_staging; // readback target and staging (R32_UINT 2048x2048)
 ID3D11RenderTargetView *g_rb_rtv;
 // Deferred CPU-write preservation copies (see deferred_schedule).
+bool deferred_kick_enabled() {
+    static const bool enabled = [] { const char *v = getenv("EOD_DEFER_KICK"); return !v || atoi(v) != 0; }();
+    return enabled;
+}
 constexpr int kSlotPixels = 64;  // a slot holds one owner page rectangle (<= 64x64 GS pixels)
 constexpr int kSlots = 256;
 ID3D11Texture2D *g_drb_staging;   // kSlots slots of 64x64 R32 values, stacked vertically
@@ -849,7 +853,10 @@ struct DeferredPage {
 };
 DeferredPage *g_deferred[kPages];
 uint32_t g_deferred_count;
-struct DeferredStats { uint32_t scheduled, merged, waited, overwritten; } g_dstats;
+struct DeferredStats { uint32_t scheduled, merged, waited, overwritten, kicked; } g_dstats;
+// Scheduling hint only (never affects data): this page's previous deferral
+// had to be merged, so submit its copy right away to have it ready.
+bool g_deferred_merged_last[kPages];
 
 void deferred_free(uint32_t page) {
     DeferredPage *d = g_deferred[page];
@@ -903,6 +910,7 @@ void deferred_resolve(uint32_t page, const char *why = "") {
         }
     }
     g_dstats.merged++;
+    g_deferred_merged_last[page] = true;
     deferred_free(page);
 }
 
@@ -996,6 +1004,11 @@ void deferred_schedule(uint32_t page) {
     g_vram_ok[page] = true;
     g_cpu_valid_blocks[page] = 0xffffffffu;
     g_dstats.scheduled++;
+    if (g_deferred_merged_last[page] && deferred_kick_enabled()) {
+        // Start the GPU on it now (asynchronously) so a later merge rarely waits.
+        g_dev->submit(false);
+        g_dstats.kicked++;
+    }
 }
 
 // The CPU is about to store these pixels: their bits no longer need GPU data.
@@ -1056,6 +1069,7 @@ void deferred_cpu_written(const PageCoverage &cov, uint32_t bp, uint32_t bw, uin
         d->pending_blocks = pending;
         if (!pending) { // every bit rewritten by the CPU: the copy is never needed
             g_dstats.overwritten++;
+            g_deferred_merged_last[p] = false;
             deferred_free(p);
         }
     }
@@ -2582,8 +2596,9 @@ void stats_line(char *buf, size_t size) {
              (unsigned long long)e[6]);
     used = strlen(buf);
     snprintf(buf + used, size > used ? size - used : 0,
-             "; deferred preservation %u (merged %u, waited %u, overwritten %u, open %u)", g_dstats.scheduled,
-             g_dstats.merged, g_dstats.waited, g_dstats.overwritten, g_deferred_count);
+             "; deferred preservation %u (merged %u, waited %u, overwritten %u, kicked %u, open %u)",
+             g_dstats.scheduled, g_dstats.merged, g_dstats.waited, g_dstats.overwritten, g_dstats.kicked,
+             g_deferred_count);
     g_dstats = DeferredStats();
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
