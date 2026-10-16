@@ -24,6 +24,7 @@
 #include "../gs_state.h"
 #include "../gs_swizzle.h"
 #include "vk_compat.h"
+#include "gs_page_coverage.h"
 
 namespace gs {
 namespace hw {
@@ -1755,24 +1756,20 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     if (!g_on)
         return;
-    uint32_t requested_blocks[kPages];
+    const PageCoverage requested = page_coverage(bp, bw, psm, x, y, w, h);
     const bool trace = readback_trace_enabled();
-    if (trace) {
-        std::fill_n(requested_blocks, kPages, 0);
-        diagnostic_blocks(bp, bw, psm, x, y, w, h,
-                          [&](uint32_t page, uint32_t mask) { requested_blocks[page] |= mask; });
-    }
-    uint32_t first, count;
-    page_range(bp, bw, psm, x, y, w, h, first, count);
-    for (uint32_t k = 0; k < count; k++) {
-        uint32_t p = (first + k) % kPages;
+    // page_range is deliberately conservative, adding an extra page for any
+    // unaligned BP. Only actual physical GS blocks can require synchronization.
+    // This does not consult the diagnostic drawn masks or skip any needed data.
+    for (uint32_t i = 0; i < requested.count; ++i) {
+        uint32_t p = requested.pages[i];
         Surface *o = g_owner[p];
         if (!o || g_vram_ok[p])
             continue;
         if (trace && readback_trace_line())
             fprintf(stderr,"[gs-readback] frame=%llu cpu-read reason=%d request_bp=%x psm=%x rect=%d,%d,%d,%d page=%u owner_bp=%x owner_psm=%x requested_blocks=%08x drawn_blocks=%08x overlap=%08x\n",
                 (unsigned long long)g_frame_no,g_rb_reason,bp,psm,x,y,w,h,p,o->bp,o->psm,
-                requested_blocks[p],g_diag_draw_blocks[p],requested_blocks[p]&g_diag_draw_blocks[p]);
+                requested.touched[p],g_diag_draw_blocks[p],requested.touched[p]&g_diag_draw_blocks[p]);
         std::vector<PageRect> pages;
         surface_pages(o, o->h, pages);
         for (const PageRect &q : pages)

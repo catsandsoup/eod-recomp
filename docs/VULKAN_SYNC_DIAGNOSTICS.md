@@ -58,3 +58,29 @@ These diagnostics never skip, delay, or otherwise change required readbacks,
 CLUT contents, ownership decisions or rendering quality. They add CPU work only
 when explicitly enabled. A timestamp-query/submit-duration investigation may be
 needed if real GPU execution remains the bottleneck after dependency fixes.
+
+## Exact requested-page correction
+
+The measured 6x multiplayer trace contained 97 CPU readback events with zero
+requested-block masks. They all came from CT32 palette requests at BP `2FC4`,
+while the extra page was owned by the Z16S surface at BP `2BE0`. The existing
+`page_range` API unconditionally adds a page for non-page-aligned BP; the 16x16
+(or8x2) palette occupies only one actual physical page here. This was a proven
+request-address false dependency, independent of conservative draw footprints.
+
+`readback_pages` now enumerates physical GS blocks touched by the requested
+pixel rectangle and synchronizes only those pages. It still reads every required
+owned page, including palette data that genuinely overlaps GPU-written depth.
+`GSPageCoverage` compares this enumeration with brute per-pixel addresses for
+520 rectangles across13 GS formats, including unaligned coordinates/BP and VRAM
+wrap. The old general `page_range` API stays unchanged for its other callers.
+No output-quality reduction or dirty-mask-based readback skipping is involved.
+This removes unnecessary submissions by construction; its whole-race speedup
+still requires a matched run after integration.
+
+Separately, a generated one-pixel CPU upload on a GPU-owned page reproduced
+lost untouched pixels: software retained(37,83,126), baseline Vulkan returned the
+stale background(32,64,96). That ownership-preservation bug is **not fixed by
+exact requested-page enumeration**. Preserving all GPU pages before CPU writes
+could be expensive; a declared full-page overwrite is not enough proof when a
+transfer can be interrupted. It needs a separate correctness/coverage design.

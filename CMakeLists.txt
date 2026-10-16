@@ -158,6 +158,8 @@ if(EOD_VULKAN)
     add_test(NAME VulkanPresentTiming COMMAND eod_present_timing_test)
     add_executable(eod_gs_pixel_math_test tools/tests/gs_pixel_math_test.cpp)
     add_test(NAME GSPixelArithmetic COMMAND eod_gs_pixel_math_test)
+    add_executable(eod_gs_page_coverage_test tools/tests/gs_page_coverage_test.cpp runtime/gs/gs_mem.cpp)
+    add_test(NAME GSPageCoverage COMMAND eod_gs_page_coverage_test)
     add_executable(eod_gs_pixel_fixture tools/tests/gs_pixel_fixture.cpp runtime/gs/gs_mem.cpp)
     if(Python3_FOUND)
       add_test(NAME VulkanGSPixels COMMAND ${Python3_EXECUTABLE}
