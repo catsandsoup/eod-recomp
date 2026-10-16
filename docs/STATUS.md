@@ -63,12 +63,14 @@ from changing the game simulation rate. Mod implementation remains parked;
 All three component branches are merged locally into `macos`. Controller source
 includes the target SDK 2.8 sequenced DMA rumble route (`1325441`) as well as the
 RPC path, with producer-derived regression tests and independent code review.
-The combined native build passes eighteen CTests: virtual input, pad RPC/DMA,
+The fresh-chat handoff build passes all 22 CTests: virtual input, pad RPC/DMA,
 memory-card persistence across processes, ISO9660/import, headless Mac startup,
 relocated Vulkan path selection, offline audio volume, procedural GS pixel arithmetic and actual Vulkan pixels,
 native camera selection (four aspect cases), keyboard context, scripted analog
 pressure, movie full-state differential behavior, display composition and the
-deferred refresh-cadence policy.
+deferred refresh-cadence policy, exact physical-page coverage, alpha ordering/
+disjoint grouping, and worker shutdown. This does not replace full-game speed
+or clean-exit validation of the combined changes.
 
 The signed app contains static SDL, libusb, the Vulkan loader, MoltenVK and an
 app-relative ICD manifest. Linked dependency audit found no Homebrew absolute

@@ -81,12 +81,44 @@ game-themed presentation remains unfinished.
 
 With the default keyboard on player 1, the first controller takes player 2.
 For two controllers in plug order, set **Keyboard port** to **0** and restart.
+
+### Joining player two on Mac
+
+The original game's **“Press X for player 2”** means **PS2 Cross (✕)**, its
+Accept button. It does **not** mean the letter X on a Mac keyboard. The game
+still shows PS2 button artwork; Mac-specific in-game prompts remain unfinished.
+
+| Your setup | Settings before launch | What player two presses |
+| --- | --- | --- |
+| Keyboard for P1 + one controller for P2 | Keyboard port **1** (default); connect the controller | The controller's **bottom face button**: Xbox **A** or PlayStation **✕** |
+| Controller for P1 + keyboard for P2 | Keyboard port **2**, then restart | **Enter** with the Racing keyboard layout |
+| Two controllers | Keyboard port **0** (off), then restart; connect pads in player order | Bottom face button on the **second** controller |
+| One keyboard, no controller | Keyboard port **1** | Use **SINGLE**; a single keyboard currently controls one player and cannot join both ports |
+
+For a local race, navigate **ACTION → RACE → MULTI** with P1, then join and
+confirm P2 using P2's assigned device. Each player uses their own Accept button
+for their car selection. Continue through the original event/track choices.
+For a solo custom race, choose **SINGLE** instead. In menus, keyboard
+WASD/arrows navigate, **Enter** accepts and **Esc** goes back. During driving,
+Enter is not an extra accelerator binding; **W/Up** accelerates,
+**S/Down/Space** brakes and **A/D or Left/Right** steers.
+
+If the game asks you to insert a controller, check the keyboard player setting
+and controller assignment first. Choosing MULTI without a device assigned to P2
+does not create a second keyboard player. Scripted/virtual two-player checks
+pass; physical controller joining still needs hands-on confirmation.
+
 **Controller layout** offers Original (the default PS2 mapping) and Modern
 (analog RT gas / LT brake through Cross/Square pressure); restart after changing
 it. Modern is intended for the game's classic control schemes. Changing the
 game's own bindings can change which actions those inputs perform.
 Scripted two-player racing and virtual pads are verified; physical Rock Candy
 USB detection, trigger feel and rumble still need a connected device.
+
+Current rendering work: menu font interiors are corrected, and matched race
+captures support added horizontal scenery with preserved proportions. Full-speed
+4K multiplayer, the reported thin black lines and visible keyboard latency are
+still under investigation. See [current evidence and limits](docs/STATUS.md).
 
 Developer build steps, measured performance and known fidelity limits:
 [docs/MACOS.md](docs/MACOS.md). High-refresh and mod work remain deferred.
