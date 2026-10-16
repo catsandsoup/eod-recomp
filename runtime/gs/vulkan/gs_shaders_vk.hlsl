@@ -141,11 +141,15 @@ float4 sample_tex(float2 tc, int lvl, bool linear_filter) {
 // specialization (F_ATEST_PASS/F_ATEST_FAIL), so both halves share one set of
 // push constants. 0 leaves c_flags unchanged.
 [[vk::constant_id(0)]] const uint c_atest_select = 0;
+// When c_flags_known is set, c_flags_value equals c_flags (the pipeline was
+// specialized for this draw's flags): the flag tests fold at compile time.
+[[vk::constant_id(1)]] const uint c_flags_value = 0;
+[[vk::constant_id(2)]] const uint c_flags_known = 0;
 #endif
 
 PSOut ps_draw(VSOut i) {
 #ifdef VK
-    uint f = c_flags | c_atest_select;
+    uint f = (c_flags_known != 0 ? c_flags_value : c_flags) | c_atest_select;
 #else
     uint f = c_flags;
 #endif

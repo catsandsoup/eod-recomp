@@ -6,13 +6,20 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <vulkan/vulkan.h>
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#include <pthread.h>
+#include <sys/qos.h>
 #else
 #include <time.h>
 #endif
@@ -294,7 +301,7 @@ struct Context {
     }
     VkPhysicalDeviceMemoryProperties memories{};
     struct PipelineKey {
-        int32_t v[14];
+        int32_t v[16]; // ..., [13] alpha-test half, [14] ps_draw flags, [15] flags specialized
         bool operator==(const PipelineKey &o) const { return !memcmp(v, o.v, sizeof v); }
     };
     struct PipelineKeyHash {
@@ -308,6 +315,18 @@ struct Context {
     std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines;
     // Two-pass alpha draws alternate between two pipelines: check recent keys first.
     PipelineKey recentKeys[4]{};
+    // Specialized ps_draw pipelines (EOD_VK_SPECIALIZE: 0 off, 1 background, 2 synchronous).
+    static constexpr size_t kDrawFlagsOffset = 52; // DrawCB::flags
+    int specializeMode = 1;
+    Shader *shaderTable[16]{};
+    struct Specializer {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::deque<PipelineKey> queue;
+        std::vector<std::pair<PipelineKey, VkPipeline>> done;
+        std::atomic<bool> ready{false};
+        uint64_t compiled = 0, compile_us = 0; // under mutex
+    } *specializer = nullptr;
     VkPipeline recentPipelines[4]{};
     unsigned recentNext = 0;
     Texture *dummy[4]{}, *rt{}, *ds{}, *resources[4]{};
@@ -370,13 +389,13 @@ struct Context {
     }
     // Diagnostic (EOD_VK_PASS_LOG=1): one stderr line per render pass.
     int passLog = -1;
-    struct PassDiag { uint32_t w, h, rtf, ds, draws, verts, blend, spec, pass_ps, dwrite, sx0, sy0, sx1, sy1; } pd{};
+    struct PassDiag { uint32_t w, h, rtf, ds, draws, verts, blend, spec, pass_ps, dwrite, sx0, sy0, sx1, sy1; double area; } pd{};
     void end_render(int cause = 0) {
         if (rendering) {
             if (passLog > 0)
-                fprintf(stderr, "PASS %llu c%d %ux%u rt%u ds%u draws %u verts %u blend %u atest %u passps %u zw %u sc %u,%u-%u,%u\n",
+                fprintf(stderr, "PASS %llu c%d %ux%u rt%u ds%u draws %u verts %u blend %u atest %u passps %u zw %u sc %u,%u-%u,%u area %.0f\n",
                         (unsigned long long)passes, cause, pd.w, pd.h, pd.rtf, pd.ds, pd.draws, pd.verts, pd.blend,
-                        pd.spec, pd.pass_ps, pd.dwrite, pd.sx0, pd.sy0, pd.sx1, pd.sy1);
+                        pd.spec, pd.pass_ps, pd.dwrite, pd.sx0, pd.sy0, pd.sx1, pd.sy1, pd.area);
             ++pass_ends[cause];
             vkCmdEndRendering(cmd);
             rendering = false;
@@ -450,6 +469,8 @@ struct Context {
             return;
         }
         end_render();
+        if (passLog > 0)
+            fprintf(stderr, "SUBMIT %s\n", synchronous ? "sync" : frameEnd ? "frame" : "kick");
         require(vkEndCommandBuffer(cmd), "end commands");
         VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         s.commandBufferCount = 1;
@@ -765,6 +786,10 @@ struct Context {
             samplers[n + i] = s[i];
     }
     void Draw(UINT count, UINT first);
+    VkPipeline create_pipeline(const PipelineKey &key);
+    VkPipeline find_pipeline(const PipelineKey &key);
+    void remember(const PipelineKey &key, VkPipeline pipeline);
+    VkPipeline specialized(const PipelineKey &key);
     bool init(bool withWindow);
     bool resize();
     Texture *acquire(bool vsync);
@@ -791,6 +816,150 @@ inline Texture::~Texture() {
         }
     });
 }
+inline VkPipeline Context::create_pipeline(const PipelineKey &k) {
+    // Everything comes from the key (and the shader modules of its ids), so
+    // the asynchronous specializer can build the same pipeline off-thread.
+    Shader *vs = shaderTable[k.v[0]], *ps = shaderTable[k.v[1]];
+    const int topology = k.v[2];
+    const bool hasRt = k.v[3] != VK_FORMAT_UNDEFINED, hasDs = k.v[4] != VK_FORMAT_UNDEFINED;
+    D3D11_RENDER_TARGET_BLEND_DESC b;
+    b.BlendEnable = k.v[5];
+    b.SrcBlend = k.v[6];
+    b.DestBlend = k.v[7];
+    b.BlendOp = k.v[8];
+    b.RenderTargetWriteMask = (uint8_t)k.v[9];
+    D3D11_DEPTH_STENCIL_DESC z;
+    z.DepthEnable = k.v[10];
+    z.DepthWriteMask = k.v[11];
+    z.DepthFunc = k.v[12];
+    const uint32_t specialization = (uint32_t)k.v[13];
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    for (int i = 0; i < 2; i++) {
+        auto *s = i ? ps : vs;
+        stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+        stages[i].module = s->module;
+        stages[i].pName = s->entry;
+    }
+    const uint32_t specData[3] = {specialization, (uint32_t)k.v[14], (uint32_t)k.v[15]};
+    VkSpecializationMapEntry specEntry[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo specInfo{3, specEntry, sizeof specData, specData};
+    if (ps->id == 1)
+        stages[1].pSpecializationInfo = &specInfo;
+    VkVertexInputBindingDescription binding{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attrs[] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+                                                 {1, 0, VK_FORMAT_R32_UINT, 8},
+                                                 {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 12},
+                                                 {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 16},
+                                                 {4, 0, VK_FORMAT_R32_SFLOAT, 28}};
+    VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    if (vs->id == 0) {
+        input.vertexBindingDescriptionCount = 1;
+        input.pVertexBindingDescriptions = &binding;
+        input.vertexAttributeDescriptionCount = 5;
+        input.pVertexAttributeDescriptions = attrs;
+    }
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = (VkPrimitiveTopology)topology;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.depthClampEnable = VK_TRUE;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dz{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dz.depthTestEnable = z.DepthEnable;
+    dz.depthWriteEnable = z.DepthWriteMask;
+    dz.depthCompareOp = (VkCompareOp)z.DepthFunc;
+    VkPipelineColorBlendAttachmentState cb{};
+    cb.blendEnable = b.BlendEnable;
+    cb.srcColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.SrcBlend : VK_BLEND_FACTOR_ONE;
+    cb.dstColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.DestBlend : VK_BLEND_FACTOR_ZERO;
+    cb.colorBlendOp = (VkBlendOp)b.BlendOp;
+    cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cb.alphaBlendOp = VK_BLEND_OP_ADD;
+    cb.colorWriteMask = b.RenderTargetWriteMask;
+    VkPipelineColorBlendStateCreateInfo blendInfo{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blendInfo.attachmentCount = hasRt ? 1 : 0;
+    blendInfo.pAttachments = &cb;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                            VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 3;
+    dynamic.pDynamicStates = dyn;
+    VkFormat color = (VkFormat)k.v[3];
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = hasRt ? 1 : 0;
+    renderingInfo.pColorAttachmentFormats = &color;
+    renderingInfo.depthAttachmentFormat = hasDs ? (VkFormat)k.v[4] : VK_FORMAT_UNDEFINED;
+    VkGraphicsPipelineCreateInfo p{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    p.pNext = &renderingInfo;
+    p.stageCount = 2;
+    p.pStages = stages;
+    p.pVertexInputState = &input;
+    p.pInputAssemblyState = &ia;
+    p.pViewportState = &vp;
+    p.pRasterizationState = &rs;
+    p.pMultisampleState = &ms;
+    p.pDepthStencilState = &dz;
+    p.pColorBlendState = &blendInfo;
+    p.pDynamicState = &dynamic;
+    p.layout = layout;
+    require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &p, nullptr, &pipeline), "graphics pipeline");
+    return pipeline;
+}
+inline VkPipeline Context::find_pipeline(const PipelineKey &key) {
+    for (unsigned i = 0; i < 4; i++)
+        if (recentPipelines[i] && recentKeys[i] == key)
+            return recentPipelines[i];
+    auto found = pipelines.find(key);
+    if (found == pipelines.end() || !found->second)
+        return VK_NULL_HANDLE;
+    remember(key, found->second);
+    return found->second;
+}
+inline void Context::remember(const PipelineKey &key, VkPipeline pipeline) {
+    recentKeys[recentNext] = key;
+    recentPipelines[recentNext] = pipeline;
+    recentNext = (recentNext + 1) % 4;
+}
+// Returns the specialized pipeline if it can be had now: synchronously in mode
+// 2 (deterministic, for comparisons), else queued once for a background thread
+// (VK_NULL_HANDLE until it is ready).
+inline VkPipeline Context::specialized(const PipelineKey &key) {
+    if (specializeMode == 2) {
+        uint64_t pipeline_start = now_us();
+        VkPipeline pipeline = create_pipeline(key);
+        pipeline_us += now_us() - pipeline_start;
+        pipelines.emplace(key, pipeline);
+        remember(key, pipeline);
+        return pipeline;
+    }
+    if (specializer->ready.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(specializer->mutex);
+        for (auto &done : specializer->done)
+            pipelines[done.first] = done.second;
+        specializer->done.clear();
+        specializer->ready.store(false, std::memory_order_relaxed);
+        auto found = pipelines.find(key);
+        if (found != pipelines.end() && found->second) {
+            remember(key, found->second);
+            return found->second;
+        }
+    }
+    if (pipelines.emplace(key, VK_NULL_HANDLE).second) { // first request
+        std::lock_guard<std::mutex> lock(specializer->mutex);
+        specializer->queue.push_back(key);
+        specializer->wake.notify_one();
+    }
+    return VK_NULL_HANDLE;
+}
 inline void Context::Draw(UINT count, UINT first) {
     if (!rt && !ds)
         return;
@@ -806,104 +975,33 @@ inline void Context::Draw(UINT count, UINT first) {
     const auto &b = blend->desc.RenderTarget[0];
     const auto &z = depth->desc;
     const uint32_t specialization = ps->id == 1 ? fragmentSpecialization : 0;
-    const PipelineKey key{{vs->id, ps->id, topology, (int32_t)(rt ? rt->desc.Format : VK_FORMAT_UNDEFINED),
-                           (int32_t)(ds ? ds->desc.Format : VK_FORMAT_UNDEFINED), b.BlendEnable, b.SrcBlend,
-                           b.DestBlend, b.BlendOp, b.RenderTargetWriteMask, z.DepthEnable, z.DepthWriteMask,
-                           z.DepthFunc, (int32_t)specialization}};
+    PipelineKey key{{vs->id, ps->id, topology, (int32_t)(rt ? rt->desc.Format : VK_FORMAT_UNDEFINED),
+                     (int32_t)(ds ? ds->desc.Format : VK_FORMAT_UNDEFINED), b.BlendEnable, b.SrcBlend, b.DestBlend,
+                     b.BlendOp, b.RenderTargetWriteMask, z.DepthEnable, z.DepthWriteMask, z.DepthFunc,
+                     (int32_t)specialization, 0, 0}};
+    if (shaderTable[vs->id] != vs) // set once: the specializer thread reads it
+        shaderTable[vs->id] = vs;
+    if (shaderTable[ps->id] != ps)
+        shaderTable[ps->id] = ps;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    for (unsigned i = 0; i < 4 && !pipeline; i++)
-        if (recentPipelines[i] && recentKeys[i] == key)
-            pipeline = recentPipelines[i];
+    if (specializeMode && ps->id == 1) {
+        // ps_draw specialized for this draw's flags (identical results, fewer
+        // instructions/registers). Until it exists, the generic pipeline draws.
+        PipelineKey special = key;
+        memcpy(&special.v[14], constants[0]->data.data() + kDrawFlagsOffset, 4);
+        special.v[15] = 1;
+        pipeline = find_pipeline(special);
+        if (!pipeline)
+            pipeline = specialized(special);
+    }
+    if (!pipeline)
+        pipeline = find_pipeline(key);
     if (!pipeline) {
-        auto found = pipelines.find(key);
-        if (found != pipelines.end())
-            pipeline = found->second;
-        else {
-            uint64_t pipeline_start = now_us();
-            VkPipelineShaderStageCreateInfo stages[2]{};
-            for (int i = 0; i < 2; i++) {
-                auto *s = i ? ps : vs;
-                stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-                stages[i].module = s->module;
-                stages[i].pName = s->entry;
-            }
-            VkSpecializationMapEntry specEntry{0, 0, sizeof specialization};
-            VkSpecializationInfo specInfo{1, &specEntry, sizeof specialization, &specialization};
-            if (ps->id == 1)
-                stages[1].pSpecializationInfo = &specInfo;
-            VkVertexInputBindingDescription binding{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
-            VkVertexInputAttributeDescription attrs[] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
-                                                         {1, 0, VK_FORMAT_R32_UINT, 8},
-                                                         {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 12},
-                                                         {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 16},
-                                                         {4, 0, VK_FORMAT_R32_SFLOAT, 28}};
-            VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-            if (vs->id == 0) {
-                input.vertexBindingDescriptionCount = 1;
-                input.pVertexBindingDescriptions = &binding;
-                input.vertexAttributeDescriptionCount = 5;
-                input.pVertexAttributeDescriptions = attrs;
-            }
-            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-            ia.topology = (VkPrimitiveTopology)topology;
-            VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-            vp.viewportCount = vp.scissorCount = 1;
-            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-            rs.depthClampEnable = VK_TRUE;
-            rs.polygonMode = VK_POLYGON_MODE_FILL;
-            rs.cullMode = VK_CULL_MODE_NONE;
-            rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-            rs.lineWidth = 1;
-            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-            VkPipelineDepthStencilStateCreateInfo dz{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-            dz.depthTestEnable = z.DepthEnable;
-            dz.depthWriteEnable = z.DepthWriteMask;
-            dz.depthCompareOp = (VkCompareOp)z.DepthFunc;
-            VkPipelineColorBlendAttachmentState cb{};
-            cb.blendEnable = b.BlendEnable;
-            cb.srcColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.SrcBlend : VK_BLEND_FACTOR_ONE;
-            cb.dstColorBlendFactor = b.BlendEnable ? (VkBlendFactor)b.DestBlend : VK_BLEND_FACTOR_ZERO;
-            cb.colorBlendOp = (VkBlendOp)b.BlendOp;
-            cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-            cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-            cb.alphaBlendOp = VK_BLEND_OP_ADD;
-            cb.colorWriteMask = b.RenderTargetWriteMask;
-            VkPipelineColorBlendStateCreateInfo blendInfo{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-            blendInfo.attachmentCount = rt ? 1 : 0;
-            blendInfo.pAttachments = &cb;
-            VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                    VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-            VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-            dynamic.dynamicStateCount = 3;
-            dynamic.pDynamicStates = dyn;
-            VkFormat color = rt ? rt->desc.Format : VK_FORMAT_UNDEFINED;
-            VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-            renderingInfo.colorAttachmentCount = rt ? 1 : 0;
-            renderingInfo.pColorAttachmentFormats = &color;
-            renderingInfo.depthAttachmentFormat = ds ? ds->desc.Format : VK_FORMAT_UNDEFINED;
-            VkGraphicsPipelineCreateInfo p{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-            p.pNext = &renderingInfo;
-            p.stageCount = 2;
-            p.pStages = stages;
-            p.pVertexInputState = &input;
-            p.pInputAssemblyState = &ia;
-            p.pViewportState = &vp;
-            p.pRasterizationState = &rs;
-            p.pMultisampleState = &ms;
-            p.pDepthStencilState = &dz;
-            p.pColorBlendState = &blendInfo;
-            p.pDynamicState = &dynamic;
-            p.layout = layout;
-            require(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &p, nullptr, &pipeline),
-                    "graphics pipeline");
-            pipeline_us += now_us() - pipeline_start;
-            pipelines.emplace(key, pipeline);
-        }
-        recentKeys[recentNext] = key;
-        recentPipelines[recentNext] = pipeline;
-        recentNext = (recentNext + 1) % 4;
+        uint64_t pipeline_start = now_us();
+        pipeline = create_pipeline(key);
+        pipeline_us += now_us() - pipeline_start;
+        pipelines.emplace(key, pipeline);
+        remember(key, pipeline);
     }
     auto *target = rt ? rt : ds;
     if (!rendering) {
@@ -954,6 +1052,13 @@ inline void Context::Draw(UINT count, UINT first) {
     if (passLog > 0) {
         pd.draws++; pd.verts += count; pd.blend += b.BlendEnable; pd.spec += specialization != 0; pd.pass_ps += vs->id != 0;
         pd.dwrite += z.DepthEnable && z.DepthWriteMask;
+        if (vs->id == 0 && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+            for (UINT t = 0; t + 2 < count; t += 3) {
+                const float *a = (const float *)(vertices->data.data() + (size_t)(first + t) * 32);
+                const float *b = (const float *)(vertices->data.data() + (size_t)(first + t + 1) * 32);
+                const float *c = (const float *)(vertices->data.data() + (size_t)(first + t + 2) * 32);
+                pd.area += std::fabs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) * 0.5;
+            }
         pd.sx0 = std::min<uint32_t>(pd.sx0, rect.offset.x); pd.sy0 = std::min<uint32_t>(pd.sy0, rect.offset.y);
         pd.sx1 = std::max<uint32_t>(pd.sx1, rect.offset.x + rect.extent.width); pd.sy1 = std::max<uint32_t>(pd.sy1, rect.offset.y + rect.extent.height);
     }
@@ -1162,6 +1267,35 @@ inline bool Context::init(bool withWindow) {
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &pc;
     require(vkCreatePipelineLayout(device, &pl, nullptr, &layout), "pipeline layout");
+    if (const char *v = getenv("EOD_VK_SPECIALIZE"))
+        specializeMode = std::clamp(atoi(v), 0, 2);
+    if (specializeMode == 1) {
+        specializer = new Specializer; // lives for the process (no join at exit)
+        std::thread([this, sp = specializer] {
+#ifdef __APPLE__
+            // Below the EE/GS threads: the compile (and Metal's compiler
+            // service, which inherits the QoS) uses otherwise idle cores.
+            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+            for (;;) {
+                PipelineKey key;
+                {
+                    std::unique_lock<std::mutex> lock(sp->mutex);
+                    sp->wake.wait(lock, [sp] { return !sp->queue.empty(); });
+                    key = sp->queue.front();
+                    sp->queue.pop_front();
+                }
+                const uint64_t start = now_us();
+                VkPipeline pipeline = create_pipeline(key);
+                const uint64_t took = now_us() - start;
+                std::lock_guard<std::mutex> lock(sp->mutex);
+                sp->compiled++;
+                sp->compile_us += took;
+                sp->done.emplace_back(key, pipeline);
+                sp->ready.store(true, std::memory_order_release);
+            }
+        }).detach();
+    }
     VkFormat formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R16G16_UINT};
     uint32_t zero = 0;
     D3D11_SUBRESOURCE_DATA init{&zero, 4, 0};
