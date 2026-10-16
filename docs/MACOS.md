@@ -56,8 +56,13 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
    in the app), then a test with the physical pad.
 3. Player-facing packaging: `.app` bundle / DMG, first-run "choose your disc"
    flow, settings UI (the Windows `eodsetup.exe` equivalent).
-4. Movie decode is slow during the intro (EE 100% busy, few movie frames/s)
-   — check the IPU path on arm64.
+4. Intro playback still needs fidelity/performance work. A bounded 8-second
+   Apple Silicon CPU sample during `logos.pss` found the translated bitstream
+   consume/refill helper `0039AFB0` at about 35% of main-thread self samples,
+   with peek/consume wrapper `0039B048` at about 13%. Native IPU IDCT was below
+   1% of self samples. This points to translated bitstream parsing as the first
+   optimization target for that sampled segment; it does not establish the
+   bottleneck for every movie or justify changing playback timing.
 
 ## Personal Mac app
 
@@ -126,3 +131,19 @@ tools/test_app_vulkan.sh "/path/Eve of Destruction.app" /path/race2p.gsd /tmp/ap
 ```
 
 The script stays headless/muted and fails if replay falls back to software.
+
+## Audio fidelity check
+
+User volume is applied once by the shared SPU2 mixer. The SDL output stream
+uses unity gain (or zero when disabled), so the Mac path no longer attenuates
+50% volume twice. `audio_volume_offline` feeds constant planar stereo PCM
+through the actual SPU2 AutoDMA/mixer and an unbound SDL stream, retrieves the
+samples into memory, and checks 100%/50%/0% amplitudes of 11998/5999/0. It never
+opens an audio device, window, or plays sound.
+
+This fixes an output-level regression, not the whole PS2 sound model. The
+current voice resampler is linear; noise/pitch-modulation and reverb fields
+are stored but are not implemented in the mixing loop. Audio is driven from
+wall-clock time, with a 100 ms catch-up limit and a 200 ms output queue cap.
+Those approximations still require original-hardware or trusted-reference
+comparison before describing audio or FMV synchronization as 1:1.
