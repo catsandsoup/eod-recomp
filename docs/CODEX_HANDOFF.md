@@ -1,10 +1,10 @@
 # Fresh-chat continuation — 2026-10-16
 
-**LATEST OWNER PRIORITY (supersedes quality ordering below):** establish accurate,
-stable, full-speed native1x PS2 rendering first, then work sequentially through
-2x,4x,6x. Higher-detail LOD/quality-ceiling work is deferred until the native
-baseline is sound. Current HUD comparison is finishing; native1x solo/MP
-accuracy and performance are next, without frame skipping. DLSS stays last.
+**LATEST OWNER PRIORITY (supersedes historical ordering below):** native 1x,
+original 4:3, 1:1 behavior, full speed and stability without frame skipping first;
+then LOD/draw distance and proper widescreen; then higher resolutions sequentially;
+then higher FPS; DLSS last. Read `DEVELOPER_HANDOFF.md` for the published source,
+reproducible build and current limitations. Native full-game acceptance remains open.
 
 **New owner steering after this handoff:** LOD/draw-distance overhaul and correct
 widescreen/ultrawide culling are now HIGH priority, exempt from the otherwise

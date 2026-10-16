@@ -54,6 +54,8 @@ In order of priority:
 
 ## macOS (Apple Silicon)
 
+Developer review/build instructions and experimental branch map: [contribution handoff](docs/DEVELOPER_HANDOFF.md).
+
 This fork adds a native arm64 Mac app with Vulkan/MoltenVK graphics, SDL3
 audio and two independent player ports for split screen. It is still a work
 in progress; [the player journey](docs/PLAYER_JOURNEY.md) distinguishes tested
