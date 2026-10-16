@@ -6,7 +6,7 @@
 // have a delay slot and the E bit ends the program after the next pair.
 #include "vu.h"
 
-#include <emmintrin.h>
+#include "sse_compat.h"
 
 #include <cmath>
 #include <cstring>
@@ -434,6 +434,7 @@ void upper(Ctx &c, uint32_t ins) {
             float f = s.f[k] * sc[ext & 3];
             if (f >= 2147483647.0f) r.s[k] = 0x7FFFFFFF;
             else if (f <= -2147483648.0f) r.s[k] = (int32_t)0x80000000;
+            else if (f != f) r.s[k] = (int32_t)0x80000000;  // NaN: as x86 cvttss
             else r.s[k] = (int32_t)f;
         }
         c.up_write = true;
