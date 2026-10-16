@@ -6,7 +6,7 @@ recompiled game code; no emulator, no Rosetta.
 ## Building
 
 ```sh
-brew install cmake ninja libusb molten-vk vulkan-loader vulkan-headers molten-vk vulkan-loader vulkan-headers
+brew install cmake ninja libusb molten-vk vulkan-loader vulkan-headers
 python3 -m venv .venv && .venv/bin/pip install rabbitizer
 cp "<your disc folder>/SLUS_209.10" .          # NTSC-U v1.00, never committed
 .venv/bin/python tools/analyze.py && .venv/bin/python tools/recomp.py && .venv/bin/python tools/vurecomp.py
@@ -40,29 +40,14 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
 
 ## Remaining validation
 
-1. Visible resize/fullscreen, native first-run/settings dialogs and even 120 Hz
-   presentation cadence need an interactive check; automation stays headless.
+1. Visible resize/fullscreen and native first-run/settings dialogs need an
+   interactive check; automation stays headless. High-refresh work is deferred.
 2. Physical Rock Candy controller verification: bundled SDL/libusb and virtual
-   tests pass, but no physical pad was connected during takeover.
-3. Intro movie decoding is slower than gameplay on arm64; investigate IPU
-   separately. All event types and career persistence still need extended play.
-
-1. **Rendering speed.** The software GS draws ~27–34 fps in a 2P race
-   (`--gs-replay` of a captured race frame: ~29 ms/frame with 4 raster
-   workers; more workers do not help, the workers mostly wait on each other
-   between primitive batches). The game itself runs at 60. Fix: a Vulkan GS
-   renderer running on macOS through MoltenVK (the route other PS2 recomps
-   take first, for compatibility), ported from `runtime/gs/d3d11/` with the
-   same design (GPU surfaces owning GS pages, one pipeline shader). The
-   existing HLSL shader compiles to SPIR-V, so D3D11 and Vulkan share one
-   shader source. It also gives Retina internal resolution. A native Metal
-   backend can come later if MoltenVK costs too much.
-2. **Xbox 360 wired pads (Rock Candy).** macOS has no 360 driver; SDL reaches
-   them through HIDAPI over libusb, but Homebrew's SDL3 is built without
-   libusb. Needs SDL3 built from source with `SDL_HIDAPI_LIBUSB=ON` (bundled
-   in the app), then a test with the physical pad.
-3. Player-facing packaging: `.app` bundle / DMG, first-run "choose your disc"
-   flow, settings UI (the Windows `eodsetup.exe` equivalent).
+   tests pass, but no physical pad was connected during takeover. Original
+   pressure mappings also need a usable modern throttle/brake layout.
+3. Career save/resume and every event type need actual journey verification.
+   Packet-level memory-card persistence tests pass; these alone do not establish
+   that the game saves and resumes a career correctly.
 4. Intro playback still needs fidelity/performance work. A bounded 8-second
    Apple Silicon CPU sample during `logos.pss` found the translated bitstream
    consume/refill helper `0039AFB0` at about 35% of main-thread self samples,
