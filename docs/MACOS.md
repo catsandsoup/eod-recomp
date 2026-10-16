@@ -6,7 +6,7 @@ recompiled game code; no emulator, no Rosetta.
 ## Building
 
 ```sh
-brew install cmake ninja sdl3 libusb
+brew install cmake ninja sdl3 libusb molten-vk vulkan-loader vulkan-headers
 python3 -m venv .venv && .venv/bin/pip install rabbitizer
 cp "<your disc folder>/SLUS_209.10" .          # NTSC-U v1.00, never committed
 .venv/bin/python tools/analyze.py && .venv/bin/python tools/recomp.py && .venv/bin/python tools/vurecomp.py
@@ -38,25 +38,14 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
 | Test input | `EOD_PAD_SCRIPT` (port 1) and `EOD_PAD_SCRIPT1` (port 2), optional left stick per entry: `frame:buttons:lx:ly`. |
 | Threads | EE, GS, raster and offload threads ask for user-interactive QoS (P-cores). `EOD_GS_RASTER=n` is no longer capped at 4 when given explicitly. |
 
-## Known gaps (in order)
+## Remaining validation
 
-1. **Rendering speed.** The software GS draws ~27–34 fps in a 2P race
-   (`--gs-replay` of a captured race frame: ~29 ms/frame with 4 raster
-   workers; more workers do not help, the workers mostly wait on each other
-   between primitive batches). The game itself runs at 60. Fix: a Vulkan GS
-   renderer running on macOS through MoltenVK (the route other PS2 recomps
-   take first, for compatibility), ported from `runtime/gs/d3d11/` with the
-   same design (GPU surfaces owning GS pages, one pipeline shader). The
-   existing HLSL shader compiles to SPIR-V, so D3D11 and Vulkan share one
-   shader source. It also gives Retina internal resolution. A native Metal
-   backend can come later if MoltenVK costs too much.
-2. **Physical Xbox 360 wired pad verification (Rock Candy).** The build now
-   includes SDL HIDAPI over libusb; the virtual tests verify input conversion
-   and hot-plug, but a physical Rock Candy pad still needs the check below.
-3. Player-facing packaging: `.app` bundle / DMG, first-run "choose your disc"
-   flow, settings UI (the Windows `eodsetup.exe` equivalent).
-4. Movie decode is slow during the intro (EE 100% busy, few movie frames/s)
-   — check the IPU path on arm64.
+1. Visible resize/fullscreen, native first-run/settings dialogs and even 120 Hz
+   presentation cadence need an interactive check; automation stays headless.
+2. Physical Rock Candy controller verification: bundled SDL/libusb and virtual
+   tests pass, but no physical pad was connected during takeover.
+3. Intro movie decoding is slower than gameplay on arm64; investigate IPU
+   separately. All event types and career persistence still need extended play.
 
 ## Controllers and Rock Candy Xbox 360 wired pads
 
@@ -155,3 +144,45 @@ tools/make_dmg.sh
 
 Native dialogs are compile-verified only; automated tests never open visible
 windows or play audio. The app and DMG are personal builds only.
+
+## Vulkan GS backend
+
+`--renderer vulkan` is the macOS default when Vulkan headers/loader and SDL3
+are available at configure time. `--renderer software` remains available;
+`-DEOD_VULKAN=OFF` builds the software-only port. If the loader cannot discover
+MoltenVK, set `VK_DRIVER_FILES` (or `VK_ICD_FILENAMES`) to its ICD JSON, normally
+`/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json` for a Homebrew CLI build.
+
+The backend retains the D3D11 renderer's GS page ownership, texture cache and
+shader logic. Vulkan 1.3 dynamic rendering, push descriptors, dual-source
+blending and depth clamp are required. Two fence-owned command/upload slots
+allow CPU/GPU overlap. Sparse page conversions are coalesced without covering
+unowned holes. Readbacks synchronize transfer writes to host reads. Default
+presentation is FIFO; disabling vsync uses immediate/mailbox when supported.
+`RenderScale=0` selects an initial scale covering the window's pixel height
+(1x offscreen); explicit values 1–6 override it. A 1964-pixel panel needs 5x.
+`EOD_SCREENSHOT_SCALE=5` captures the 5x composition rather than a 1x screenshot.
+
+Verified 2026-10-16 on M2 Pro, entirely headless and muted:
+
+- Existing `work/race2p.gsd`, 509,709 primitives / **nine** game frames per replay:
+  software with four workers 369.8 ms; warm Vulkan 1x 113.0 ms (12.56 ms/frame),
+  Vulkan 5x 120.4 ms (13.38 ms/frame). These are renderer replay timings;
+  they do not prove visible presentation cadence.
+- At 1x, RGB mean absolute difference versus software is 1.641/255;
+  95% of channel differences are at most 4. Images are close, not bit exact.
+  The 5x raster downsampled to 1x differs more (MAE 6.956/255).
+- 379 forced rendered-page readbacks pass. Invalid ICD discovery falls back
+  to software headlessly. SPIR-V regeneration validates all ten modules.
+- 5x replay plus a 3200×2240 screenshot peaks near 1.00 GB total memory
+  footprint including GPU allocations (315 MB resident), with no swaps.
+- Scripted two-player racing reaches approximately 59.9 game/drawn frames/s;
+  transient asset-loading dips remain. Logs and screenshots are local work
+  artifacts, not committed game data.
+
+Repeat full-game comparisons with `EOD_TEST_RENDERER=vulkan` and optionally
+`EOD_TEST_CONFIG=work/vulkan5.ini` when invoking `tools/test_2p_race.sh`.
+For a replay, save each generated `.gsd.ppm` before running another renderer,
+because the next run overwrites that filename. Shader sources can be rebuilt
+with `python3 tools/build_vk_shaders.py` (glslang and spirv-tools required);
+the normal build uses the checked-in SPIR-V arrays.

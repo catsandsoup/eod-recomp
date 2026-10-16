@@ -26,6 +26,7 @@
 #ifdef __APPLE__
 #include "../../app/macos_app.h"
 #endif
+#include "../../gs/gs_hw.h"
 #include "../pad_script.h"
 #include "../platform.h"
 #include "sdl_input.h"
@@ -34,6 +35,7 @@ namespace {
 
 PlatformConfig g_cfg;
 bool g_headless;
+bool g_vulkan_window;
 SDL_Window *g_window;
 SDL_Renderer *g_renderer;
 SDL_Texture *g_texture;
@@ -160,12 +162,16 @@ bool platform_init(const PlatformConfig &cfg) {
 
     if (!g_headless) {
         SDL_WindowFlags wf = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef EOD_VULKAN
+        if (g_config.renderer == "vulkan") { wf |= SDL_WINDOW_VULKAN; g_vulkan_window=true; }
+#endif
         if (cfg.fullscreen) wf |= SDL_WINDOW_FULLSCREEN;
         g_window = SDL_CreateWindow(cfg.title, cfg.width, cfg.height, wf);
         if (!g_window) {
             fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
             return false;
         }
+        if (!g_vulkan_window) {
         g_renderer = SDL_CreateRenderer(g_window, nullptr);
         if (!g_renderer) {
             fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
@@ -173,6 +179,7 @@ bool platform_init(const PlatformConfig &cfg) {
         }
         SDL_SetRenderVSync(g_renderer, g_config.vsync ? 1 : 0);
         fprintf(stderr, "[video] SDL renderer: %s\n", SDL_GetRendererName(g_renderer));
+        }
     }
 
     int kb = sdl_input::keyboard_port();
@@ -255,6 +262,22 @@ void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
 }
 
 void platform_present(const uint32_t *pixels, int width, int height, int stride) {
+    // Hardware initialization can fail after SDL created its Vulkan window.
+    // Recreate that window for the software presenter on this main thread.
+    if (!g_headless && !g_renderer && g_vulkan_window && !gs::hw::g_on) {
+        SDL_DestroyWindow(g_window);
+        SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        if (g_cfg.fullscreen) flags |= SDL_WINDOW_FULLSCREEN;
+        g_window = SDL_CreateWindow(g_cfg.title, g_cfg.width, g_cfg.height, flags);
+        g_vulkan_window = false;
+        g_renderer = g_window ? SDL_CreateRenderer(g_window, nullptr) : nullptr;
+        if (!g_renderer) {
+            fprintf(stderr, "[video] software fallback display failed: %s\n", SDL_GetError());
+            return;
+        }
+        SDL_SetRenderVSync(g_renderer, g_config.vsync ? 1 : 0);
+        fprintf(stderr, "[video] software fallback: %s\n", SDL_GetRendererName(g_renderer));
+    }
     if (g_headless || !g_renderer) {
         g_last_frame.resize((size_t)width * height);
         for (int y = 0; y < height; y++)
@@ -292,7 +315,7 @@ bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {
     return true;
 }
 
-void *platform_native_window() { return nullptr; }  // no D3D11; the GS renderer is software here
+void *platform_native_window() { return g_vulkan_window ? g_window : nullptr; }
 
 void platform_set_status(const char *text) {
     if (!g_window) return;

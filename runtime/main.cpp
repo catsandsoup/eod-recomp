@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
         else if (a == "--list-pads") list_pads = true;
         else if (a == "--watch") watch_pads = atoi(next());
         else if (a == "--help" || a == "-h") {
-            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
+            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
