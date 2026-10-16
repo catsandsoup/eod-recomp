@@ -51,14 +51,63 @@ if(WIN32)
 else()
   file(GLOB PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/posix/*.cpp)
   # SDL3: window, audio and controllers (required on macOS; optional elsewhere,
-  # where the build without it is the headless test backend)
+  # where the build without it is the headless test backend).
+  #
+  # EOD_BUNDLED_SDL builds SDL3 from source (pinned release) with HIDAPI over
+  # libusb, linked statically into eod. That is how Xbox 360 wired pads (Rock
+  # Candy and other third-party 360 pads) work on macOS, which has no 360
+  # driver: Homebrew's SDL3 is built without libusb and never sees them.
+  # libusb itself comes from Homebrew (brew install libusb) and is linked
+  # dynamically, so a .app bundle must ship libusb-1.0.0.dylib (docs/MACOS.md).
+  # OFF: use an installed SDL3 (find_package), e.g. Homebrew's, without 360 pads.
   if(APPLE)
+    option(EOD_BUNDLED_SDL "build SDL3 from source with libusb HIDAPI (Xbox 360 pads)" ON)
+  else()
+    option(EOD_BUNDLED_SDL "build SDL3 from source with libusb HIDAPI (Xbox 360 pads)" OFF)
+  endif()
+  if(EOD_BUNDLED_SDL)
+    include(FetchContent)
+    set(EOD_SDL_VERSION 3.4.18)
+    # Homebrew's libusb (SDL's FindLibUSB uses pkg-config, then find_library)
+    foreach(prefix /opt/homebrew/opt/libusb /usr/local/opt/libusb)
+      if(EXISTS ${prefix}/include/libusb-1.0/libusb.h)
+        list(APPEND CMAKE_PREFIX_PATH ${prefix})
+        set(LibUSB_ROOT ${prefix})
+      endif()
+    endforeach()
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI_JOYSTICK ON CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI_LIBUSB ON CACHE BOOL "" FORCE)
+    # link libusb directly instead of dlopen()ing it by an absolute Homebrew
+    # path: otool -L shows the dependency and bundling tools can rewrite it
+    set(SDL_HIDAPI_LIBUSB_SHARED OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3
+      URL https://github.com/libsdl-org/SDL/releases/download/release-${EOD_SDL_VERSION}/SDL3-${EOD_SDL_VERSION}.tar.gz
+      URL_HASH SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(SDL3)
+    # SDL silently drops libusb when it can't find it; for 360 pads it is the point
+    get_directory_property(_sdl_libusb DIRECTORY ${sdl3_SOURCE_DIR} DEFINITION HAVE_HIDAPI_LIBUSB)
+    if(NOT _sdl_libusb)
+      message(FATAL_ERROR "bundled SDL3 was configured without libusb: brew install libusb "
+                          "(or -DEOD_BUNDLED_SDL=OFF for an installed SDL3 without Xbox 360 pads)")
+    endif()
+    message(STATUS "SDL3 ${EOD_SDL_VERSION} from source, HIDAPI over libusb")
+    set(SDL3_FOUND TRUE)
+  elseif(APPLE)
     find_package(SDL3 REQUIRED CONFIG)
   else()
     find_package(SDL3 QUIET CONFIG)
   endif()
   if(SDL3_FOUND)
-    list(APPEND PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/platform_sdl3.cpp)
+    list(APPEND PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/platform_sdl3.cpp
+                                 ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/sdl_input.cpp)
   endif()
 endif()
 
@@ -124,6 +173,21 @@ else()
   target_link_libraries(eod PRIVATE Threads::Threads m)
   if(SDL3_FOUND)
     target_compile_definitions(eod PRIVATE EOD_SDL3)
+    if(EOD_BUNDLED_SDL)
+      target_compile_definitions(eod PRIVATE EOD_SDL_LIBUSB)
+    endif()
     target_link_libraries(eod PRIVATE SDL3::SDL3)
+    # controller tests without hardware: SDL virtual joysticks posing as an
+    # Xbox 360 / PDP Rock Candy pad (port assignment, triggers, hot-plug)
+    enable_testing()
+    add_executable(eod_input_test ${CMAKE_SOURCE_DIR}/tools/input_test/input_test.cpp
+                   ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/sdl_input.cpp)
+    target_include_directories(eod_input_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_SOURCE_DIR}/runtime)
+    target_link_libraries(eod_input_test PRIVATE SDL3::SDL3)
+    add_executable(eod_pad_rpc_test tools/input_test/pad_rpc_test.cpp runtime/iop/pad.cpp)
+    target_include_directories(eod_pad_rpc_test PRIVATE runtime/include runtime)
+    add_test(NAME pad_rpc COMMAND eod_pad_rpc_test)
+    add_test(NAME input COMMAND eod_input_test)
+    set_tests_properties(input pad_rpc PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   endif()
 endif()

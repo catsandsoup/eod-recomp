@@ -87,11 +87,31 @@ void write_pad_data(int port, int slot) {
     if (!hs.connected) d[1] = 0;
     ee_write_block(p.pad_area + (p.frame & 1) * 128, d, 128);
 
-    // vibration values the EE sent with scePadSetActDirect (2 x 32 bytes)
+    // vibration values the EE may DMA here (2 x 32 bytes); libpad 2.8 sends
+    // them with SET_ACTDIR instead (below), so this only reports a surprise
     if (p.iop_buf) {
-        const uint8_t *a = g_iop_ram + p.iop_buf + ((p.frame - 1) & 1) * 32;
-        (void)a;
+        static bool reported;
+        const uint8_t *a = g_iop_ram + p.iop_buf;
+        for (int i = 0; i < 64 && !reported; i++)
+            if (a[i]) {
+                reported = true;
+                LOG(LOG_PAD, "pad %d: actuator data in the IOP buffer (unhandled)", port);
+            }
     }
+}
+
+// scePadSetActDirect: one byte per actuator slot, routed by the alignment
+// from scePadSetActAlign (0 = small motor, on/off; 1 = large motor, 0-255).
+void set_actuators(int port, int slot, const uint8_t *data) {
+    Port &p = g_ports[port][slot];
+    uint8_t small = 0, large = 0;
+    for (int i = 0; i < 6; i++) {
+        if (p.act_align[i] == 0) small = data[i];
+        else if (p.act_align[i] == 1) large = data[i];
+    }
+    if (slot != 0) return;  // no multitap
+    LOG(LOG_PAD, "pad %d vibration small %d large %d", port, small, large);
+    platform_set_vibration(port, small ? 1 : 0, large);
 }
 
 }  // namespace
@@ -129,7 +149,9 @@ void iop_pad_init() {
             LOG(LOG_PAD, "pad %d main mode %s lock %d", port, p.analog ? "analog" : "digital", p.lock);
             break;
         }
-        case 0x07:  // SET_ACTDIR
+        case 0x07:  // SET_ACTDIR(port, slot, data[6]): vibration
+            set_actuators(port, slot, buf + 0xC);
+            g_ports[port][slot].req_state = PAD_RSTAT_COMPLETE;
             break;
         case 0x08: {  // SET_ACTALIGN(port, slot, align[6])
             Port &p = g_ports[port][slot];
@@ -157,6 +179,7 @@ void iop_pad_init() {
             break;
         case 0x0E:  // CLOSE
             g_ports[port][slot].open = false;
+            if (slot == 0) platform_set_vibration(port, 0, 0);
             break;
         case 0x0F:  // END
         case 0x10:  // INIT

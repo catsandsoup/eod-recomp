@@ -126,6 +126,8 @@ int main(int argc, char **argv) {
     const char *log_spec = getenv("EOD_LOG");
     const char *replay = nullptr;
     int repeat = 3;
+    bool list_pads = false;
+    int watch_pads = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * {
@@ -153,16 +155,20 @@ int main(int argc, char **argv) {
         else if (a == "--screenshot-dir") g_opt_screenshot_dir = next();
         else if (a == "--gs-replay") replay = next();
         else if (a == "--repeat") repeat = atoi(next());
+        else if (a == "--list-pads") list_pads = true;
+        else if (a == "--watch") watch_pads = atoi(next());
         else if (a == "--help" || a == "-h") {
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
+                   "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
-                   argv[0]);
+                   argv[0], argv[0]);
             return 0;
         }
     }
     log_init(log_spec);
+    if (list_pads || watch_pads > 0) return platform_list_pads(watch_pads);
     if (replay) return gs_replay(replay, repeat);
 
 #ifdef HAVE_SSE
