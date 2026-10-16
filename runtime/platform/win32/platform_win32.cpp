@@ -189,14 +189,17 @@ void audio_pump() {
 
 // ------------------------------------------------------------- ticker
 void (*g_tick_cb)();
+HANDLE g_tick_thread;
+volatile LONG g_tick_stop;
 DWORD WINAPI ticker_thread(LPVOID p) {
     unsigned period = (unsigned)(uintptr_t)p;
     DWORD ms = period / 1000;
     if (ms == 0) ms = 1;
-    for (;;) {
+    while (!InterlockedCompareExchange(&g_tick_stop, 0, 0)) {
         Sleep(ms);
-        g_tick_cb();
+        if (!InterlockedCompareExchange(&g_tick_stop, 0, 0)) g_tick_cb();
     }
+    return 0;
 }
 
 }  // namespace
@@ -532,12 +535,18 @@ void fiber_delete(HostFiber *f) {
     delete f;
 }
 
+void platform_stop_ticker() {
+    InterlockedExchange(&g_tick_stop, 1);
+    if (g_tick_thread) { WaitForSingleObject(g_tick_thread, INFINITE); CloseHandle(g_tick_thread); g_tick_thread = nullptr; }
+}
 void platform_start_ticker(void (*cb)(), unsigned period_us) {
+    platform_stop_ticker();
+    InterlockedExchange(&g_tick_stop, 0);
     g_tick_cb = cb;
     HANDLE t = CreateThread(nullptr, 0, ticker_thread, (LPVOID)(uintptr_t)period_us, 0, nullptr);
     if (t) {
         SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
-        CloseHandle(t);
+        g_tick_thread = t;
     }
 }
 

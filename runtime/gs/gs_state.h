@@ -60,6 +60,7 @@ void clut_load(uint64_t tex0);
 // primitives, and order other VRAM accesses after the primitives they touch
 void raster_start(int n);
 void raster_sync();
+void raster_shutdown();
 // forgets cached state after VRAM/registers were replaced (GS replay)
 void raster_reset();
 // marks the pages drawn since the last env change as written (gs_mem.h page tracking)

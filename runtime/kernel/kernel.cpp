@@ -338,6 +338,7 @@ void service_events(bool run_alarms) {
         uint64_t input_begin = input_timing ? platform_time_us() : 0;
         if (!vblank_poll_input()) {
             LOG(LOG_CORE, "window closed - exiting");
+            gs_shutdown();
             exit(0);
         }
         uint64_t input_end = input_timing ? platform_time_us() : 0;
@@ -742,6 +743,7 @@ int handle_syscall(int num) {
     case 0x04:  // Exit
         LOG(LOG_CORE, "Exit(%d)", (int)a0);
         if (a0) cpu_dump_state();
+        gs_shutdown();
         exit((int)a0);
     case 0x06:  // LoadExecPS2
     case 0x07: {  // ExecPS2
@@ -954,6 +956,7 @@ int handle_syscall(int num) {
         return (int)sif_get_reg(a0);
     case 0x7B:  // ExecOSD
         LOG(LOG_CORE, "ExecOSD - exiting");
+        gs_shutdown();
         exit(0);
     case 0x7C:  // Deci2Call
         return -1;
