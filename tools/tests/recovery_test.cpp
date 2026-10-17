@@ -44,6 +44,12 @@ int main() {
     g_ee={};g_ee.r[4].uw[0]=EE_RAM_SIZE-4;g_ee.r[5].uw[0]=p;
     f_001B8370();check(resets==5,"invalid timer native passthrough");
     check(calls==8,"native exactly once");
+    // The settings UI updates g_config in-process: no reload or restart.
+    MEM_SW(p+4,car); MEM_SW(car+12,0x50434152); MEM_SW(car+480,0x50);
+    g_config.manual_recovery=false; invoke();
+    check(resets==6 && MEM_LW(p+192)==0xffffffff,"live toggle off restores automatic recovery");
+    g_config.manual_recovery=true; invoke();
+    check(resets==6 && MEM_LW(p+192)==0 && getf(p+196)==15,"live toggle on suppresses recovery again");
     Config c; c.manual_recovery=true;
     const char *path="recovery-test.ini";
     check(config_save(path,c),"save");Config read;check(config_load(path,read)&&read.manual_recovery,"config round trip");std::remove(path);
