@@ -106,7 +106,10 @@ the installed disc are beside it. The settings dialog identifies changes
 that require a relaunch. The current settings use standard Mac controls;
 game-themed presentation remains unfinished.
 
-With the default keyboard on player 1, the first controller takes player 2.
+Automatic keyboard assignment (`KeyboardPort=-1`) puts the first controller on
+player 1 and the keyboard on player 2; keyboard alone starts on player 1.
+Existing explicit keyboard-port settings are preserved; choose -1 in Settings
+and restart to use automatic assignment.
 For two controllers in plug order, set **Keyboard port** to **0** and restart.
 
 ### Joining player two on Mac

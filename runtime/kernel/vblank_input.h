@@ -8,3 +8,11 @@ inline bool vblank_poll_input() {
     iop_pad_vblank();
     return true;
 }
+
+// Wait for rendering before sampling: events that arrive during GS backpressure
+// must be visible to the EE consumer on this same vblank.
+template<class FinishGraphics>
+inline bool vblank_finish_and_poll_input(FinishGraphics finish_graphics) {
+    finish_graphics();
+    return vblank_poll_input();
+}

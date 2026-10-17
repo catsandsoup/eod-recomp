@@ -86,7 +86,7 @@ bool mac_app_settings() {
         {"Fullscreen",std::to_string(g_config.fullscreen)}, {"VSync",std::to_string(g_config.vsync)},
         {"Aspect (next launch)",g_config.aspect}, {"Smooth display",std::to_string(g_config.smooth_display)},
         {"Frame skip",std::to_string(g_config.frame_skip)}, {"Audio enabled",std::to_string(g_config.audio)},
-        {"Volume (0–100)",std::to_string(g_config.volume)}, {"Keyboard port (0 off, 1, 2)",std::to_string(g_config.keyboard_port)},
+        {"Volume (0–100)",std::to_string(g_config.volume)}, {"Keyboard port (-1 auto, 0 off, 1, 2)",std::to_string(g_config.keyboard_port)},
         {"Vibration",std::to_string(g_config.vibration)}, {"Memory card folder",g_config.memcard_dir}, {"Disc folder",g_config.data_dir},
         {"Controller layout",g_config.controller_layout}, {"Keyboard layout",g_config.keyboard_layout}
     };
@@ -136,7 +136,7 @@ bool mac_app_settings() {
     c.renderer=value(0); c.render_scale=number(1,0,6); c.width=number(2,320,16384); c.height=number(3,240,16384);
     c.fullscreen=number(4,0,1); c.vsync=number(5,0,1); c.aspect=value(6);
     c.smooth_display=number(7,0,1); c.frame_skip=number(8,0,1); c.audio=number(9,0,1); c.volume=number(10,0,100);
-    c.keyboard_port=number(11,0,2); c.vibration=number(12,0,1); c.memcard_dir=value(13); c.data_dir=value(14);
+    c.keyboard_port=number(11,-1,2); c.vibration=number(12,0,1); c.memcard_dir=value(13); c.data_dir=value(14);
     c.controller_layout=value(15);c.keyboard_layout=value(16);
     for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(17+i);
     if (c.aspect!="auto" && c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="stretch") { error("Aspect must be auto (the game's Widescreen option), 4:3, 16:9 or stretch."); return false; }

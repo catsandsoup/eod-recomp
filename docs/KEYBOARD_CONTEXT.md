@@ -32,10 +32,11 @@ S/Down/Space for Square (brake), A/D or Left/Right for steering, and Escape
 for Start (pause). Enter has no driving action. Other configured keys retain
 their PS2 bindings. Reserved Racing keys override conflicting PS2 bindings,
 so Enter never sends Cross plus Start and Space never sends Circle in a race.
-Opposite directions cancel to center. A key held across a context change
-must be released before it can acquire a different action; this includes
-Escape opening Pause, Enter leaving Title, W crossing from Menu into Driving,
-and custom keys. Original bindings remain independent of game context.
+Opposite directions cancel to center. Held gas/steering and custom bindings remain live across context changes,
+including countdown and temporary modals. Enter and Escape alone require release
+before acquiring a new context action, preventing a held Pause from backing out
+and a title Accept from also accepting the next menu. Focus loss publishes neutral
+keyboard/gamepad state and stops rumble; focus return uses SDL's current snapshot. Original bindings remain independent of game context.
 
 `eod_keyboard_test` exercises these cases and layout config round trips.
 The target state evidence above is disassembly evidence; actual full-game
@@ -47,8 +48,9 @@ validation, not established by a pure mapper test.
 Host events must be pumped before publishing this vblank's IOP pad DMA. SDL's
 `SDL_GetKeyboardState` returns its last event-pump snapshot. The former order
 (Pad DMA, GS/present, event pump) therefore published a stale key state and
-could delay the next refresh behind GS work. The kernel now pumps once, then
-publishes pad DMA, then services GS and the existing vblank flags/IRQ. Quit
+could delay the next refresh behind GS work. The SDL kernel now services GS first, then pumps once and publishes pad DMA
+immediately before the existing vblank flags/IRQ. Events arriving while GS
+blocks are therefore included in this vblank rather than the next. Quit
 returns before publishing pad data. `pad_rpc_test` models queued keydown and
 release events and reads the actual pad DMA halves: all three freshness/quit
 checks fail with the former order and pass with the corrected order.

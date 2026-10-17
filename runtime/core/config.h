@@ -40,7 +40,7 @@ struct Config {
     std::string keys[KEY_COUNT];
     bool vibration = true;
 #ifndef _WIN32  // SDL3 input options
-    int keyboard_port = 1;           // 0: disabled, 1 or 2: player port
+    int keyboard_port = -1;          // -1: automatic, 0: disabled, 1 or 2: player port
     std::string keyboard_layout = "racing"; // racing (context-aware WASD/arrows) | original (Key_* bindings)
     std::string controller_layout = "original"; // original | modern (RT Cross, LT Square pressure)
 #endif

@@ -127,7 +127,7 @@ void test_conversions() {
     const char *old = getenv("EOD_KEYBOARD_PORT");
     (void)old;
     unsetenv("EOD_KEYBOARD_PORT");
-    CHECK(sdl_input::keyboard_port_from_env() == 0, "keyboard defaults to player 1");
+    CHECK(sdl_input::keyboard_port_from_env() == -2, "keyboard defaults to automatic");
     setenv("EOD_KEYBOARD_PORT", "2", 1);
     CHECK(sdl_input::keyboard_port_from_env() == 1, "EOD_KEYBOARD_PORT=2");
     setenv("EOD_KEYBOARD_PORT", "none", 1);
@@ -242,6 +242,13 @@ void test_rock_candy_with_keyboard() {
     CHECK(rc.rumble_low == 0 && rc.rumble_high == 0, "rumble off");
     CHECK(!sdl_input::rumble(0, 1, 255), "no rumble on the keyboard port");
 
+    set_button(rc, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    HostPadState unfocused;
+    sdl_input::read_gamepad(sdl_input::port_gamepad(1), &unfocused, false);
+    CHECK(unfocused.connected && unfocused.buttons==0, "focus loss neutralizes held gamepad input");
+    CHECK(read_port(1).buttons==PAD_CROSS, "focus return restores held gamepad input");
+    set_button(rc, SDL_GAMEPAD_BUTTON_SOUTH, false);
+
     // a second pad: both ports now have a pad (the keyboard shares player 1)
     Pad ms;
     attach(ms, 0x045E, 0x028E, "Xbox 360 Controller");
@@ -286,6 +293,38 @@ void test_rock_candy_with_keyboard() {
     CHECK(!sdl_input::port_gamepad(0) && sdl_input::port_of(rc.id) == 1, "player 1 back to keyboard only");
     detach(rc);
     sdl_input::close_all();
+}
+
+void test_auto_ports() {
+    sdl_input::set_keyboard_port(-2); // automatic keyboard fallback
+    CHECK(sdl_input::keyboard_port()==0, "keyboard alone controls P1");
+    Pad a,b;
+    attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(a.id)==0, "lone pad controls P1");
+    CHECK(sdl_input::keyboard_port()==1, "keyboard joins P2 with lone pad");
+    attach(b, 0x045E, 0x028E, "Xbox 360 Controller");
+    CHECK(sdl_input::port_of(b.id)==1, "second pad controls P2");
+    detach(a);
+    CHECK(sdl_input::keyboard_port()==1, "keyboard does not swap players when P1 disconnects");
+    detach(b);
+    attach(b, 0x045E, 0x028E, "Xbox 360 Controller");
+    CHECK(sdl_input::port_of(b.id)==1, "reconnect restores P2 even with P1 absent");
+    attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(a.id)==0, "reconnect restores P1");
+    detach(a); detach(b); sdl_input::close_all();
+}
+
+void test_identical_pads_keep_live_slots() {
+    sdl_input::set_keyboard_port(-2);
+    Pad a,b;
+    attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    attach(b, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(a.id)==0 && sdl_input::port_of(b.id)==1, "identical pads occupy separate slots");
+    detach(a);
+    CHECK(sdl_input::port_of(b.id)==1, "disconnect does not swap identical live P2");
+    attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(a.id)==0 && sdl_input::port_of(b.id)==1, "reconnect cannot steal live P2");
+    detach(a); detach(b); sdl_input::close_all();
 }
 
 void test_two_pads_no_keyboard() {
@@ -382,6 +421,8 @@ int main() {
     }
     test_conversions();
     test_rock_candy_with_keyboard();
+    test_auto_ports();
+    test_identical_pads_keep_live_slots();
     test_two_pads_no_keyboard();
     test_keyboard_on_player_2();
     test_modern_triggers();

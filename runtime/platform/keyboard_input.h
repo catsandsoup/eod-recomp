@@ -23,9 +23,12 @@ class Mapper {
     Context previous_context_ = Context::Menu;
     bool initialized_ = false, previous_racing_ = false;
 public:
-    HostPadState read(const Keys &physical, Context ctx, bool racing, const std::vector<Binding> &bindings) {
+    HostPadState read(const Keys &snapshot, Context ctx, bool racing, const std::vector<Binding> &bindings, bool focused = true) {
+        const Keys physical = focused ? snapshot : Keys{};
+        // Only menu action keys need release-to-rearm: held gas, steering and
+        // unchanged custom bindings must survive menu/countdown transitions.
         if (initialized_ && ((racing && ctx != previous_context_) || racing != previous_racing_))
-            for (size_t k = 0; k < physical.size(); ++k) blocked_[k] = physical[k] && previous_[k];
+            for (size_t k = 0; k < physical.size(); ++k) blocked_[k] = (k == 0x0d || k == 0x1b) && physical[k] && previous_[k];
         Keys keys{};
         for (size_t k = 0; k < keys.size(); ++k) {
             if (!physical[k]) blocked_[k] = false;

@@ -39,7 +39,7 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
 | Floats | `-ffp-contract=off` on arm64 so no FMA fusing: results match the x86 build. |
 | Fibers | Direct arm64 register switch instead of ucontext (deprecated on macOS; swapcontext makes a syscall per switch). |
 | Platform | `runtime/platform/sdl3/platform_sdl3.cpp`: window (SDL renderer, Metal), audio stream, keyboard + hot-plugged controllers on two player ports, analog triggers → L2/R2 pressure, rumble. |
-| Input ports | Keyboard on `EOD_KEYBOARD_PORT` (1, 2 or `none`; default 1); the first controller takes the other port, and the second shares the keyboard port. Set `EOD_KEYBOARD_PORT=none` for two pads in P1/P2 plug order. Existing players keep their port on hot-plug. |
+| Input ports | Automatic (`KeyboardPort=-1`, or `EOD_KEYBOARD_PORT=auto`) assigns the first pad to P1 and then the keyboard to P2; a second pad takes P2. Keyboard alone starts on P1. Existing connected pads keep their ports on hot-plug; known reconnects restore free remembered slots. Explicit INI ports 0 (off), 1, 2 retain legacy behavior; environment ports are `none`, 1, 2. Saved settings are preserved. |
 | Test input | `EOD_PAD_SCRIPT` (port 1) and `EOD_PAD_SCRIPT1` (port 2), optional left stick per entry: `frame:buttons:lx:ly`. |
 | Threads | EE, GS, raster and offload threads ask for user-interactive QoS (P-cores). `EOD_GS_RASTER=n` is no longer capped at 4 when given explicitly. |
 
