@@ -15,3 +15,5 @@
 # event instead of spinning.
 0035C460 idle     # frame loop: wait for the vblank counter to change
 0035C528 idle     # frame loop: wait for the draw-done state (1 or 7)
+
+001B8370 wrap     # optional manual-only human countdown recovery
