@@ -77,7 +77,7 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
 bool mac_app_settings() {
     [NSApplication sharedApplication];
     NSAlert *a = [NSAlert new]; a.messageText = @"Settings";
-    a.informativeText = @"Press F2 during play for Controls and player 2 help, including current device assignments. Window size, fullscreen, smoothing, volume and key bindings apply now. Aspect ratio, camera projection and other changes apply on the next launch. PS2 key fields below apply only to the Original keyboard preset. Multiple keys may be separated by commas.";
+    a.informativeText = @"Press F2 during play for Controls and player 2 help, including current device assignments. Window size, fullscreen, smoothing, volume, key bindings and manual recovery apply now. Aspect ratio, camera projection and other changes apply on the next launch. PS2 key fields below apply only to the Original keyboard preset. Multiple keys may be separated by commas.";
     [a addButtonWithTitle:@"Save"]; [a addButtonWithTitle:@"Cancel"];
     struct Field { std::string label; std::string value; };
     std::vector<Field> fields = {
@@ -88,7 +88,8 @@ bool mac_app_settings() {
         {"Frame skip",std::to_string(g_config.frame_skip)}, {"Audio enabled",std::to_string(g_config.audio)},
         {"Volume (0–100)",std::to_string(g_config.volume)}, {"Keyboard port (-1 auto, 0 off, 1, 2)",std::to_string(g_config.keyboard_port)},
         {"Vibration",std::to_string(g_config.vibration)}, {"Memory card folder",g_config.memcard_dir}, {"Disc folder",g_config.data_dir},
-        {"Controller layout",g_config.controller_layout}, {"Keyboard layout",g_config.keyboard_layout}, {"Detail (next launch)",g_config.detail}
+        {"Controller layout",g_config.controller_layout}, {"Keyboard layout",g_config.keyboard_layout}, {"Detail (next launch)",g_config.detail},
+        {"Manual recovery only",std::to_string(g_config.manual_recovery)}
     };
     for (int i=0;i<KEY_COUNT;i++) fields.push_back({kPadKeyLabels[i],g_config.keys[i]});
     NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0,0,560,430)]; scroll.hasVerticalScroller = YES;
@@ -98,7 +99,7 @@ bool mac_app_settings() {
         CGFloat y = (fields.size()-i-1)*32;
         NSTextField *label=[NSTextField labelWithString:ns(fields[i].label)]; label.frame=NSMakeRect(0,y+5,215,22); [view addSubview:label];
         NSControl *input;
-        if (i==4 || i==5 || i==7 || i==8 || i==9 || i==12) {
+        if (i==4 || i==5 || i==7 || i==8 || i==9 || i==12 || i==18) {
             NSButton *check=[NSButton checkboxWithTitle:@"Enabled" target:nil action:nil];
             check.state=fields[i].value=="1" ? NSControlStateValueOn : NSControlStateValueOff;
             input=check;
@@ -122,6 +123,7 @@ bool mac_app_settings() {
             NSTextField *text=[[NSTextField alloc] initWithFrame:NSZeroRect];
             text.stringValue=ns(fields[i].value); input=text;
         }
+        if (i==18) input.toolTip=@"Explore without automatic wrong-way, upside-down or off-track countdown resets. SELECT still recovers your car. Applies when you save; AI recovery is unchanged.";
         input.frame=NSMakeRect(220,y,310,26); [view addSubview:input]; [inputs addObject:input];
     }
     scroll.documentView=view; [view scrollPoint:NSMakePoint(0,view.frame.size.height)]; a.accessoryView=scroll;
@@ -143,7 +145,8 @@ bool mac_app_settings() {
     c.keyboard_port=number(11,-1,2); c.vibration=number(12,0,1); c.memcard_dir=value(13); c.data_dir=value(14);
     c.controller_layout=value(15);c.keyboard_layout=value(16);
     c.detail=value(17);
-    for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(18+i);
+    c.manual_recovery=number(18,0,1);
+    for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(19+i);
     if (c.aspect!="auto" && c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="stretch") { error("Aspect must be auto (the game's Widescreen option), 4:3, 16:9 or stretch."); return false; }
     if (c.renderer!="software" && c.renderer!="vulkan") { error("Renderer must be software (or vulkan in a build with Vulkan support)."); return false; }
     if (!config_save(config_path,c)) { error("Could not save settings. Check the settings folder permissions."); return false; }

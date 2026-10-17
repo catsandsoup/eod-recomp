@@ -84,3 +84,11 @@ Production validation: all 48 CTest cases passed (15.95s), including
 ManualRecovery. Full Release app build completed; strict deep codesign
 verification passed. Neither generated validation predicate nor diagnostic log
 strings remains in the restored generated files.
+
+Live UI toggle: open Settings (F1 or Command-comma on Mac), change
+“Manual recovery only”, and Save. It applies when gameplay resumes without a
+restart. The Windows overlay exposes the same checkbox in its Gameplay tab;
+it applies immediately, and Save settings persists it. Turning it off restores
+native countdown recovery. The CPU regression exercises off/on changes in one
+process. The Mac settings UI builds successfully; Windows UI interaction has not
+been tested locally.
