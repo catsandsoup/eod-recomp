@@ -282,6 +282,12 @@ void tab_controls() {
     }
 }
 
+void tab_gameplay() {
+    ImGui::Checkbox("Manual recovery only", &g_config.manual_recovery);
+    help("Explore without automatic wrong-way, upside-down or off-track countdown resets. "
+         "SELECT still recovers your car. Applies immediately; AI recovery is unchanged.");
+}
+
 void tab_system() {
     ImGui::Checkbox("Pause the game while this menu is open", &g_config.pause_in_menu);
     ImGui::Spacing();
@@ -310,6 +316,10 @@ void draw_menu() {
             }
             if (ImGui::BeginTabItem("Controls")) {
                 tab_controls();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Gameplay")) {
+                tab_gameplay();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("System")) {
