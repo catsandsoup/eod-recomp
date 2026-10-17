@@ -188,11 +188,14 @@ else()
       # EOD_MAC_APP: also <build>/Eve of Destruction.app, with the libraries it
       # uses (SDL3, libusb, the Vulkan loader and MoltenVK) copied in and
       # ad-hoc signed (tools/macos/bundle.py). The game's files are not included.
+      # codesign refuses the Finder metadata that iCloud Drive puts on folders
+      # in Desktop/Documents: EOD_APP_DIR can put the app somewhere else.
       option(EOD_MAC_APP "build Eve of Destruction.app (macOS)" OFF)
+      set(EOD_APP_DIR "${CMAKE_BINARY_DIR}" CACHE PATH "folder for Eve of Destruction.app (EOD_MAC_APP)")
       if(EOD_MAC_APP)
         add_custom_target(eod_app ALL
           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/macos/bundle.py
-                  "${CMAKE_BINARY_DIR}/Eve of Destruction.app" $<TARGET_FILE:eod>
+                  "${EOD_APP_DIR}/Eve of Destruction.app" $<TARGET_FILE:eod>
           DEPENDS eod VERBATIM)
       endif()
     endif()
