@@ -8,7 +8,8 @@ namespace sdl_input {
 
 namespace {
 
-int g_keyboard_port = 0;
+int g_keyboard_port = -2; // automatic: keyboard alone P1, with a P1 pad P2
+std::string g_port_identity[kPorts];
 bool g_modern_layout = false;
 SDL_JoystickID g_port_pad[kPorts];
 SDL_Gamepad *g_port_gamepad[kPorts];
@@ -61,6 +62,17 @@ const char *pad_name(SDL_JoystickID id) {
     return n ? n : "controller";
 }
 
+std::string identity(SDL_Gamepad *gp, SDL_JoystickID id) {
+    char guid[33]; SDL_GUIDToString(SDL_GetGamepadGUIDForID(id), guid, sizeof guid);
+    std::string key = guid;
+    const char *serial = SDL_GetGamepadSerial(gp);
+    const char *path = SDL_GetGamepadPath(gp);
+    if (serial && *serial) key += std::string(":serial:") + serial;
+    else if (path && *path) key += std::string(":path:") + path;
+    // Devices without a serial/path can only be distinguished by GUID.
+    return key;
+}
+
 int free_port() {
     for (int p = 0; p < kPorts; p++)
         if (p != g_keyboard_port && !g_port_pad[p]) return p;
@@ -89,7 +101,7 @@ void set_hints() {
 
 int keyboard_port_from_env() {
     const char *kp = getenv("EOD_KEYBOARD_PORT");
-    if (!kp || !kp[0]) return 0;
+    if (!kp || !kp[0] || !strcmp(kp, "auto")) return -2;
     if (!strcmp(kp, "none") || !strcmp(kp, "off")) return -1;
     int n = atoi(kp);
     if (n == 0) return 0;  // older scripts used 0-based "0" for player 1
@@ -98,14 +110,15 @@ int keyboard_port_from_env() {
 
 void set_controller_layout(bool modern) { g_modern_layout = modern; }
 
-void set_keyboard_port(int port) { g_keyboard_port = port >= 0 && port < kPorts ? port : -1; }
-int keyboard_port() { return g_keyboard_port; }
+void set_keyboard_port(int port) { g_keyboard_port = port == -2 || (port >= 0 && port < kPorts) ? port : -1; }
+int keyboard_port() { return g_keyboard_port == -2 ? (!g_port_identity[0].empty() ? 1 : 0) : g_keyboard_port; }
 
 std::string help_text(bool racing_keyboard, const std::string &cross_keys) {
+    const int kb = keyboard_port();
     std::string text = "The game's X means PS2 Cross, the Accept button.\n\n";
     for (int p = 0; p < kPorts; ++p) {
         text += "Player " + std::to_string(p + 1) + ": ";
-        bool keyboard = p == g_keyboard_port;
+        bool keyboard = p == kb;
         if (keyboard) text += "Keyboard - " + (racing_keyboard ? std::string("Enter") :
             cross_keys.empty() ? std::string("no Cross key bound; set one in F1 Settings") : cross_keys);
         if (SDL_Gamepad *gp = port_gamepad(p)) {
@@ -125,18 +138,18 @@ std::string help_text(bool racing_keyboard, const std::string &cross_keys) {
     }
     text += "\nLocal race: ACTION > RACE > MULTI. Player 2 joins with their own Accept button; "
             "each player confirms their own car. For a solo race choose SINGLE.\n";
-    if (g_keyboard_port != 1 && !port_gamepad(1)) {
+    if (kb != 1 && !port_gamepad(1)) {
         text += "\nPlayer 2 has no device. Connect a controller, or set Keyboard port to 2 in F1 Settings "
                 "and restart (player 1 then needs a controller). One keyboard controls one player.\n";
-        if (racing_keyboard && g_keyboard_port == 0)
+        if (racing_keyboard && kb == 0)
             text += "Enter belongs to player 1 and cannot join player 2.\n";
     }
-    if (racing_keyboard && g_keyboard_port >= 0)
+    if (racing_keyboard && kb >= 0)
         text += "\nRacing keyboard: WASD/arrows navigate, Enter accepts, Esc goes back. "
                 "Enter starts the title screen. Driving: W/Up gas, S/Down/Space brake, "
                 "A/D or Left/Right steer, Esc pauses.\n";
-    text += "\nF1 or Cmd+, opens Settings. Keyboard port: 0 off, 1 player 1, 2 player 2; "
-            "restart after changing it. With keyboard off, controllers fill players in connection order. "
+    text += "\nF1 or Cmd+, opens Settings. Keyboard port: -1 automatic, 0 off, 1 player 1, 2 player 2; "
+            "restart after changing it. Automatic assigns the first controller to P1 and the keyboard to P2. "
             "Reopen F2 after connecting or unplugging a controller to refresh these assignments.";
     return text;
 }
@@ -152,16 +165,22 @@ int port_of(SDL_JoystickID id) {
 
 void on_added(SDL_JoystickID id) {
     if (!id || port_of(id) >= 0) return;
-    int p = free_port();
-    if (p < 0) {
-        fprintf(stderr, "[input] %s connected, but both player ports are taken\n", pad_name(id));
-        return;
-    }
     SDL_Gamepad *gp = SDL_OpenGamepad(id);
     if (!gp) {
         fprintf(stderr, "[input] cannot open %s: %s\n", pad_name(id), SDL_GetError());
         return;
     }
+    const std::string key = identity(gp, id);
+    int p = -1;
+    for (int i = 0; i < kPorts; ++i)
+        if (!g_port_pad[i] && g_port_identity[i] == key) { p = i; break; }
+    if (p < 0) p = free_port();
+    if (p < 0) {
+        SDL_CloseGamepad(gp);
+        fprintf(stderr, "[input] %s connected, but both player ports are taken\n", pad_name(id));
+        return;
+    }
+    g_port_identity[p] = key;
     g_port_pad[p] = id;
     g_port_gamepad[p] = gp;
     g_rumble[p] = Rumble();
@@ -193,6 +212,7 @@ void assign_waiting() {
 
 void close_all() {
     for (int p = 0; p < kPorts; p++) {
+        g_port_identity[p].clear();
         if (!g_port_gamepad[p]) continue;
         stop_rumble(p);
         SDL_CloseGamepad(g_port_gamepad[p]);
@@ -217,7 +237,8 @@ uint8_t trigger_byte(Sint16 v) {
     return (uint8_t)(a < 0 ? 0 : a > 255 ? 255 : a);
 }
 
-void read_gamepad(SDL_Gamepad *gp, HostPadState *out) {
+void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused) {
+    if (!focused) { *out = HostPadState(); out->connected = true; return; }
     static const struct {
         SDL_GamepadButton b;
         uint16_t btn;
@@ -416,7 +437,7 @@ int list_pads(int watch_seconds) {
         fflush(stdout);
         set_keyboard_port(keyboard_port_from_env());
         printf("Keyboard: %s (no window here, so keys are not read)\n",
-               g_keyboard_port < 0 ? "no player" : g_keyboard_port == 0 ? "player 1" : "player 2");
+               g_keyboard_port == -2 ? "automatic" : g_keyboard_port < 0 ? "no player" : g_keyboard_port == 0 ? "player 1" : "player 2");
         int nn = 0;
         SDL_JoystickID *gids = SDL_GetGamepads(&nn);
         for (int i = 0; i < nn; i++) on_added(gids[i]);

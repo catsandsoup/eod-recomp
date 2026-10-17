@@ -36,8 +36,8 @@ int main() {
     CHECK(m.read(k,Context::Menu,true,bindings).buttons==0);
     k={};k['W']=true;
     CHECK(m.read(k,Context::Menu,true,bindings).buttons==PAD_UP);
-    CHECK(m.read(k,Context::Driving,true,bindings).buttons==0); // held navigation cannot become gas
-    CHECK(m.read(k,Context::Driving,true,bindings).buttons==0);
+    CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_CROSS); // held gas survives entering the driving context
+    CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_CROSS);
     k={};m.read(k,Context::Driving,true,bindings);k['W']=true;
     CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_CROSS);
     k={};k[0x1b]=true;
@@ -52,13 +52,22 @@ int main() {
     CHECK(m.read(k,Context::Menu,true,bindings).buttons==PAD_CROSS);
     k={};m.read(k,Context::Menu,true,bindings);k['Q']=true;
     CHECK(m.read(k,Context::Menu,true,bindings).buttons==PAD_L1);
-    CHECK(m.read(k,Context::Driving,true,bindings).buttons==0); // custom keys suppressed too
+    CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_L1); // unchanged custom action survives context change
+    k={}; k['W']=true;
+    CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_CROSS);
+    CHECK(m.read(k,Context::Menu,true,bindings).buttons==PAD_UP);
+    CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_CROSS);
+    k={}; CHECK(m.read(k,Context::Driving,true,bindings).buttons==0); // focus loss releases
+    k['W']=true; CHECK(m.read(k,Context::Driving,true,bindings).buttons==PAD_CROSS);
+    CHECK(m.read(k,Context::Driving,true,bindings,false).buttons==0);
+    CHECK(m.read(k,Context::Driving,true,bindings,true).buttons==PAD_CROSS);
     Mapper original;k={};k[0x20]=true;
     CHECK(original.read(k,Context::Menu,false,bindings).buttons==PAD_CIRCLE);
     k={};k[0x25]=k[0x27]=true;
     out=original.read(k,Context::Menu,false,bindings);
     CHECK(out.lx==128 && out.buttons==0);
     Config cfg;
+    CHECK(cfg.keyboard_port == -1);
     CHECK(cfg.keyboard_layout=="racing");
     char path[]="/tmp/eod-keyboard-test-XXXXXX"; int fd=mkstemp(path); CHECK(fd>=0); if(fd<0)return 1; close(fd);
     cfg.keyboard_layout="original"; cfg.keys[KEY_CROSS]="F4";
@@ -68,6 +77,12 @@ int main() {
     CHECK(config_load(path,loaded) && loaded.keyboard_layout=="racing");
     f=fopen(path,"w");fprintf(f,"[Input]\nKeyboardLayout=invalid\n");fclose(f);
     loaded.keyboard_layout="original";CHECK(config_load(path,loaded) && loaded.keyboard_layout=="original");
+    f=fopen(path,"w");fprintf(f,"[Input]\nKeyboardPort=-1\n");fclose(f);
+    CHECK(config_load(path,loaded) && loaded.keyboard_port==-1);
+    for(int port=0;port<=2;++port) {
+        loaded.keyboard_port=port; CHECK(config_save(path,loaded));
+        Config restored; CHECK(config_load(path,restored) && restored.keyboard_port==port);
+    }
     unlink(path);
     printf("%d keyboard checks passed, %d failed\n",checks-failures,failures); return failures?1:0;
 }

@@ -180,7 +180,8 @@ void read_keyboard(HostPadState *out, keyboard_input::Context ctx) {
     const bool *physical = SDL_GetKeyboardState(nullptr);
     keyboard_input::Keys keys{};
     for (const auto &m : g_keyboard_scancodes) keys[m.first] = physical[m.second];
-    *out = g_keyboard.read(keys, ctx, g_config.keyboard_layout == "racing", g_key_map);
+    *out = g_keyboard.read(keys, ctx, g_config.keyboard_layout == "racing", g_key_map,
+        g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS));
     if (g_key_timing_pending && g_key_timing_lines < 256) {
         uint64_t now = SDL_GetTicksNS();
         fprintf(stderr, "[input-timing] keyboard_sample buttons=%04x event_age_us=%llu\n", out->buttons,
@@ -262,6 +263,9 @@ bool platform_pump() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
+        case SDL_EVENT_WINDOW_FOCUS_LOST:
+            for (int p = 0; p < kPorts; ++p) sdl_input::rumble(p, 0, 0);
+            break;
         case SDL_EVENT_QUIT:
             return false;
         case SDL_EVENT_GAMEPAD_ADDED:
@@ -384,7 +388,8 @@ void platform_get_pad(int port, HostPadState *out) {
     if (port < 0 || port >= kPorts) return;
     auto ctx = keyboard_context(); // also observed in headless/scripted tests
     if (port == sdl_input::keyboard_port()) read_keyboard(out, ctx);
-    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out);
+    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out, g_headless ||
+        (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
     // EOD_PAD_SCRIPT / EOD_PAD_SCRIPT1 (automated tests) replace the port
     if (!pad_script_state(port, out)) {
         static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
@@ -396,7 +401,8 @@ void platform_get_pad(int port, HostPadState *out) {
 }
 
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) {
-    if (!g_config.vibration) small_motor = large_motor = 0;
+    if (!g_config.vibration || (!g_headless &&
+        (!g_window || !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)))) small_motor = large_motor = 0;
     sdl_input::rumble(port, small_motor, large_motor);
 }
 
@@ -406,7 +412,8 @@ int platform_list_pads(int watch_seconds) { return sdl_input::list_pads(watch_se
 void platform_get_controller(int port, HostPadState *out) {
     *out = HostPadState();
     if (port < 0 || port >= kPorts) return;
-    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out);
+    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out, g_headless ||
+        (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
 }
 
 // The game's display mode (src/game_patches.cpp, EE thread). The GS command

@@ -5,16 +5,10 @@
 // data. The keyboard stays in platform_sdl3.cpp; this module only needs to
 // know which port it sits on.
 //
-// Port rules (two players):
-//  - the keyboard sits on its port (EOD_KEYBOARD_PORT, default player 1);
-//  - a controller takes the lowest port with neither the keyboard nor
-//    another controller on it, else the keyboard's port (keyboard and pad
-//    then both drive that player), else it waits;
-//  - unplugging frees the port; a waiting controller takes it, otherwise the
-//    next controller plugged in does (so re-plugging a pad gives it back its
-//    player).
-// So keyboard + pad = keyboard P1, pad P2; two pads = first pad P2, second
-// pad P1 (EOD_KEYBOARD_PORT=none: first pad P1, second P2).
+// Automatic ports: controllers fill P1 then P2; keyboard alone is P1, and
+// with a P1 controller it is P2. Explicit keyboard ports keep legacy sharing.
+// Reconnect restores an available remembered slot by serial/path/GUID. Never
+// move a connected controller to make room for a different controller.
 #pragma once
 #include <SDL3/SDL.h>
 
@@ -34,8 +28,8 @@ void set_hints();
 // Explicit persisted app setting: false = Original PS2, true = Modern RT/LT gas/brake.
 void set_controller_layout(bool modern);
 
-void set_keyboard_port(int port);  // 0 or 1, -1 = none
-// EOD_KEYBOARD_PORT: "1" (default) or "2" = that player, "none" = no keyboard player
+void set_keyboard_port(int port);  // -2 = automatic, 0 or 1 = explicit, -1 = none
+// EOD_KEYBOARD_PORT: "auto" (default), "1" or "2", "none"
 int keyboard_port_from_env();
 int keyboard_port();
 
@@ -53,7 +47,7 @@ int port_of(SDL_JoystickID id);  // -1 when not on a port
 // SDL gamepad -> DualShock 2: buttons, 0..255 sticks (dead zone), triggers as
 // L2/R2 pressure plus the digital bit (Original), or Cross/Square pressure
 // for analog throttle/brake (Modern).
-void read_gamepad(SDL_Gamepad *gp, HostPadState *out);
+void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused = true);
 uint8_t stick_byte(Sint16 v);    // -32768..32767 -> 0..255, centre 128, dead zone
 uint8_t trigger_byte(Sint16 v);  // 0..32767 -> 0..255
 constexpr uint8_t kTriggerDigital = 30;  // L2/R2 bit above this travel (as XInput)

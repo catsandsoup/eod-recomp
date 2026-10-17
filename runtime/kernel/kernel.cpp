@@ -364,31 +364,38 @@ void service_events(bool run_alarms) {
         static const bool input_timing = getenv("EOD_INPUT_TIMING") != nullptr;
         static uint64_t previous_input_us, last_timing_us, max_gap, max_pump_dma, max_gs_block;
         static unsigned timing_lines;
-        uint64_t input_begin = input_timing ? platform_time_us() : 0;
+        uint64_t input_begin = 0, input_end = 0, gs_begin = 0, gs_end = 0;
+        auto finish_graphics = [&]() {
+            game_patches_vblank();
+            gs_begin = (input_timing || timing_trace) ? platform_time_us() : 0;
+            gs_vblank();
+            gs_end = (input_timing || timing_trace) ? platform_time_us() : 0;
+#ifndef _WIN32
+            input_begin = input_timing ? platform_time_us() : 0;
+#endif
+        };
 #ifdef _WIN32
+        input_begin = input_timing ? platform_time_us() : 0;
         iop_pad_vblank();
+        input_end = input_timing ? platform_time_us() : 0;
+        finish_graphics();
 #else
-        // SDL refreshes keyboard/gamepad state while pumping events. Publish
-        // that fresh state before GS backpressure or this vblank's IRQ.
-        // (Windows pumps after the IRQ, below; the SDL3 port pumps first for latency.)
-        if (!vblank_poll_input()) {  // platform_pump + iop_pad_vblank
+        // Publish after GS backpressure, immediately before waking EE readers.
+        if (!vblank_finish_and_poll_input(finish_graphics)) {
             LOG(LOG_CORE, "window closed - exiting");
             app_exit(0);
         }
+        input_end = input_timing ? platform_time_us() : 0;
 #endif
-        game_patches_vblank();
-        uint64_t input_end = (input_timing || timing_trace) ? platform_time_us() : 0;
-        gs_vblank();
         if (timing_trace) {
             auto &s = eod_timing::state();
-            s.gs_block_max = std::max(s.gs_block_max, platform_time_us() - input_end);
+            s.gs_block_max = std::max(s.gs_block_max, gs_end - gs_begin);
         }
         if (input_timing) {
-            uint64_t gs_end = platform_time_us();
             uint64_t gap = previous_input_us ? input_begin - previous_input_us : 0;
             if (gap > max_gap) max_gap = gap;
             if (input_end - input_begin > max_pump_dma) max_pump_dma = input_end - input_begin;
-            if (gs_end - input_end > max_gs_block) max_gs_block = gs_end - input_end;
+            if (gs_end - gs_begin > max_gs_block) max_gs_block = gs_end - gs_begin;
             if (!last_timing_us) last_timing_us = input_begin;
             if (timing_lines < 120 && input_begin - last_timing_us >= 1000000) {
                 fprintf(stderr, "[input-timing] vblank=%llu max_pump_gap_us=%llu max_pump_dma_us=%llu max_gs_block_us=%llu\n",

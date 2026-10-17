@@ -127,7 +127,7 @@ bool config_load(const std::string &path, Config &c) {
         } else if (ieq(section, "Input")) {
             if (ieq(k, "Vibration")) c.vibration = to_bool(v);
 #ifndef _WIN32  // SDL3 input options
-            else if (ieq(k, "KeyboardPort")) c.keyboard_port = num(0, 2);
+            else if (ieq(k, "KeyboardPort")) c.keyboard_port = num(-1, 2);
             else if (ieq(k, "ControllerLayout") && (ieq(v, "original") || ieq(v, "modern")))
                 c.controller_layout = ieq(v, "modern") ? "modern" : "original";
             else if (ieq(k, "KeyboardLayout") && (ieq(v, "original") || ieq(v, "racing")))
