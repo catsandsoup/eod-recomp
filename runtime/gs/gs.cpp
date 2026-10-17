@@ -30,6 +30,7 @@
 #include "gs_mem.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
+#include "gs_transfer_chunk.h"
 #include "../core/prof.h"
 #include "../ui/overlay.h"
 
@@ -89,6 +90,19 @@ void write_reg(uint32_t reg, uint64_t v);
 uint32_t gif_reg_ctrl, gif_reg_mode;
 
 // --------------------------------------------------------------- transfer
+// Host->local transfers: by default the renderers are told about the whole
+// TRXREG rectangle when the transfer starts (vram_written, raster_vram_write,
+// vram_mark). With kChunkedHostWrites they are told, in xfer_data, about the
+// pixels each chunk of IMAGE data actually supplies, just before it is written:
+// a GPU renderer then never gives up drawn pages for data that hasn't arrived,
+// or never arrives (a transfer cut short). The Vulkan renderer uses this;
+// Direct3D 11 and the software-only build keep the TRXREG notification.
+#ifdef EOD_VULKAN
+constexpr bool kChunkedHostWrites = true;
+#else
+constexpr bool kChunkedHostWrites = false;
+#endif
+
 void xfer_start() {
     if (replay_frozen()) {
         g_xfer.active = false;
@@ -104,11 +118,11 @@ void xfer_start() {
     census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
     if (hw::g_on) {
         if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h, dir == 1 ? "local->host" : "local->local");
-        if (dir == 0 || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
+        if ((dir == 0 && !kChunkedHostWrites) || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
     }
     if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
     if (dir == 1) raster_sync();
-    if (dir == 0 || dir == 2) {
+    if ((dir == 0 && !kChunkedHostWrites) || dir == 2) {
         raster_vram_write(dbp, dbw, dpsm, dx, dy, w, h);
         vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
     }
@@ -241,6 +255,16 @@ void xfer_small(Transfer &t, const uint8_t *p, uint32_t n) {
 void xfer_data(const uint8_t *p, uint32_t n) {
     Transfer &t = g_xfer;
     if (!t.active) return;
+    if (kChunkedHostWrites) {
+        uint64_t pixels = transfer_pixels_supplied(bits_per_pixel(t.dpsm), n, t.pend_n);
+        const TransferWriteRegions regions = transfer_write_regions(t.x0, t.y0, t.w, t.h, t.x, t.y, pixels);
+        for (unsigned i = 0; i < regions.count; ++i) {
+            const TransferWriteRect &r = regions.rects[i];
+            if (hw::g_on) hw::vram_written(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            raster_vram_write(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            vram_mark(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+        }
+    }
     switch (t.dpsm) {
     case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: xfer_small<16>(t, p, n & ~1u); return;
     case PSMT8: xfer_small<8>(t, p, n); return;
