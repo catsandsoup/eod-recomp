@@ -18,7 +18,8 @@ Put your `SLUS_209.10` in the repository root (see the README), then:
 
 ```sh
 cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DEOD_SDL3=ON -DEOD_VULKAN=ON -DEOD_MAC_APP=ON
+      -DEOD_SDL3=ON -DEOD_VULKAN=ON -DEOD_MAC_APP=ON \
+      -DEOD_APP_DIR="$HOME/Library/Application Support/TDEODRecomp/local-build"
 ninja -C build-mac
 ```
 
@@ -27,9 +28,10 @@ ninja -C build-mac
 | `EOD_SDL3` | SDL3 window, input and audio (without it: the headless test build) |
 | `EOD_VULKAN` | the Vulkan GS renderer (`Renderer=vulkan`, the default in this build); needs `EOD_SDL3` |
 | `EOD_MAC_APP` | also `build-mac/Eve of Destruction.app`: the libraries it needs (SDL3, libusb, the Vulkan loader, MoltenVK) copied in, ad-hoc signed |
+| `EOD_APP_DIR` | where `EOD_MAC_APP` puts the app (default: the build folder). Finder metadata in iCloud-synced Desktop/Documents can prevent signing; use a folder outside them |
 | `EOD_BUNDLED_SDL` | SDL3 3.4.18 built from source with HIDAPI over libusb, linked statically: wired Xbox 360 pads (and third-party ones), which macOS has no driver for and Homebrew's SDL3 doesn't see |
 
-`tools/macos/make_dmg.sh "build-mac/Eve of Destruction.app"` makes a disk
+`tools/macos/make_dmg.sh "$HOME/Library/Application Support/TDEODRecomp/local-build/Eve of Destruction.app"` makes a disk
 image of the app. The game's files are never put in the app or the image.
 
 ## Running
