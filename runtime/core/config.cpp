@@ -107,6 +107,8 @@ bool config_load(const std::string &path, Config &c) {
 #else
             if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "vulkan") ? "vulkan" : ieq(v, "warp") ? "warp" : "d3d11";
 #endif
+            else if (ieq(k, "Detail") && (ieq(v,"original") || ieq(v,"high") || ieq(v,"maximum")))
+                c.detail = ieq(v,"maximum") ? "maximum" : ieq(v,"high") ? "high" : "original";
             else if (ieq(k, "Adapter")) c.adapter = num(0, 15);
             else if (ieq(k, "Fullscreen")) c.fullscreen = to_bool(v);
             else if (ieq(k, "Width")) c.width = num(320, 16384);
@@ -154,6 +156,7 @@ bool config_save(const std::string &path, const Config &c) {
     if (!f) return false;
     fprintf(f, "; Test Drive: Eve of Destruction - PC port settings (written by eodsetup and the in-game menu)\n\n");
     fprintf(f, "[Video]\n");
+    fprintf(f, "Detail=%s\n", c.detail.c_str());
 #ifdef _WIN32
     fprintf(f, "Renderer=%s        ; d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
 #else

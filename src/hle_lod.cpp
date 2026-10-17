@@ -2,14 +2,17 @@
 // helpers never assign g_ee, so native caller/callee register effects survive.
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include "core/cpu.h"
 #include "core/memory.h"
+#include "core/config.h"
 #include "lod_thresholds.h"
 
 extern "C" void f_0021ABF8_orig();
 extern "C" void f_0021C6E0_orig();
 extern "C" void f_00218E68_orig();
 extern "C" void f_0034E308_orig();
+extern "C" void f_00212B58_orig();
 namespace {
 bool trace() { static const bool enabled = std::getenv("EOD_LOD_TRACE") != nullptr; return enabled; }
 bool ram(uint32_t a, uint32_t size) { return a && !(a & 3) && a < EE_RAM_SIZE && size <= EE_RAM_SIZE-a; }
@@ -31,8 +34,13 @@ void selected(const char *where, uint32_t object, uint32_t ra) {
         where,ra,object,t.records,t.count,ee_r32(object+0x550),double(loadf(object+0x548)),index,
         index<t.count ? ee_r32(t.handles+index*4) : 0xffffffffu,double(loadf(0x4cd370)),double(loadf(0x4cd374)),ee_r32(0x3d1a74));
 }
+bool maximum() {
+    static const bool enabled = !std::getenv("EOD_CAR_LOD_MULTIPLIER") && g_config.detail=="maximum";
+    return enabled;
+}
 float multiplier() {
     static const float value=[] {
+        if (!std::getenv("EOD_CAR_LOD_MULTIPLIER")) return g_config.detail=="high" ? 3.0f : 1.0f;
         float v;
         if (!eod_lod::parse_multiplier(std::getenv("EOD_CAR_LOD_MULTIPLIER"),v))
             std::fprintf(stderr,"[lod] invalid EOD_CAR_LOD_MULTIPLIER; using 1\n");
@@ -53,8 +61,8 @@ extern "C" void f_0021ABF8() {
         }
     }
     f_0021ABF8_orig();
-    const float factor=multiplier();
-    if (!trace() && factor==1) return;
+    float factor=multiplier();
+    if (!trace() && factor==1 && !maximum()) return;
     static unsigned errors;
     Table t{};
     if (!table(object,t)) {
@@ -69,6 +77,14 @@ extern "C" void f_0021ABF8() {
     for (unsigned i=0;i<t.count;++i) {
         before[i]=loadf(t.records+i*16);
         valid=valid && ee_r32(object+0x74+i*4)!=0xffffffffu;
+    }
+    // Keep the native minimum model (usually 1, not the incomplete model 0).
+    // One million scaled distance units is > 800x the largest native far plane
+    // (1150); retain ordered finite thresholds, handles and capability flags.
+    if (valid && maximum()) {
+        const float first=before[ee_r32(object+0x550)];
+        valid=std::isfinite(first) && first>0;
+        if (valid) factor=std::max(1.0f, 1000000.0f/first);
     }
     valid=valid && eod_lod::scale(before,after,t.count,factor);
     static unsigned loads;
@@ -109,4 +125,17 @@ extern "C" void f_0034E308() {
         // them as raw post-call words rather than claiming a classification.
         std::fprintf(stderr,"[lod] visibility ra=%08x centre=%08x xyz=%.9g,%.9g,%.9g radius=%.9g result=%u class_ptr=%08x class_raw=%08x distance_ptr=%08x distance_raw=%08x near=%.9g far=%.9g tan=%.9g sphere=%.9g camera=%.9g,%.9g,%.9g\n",ra,centre,double(xyz[0]),double(xyz[1]),double(xyz[2]),double(radius),g_ee.r[2].uw[0],classification,ram(classification,4)?ee_r32(classification):0,distance,ram(distance,4)?ee_r32(distance):0,double(loadf(0x4cd370)),double(loadf(0x4cd374)),double(loadf(0x4cd378)),double(loadf(0x4cd380)),double(loadf(0x4cd31c)),double(loadf(0x4cd320)),double(loadf(0x4cd324)));
     }
+}
+
+// Native camera builder divides the configured distance by the view count and
+// derives BOTH projection and fog from that quotient. Scope the source distance
+// here rather than altering the global view count or projection alone.
+extern "C" void f_00212B58() {
+    const uint32_t original=ee_r32(0x495d58);
+    const float distance=loadf(0x495d58);
+    const bool extend=maximum() && ee_r32(0x3d1a74)==2 &&
+        std::isfinite(distance) && distance>0 && distance<=1150;
+    if (extend) storef(0x495d58,distance*2);
+    f_00212B58_orig();
+    if (extend) ee_w32(0x495d58,original);
 }

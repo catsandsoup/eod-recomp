@@ -389,3 +389,14 @@ is carried in GS queue order, including output captures. Matched 4:3/wide 3D
 scene comparisons are still required to validate horizontal field of view and
 object proportions. On macOS the GS queue defaults to at most two outstanding
 vblanks for lower input latency; `EOD_GS_LAG` remains a developer override.
+
+## Optional detail presets
+
+F1 Settings → Detail (next launch) offers Original (default), High and Maximum.
+The INI setting is `[Video] Detail=original|high|maximum`. High scales positive
+car LOD thresholds by3; Maximum keeps the highest native permitted loaded model
+throughout the supported visible range and restores the one-player projection/
+fog distance in two-player cameras. Restart after changing it. The legacy
+`EOD_CAR_LOD_MULTIPLIER` environment value overrides the preset for experiments.
+No user setting is automatically changed. See [DETAIL_PRESETS.md](DETAIL_PRESETS.md)
+for tests, performance, comparison images and the limits of the tested scene.

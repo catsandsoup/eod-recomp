@@ -112,6 +112,12 @@ Existing explicit keyboard-port settings are preserved; choose -1 in Settings
 and restart to use automatic assignment.
 For two controllers in plug order, set **Keyboard port** to **0** and restart.
 
+The optional **Detail** setting in F1 Settings takes effect after restarting.
+**Original** preserves native detail; **High** keeps car models detailed three
+times farther away; **Maximum** retains their highest permitted models and gives
+two-player cameras the one-player draw/fog range. It remains off by default.
+See [detail preset evidence and limits](docs/DETAIL_PRESETS.md).
+
 ### Joining player two on Mac
 
 The original game's **“Press X for player 2”** means **PS2 Cross (✕)**, its
