@@ -80,6 +80,11 @@ plist_path=app/'Contents/Info.plist'
 with plist_path.open('rb') as f: info=plistlib.load(f)
 info['LSMinimumSystemVersion']='.'.join(map(str,minimum))
 with plist_path.open('wb') as f: plistlib.dump(info,f)
+def sign(path):
+    if subprocess.run(['codesign','--force','--sign','-',str(path)]).returncode:
+        sys.exit(f'bundle.py: codesign failed for {path}. If it says "resource fork, Finder information,'
+                 ' or similar detritus not allowed", Finder metadata may be restored by iCloud Drive (Desktop or Documents):'
+                 ' configure with -DEOD_APP_DIR=<a folder outside it>.')
 # macOS may propagate Finder metadata from Documents into linker outputs.
 subprocess.run(['xattr','-cr',str(app)],check=True)
 for binary in [*frameworks.iterdir(),exe]:
@@ -90,8 +95,8 @@ for binary in [*frameworks.iterdir(),exe]:
             subprocess.run(['install_name_tool','-delete_rpath',old,str(binary)],check=True)
     if rel not in rpaths(binary): subprocess.run(['install_name_tool','-add_rpath',rel,str(binary)],check=True)
     subprocess.run(['xattr','-cr',str(app)],check=True)
-    subprocess.run(['codesign','--force','--sign','-',str(binary)],check=True)
+    sign(binary)
 subprocess.run(['xattr','-cr',str(app)],check=True)
 subprocess.run(['xattr','-d','com.apple.FinderInfo',str(app)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-subprocess.run(['codesign','--force','--sign','-',str(app)],check=True)
+sign(app)
 subprocess.run(['codesign','--verify','--deep','--strict',str(app)],check=True)
