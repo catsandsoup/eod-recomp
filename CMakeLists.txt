@@ -73,7 +73,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   # Generated code relies on wrapping arithmetic and type punning.
   target_compile_options(eod_gen PRIVATE -fno-strict-aliasing -fwrapv -w)
   target_compile_options(eod PRIVATE -fno-strict-aliasing -fwrapv -Wall -Wno-unused-function)
-  if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+    # arm64 (Apple Silicon): NEON stands in for SSE (runtime/include/sse_compat.h).
+    # No FMA contraction, so float results match the x86 builds.
+    target_compile_options(eod_gen PRIVATE -ffp-contract=off)
+    target_compile_options(eod PRIVATE -ffp-contract=off)
+  elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Pentium 4 / Core 2 baseline; SSE math avoids x87 excess precision.
     target_compile_options(eod_gen PRIVATE -msse2 -mfpmath=sse -march=pentium4 -mtune=core2)
     target_compile_options(eod PRIVATE -msse2 -mfpmath=sse -march=pentium4 -mtune=core2)
