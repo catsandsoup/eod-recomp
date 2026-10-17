@@ -13,6 +13,7 @@ enum PadKey {
 
 struct Config {
     // [Video]
+    std::string detail = "original"; // optional car/detail preset; restart to apply
 #if defined(__APPLE__) && defined(EOD_VULKAN)
     std::string renderer = "vulkan";  // vulkan | software (macOS)
 #elif defined(__APPLE__)

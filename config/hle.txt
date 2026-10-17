@@ -7,6 +7,7 @@
 00331E48 replace  # debug printf (formats and discards in the release build) - logged with --log game
 0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
+00212B58 wrap     # optional Maximum: matched 1P projection/fog range in 2P
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
 0021C6E0 wrap     # bounded single-car selection trace
 00218E68 wrap     # bounded batch selection/submission trace
