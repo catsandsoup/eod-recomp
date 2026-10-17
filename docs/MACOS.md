@@ -27,7 +27,7 @@ ninja -C build-mac
 |---|---|
 | `EOD_SDL3` | SDL3 window, input and audio (without it: the headless test build) |
 | `EOD_VULKAN` | the Vulkan GS renderer (`Renderer=vulkan`, the default in this build); needs `EOD_SDL3` |
-| `EOD_MAC_APP` | also `build-mac/Eve of Destruction.app`: the libraries it needs (SDL3, libusb, the Vulkan loader, MoltenVK) copied in, ad-hoc signed |
+| `EOD_MAC_APP` | also creates `Eve of Destruction.app` in `EOD_APP_DIR`: the libraries it needs (SDL3, libusb, the Vulkan loader, MoltenVK) copied in, ad-hoc signed |
 | `EOD_APP_DIR` | where `EOD_MAC_APP` puts the app (default: the build folder). Finder metadata in iCloud-synced Desktop/Documents can prevent signing; use a folder outside them |
 | `EOD_BUNDLED_SDL` | SDL3 3.4.18 built from source with HIDAPI over libusb, linked statically: wired Xbox 360 pads (and third-party ones), which macOS has no driver for and Homebrew's SDL3 doesn't see |
 
