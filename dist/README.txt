@@ -1,5 +1,5 @@
 Test Drive: Eve of Destruction - native PC port (PS2 static recompilation)
-Version 1.0.1
+Version 1.0.2
 
 Report bugs at https://github.com/pareidolico/eod-recomp/issues
 

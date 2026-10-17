@@ -19,11 +19,15 @@ The game is **not** included: you need your own copy of the NTSC-U disc (`SLUS_2
 * `eodsetup.exe`: PCSX2 save import, save editor (money, reputation, settings) and garage (any vehicle in the four career slots, including Action mode paint jobs and special vehicles)
 * Optional "Car durability as rated in the menu": the per-car durability values from the game's car files, which the original game never applies (table in `README.txt`)
 
-## Fixes in this version
+## Changes in this version
 
-* The game's controller setup now completes: the pad driver returns each command's result where the game reads it, so the "Set actAlign" error path (vibration setup) is no longer taken (#4, thanks catsandsoup)
-* The game's Exit call and a returning entry point now shut down cleanly like the other exits (#3, thanks catsandsoup)
+All from catsandsoup:
 
+* Direct3D 11 above RenderScale 1: sprites at the edges of the picture now fill their whole last pixel, as the PS2 does. This removes the dark right-hand column and the thin dark line in two-player races (#5)
+* Movies: the movie player's bit reader works directly on memory, with identical output and less CPU time per movie (#6)
+* Builds: the headless test build runs on arm64 (Apple Silicon) (#8); the VU code builds without the compiled VU programs (#7); groundwork for a Vulkan renderer on other platforms (#9, #10). None of these change the Windows builds
+
+Fixed in 1.0.1: the controller setup completes (vibration setup); clean exit on the game's Exit call.
 Fixed in 1.0: race music playing over the menu music after leaving a race; stale movie audio when decoding falls behind; widescreen returning to stretched 4:3 after the first movie.
 
 Known issues and bug reports: https://github.com/pareidolico/eod-recomp/issues
