@@ -1714,6 +1714,7 @@ int vu_bench(const char *path, int repeat) {
         pass.push_back(ns[1] - before);
     }
     std::sort(pass.begin(), pass.end());
+#ifdef VU_REC  // (block counts exist only with the compiled programs)
     if (!g_blk_stats.empty()) {
         std::vector<std::pair<uint64_t, std::string>> top;
         uint64_t total = 0;
@@ -1728,6 +1729,7 @@ int vu_bench(const char *path, int repeat) {
         for (size_t k = 0; k < top.size() && k < 40; k++)
             printf("  %5.1f%%  %s\n", 100.0 * top[k].first / total, top[k].second.c_str());
     }
+#endif
     printf("vu-bench: %zu records x %d: VU0 %zu runs %.3f ms, VU1 %zu runs %.3f ms; VU1 per pass: fastest %.3f ms, "
            "median %.3f ms (%.2f ns per VU1 cycle); result hash %016llx\n",
            recs.size(), repeat, calls[0], ns[0] / 1e6, calls[1], ns[1] / 1e6, pass.empty() ? 0 : pass[0] / 1e6,
