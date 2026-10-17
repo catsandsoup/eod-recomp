@@ -141,3 +141,12 @@ if(BUILD_TESTING AND Python3_FOUND)
   target_include_directories(gs_transfer_chunk_test PRIVATE runtime)
   add_test(NAME gs_transfer_chunks COMMAND gs_transfer_chunk_test)
 endif()
+
+# Optional manual-recovery CPU/config regression.
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(eod_recovery_test tools/tests/recovery_test.cpp src/hle_recovery.cpp runtime/core/config.cpp)
+  target_include_directories(eod_recovery_test PRIVATE runtime runtime/include)
+  add_test(NAME ManualRecovery COMMAND eod_recovery_test)
+  set_tests_properties(ManualRecovery PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
+endif()

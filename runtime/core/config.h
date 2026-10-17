@@ -40,6 +40,7 @@ struct Config {
     // [Gameplay] each car's damage_scale (from its file; the game ignores it,
     // its menu durability ratings follow it) multiplies the damage it takes
     bool car_durability = false;
+    bool manual_recovery = false; // humans: SELECT recovery only, no countdown reset
     // [Career] career cars drawn as another vehicle: "845:790,859:68" (career
     // vehicle : the vehicle it looks like; set by the save editor)
     std::string car_looks;

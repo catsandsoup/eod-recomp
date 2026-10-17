@@ -126,6 +126,7 @@ bool config_load(const std::string &path, Config &c) {
                 if (ieq(k, kPadKeyNames[i])) c.keys[i] = v;
         } else if (ieq(section, "Gameplay")) {
             if (ieq(k, "CarDurability")) c.car_durability = to_bool(v);
+            else if (ieq(k, "ManualRecovery")) c.manual_recovery = to_bool(v);
         } else if (ieq(section, "Career")) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
         } else if (ieq(section, "System")) {
@@ -168,6 +169,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "\n[Gameplay]\n");
     fprintf(f, "CarDurability=%d      ; 1: each car's durability from its files (damage_scale) on top of its weight\n",
             c.car_durability ? 1 : 0);
+    fprintf(f, "ManualRecovery=%d     ; 1: human countdown recovery disabled; SELECT retained\n", c.manual_recovery ? 1 : 0);
     fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
     fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());
     fprintf(f, "\n[System]\n");
