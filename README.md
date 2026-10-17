@@ -1,6 +1,6 @@
 # eod-recomp — Test Drive: Eve of Destruction, native PC port
 
-**Version 1.0.1**
+**Version 1.0.2**
 
 This project turns the PlayStation 2 executable of **Test Drive: Eve of
 Destruction** (NTSC-U, `SLUS_209.10`, v1.00) into C/C++ source code that builds
