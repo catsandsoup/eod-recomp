@@ -37,6 +37,12 @@ void platform_set_fullscreen(bool on);
 bool platform_fullscreen();
 // Short status text shown after the window title (speed statistics).
 void platform_set_status(const char *text);
+// High-visibility in-game HUD notification banner and mod guide overlay.
+void platform_show_hud_banner(const char *text, int duration_ms = 2500);
+void platform_set_mod_overlay(bool visible);
+void platform_haptic_pulse(int port, int duration_ms = 150, uint8_t small_motor = 1, uint8_t large_motor = 150);
+void platform_audio_feedback(bool enabled);
+uint16_t game_patches_suppressed_buttons();
 // Displays a 32-bit (0xAABBGGRR little endian, i.e. bytes R,G,B,A) image.
 void platform_present(const uint32_t *pixels, int width, int height, int stride);
 

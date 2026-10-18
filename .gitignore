@@ -12,6 +12,7 @@ system.cnf
 SYSTEM.CNF
 release/
 .venv/
+.agents/
 work/
 
 # Finder metadata is not project source.

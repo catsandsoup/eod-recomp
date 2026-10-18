@@ -29,3 +29,6 @@
 0039AFB0 wrap     # movie bit-buffer consume/refill: exact RAM fast path, generated fallback
 
 001B8370 wrap     # optional manual-only human countdown recovery
+0017DA58 wrap     # scale chicken explosion blast radius and impulse force
+0018F2A8 wrap     # optional turbo boost scaling (speed cap and acceleration)
+001244A8 wrap     # optional single player battle mode injection into action eves

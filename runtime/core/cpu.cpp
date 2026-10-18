@@ -6,6 +6,7 @@
 #include "cpu.h"
 #include "ee.h"
 #include "log.h"
+#include "memory.h"
 #include "../kernel/kernel.h"
 #include "../hw/hw.h"
 #include "../platform/platform.h"
@@ -59,10 +60,27 @@ extern "C" EEFunc ee_lookup_func(uint32_t addr) {
 
 static void dump_and_die(const char *what, uint32_t addr) {
     cpu_dump_state();
+    uint32_t sp = (uint32_t)g_ee.r[29].sd[0];
+    LOG(LOG_CORE, "Stack dump at sp=%08x:", sp);
+    for (int i = 0; i < 64; i++) {
+        uint32_t a = sp + i * 4;
+        if (a < EE_RAM_SIZE) {
+            LOG(LOG_CORE, "  [sp+%03x] %08x = %08x", i * 4, a, ee_r32(a));
+        }
+    }
+    uint32_t a0 = (uint32_t)g_ee.r[4].sd[0];
+    LOG(LOG_CORE, "Object at a0=%08x:", a0);
+    for (int i = 0; i < 48; i++) {
+        uint32_t a = a0 + i * 4;
+        if (a < EE_RAM_SIZE) {
+            LOG(LOG_CORE, "  [+0x%02x] %08x", i * 4, ee_r32(a));
+        }
+    }
     fatal("%s to %08x: no recompiled function at that address", what, addr);
 }
 
 extern "C" void ee_call(uint32_t addr) {
+    if (!addr) return;
     if (EEFunc f = ee_lookup_func(addr)) {
         f();
         return;
@@ -72,6 +90,7 @@ extern "C" void ee_call(uint32_t addr) {
 }
 
 extern "C" void ee_jump(uint32_t addr) {
+    if (!addr) return;
     // Tail jump to a computed address: treat as a call whose return is ours.
     if (EEFunc f = ee_lookup_func(addr)) {
         f();
