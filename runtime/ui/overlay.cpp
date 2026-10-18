@@ -160,7 +160,7 @@ void controller_input() {
     uint16_t b = p.connected ? p.buttons : 0;
     uint16_t pressed = b & ~g_pad_prev;
     g_pad_prev = b;
-    const uint16_t chord = PAD_L3 | PAD_R3;
+    const uint16_t chord = PAD_L3 | PAD_R3 | PAD_START;
     if ((b & chord) == chord && (pressed & chord)) open_menu(!g_open);
     if (!g_open) return;
     ImGuiIO &io = ImGui::GetIO();
@@ -286,6 +286,19 @@ void tab_gameplay() {
     ImGui::Checkbox("Manual recovery only", &g_config.manual_recovery);
     help("Explore without automatic wrong-way, upside-down or off-track countdown resets. "
          "SELECT still recovers your car. Applies immediately; AI recovery is unchanged.");
+    ImGui::Separator();
+    ImGui::Text("Live Cheats & Mods (Controller combos: L1 + R1 + D-Pad):");
+    ImGui::Checkbox("Chicken Fight (L2 fires explosive chickens)", &g_config.cheat_chickens);
+    help("L1 + R1 + D-Pad Up toggles live in-game without opening menus.");
+    ImGui::Checkbox("Turbo Boost (L2 boosts beyond top speed)", &g_config.cheat_turbo);
+    help("L1 + R1 + D-Pad Right toggles live in-game without opening menus.");
+    ImGui::SliderFloat("Turbo Scale", &g_config.turbo_scale, 1.0f, 3.0f, "%.2fx");
+    ImGui::SliderFloat("Chicken Blast Force", &g_config.chicken_force_scale, 1.0f, 4.0f, "%.2fx");
+    ImGui::SliderFloat("Chicken Blast Radius", &g_config.chicken_radius_scale, 1.0f, 4.0f, "%.2fx");
+    ImGui::Checkbox("Single Player Battle Mode", &g_config.sp_battle_mode);
+    help("Injects Battle Mode into Action and Career Eve contest menus with AI opponents.");
+    ImGui::Checkbox("Unlock All Out of the Box", &g_config.unlock_all);
+    help("All tracks, cars, dares, and feat cheat prizes unlocked out of the box.");
 }
 
 void tab_system() {

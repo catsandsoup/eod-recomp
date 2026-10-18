@@ -89,7 +89,11 @@ bool mac_app_settings() {
         {"Volume (0–100)",std::to_string(g_config.volume)}, {"Keyboard port (-1 auto, 0 off, 1, 2)",std::to_string(g_config.keyboard_port)},
         {"Vibration",std::to_string(g_config.vibration)}, {"Memory card folder",g_config.memcard_dir}, {"Disc folder",g_config.data_dir},
         {"Controller layout",g_config.controller_layout}, {"Keyboard layout",g_config.keyboard_layout}, {"Detail (next launch)",g_config.detail},
-        {"Manual recovery only",std::to_string(g_config.manual_recovery)}
+        {"Manual recovery only",std::to_string(g_config.manual_recovery)},
+        {"Chicken fight (L2 fires chickens)",std::to_string(g_config.cheat_chickens)},
+        {"Turbo boost (L2 boosts)",std::to_string(g_config.cheat_turbo)},
+        {"Single player battle mode",std::to_string(g_config.sp_battle_mode)},
+        {"Unlock all out of box",std::to_string(g_config.unlock_all)}
     };
     for (int i=0;i<KEY_COUNT;i++) fields.push_back({kPadKeyLabels[i],g_config.keys[i]});
     NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0,0,560,430)]; scroll.hasVerticalScroller = YES;
@@ -99,7 +103,7 @@ bool mac_app_settings() {
         CGFloat y = (fields.size()-i-1)*32;
         NSTextField *label=[NSTextField labelWithString:ns(fields[i].label)]; label.frame=NSMakeRect(0,y+5,215,22); [view addSubview:label];
         NSControl *input;
-        if (i==4 || i==5 || i==7 || i==8 || i==9 || i==12 || i==18) {
+        if (i==4 || i==5 || i==7 || i==8 || i==9 || i==12 || (i>=18 && i<=22)) {
             NSButton *check=[NSButton checkboxWithTitle:@"Enabled" target:nil action:nil];
             check.state=fields[i].value=="1" ? NSControlStateValueOn : NSControlStateValueOff;
             input=check;
@@ -124,6 +128,8 @@ bool mac_app_settings() {
             text.stringValue=ns(fields[i].value); input=text;
         }
         if (i==18) input.toolTip=@"Explore without automatic wrong-way, upside-down or off-track countdown resets. SELECT still recovers your car. Applies when you save; AI recovery is unchanged.";
+        if (i==19) input.toolTip=@"Enables chicken weapon shooting on holding L2. Also toggle live with L1+R1+D-Pad Up or L3+R3.";
+        if (i==20) input.toolTip=@"Enables supercharged turbo boost on holding L2. Also toggle live with L1+R1+D-Pad Right.";
         input.frame=NSMakeRect(220,y,310,26); [view addSubview:input]; [inputs addObject:input];
     }
     scroll.documentView=view; [view scrollPoint:NSMakePoint(0,view.frame.size.height)]; a.accessoryView=scroll;
@@ -146,7 +152,11 @@ bool mac_app_settings() {
     c.controller_layout=value(15);c.keyboard_layout=value(16);
     c.detail=value(17);
     c.manual_recovery=number(18,0,1);
-    for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(19+i);
+    c.cheat_chickens=number(19,0,1);
+    c.cheat_turbo=number(20,0,1);
+    c.sp_battle_mode=number(21,0,1);
+    c.unlock_all=number(22,0,1);
+    for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(23+i);
     if (c.aspect!="auto" && c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="stretch") { error("Aspect must be auto (the game's Widescreen option), 4:3, 16:9 or stretch."); return false; }
     if (c.renderer!="software" && c.renderer!="vulkan") { error("Renderer must be software (or vulkan in a build with Vulkan support)."); return false; }
     if (!config_save(config_path,c)) { error("Could not save settings. Check the settings folder permissions."); return false; }

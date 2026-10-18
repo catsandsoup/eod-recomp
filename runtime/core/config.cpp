@@ -137,9 +137,17 @@ bool config_load(const std::string &path, Config &c) {
 #endif
             for (int i = 0; i < KEY_COUNT; i++)
                 if (ieq(k, kPadKeyNames[i])) c.keys[i] = v;
-        } else if (ieq(section, "Gameplay")) {
+        } else if (ieq(section, "Gameplay") || ieq(section, "Cheats")) {
             if (ieq(k, "CarDurability")) c.car_durability = to_bool(v);
             else if (ieq(k, "ManualRecovery")) c.manual_recovery = to_bool(v);
+            else if (ieq(k, "UnlockAll")) c.unlock_all = to_bool(v);
+            else if (ieq(k, "CareerCheats")) c.career_cheats = to_bool(v);
+            else if (ieq(k, "TurboBoost") || ieq(k, "Turbo")) c.cheat_turbo = to_bool(v);
+            else if (ieq(k, "ChickenFight") || ieq(k, "Chickens")) c.cheat_chickens = to_bool(v);
+            else if (ieq(k, "TurboScale")) c.turbo_scale = (float)atof(v.c_str());
+            else if (ieq(k, "ChickenForceScale")) c.chicken_force_scale = (float)atof(v.c_str());
+            else if (ieq(k, "ChickenRadiusScale")) c.chicken_radius_scale = (float)atof(v.c_str());
+            else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
         } else if (ieq(section, "Career")) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
         } else if (ieq(section, "System")) {
@@ -149,6 +157,17 @@ bool config_load(const std::string &path, Config &c) {
         }
     }
     fclose(f);
+
+    // Environment variable overrides
+    if (const char *e = getenv("EOD_UNLOCK_ALL")) c.unlock_all = to_bool(e);
+    if (const char *e = getenv("EOD_CAREER_CHEATS")) c.career_cheats = to_bool(e);
+    if (const char *e = getenv("EOD_TURBO")) c.cheat_turbo = to_bool(e);
+    if (const char *e = getenv("EOD_CHICKENS")) c.cheat_chickens = to_bool(e);
+    if (const char *e = getenv("EOD_TURBO_SCALE")) c.turbo_scale = (float)atof(e);
+    if (const char *e = getenv("EOD_CHICKEN_FORCE")) c.chicken_force_scale = (float)atof(e);
+    if (const char *e = getenv("EOD_CHICKEN_RADIUS")) c.chicken_radius_scale = (float)atof(e);
+    if (const char *e = getenv("EOD_SP_BATTLE")) c.sp_battle_mode = to_bool(e);
+
     return true;
 }
 
@@ -195,6 +214,15 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "CarDurability=%d      ; 1: each car's durability from its files (damage_scale) on top of its weight\n",
             c.car_durability ? 1 : 0);
     fprintf(f, "ManualRecovery=%d     ; 1: human countdown recovery disabled; SELECT retained\n", c.manual_recovery ? 1 : 0);
+    fprintf(f, "\n[Cheats]\n");
+    fprintf(f, "UnlockAll=%d          ; 1: unlock all career tracks, vehicles, dares, and feat prizes\n", c.unlock_all ? 1 : 0);
+    fprintf(f, "CareerCheats=%d       ; 1: allow cheat feats to function in career mode\n", c.career_cheats ? 1 : 0);
+    fprintf(f, "TurboBoost=%d         ; 1: enable turbo boost on L2\n", c.cheat_turbo ? 1 : 0);
+    fprintf(f, "ChickenFight=%d       ; 1: enable explosive chicken shooting on L2\n", c.cheat_chickens ? 1 : 0);
+    fprintf(f, "TurboScale=%.2f       ; multiplier for turbo thrust and top speed cap (default 1.0)\n", c.turbo_scale);
+    fprintf(f, "ChickenForceScale=%.2f; multiplier for chicken explosion blast impulse (default 1.0)\n", c.chicken_force_scale);
+    fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);
+    fprintf(f, "SinglePlayerBattle=%d ; 1: inject Battle Mode into single player action menus with AI\n", c.sp_battle_mode ? 1 : 0);
     fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
     fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());
     fprintf(f, "\n[System]\n");

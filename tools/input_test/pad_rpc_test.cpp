@@ -26,6 +26,7 @@ bool platform_pump() {
     return true;
 }
 void platform_get_pad(int p, HostPadState *s) { *s = pads[p]; }
+uint16_t game_patches_suppressed_buttons() { return 0; }
 static int rumble_port = -1;
 static uint8_t small, large;
 static int rumble_calls;

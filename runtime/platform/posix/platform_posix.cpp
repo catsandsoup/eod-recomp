@@ -70,6 +70,10 @@ int platform_list_pads(int) {
 }
 
 void platform_set_status(const char *) {}
+void platform_show_hud_banner(const char *, int) {}
+void platform_set_mod_overlay(bool) {}
+void platform_haptic_pulse(int, int, uint8_t, uint8_t) {}
+void platform_audio_feedback(bool) {}
 
 void platform_set_aspect(int aspect) { presentation::requested.store(aspect, std::memory_order_relaxed); }
 

@@ -19,6 +19,10 @@
 #include "../platform/platform.h"
 #include "iop.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) uint16_t game_patches_suppressed_buttons() { return 0; }
+#endif
+
 namespace {
 
 enum { PAD_STATE_DISCONN = 0, PAD_STATE_STABLE = 6 };
@@ -78,7 +82,9 @@ void write_pad_data(int port, int slot) {
     if (slot != 0) hs.connected = false;  // no multitap
     uint8_t d[128] = {};
     uint8_t mode = !p.analog ? 0x41 : p.pressure ? 0x79 : 0x73;
-    uint16_t btn = (uint16_t)~hs.buttons;  // active low
+    uint16_t b_clean = hs.buttons;
+    if (port == 0) b_clean &= ~game_patches_suppressed_buttons();
+    uint16_t btn = (uint16_t)~b_clean;  // active low
     d[0] = 0x00;
     d[1] = mode;
     d[2] = (uint8_t)btn;

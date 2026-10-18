@@ -56,6 +56,10 @@ void update_audio_gain() {
 
 std::vector<uint32_t> g_last_frame;
 int g_last_w, g_last_h;
+std::string g_hud_banner_text;
+uint64_t g_hud_banner_until = 0;
+bool g_mod_overlay_visible = false;
+uint64_t g_haptic_pulse_until = 0;
 
 // ---------------------------------------------------------------- input
 using sdl_input::kPorts;
@@ -305,10 +309,49 @@ bool platform_pump() {
                 bool fs = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
                 SDL_SetWindowFullscreen(g_window, !fs);
             }
+            if (!g_headless && !e.key.repeat) {
+                if (e.key.scancode == SDL_SCANCODE_F5) {
+                    g_config.cheat_chickens = !g_config.cheat_chickens;
+                    platform_show_hud_banner(g_config.cheat_chickens ? "★ CHICKEN FIGHT: ON (Press L2 to Fire) ★" : "★ CHICKEN FIGHT: OFF ★");
+                    platform_haptic_pulse(0, 150, 1, 180);
+                    platform_audio_feedback(g_config.cheat_chickens);
+                } else if (e.key.scancode == SDL_SCANCODE_F6) {
+                    g_config.cheat_turbo = !g_config.cheat_turbo;
+                    if (g_config.cheat_turbo && g_config.turbo_scale <= 1.0f) g_config.turbo_scale = 1.75f;
+                    platform_show_hud_banner(g_config.cheat_turbo ? "★ TURBO BOOST: ON (Hold L2) ★" : "★ TURBO BOOST: OFF ★");
+                    platform_haptic_pulse(0, 150, 1, 180);
+                    platform_audio_feedback(g_config.cheat_turbo);
+                } else if (e.key.scancode == SDL_SCANCODE_F7) {
+                    uint32_t c = ee_r32(0x003C4190);
+                    bool on = !(c & 0x80);
+                    if (on) {
+                        ee_w32(0x003C4190, (c | 0x89) & ~0x10);
+                        g_config.cheat_chickens = false;
+                    } else {
+                        ee_w32(0x003C4190, c & ~0x80);
+                    }
+                    platform_show_hud_banner(on ? "★ RAINING CHICKENS: ON ★" : "★ RAINING CHICKENS: OFF ★");
+                    platform_haptic_pulse(0, 150, 1, 180);
+                    platform_audio_feedback(on);
+                } else if (e.key.scancode == SDL_SCANCODE_F8) {
+                    bool on = !(g_config.cheat_chickens && g_config.cheat_turbo);
+                    g_config.cheat_chickens = on;
+                    g_config.cheat_turbo = on;
+                    if (on && g_config.turbo_scale <= 1.0f) g_config.turbo_scale = 1.75f;
+                    platform_show_hud_banner(on ? "★ CHAOS MODE: ON (Chickens + Turbo) ★" : "★ CHAOS MODE: OFF ★");
+                    platform_haptic_pulse(0, 150, 1, 200);
+                    platform_audio_feedback(on);
+                }
+            }
             break;
         default:
             break;
         }
+    }
+    uint64_t now_us = platform_time_us();
+    if (g_haptic_pulse_until && now_us >= g_haptic_pulse_until) {
+        g_haptic_pulse_until = 0;
+        for (int p = 0; p < kPorts; ++p) sdl_input::rumble(p, 0, 0);
     }
     sdl_input::update_rumble();
     return true;
@@ -362,6 +405,63 @@ void platform_present(const uint32_t *pixels, int width, int height, int stride)
     SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
     SDL_RenderClear(g_renderer);
     SDL_RenderTexture(g_renderer, g_texture, nullptr, &dst);
+
+    uint64_t now_us = platform_time_us();
+    if (g_mod_overlay_visible) {
+        SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+        float box_w = std::min(500.0f, (float)ow - 40.0f);
+        float box_h = 185.0f;
+        float box_x = ((float)ow - box_w) * 0.5f;
+        float box_y = ((float)oh - box_h) * 0.5f;
+
+        SDL_FRect bg = {box_x, box_y, box_w, box_h};
+        SDL_SetRenderDrawColor(g_renderer, 15, 15, 20, 230);
+        SDL_RenderFillRect(g_renderer, &bg);
+
+        SDL_SetRenderDrawColor(g_renderer, 240, 180, 20, 255);
+        SDL_RenderRect(g_renderer, &bg);
+
+        float text_scale = ow >= 1280 ? 1.5f : 1.0f;
+        SDL_SetRenderScale(g_renderer, text_scale, text_scale);
+        float sx = (box_x + 16.0f) / text_scale;
+        float sy = (box_y + 14.0f) / text_scale;
+        float line_h = 18.0f;
+
+        SDL_SetRenderDrawColor(g_renderer, 255, 215, 0, 255);
+        SDL_RenderDebugText(g_renderer, sx, sy, "[ LIVE MOD CHEATS - L1+R1 HELD ]");
+
+        SDL_SetRenderDrawColor(g_renderer, 255, 255, 255, 255);
+        SDL_RenderDebugTextFormat(g_renderer, sx, sy + line_h * 1.5f, "D-PAD UP   : Chicken Fight   [%s]", g_config.cheat_chickens ? "ON" : "OFF");
+        SDL_RenderDebugTextFormat(g_renderer, sx, sy + line_h * 2.5f, "D-PAD RIGHT: Turbo Boost     [%s]", g_config.cheat_turbo ? "ON" : "OFF");
+        SDL_RenderDebugTextFormat(g_renderer, sx, sy + line_h * 3.5f, "D-PAD DOWN : Rain Chickens   [%s]", (ee_r32(0x003C4190) & 0x80) ? "ON" : "OFF");
+        SDL_RenderDebugTextFormat(g_renderer, sx, sy + line_h * 4.5f, "D-PAD LEFT : AI Vengeance    [%s]", (ee_r32(0x003C4190) & 0x20) ? "ON" : "OFF");
+        SDL_RenderDebugText(g_renderer, sx, sy + line_h * 5.5f, "TRIANGLE   : Chaos Mode      (Chickens + Turbo)");
+        SDL_RenderDebugTextFormat(g_renderer, sx, sy + line_h * 6.5f, "SELECT / L3+R3: Quick Chickens  [%s]", g_config.cheat_chickens ? "ON" : "OFF");
+
+        SDL_SetRenderScale(g_renderer, 1.0f, 1.0f);
+    } else if (g_hud_banner_until > now_us && !g_hud_banner_text.empty()) {
+        SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+        float banner_w = std::min(540.0f, (float)ow - 40.0f);
+        float banner_h = 36.0f;
+        float banner_x = ((float)ow - banner_w) * 0.5f;
+        float banner_y = 24.0f;
+
+        SDL_FRect bg = {banner_x, banner_y, banner_w, banner_h};
+        SDL_SetRenderDrawColor(g_renderer, 15, 15, 22, 235);
+        SDL_RenderFillRect(g_renderer, &bg);
+
+        SDL_SetRenderDrawColor(g_renderer, 240, 180, 20, 255);
+        SDL_RenderRect(g_renderer, &bg);
+
+        float text_scale = ow >= 1280 ? 1.5f : 1.0f;
+        SDL_SetRenderScale(g_renderer, text_scale, text_scale);
+        float sx = (banner_x + 14.0f) / text_scale;
+        float sy = (banner_y + 10.0f) / text_scale;
+        SDL_SetRenderDrawColor(g_renderer, 255, 255, 255, 255);
+        SDL_RenderDebugText(g_renderer, sx, sy, g_hud_banner_text.c_str());
+        SDL_SetRenderScale(g_renderer, 1.0f, 1.0f);
+    }
+
     SDL_RenderPresent(g_renderer);
 }
 
@@ -383,6 +483,20 @@ void platform_set_status(const char *text) {
     SDL_SetWindowTitle(g_window, buf);
 }
 
+void platform_show_hud_banner(const char *text, int duration_ms) {
+    if (!text || !text[0]) {
+        g_hud_banner_until = 0;
+        return;
+    }
+    g_hud_banner_text = text;
+    g_hud_banner_until = platform_time_us() + (uint64_t)duration_ms * 1000;
+    platform_set_status(text);
+}
+
+void platform_set_mod_overlay(bool visible) {
+    g_mod_overlay_visible = visible;
+}
+
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     if (port < 0 || port >= kPorts) return;
@@ -400,10 +514,40 @@ void platform_get_pad(int port, HostPadState *out) {
     if (sdl_input::log_enabled()) sdl_input::log_state(port, *out);
 }
 
+void platform_haptic_pulse(int port, int duration_ms, uint8_t small_motor, uint8_t large_motor) {
+    if (!g_config.vibration || g_headless) return;
+    g_haptic_pulse_until = platform_time_us() + (uint64_t)duration_ms * 1000;
+    sdl_input::rumble(port, small_motor, large_motor);
+}
+
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) {
+    uint64_t now_us = platform_time_us();
+    if (now_us < g_haptic_pulse_until) return; // protect timed haptic pulse
     if (!g_config.vibration || (!g_headless &&
         (!g_window || !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)))) small_motor = large_motor = 0;
     sdl_input::rumble(port, small_motor, large_motor);
+}
+
+void platform_audio_feedback(bool enabled) {
+    if (g_headless || !g_config.audio) return;
+    const int sample_rate = 48000;
+    const int duration_ms = 80;
+    const int total_samples = (sample_rate * duration_ms) / 1000;
+    std::vector<int16_t> pcm(total_samples * 2);
+    float freq1 = 880.0f;
+    float freq2 = enabled ? 1320.0f : 440.0f;
+    int half = total_samples / 2;
+    for (int i = 0; i < total_samples; i++) {
+        float f = (i < half) ? freq1 : freq2;
+        float t = (float)i / (float)sample_rate;
+        float env = 1.0f;
+        if (i < 200) env = (float)i / 200.0f;
+        else if (total_samples - i < 200) env = (float)(total_samples - i) / 200.0f;
+        int16_t val = (int16_t)(sinf(2.0f * 3.14159265f * f * t) * 5000.0f * env);
+        pcm[i * 2 + 0] = val;
+        pcm[i * 2 + 1] = val;
+    }
+    platform_audio_submit(pcm.data(), total_samples);
 }
 
 int platform_list_pads(int watch_seconds) { return sdl_input::list_pads(watch_seconds); }

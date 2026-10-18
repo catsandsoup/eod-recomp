@@ -53,6 +53,15 @@ struct Config {
     // its menu durability ratings follow it) multiplies the damage it takes
     bool car_durability = false;
     bool manual_recovery = false; // humans: SELECT recovery only, no countdown reset
+    // [Cheats & Gameplay Mods]
+    bool unlock_all = true;            // unlock all cars, tracks, dares, and feats out of the box
+    bool career_cheats = true;         // allow cheats in career mode (master cheat flag)
+    bool cheat_turbo = false;          // turbo boost active on L2
+    bool cheat_chickens = false;       // chicken fight active on L2
+    float turbo_scale = 1.75f;         // multiplier for turbo push force and top speed
+    float chicken_force_scale = 2.0f;  // multiplier for chicken explosion blast force
+    float chicken_radius_scale = 1.5f; // multiplier for chicken explosion blast radius
+    bool sp_battle_mode = true;        // inject Battle Mode into single player action menus with AI
     // [Career] career cars drawn as another vehicle: "845:790,859:68" (career
     // vehicle : the vehicle it looks like; set by the save editor)
     std::string car_looks;

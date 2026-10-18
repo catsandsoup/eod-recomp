@@ -474,13 +474,39 @@ void platform_set_status(const char *text) {
     SetWindowTextA(g_hwnd, buf);
 }
 
+void platform_show_hud_banner(const char *text, int duration_ms) {
+    (void)duration_ms;
+    platform_set_status(text);
+}
+
+void platform_set_mod_overlay(bool visible) {
+    (void)visible;
+}
+
+static uint64_t g_haptic_pulse_until = 0;
+
+void platform_haptic_pulse(int port, int duration_ms, uint8_t small_motor, uint8_t large_motor) {
+    if (!pXInputSetState || !g_config.vibration) return;
+    g_haptic_pulse_until = platform_time_us() + (uint64_t)duration_ms * 1000;
+    XINPUT_VIBRATION_ v;
+    v.wLeftMotorSpeed = (WORD)(large_motor * 257);
+    v.wRightMotorSpeed = small_motor ? 0xFFFF : 0;
+    pXInputSetState((DWORD)port, &v);
+}
+
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor) {
     if (!pXInputSetState) return;
+    uint64_t now_us = platform_time_us();
+    if (now_us < g_haptic_pulse_until) return; // protect timed haptic pulse
     if (!g_config.vibration) small_motor = large_motor = 0;
     XINPUT_VIBRATION_ v;
     v.wLeftMotorSpeed = (WORD)(large_motor * 257);
     v.wRightMotorSpeed = small_motor ? 0xFFFF : 0;
     pXInputSetState((DWORD)port, &v);
+}
+
+void platform_audio_feedback(bool enabled) {
+    (void)enabled;
 }
 
 // ------------------------------------------------------------------ audio
