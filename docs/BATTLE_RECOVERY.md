@@ -7,6 +7,32 @@ It describes the North American `SLUS_209.10` executable only. Addresses are
 guest EE addresses, not host pointers or portable APIs for another game.
 Executable SHA-256: `4f60053dc141365f5ae50737622f8408be30ced513b4c109427c926461f2e2ae`.
 
+## Final bounded scope — 2026-10-19
+
+The owner stopped further expansion at the tested checkpoint and authorized
+building, publishing main and removing verified obsolete builds/merged unused
+branches. This ships the measured native weapon recovery and experimental bot
+policy; it is not a claim that every original acceptance ambition below is met.
+No numeric participant selector, Career exclusion, new obstacle query or native
+versus mod flag-ownership redesign was implemented. `BattleBots` remains a
+boolean that fills Battle to four cars while preserving humans. Changes apply
+when starting the next event, not by restarting the app. Native behavior applies
+when it is off. That does not mean "humans only": native `0x0012C158`
+uses `max(humans, min(contest.max_cars, native_cap))`, with observed native
+caps 99/10/4/4 for one/two/three/four humans. A native Battle descriptor with
+`max_cars=2` therefore yields two cars for one or two humans, then three/four
+for three/four humans. Solo with bots off does not receive the custom AI weapon
+or input policy; that particular gameplay journey was not live-validated.
+Ordinary non-Battle rosters bypass that hook. `SinglePlayerBattle`
+still appends native Battle descriptors in solo Action **and Career** where
+capacity permits; disable it for unchanged native Career contest menus. A Career
+season hard lock was discussed but not added at this stopping point.
+
+Unbuilt contact/weapon tracing candidates and unfinished toggle test fixtures
+were preserved under ignored `work/stopped-expansion-2026-10-19/`, then removed
+from the shipped source. The original inherited recovery backup is preserved.
+Known limitations and the exact verified journeys below remain authoritative.
+
 ## Player success and acceptance
 
 The player can enter original two-player Battle with independent controls and
@@ -410,9 +436,23 @@ Its exit check only establishes reaching combat, not full player acceptance.
   not reach phase 2, and pins remain. Different stimuli/frame bounds prevent
   treating these observations as a controlled performance comparison with
   `mixed-final`; primary-course following is not a complete obstacle solution.
-- The navigation rebuild passed **54/54 CTests** (15.31 seconds, latest checkpoint rebuild), including the
+- `anoka-lifecycle` (18,000 vblanks, exit 0): verified `Anoka.trk`, two
+  humans/two bots using the final course policy. Native phase 2 began at
+  t=188.322; bot slot 1 reached five net kills (slot 0 maximum four). Both
+  bots and both humans completed three sampled respawns each. Bot maximum
+  alive-period displacements were 143.12/159.39, firing transitions 11/12,
+  and low-progress intervals 3.84/3.19 seconds. Course routing was active in
+  39/41 of 181 sampled updates per bot. Captures show killed-by messages,
+  respawn prompts, 3rd/4th ranks and native Eve standings. The explicit START
+  at vblank 16,500 occurred during finish presentation; no fresh countdown or
+  score reset followed. Thus five-kill/results acceptance is verified on Anoka,
+  while controlled restart and UI return-to-menu remain unverified. The frame
+  bound produced a clean process exit, not evidence of a menu Exit selection.
+- The navigation rebuild passed **54/54 CTests** (13.32 seconds, final safe rebuild), including the
   138 native weapon assertions. The local macOS app rebuilt successfully and
-  passed `codesign --verify --deep --strict`.
+  passed `codesign --verify --deep --strict`. Final bundled startup reached
+  its 60-vblank bound and exited zero, headless/muted with an isolated card.
+  `CFBundleIconFile=AppIcon.icns` points to a nonempty 3,364,625-byte ICNS resource.
 - Earlier failed experiments are not acceptance: a NullDriver hook never ran;
   writing zero to drivetrain engagement left bots nearly stationary. Those
   failures explain why fixture-only success was insufficient.
@@ -433,18 +473,46 @@ The following requirements remain pending until a named live run proves them.
 | Additional original-reference coverage | Additional pitch/camera angles and direct original-hardware comparisons beyond the recorded vanilla run. |
 | Additional real-match angle/impact coverage | The dedicated reload journey below verifies held/release/repress; additional named pitch/camera/impact cases still need live evidence. |
 | Collision, blast and ownership | Native impact/detonation path; correct attacker and victim; score changes consistent with the hit. |
-| Complete mixed match with course routing | Two humans plus two bots through five net kills and results with the final course policy; the earlier direct-pursuit Anoka run reached this threshold. |
+| Additional map completion | The final-policy Anoka run reached five kills/results; Home, Woodly and the final Dennison run did not. |
 | Recovery and respawn | Observed wall recovery and native respawn transforms on the actual track; no invented world-origin circle or unsupported time guarantee. |
 | Complete lifecycle | Countdown, combat, death, respawn, score threshold, results, restart and exit without stale state. |
 | Additional regression journeys | Four-human Battle, restart, return-to-menu and normal-race visual checks beyond the passing fixture suite. |
 
+## Current optional-weapon toggle limits
+
+Progression unlocks do not activate cheat flags. `UnlockAll` and native Extras
+unlock masks are separate from the active flags at `0x003C4190`. Battle supplies
+its native weapon regardless of progression/Extras menu availability; the
+locked-progression vanilla journey verifies flags `0x09` and firing.
+
+While the optional Chicken Fight setting is on, each vblank forces master and
+weapon (`0x09`) and clears mortar/rain (`0x90`), selecting straight native fire.
+Initial OFF leaves native Battle/feat selections alone. OFF after ON preserves
+Battle's weapon bit; outside Battle it clears weapon `0x08` unless rain `0x80`
+is active. It does not restore the previous mortar/rain selection, and the
+master bit remains latched. The rain shortcut's OFF branch clears only `0x80`,
+so master/weapon can remain active while the Chicken Fight checkbox is false.
+These are known ownership limitations; the stopped redesign was not shipped.
+Native rain has priority over mortar, then straight launch; straight-mod ON
+suppresses both alternate modes. Turbo and chickens share L2 and may operate
+together when both are enabled.
+
+For human cars, the common native world builder at `0x00210000` calls
+`0x00227EE8 → 0x00227CA0` for Human records (`0x50`) when `0x002CE180` permits
+it; that gate is a native constant-zero return. The factory builds a BALL scene
+and queues native physical initialization without a Battle/progression/active
+weapon-flag condition. This supports enabling an already constructed weapon
+without manual allocation. Static inspection and a historical non-Battle dump
+support this; fresh current-build Action/Career live-toggle acceptance and the
+actual Extras menu visual state were not completed.
+
 ## Pending acceptance journeys
 
-The checkpoint intentionally does not claim the owner's entire Battle/chicken
-request is complete. Preserve working builds and branches until the remaining
-acceptance is verified; final source push and cleanup follow that acceptance.
+The owner explicitly stopped expansion at this tested checkpoint. The gaps
+below remain recorded for future work; they do not authorize continued feature
+work during the requested final build and safe cleanup.
 
-The bounded next weapon journey is authored as:
+The verified weapon journey is reproduced as:
 
 ```sh
 tools/test_battle.sh "$DISC" weapon work/battle-weapon-reload 7000 Dennison
@@ -465,8 +533,8 @@ No native blast was observed, so this journey does not prove victim/kill credit.
 entry's attacker index, position, radius and force when tracing is enabled;
 it does not itself prove which car was hit or why a later score changed.
 
-Use an explicitly named `Anoka` mixed run for the next full-match/lifecycle
-journey; the harness supports its ten RIGHT taps and requires `Anoka.trk`.
+The completed `Anoka` mixed journey uses ten RIGHT taps and requires
+`Anoka.trk`; its bounded results are recorded above.
 Control post-match input separately: demonstrate rank/results, select restart,
 observe a fresh countdown/score reset, return to the menu and exit. Existing
 fixed smoke scripts do not certify those post-match choices. For an explicit
@@ -505,5 +573,5 @@ weapon rendering, bot attacks and kill credit. Remaining acceptance is explicit.
 
 **Result:** native CPU weapon characterization and mixed Battle attack/score
 evidence are established. Solo Battle, bot/human respawns and the 54-test regression suite also pass.
-The longer Dennison mixed run failed to reach the score threshold and exposed obstacle-navigation limits; the later mislabeled Anoka run did reach five kills/results. Home fallback and Woodly course activation are now measured, with obstacle pins still present. Next decisive checks are robust obstacle routing, controlled restart and exit. No claim of completed player acceptance follows from unit
+The longer Dennison mixed run failed to reach the score threshold and exposed obstacle-navigation limits; both the mislabeled earlier Anoka run and the final-policy Anoka journey reached five kills/results. Home fallback and Woodly course activation are now measured, with obstacle pins still present. Next decisive checks are robust obstacle routing, controlled restart and exit. No claim of completed player acceptance follows from unit
 tests alone.

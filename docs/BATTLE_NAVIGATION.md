@@ -69,8 +69,32 @@ menu capacity. The current 312/320 contest occupancy leaves eight additions:
 Anoka, Ashland, Baxter, Dennison, Dundas, Eagan, Gilroy and Hampton. This is a
 capacity policy, not a tested small-track allowlist. Home/Mankato/Woodly remain
 native multiplayer selections; unlocking them does not expand the solo table.
-Safe per-map eligibility needs full chase/completion evidence before widening
+Anoka now has bounded final-policy five-kill/results evidence; that does not
+validate every obstacle route. Safe per-map eligibility needs full chase/completion evidence before widening
 solo exposure or claiming any current map to be fully validated.
+
+## Rejected obstacle-query candidates
+
+Read-only native inspection recovered segment/BSP routine `0x00216D98`:
+`a0=start XYZ*`, `a1=end XYZ*`, `a2=hit XYZ output*`, `v0=hit boolean`,
+root pointer at `0x003D1C24`, hit triangle at `0x00496218`. However, saved
+Home/Woodly/Dennison worlds each contain one giant horizontal ground triangle
+and no child nodes. Their installed `track.bsp` resources are only 108 bytes.
+The substantial scenery collision resources are `track.bsc` (SCOL), not this
+fallback BSP. A correct call to that routine would still miss the fences.
+
+The static proxy list at `0x003D216C` is incomplete too: Woodly has nineteen
+BOX proxies far from the observed final pins, while Home has zero. Neither
+candidate was integrated or shipped as a general wall-clearance oracle.
+
+The next discriminating research observation would be a read-only trace of
+actual native impulse/contact entry `0x0017B918`, matched against an actual
+bot body, followed by identifying the blocking SCOL/shape. Native input
+registers there are body `a0`, other shape `a1`, impulse XYZ pointer `a2`,
+contact XYZ pointer `a3`, type `t0`, optional alternate point `t1`, other body
+`t2`, and impulse scale `f12`; it queues contact then calls `0x0017B818`.
+A candidate host logger was written but never built or executed and was removed
+at the owner's scope stop. This is a future probe, not a validated navigation API.
 
 ## Reproduction and diagnostics
 
