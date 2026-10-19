@@ -1,5 +1,17 @@
 # Test Drive: Eve of Destruction (SLUS-209.10) - Gameplay Mods & Reverse Engineering Technical Reference
 
+> [!WARNING]
+> **Correction — 2026-10-19:** This document contains historical claims that are
+> not a verified implementation contract. Read [Battle recovery](BATTLE_RECOVERY.md)
+> first for the checked native weapon ABI and current evidence limits. In
+> particular, the weapon registry contains owner indices and **interface**
+> pointers; `0x0017E000` is the trigger and `0x0017E5C8` is an update;
+> flag `0x10` selects the feat mortar rather than the straight Battle shot.
+> Earlier steering, synthetic weapon registration, bot recovery guarantees,
+> respawn relocation and world-origin boundary claims must not be used as proof
+> of correct native behavior. The new chapter distinguishes verified CPU results
+> from pending gameplay validation and supersedes conflicting statements below.
+
 ## Executive Summary & Agent Handoff
 
 This technical reference document provides an exhaustive reverse-engineering specification, memory map, disassembly breakdown, mathematical AI formulation, and user guide for gameplay modifications and the Battle Mode subsystem within the static recompilation of *Test Drive: Eve of Destruction* (`SLUS_209.10` / `eod-recomp`).

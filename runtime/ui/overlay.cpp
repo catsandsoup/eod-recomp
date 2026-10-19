@@ -296,7 +296,9 @@ void tab_gameplay() {
     ImGui::SliderFloat("Chicken Blast Force", &g_config.chicken_force_scale, 1.0f, 4.0f, "%.2fx");
     ImGui::SliderFloat("Chicken Blast Radius", &g_config.chicken_radius_scale, 1.0f, 4.0f, "%.2fx");
     ImGui::Checkbox("Single Player Battle Mode", &g_config.sp_battle_mode);
-    help("Injects Battle Mode into Action and Career Eve contest menus with AI opponents.");
+    help("Adds Battle to supported solo tracks where menu capacity permits. Reload solo mode to apply.");
+    ImGui::Checkbox("Battle bots (fill to four cars)", &g_config.battle_bots);
+    help("Experimental opponents with native weapons and respawns. Navigation can stall at obstacles. Applies on the next event.");
     ImGui::Checkbox("Unlock All Out of the Box", &g_config.unlock_all);
     help("All tracks, cars, dares, and feat cheat prizes unlocked out of the box.");
 }

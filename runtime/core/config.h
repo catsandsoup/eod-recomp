@@ -59,8 +59,9 @@ struct Config {
     bool cheat_turbo = false;          // turbo boost active on L2
     bool cheat_chickens = false;       // chicken fight active on L2
     float turbo_scale = 1.75f;         // multiplier for turbo push force and top speed
-    float chicken_force_scale = 2.0f;  // multiplier for chicken explosion blast force
-    float chicken_radius_scale = 1.5f; // multiplier for chicken explosion blast radius
+    float chicken_force_scale = 1.0f;  // multiplier for chicken explosion blast force
+    float chicken_radius_scale = 1.0f; // multiplier for chicken explosion blast radius
+    bool battle_bots = true;          // fill Battle to four cars with AI; restart event to apply
     bool sp_battle_mode = true;        // inject Battle Mode into single player action menus with AI
     // [Career] career cars drawn as another vehicle: "845:790,859:68" (career
     // vehicle : the vehicle it looks like; set by the save editor)

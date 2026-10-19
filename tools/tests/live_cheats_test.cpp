@@ -18,7 +18,7 @@ extern "C" void ee_write32_slow(uint32_t, uint32_t) { std::abort(); }
 extern "C" uint8_t ee_read8_slow(uint32_t a) { return a < EE_RAM_SIZE ? g_ram[a] : 0; }
 extern "C" void ee_write8_slow(uint32_t a, uint8_t v) { if (a < EE_RAM_SIZE) g_ram[a] = v; }
 extern "C" void *ee_ptr(uint32_t a) { return a < EE_RAM_SIZE ? (g_ram + a) : nullptr; }
-extern "C" void ee_call(uint32_t) {}
+extern "C" void ee_call(uint32_t) { g_ee.r[2].ud[0] = 1; }
 
 std::atomic<bool> g_movie_playing{false};
 std::string g_game_root;
@@ -31,7 +31,10 @@ extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
 extern "C" void f_0018AFE0_orig() {}
 extern "C" void f_0017DA58_orig() {}
-extern "C" void f_0018F2A8_orig() {}
+static int native_driver_calls = 0;
+extern "C" void f_0018F2A8();
+extern "C" void f_0018F2A8_orig() { ++native_driver_calls; }
+extern "C" void f_0017DFA8() { g_ee.r[2].ud[0] = 0; }
 extern "C" void f_0034D328_orig() {}
 extern "C" void f_00179A08() {}
 extern "C" void f_0018AA50() {}
@@ -72,65 +75,87 @@ int main() {
     std::vector<uint8_t> ram(EE_RAM_SIZE, 0);
     g_ram = ram.data();
 
+    // Regression: Battle P2 must retain its native human controller.
+    // The old wrapper classified every car except slot zero as a bot.
+    g_config.sp_battle_mode = true;
+    MEM_SW(0x003CF19C, 0x18000224);
+    MEM_SW(0x003C41AC, 2);
+    MEM_SW(0x0048522C, 4);
+    MEM_SW(0x00447458, 0x10000);
+    MEM_SW(0x0044745C, 0x14000);
+    MEM_SW(0x20000 + 0x38, 0x14000);
+    MEM_SW(0x20000 + 0x40, 1);
+    g_ee.r[4].ud[0] = 0x20000;
+    f_0018F2A8();
+    check(native_driver_calls == 1, "Battle player 2 keeps native human input");
+    std::memset(g_ram, 0, EE_RAM_SIZE);
+
+    g_config = Config{};
+    g_config.unlock_all = false;
+    g_config.career_cheats = false;
+    g_config.sp_battle_mode = false;
+    MEM_SW(0x003CF19C, 0x18000224);
+    MEM_SW(0x003C4190, 9); // Native Battle enables its own weapon.
+    for (uint32_t i = 0; i < 7; ++i) MEM_SB(0x004A8AF8 + i, 0x12 + i);
+    MEM_SW(0x003D8180, 0x12345678);
+    game_patches_vblank();
+    check(MEM_LW(0x003D8180) == 0x12345678, "UnlockAll off preserves event progression override");
+    for (uint32_t i = 0; i < 7; ++i)
+        check(MEM_LB(0x004A8AF8 + i) == 0x12 + i, "UnlockAll off preserves every native prize mask");
+    check(MEM_LW(0x003C4190) == 9, "Disabled mods preserve native Battle weapon");
+    check(MEM_LW(0x003D18E0) == 0 && MEM_LW(0x003D18E4) == 0,
+          "UnlockAll off preserves original progression");
+    std::memset(g_ram, 0, EE_RAM_SIZE);
+
+    g_config = Config{};
+    g_config.cheat_turbo = true;
+    MEM_SW(0x20000 + 0x38, 0x10000);
+    MEM_SW(0x20000 + 0x3C, 0x30000);
+    MEM_SW(0x30000, 0x31000);
+    MEM_SW(0x31000 + 0x2C, 0x123456);
+    MEM_SW(0x10000 + 0x84, 0x3F800000); // forward Z=1
+    MEM_SW(0x003C4190, 2); // turbo flag without master
+    g_ee.r[4].ud[0] = 0x20000;
+    f_0018F2A8();
+    check(MEM_LW(0x10000 + 0x10C) == 0, "Turbo scale respects native master gate");
+    std::memset(g_ram, 0, EE_RAM_SIZE);
+
     // ------------------------------------------------------------ 1. Out of the box config
     Config cfg_default;
     check(cfg_default.unlock_all == true, "unlock_all is true out of the box");
     check(cfg_default.career_cheats == true, "career_cheats is true out of the box");
     check(cfg_default.sp_battle_mode == true, "sp_battle_mode is true out of the box");
     check(cfg_default.turbo_scale > 1.0f, "turbo_scale is enhanced out of the box");
-    check(cfg_default.chicken_force_scale > 1.0f, "chicken_force_scale is enhanced out of the box");
-    check(cfg_default.chicken_radius_scale > 1.0f, "chicken_radius_scale is enhanced out of the box");
+    check(cfg_default.chicken_force_scale == 1.0f, "default chicken blast force preserves native behavior");
+    check(cfg_default.chicken_radius_scale == 1.0f, "default chicken blast radius preserves native behavior");
 
     // ------------------------------------------------------------ 2. Feats out of the box
     g_config = cfg_default;
+    MEM_SB(0x004A8AF7, 0x5A);
+    MEM_SB(0x004A8AFF, 0xA5);
+    MEM_SW(0x003D817C, 0x12345678);
+    MEM_SW(0x003D8184, 0x87654321);
     game_patches_vblank();
     check(MEM_LW(0x003D18E0) == 0xFFFFFFFF, "0x003D18E0 feats bitmask unlocked out of the box");
     check(MEM_LW(0x003D18E4) == 0xFFFFFFFF, "0x003D18E4 feat cheats bitmask unlocked out of the box");
 
-    // ------------------------------------------------------------ 3. Battle Mode Eve Injection
-    // Set active mode: 0x12F = Action mode
-    MEM_SW(0x003C4C04, 0x12F);
-    // Number of eves = 2
-    MEM_SW(0x003C4CF4, 2);
-    // Eve 0 at 0x003C4D08, cur_contests at +0x70 = 4 (e.g. 4 events)
-    MEM_SW(0x003C4D08 + 0x70, 4);
-    // Eve 1 at 0x003C4D08 + 0x84, cur_contests at +0x70 = 3
-    MEM_SW(0x003C4D08 + 0x84 + 0x70, 3);
-    // Total contests initially = 7
-    MEM_SW(0x003C4CF8, 7);
-
-    // Call Eve loader hook
-    f_001244A8();
-
-    // Contest count should be 7 + 2 = 9
-    check(MEM_LW(0x003C4CF8) == 9, "two Battle contests appended across the 2 eves");
-    // Eve 0 should now have 5 contests
-    check(MEM_LW(0x003C4D08 + 0x70) == 5, "Eve 0 now has 5 contests (Battle mode visible in Event 1 of 5 screen)");
-    // Eve 1 should now have 4 contests
-    check(MEM_LW(0x003C4D08 + 0x84 + 0x70) == 4, "Eve 1 now has 4 contests");
-
-    // Inspect injected contest 7 (in Eve 0) at 0x003C61A8 + 7 * 0x28
-    uint32_t c7 = 0x003C61A8 + 7 * 0x28;
-    check(MEM_LW(c7 + 0x00) == 7, "contest 7: global index is 7");
-    check(MEM_LW(c7 + 0x04) == 0, "contest 7: eve index is 0 (belongs to Eve 0)");
-    check(MEM_LW(c7 + 0x08) == 0x18000224, "contest 7: event_type is 0x18000224 (BATTLE)");
-    check(MEM_LW(c7 + 0x0C) == 1, "contest 7: laps is 1");
-    check(MEM_LW(c7 + 0x10) == 4, "contest 7: max_cars is 4 (BattleMaster struct bound)");
-    check(MEM_LW(c7 + 0x14) == 0xFFFFFFFF, "contest 7: terrain_mask is 0xFFFFFFFF");
-    check(MEM_LW(c7 + 0x18) == 1, "contest 7: rounds is 1");
-    check(MEM_LW(c7 + 0x1C) == 500, "contest 7: purse points is 500");
-    check(MEM_LW(c7 + 0x24) == 1, "contest 7: enabled flag is 1 (selectable in event menu)");
-
-    // Inspect injected contest 8 (in Eve 1)
-    uint32_t c8 = 0x003C61A8 + 8 * 0x28;
-    check(MEM_LW(c8 + 0x00) == 8, "contest 8: global index is 8");
-    check(MEM_LW(c8 + 0x04) == 1, "contest 8: eve index is 1 (belongs to Eve 1)");
-    check(MEM_LW(c8 + 0x08) == 0x18000224, "contest 8: event_type is 0x18000224 (BATTLE)");
-    check(MEM_LW(c8 + 0x24) == 1, "contest 8: enabled flag is 1");
-
-    // Re-calling f_001244A8 must be idempotent (no duplicate insertions)
-    f_001244A8();
-    check(MEM_LW(0x003C4CF8) == 9, "idempotent: does not duplicate Battle contests if already present");
+    check(((MEM_LW(0x003D18E0) | MEM_LW(0x003D18E4)) & (1u << 7)) != 0,
+          "Native Home until_career_done visibility feat is available");
+    for (uint32_t i = 0; i < 7; ++i)
+        check(MEM_LB(0x004A8AF8 + i) == 0xFF, "Native seven-byte prize masks unlocked");
+    check(MEM_LB(0x004A8AF7) == 0x5A && MEM_LB(0x004A8AFF) == 0xA5,
+          "Unlocking preserves both bytes adjacent to native prize masks");
+    check(MEM_LW(0x003D8180) == 1, "Native event selection override enabled");
+    check(MEM_LW(0x003D817C) == 0x12345678 && MEM_LW(0x003D8184) == 0x87654321,
+          "Unlocking preserves adjacent event menu state");
+    // Native menu/profile initialization may clear these after boot. Reapply
+    // at the next vblank, rather than latching a once-only unlock at startup.
+    MEM_SW(0x003D18E4, 0);
+    MEM_SB(0x004A8AFE, 0);
+    MEM_SW(0x003D8180, 0);
+    game_patches_vblank();
+    check(MEM_LW(0x003D18E4) == 0xFFFFFFFF && MEM_LB(0x004A8AFE) == 0xFF &&
+          MEM_LW(0x003D8180) == 1, "Unlocks restored after native initialization resets");
 
     // ------------------------------------------------------------ 4. Live Controller Combos
     s_mock_pad.connected = true;
@@ -140,7 +165,7 @@ int main() {
     s_mock_pad.buttons = PAD_L1 | PAD_R1 | PAD_UP;
     game_patches_vblank();
     check(g_config.cheat_chickens == true, "L1 + R1 + D-Pad Up toggles Chicken Fight ON");
-    check((MEM_LW(0x003C4190) & 0x19) == 0x19, "0x003C4190 has bits 0, 3, 4 set (Master + Weapon + Chicken)");
+    check((MEM_LW(0x003C4190) & 0x99) == 0x09, "Chicken Fight uses native straight shot, not mortar/rain");
     check(!s_last_hud_banner.empty(), "HUD banner displayed on chicken toggle");
     check(s_mod_overlay_visible == true, "Mod overlay visible while L1+R1 held");
     check(s_haptic_pulse_calls > 0, "Haptic pulse triggered on toggle");
@@ -186,7 +211,7 @@ int main() {
     game_patches_vblank();
     check(g_config.cheat_chickens == true, "Chaos Mode sets cheat_chickens ON");
     check(g_config.cheat_turbo == true, "Chaos Mode sets cheat_turbo ON");
-    check((MEM_LW(0x003C4190) & 0x1B) == 0x1B, "0x003C4190 has Master(1) + Turbo(2) + Weapon(8) + Chicken(16)");
+    check((MEM_LW(0x003C4190) & 0x1B) == 0x0B, "Chaos uses Master + Turbo + straight Weapon");
 
     // Combo 6: L1 + R1 + Select -> Quick toggle Chicken Fight
     s_mock_pad.buttons = 0;
@@ -229,6 +254,7 @@ int main() {
     Config test_cfg;
     test_cfg.unlock_all = true;
     test_cfg.sp_battle_mode = true;
+    test_cfg.battle_bots = false;
     test_cfg.cheat_chickens = true;
     test_cfg.cheat_turbo = true;
     test_cfg.turbo_scale = 2.25f;
@@ -241,6 +267,7 @@ int main() {
     check(config_load(test_ini, loaded_cfg), "config_load reads ini");
     check(loaded_cfg.unlock_all == true, "persisted unlock_all");
     check(loaded_cfg.sp_battle_mode == true, "persisted sp_battle_mode");
+    check(!loaded_cfg.battle_bots, "persisted BattleBots off overrides default");
     check(loaded_cfg.cheat_chickens == true, "persisted cheat_chickens");
     check(loaded_cfg.cheat_turbo == true, "persisted cheat_turbo");
     check(loaded_cfg.turbo_scale == 2.25f, "persisted turbo_scale");

@@ -147,6 +147,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "TurboScale")) c.turbo_scale = (float)atof(v.c_str());
             else if (ieq(k, "ChickenForceScale")) c.chicken_force_scale = (float)atof(v.c_str());
             else if (ieq(k, "ChickenRadiusScale")) c.chicken_radius_scale = (float)atof(v.c_str());
+            else if (ieq(k, "BattleBots")) c.battle_bots = to_bool(v);
             else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
         } else if (ieq(section, "Career")) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
@@ -166,6 +167,7 @@ bool config_load(const std::string &path, Config &c) {
     if (const char *e = getenv("EOD_TURBO_SCALE")) c.turbo_scale = (float)atof(e);
     if (const char *e = getenv("EOD_CHICKEN_FORCE")) c.chicken_force_scale = (float)atof(e);
     if (const char *e = getenv("EOD_CHICKEN_RADIUS")) c.chicken_radius_scale = (float)atof(e);
+    if (const char *e = getenv("EOD_BATTLE_BOTS")) c.battle_bots = to_bool(e);
     if (const char *e = getenv("EOD_SP_BATTLE")) c.sp_battle_mode = to_bool(e);
 
     return true;
@@ -222,6 +224,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "TurboScale=%.2f       ; multiplier for turbo thrust and top speed cap (default 1.0)\n", c.turbo_scale);
     fprintf(f, "ChickenForceScale=%.2f; multiplier for chicken explosion blast impulse (default 1.0)\n", c.chicken_force_scale);
     fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);
+    fprintf(f, "BattleBots=%d         ; 1: fill Battle to four participants; restart event to apply\n", c.battle_bots ? 1 : 0);
     fprintf(f, "SinglePlayerBattle=%d ; 1: inject Battle Mode into single player action menus with AI\n", c.sp_battle_mode ? 1 : 0);
     fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
     fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());

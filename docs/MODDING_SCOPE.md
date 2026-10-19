@@ -558,9 +558,11 @@ editor **Low**.
   (which `c_*.va0` prop layout to use), `line_basename`, start/arena positions,
   AI skill and purse. All of these keys were found in the `*_eves.val` files.
 * **The 2-player menu is data, and it is the same data on PS2.** Each track's
-  `<track>_eves.val` has one `[eve] mode = multi` with ~25 contests (every track
-  except HomeBase offers jump/normal/figure-8/derby/battle/capture/gauntlet/…,
-  and `soccer` appears only in MP on 5 tracks). These files are semantically
+  `<track>_eves.val` has one `[eve] mode = multi` with a track-specific contest list. HomeBase also has a native multiplayer
+  Battle definition (`$0069$contest`, `max_cars=2`); the older claim that Home
+  was excluded was incorrect. Most other tracks have roughly 25 contests
+  including jump/normal/figure-8/derby/battle/capture/gauntlet/…; `soccer`
+  appears only in MP on 5 tracks. These files are semantically
   identical on both discs, so the Xbox decode applies to the PS2 port. Adding a
   contest to that list adds an MP option.
 * Split screen and pads on PS2: `Multiplayer requires at least two
