@@ -1,3 +1,6 @@
+---
+tags: ["engine", "modding-and-formats", "ps2", "technical-reference"]
+---
 # Test Drive: Eve of Destruction (SLUS-209.10) - Gameplay Mods & Reverse Engineering Technical Reference
 
 > [!WARNING]
@@ -12,18 +15,115 @@
 > of correct native behavior. The new chapter distinguishes verified CPU results
 > from pending gameplay validation and supersedes conflicting statements below.
 
-## Executive Summary & Agent Handoff
+## 0. Built-in Mods Catalog & Implementation Roadmap
 
-This technical reference document provides an exhaustive reverse-engineering specification, memory map, disassembly breakdown, mathematical AI formulation, and user guide for gameplay modifications and the Battle Mode subsystem within the static recompilation of *Test Drive: Eve of Destruction* (`SLUS_209.10` / `eod-recomp`).
+This section provides an immediate, evidence-backed reference for human modders and LLM agents on what mods are built into the recompiled PlayStation 2 engine (`SLUS_209.10`), their code-level mechanisms, their configuration options, and current implementation limits.
 
-The systems documented herein encompass:
-1. **Master Feats & Career Cheats Unlocking**: Permanent career unlock states, bitmask layout at `0x003C4190`, career-mode lockout bypass, and concurrent multi-cheat activation.
-2. **High-Velocity Scaled Turbo Boost Thrust Engine**: Interception of `HumanDriver::DriveUpdate` (`f_0018F2A8`), bypass of the hardcoded 100 mph (44.44 m/s) velocity ceiling, and linear forward impulse injection.
-3. **Explosive Ballistic Chicken Shockwave Engine**: Projectile kinematics of the `Ball` object (`0x228` bytes), radial impulse scaling in `f_0017DA58`, and spatial hash grid interaction.
-4. **Single-Player & Multi-AI Battle Mode Architecture**: Full reverse engineering of event type `0x18000224`, master event tables (`0x003C3A70`), contest tables (`0x003C61A8`), Eve tables (`0x003C4D08`), EveResultsTracker (`0x003C4BF8`), the `BattleMaster` core structure (`0x5AC` bytes), vehicle input setters (`f_0018AA50-80`), and weapon accessors (`f_0017DE78`/`f_0017E5C8`).
-5. **Demolition Derby AI Combat Subsystem**: Mathematical formulations for dynamic lead-pursuit trajectory interception, power-slide ramming via rear-wheel handbrake modulation, 40-frame barrier unstick recovery state machine, ballistic chicken weapon firing geometry, 1P-to-4P dynamic bot scaling, 5-kill race finish arbitration, and arena infield respawn/boundary reflection physics.
-6. **Zero-Friction Controller-Only User Journey**: Chording combos (`L1+R1+DPad`, `L3+R3`, Hold `Select`), chord button suppression in IOP pad RPC, and multi-sensory feedback (haptic pulses, audio chimes, HUD banners).
-7. **Configuration & Verification Reference**: Unified `eod.ini` schema, environment variable overrides, headless padscript automation, and CTest regression test execution.
+### 0.1 Built-in Mods Status Matrix (Completed vs. In-Progress)
+
+| Mod / Subsystem | Status in Latest Build (`0959cc4`) | Code-Level Hook & Mechanism | Configuration Key |
+| :--- | :--- | :--- | :--- |
+| **Straight-Shot Chicken Fight** | **Completed & Verified** | `game_patches_vblank()` asserts `cheats = (cheats \| 0x09) & ~0x90` at `0x003C4190`, clearing mortar bit `0x10`. Fired via native trigger `f_0017E000` with straight velocity $\vec{v} = \vec{F} \times (\|\vec{v}\| + 28)$. Reload handled by `body + 0x1E0` (0 cooldown $\to$ 1 wait release $\to$ 2 armed). | `[Cheats] ChickenFight=true` / Chord `L1+R1+UP` / Hold `Select` / `L3+R3` |
+| **High-Velocity Turbo Boost** | **Completed & Verified** | `f_0018F2A8` (`HumanDriver::DriveUpdate`) intercepts L2, multiplies vanilla 100 mph speed ceiling by `turbo_scale` (default 1.75x $\to$ 174 mph), and injects forward linear impulse. | `[Cheats] TurboBoost=true`, `TurboScale=1.75` / Chord `L1+R1+RIGHT` |
+| **Explosion Force & Radius Scaling** | **Completed & Verified** | `f_0017DA58` intercepts detonation shockwave: multiplies radius `$f12` by `chicken_radius_scale` and force impulse `$f13` by `chicken_force_scale`. | `ChickenForceScale=2.0`, `ChickenRadiusScale=1.5` |
+| **Single Player Battle Mode** | **Completed & Verified** | `src/battle_events.cpp:f_001244A8` appends native Battle contest records (`0x18000224`, 10 words) into the 320-contest table (`0x003C61A8`) for 8 spare Eve slots in solo Action & Career. | `[Cheats] SinglePlayerBattle=true` |
+| **Battle Bots (AI Opponents)** | **Completed & Verified (Experimental Navigation)** | `f_0012C158` fills roster to 4 cars; `f_0020FD48` invokes `f_00227EE8` to build weapon scenes for AI (`0x51`); `battle_driver.cpp` intercepts `AICar` update `f_001A2D20` to inject controls (`+0x1B6C` steer, `+0x1B70` gas, `+0x1B74` brake, `+0x1B78` clutch=1.0f). | `[Cheats] BattleBots=true` |
+| **Course Waypoint Tracking** | **Completed & Verified** | `src/battle_navigation.cpp` reads loaded primary course cache at `0x003CD190` (tag `0x104F128B`, 60-byte nodes). Follows track waypoint tangents; falls back to direct pursuit when unsupported. | Built into bot driver |
+| **Unlock All Out of the Box** | **Completed & Verified** | `game_patches_vblank()` sets feats `0x003D18E0 = 0xFFFFFFFF`, cheat prizes `0x003D18E4 = 0xFFFFFFFF`, writes 7 prize bytes at `0x004A8AF8`, and sets event override `0x003D8180 = 1`. | `[Cheats] UnlockAll=true` |
+| **Career Mode Cheat Bypass** | **Completed & Verified** | `game_patches_vblank()` asserts `cheats \|= 0x1` every vblank, neutralizing Career mode's lockout at `0x002C1224` (`andi $v0, $v1, 0xFFFE`). | `[Cheats] CareerCheats=true` |
+| **Human Manual Recovery** | **Completed & Verified** | `src/hle_recovery.cpp:f_001B8370` gates `00485098`, suppresses 3-second auto-reset for local humans (`car+480 == 0x50`), keeps AI auto-recovery intact (`0x51`), and retains manual SELECT countdown `timer[68]+timer[72]`. | `[Gameplay] ManualRecovery=1` / In-game F1 menu |
+| **Car LOD Detail Presets** | **Completed & Verified** | `src/hle_lod.cpp:f_0021ABF8` intercepts car tables: `original` (1.0x), `high` (3.0x), `maximum` ($\ge 1{,}000{,}000$ locking `Low1.mod`). | `[Video] Detail=maximum` / `EOD_CAR_LOD_MULTIPLIER` |
+| **2P Split-Screen Far/Fog Fix** | **Completed & Verified** | `src/hle_lod.cpp:f_00212B58` intercepts camera builder when `Detail=maximum && view_count == 2`, doubling far distance `0x00495D58` from 1150 to 2300. | Automatic in `Detail=maximum` |
+| **Native Hor+ 16:9 Widescreen** | **Completed & Verified** | `src/hle_camera.cpp:f_0034D328` forces Mode 1 (`xScale=0.75`), native Hor+ FOV expansion $2\arctan(\tan(\text{FOV}/2)/0.75)$, VU1 Y scaling $-0.9333334/\text{xScale}$. | `[Display] Aspect=16:9` |
+| **HUD Edge Anchoring** | **Completed & Verified** | `src/hle_hud.cpp` temporarily shifts left queue `003C4370` and right queue `003C4600` outward by $\Delta = 320 \times (1/k - 1) = 106.6667$ units. | `EOD_HUD_EDGE_ANCHORS=1` (or 16:9) |
+| **In-Game Mod Menu Overlay** | **Completed & Verified** | `runtime/ui/overlay.cpp` renders ImGui overlay on `F1` or controller `L3 + R3` (both sticks clicked) with Display, Audio, Controls, Gameplay, and System tabs. | `F1` key / `L3 + R3` pad chord |
+| **General Obstacle/Wall Avoidance** | *In Progress / Known Limit* | Native BSP query and static obstacle proxies lack track perimeter fence coverage; bots can remain pinned against outer fences until reverse recovery disengages. | Planned navigation enhancement |
+| **Battle Participant Count > 4** | *In Progress / Known Limit* | `BattleMaster` structure (`0x5AC` bytes) has a hardcoded 4-slot participant array (`master + 0x454`, stride `0x50`). Registering $>4$ cars corrupts rankings (`+0x594`) and spawn state. | Requires structural `BattleMaster` relocation |
+| **Multiplayer 3-4 Player Splitscreen** | *In Progress / Known Limit* | Input code can poll 4 pads, but the GS/VU1 rendering pipeline only contains passes, cameras, and viewport scissors for 2 local players. | Requires multi-pass renderer refactor |
+| **Custom 3D Model / Car Importer** | *In Progress / Known Limit* | Archive `0TSR` format and CRC32 polynomial (`0x04C11DB7`) are solved, but automated tool to convert modern meshes into PS2 `SPS4` VIF/VU1 DMA packets is pending. | External tool pipeline |
+
+---
+
+### 0.2 In-Game Mod Menu (`F1` / `L3 + R3` Controller Overlay)
+
+The recompiled engine embeds a full graphical settings and modding menu built with Dear ImGui in [`runtime/ui/overlay.cpp`](file:///Users/monty/Documents/GitHub/eod-recomp/runtime/ui/overlay.cpp).
+
+* **How to Open / Close**:
+  * **Keyboard**: Press `F1` (or `Cmd + ,` on macOS).
+  * **Controller**: Click both analog sticks simultaneously (`L3 + R3`).
+  * **Behavior**: Pauses the game loop if `PauseInMenu=1`, dimming the background.
+
+* **Menu Tabs & Interactive Controls**:
+  1. **Display Tab**: Fullscreen toggle (`F11` / `Alt+Enter`), Aspect ratio combo (`Auto`, `4:3`, `16:9 widescreen`, `Stretch`), VSync toggle, Smooth scaling filter, Internal resolution scaling (`1x` native 640x448 up to `6x` 3840x2688 4K), and Show FPS toggle.
+  2. **Audio Tab**: Master audio enable/disable and Volume slider (0% to 100%).
+  3. **Controls Tab**: Controller vibration toggle, DualShock button mappings, and keyboard key remapping table.
+  4. **Gameplay Tab (Live Mods)**:
+     - `Manual recovery only`: Checkbox for `g_config.manual_recovery`. Disables the 3-second wrong-way/rollover countdown teleport; SELECT manual recovery remains fully active.
+     - `Chicken Fight (L2 fires explosive chickens)`: Checkbox for `g_config.cheat_chickens`.
+     - `Turbo Boost (L2 boosts beyond top speed)`: Checkbox for `g_config.cheat_turbo`.
+     - `Turbo Scale`: Slider (`1.00x` to `3.00x`, default `1.75x`).
+     - `Chicken Blast Force`: Slider (`1.00x` to `4.00x`, default `1.00x`).
+     - `Chicken Blast Radius`: Slider (`1.00x` to `4.00x`, default `1.00x`).
+     - `Single Player Battle Mode`: Checkbox for `g_config.sp_battle_mode`.
+     - `Battle bots (fill to four cars)`: Checkbox for `g_config.battle_bots`.
+     - `Unlock All Out of the Box`: Checkbox for `g_config.unlock_all`.
+  5. **System Tab**: `Pause the game while this menu is open` checkbox.
+
+---
+
+### 0.3 Code-Level Mechanisms Summary for LLM Agents
+
+#### 1. How Battle Mode & Bots Work
+* **Contest Injection (`src/battle_events.cpp:f_001244A8`)**: During Eve loading, recomp discovers native Battle sections (`event_type == "battle"`) across tracks. It appends a 10-word contest descriptor `{contest_id, eve_id, 0x18000224, laps=0, max_cars=4, terrain, rounds=1, purse=1000, section_ptr, enabled=1}` to `0x003C61A8`.
+* **Roster Expansion (`src/battle_bots.cpp:f_0012C158`)**: Clamps car count to 4 when `contest.event_type == 0x18000224` and `BattleBots` is true, preserving all human players.
+* **Weapon Allocation (`src/battle_bots.cpp:f_0020FD48`)**: Vanilla code only allocated chicken weapons to human records (`0x50`). Recomp intercepts car builder `f_0020FD48`, iterates AI records (`0x51`), flags `ai_slots |= (1 << slot)`, and calls native chicken constructor `f_00227EE8(slot)` to equip each AI with a functional chicken launcher.
+* **Driver Interception (`src/battle_driver.cpp`)**: Native factory `0x00138288` returns `NullDriver` for Battle. Recomp intercepts `AICar` update `f_001A2D20`, validates `BattleMaster` (`0x003CF194`), and directly writes control registers:
+  * Steering (`+0x1B6C`): Clamped `[-1.0, 1.0]` based on target angle $\text{atan2}(\text{lat}, \text{fwd}) \times 1.25$.
+  * Throttle (`+0x1B70`): Scaled dynamically `[0.0, 1.0]`.
+  * Clutch (`+0x1B78`): **Must be pinned to `1.0f`**. Setting `0.0f` leaves transmission disengaged, preventing all movement.
+  * Handbrake (`+0x1B7C`): Rear-axle braking for power-slide turns.
+  * Gear (`+0x1B90`): `-10` for automatic forward, `-1` for reverse recovery.
+* **Course Navigation (`src/battle_navigation.cpp`)**: Reads native course cache at `0x003CD190` (tag `0x104F128B`, 60-byte nodes: position `+0x00`, tangent `+0x08`, packed metadata `+0x10`, next pointer `+0x14`). If on course, steers toward waypoint tangent with hysteresis; falls back to direct pursuit when off-track.
+* **Participant Limit**: `BattleMaster` (`0x5AC` bytes) allocates participant records from `+0x454` with stride `0x50`. The 4-int rankings array starts at `+0x594`. **Strictly 4 cars maximum**; registering $>4$ corrupts memory.
+
+#### 2. How the Straight Chicken Shooting Mod Works
+* **Active Cheat Mask (`0x003C4190`)**:
+  * Master Cheat Enable (`0x001`) + Weapon Master Active (`0x008`) = `0x009`.
+  * Feat Mortar Chicken (`0x010`) is **explicitly cleared** (`~0x10`).
+  * Raining Chickens (`0x080`) is **cleared** (`~0x80`).
+  * Recomp enforces `cheats = (cheats | 0x09) & ~0x90` in `game_patches_vblank()`.
+* **Trajectory Kinematics**: Because `0x010` is cleared, native trigger `f_0017E000` bypasses the parabolic mortar arc $(0.707\vec{F} + 0.495\vec{U}) \times 24.89 + \vec{V}$ and executes the straight Battle trajectory:
+  $$\vec{v}_{\text{launch}} = \vec{F}_{\text{car}} \times (\|\vec{v}_{\text{car}}\| + 28.0)$$
+* **Reload State Machine (`body + 0x1E0`)**:
+  * State `0` (Cooldown): 3.0s timer running against deadline at `body + 0x1E4`.
+  * State `1` (Awaiting Release): Reached when deadline expires while L2 is still held. Does not refire!
+  * State `2` (Armed): Triggered when L2 is released. Next L2 press fires.
+* **Detonation Scaling (`src/game_patches.cpp:f_0017DA58`)**: Detonation shockwave scales radius (`$f12 *= chicken_radius_scale`) and impulse Newtons (`$f13 *= chicken_force_scale`).
+
+#### 3. How Unlocks Work
+* **Out-of-the-Box Unlocks (`g_config.unlock_all`)**:
+  * Feat completion bitmask: `ee_w32(0x003D18E0, 0xFFFFFFFF);`
+  * Feat cheat unlock bitmask: `ee_w32(0x003D18E4, 0xFFFFFFFF);`
+  * Prize mask bytes: `ee_w8(0x004A8AF8 + i, 0xFF);` for $i = 0..6$ (exactly 7 prize bytes from `0x002CBC18`).
+  * Event selection override: `ee_w32(0x003D8180, 1);`
+  * Bit 7 of the completed feats union makes Home visible in `0x002C71B0 -> 0x002E0AF8 -> 0x00205368`, unlocking Homebase Battle.
+* **Career Cheat Lockout Neutralization**: Retail Career mode executes `0x002C1224` (`andi $v0, $v1, 0xFFFE`), stripping Bit 0. Recomp asserts `cheats |= 0x1` every vblank in `game_patches_vblank()`.
+
+#### 4. How LODs Work
+* **Native Distance Calculation**:
+  * Euclidean distance at `0034FA98`: $d = \|\mathbf{x}_{\text{car}} - \mathbf{x}_{\text{cam}}\|$.
+  * FOV compensation factor at `0034F620`: $f_{\text{fov}} = \frac{\tan(\text{ref}/2)}{\tan(\text{cur}/2)}$.
+  * View factor at `00211318`: Array at `004062A8` (`{1.0, 1.0, 2.0, 2.0}`). Crucially, 1P and 2P are both 1.0!
+  * Composite scaled distance: $\text{scaled\_distance} = d \times f_{\text{fov}} \times f_{\text{view}}$.
+* **Level Selection (`0021C6E0` / `00218E68`)**: Traverses 16-byte record array at `object + 0x220`. Selects first index where $\text{scaled\_distance} < \text{threshold}$, clamped to $[\text{min}, \text{count}-1]$.
+* **Mesh Hierarchy Fact**: `Low1.mod` is the highest complete playable car mesh; `Low0.mod` is parts-only.
+* **Detail Presets (`src/hle_lod.cpp:f_0021ABF8`)**:
+  * `original`: Preserves native thresholds bit-for-bit (1.0x).
+  * `high`: Multiplies all strictly positive thresholds by 3.0x.
+  * `maximum`: Dynamically sets factor $\max(1.0f, 1{,}000{,}000.0f / \text{threshold}[\text{min}])$. Clamps all vehicles at `Low1.mod` across all race distances ($\le 1150$).
+* **2P Split-Screen Far/Fog Restoration**: Native camera builder `00212B58` divides far plane (`0x00495D58`) by view count ($2$), reducing 2P draw/fog distance to $575$. Recomp intercepts `f_00212B58` when `Detail=maximum && view_count == 2`, doubling `0x00495D58` ($1150 \to 2300$) prior to calling the original, restoring full 1P view range.
+
+---
 
 ---
 
@@ -235,7 +335,7 @@ The Action Mode event selection carousel is driven by `f_00379728`:
 - Physical controller query: `f_00335518` counts connected pads.
 - Callers of `f_00335518`:
   - `0x002C0DF4`: Main Menu Multiplayer verification. Branches to `0x002A3220` displaying dialog `"Multiplayer requires at least two controllers!"` (`0x004197B8`).
-  - `0x002B8E1C`: Player setup screen. Clamps player count to 1 if count $< 2$.
+  - `0x002B8E1C`: Player setup screen. Clamps player count to 1 if count $&lt; 2$.
 - **Solo Clean Boot Rationale**: When Battle Mode is launched via Single Player Action Mode (`mode == 0x12F`) or Career Mode (`mode == 0x130`), the code branch at `0x002C0DF4` is **never executed**.
 - **Respawn Safety**: In `f_001673B8` (respawn selector), when `num_cars == 1` (`total_opponents == 0`), the opponent distance loop executes 0 times and assigns spawn point at `0x00167518` without null dereferences. 1 player drives solo cleanly.
 
@@ -314,10 +414,10 @@ Analysis of `f_00189D50` (tire slip & longitudinal traction update) reveals crit
 - **Handbrake (`car + 0x1B78`)**: Uncouples front wheels, zeroing front braking torque, and locks only the rear axle. When applied at speed during steering deflection, rear tire cornering stiffness drops to zero ($C_{\alpha,\text{rear}} \approx 0$), initiating an oversteer yaw rotation while engine throttle (`0x1B70 = 1.0f`) maintains forward velocity.
 
 ### 4.8 Weapon Subsystem Functions
-- `f_0017DE78(int owner_id, int slot_idx)`: Queries weapon registration table at `0x003CE3F8`. Returns pointer to vehicle's `Weapon` object in `$v0` (`g_ee.r[2]`).
-- `f_0017DE30(Weapon *weapon, int owner_id, int slot_idx)`: Registers a newly constructed weapon into the global weapon registry.
+
+
 - `f_0017DDB0(Weapon *weapon)`: Unregisters and removes a weapon from the registry.
-- `weapon->vtbl[2](weapon, car, &trigger_state)`: Native virtual method (`*(weapon->vtbl + 8)`) executed each tick within `HumanDriver::DriveUpdate` (`f_0018F2A8_orig`) when Chicken Fight cheat is active.
+- `weapon->vtbl[2] (`weapon, car, &trigger_state`, source checkout)`: Native virtual method (`*(weapon->vtbl + 8)`) executed each tick within `HumanDriver::DriveUpdate` (`f_0018F2A8_orig`) when Chicken Fight cheat is active.
 - `f_0017DA58(const float *pos, int attacker_idx, float radius, float force)`: Applies explosion impulse and radial chassis deformation.
 
 ---
@@ -362,7 +462,7 @@ Direct target tail-chasing in open demolition arenas results in AI vehicles cons
 To execute high-speed T-bone collisions rather than glancing rear-end scrapes, bots execute power-slides on sharp cornering angles:
 
 #### Activation Criteria:
-$$face\_dot < 0.15 \quad \text{AND} \quad \|\vec{V}_{\text{ai}}\| > 9.0\text{ m/s}$$
+$$face\_dot &lt; 0.15 \quad \text{AND} \quad \|\vec{V}_{\text{ai}}\| > 9.0\text{ m/s}$$
 where $face\_dot = \hat{L} \cdot \vec{F} = L_x F_x + L_z F_z$.
 
 #### Control Modulation:
@@ -397,7 +497,7 @@ When an AI vehicle strikes a perimeter wall or barrier at an acute angle, full t
 1. **Displacement Metric**:
    $$\Delta d = \sqrt{(P_{x,t} - P_{x,t-1})^2 + (P_{z,t} - P_{z,t-1})^2}$$
 2. **Pin Detection Threshold**:
-   $$\|\vec{V}_{\text{ai}}\| < 1.4\text{ m/s} \quad \text{AND} \quad \Delta d < 0.35\text{ m}$$
+   $$\|\vec{V}_{\text{ai}}\| &lt; 1.4\text{ m/s} \quad \text{AND} \quad \Delta d &lt; 0.35\text{ m}$$
 3. **Trigger Threshold**:
    If the pin condition holds for $> 40\text{ frames}$ ($\approx 0.67\text{ s}$ at 60Hz):
    - Set `reverse_frames = 55` ($\approx 0.92\text{ s}$).
@@ -409,7 +509,7 @@ When an AI vehicle strikes a perimeter wall or barrier at an acute angle, full t
    - `steer = reverse_dir * 0.9f` via `f_0018AA80()`
    - `footbrake = 0.0f`, `handbrake = 0.0f`
 5. **Recovery Timing Verification**:
-   Total recovery duration $= 40 + 55 = 95\text{ frames} = 1.583\text{ seconds}$, guaranteed to satisfy the $< 2.0\text{ s}$ acceptance requirement.
+   Total recovery duration $= 40 + 55 = 95\text{ frames} = 1.583\text{ seconds}$, guaranteed to satisfy the $&lt; 2.0\text{ s}$ acceptance requirement.
 
 ### 5.4 Ballistic Chicken Weapon Targeting & Firing Geometry
 AI vehicles scan direct line-of-sight toward their current target:
@@ -510,7 +610,7 @@ For all active vehicles, perimeter distance $d = \sqrt{P_x^2 + P_z^2}$ is monito
 If $d > 24.5\text{ m}$:
 1. Compute inward unit normal $\hat{n} = \left(-\frac{P_x}{d}, -\frac{P_z}{d}\right)$.
 2. Calculate normal velocity component $v_n = \vec{V} \cdot \hat{n}$.
-3. If $v_n < 0$ (vehicle moving outbound):
+3. If $v_n &lt; 0$ (vehicle moving outbound):
    $$\vec{V}' = \vec{V} - (1.0 + e) \cdot (\vec{V} \cdot \hat{n}) \cdot \hat{n}$$
    with restitution coefficient $e = 0.8$ ($1.0 + e = 1.8$), bouncing the car back into the arena.
 4. Position is clamped to perimeter safety limit:
@@ -532,7 +632,7 @@ Cheats and gameplay modes can be toggled in real time during live driving or whi
 | **`L1 + R1 + Triangle`** | Chaos Mode | Simultaneous Chicken Fight + Turbo Boost on L2 (`0x003C4190 |= 0x1B`). |
 | **`L1 + R1 + Select`** | Quick Chicken Toggle | Immediately inverts `cheat_chickens` state. |
 | **`L3 + R3`** (Both Sticks Click) | Instant Chicken Fight Toggle | Toggles `cheat_chickens` on the fly. |
-| **Hold `Select` (30 frames / 500ms)** | Instant Chicken Fight Toggle | Toggles `cheat_chickens`. Short tap (<30 frames) retains normal vehicle reset. |
+| **Hold `Select` (30 frames / 500ms)** | Instant Chicken Fight Toggle | Toggles `cheat_chickens`. Short tap (&lt;30 frames) retains normal vehicle reset. |
 | **`L1 + R1` (Hold)** | Live Cheat Guide Overlay | Renders on-screen cheat guide HUD overlay. |
 | **Keyboard `F5`** | Chicken Fight Toggle | Toggles forward ballistic chickens. |
 | **Keyboard `F6`** | Turbo Boost Toggle | Toggles high-velocity turbo boost. |
