@@ -32,3 +32,7 @@
 0017DA58 wrap     # scale chicken explosion blast radius and impulse force
 0018F2A8 wrap     # optional turbo boost scaling (speed cap and acceleration)
 001244A8 wrap     # optional single player battle mode injection into action eves
+
+0012C158 wrap     # optional Battle bots: native roster builder fills to four cars
+0020FD48 wrap     # optional Battle bots: create weapons through native scene factory
+001A2D20 wrap     # optional Battle bots: input after native AICar update
