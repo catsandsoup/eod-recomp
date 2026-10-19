@@ -6,6 +6,7 @@ optional scenario (weapon selects held/release/repress native reload input).
 Menu offsets are specific to the unlocked SLUS_209.10 Action multiplayer menu.
 """
 import bisect
+import os
 import sys
 
 base, track, bound, pad = sys.argv[1:5]
@@ -43,6 +44,18 @@ if scenario == "weapon":
     events = {frame: value for frame, value in events.items() if frame < 5000}
     events[5000] = 0
     spans = [] if pad else [(5200, 5550, 0x100), (5580, 5590, 0x100)]
+post = os.environ.get("EOD_BATTLE_POST_SCRIPT", "")
+if post:
+    # Optional explicit native menu inputs replace gameplay stimulus from their
+    # first frame. Both pads become neutral; only pad 0 receives the sequence.
+    post_events = {int(frame): int(mask, 16)
+                   for frame, mask in (item.split(":") for item in post.split(","))}
+    first = min(post_events)
+    events = {frame: value for frame, value in events.items() if frame < first}
+    events[first] = 0
+    spans = [(start, min(end, first), buttons) for start, end, buttons in spans if start < first]
+    if pad == 0:
+        events.update(post_events)
 times = sorted(events)
 points = sorted(set(times) | {p for start, end, _ in spans for p in (start, end)})
 output = []

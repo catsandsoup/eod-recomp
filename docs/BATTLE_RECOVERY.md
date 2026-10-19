@@ -431,7 +431,7 @@ The following requirements remain pending until a named live run proves them.
 | Pending check | Evidence needed |
 | --- | --- |
 | Additional original-reference coverage | Additional pitch/camera angles and direct original-hardware comparisons beyond the recorded vanilla run. |
-| Reload in a real match | First shot, held input through expiry, release, second press; matching native state/deadline and visible second shot. |
+| Additional real-match angle/impact coverage | The dedicated reload journey below verifies held/release/repress; additional named pitch/camera/impact cases still need live evidence. |
 | Collision, blast and ownership | Native impact/detonation path; correct attacker and victim; score changes consistent with the hit. |
 | Complete mixed match with course routing | Two humans plus two bots through five net kills and results with the final course policy; the earlier direct-pursuit Anoka run reached this threshold. |
 | Recovery and respawn | Observed wall recovery and native respawn transforms on the actual track; no invented world-origin circle or unsupported time guarantee. |
@@ -450,11 +450,18 @@ The bounded next weapon journey is authored as:
 tools/test_battle.sh "$DISC" weapon work/battle-weapon-reload 7000 Dennison
 ```
 
-It uses original two-human Battle with bots/enhancements off, holds human 0's
+The completed `weapon-reload` run (7,000 vblanks, exit 0, native
+`Dennison.trk`, flags `0x09`) uses original two-human Battle with
+bots/enhancements off, holds human 0's
 L2 from vblank 5200 through 5549, releases at 5550 and presses again at 5580.
-Human 1 remains neutral. Input-state checks establish the intended timeline;
-real reload, visible flight/impact and score evidence remain pending until this
-journey is actually inspected. `BATTLE_BLAST` records the native detonation
+Human 1 remains neutral. Both input-state checks and rendered/native trace inspection establish the
+journey. The first shot is sampled at native t=10.344 (state 0, flight 1);
+state 1 appears at t=13.347 while L2 remains held. Release re-arms state 2 at
+t=16.183; repress launches again at t=16.683 (state 0, fresh muzzle position
+and launch velocity). Captures show native chickens and Arming/Press L2 UI.
+Human 1 stays neutral. The in-flight marker stays one between these shots:
+this confirms that native in-flight status is separate from trigger readiness.
+No native blast was observed, so this journey does not prove victim/kill credit. `BATTLE_BLAST` records the native detonation
 entry's attacker index, position, radius and force when tracing is enabled;
 it does not itself prove which car was hit or why a later score changed.
 
@@ -462,7 +469,18 @@ Use an explicitly named `Anoka` mixed run for the next full-match/lifecycle
 journey; the harness supports its ten RIGHT taps and requires `Anoka.trk`.
 Control post-match input separately: demonstrate rank/results, select restart,
 observe a fresh countdown/score reset, return to the menu and exit. Existing
-fixed smoke scripts do not certify those post-match choices.
+fixed smoke scripts do not certify those post-match choices. For an explicit
+post-match probe, `EOD_BATTLE_POST_SCRIPT` supplies native frame:hex-mask input,
+replacing later gameplay stimuli and making both pads neutral except for the
+specified pad-0 sequence. The exact resulting timelines are saved as usual:
+
+```sh
+EOD_BATTLE_POST_SCRIPT='16500:0008,16510:0000' \
+  tools/test_battle.sh "$DISC" mixed work/battle-anoka-lifecycle 18000 Anoka
+```
+
+Here `0x0008` is START; this is a probe, not a claim that START selects restart.
+Inspect the native result/menu before authoring the next confirmed selection.
 
 The major unresolved implementation gap is obstacle-aware pursuit: the current
 reader only supplies primary-course segments, and no safe native wall/clearance
