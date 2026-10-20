@@ -401,6 +401,8 @@ class TestCustomCarPipeline(unittest.TestCase):
         config = scratch / "eod.ini"
         config.write_text("[Video]\nRenderer=vulkan\nRenderScale=1\nAspectRatio=4:3\nFrameSkip=0\nVSync=0\n")
         env["EOD_MEMCARD"] = str(scratch / "memcard")
+        ram_path = scratch / "ram.bin"
+        env["EOD_DUMP_RAM"] = str(ram_path)
 
         cmd = [
             str(EOD_BIN),
@@ -433,6 +435,28 @@ class TestCustomCarPipeline(unittest.TestCase):
         self.assertIn("car Phantom: mass 3200", proc.stdout)
         self.assertNotIn("CarStatsLookup: no such car as Phantom, AFAIK", proc.stdout)
         self.assertNotIn("have the same number", proc.stdout)
+        # A Phantom AI load does not prove that the player selected Phantom.
+        # Native f_00185470 marks human cars 0x50 and copies the chassis name;
+        # humans can occupy any world slot, including the last slot.
+        ram = ram_path.read_bytes()
+        def word(address):
+            self.assertGreaterEqual(address, 0)
+            self.assertLessEqual(address + 4, len(ram))
+            return struct.unpack_from("<I", ram, address)[0]
+        count = word(0x0048522C)
+        self.assertGreater(count, 0)
+        self.assertLessEqual(count, 16)
+        human_models = []
+        for index in range(count):
+            car = word(0x00447458 + index * 4)
+            self.assertGreater(car, 0)
+            if word(car + 0x1E0) == 0x50:
+                model = ram[car + 0x224:car + 0x224 + 32].split(b"\0", 1)[0]
+                parameters = word(car + 8)
+                parameter_model = ram[parameters + 0xAC:parameters + 0xAC + 32].split(b"\0", 1)[0]
+                self.assertEqual(model, parameter_model)
+                human_models.append(model)
+        self.assertEqual(human_models, [b"Phantom"], "P1 must drive Phantom, not merely race a Phantom AI")
 
     def test_09_audio_sfx_and_pss_pipeline(self):
         """Verify SPU2 ADPCM codec, SFX0 compilation/decompilation, and PSS audio extraction."""

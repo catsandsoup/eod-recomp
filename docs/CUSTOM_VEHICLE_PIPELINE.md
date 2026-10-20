@@ -148,9 +148,13 @@ frame 3,000 shows MIDSIZE / PHANTOM, stats 9/8/8, and the clean custom 777
 number-card preview. Frames 4,950 and 6,000 show the selected native-chassis
 player car with the generated black/white livery in a 14-car race. The game
 loaded Phantom.car and logged the expected mass 3200; no missing-car or duplicate
-number panic occurred. The automated route is in test_08; its resource assertions
-alone do not distinguish a player from AI, so the menu and race images were
-inspected separately. These local captures are not committed.
+number panic occurred. The automated route is in test_08. A subsequent 6,000-vblank run passed in
+100.227 seconds with an additional RAM assertion: exactly one human-controlled
+car (type 0x50) has chassis Phantom at car+0x224, matching its parameter name
+at u32[car+8]+0xAC. The assertion iterates the native world roster rather than
+assuming the human occupies slot zero. This distinguishes player selection
+from merely loading a Phantom AI. Menu and race images were inspected
+separately; these local captures and RAM are not committed.
 
 This bounded result establishes selection, race startup and visible custom
 textures. It does not establish a complete race, driving feel, every LOD distance,

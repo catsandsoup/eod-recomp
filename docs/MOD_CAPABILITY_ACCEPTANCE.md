@@ -28,7 +28,7 @@ not a statement that every capability is implemented. NASCAR remains paused.
 | Compatible-game track conversion | Research candidate only; paused | Proven per-format geometry, collision, materials, LOD and gameplay conversion |
 | Native gates/checkpoints/grids/finish/spawns | Existing native contracts retained; Welch Battle spawn samples verified | Every authored/imported layout and complete event lifecycle |
 | Universal pretested modes, Battle first | Fourteen-map catalog built; bounded Welch solo and 2P verified | Complete matches on every map, 3P and 4P included |
-| Expanded Battle population | Current generator caps at four; BattleBots fills to four | Establish safe capacity, then 1 human + 15 AI and extra-AI multiplayer scoring/respawns |
+| Expanded Battle population | Native four-record state overlaps ranks/count at participant five; generator caps at four | Relocate/audit participant and rank storage, then expanded scoring/respawn/HUD/match tests |
 | Real-time invincibility | Toggle and damage wrappers regression checked | Rendered on/off collisions and timed damage in every relevant mode |
 | Arbitrary real-time turbo multiplier | Launch-time multiplier and live enable toggle only | Live numeric adjustment, validation and all-mode behavior |
 | GUI for all supported operations | Car/config/save-edit implementation and smoke checks | Visual full-flow acceptance; unsupported operations must stay explicit |
