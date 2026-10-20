@@ -261,3 +261,23 @@ and `work/gameplay-live/welch-mixed-unlocked/`, with exact controller scripts,
 configuration, screenshots, logs and RAM. Solo used the v4 catalog before the
 native preview-name preservation; two-player used the final v5 output.
 Generated disc-derived archives and captures are not committed.
+
+## Expanded Battle participant capacity — static analysis
+
+Increasing maxcars beyond four is unsafe with the current native Battle state.
+The factory at 0x00167F30 allocates 0x5AC bytes (0x00167F48/4C). Constructor
+0x00166C60 initializes only four records, at master+0x46C, +0x4BC, +0x50C and
++0x55C, through 0x00167F20. Loader 0x001678A8 copies the description's count
+(+0x98C) to master+0x5A8 and indexes participants at +0x454+0x50*i without
+a greater-than-four guard. Participant five starts at +0x594, overlapping rank
+zero. During update, 0x00166DA0 calls 0x00167908 per participant; the fifth
+record's clears at +0x0C/+0x10/+0x14 reach master+0x5A0, +0x5A4 (spawn index)
+and +0x5A8 (participant count). Ranking 0x00167658 uses +0x594+4*i, likewise
+overlapping spawn/count with larger populations; finish 0x00167D58 consumes the
+same layout.
+
+These are source/disassembly findings, not a >4-car live test. A safe expansion
+needs coordinated participant/rank storage, construction/allocation and every
+native access (including finish and HUD) audited and adapted, followed by
+complete scoring/respawn/match tests. Neither ordinary 14-car racing nor changing
+one Battle catalog field establishes this. The generator retains maxcars=4.
