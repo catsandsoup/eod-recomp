@@ -327,3 +327,44 @@ experiment was rejected and removed. Read COLLISION_PERFORMANCE.md for exact
 profiles, parity gates, reproduction limits and the next decisive work. No
 physics/effects/quality reduction or frame skipping was introduced; NASCAR stayed
 paused.
+
+## On-demand personal Mac app — 2026-10-21
+
+The owner's personal signed app now includes Native, Phantom, all-map Battle
+and Combined launch choices. F1 exposes existing cheats/damage options and
+editable turbo/chicken multipliers. Profile selection precedes streaming;
+resource changes require a restart. Native uses no overlay. Headless and explicit
+EOD_MOD_DIR runs bypass the chooser. Personal disc-derived profiles can be
+bundled with EOD_BUNDLE_MODS; normal source builds include none.
+
+Verification: all 62 active CTests passed (45.69 s); NASCAR was excluded per the
+owner's pause. Eight composer CPU cases cover independent edits, conflicts and
+exclusive atomic publication. Strict app signing verification passes. All 58
+merged COMMON entries were compared against the selected original source
+payload/metadata with no loss. A 6,000-frame native-input Combined race selected
+Phantom as the human car and passed the existing E2E assertions (100.20 s).
+The clean Combined profile also passed a separate 6,000-frame scripted Welch
+solo Battle check: actual Welch resource loaded, active phase 1, one human and
+four total cars. This bounds startup acceptance; it does not prove a full match,
+all-map AI navigation or every mode. Logs are in ignored
+`work/on-demand-{clean-combined-car-e2e,combined-welch-result}.log` and
+`work/on-demand-combined-welch/out.log`.
+
+An initial Combined race crashed with `MemFree: Dennison.trk not in use` when
+using an older Battle package that also contained an experimental Dennison
+dynamic-barrier edit. Regenerating a pure Battle catalog excludes that track
+override and the same race then passes. The clean and experimental Battle
+COMMON archives are byte-identical; the experimental track remains excluded.
+This does not claim to have repaired that barrier experiment.
+
+Cleanup removed merged local branches `fix/input` and `mod/lod`, their obsolete
+compiled checkouts, old test executables/app backups and an unused legacy game
+library cache: 4,731,352,428 logical bytes. A verified all-refs Git bundle,
+inventories and preserved work/gen research live in ignored
+`work/cleanup-2026-10-20`. Remaining unmerged branches and the open recovery PR
+were retained. Disc assets, saves and personal settings were preserved.
+
+Visible chooser/F1 interaction and exhaustive event compatibility remain
+hands-on acceptance gaps. Four-car Battle capacity, navigation limitations,
+unfinished geometry import and the high-resolution effects slowdown remain.
+See ON_DEMAND_MODS.md for usage and STAR handoff.

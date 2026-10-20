@@ -41,6 +41,23 @@ int main() {
     check(data == missing, "explicit environment path retained without fallback");
     check(NSApp == nil, "headless validation never creates NSApplication");
     unsetenv("EOD_DATA");
+    fs::create_directories(fs::path(support) / "mods/phantom/DATA/CAR");
+    fs::create_directories(fs::path(support) / "mods/phantom/DATA/RES");
+    setenv("EOD_MOD_DIR", "explicit-test-overlay", 1);
+    check(mac_app_select_mods(true), "headless startup bypasses selector");
+    check(mac_app_select_mods(false), "explicit developer overlay bypasses visible selector");
+    check(std::string(getenv("EOD_MOD_DIR")) == "explicit-test-overlay", "explicit overlay preserved");
+    check(!mac_app_set_mod_profile("../disc"), "unknown profile rejected");
+    check(!mac_app_set_mod_profile("phantom"), "incomplete profile rejected");
+    check(std::string(getenv("EOD_MOD_DIR")) == "explicit-test-overlay", "failed selection preserves current overlay");
+    for (const char *file : {"CAR/PHANTOM.CAR", "RES/COMMON.RES", "RES/CT.RES", "RES/UICAR.RES"}) {
+        std::ofstream(fs::path(support) / "mods/phantom/DATA" / file).put('x');
+    }
+    check(mac_app_set_mod_profile("phantom"), "complete installed profile selected");
+    check(std::string(getenv("EOD_MOD_DIR")) == support + "/mods/phantom", "profile resolves inside application support");
+    check(mac_app_set_mod_profile("native"), "native profile selected");
+    check(getenv("EOD_MOD_DIR") == nullptr, "native mode removes overlay");
+    check(NSApp == nil, "profile selection tests never create NSApplication");
     fs::remove_all(scratch);
     if (!failures) puts("macos_startup_test: all tests passed without SDL initialization");
     return failures ? 1 : 0;
