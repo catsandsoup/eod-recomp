@@ -94,6 +94,7 @@ int main() {
     setenv("EOD_INVINCIBLE", "0", 1);
     g_config = Config{};
     const uint32_t protected_car = 0x10000;
+    MEM_SW(protected_car + 0x1E0, 0x50); // native human driver identity, independent of slot
     MEM_SW(protected_car + 7148, 0x3F000000); // 50% accumulated damage
     MEM_SW(protected_car + 0x10C, 0x12345678); // unrelated physics sentinel
     g_ee.r[4].ud[0] = protected_car;
@@ -118,21 +119,51 @@ int main() {
           "Invincibility does not invent repairs for pre-existing damage");
     check(MEM_LW(protected_car + 0x10C) == 0x12345678,
           "Invincibility preserves unrelated car physics state");
+    for (int player=0;player<4;player++) {
+        const uint32_t car = 0x20000 + player * 0x4000;
+        MEM_SW(car + 0x1E0, 0x50);
+        g_ee.r[4].ud[0] = car;
+        f_0018AD20(); f_0018CA98();
+    }
+    check(native_damage_calls == 1 && native_collision_damage_calls == 1,
+          "Invincibility protects all four humans without assuming a world slot");
+    const uint32_t ai_car = 0x40000;
+    MEM_SW(ai_car + 0x1E0, 0x56);
+    g_ee.r[4].ud[0] = ai_car;
+    f_0018AD20(); f_0018CA98();
+    check(native_damage_calls == 2 && native_collision_damage_calls == 2,
+          "Invincibility leaves native AI scalar and collision damage active");
+    for (uint32_t car : {0u, 3u, uint32_t(EE_RAM_SIZE-4)}) {
+        g_ee.r[4].ud[0] = car;
+        f_0018AD20(); f_0018CA98();
+    }
+    check(native_damage_calls == 5 && native_collision_damage_calls == 5,
+          "Invalid or unknown car pointers are never classified as protected humans");
     std::memset(g_ram, 0, EE_RAM_SIZE);
 
     // Native timed-damage cheat writes health inline in the world update.
     // Suppress that bit only during the update, retain all other work/flags.
     MEM_SW(0x003C4190, 0x49);
+    MEM_SW(0x00485280, 0);
+    MEM_SW(0x0048522C, 1);
+    MEM_SW(0x00485230, 0x20000);
+    MEM_SW(0x20000 + 4, protected_car);
+    MEM_SW(protected_car + 0x1E0, 0x50);
     g_config.cheat_invincible = true;
     f_001B5840();
     check(native_update_calls == 1 && native_update_cheats == 9,
           "Invincibility disables timed-damage bit during native update only");
     check(MEM_LW(0x003C4190) == 0x10049,
           "Timed-damage suppression restores its bit and retains native flag changes");
-    g_config.cheat_invincible = false;
+    MEM_SW(protected_car + 0x1E0, 0x56);
     MEM_SW(0x003C4190, 0x49);
     f_001B5840();
     check(native_update_calls == 2 && native_update_cheats == 0x49,
+          "Timed damage remains active for a selected AI car while invincibility is enabled");
+    g_config.cheat_invincible = false;
+    MEM_SW(0x003C4190, 0x49);
+    f_001B5840();
+    check(native_update_calls == 3 && native_update_cheats == 0x49,
           "Disabled invincibility preserves timed native damage gate");
     std::memset(g_ram, 0, EE_RAM_SIZE);
 

@@ -13,9 +13,8 @@ synthetic tests establish neither safe terrain nor complete player success.
 For optional invincibility, a fresh vehicle takes no new mechanical or panel
 damage while collisions and chicken knockback continue. With the option off,
 the native damage callbacks run. Existing wrecks and detached panels do not
-repair when it is enabled mid-event. Protection applies to AI too; consequently
-damage-based Battle kills cannot work normally while every car is invincible.
-Disable it for ordinary Battle scoring.
+repair when it is enabled mid-event. Protection applies to all human players (P1–P4), regardless of world slot.
+AI keep native damage and can still be destroyed in Battle.
 
 For the boundary work, the intended player outcome remains driving through
 Dennison's highway access gap and clearing visible fences without invisible
@@ -126,8 +125,9 @@ collision/chicken comparisons. The callbacks delegate directly when disabled;
 there are no per-frame health writes or silent weak native fallbacks.
 The native world update `0x001B5840` also writes damage inline for the
 master+`0x40` timed-damage feat. A third wrapper temporarily clears only that
-bit during the complete native update, then restores just that bit while
-retaining unrelated native flag changes. Initialization and respawn health
+bit when its selected driver belongs to a protected human, then restores just
+that bit while retaining unrelated native flag changes. A selected AI retains
+the native timed-damage gate. Initialization and respawn health
 stores (`0x00187248`, `0x0018D878`) remain native.
 `config/hle.txt` registers all three hooks so generated code is reproducible.
 

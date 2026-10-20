@@ -58,7 +58,7 @@ struct Config {
     bool career_cheats = true;         // allow cheats in career mode (master cheat flag)
     bool cheat_turbo = false;          // turbo boost active on L2
     bool cheat_chickens = false;       // chicken fight active on L2
-    bool cheat_invincible = false;     // cars take no mechanical/deformation damage
+    bool cheat_invincible = false;     // human players take no mechanical/deformation damage; AI remain vulnerable
     float turbo_scale = 1.75f;         // multiplier for turbo push force and top speed
     float chicken_force_scale = 1.0f;  // multiplier for chicken explosion blast force
     float chicken_radius_scale = 1.0f; // multiplier for chicken explosion blast radius

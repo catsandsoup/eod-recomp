@@ -161,7 +161,7 @@ def build(disc, output, battle=False, remove_dynos=()):
               'tracks': [], 'sources': {}, 'removed_dynamic_objects': 0,
               'limits': ['Static SOL/BPP fences are unchanged.',
                          'Catalog reduces Action to race+Battle and MP to Battle; Career definitions remain.',
-                         'Invincibility prevents Battle damage kills; disable it for ordinary scoring.']}
+                         'Invincibility protects human players only; AI remain vulnerable.']}
     output.parent.mkdir(parents=True, exist_ok=True)
     # Build completely in a temporary sibling. Failed builds cannot leave an
     # accidentally selectable partial mod root.

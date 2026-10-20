@@ -224,7 +224,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "CareerCheats=%d       ; 1: allow cheat feats to function in career mode\n", c.career_cheats ? 1 : 0);
     fprintf(f, "TurboBoost=%d         ; 1: enable turbo boost on L2\n", c.cheat_turbo ? 1 : 0);
     fprintf(f, "ChickenFight=%d       ; 1: enable explosive chicken shooting on L2\n", c.cheat_chickens ? 1 : 0);
-    fprintf(f, "Invincible=%d        ; 1: suppress vehicle damage/deformation for all cars; existing damage remains\n", c.cheat_invincible ? 1 : 0);
+    fprintf(f, "Invincible=%d        ; 1: suppress damage/deformation for human players only; AI remain vulnerable\n", c.cheat_invincible ? 1 : 0);
     fprintf(f, "TurboScale=%.2f       ; multiplier for turbo thrust and top speed cap (default 1.0)\n", c.turbo_scale);
     fprintf(f, "ChickenForceScale=%.2f; multiplier for chicken explosion blast impulse (default 1.0)\n", c.chicken_force_scale);
     fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);
