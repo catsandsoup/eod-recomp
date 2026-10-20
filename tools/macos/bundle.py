@@ -81,6 +81,9 @@ if not sdl_license.is_file(): sdl_license=pathlib.Path('/opt/homebrew/opt/sdl3/L
 for name,license_path in [('SDL3',str(sdl_license)),('libusb','/opt/homebrew/opt/libusb/COPYING'),('MoltenVK','/opt/homebrew/opt/molten-vk/LICENSE')]:
     source=pathlib.Path(license_path)
     if source.exists(): shutil.copyfile(source,licenses/(name+'.txt'))
+if len(sys.argv)>2:
+    xxhash_license=pathlib.Path(sys.argv[2]).resolve().parent/'_deps/eod_xxhash-src/LICENSE'
+    if xxhash_license.is_file(): shutil.copyfile(xxhash_license,licenses/'xxHash.txt')
 # The local SDK/Homebrew binaries can impose a newer minimum than our source.
 minimum=(13,0)
 for binary in [*frameworks.iterdir(),exe]:

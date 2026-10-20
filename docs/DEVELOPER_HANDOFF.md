@@ -313,3 +313,17 @@ countdown windows run at ~57 at every scale: the game's own rate). Before: 4x
 Not done: the one-off race-load texture decode (no longer causes vblank debt
 > 2 ms), the two-pass alpha draws (still ~2x fragment work for alpha-tested
 geometry), full-surface conversion passes.
+
+## Collision/effects performance checkpoint — 2026-10-20
+
+The player reports reduced drawn FPS during crashes, chicken explosions, sparks
+and dust, while the title still shows 100% speed. That label is host-vblank based,
+not proof of smooth game frames. Native 1x ordinary-race samples remain near 60;
+4x effect-heavy runs reproduce drops. The retained Vulkan texture-key optimization
+uses pinned header-only xxHash and reduces warmed CPU-limited replay wall time
+by 12.4% (1.14x throughput), but only 1.5% at 4x. This is **not** completion of the
+reported high-resolution carnage issue or step 1. A slower depth-batching
+experiment was rejected and removed. Read COLLISION_PERFORMANCE.md for exact
+profiles, parity gates, reproduction limits and the next decisive work. No
+physics/effects/quality reduction or frame skipping was introduced; NASCAR stayed
+paused.

@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <vector>
 
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
 #include "../../core/config.h"
 #include "../../core/log.h"
 #include "../../platform/platform.h"
@@ -1405,8 +1408,15 @@ uint64_t hash_level(uint32_t tbp, uint32_t tbw, uint32_t psm, int w, int h) {
             uint32_t a = T->addr(tbp, x, y);
             uint32_t byte_addr = ub == 32 ? a * 4 : ub == 16 ? a * 2 : ub == 8 ? a : a / 2;
             const uint64_t *p = reinterpret_cast<const uint64_t *>(vram + ((byte_addr & ~255u) & (kVramSize - 1)));
-            for (int k = 0; k < 32; k++)
-                hash = mix64(hash, p[k]);
+            // Read exactly the same 256-byte GS block. A vectorized content
+            // hash avoids the old 32-deep dependent multiply chain; ownership,
+            // generations, deferred reads and texture decoding stay unchanged.
+            static const bool fast_hash = [] {
+                const char *v = std::getenv("EOD_TEXTURE_HASH");
+                return !v || std::atoi(v) != 0;
+            }();
+            if (fast_hash) hash = mix64(hash, XXH3_64bits(p, 256));
+            else for (int k = 0; k < 32; k++) hash = mix64(hash, p[k]);
         }
     return hash;
 }

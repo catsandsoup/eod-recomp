@@ -243,6 +243,16 @@ if(BUILD_TESTING)
 endif()
 
 if(EOD_VULKAN)
+  # PCSX2 uses xxHash for texture-content keys. Header-only inclusion keeps
+  # the personal app self-contained; pin both source revision and archive hash.
+  include(FetchContent)
+  FetchContent_Declare(eod_xxhash
+    URL https://codeload.github.com/Cyan4973/xxHash/tar.gz/e626a72bc2321cd320e953a0ccf1584cad60f363
+    URL_HASH SHA256=34e71c085636fbc1726482996d92719d0a16e6a6097970ecf2990a27b3821162
+    SOURCE_SUBDIR headers-only
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(eod_xxhash)
+  target_include_directories(eod PRIVATE ${eod_xxhash_SOURCE_DIR})
   target_compile_definitions(eod PRIVATE EOD_VULKAN)
   target_link_libraries(eod PRIVATE Vulkan::Vulkan)
   include(CTest)
@@ -301,6 +311,11 @@ if(EOD_VULKAN)
           --generator $<TARGET_FILE:eod_gs_pixel_fixture> --scale ${alpha_scale}
           --work-dir ${CMAKE_BINARY_DIR}/gs-state-cache-${alpha_scale}x)
         set_tests_properties(VulkanGSStateCache${alpha_scale}x PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME VulkanGSTextureHash${alpha_scale}x COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/tests/test_gs_state_cache.py --eod $<TARGET_FILE:eod>
+          --generator $<TARGET_FILE:eod_gs_pixel_fixture> --scale ${alpha_scale}
+          --optimization texture-hash --work-dir ${CMAKE_BINARY_DIR}/gs-texture-hash-${alpha_scale}x)
+        set_tests_properties(VulkanGSTextureHash${alpha_scale}x PROPERTIES SKIP_RETURN_CODE 77)
       endforeach()
     endif()
   endif()
