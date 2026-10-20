@@ -184,3 +184,51 @@ Ruled out with measurements on the race capture (same binary, alternating):
   command buffer costs a ~0.2–0.3 ms round trip on this M2 Pro. Not shipped.
 - `EOD_GPU_UPLOADS=1` reduces readbacks 19 to 7 but not wait time (bigger
   batches per sync); see `GS_CPU_WRITE_PRESERVATION.md`.
+
+## NASCAR: Dirt to Daytona format investigation — scope and limits
+
+The recovered Antigravity work inspected owner-supplied *NASCAR: Dirt to
+Daytona* (`SLUS-20441`) assets and created an ignored candidate EOD overlay.
+Its broad cross-engine compatibility claims are not established by the evidence.
+
+- `tools/rst0.py` supports the observed 0TSR v2 container layout for extraction
+  and writes EOD v6 archives. Packing v2 is not a lossless round trip. The owner mounted the disc during the audit, allowing source extraction,
+  table and model metadata checks; these do not establish runtime compatibility.
+- `tools/valt.py` reads the observed legacy section/string encoding and serializes
+  table models into EOD's format. This is structural conversion, not proof of
+  identical physics units, schema semantics, inheritance or deformation links.
+  The importer preserves source physics values rather than inserting guessed
+  horsepower/weight keys.
+- `tools/modl.py` inspects headers, part metadata and fixed texture fields. Its
+  OBJ export contains model bounds, not decoded VIF/SPS4 vehicle meshes.
+  Source geometry, panel damage and skeleton compatibility remain unverified.
+- `tools/trk.py` exposes a candidate 76-byte NASCAR record layout. Truncating
+  19 floats to 15 does not establish semantic ILIN translation: fields include
+  packed pointers/metadata, and NASCAR meanings/units remain unverified. This
+  converter is research-only and opt-in; actual Daytona data fails the strict
+  extent check (68 unaccounted bytes). Any candidate output is outside DATA.
+  The importer does not insert a Daytona line into unrelated Afton geometry.
+- EOD ILIN positions are planar X/Z at record offsets +0/+4; +20 is a next
+  pointer, as documented by `src/battle_navigation.cpp`. Eight retail Afton
+  ILIN files round-tripped byte for byte during this audit. Unchanged mixed
+  pointer/float records retain raw bits, including NaN payloads.
+
+See `NASCAR_IMPORT_JTBD.md` for player acceptance, reproducible commands, actual
+package/fixture evidence and the next decisive tests. No retail assets or
+candidate binaries are committed. The reuse review below explains why the
+existing EOD archive/streamer interface is extended rather than substituting a
+renderer texture-pack loader; it does not prove cross-game asset compatibility.
+
+## Mod overlay reuse check — 2026-10-20
+
+Checked [RoadTripAdventure-recomp](https://github.com/silentsudin/RoadTripAdventure-recomp)
+`main` revision `0f6d3613e8e32ccda5305227a578b1fb659983a8` for an existing asset
+modding wheel. Its texture-pack feature supplies renderer textures, whereas EOD
+loads named 0TSR car/resource archives through both FILEIO paths and an MGI
+streamer sector TOC. A texture-pack loader does not register new filenames or
+assign sectors in that TOC. This change therefore extends EOD's existing
+`scan`/`assign`/`platform_find_file` implementation rather than importing another
+renderer subsystem. An explicit `EOD_MOD_DIR` selects one read-only overlay;
+without it staged mods are inactive. The selected overlay merges before sector
+assignment, so replacement sizes and newly named cars are reflected consistently
+in FILEIO and streaming reads. Disposable-file tests cover both paths.

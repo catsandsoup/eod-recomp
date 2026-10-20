@@ -81,10 +81,10 @@ std::string g_config_path = "eod.ini";
 bool config_load(const std::string &path, Config &c) {
     if (&c == &g_config) g_config_path = path;
     FILE *f = fopen(path.c_str(), "r");
-    if (!f) return false;
+    const bool file_loaded = f != nullptr;
     char line[1024];
     std::string section;
-    while (fgets(line, sizeof line, f)) {
+    while (f && fgets(line, sizeof line, f)) {
         std::string l = line;
         size_t sc = l.find(';');
         if (sc != std::string::npos) l = l.substr(0, sc);
@@ -149,6 +149,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "ChickenRadiusScale")) c.chicken_radius_scale = (float)atof(v.c_str());
             else if (ieq(k, "BattleBots")) c.battle_bots = to_bool(v);
             else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
+            else if (ieq(k, "Invincible") || ieq(k, "GodMode")) c.cheat_invincible = to_bool(v);
         } else if (ieq(section, "Career")) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
         } else if (ieq(section, "System")) {
@@ -157,20 +158,22 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "PauseInMenu")) c.pause_in_menu = to_bool(v);
         }
     }
-    fclose(f);
+    if (f) fclose(f);
 
-    // Environment variable overrides
+    // Environment variable overrides apply even on first launch without an ini.
     if (const char *e = getenv("EOD_UNLOCK_ALL")) c.unlock_all = to_bool(e);
     if (const char *e = getenv("EOD_CAREER_CHEATS")) c.career_cheats = to_bool(e);
     if (const char *e = getenv("EOD_TURBO")) c.cheat_turbo = to_bool(e);
     if (const char *e = getenv("EOD_CHICKENS")) c.cheat_chickens = to_bool(e);
+    if (const char *e = getenv("EOD_INVINCIBLE")) c.cheat_invincible = to_bool(e);
+    if (const char *e = getenv("EOD_GODMODE")) c.cheat_invincible = to_bool(e);
     if (const char *e = getenv("EOD_TURBO_SCALE")) c.turbo_scale = (float)atof(e);
     if (const char *e = getenv("EOD_CHICKEN_FORCE")) c.chicken_force_scale = (float)atof(e);
     if (const char *e = getenv("EOD_CHICKEN_RADIUS")) c.chicken_radius_scale = (float)atof(e);
     if (const char *e = getenv("EOD_BATTLE_BOTS")) c.battle_bots = to_bool(e);
     if (const char *e = getenv("EOD_SP_BATTLE")) c.sp_battle_mode = to_bool(e);
 
-    return true;
+    return file_loaded;
 }
 
 bool config_save(const std::string &path, const Config &c) {
@@ -221,6 +224,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "CareerCheats=%d       ; 1: allow cheat feats to function in career mode\n", c.career_cheats ? 1 : 0);
     fprintf(f, "TurboBoost=%d         ; 1: enable turbo boost on L2\n", c.cheat_turbo ? 1 : 0);
     fprintf(f, "ChickenFight=%d       ; 1: enable explosive chicken shooting on L2\n", c.cheat_chickens ? 1 : 0);
+    fprintf(f, "Invincible=%d        ; 1: suppress vehicle damage/deformation for all cars; existing damage remains\n", c.cheat_invincible ? 1 : 0);
     fprintf(f, "TurboScale=%.2f       ; multiplier for turbo thrust and top speed cap (default 1.0)\n", c.turbo_scale);
     fprintf(f, "ChickenForceScale=%.2f; multiplier for chicken explosion blast impulse (default 1.0)\n", c.chicken_force_scale);
     fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);

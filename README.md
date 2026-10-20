@@ -184,6 +184,30 @@ widescreen HUD edge anchors are implemented and CPU-tested; rendered checking
 is pending. See [LOD experiment](docs/LOD_RUNTIME.md) and
 [HUD anchor work](docs/HUD_EDGE_ANCHORS.md).
 
+## Optional gameplay and asset tools
+
+`UnlockAll` defaults on. The runtime also opens the separate native points-gated
+track/car roster, so prize masks alone cannot leave maps padlocked. Set
+`UnlockAll=false` under `[Gameplay]` to retain native progression behavior.
+
+Invincibility is optional (`--invincible`, `EOD_INVINCIBLE=1`, or
+`[Gameplay] Invincible=1`); L1+R1+Square toggles it during play. It protects all
+cars from new damage, which also prevents normal damage kills in Battle.
+
+The [custom vehicle tools](docs/CUSTOM_VEHICLE_PIPELINE.md) clone and retexture
+retail chassis, change specs, register Midsize Phantom by default, and expose a
+Tk GUI with verified native save-money editing. [Optional Battle catalogs](docs/OPTIONAL_GAMEPLAY_MODS.md)
+add all fourteen maps; bounded rendered Welch solo/two-player evidence is
+separate from complete-match/every-map acceptance. Select a generated overlay
+explicitly with `EOD_MOD_DIR`; staged mods remain inactive otherwise.
+
+[Audio tools](docs/AUDIO_FORMAT_NOTES.md) extract the tested Sony PSS music
+streams and support the documented SFX/WAV workflow. Arbitrary new mesh
+compilation and complete static-fence removal remain unfinished. NASCAR work is
+paused; its source-only candidate tooling is not a verified playable port.
+The [capability acceptance checklist](docs/MOD_CAPABILITY_ACCEPTANCE.md) records
+which car, track, driver, GUI and mode requirements remain unimplemented or unverified.
+
 ## Game files
 
 Copy the whole disc (at least `SLUS_209.10`, `SYSTEM.CNF` and the `DATA`

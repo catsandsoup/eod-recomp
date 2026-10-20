@@ -29,7 +29,7 @@ This section provides an immediate, evidence-backed reference for human modders 
 | **Single Player Battle Mode** | **Completed & Verified** | `src/battle_events.cpp:f_001244A8` appends native Battle contest records (`0x18000224`, 10 words) into the 320-contest table (`0x003C61A8`) for 8 spare Eve slots in solo Action & Career. | `[Cheats] SinglePlayerBattle=true` |
 | **Battle Bots (AI Opponents)** | **Completed & Verified (Experimental Navigation)** | `f_0012C158` fills roster to 4 cars; `f_0020FD48` invokes `f_00227EE8` to build weapon scenes for AI (`0x51`); `battle_driver.cpp` intercepts `AICar` update `f_001A2D20` to inject controls (`+0x1B6C` steer, `+0x1B70` gas, `+0x1B74` brake, `+0x1B78` clutch=1.0f). | `[Cheats] BattleBots=true` |
 | **Course Waypoint Tracking** | **Completed & Verified** | `src/battle_navigation.cpp` reads loaded primary course cache at `0x003CD190` (tag `0x104F128B`, 60-byte nodes). Follows track waypoint tangents; falls back to direct pursuit when unsupported. | Built into bot driver |
-| **Unlock All Out of the Box** | **Completed & Verified** | `game_patches_vblank()` sets feats `0x003D18E0 = 0xFFFFFFFF`, cheat prizes `0x003D18E4 = 0xFFFFFFFF`, writes 7 prize bytes at `0x004A8AF8`, and sets event override `0x003D8180 = 1`. | `[Cheats] UnlockAll=true` |
+| **Unlock All Out of the Box** | **Default enabled; CPU contracts verified, rendered selection retested separately** | `game_patches_vblank()` sets feat/prize masks, event override `0x003D8180=1`, and each loaded native points-roster unlock flag at `0x003CBF58 + 16*i` (count at `0x003CBF48`, bounded to 32). Prize masks alone left tracks locked. | `[Cheats] UnlockAll=true` |
 | **Career Mode Cheat Bypass** | **Completed & Verified** | `game_patches_vblank()` asserts `cheats \|= 0x1` every vblank, neutralizing Career mode's lockout at `0x002C1224` (`andi $v0, $v1, 0xFFFE`). | `[Cheats] CareerCheats=true` |
 | **Human Manual Recovery** | **Completed & Verified** | `src/hle_recovery.cpp:f_001B8370` gates `00485098`, suppresses 3-second auto-reset for local humans (`car+480 == 0x50`), keeps AI auto-recovery intact (`0x51`), and retains manual SELECT countdown `timer[68]+timer[72]`. | `[Gameplay] ManualRecovery=1` / In-game F1 menu |
 | **Car LOD Detail Presets** | **Completed & Verified** | `src/hle_lod.cpp:f_0021ABF8` intercepts car tables: `original` (1.0x), `high` (3.0x), `maximum` ($\ge 1{,}000{,}000$ locking `Low1.mod`). | `[Video] Detail=maximum` / `EOD_CAR_LOD_MULTIPLIER` |
@@ -146,6 +146,15 @@ The master gameplay bitmask is evaluated at runtime during vehicle physics ticks
 | **7** | `0x080` | `raining_chickens` (`hack=7`) | Explosive chickens drop from high altitude directly above all active vehicles. | `0x0017E228`, `0x0017E6CC`, `0x0017F2E0` |
 | **8** | `0x100` | `one_hit_kills` (`hack=8`) | Any collision impact exceeding threshold instantly totals vehicle (`damage = 1.0f`). | `0x0018D7D4`, `0x00204A40` |
 | **9** | `0x200` | `sepia` (`hack=9`) | Vintage sepia visual post-processing color grading filter. | `0x0017868C`, `0x002378F4`, `0x00268930` |
+
+#### Separate track/car points unlock roster
+
+The track picker `0x0012CC40` checks the native roster loaded by `0x0012C940`,
+not just the feat/prize bytes. `0x0012CAB8` sets each loaded row's unlocked
+flag. The October 20 correction mirrors those flags with the native 32-row
+bound, leaving type, name, points thresholds and unused rows intact. When
+`UnlockAll=false`, it does not write these flags. Unlocks are reapplied after
+profile loads; this does not call the full Career cheat that changes money/cars.
 
 #### Feat Unlock Memory Registers
 - `0x003D18E0` (`uint32_t`): Bitmask of career-completed feats (`0..7`).

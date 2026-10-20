@@ -180,7 +180,11 @@ static float car_file_damage_scale(const std::string &model) {
     for (const std::string &n : names) {
         char path[1024];
         std::string rel = "DATA/CAR/" + n + ".car";
-        if (!platform_find_file(g_game_root.c_str(), rel.c_str(), path, sizeof path)) continue;
+        bool found = false;
+        const char *env_mod = getenv("EOD_MOD_DIR");
+        if (env_mod && *env_mod)
+            found = platform_find_file(env_mod, rel.c_str(), path, sizeof path);
+        if (!found && !platform_find_file(g_game_root.c_str(), rel.c_str(), path, sizeof path)) continue;
         FILE *f = fopen(path, "rb");
         if (!f) continue;
         fseek(f, 0, SEEK_END);
@@ -250,6 +254,32 @@ extern "C" void f_0018AFE0(void) {
     if (scale != 1.0f) ee_wf(car + 0x4B0, damage * scale);
     LOG(LOG_CORE, "car %s: mass %.0f, damage x%.3f%s", name, ee_rf(par + 8), damage * scale,
         scale != 1.0f ? " (with its damage_scale)" : "");
+}
+
+// Native damage callbacks are separate from collision impulse resolution:
+// 189CD8 invokes CA98 after collision response; CA98 owns panel deformation,
+// damage state transitions and destruction. Suppress those callbacks only.
+// This protects every vehicle, including AI, and does not repair existing
+// damage or restore already detached panels when toggled during an event.
+extern "C" void f_0018AD20_orig(void);
+extern "C" void f_0018CA98_orig(void);
+extern "C" void f_0018AD20(void) {
+    if (!g_config.cheat_invincible) f_0018AD20_orig();
+}
+extern "C" void f_0018CA98(void) {
+    if (!g_config.cheat_invincible) f_0018CA98_orig();
+}
+
+// The native world update has one inline damage write for the timed-damage
+// feat (master + bit 0x40), bypassing the collision damage callbacks. Keep the
+// rest of that update intact, and preserve changes to every unrelated flag.
+extern "C" void f_001B5840_orig(void);
+extern "C" void f_001B5840(void) {
+    const uint32_t flags = ee_r32(0x003C4190);
+    const bool suppress_timer = g_config.cheat_invincible && (flags & 0x40);
+    if (suppress_timer) ee_w32(0x003C4190, flags & ~0x40u);
+    f_001B5840_orig();
+    if (suppress_timer) ee_w32(0x003C4190, ee_r32(0x003C4190) | 0x40u);
 }
 
 // Chicken weapon explosion shockwave handler (called on chicken detonation at 0x0017E7FC).
@@ -391,6 +421,13 @@ void game_patches_vblank() {
         ee_w32(0x003D18E4, 0xFFFFFFFF);
         for (uint32_t i = 0; i < 7; ++i) ee_w8(0x004A8AF8 + i, 0xFF);
         ee_w32(0x003D8180, 1);
+        // Prize masks do not unlock the separate points-gated TRACK/CAR
+        // roster. 12C940 loads up to 32 rows; 12CAB8 marks row i unlocked
+        // at base+0x10+i*0x10. Track picker 12CC40 consumes that exact flag.
+        const uint32_t unlock_count = ee_r32(0x003CBF48);
+        if (unlock_count <= 32)
+            for (uint32_t i = 0; i < unlock_count; ++i)
+                ee_w32(0x003CBF58 + i * 0x10, 1);
     }
 
     // Live controller combo detection (L1 + R1 + D-Pad, L3 + R3, Select hold)
@@ -427,7 +464,7 @@ void game_patches_vblank() {
 
     if (l1_r1_held) {
         // While L1+R1 modifier is held, suppress chord and navigation buttons from being sent to the game
-        s_suppressed_pad0_buttons |= (PAD_L1 | PAD_R1 | PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT | PAD_TRIANGLE | PAD_SELECT);
+        s_suppressed_pad0_buttons |= (PAD_L1 | PAD_R1 | PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT | PAD_TRIANGLE | PAD_SELECT | PAD_SQUARE);
 
         if (pressed & PAD_UP) {
             g_config.cheat_chickens = !g_config.cheat_chickens;
@@ -484,6 +521,13 @@ void game_patches_vblank() {
             platform_haptic_pulse(0, 150, 1, 180);
             platform_audio_feedback(g_config.cheat_chickens);
             LOG(LOG_CORE, "[MOD COMBO L1+R1+SELECT] Chicken Fight: %s", g_config.cheat_chickens ? "ON" : "OFF");
+        }
+        if (pressed & PAD_SQUARE) {
+            g_config.cheat_invincible = !g_config.cheat_invincible;
+            platform_show_hud_banner(g_config.cheat_invincible ? "★ INVINCIBILITY: ON ★" : "★ INVINCIBILITY: OFF ★");
+            platform_haptic_pulse(0, 150, 1, 180);
+            platform_audio_feedback(g_config.cheat_invincible);
+            LOG(LOG_CORE, "[MOD COMBO L1+R1+SQUARE] Invincibility: %s", g_config.cheat_invincible ? "ON" : "OFF");
         }
     } else if ((pressed & (PAD_L3 | PAD_R3)) && (b & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3)) {
         s_suppressed_pad0_buttons |= (PAD_L3 | PAD_R3);

@@ -17,3 +17,6 @@ work/
 
 # Finder metadata is not project source.
 .DS_Store
+
+# Local mod packages contain retail-derived assets; publish source tools only.
+mods/

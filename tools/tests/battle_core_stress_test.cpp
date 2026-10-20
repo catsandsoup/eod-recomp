@@ -160,6 +160,9 @@ extern "C" void f_0017E5C8() { // Weapon Fire
 extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
 extern "C" void f_0018AFE0_orig() {}
+extern "C" void f_0018AD20_orig() {}
+extern "C" void f_0018CA98_orig() {}
+extern "C" void f_001B5840_orig() {}
 extern "C" void f_0017DA58_orig() {}
 extern "C" void f_0018F2A8_orig() {}
 extern "C" void f_0034D328_orig() {}

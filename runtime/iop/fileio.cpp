@@ -60,6 +60,16 @@ std::string strip_device(const char *path, std::string *dev) {
 bool resolve(const char *ps2path, std::string &host, bool for_write) {
     std::string rel = strip_device(ps2path, nullptr);
     char found[1024];
+
+    // A selected overlay is read-only. Never scan every staged mod: unrelated
+    // builds can contain mutually exclusive COMMON.RES/track replacements.
+    const char *env_mod = getenv("EOD_MOD_DIR");
+    if (!for_write && env_mod && *env_mod &&
+        platform_find_file(env_mod, rel.c_str(), found, sizeof found)) {
+        host = found;
+        return true;
+    }
+
     if (platform_find_file(g_game_root.c_str(), rel.c_str(), found, sizeof found)) {
         host = found;
         return true;
@@ -105,7 +115,7 @@ int file_open(const char *name, uint32_t flags) {
     if (fd < 0) return kEMFILE;
     bool wr = (flags & 3) != 1;
     std::string host;
-    if (!resolve(name, host, wr && (flags & 0x200))) {
+    if (!resolve(name, host, wr)) {
         LOG(LOG_FILE, "open '%s' -> not found", name);
         return kENOENT;
     }

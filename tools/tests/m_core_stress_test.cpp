@@ -73,6 +73,9 @@ static uint32_t s_mock_weapon_ptr = 0x00550000;
 extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
 extern "C" void f_0018AFE0_orig() {}
+extern "C" void f_0018AD20_orig() {}
+extern "C" void f_0018CA98_orig() {}
+extern "C" void f_001B5840_orig() {}
 extern "C" void f_0017DA58_orig() {}
 extern "C" void f_0018F2A8_orig() {}
 extern "C" void f_0034D328_orig() {}
