@@ -368,3 +368,22 @@ Visible chooser/F1 interaction and exhaustive event compatibility remain
 hands-on acceptance gaps. Four-car Battle capacity, navigation limitations,
 unfinished geometry import and the high-resolution effects slowdown remain.
 See ON_DEMAND_MODS.md for usage and STAR handoff.
+
+### Owner correction: invincibility protects humans only
+
+The owner clarified that invincibility must apply to every human player, with
+AI retaining normal damage. Both damage hooks now classify their target using
+native car+0x1E0 == 0x50, covering P1–P4 regardless of world slot. The inline
+timed-damage guard follows the native selected-driver array and suppresses the
+feat only for a human car. Native source inspection confirms queued camera
+changes do not alter that selected-driver index before the inline write.
+Collision impulses, existing damage, repairs and respawn remain unchanged.
+
+A failing-then-passing regression covers four humans, AI callback delegation,
+invalid pointers and selected-human versus selected-AI timed damage. F1 and
+saved-setting descriptions now explicitly say human players only. This
+supersedes earlier statements that invincibility protects AI or prevents AI
+Battle damage kills. Hands-on collision/deformation acceptance remains separate
+from the callback/identity regression.
+After this correction, all 62 active CTests pass again (50.02 s); NASCAR remains
+excluded. The personal app and ZIP were rebuilt with the human-only behavior.

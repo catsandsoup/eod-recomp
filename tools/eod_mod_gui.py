@@ -364,7 +364,7 @@ class EodModdingApp(tk.Tk):
         r_t1 = ttk.Frame(tf)
         r_t1.pack(fill=tk.X, pady=4)
         self.god_mode_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r_t1, text="Invincibility: prevent new vehicle damage (all cars)", variable=self.god_mode_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(r_t1, text="Invincibility: protect all human players (AI remain vulnerable)", variable=self.god_mode_var).pack(side=tk.LEFT)
 
         r_t2 = ttk.Frame(tf)
         r_t2.pack(fill=tk.X, pady=4)

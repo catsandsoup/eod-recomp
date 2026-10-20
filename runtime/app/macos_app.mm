@@ -50,7 +50,7 @@ bool mac_app_select_mods(bool headless) {
     NSArray<NSString *> *titles = @[@"Native game", @"Phantom custom car", @"All-map Battle catalog", @"Phantom + all-map Battle"];
     NSAlert *a = [NSAlert new];
     a.messageText = @"Choose your mods";
-    a.informativeText = @"Choose a profile for this session. Press F1 during play for chickens, turbo, invincibility, recovery and other settings. F2 shows controls.\n\nBattle profiles keep Career but replace Action with race + Battle, and multiplayer with Battle. Battle supports four cars total. Disable invincibility for ordinary Battle scoring. Change resource profiles by restarting the app.";
+    a.informativeText = @"Choose a profile for this session. Press F1 during play for chickens, turbo, invincibility, recovery and other settings. F2 shows controls.\n\nBattle profiles keep Career but replace Action with race + Battle, and multiplayer with Battle. Battle supports four cars total. Change resource profiles by restarting the app.";
     [a addButtonWithTitle:@"Play"]; [a addButtonWithTitle:@"Quit"];
     NSPopUpButton *choice = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0,0,360,30) pullsDown:NO];
     [choice addItemsWithTitles:titles];
@@ -146,7 +146,7 @@ bool mac_app_settings() {
         {"Single player battle mode",std::to_string(g_config.sp_battle_mode)},
         {"Unlock all out of box",std::to_string(g_config.unlock_all)},
         {"Battle bots (next event)",std::to_string(g_config.battle_bots)},
-        {"Invincibility (all cars)",std::to_string(g_config.cheat_invincible)},
+        {"Invincibility (all humans)",std::to_string(g_config.cheat_invincible)},
         {"Allow cheats in Career",std::to_string(g_config.career_cheats)},
         {"Per-car damage scaling",std::to_string(g_config.car_durability)},
         {"Turbo multiplier (0.1–100)",std::to_string(g_config.turbo_scale)},
@@ -190,7 +190,7 @@ bool mac_app_settings() {
         if (i==19) input.toolTip=@"Press L2 to fire a chicken; release before firing again. Also toggle live with L1+R1+D-Pad Up or L3+R3.";
         if (i==23) input.toolTip=@"Experimental AI opponents with native weapons and respawns; navigation can stall at obstacles. Applies when starting the next event.";
         if (i==20) input.toolTip=@"Enables supercharged turbo boost on holding L2. Also toggle live with L1+R1+D-Pad Right.";
-        if (i==24) input.toolTip=@"Suppresses damage for ALL cars, including AI. Existing damage remains. Turn off for ordinary Battle damage kills. Applies when saved.";
+        if (i==24) input.toolTip=@"Protects all human players (P1–P4). AI still take damage. Existing damage remains. Applies when saved.";
         input.frame=NSMakeRect(220,y,310,26); [view addSubview:input]; [inputs addObject:input];
     }
     scroll.documentView=view; [view scrollPoint:NSMakePoint(0,view.frame.size.height)]; a.accessoryView=scroll;

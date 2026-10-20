@@ -259,15 +259,20 @@ extern "C" void f_0018AFE0(void) {
 // Native damage callbacks are separate from collision impulse resolution:
 // 189CD8 invokes CA98 after collision response; CA98 owns panel deformation,
 // damage state transitions and destruction. Suppress those callbacks only.
-// This protects every vehicle, including AI, and does not repair existing
-// damage or restore already detached panels when toggled during an event.
+// Native car setup copies the driver identity to car+1E0 (50 = human).
+// This covers P1-P4 regardless of world slot, leaving AI damage native.
+// Existing damage and already detached panels are not repaired.
+static bool invincible_human(uint32_t car) {
+    return g_config.cheat_invincible && car && !(car & 3) &&
+        car <= EE_RAM_SIZE - 0x1E4 && ee_r32(car + 0x1E0) == 0x50;
+}
 extern "C" void f_0018AD20_orig(void);
 extern "C" void f_0018CA98_orig(void);
 extern "C" void f_0018AD20(void) {
-    if (!g_config.cheat_invincible) f_0018AD20_orig();
+    if (!invincible_human(g_ee.r[4].uw[0])) f_0018AD20_orig();
 }
 extern "C" void f_0018CA98(void) {
-    if (!g_config.cheat_invincible) f_0018CA98_orig();
+    if (!invincible_human(g_ee.r[4].uw[0])) f_0018CA98_orig();
 }
 
 // The native world update has one inline damage write for the timed-damage
@@ -276,7 +281,12 @@ extern "C" void f_0018CA98(void) {
 extern "C" void f_001B5840_orig(void);
 extern "C" void f_001B5840(void) {
     const uint32_t flags = ee_r32(0x003C4190);
-    const bool suppress_timer = g_config.cheat_invincible && (flags & 0x40);
+    // The inline feat targets the selected driver, not every world car:
+    // 1B5C00 indexes 485230 by 485280; driver+4 is its car.
+    const uint32_t index = ee_r32(0x00485280), count = ee_r32(0x0048522C);
+    const uint32_t driver = index < count && count <= 16 ? ee_r32(0x00485230 + index * 4) : 0;
+    const uint32_t car = driver && !(driver & 3) && driver <= EE_RAM_SIZE - 8 ? ee_r32(driver + 4) : 0;
+    const bool suppress_timer = (flags & 0x40) && invincible_human(car);
     if (suppress_timer) ee_w32(0x003C4190, flags & ~0x40u);
     f_001B5840_orig();
     if (suppress_timer) ee_w32(0x003C4190, ee_r32(0x003C4190) | 0x40u);

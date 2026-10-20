@@ -28,8 +28,7 @@ The chooser remembers the previous selection. F1 exposes chicken weapons, turbo,
 invincibility, Career cheats, manual recovery, damage scaling, Battle bots, unlocks
 and turbo/chicken multipliers. Existing renderer, detail and aspect controls also
 remain available. Battle bots apply at the next event; detail/aspect changes
-apply next launch. Invincibility protects **all cars**, so disable it for ordinary
-Battle damage kills. Chickens and turbo share L2 when both are enabled. F2 shows
+apply next launch. Invincibility protects **all human players (P1–P4)**; AI remain vulnerable. Chickens and turbo share L2 when both are enabled. F2 shows
 controls. The original 100% speed indicator is not proof of smooth drawn FPS.
 
 Profiles are resolved from `Application Support/TDEODRecomp/mods/<profile>`;
