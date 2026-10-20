@@ -280,6 +280,7 @@ int main(int argc, char **argv) {
         else if (a == "--log") log_spec = next();
         else if (a == "--log-file") log_set_file(next());
         else if (a == "--headless") cfg.headless = true;
+        else if (a == "--invincible" || a == "--godmode") g_config.cheat_invincible = true;
         else if (a == "--frames") g_opt_frames = atoi(next());
         else if (a == "--scale") {
             int n = atoi(next());
@@ -300,7 +301,7 @@ int main(int argc, char **argv) {
         else if (a == "--help" || a == "-h") {
 #ifdef _WIN32
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
-                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
+                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
@@ -308,7 +309,7 @@ int main(int argc, char **argv) {
                    argv[0]);
 #else
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
-                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
+                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"

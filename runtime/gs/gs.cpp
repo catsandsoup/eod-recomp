@@ -1761,7 +1761,15 @@ void gs_vblank() {
             }
         }
     }
-    if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0) {
+    static int s_shot_start = -1, s_shot_end = -1;
+    if (s_shot_start == -1) {
+        const char *st = getenv("EOD_SCREENSHOT_START");
+        s_shot_start = st ? atoi(st) : 0;
+        const char *en = getenv("EOD_SCREENSHOT_END");
+        s_shot_end = en ? atoi(en) : 0x7FFFFFFF;
+    }
+    if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0 &&
+        (int)g_frames >= s_shot_start && (int)g_frames <= s_shot_end) {
         char path[1024];
         snprintf(path, sizeof path, "%s/frame_%05llu.ppm", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
         gs_screenshot(path);

@@ -30,6 +30,20 @@ bool platform_find_file(const char *, const char *, char *, size_t) { return fal
 extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
 extern "C" void f_0018AFE0_orig() {}
+extern "C" void f_0018AD20();
+extern "C" void f_0018CA98();
+extern "C" void f_001B5840();
+static uint32_t native_update_cheats = 0;
+static int native_update_calls = 0;
+extern "C" void f_001B5840_orig() {
+    ++native_update_calls;
+    native_update_cheats = MEM_LW(0x003C4190);
+    MEM_SW(0x003C4190, native_update_cheats | 0x10000);
+}
+static int native_damage_calls = 0;
+static int native_collision_damage_calls = 0;
+extern "C" void f_0018AD20_orig() { ++native_damage_calls; }
+extern "C" void f_0018CA98_orig() { ++native_collision_damage_calls; }
 extern "C" void f_0017DA58_orig() {}
 static int native_driver_calls = 0;
 extern "C" void f_0018F2A8();
@@ -75,6 +89,53 @@ int main() {
     std::vector<uint8_t> ram(EE_RAM_SIZE, 0);
     g_ram = ram.data();
 
+    // Disabling via environment must never enable the cheat merely because
+    // the variable exists. Config parsing is the sole launch-option authority.
+    setenv("EOD_INVINCIBLE", "0", 1);
+    g_config = Config{};
+    const uint32_t protected_car = 0x10000;
+    MEM_SW(protected_car + 7148, 0x3F000000); // 50% accumulated damage
+    MEM_SW(protected_car + 0x10C, 0x12345678); // unrelated physics sentinel
+    g_ee.r[4].ud[0] = protected_car;
+    f_0018AD20();
+    check(native_damage_calls == 1, "Invincibility off delegates damage to native");
+    f_0018CA98();
+    check(native_collision_damage_calls == 1, "Invincibility off delegates collision damage to native");
+    check(MEM_LW(protected_car + 7148) == 0x3F000000,
+          "EOD_INVINCIBLE=0 does not overwrite health");
+    MEM_SW(0x0048522C, 1);
+    MEM_SW(0x00447458, protected_car);
+    game_patches_vblank();
+    check(MEM_LW(protected_car + 7148) == 0x3F000000,
+          "Disabled vblank preserves accumulated damage");
+    unsetenv("EOD_INVINCIBLE");
+    g_config.cheat_invincible = true;
+    f_0018AD20();
+    f_0018CA98();
+    check(native_damage_calls == 1 && native_collision_damage_calls == 1,
+          "Invincibility blocks scalar and collision damage callbacks");
+    check(MEM_LW(protected_car + 7148) == 0x3F000000,
+          "Invincibility does not invent repairs for pre-existing damage");
+    check(MEM_LW(protected_car + 0x10C) == 0x12345678,
+          "Invincibility preserves unrelated car physics state");
+    std::memset(g_ram, 0, EE_RAM_SIZE);
+
+    // Native timed-damage cheat writes health inline in the world update.
+    // Suppress that bit only during the update, retain all other work/flags.
+    MEM_SW(0x003C4190, 0x49);
+    g_config.cheat_invincible = true;
+    f_001B5840();
+    check(native_update_calls == 1 && native_update_cheats == 9,
+          "Invincibility disables timed-damage bit during native update only");
+    check(MEM_LW(0x003C4190) == 0x10049,
+          "Timed-damage suppression restores its bit and retains native flag changes");
+    g_config.cheat_invincible = false;
+    MEM_SW(0x003C4190, 0x49);
+    f_001B5840();
+    check(native_update_calls == 2 && native_update_cheats == 0x49,
+          "Disabled invincibility preserves timed native damage gate");
+    std::memset(g_ram, 0, EE_RAM_SIZE);
+
     // Regression: Battle P2 must retain its native human controller.
     // The old wrapper classified every car except slot zero as a bot.
     g_config.sp_battle_mode = true;
@@ -98,8 +159,13 @@ int main() {
     MEM_SW(0x003C4190, 9); // Native Battle enables its own weapon.
     for (uint32_t i = 0; i < 7; ++i) MEM_SB(0x004A8AF8 + i, 0x12 + i);
     MEM_SW(0x003D8180, 0x12345678);
+    MEM_SW(0x003CBF48, 2); // Native points-unlock roster, independent of prizes.
+    MEM_SW(0x003CBF58, 0x12345678);
+    MEM_SW(0x003CBF68, 0x87654321);
     game_patches_vblank();
     check(MEM_LW(0x003D8180) == 0x12345678, "UnlockAll off preserves event progression override");
+    check(MEM_LW(0x003CBF58) == 0x12345678 && MEM_LW(0x003CBF68) == 0x87654321,
+          "UnlockAll off preserves native points-unlock roster flags");
     for (uint32_t i = 0; i < 7; ++i)
         check(MEM_LB(0x004A8AF8 + i) == 0x12 + i, "UnlockAll off preserves every native prize mask");
     check(MEM_LW(0x003C4190) == 9, "Disabled mods preserve native Battle weapon");
@@ -131,11 +197,23 @@ int main() {
 
     // ------------------------------------------------------------ 2. Feats out of the box
     g_config = cfg_default;
+    MEM_SW(0x003CBF48, 2);
+    MEM_SW(0x003CBF4C, 0x11111111); // type
+    MEM_SW(0x003CBF50, 0x22222222); // name
+    MEM_SW(0x003CBF54, 70000);      // points threshold
+    MEM_SW(0x003CBF58, 0);          // unlocked flag (native 12CAB8)
+    MEM_SW(0x003CBF68, 0);
+    MEM_SW(0x003CBF78, 0xAABBCCDD); // first unused row's flag
     MEM_SB(0x004A8AF7, 0x5A);
     MEM_SB(0x004A8AFF, 0xA5);
     MEM_SW(0x003D817C, 0x12345678);
     MEM_SW(0x003D8184, 0x87654321);
     game_patches_vblank();
+    check(MEM_LW(0x003CBF58) == 1 && MEM_LW(0x003CBF68) == 1,
+          "Default UnlockAll opens native points-gated tracks and vehicles");
+    check(MEM_LW(0x003CBF4C) == 0x11111111 && MEM_LW(0x003CBF50) == 0x22222222 &&
+          MEM_LW(0x003CBF54) == 70000 && MEM_LW(0x003CBF78) == 0xAABBCCDD,
+          "UnlockAll preserves native type/name/threshold and unused rows");
     check(MEM_LW(0x003D18E0) == 0xFFFFFFFF, "0x003D18E0 feats bitmask unlocked out of the box");
     check(MEM_LW(0x003D18E4) == 0xFFFFFFFF, "0x003D18E4 feat cheats bitmask unlocked out of the box");
 
@@ -150,12 +228,20 @@ int main() {
           "Unlocking preserves adjacent event menu state");
     // Native menu/profile initialization may clear these after boot. Reapply
     // at the next vblank, rather than latching a once-only unlock at startup.
+    MEM_SW(0x003CBF58, 0);
     MEM_SW(0x003D18E4, 0);
     MEM_SB(0x004A8AFE, 0);
     MEM_SW(0x003D8180, 0);
     game_patches_vblank();
     check(MEM_LW(0x003D18E4) == 0xFFFFFFFF && MEM_LB(0x004A8AFE) == 0xFF &&
           MEM_LW(0x003D8180) == 1, "Unlocks restored after native initialization resets");
+
+    check(MEM_LW(0x003CBF58) == 1, "Points unlock flags restored after native profile reset");
+    MEM_SW(0x003CBF48, 33);
+    MEM_SW(0x003CBF58, 0x55667788);
+    game_patches_vblank();
+    check(MEM_LW(0x003CBF58) == 0x55667788, "Invalid points roster count cannot write flags");
+    MEM_SW(0x003CBF48, 0);
 
     // ------------------------------------------------------------ 4. Live Controller Combos
     s_mock_pad.connected = true;
@@ -250,6 +336,22 @@ int main() {
     game_patches_vblank();
     check((game_patches_suppressed_buttons() & PAD_SELECT) == 0, "Select unsuppressed after release");
 
+    // Invincibility is a live, edge-triggered chord and cannot leak Square
+    // into normal gameplay while the modifier is held.
+    s_mock_pad.buttons = PAD_L1 | PAD_R1 | PAD_SQUARE;
+    g_config.cheat_invincible = false;
+    game_patches_vblank();
+    check(g_config.cheat_invincible, "L1+R1+Square enables invincibility");
+    check((game_patches_suppressed_buttons() & PAD_SQUARE) != 0,
+          "Invincibility chord suppresses Square");
+    game_patches_vblank();
+    check(g_config.cheat_invincible, "Holding chord does not retrigger");
+    s_mock_pad.buttons = 0;
+    game_patches_vblank();
+    s_mock_pad.buttons = PAD_L1 | PAD_R1 | PAD_SQUARE;
+    game_patches_vblank();
+    check(!g_config.cheat_invincible, "Second chord disables invincibility");
+
     // ------------------------------------------------------------ 5. Config Persistence Roundtrip
     Config test_cfg;
     test_cfg.unlock_all = true;
@@ -257,6 +359,7 @@ int main() {
     test_cfg.battle_bots = false;
     test_cfg.cheat_chickens = true;
     test_cfg.cheat_turbo = true;
+    test_cfg.cheat_invincible = true;
     test_cfg.turbo_scale = 2.25f;
     test_cfg.chicken_force_scale = 3.0f;
     test_cfg.chicken_radius_scale = 2.5f;
@@ -270,9 +373,19 @@ int main() {
     check(!loaded_cfg.battle_bots, "persisted BattleBots off overrides default");
     check(loaded_cfg.cheat_chickens == true, "persisted cheat_chickens");
     check(loaded_cfg.cheat_turbo == true, "persisted cheat_turbo");
+    check(loaded_cfg.cheat_invincible, "persisted invincibility");
+    setenv("EOD_INVINCIBLE", "0", 1);
+    check(config_load(test_ini, loaded_cfg) && !loaded_cfg.cheat_invincible,
+          "Explicit env off overrides saved invincibility");
+    unsetenv("EOD_INVINCIBLE");
     check(loaded_cfg.turbo_scale == 2.25f, "persisted turbo_scale");
     check(loaded_cfg.chicken_force_scale == 3.0f, "persisted chicken_force_scale");
     check(loaded_cfg.chicken_radius_scale == 2.5f, "persisted chicken_radius_scale");
+    setenv("EOD_INVINCIBLE", "1", 1);
+    Config no_ini;
+    check(!config_load("missing-gameplay-config.ini", no_ini) && no_ini.cheat_invincible,
+          "Environment enables invincibility on first launch without an ini");
+    unsetenv("EOD_INVINCIBLE");
     std::remove(test_ini);
 
     std::puts("PASS: Live cheats, controller combo triggers, and Battle mode verification succeeded.");

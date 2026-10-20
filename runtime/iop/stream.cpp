@@ -146,6 +146,54 @@ void build_toc(const Node &dir, const Node *parent) {
         if (c.dir) build_toc(c, &dir);
 }
 
+static void merge_overlay(Node &target, const std::string &overlay_dir) {
+    std::vector<DirEntryInfo> list;
+    platform_list_dir(overlay_dir.c_str(), list);
+    for (auto &e : list) {
+        std::string u = upper(e.name);
+        std::string child_host = overlay_dir + "/" + e.name;
+        auto it = std::find_if(target.children.begin(), target.children.end(),
+                               [&](const Node &n) { return n.name == u; });
+        if (it != target.children.end()) {
+            if (it->dir && e.is_dir) {
+                merge_overlay(*it, child_host);
+            } else if (!it->dir && !e.is_dir) {
+                LOG(LOG_FILE, "stream: overlay file %s replaces %s (%zu -> %llu bytes)",
+                    child_host.c_str(), it->host.c_str(), (size_t)it->size, (unsigned long long)e.size);
+                it->host = child_host;
+                it->size = e.size;
+                it->synthetic.clear(); // a real overlay bank supersedes any missing-disc fallback
+            }
+        } else {
+            Node c;
+            c.name = u;
+            c.host = child_host;
+            c.dir = e.is_dir;
+            c.size = e.size;
+            if (c.dir) scan(c);
+            LOG(LOG_FILE, "stream: overlay file added: %s (%s)", u.c_str(), child_host.c_str());
+            target.children.push_back(std::move(c));
+        }
+    }
+    std::sort(target.children.begin(), target.children.end(),
+              [](const Node &a, const Node &b) { return a.name < b.name; });
+}
+
+static void apply_mod_overlays(Node &root) {
+    // Match FILEIO: only the explicitly selected mod participates. Merge before
+    // assigning sectors so newly added cars are visible to the native streamer.
+    const char *env_mod = getenv("EOD_MOD_DIR");
+    if (!env_mod || !*env_mod) return;
+    char data_dir[1024];
+    if (!platform_find_file(env_mod, "DATA", data_dir, sizeof data_dir)) return;
+    for (auto &child : root.children) {
+        if (child.name == "DATA" && child.dir) {
+            merge_overlay(child, data_dir);
+            return;
+        }
+    }
+}
+
 void build_disc() {
     if (g_built) return;
     g_built = true;
@@ -172,6 +220,7 @@ void build_disc() {
         }
         root.children.push_back(std::move(c));
     }
+    apply_mod_overlays(root);
     std::sort(root.children.begin(), root.children.end(),
               [](const Node &a, const Node &b) { return a.name < b.name; });
     assign(root);

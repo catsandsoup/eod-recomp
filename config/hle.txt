@@ -21,6 +21,10 @@
 0034D328 wrap     # display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it
 0018AFE0 wrap     # car setup: computes the damage multiplier (car+0x4B0) from the chassis mass - DamageScale
 
+001B5840 wrap     # optional invincibility: suppress inline timed-damage feat during native update
+0018AD20 wrap     # optional invincibility: scalar vehicle damage setter
+0018CA98 wrap     # optional invincibility: collision deformation and damage, after physics response
+
 # Busy-wait loops on memory set by interrupt handlers: sleep until the next
 # event instead of spinning.
 0035C460 idle     # frame loop: wait for the vblank counter to change

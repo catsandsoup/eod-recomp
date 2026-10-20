@@ -362,6 +362,17 @@ masks; the adjacent bytes must remain unchanged. The full career cheat
 `0x002B6DB8` is not called because it also changes money, vehicles and
 career state. With `UnlockAll=false`, these fields are left to native progression.
 
+**October 20 correction:** prize/feat masks alone do not open the separate
+points-gated track roster. A rendered Welch probe remained padlocked with all
+seven prize bytes set. Native `0x0012CC40` checks points or an explicit row flag
+in the roster at `0x003CBF48`; `0x0012CAB8` sets the flag at
+`0x003CBF58 + index*0x10`, and loader `0x0012C940` caps the roster at 32.
+Default `UnlockAll=1` now mirrors those native bounded flags every vblank too,
+for ordinary launches and optional catalogs. Names, points thresholds, adjacent
+fields, money and season state remain intact. `UnlockAll=0` preserves the loaded
+flags. See [optional gameplay recovery](OPTIONAL_GAMEPLAY_MODS.md) for regression
+and live acceptance evidence.
+
 Home's `hidden=until_career_done` gate uses
 `0x002C71B0 → 0x002E0AF8 → 0x00205368(7)` and the feat masks. Home has a
 native multiplayer Battle descriptor in `homebase_eves.val`,
