@@ -21,6 +21,17 @@ def rpaths(path):
     return result
 seen={}; pending=[(exe,exe)]
 resources=app/'Contents/Resources'; resources.mkdir(exist_ok=True)
+bundled_mods=resources/'Mods'
+# Optional personal package only: these files derive from the owner's disc and
+# must never enter Git or a public release. A normal source build includes none.
+if bundled_mods.exists(): shutil.rmtree(bundled_mods)
+if mod_source := os.environ.get('EOD_BUNDLE_MODS'):
+    mod_source=pathlib.Path(mod_source).resolve()
+    for profile in ('phantom','battle','combined'):
+        source=mod_source/profile
+        if not (source/'DATA/RES/COMMON.RES').is_file():
+            raise RuntimeError(f'Missing personal mod profile: {source}')
+        shutil.copytree(source,bundled_mods/profile)
 vulkan_resources=resources/'vulkan'
 if vulkan_resources.exists(): shutil.rmtree(vulkan_resources)
 # MoltenVK is dlopened by the Vulkan loader: it does not appear in its linked

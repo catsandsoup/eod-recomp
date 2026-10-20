@@ -338,6 +338,7 @@ int main(int argc, char **argv) {
             }
         }
         if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32})) return 1;
+        if (!mac_app_select_mods(headless)) return 0;
     }
 #endif
     platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.

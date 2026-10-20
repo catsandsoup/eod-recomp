@@ -26,6 +26,18 @@ There is no claim that boundary acceptance is complete.
 
 ## Use
 
+The personal Mac app built on 2026-10-21 offers Native, Phantom, all-map Battle
+and Phantom + Battle at launch. F1 exposes the implemented live gameplay
+options and turbo/chicken multipliers; changing resource profiles requires a
+restart. The Combined profile merges independent archive entries against the
+original disc rather than overwriting COMMON.RES. Its human-driven Phantom
+race passed a 6,000-frame headless E2E check. The packaged Battle profiles
+exclude the experimental Dennison barrier edit: an earlier package containing
+that edit crashed while the clean catalog passed the same race. Native geometry
+import, larger Battle grids and exhaustive map/event acceptance remain unfinished.
+Generated profiles stay local; source builds bundle none unless explicitly
+configured with EOD_BUNDLE_MODS.
+
 Build a separate, local optional overlay from the installed disc:
 
 ```sh
