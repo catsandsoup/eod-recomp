@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Prove command-state reuse preserves complete GPU VRAM across submissions."""
+"""Prove renderer cache optimizations preserve complete GPU VRAM across submissions."""
 import argparse, os, re, subprocess, sys
 from pathlib import Path
 p=argparse.ArgumentParser()
 for flag in ('eod','generator','work-dir'): p.add_argument('--'+flag,type=Path,required=True)
 p.add_argument('--scale',type=int,required=True)
+p.add_argument('--optimization',choices=('state','texture-hash'),default='state')
 a=p.parse_args();work=a.work_dir.resolve();work.mkdir(parents=True,exist_ok=True)
 config=work/'settings.ini';config.write_text(f'[Video]\nRenderScale={a.scale}\nAspectRatio=4:3\n')
 env=dict(os.environ,EOD_HEADLESS='1',EOD_MUTE='1',EOD_GS_RASTER='0')
@@ -14,7 +15,7 @@ for case in ('state_cache','alpha_range_rendered','alpha_range_fail_rgb','alpha_
     results=[];draws=[];pixels=[]
     for enabled in (0,1):
         raw=work/f'{case}-{enabled}.vram'
-        run=subprocess.run([str(a.eod.resolve()),'--headless','--config',str(config),'--renderer','vulkan','--gs-replay',str(fixture),'--repeat','2'],env=dict(env,EOD_ALPHA_RANGE='1',EOD_VK_STATE_CACHE=str(enabled),EOD_GS_REPLAY_DUMP=str(raw)),capture_output=True,text=True,timeout=30,cwd=work)
+        run=subprocess.run([str(a.eod.resolve()),'--headless','--config',str(config),'--renderer','vulkan','--gs-replay',str(fixture),'--repeat','2'],env=dict(env,EOD_ALPHA_RANGE='1',**{('EOD_TEXTURE_HASH' if a.optimization=='texture-hash' else 'EOD_VK_STATE_CACHE'):str(enabled)},EOD_GS_REPLAY_DUMP=str(raw)),capture_output=True,text=True,timeout=30,cwd=work)
         (work/f'{case}-{enabled}.log').write_text(run.stdout+run.stderr)
         assert run.returncode==0,run.stderr
         if 'replaying with vulkan' not in run.stderr:sys.exit(77)
