@@ -86,6 +86,10 @@ class TestNascarImportPipeline(unittest.TestCase):
             self.assertIn("drag", chassis_pairs)
             self.assertEqual(chassis_pairs["mass"], "3500")
             self.assertEqual(chassis_pairs["drag"], "0.30")
+            # This value ends the source payload: the old v2 extractor cut
+            # its final four bytes and silently parsed 645.7 as 64.
+            rear = next(s for s in phys_model["sections"] if s["name"] == "Rear")
+            self.assertEqual(dict(rear["pairs"])["stiff_c2"], "645.7")
 
             # Verify round-trip compilation to VALT v11 format
             v11_bytes = compile_eod_table(phys_model)

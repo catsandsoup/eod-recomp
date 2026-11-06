@@ -40,3 +40,6 @@
 0012C158 wrap     # optional Battle bots: native roster builder fills to four cars
 0020FD48 wrap     # optional Battle bots: create weapons through native scene factory
 001A2D20 wrap     # optional Battle bots: input after native AICar update
+
+0034CEF0 wrap     # optional Cup source fast wheel geometry; exact native fallback
+00220788 wrap     # bounded opt-in Cup actual slow/fast selection trace

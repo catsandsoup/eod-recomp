@@ -77,6 +77,8 @@ def unpack_archive(archive_path: str, out_dir: str):
     first_u32 = struct.unpack("<I", data[4:8])[0]
     if first_u32 == 2:
         # 0TSR v2 (NASCAR: Dirt to Daytona)
+        if len(data) < 24:
+            raise ValueError("Truncated 0TSR v2 header")
         version = 2
         dir_offset = 0x18
         total_size, build_time, entry_count = struct.unpack("<III", data[12:24])
@@ -95,6 +97,8 @@ def unpack_archive(archive_path: str, out_dir: str):
         }
 
         dir_end = dir_offset + entry_count * 0x38
+        if dir_end > len(data):
+            raise ValueError("Truncated 0TSR v2 directory")
         cur_pos = data.find(b"!IGM", dir_end)
         if cur_pos == -1:
             cur_pos = ((dir_end - 0x14 + 0x7F) & ~0x7F) + 0x14
@@ -105,13 +109,14 @@ def unpack_archive(archive_path: str, out_dir: str):
             fourcc = e_bytes[0x24:0x28][::-1].decode("latin1", errors="replace")
             c_ver, size = struct.unpack("<II", e_bytes[0x28:0x30])
 
-            if cur_pos != -1 and cur_pos < len(data) and data[cur_pos : cur_pos + 4] == b"!IGM":
-                # Strip 4-byte container magic for direct tool consumption
-                entry_data = data[cur_pos + 4 : cur_pos + size]
-                has_igm = True
-            else:
-                entry_data = data[cur_pos : cur_pos + size]
-                has_igm = False
+            has_igm = data[cur_pos:cur_pos + 4] == b"!IGM"
+            # Directory size is the payload length, excluding the marker. The old
+            # slice ended at cur_pos+size and silently lost the final four bytes.
+            payload_start = cur_pos + (4 if has_igm else 0)
+            payload_end = payload_start + size
+            if cur_pos < 0 or payload_end > len(data):
+                raise ValueError(f"Truncated 0TSR v2 archive entry: {name}")
+            entry_data = data[payload_start:payload_end]
 
             if not name or name in (".", "..", "manifest.json") or "/" in name or "\\" in name:
                 raise ValueError(f"Unsafe archive entry name: {name!r}")
@@ -132,11 +137,11 @@ def unpack_archive(archive_path: str, out_dir: str):
             })
 
             # Next entry location: find next !IGM marker after this entry
-            next_pos = data.find(b"!IGM", cur_pos + size)
+            next_pos = data.find(b"!IGM", payload_end)
             if next_pos != -1:
                 cur_pos = next_pos
             else:
-                cur_pos += (size + 0x7F) & ~0x7F
+                cur_pos = payload_start + ((size + 0x7F) & ~0x7F)
 
         with open(os.path.join(out_dir, "manifest.json"), "w") as f_m:
             json.dump(manifest, f_m, indent=2)
