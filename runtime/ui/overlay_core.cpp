@@ -2,6 +2,7 @@
 // (see overlay.h): ImGui context, fonts, textures, controller/keyboard/mouse
 // input for the menu, menu sounds, publishing the draw lists for the renderer.
 #include "overlay.h"
+#include "../iop/custom_music.h"
 
 #include <algorithm>
 #include <atomic>
@@ -125,6 +126,39 @@ void play(frontend::Sound s) {
     g_snd_pos = 0;
 }
 
+
+// The MODS tab's Custom Music list, backed by the music library (runtime/iop/custom_music.h).
+class MusicAdapter : public frontend::MusicSource {
+public:
+    std::vector<frontend::MusicSong> songs() override {
+        using S = custom_music::State;
+        std::vector<frontend::MusicSong> out;
+        for (const custom_music::Song &s : custom_music::songs()) {
+            frontend::MusicSong m;
+            m.rel = s.rel;
+            m.name = s.name;
+            m.reason = s.reason;
+            m.enabled = s.enabled;
+            switch (s.state) {
+            case S::Pending: m.status = frontend::MusicSong::Status::Waiting; break;
+            case S::Scanning: m.status = frontend::MusicSong::Status::Decoding; break;
+            case S::Ready: m.status = frontend::MusicSong::Status::Ready; break;
+            case S::Skipped: m.status = frontend::MusicSong::Status::Skipped; break;
+            case S::Protected: m.status = frontend::MusicSong::Status::Protected; break;
+            }
+            out.push_back(std::move(m));
+        }
+        return out;
+    }
+    void progress(int &done, int &total, bool &scanning) override {
+        const custom_music::Progress p = custom_music::progress();
+        done = p.done; total = p.total; scanning = p.scanning;
+    }
+    void set_enabled(const std::string &rel, bool on) override { custom_music::set_enabled(rel, on); }
+    std::string folder() override { return custom_music::root_dir(); }
+    void rescan() override { custom_music::rescan(); }
+};
+
 void refresh_host();
 
 void open_menu(bool open) {
@@ -202,6 +236,7 @@ void ensure_context() {
     g_font_gen++;
     ui_art::load(g_game_root, add_texture);
     g_menu = std::make_unique<frontend::Menu>(g_config);
+    g_menu->set_music(std::make_shared<MusicAdapter>());
     g_net = std::make_shared<StubNetwork>();
     g_menu->set_network(g_net);
     g_context = true;

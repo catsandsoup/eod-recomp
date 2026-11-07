@@ -81,6 +81,24 @@ struct ModEntry {
 std::vector<ModEntry> discover_mods(const std::string &root);
 std::vector<ModEntry> builtin_mods();
 
+// The custom music library as the MODS tab sees it (runtime/iop/custom_music.h; the host
+// supplies an adapter, so this model stays free of audio and OS code).
+struct MusicSong {
+    std::string rel, name;
+    enum class Status { Waiting, Decoding, Ready, Skipped, Protected } status = Status::Waiting;
+    std::string reason;
+    bool enabled = true;
+};
+class MusicSource {
+public:
+    virtual ~MusicSource() = default;
+    virtual std::vector<MusicSong> songs() = 0;
+    virtual void progress(int &done, int &total, bool &scanning) = 0;
+    virtual void set_enabled(const std::string &rel, bool on) = 0;
+    virtual std::string folder() = 0;
+    virtual void rescan() = 0;  // the menu opened: look for new or removed files
+};
+
 // Things the host must do after an update (platform effects; the Config is already changed).
 struct Effects {
     Sound sound = Sound::None;
@@ -114,6 +132,8 @@ public:
     void set_host(const HostInfo &h) { host_ = h; }
     const HostInfo &host() const { return host_; }
     void set_network(std::shared_ptr<game_frontend::Network> n);
+    void set_music(std::shared_ptr<MusicSource> m) { music_ = std::move(m); }
+    bool music_open() const { return music_open_; }
     game_frontend::Network *network() { return net_.get(); }
 
     // Opens on the remembered tab; clears transient states (rebind, details, text).
@@ -175,6 +195,9 @@ private:
     int scroll_[(int)Tab::Count + 1] = {};
     std::vector<Row> rows_[(int)Tab::Count + 1];  // [Count] = error screen
     std::vector<ModEntry> mods_;
+    std::shared_ptr<MusicSource> music_;
+    std::vector<MusicSong> music_songs_;  // as of the last rows_mods()
+    bool music_open_ = false;
     bool details_ = false;
     int rebind_ = -1;
     std::string text_id_, text_, text_before_;

@@ -29,7 +29,9 @@
 
 #include "../core/log.h"
 #include "../platform/platform.h"
+#include "custom_music.h"
 #include "iop.h"
+#include "music_core.h"
 #include "spu2.h"
 
 namespace {
@@ -270,6 +272,11 @@ struct StreamChannel {
     uint32_t last_play = 0;  // ring offset of the voice at the last update
     struct Req {
         uint32_t lsn, bytes;
+        // A custom (host) song: virtual id; its PCM is mixed by the SPU2 in place of the
+        // ADPCM, while this ring holds silence (see custom_music.h).
+        uint32_t host = 0;
+        bool preloaded = false, started = false;
+        uint64_t start_at = 0;  // ring stream position where the song begins
     };
     std::vector<Req> queue;
     uint32_t done = 0;  // bytes of queue[0] already fed
@@ -279,12 +286,20 @@ StreamChannel g_chan[2] = {{0, 0x1FC000, 0x4000, 0x1FD}, {1, 0x1F4000, 0x8000, 0
 uint16_t voice_entry(int voice, uint16_t param) { return (uint16_t)(param | (voice << 1)); }
 
 // Writes `n` bytes (multiple of 16) at ring offset `off` from the queue, or silence.
-void feed(StreamChannel &c, uint32_t off, uint32_t n) {
+void feed(StreamChannel &c, uint32_t off, uint32_t n, uint64_t base) {
     static std::vector<uint8_t> buf;
     buf.assign(n, 0);
     uint32_t got = 0;
     while (got < n && !c.queue.empty()) {
         StreamChannel::Req &r = c.queue.front();
+        if (r.host) {  // a custom song plays through the mixer: the ring holds silence meanwhile
+            if (!r.preloaded) {
+                r.preloaded = true;
+                r.start_at = base + got;
+                custom_music::host_preload((int)(&c - g_chan), r.host);
+            }
+            break;
+        }
         uint32_t take = std::min(n - got, r.bytes - c.done);
         // read whole sectors around the wanted bytes
         uint64_t pos = (uint64_t)r.lsn * kSector + c.done;
@@ -318,7 +333,7 @@ void feed(StreamChannel &c, uint32_t off, uint32_t n) {
 }
 
 void start_channel(StreamChannel &c) {
-    feed(c, 0, c.size);  // the whole ring is ahead of the voice
+    feed(c, 0, c.size, 0);  // the whole ring is ahead of the voice
     c.written = c.size;
     c.played = 0;
     c.last_play = 0;
@@ -353,6 +368,44 @@ void drop_ahead(StreamChannel &c) {
     c.written = keep;
 }
 
+
+// ------------------------------------------------------- custom music (host songs)
+// The 13 retail songs are the big records of DATA/SPEECH.BNK; a stream request whose
+// {lsn, bytes} names one is "the game queued a song", and may be replaced by a custom one.
+bool g_bank_read;
+uint32_t g_bank_lsn;
+std::vector<music::BankRecord> g_music_recs;
+
+void read_bank() {
+    g_bank_read = true;
+    for (const DiscFile &f : g_files) {
+        std::string n = f.host_path.substr(f.host_path.find_last_of("/\\") + 1);
+        if (upper(n) != "SPEECH.BNK") continue;
+        uint8_t hdr[16];
+        disc_read(f.lsn, hdr, sizeof hdr);
+        uint32_t count = rd32(hdr + 8);
+        if (memcmp(hdr, "knaB", 4) || count > 100000) return;
+        std::vector<uint8_t> tab((size_t)16 + count * 12);
+        uint32_t secs = (uint32_t)((tab.size() + kSector - 1) / kSector);
+        std::vector<uint8_t> raw((size_t)secs * kSector);
+        disc_read(f.lsn, raw.data(), (uint32_t)raw.size());
+        g_bank_lsn = f.lsn;
+        g_music_recs = music::parse_bank_music(raw.data(), tab.size());
+        LOG(LOG_SND, "stream: SPEECH.BNK at lsn %u, %zu music records", f.lsn, g_music_recs.size());
+        return;
+    }
+}
+
+// 0: play the queued song; otherwise the virtual id of the custom song replacing it.
+uint32_t custom_for(uint32_t lsn, uint32_t bytes) {
+    if (!g_bank_read) read_bank();
+    const music::BankRecord *r = music::find_music_record(g_music_recs, g_bank_lsn, lsn, bytes);
+    if (!r) return 0;
+    const uint32_t v = custom_music::pick_for_native();
+    LOG(LOG_SND, "stream: song %u queued -> %s%x", r->id, v ? "custom song id " : "native, bag says ", v);
+    return v;
+}
+
 }  // namespace
 
 // Keeps the stream voices' ring buffers ahead of playback (called often).
@@ -363,11 +416,30 @@ void iop_stream_update() {
         // writable: up to 0x200 bytes before the play position
         uint64_t limit = c.played + c.size - 0x200;
         uint32_t avail = limit > c.written ? (uint32_t)std::min<uint64_t>(limit - c.written, c.size) : 0;
+        // custom song at the front: start it when the voice reaches it, drop it once it ended
+        if (!c.queue.empty() && c.queue.front().host) {
+            StreamChannel::Req &r = c.queue.front();
+            const int slot = (int)(&c - g_chan);
+            if (r.preloaded && !r.started && c.played >= r.start_at) {
+                r.started = true;
+                custom_music::host_start(slot);
+                LOG(LOG_SND, "stream: channel %d custom song %x starts", slot, r.host);
+            }
+            if (r.started && custom_music::host_finished(slot)) {
+                LOG(LOG_SND, "stream: channel %d custom song %x ended", slot, r.host);
+                custom_music::host_stop(slot);
+                c.queue.erase(c.queue.begin());
+                c.done = 0;
+                drop_ahead(c);  // all that was written ahead is silence: the next song follows at once
+                limit = c.played + c.size - 0x200;
+            }
+        }
+        avail = limit > c.written ? (uint32_t)std::min<uint64_t>(limit - c.written, c.size) : 0;
         avail &= ~0x3Fu;
         while (avail) {
             uint32_t wpos = (uint32_t)(c.written % c.size);
             uint32_t n = std::min(avail, c.size - wpos);
-            feed(c, wpos, n);
+            feed(c, wpos, n, c.written);
             c.written += n;
             avail -= n;
         }
@@ -375,6 +447,8 @@ void iop_stream_update() {
 }
 
 void iop_stream_init() {
+    const char *off = getenv("EOD_NO_CUSTOM_MUSIC");
+    if (!off || off[0] != '1') custom_music::init_default();
     iop_register_server(0x8000021A, "stream", [](const RpcCall &c, uint8_t *buf) -> uint32_t {
         switch (c.fno) {
         case 1: {  // StreamInit
@@ -412,11 +486,16 @@ void iop_stream_init() {
                 if (ch > 1) continue;
                 StreamChannel &sc = g_chan[ch];
                 if (flags & 1) {
+                    custom_music::host_stop((int)ch);
                     sc.queue.clear();
                     sc.done = 0;
                     drop_ahead(sc);
                 }
-                if (lsn != 0xFFFFFFFFu && bytes && bytes != 0xFFFFFFFFu) sc.queue.push_back({lsn, bytes});
+                if (lsn != 0xFFFFFFFFu && bytes && bytes != 0xFFFFFFFFu) {
+                    StreamChannel::Req rq{lsn, bytes};
+                    if (!(flags & 1)) rq.host = custom_for(lsn, bytes);
+                    sc.queue.push_back(rq);
+                }
                 if (!sc.running && !sc.queue.empty()) start_channel(sc);
                 if (flags & 1) iop_stream_update();  // refill the dropped part now
             }

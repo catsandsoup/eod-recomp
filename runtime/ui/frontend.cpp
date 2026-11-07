@@ -97,7 +97,7 @@ std::vector<ModEntry> discover_mods(const std::string &root) {
     std::vector<fs::path> dirs;
     for (const auto &e : fs::directory_iterator(root, ec)) {
         const std::string name = e.path().filename().string();
-        if (name.empty() || name[0] == '.' || name == "integrated") continue;
+        if (name.empty() || name[0] == '.' || name == "integrated" || name == "music") continue;  // music/: the Custom Music folder
         if (e.is_directory(ec)) dirs.push_back(e.path());
     }
     std::sort(dirs.begin(), dirs.end());
@@ -148,6 +148,8 @@ void Menu::rescan_mods() {
 
 void Menu::open() {
     details_ = false;
+    music_open_ = false;
+    if (music_) music_->rescan();
     status_.clear();
     rebind_ = -1;
     text_id_.clear();
@@ -369,6 +371,74 @@ void Menu::rows_inputs(std::vector<Row> &r) {
 }
 
 void Menu::rows_mods(std::vector<Row> &r) {
+    using St = MusicSong::Status;
+    music_songs_.clear();
+    int done = 0, total = 0;
+    bool scanning = false;
+    if (music_) {
+        music_songs_ = music_->songs();
+        music_->progress(done, total, scanning);
+    }
+    if (music_open_) {
+        int on = 0, skipped = 0;
+        for (const MusicSong &m : music_songs_) {
+            on += m.status == St::Ready && m.enabled;
+            skipped += m.status == St::Skipped || m.status == St::Protected;
+        }
+        r.push_back(header("CUSTOM MUSIC"));
+        if (scanning) {
+            Row p = info("musicscan", "SCANNING MUSIC", std::to_string(done) + " / " + std::to_string(total),
+                         "Decoding your songs in the background. Finished songs join the game's music right away.");
+            r.push_back(p);
+        }
+        for (size_t i = 0; i < music_songs_.size(); i++) {
+            const MusicSong &m = music_songs_[i];
+            Row row;
+            row.id = "song" + std::to_string(i);
+            row.label = m.name;
+            switch (m.status) {
+            case St::Ready:
+                row.kind = RowKind::Check;
+                row.checked = m.enabled;
+                row.note = "LIVE";
+                row.help = "Plays in the game's music rotation (menus and races) with the original songs. "
+                           "Takes effect the next time the game picks a song.";
+                break;
+            case St::Skipped:
+            case St::Protected:
+                row.kind = RowKind::Action;  // selectable, so the reason shows in the details panel
+                row.id = "songx" + std::to_string(i);
+                row.value = m.status == St::Protected ? "PROTECTED" : "SKIPPED";
+                row.warn = true;
+                row.help = (m.status == St::Protected ? "Protected: " : "Skipped: ") + m.reason;
+                break;
+            default:
+                row.kind = RowKind::Info;
+                row.value = m.status == St::Decoding ? "DECODING" : "WAITING";
+                row.help = "Not decoded yet.";
+                break;
+            }
+            r.push_back(row);
+        }
+        if (music_songs_.empty() && !scanning)
+            r.push_back(info("musicnone", "NO SONGS FOUND", "", ("Put music files (MP3, M4A, FLAC, WAV...) in " + (music_ ? music_->folder() : std::string()) +
+                                                                  " (folders are fine). They are found when this menu opens.").c_str()));
+        r.push_back(action("musicback", "BACK", on == 0 && skipped == 0 ? "" : std::to_string(on) + " ON", "Back to the mods."));
+        return;
+    }
+    if (music_) {
+        int ready = 0, skipped = 0;
+        for (const MusicSong &m : music_songs_) {
+            ready += m.status == St::Ready;
+            skipped += m.status == St::Skipped || m.status == St::Protected;
+        }
+        std::string v = std::to_string(ready) + (ready == 1 ? " SONG" : " SONGS");
+        if (skipped) v += ", " + std::to_string(skipped) + " SKIPPED";
+        Row row = action("music", "CUSTOM MUSIC", v,
+                         "Your own songs, played with the game's original music in menus and races. Pick which ones are on.");
+        row.note = scanning ? "SCANNING " + std::to_string(done) + "/" + std::to_string(total) : "LIVE";
+        r.push_back(row);
+    }
     for (size_t i = 0; i < mods_.size(); i++) {
         const ModEntry &m = mods_[i];
         Row row;
@@ -382,7 +452,7 @@ void Menu::rows_mods(std::vector<Row> &r) {
         row.help = m.description.empty() ? "No description." : m.description;
         r.push_back(row);
     }
-    if (mods_.empty()) r.push_back(info("nomods", "NO MODS", ""));
+    if (mods_.empty() && !music_) r.push_back(info("nomods", "NO MODS", ""));
 }
 
 void Menu::rows_online(std::vector<Row> &r) {
@@ -593,6 +663,13 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (!row.enabled) { fx.sound = Sound::Error; return; }
     if (row.kind == RowKind::Toggle || row.kind == RowKind::Choice) { change(row, +1, fx); fx.sound = Sound::Select; return; }
     fx.sound = Sound::Select;
+    if (id == "music") { music_open_ = true; sel_[(int)Tab::Mods] = 0; scroll_[(int)Tab::Mods] = 0; return; }
+    if (id == "musicback") { music_open_ = false; sel_[(int)Tab::Mods] = 0; scroll_[(int)Tab::Mods] = 0; fx.sound = Sound::Back; return; }
+    if (id.compare(0, 4, "song") == 0 && row.kind == RowKind::Check) {
+        const size_t i = (size_t)std::stoi(id.substr(4));
+        if (music_ && i < music_songs_.size()) music_->set_enabled(music_songs_[i].rel, !music_songs_[i].enabled);
+        return;
+    }
     if (id.compare(0, 3, "mod") == 0 && row.kind == RowKind::Check) {
         ModEntry &m = mods_[std::stoi(id.substr(3))];
         if (m.builtin) { set_status("Built-in content is always on (it is part of the integrated game)."); fx.sound = Sound::Error; return; }
@@ -681,6 +758,7 @@ Effects Menu::update(const Input &in) {
         return fx;
     }
     if (in.back) {
+        if (music_open_) { music_open_ = false; sel_[(int)Tab::Mods] = 0; scroll_[(int)Tab::Mods] = 0; fx.sound = Sound::Back; return fx; }
         if (details_) { details_ = false; fx.sound = Sound::Back; return fx; }
         if (err && browse_) { browse_ = false; sel_[(int)Tab::Count] = 0; fx.sound = Sound::Back; return fx; }
         if (!err) { fx.close = true; fx.sound = Sound::Back; }

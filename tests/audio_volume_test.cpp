@@ -3,6 +3,11 @@
 #include <SDL3/SDL.h>
 #include "../runtime/platform/sdl3/audio_gain.h"
 #include "../runtime/iop/spu2.cpp"
+namespace custom_music {  // no custom songs in this test
+void host_begin_block() {}
+bool host_frame(int, int &, int &) { return false; }
+bool host_active(int) { return false; }
+}  // namespace custom_music
 void overlay_mix_audio(int16_t *, int) {}  // the front end's menu sounds are not part of this test
 #include <cmath>
 uint8_t *g_iop_ram;

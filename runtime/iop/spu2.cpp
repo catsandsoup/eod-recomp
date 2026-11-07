@@ -7,7 +7,12 @@
 // Audio is produced at 48kHz in step with the wall clock.
 #include "spu2.h"
 
+#include "custom_music.h"
+#include "music_core.h"
+
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -260,6 +265,7 @@ void adma_sample(Core &c, int ch, int &l, int &r) {
 }
 
 void mix(int16_t *out, int frames) {
+    custom_music::host_begin_block();  // publishes a custom song the loader thread finished
     for (int n = 0; n < frames; n++) {
         int64_t out_l = 0, out_r = 0;
         for (int ci = 0; ci < 2; ci++) {
@@ -270,6 +276,15 @@ void mix(int16_t *out, int frames) {
                 if (v.phase == OFF) continue;
                 int s = voice_sample(c, ci, i);
                 update_envelope(v);
+                // A custom song bound to a stream voice (core 0 voice 0/1, stream.cpp): its host
+                // PCM replaces the voice's ADPCM samples; envelope, volumes and the master path
+                // stay the game's, so music volume, spotter ducking and stop/start still apply.
+                int hl, hr;
+                if (ci == 0 && i < 2 && custom_music::host_frame(i, hl, hr)) {
+                    music::host_voice_mix(hl, hr, v.env.level, vol_value(v.voll, v.fixed_l), vol_value(v.volr, v.fixed_r),
+                                          (c.vmixl & (1u << i)) != 0, (c.vmixr & (1u << i)) != 0, dl, dr);
+                    continue;
+                }
                 s = (s * v.env.level) >> 15;
                 int vl = vol_value(v.voll, v.fixed_l), vr = vol_value(v.volr, v.fixed_r);
                 if (c.vmixl & (1u << i)) dl += (s * vl) >> 15;
@@ -288,6 +303,40 @@ void mix(int16_t *out, int frames) {
     }
 }
 
+// EOD_AUDIO_DUMP=<file.wav>: writes the final mix (48 kHz stereo 16-bit) for inspection.
+void dump_audio(const int16_t *pcm, int frames) {
+    static FILE *f = [] {
+        const char *p = getenv("EOD_AUDIO_DUMP");
+        FILE *h = p && *p ? fopen(p, "wb") : nullptr;
+        if (h) { uint8_t z[44] = {}; fwrite(z, 1, sizeof z, h); }
+        return h;
+    }();
+    static uint32_t bytes = 0;
+    if (!f) return;
+    static uint32_t since_log = 0;
+    since_log += (uint32_t)frames;
+    if (since_log >= kRate * 2) {  // (state of the stream voices, for tracing a silent dump)
+        since_log = 0;
+        for (int i = 0; i < 2; i++) {
+            const Voice &v = g_core[0].v[i];
+            LOG(LOG_SND, "spu2: dump: voice %d phase %d env %d vol %04x/%04x mvol %04x/%04x vmix %06x/%06x host %d", i, (int)v.phase,
+                (int)v.env.level, v.voll, v.volr, g_core[0].mvoll, g_core[0].mvolr, g_core[0].vmixl, g_core[0].vmixr,
+                custom_music::host_active(i) ? 1 : 0);
+        }
+    }
+    fwrite(pcm, 4, (size_t)frames, f);
+    bytes += (uint32_t)frames * 4;
+    uint8_t h[44];
+    memcpy(h, "RIFF", 4); uint32_t v = 36 + bytes; memcpy(h + 4, &v, 4);
+    memcpy(h + 8, "WAVEfmt ", 8); v = 16; memcpy(h + 16, &v, 4);
+    uint16_t w = 1; memcpy(h + 20, &w, 2); w = 2; memcpy(h + 22, &w, 2);
+    v = kRate; memcpy(h + 24, &v, 4); v = kRate * 4; memcpy(h + 28, &v, 4);
+    w = 4; memcpy(h + 32, &w, 2); w = 16; memcpy(h + 34, &w, 2);
+    memcpy(h + 36, "data", 4); memcpy(h + 40, &bytes, 4);
+    long at = ftell(f);
+    fseek(f, 0, SEEK_SET); fwrite(h, 1, 44, f); fseek(f, at, SEEK_SET); fflush(f);
+}
+
 uint64_t g_t0, g_produced;
 bool g_audio_open;
 
@@ -296,6 +345,10 @@ bool g_audio_open;
 void spu2_init() {
     memset(g_sram, 0, sizeof g_sram);
     for (Core &c : g_core) c = Core();
+    // Test hook (never set in play): EOD_DIRECT_START skips the menus, which are where the game
+    // sets the SPU2 master volume, so a direct-start race is silent; this opens both cores.
+    if (const char *t = getenv("EOD_TEST_MASTER_VOL"); t && t[0] == '1')
+        for (Core &c : g_core) c.mvoll = c.mvolr = 0x3FFF;
 }
 
 void spu2_set_callbacks(void (*trans_done)(int), void (*irq)(int)) {
@@ -533,6 +586,7 @@ void spu2_update() {
         for (int16_t &x : buf) x = (int16_t)((x * v) >> 8);
     }
     overlay_mix_audio(buf.data(), frames);  // the front end's menu sounds (runtime/ui)
+    dump_audio(buf.data(), frames);
     // (Sound can be switched on and off in the in-game menu)
     static bool tried = g_audio_open;
     if (!g_audio_open && !tried && g_config.audio) {
