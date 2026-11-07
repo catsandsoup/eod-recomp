@@ -133,3 +133,27 @@ batching experiment. Work stayed within step 1; NASCAR remained paused.
 
 **Result:** texture-hash CPU overhead is reduced. The main high-resolution
 collision/effects acceptance remains open; the measured 4x benefit is small.
+
+## 2026-11-07: lazy CLUT loads
+
+In 8-AI Battle carnage the GS worker spent about a quarter of its time waiting on
+GPU fences, nearly all from CLUT loads. Each frame the game loads a palette from
+inside the split-screen Z16S depth buffer (CBP 0x2FC4) before uploading the real
+one and loading again. The first load forced a submit and wait for depth data that
+was never used.
+
+CLUT loads whose source is GPU-owned or awaiting a deferred preservation copy now
+record the same readback at the same command position into staging, with no wait.
+`st.clut` is filled from that snapshot only when it is first read (palette setup,
+replay dump, partial overwrite). A pending load that a later load fully covers is
+dropped. `EOD_LAZY_CLUT=0` restores the synchronous path. Also:
+RenderScale=0 (auto) now picks the scale nearest the display pixel height (an
+1800-pixel Retina panel gets 4), `prof_ticks` reads `cntvct_el0` on arm64 with
+per-category cache lines, and one more VU1 program is compiled ahead of time.
+
+Exactness: on four heavy Battle captures at scales 1, 4 and 6, the displayed image
+and the full 4 MiB VRAM are byte-identical to the previous build. ctest 72/72.
+Warm GS replay median per two frames (b8.5340): 1x 25.1 to 15.6 ms, 4x 32.1 to 20.7 ms,
+6x 46.1 to 33.3 ms. Live Battle at 6x still misses its budgets (GS peak 69%, GPU
+64% busy). The next fixes are a single-pass exact alpha test for overlapping
+effect primitives, and a GPU-side merge of deferred pages.

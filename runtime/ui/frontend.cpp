@@ -260,7 +260,7 @@ void Menu::rows_graphics(std::vector<Row> &r) {
 #endif
     r.push_back(choice("scale", "RENDER SCALE", kScales[sc], scale_note,
                        "Internal resolution the 3D is drawn at. Higher is sharper and needs a faster GPU; it also "
-                       "supersamples (the anti-aliasing of this renderer). AUTO covers the window height."));
+                       "supersamples (the anti-aliasing of this renderer). AUTO matches the display's pixel height."));
     r.push_back(choice("aspect", "ASPECT RATIO", kAspectLabels[index_of(kAspects, 5, cfg_.aspect)], "NEXT LAUNCH",
                        "Display shape. 16:9 and 16:10 switch the game's own widescreen camera and HUD; menus and "
                        "movies keep their 4:3 composition. Camera and composition change together on the next launch."));

@@ -14,6 +14,15 @@
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <x86intrin.h>
 inline uint64_t prof_ticks() { return __rdtsc(); }
+#elif defined(__aarch64__)
+// The virtual counter (24 MHz on Apple silicon): a register read, where
+// steady_clock::now() costs a library call per ProfScope on the hot VU/VIF paths.
+// Only ratios of ticks are ever used.
+inline uint64_t prof_ticks() {
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
 #else
 #include <chrono>
 inline uint64_t prof_ticks() {
@@ -45,7 +54,10 @@ enum ProfCat {
     P_COUNT
 };
 
-extern std::atomic<uint64_t> g_prof[P_COUNT];
+// One cache line per category: the EE and GS threads add to their own
+// categories constantly and must not share lines.
+struct alignas(64) ProfCounter : std::atomic<uint64_t> {};
+extern ProfCounter g_prof[P_COUNT];
 
 struct ProfThread {
     int cur = -1;  // -1: thread not profiled

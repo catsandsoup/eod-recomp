@@ -55,6 +55,10 @@ void draw_sprite(const Vertex &a, const Vertex &b);
 
 // texture/CLUT helpers (gs_draw.cpp)
 void clut_load(uint64_t tex0);
+// st.clut may still hold entries of a lazy (GPU-sourced) CLUT load: complete
+// them before reading st.clut as a whole; drop them when st is replaced.
+void clut_resolve();
+void clut_drop();
 
 // raster worker threads (gs_draw.cpp): start, wait for all queued
 // primitives, and order other VRAM accesses after the primitives they touch

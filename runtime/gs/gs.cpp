@@ -994,6 +994,7 @@ std::unique_ptr<capture::Writer> g_cold_zip;
 const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
 
 void dump_state(FILE *f, capture::Writer *zip = nullptr) {
+    clut_resolve();  // st.clut is serialized
     // Raster synchronization only drains CPU workers. Hardware-owned GS pages
     // must also reach the CPU copy before serializing a replay's initial VRAM.
     if (hw::g_on) {
@@ -1020,6 +1021,7 @@ template <typename Read> bool load_state_read(Read read) {
     if (read(magic, 8) != 8 || memcmp(magic, kDumpMagic, 8) || read(sizes, sizeof sizes) != sizeof sizes ||
         sizes[0] != sizeof st || sizes[1] != sizeof g_path || sizes[2] != sizeof g_xfer)
         return false;
+    clut_drop();  // st (with its CLUT) is replaced
     bool ok = read(&st, sizeof st) == sizeof st && read(g_path, sizeof g_path) == sizeof g_path &&
               read(&g_xfer, sizeof g_xfer) == sizeof g_xfer && read(vram, kVramSize) == kVramSize;
     if (g_xfer.active) {

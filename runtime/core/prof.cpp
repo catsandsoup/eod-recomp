@@ -4,7 +4,7 @@
 #include <chrono>
 #include <cstdio>
 
-std::atomic<uint64_t> g_prof[P_COUNT];
+ProfCounter g_prof[P_COUNT];
 thread_local ProfThread t_prof;
 
 void prof_report(char *ee, int ee_size, char *gs, int gs_size) {

@@ -27,7 +27,7 @@ struct Config {
     bool vsync = true;
     std::string aspect = "auto";     // auto (the game's own 4:3 / 16:9 option) | 4:3 | 16:9 | stretch
 #ifdef __APPLE__
-    int render_scale = 0;  // 0 = auto (Vulkan: enough GS samples to cover the window pixel height)
+    int render_scale = 0;  // 0 = auto (Vulkan: the scale nearest the window pixel height)
 #else
     int render_scale = 2;            // internal resolution multiplier (d3d11 renderer)
 #endif

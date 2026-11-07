@@ -711,6 +711,17 @@ constexpr int kSlotPixels = 64;  // a slot holds one owner page rectangle (<= 64
 constexpr int kSlots = 256;
 ID3D11Texture2D *g_drb_staging;   // kSlots slots of 64x64 R32 values, stacked vertically
 std::vector<int> g_free_slots;
+uint8_t g_slot_refs[kSlots]; // holders of a slot's copy (a deferred page, CLUT snapshots)
+int slot_take() {
+    const int slot = g_free_slots.back();
+    g_free_slots.pop_back();
+    g_slot_refs[slot] = 1;
+    return slot;
+}
+void slot_release(int slot) {
+    if (--g_slot_refs[slot] == 0)
+        g_free_slots.push_back(slot);
+}
 
 bool create_raw_textures() {
     D3D11_TEXTURE2D_DESC td = {};
@@ -867,7 +878,7 @@ bool g_deferred_merged_last[kPages];
 void deferred_free(uint32_t page) {
     DeferredPage *d = g_deferred[page];
     for (const DeferredPart &q : d->parts)
-        g_free_slots.push_back(q.slot);
+        slot_release(q.slot);
     delete d;
     g_deferred[page] = nullptr;
     --g_deferred_count;
@@ -991,8 +1002,7 @@ void deferred_schedule(uint32_t page) {
             g_deferred[page] = d;
             ++g_deferred_count;
         }
-        const int slot = g_free_slots.back();
-        g_free_slots.pop_back();
+        const int slot = slot_take();
         readback_record(o, q.x, q.y, q.w, q.h);
         D3D11_BOX box = {0, 0, 0, (UINT)q.w, (UINT)q.h, 1};
         g_ctx->CopySubresourceRegion(g_drb_staging, 0, 0, (UINT)(slot * kSlotPixels), 0, g_rb_tex, 0, &box);
@@ -1099,6 +1109,204 @@ void deferred_cpu_written(const PageCoverage &cov, uint32_t bp, uint32_t bw, uin
         }
     }
 }
+
+// ------------------------------------------------- lazy CLUT source snapshots
+// A CLUT load reading GPU-rendered (or deferred-preserved) blocks used to do a
+// synchronous readback: submit, then wait for all earlier GPU work. The game
+// often writes TEX0 with CLD before it uploads the palette, and loads again
+// afterwards, so that first CLUT is never used. Here the identical readback
+// pass is recorded at the identical command position into private staging
+// slots, together with a copy of the CPU bytes of the same pages and the
+// deferred-merge masks in force now. The page images are completed (waiting
+// for the GPU) only when the loaded CLUT entries are actually read. The image
+// of each page is what gs::vram would hold after the synchronous order at the
+// load. Ownership metadata is left as it is: later CPU readers synchronize as
+// they always do. EOD_LAZY_CLUT=0 restores the synchronous readback.
+bool lazy_clut_enabled() {
+    static const bool enabled = [] { const char *v = getenv("EOD_LAZY_CLUT"); return !v || atoi(v) != 0; }();
+    return enabled;
+}
+struct SnapshotPage {
+    uint32_t page = 0;
+    uint64_t serial = 0;              // command buffer holding the GPU copies (0: none)
+    std::vector<DeferredPart> readback; // owner readback parts (readback_rect order)
+    std::vector<DeferredPart> deferred; // a deferred page's parts, merged with `written`
+    std::vector<uint8_t> written;       // deferred-merge mask at the snapshot
+    uint8_t bytes[8192];                // gs::vram bytes at the snapshot, completed once
+    bool complete = false;
+};
+} // namespace
+struct ClutSnapshot {
+    std::vector<SnapshotPage *> pages;
+};
+namespace {
+uint64_t g_clut_lazy, g_clut_lazy_waits;
+
+// The bytes of a GS pixel at swizzled unit address `a` for this format.
+inline void pixel_bytes(uint32_t psm, uint32_t a, uint32_t &addr, uint32_t &n) {
+    if (bpp_of(psm) == 16) {
+        addr = (a & 0x1FFFFF) * 2;
+        n = 2;
+    } else {
+        addr = (a & 0xFFFFF) * 4;
+        n = 4;
+    }
+}
+
+void snapshot_complete(SnapshotPage &sp) {
+    if (sp.complete)
+        return;
+    if (sp.serial && g_dev->wait_serial(sp.serial))
+        ++g_clut_lazy_waits;
+    const uint8_t *base = (const uint8_t *)g_drb_staging->host.map;
+    auto store = [&](const DeferredPart &q, bool merge) {
+        const SwizzleTab *T = swizzle_table(q.psm, q.bw);
+        const bool b16 = bpp_of(q.psm) == 16, b24 = (q.psm & 0xF) == 0x1;
+        const uint32_t *slot = (const uint32_t *)(base + (size_t)q.slot * kSlotPixels * kSlotPixels * 4);
+        for (int r = 0; r < q.h; r++) {
+            const uint32_t *src = slot + (size_t)r * kSlotPixels;
+            int py = q.y + r;
+            uint32_t rb = T->row_base(q.bp, py), rc = T->rowC[py & 2047];
+            for (int c = 0; c < q.w; c++) {
+                uint32_t a = T->addr_row(rb, rc, q.x + c), v = src[c], addr, n;
+                pixel_bytes(q.psm, a, addr, n);
+                const uint32_t off0 = addr - sp.page * 8192;
+                if (off0 >= 8192)
+                    continue; // (parts lie in their page; defensive)
+                if (b24 && !b16) {
+                    uint32_t old;
+                    memcpy(&old, sp.bytes + off0, 4);
+                    v = (old & 0xFF000000u) | (v & 0xFFFFFF);
+                }
+                for (uint32_t k = 0; k < n; k++) {
+                    uint8_t &b = sp.bytes[off0 + k];
+                    const uint8_t keep = merge ? sp.written[off0 + k] : 0;
+                    b = (uint8_t)((b & keep) | ((v >> (8 * k)) & ~keep & 0xFF));
+                }
+            }
+        }
+    };
+    for (const DeferredPart &q : sp.deferred) // deferred_resolve, as at the snapshot
+        store(q, true);
+    for (const DeferredPart &q : sp.readback) // then readback_rect, as readback_pages
+        store(q, false);
+    sp.complete = true;
+}
+} // namespace
+
+ClutSnapshot *clut_snapshot(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    if (!g_on)
+        return nullptr;
+    flush(); // CPU reads observe all earlier queued GS primitives (vram_needed)
+    g_rb_reason = 0;
+    const PageCoverage c = page_coverage(bp, bw, psm, x, y, w, h);
+    // What vram_needed would synchronize, refined for deferred pages to the
+    // actual bytes read: bytes the CPU rewrote since the deferral are final.
+    const SwizzleTab *T = swizzle_table(psm, bw);
+    std::vector<uint32_t> def_pages, rb_pages;
+    for (uint32_t i = 0; i < c.count; ++i) {
+        const uint32_t p = c.pages[i];
+        DeferredPage *d = g_deferred[p];
+        if (d && (c.touched[p] & d->pending_blocks)) {
+            bool final_bytes = true;
+            for (int py = y; py < y + h && final_bytes; py++)
+                for (int px = x; px < x + w && final_bytes; px++) {
+                    uint32_t addr, n;
+                    pixel_bytes(psm, T->addr(bp, px, py), addr, n);
+                    if (addr / 8192 != p)
+                        continue;
+                    for (uint32_t k = 0; k < n; k++)
+                        if (d->written[(addr + k) % 8192] != 0xFF)
+                            final_bytes = false;
+                }
+            if (!final_bytes)
+                def_pages.push_back(p);
+        }
+        Surface *o = g_owner[p];
+        if (o && !g_vram_ok[p] && (c.touched[p] & ~g_cpu_valid_blocks[p]))
+            rb_pages.push_back(p);
+    }
+    if (def_pages.empty() && rb_pages.empty())
+        return nullptr;
+    bool lazy = lazy_clut_enabled() && g_free_slots.size() >= 64;
+    for (uint32_t p : def_pages)
+        lazy = lazy && std::find(rb_pages.begin(), rb_pages.end(), p) == rb_pages.end();
+    for (uint32_t p : rb_pages) {
+        bool found = false;
+        std::vector<PageRect> pages;
+        surface_pages(g_owner[p], g_owner[p]->h, pages);
+        for (const PageRect &q : pages)
+            found = found || q.page == p;
+        lazy = lazy && found;
+    }
+    if (!lazy) { // the synchronous order
+        readback_pages(bp, bw, psm, x, y, w, h);
+        return nullptr;
+    }
+    auto *snap = new ClutSnapshot;
+    bool recorded = false;
+    for (uint32_t i = 0; i < c.count; ++i) {
+        const uint32_t p = c.pages[i];
+        auto *sp = new SnapshotPage;
+        sp->page = p;
+        memcpy(sp->bytes, vram + (size_t)p * 8192, 8192);
+        if (std::find(def_pages.begin(), def_pages.end(), p) != def_pages.end()) {
+            DeferredPage *d = g_deferred[p];
+            sp->deferred = d->parts;
+            for (const DeferredPart &q : d->parts)
+                ++g_slot_refs[q.slot];
+            sp->written.assign(d->written, d->written + 8192);
+            sp->serial = d->serial;
+        }
+        if (std::find(rb_pages.begin(), rb_pages.end(), p) != rb_pages.end()) {
+            Surface *o = g_owner[p];
+            std::vector<PageRect> pages;
+            surface_pages(o, o->h, pages);
+            for (const PageRect &q : pages) {
+                if (q.page != p || q.w <= 0 || q.h <= 0)
+                    continue;
+                const int slot = slot_take();
+                readback_record(o, q.x, q.y, q.w, q.h);
+                D3D11_BOX box = {0, 0, 0, (UINT)q.w, (UINT)q.h, 1};
+                g_ctx->CopySubresourceRegion(g_drb_staging, 0, 0, (UINT)(slot * kSlotPixels), 0, g_rb_tex, 0, &box);
+                sp->readback.push_back({o->bp, o->bw, o->psm, q.x, q.y, q.w, q.h, slot});
+                recorded = true;
+            }
+        }
+        snap->pages.push_back(sp);
+    }
+    if (recorded) {
+        g_ctx->host_read_barrier();
+        for (SnapshotPage *sp : snap->pages)
+            if (!sp->readback.empty())
+                sp->serial = g_dev->serial; // (after the deferred part's serial, which is earlier)
+    }
+    ++g_clut_lazy;
+    return snap;
+}
+
+const uint8_t *clut_snapshot_page(ClutSnapshot *s, uint32_t page) {
+    for (SnapshotPage *sp : s->pages)
+        if (sp->page == page) {
+            snapshot_complete(*sp);
+            return sp->bytes;
+        }
+    return nullptr;
+}
+
+void clut_snapshot_free(ClutSnapshot *s) {
+    if (!s)
+        return;
+    for (SnapshotPage *sp : s->pages) {
+        for (const DeferredPart &q : sp->deferred)
+            slot_release(q.slot);
+        for (const DeferredPart &q : sp->readback)
+            slot_release(q.slot);
+        delete sp;
+    }
+    delete s;
+}
+namespace {
 
 // ------------------------------------------------------------ conversions
 // Remap tables between two block layouts of the same pixel size: for each
@@ -2037,7 +2245,10 @@ bool start(bool with_window) {
         vkgs::ctx = g_dev;
         if (!g_dev->init(with_window))
             return false;
-        int automatic_scale = with_window ? ((int)g_dev->extent.height + 447) / 448 : 1;
+        // Auto (RenderScale=0): the scale nearest the display's pixel height
+        // (e.g. 1800-pixel Retina 1440x900: 4, 2560x1792), not the next one up,
+        // which would render ~1.6x the pixels only to downsample them.
+        int automatic_scale = with_window ? ((int)g_dev->extent.height + 224) / 448 : 1;
         g_scale = std::clamp(g_config.render_scale > 0 ? g_config.render_scale : automatic_scale, 1, 6);
         if (!create_shaders() || !create_raw_textures())
             return false;
@@ -2791,6 +3002,10 @@ void stats_line(char *buf, size_t size) {
              g_dstats.scheduled, g_dstats.merged, g_dstats.waited, g_dstats.overwritten, g_dstats.kicked,
              g_deferred_count);
     g_dstats = DeferredStats();
+    used = strlen(buf);
+    snprintf(buf + used, size > used ? size - used : 0, "; lazy CLUT %llu (waited %llu)",
+             (unsigned long long)g_clut_lazy, (unsigned long long)g_clut_lazy_waits);
+    g_clut_lazy = g_clut_lazy_waits = 0;
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = g_dev->chunk_submits = 0;

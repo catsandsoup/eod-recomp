@@ -565,6 +565,7 @@ inline uint32_t expand16(uint32_t c, const Env &e) {
 bool g_debug_noclut = getenv("EOD_DEBUG_NOCLUT") != nullptr;
 
 uint32_t clut_lookup(uint32_t idx, const Env &e, bool four_bit) {
+    clut_resolve();
     if (g_debug_noclut) {
         uint32_t g = four_bit ? idx * 17 : idx;
         return g | (g << 8) | (g << 16) | 0x80000000u;
@@ -1796,6 +1797,94 @@ void draw_point(const Vertex &a) {
 }
 
 // ------------------------------------------------------------------ CLUT
+namespace {
+// A CLUT load whose source bytes were GPU-rendered: its entries are filled from
+// a snapshot of the source pages at the load (hw::clut_snapshot) when st.clut
+// is first read, or never when later loads overwrite every one of them.
+struct PendingClut {
+    hw::ClutSnapshot *snap = nullptr;
+    uint32_t cbp, cpsm, csm, cbw, cou, cov, off;
+    bool eight;
+    uint64_t slots[8];  // st.clut entries this load writes
+} g_pclut;
+
+void clut_slots(bool eight, uint32_t cpsm, uint32_t off, uint64_t (&m)[8]) {
+    memset(m, 0, sizeof m);
+    const int n = eight ? 256 : 16;
+    for (int i = 0; i < n; i++) {
+        if (cpsm == PSMCT32 || cpsm == PSMCT24) {
+            const uint32_t k = (off + i) & 255;
+            m[k >> 6] |= 1ull << (k & 63);
+            m[(k + 256) >> 6] |= 1ull << ((k + 256) & 63);
+        } else {
+            const uint32_t k = (off + i) & 511;
+            m[k >> 6] |= 1ull << (k & 63);
+        }
+    }
+}
+
+// Fills st.clut as the load does; read(psm, x, y, bp, bw) supplies source pixels.
+template <class Read>
+void clut_fill(bool eight, uint32_t cbp, uint32_t cpsm, uint32_t csm, uint32_t cbw, uint32_t cou, uint32_t cov,
+               uint32_t off, Read read) {
+    const int n = eight ? 256 : 16;
+    for (int i = 0; i < n; i++) {
+        int x, y;
+        uint32_t bw = 1;
+        if (csm == 0) {
+            if (eight) {
+                x = (i & 7) | ((i & 0x10) >> 1);
+                y = ((i & 8) >> 3) | ((i & 0xE0) >> 4);
+            } else {
+                x = i & 7;
+                y = i >> 3;
+            }
+        } else {
+            x = (int)(cou * 16) + i;
+            y = (int)cov;
+            bw = cbw;
+        }
+        uint32_t c = read(cpsm == PSMCT24 ? PSMCT32 : cpsm, x, y, cbp, bw);
+        if (cpsm == PSMCT32 || cpsm == PSMCT24) {
+            uint32_t k = (off + i) & 255;
+            st.clut[k] = (uint16_t)c;
+            st.clut[k + 256] = (uint16_t)(c >> 16);
+        } else {
+            st.clut[(off + i) & 511] = (uint16_t)c;
+        }
+    }
+}
+}  // namespace
+
+void clut_drop() {
+    hw::clut_snapshot_free(g_pclut.snap);
+    g_pclut.snap = nullptr;
+}
+
+void clut_resolve() {
+    if (!g_pclut.snap) return;
+    PendingClut p = g_pclut;
+    g_pclut.snap = nullptr;
+    clut_fill(p.eight, p.cbp, p.cpsm, p.csm, p.cbw, p.cou, p.cov, p.off,
+              [&](uint32_t psm, int x, int y, uint32_t bp, uint32_t bw) -> uint32_t {
+                  // read_pixel on the snapshot page images (CLUT formats: CT32, CT16, CT16S)
+                  uint32_t addr, n;
+                  switch (psm) {
+                  case PSMCT32: addr = addr32(x, y, bp, bw) * 4; n = 4; break;
+                  case PSMCT16: addr = addr16(x, y, bp, bw) * 2; n = 2; break;
+                  case PSMCT16S: addr = addr16s(x, y, bp, bw) * 2; n = 2; break;
+                  default: return read_pixel(psm, x, y, bp, bw);  // (not snapshotted: see clut_load)
+                  }
+                  addr %= kVramSize;
+                  const uint8_t *page = hw::clut_snapshot_page(p.snap, addr / 8192);
+                  const uint8_t *b = page ? page + addr % 8192 : vram + addr;
+                  uint32_t v = 0;
+                  memcpy(&v, b, n);
+                  return v;
+              });
+    hw::clut_snapshot_free(p.snap);
+}
+
 void clut_load(uint64_t tex0) {
     uint32_t psm = bits(tex0, 20, 6);
     bool four = psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH;
@@ -1835,40 +1924,40 @@ void clut_load(uint64_t tex0) {
         log_write(LOG_GS, "CLUT load cld=%u cbp=%x cpsm=%x csm=%u csa=%u psm=%x", cld, cbp, cpsm, csm, csa, psm);
     g_clut_gen++;
     g_reg_gen++;  // the drawing state uses the CLUT
-    int n = eight ? 256 : 16;
     uint32_t off = four ? csa * 16 : 0;
     uint32_t cbw = bits(st.texclut, 0, 6), cou = bits(st.texclut, 6, 6), cov = bits(st.texclut, 12, 10);
+    if (g_pclut.snap) {
+        // An earlier lazy load: dropped when this one rewrites all its entries,
+        // otherwise completed first (its other entries stay in st.clut).
+        uint64_t mine[8];
+        clut_slots(eight, cpsm, off, mine);
+        bool covered = true;
+        for (int k = 0; k < 8; k++) covered = covered && (g_pclut.slots[k] & ~mine[k]) == 0;
+        if (covered) clut_drop();
+        else clut_resolve();
+    }
     if (hw::g_on) {  // the CLUT may have been rendered
-        if (csm == 0)
-            hw::vram_needed(cbp, 1, cpsm == PSMCT24 ? PSMCT32 : cpsm, 0, 0, eight ? 16 : 8, eight ? 16 : 2, "clut");
-        else
-            hw::vram_needed(cbp, cbw, cpsm == PSMCT24 ? PSMCT32 : cpsm, (int)cou * 16, (int)cov, n, 1, "clut");
-    }
-    for (int i = 0; i < n; i++) {
-        int x, y;
-        uint32_t bw = 1;
-        if (csm == 0) {
-            if (eight) {
-                x = (i & 7) | ((i & 0x10) >> 1);
-                y = ((i & 8) >> 3) | ((i & 0xE0) >> 4);
-            } else {
-                x = i & 7;
-                y = i >> 3;
-            }
+        const uint32_t rpsm = cpsm == PSMCT24 ? PSMCT32 : cpsm;
+        const bool snapshot_format = rpsm == PSMCT32 || rpsm == PSMCT16 || rpsm == PSMCT16S;
+        hw::ClutSnapshot *snap = nullptr;
+        if (!snapshot_format) {
+            if (csm == 0) hw::vram_needed(cbp, 1, rpsm, 0, 0, eight ? 16 : 8, eight ? 16 : 2, "clut");
+            else hw::vram_needed(cbp, cbw, rpsm, (int)cou * 16, (int)cov, eight ? 256 : 16, 1, "clut");
+        } else if (csm == 0) {
+            snap = hw::clut_snapshot(cbp, 1, rpsm, 0, 0, eight ? 16 : 8, eight ? 16 : 2);
         } else {
-            x = (int)(cou * 16) + i;
-            y = (int)cov;
-            bw = cbw;
+            snap = hw::clut_snapshot(cbp, cbw, rpsm, (int)cou * 16, (int)cov, eight ? 256 : 16, 1);
         }
-        uint32_t c = read_pixel(cpsm == PSMCT24 ? PSMCT32 : cpsm, x, y, cbp, bw);
-        if (cpsm == PSMCT32 || cpsm == PSMCT24) {
-            uint32_t k = (off + i) & 255;
-            st.clut[k] = (uint16_t)c;
-            st.clut[k + 256] = (uint16_t)(c >> 16);
-        } else {
-            st.clut[(off + i) & 511] = (uint16_t)c;
+        if (snap) {
+            g_pclut.snap = snap;
+            g_pclut.cbp = cbp; g_pclut.cpsm = cpsm; g_pclut.csm = csm; g_pclut.cbw = cbw;
+            g_pclut.cou = cou; g_pclut.cov = cov; g_pclut.off = off; g_pclut.eight = eight;
+            clut_slots(eight, cpsm, off, g_pclut.slots);
+            return;
         }
     }
+    clut_fill(eight, cbp, cpsm, csm, cbw, cou, cov, off,
+              [](uint32_t psm, int x, int y, uint32_t bp, uint32_t bw) { return read_pixel(psm, x, y, bp, bw); });
 }
 
 // ------------------------------------------------------------ worker control
