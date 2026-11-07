@@ -43,3 +43,12 @@
 
 0034CEF0 wrap     # optional Cup source fast wheel geometry; exact native fallback
 00220788 wrap     # bounded opt-in Cup actual slow/fast selection trace
+
+00177718 wrap     # default-off netplay world-step diagnostic boundary
+0038FF40 wrap     # default-off netplay consumed SDK pad reply trace
+00191548 wrap     # native six-byte per-tick human replay record diagnostics
+00176918 wrap     # opt-in netplay agreed native race RNG seeds
+00176698 wrap     # opt-in agreed native race-start phase and RNG epoch
+0012F3C8 wrap     # bounded opt-in RNG0 callsite diagnosis
+0012F470 wrap     # bounded opt-in RNG0 callsite diagnosis
+0012F4F0 wrap     # bounded opt-in RNG0 callsite diagnosis
