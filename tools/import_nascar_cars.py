@@ -38,6 +38,7 @@ if os.environ.get("EOD_TOOLS"):
 
 import math  # noqa: E402
 import nascar_gen as gen  # noqa: E402
+import nascar_parts  # noqa: E402
 
 from create_custom_car import build_custom_car, car_archive_filename  # noqa: E402
 from modl import parse_modl, retexture_modl  # noqa: E402
@@ -206,7 +207,10 @@ def transcode_modl(data: bytes) -> bytes:
 STOCK_DROP_GROUPS = {7, 8, 9, 10}           # keep variant 5/6, drop the other two
 STOCK_GROUP_MAP = {5: 9, 6: 10, 11: 2, 12: 1}
 STOCK_INTERIOR_TEXTURES = {"rollwht.tex", "airhose.tex", "template01c.tex", "padding.tex", "swindnet.tex"}
-SURF_GROUPS = ({0, 1, 2, 10}, {9})          # bonesurf_1 (front + rear clips), bonesurf_2 (body)
+# Groups after nascar_parts.split_model: 1 nose, 2 hood, 3/4 right/left fender, 5/6 right/left door,
+# 9 body+roof+glass, 10 rear quarters, 11 decklid, 12/13 front/rear bumper (TDEOD's panel table).
+# bonesurf_1 (front + rear clips and their panels), bonesurf_2 (body and doors).
+SURF_GROUPS = ({0, 1, 2, 3, 4, 10, 11, 12, 13}, {5, 6, 9})
 
 
 def remap_stock_groups(m):
@@ -241,7 +245,9 @@ def make_bones(gpts):
     surf_pts = [[p for g in SURF_GROUPS[0] if g != 0 for p in gpts.get(g, [])],
                 [p for g in SURF_GROUPS[1] for p in gpts.get(g, [])]]
     b1, cell1 = gen.place_bones(surf_pts[0], 79)
-    b2, cell2 = gen.place_bones(surf_pts[1], 79)
+    # Retail Bone.mvl holds 157 bones (bone_157 is its last section); more breaks the VALT reader
+    # ("Bad vector value ... in bone_159"), so surface 2 is capped at 77 like Algar's.
+    b2, cell2 = gen.place_bones(surf_pts[1], 77)
     bones = [gen.bone_params(p, 0.0) for p in b1]
     bones += [dict(gen.DUMMY_BONE) for _ in range(80 - len(b1))]
     bones += [gen.bone_params(p, 0.0) for p in b2]
@@ -266,21 +272,10 @@ def skin_modl(m, local, rigid_all=False):
 
 
 def hood_helpers(gpts):
-    """TJRM helpers for the hood (group 2), placed like Algar's: hinges on the rear corners,
-    latch at the front centre; plus a trailer hitch at the rear centre."""
-    hood = gpts.get(2)
-    out = []
-    if hood:
-        zmin = min(p[2] for p in hood)
-        zmax = max(p[2] for p in hood)
-        xmax = max(abs(p[0]) for p in hood)
-        rear = [p for p in hood if p[2] < zmin + 0.06]
-        front = [p for p in hood if p[2] > zmax - 0.06]
-        yr = max(p[1] for p in rear)
-        yf = min(p[1] for p in front)
-        out += [("left hood hinge", gen.IDENTITY, (-xmax, yr, zmin)),
-                ("right hood hinge", gen.IDENTITY, (xmax, yr, zmin)),
-                ("hood latch", gen.IDENTITY, (0.0, yf, zmax))]
+    """TJRM helpers the EE looks up for the detachable panels (nascar_parts.panel_helpers: hood
+    hinges/latch like Algar's, plus the door, decklid and bumper helpers for every panel group
+    present) and a trailer hitch at the rear centre."""
+    out = nascar_parts.panel_helpers(gpts)
     body = [p for g in (1, 9, 10) for p in gpts.get(g, [])]
     if body:
         zmin = min(p[2] for p in body)
@@ -331,22 +326,22 @@ def fix_cockpit_roof(low0, gpts):
 
 
 def make_shadows(gpts, donor_shadows):
-    """shadow1-3.mod in the retail format (type-7 closed volumes, MSCAL 4)."""
-    ext = [p for g in (1, 2, 9, 10) for p in gpts.get(g, [])]
+    """shadow1-3.mod in the retail format: closed shadow volumes whose every edge carries a
+    degenerate fin (see nascar_gen.shadow_volume_triangles); MSCAL 4 then MSCNT like retail."""
+    ext = [p for g, pts in gpts.items() if g != 0 for p in pts]
     out = {}
     floor = min(p[1] for p in ext) + 0.12      # retail volumes stop ~0.1 m above the sill
     ext = [(p[0], max(p[1], floor), p[2]) for p in ext]
     lo = [min(p[i] for p in ext) for i in range(3)]
     hi = [max(p[i] for p in ext) for i in range(3)]
-    for name, cell in (("shadow1.mod", 0.6), ("shadow2.mod", 1.2)):
+    for name, cell in (("shadow1.mod", 0.9), ("shadow2.mod", 1.5)):
         reps = gen._mirror(gen._cluster(ext, cell))
-        tris = gen.hull_triangles(reps)
-        out[name] = tris
+        out[name] = gen.shadow_volume_triangles(gen.hull_triangles(reps))
     y = 0.35
     w, z0, z1 = hi[0] + 0.07, lo[2] - 0.02, hi[2] + 0.02
     a, b, c, d = (-w, y, z1), (w, y, z1), (w, y, z0), (-w, y, z0)
-    out["shadow3.mod"] = [((a, b, c), (0, 1, 0)), ((a, c, d), (0, 1, 0)),
-                          ((a, c, b), (0, -1, 0)), ((a, d, c), (0, -1, 0))]
+    out["shadow3.mod"] = gen.shadow_volume_triangles(
+        [((a, b, c), (0, 1, 0)), ((a, c, d), (0, 1, 0)), ((a, c, b), (0, -1, 0)), ((a, d, c), (0, -1, 0))])
     files = {}
     for name, tris in out.items():
         donor = gen.read_modl(donor_shadows[name])
@@ -389,6 +384,16 @@ def drop_top_mip(v10: bytes) -> bytes:
     struct.pack_into("<7I", header, 0, w // 2, h // 2, mips - 1, fmt, flags, aux, 0x80)
     struct.pack_into(f"<{mips - 1}I", header, 28, *[o - shift for o in offs[1:]])
     return bytes(header) + palette + payload
+
+
+def unpack_source(archive, out_dir):
+    """Unpack a source 0TSR archive; an already extracted directory (archive layout with
+    manifest.json) is accepted for machines where the original disc is not mounted."""
+    archive = Path(archive)
+    if archive.is_dir():
+        shutil.copytree(archive, out_dir, dirs_exist_ok=True)
+    else:
+        unpack_archive(str(archive), str(out_dir))
 
 
 def find_entry(directory: Path, name: str) -> Path:
@@ -463,9 +468,9 @@ def import_vehicle(kind, nascar_data, eod_data, output, name, number, base, car_
                          description="NASCAR Winston Cup stock car imported from Dirt to Daytona")
 
         src = tmp / "nascar_car"
-        unpack_archive(str(nascar_data / car_file), str(src))
+        unpack_source(nascar_data / car_file, src)
         paints = tmp / "paint"
-        unpack_archive(str(nascar_data / "RES" / "PAINT256.RES"), str(paints))
+        unpack_source(nascar_data / "RES" / "PAINT256.RES", paints)
 
         car_dir = tmp / "car"
         unpack_archive(str(pkg / "DATA" / "CAR" / car_archive_filename(name)), str(car_dir))
@@ -491,6 +496,12 @@ def import_vehicle(kind, nascar_data, eod_data, output, name, number, base, car_
             lods[i] = gen.read_modl(data)
         for i in range(1, 5):
             remap_stock_groups(lods[i])
+        # Cut the NASCAR body into TDEOD's detachable panels (Low1-3 share one mesh; the far Low4
+        # silhouette keeps a single body group).  Done before bones/skin so they see the new groups.
+        split_textures = {body_tex.lower(), "swindows.tex", "window2.tex"}
+        for i in range(1, 4):
+            moved = nascar_parts.split_model(lods[i], split_textures)
+            print(f"Low{i} panels: " + ", ".join(f"group {g}: {n} tris" for g, n in sorted(moved.items())))
         gpts = group_points(lods[1])
         bones, surfs, local = make_bones(gpts)
         for i in range(1, 5):
@@ -618,7 +629,7 @@ def import_vehicle(kind, nascar_data, eod_data, output, name, number, base, car_
         race = tmp / "race"
         unpack_archive(str(eod_data / "RES" / "RACE.RES"), str(race))
         source_race = tmp / "source_race"
-        unpack_archive(str(nascar_data / "RES" / "RACE.RES"), str(source_race))
+        unpack_source(nascar_data / "RES" / "RACE.RES", source_race)
         wheel_resources, wheel_provenance = build_cup_wheels(
             source_race, parse_binary_valt(find_entry(src, "physics.val").read_bytes()))
         race_manifest = json.loads((race / "manifest.json").read_text())

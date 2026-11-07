@@ -71,8 +71,8 @@ validated by this Python suite.
 Remaining donor adapters: transmission gearing, wheel meshes/class, engine audio,
 effects, LOD distances, speedometer/menu preview. No fifth-class hooks, Career
 circuit, dirt-tyre shop upgrade, imported track or4K/120 acceptance yet. No race
-finish, buy/save/reload or split-screen acceptance yet. Doors/decklid/bumpers are
-not demonstrated detachable; only hood helper geometry has been generated.
+finish, buy/save/reload or split-screen acceptance yet. Doors/decklid/bumpers were
+not detachable at this checkpoint; see "Detachable panels and shadow volumes" below.
 
 ## Next decisive tests
 
@@ -113,3 +113,30 @@ No production networking code has been added: the user separately requested
 a scoping-only online-multiplayer subagent for TDEOD base game, with UG2 as
 inspiration. That scope is complete in ONLINE_MULTIPLAYER_SCOPE.md; no networking
 implementation was performed. This is separate from NASCAR content and is not a prerequisite.
+
+## Detachable panels and shadow volumes — 2026-11-07
+
+**Panels.** The EE holds a table of eight detachable panels (`0x44AE68`, written by
+`0x18DBF8`, read every frame by `0x18AFE0`/`0x18CFE8`): left/right door (groups 6/5), hood (2),
+decklid (11), front/rear bumper (12/13) and left/right fender (4/3, hung from the door-hinge
+helpers). A row exists only if its TJRM helper is found in the car's MODL ("car: can't find
+helper %s in %s (%s)") and sheds when the Bone.mvl bone nearest that helper moves beyond the
+row's threshold (0.076 m; hood 0.127 m; decklid 0.038 m). The imported Cup body had only the
+groups 1/2/9/10 and only hood helpers, so five rows never existed. `tools/nascar_parts.py` now
+cuts the NASCAR triangles into those groups (clipping the side panel at the door edges), writes
+the helpers and `import_nascar_cars.py` rebuilds Bone.mvl for the new groups (two bone surfaces,
+79+77 bones: more than 157 bones breaks the native VALT reader). Low1-3 are split; Low4 keeps
+one body group. Verified in an Anoka Battle: all eight rows exist for Cupcar, the rear bumper
+(row 5), the front bumper and a fender were shed and drawn as debris. Hood, doors and
+decklid use the same mechanism but were not seen shedding in the short runs. The roster
+builder (`nascar_roster.py`) still generates unsplit bodies for the other families.
+
+**Shadows.** The shadow program (VU1 `0x0020`) pushes every vertex whose stored normal faces
+the light along the light vector, so a shadow mesh is a closed volume only if every edge
+carries a degenerate fin quad (the retail meshes' zero-area stitching triangles), and it flips
+the facing of the triangle at every odd vertex index. The generator emitted a bare convex hull
+whose lit faces flew off as detached triangles (the dark fans beside and behind the car) and
+stored half of its triangles with the wrong parity. `nascar_gen.shadow_volume_triangles` adds
+the fins, `encode_shadow_part` applies the parity rule (checked against all 92 solid triangles
+of Algar's shadow1/2) and continues later batches with MSCNT like retail. Native cars render
+the same scene cleanly; no renderer change.

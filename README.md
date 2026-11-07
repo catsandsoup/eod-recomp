@@ -38,7 +38,7 @@
 ### Bonus cars
 
 * **The Phantom.** A mean, black-and-white new ride for the demolition derby.
-* **A NASCAR stock car.** Take a Cup-style racer through the mud. More are on the way.
+* **A NASCAR stock car.** Take a Cup-style racer through the mud. It crumples, sheds bumpers and panels, and casts a proper shadow, just like the original cars. More are on the way.
 
 ![Bonus NASCAR stock car launching off a dirt jump in Eve of Destruction](docs/img/nascar-stock-car-bonus.jpg)
 ![The bonus Phantom car lining up at the start of a race](docs/img/phantom-bonus-car.jpg)

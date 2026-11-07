@@ -466,13 +466,19 @@ def _qbase(lo, hi):
 
 
 def encode_shadow_part(tris, first_q198_z, f30, tex=b'.tex'):
-    """tris: list of ((p0,p1,p2), outward normal). Builds one type-7 shadow part
-    (separate 3-vertex strips, ADC on the first two, inward normals like retail)."""
+    """tris: list of ((p0,p1,p2), (n0,n1,n2)) with the per-vertex *stored* normals (retail stores
+    the inward face normal; see shadow_volume_triangles).  Builds one type-7 shadow part as
+    separate 3-vertex strips (ADC on the first two).  Like retail, only the first batch calls the
+    shadow program with MSCAL 4; later batches continue it with MSCNT."""
     verts = []
-    for (a, b, c), n in tris:
-        inward = tuple(-x for x in n)
-        for k, p in enumerate((a, b, c)):
-            verts.append((p, inward, k < 2))
+    for t, ((a, b, c), (na, nb_, nc)) in enumerate(tris):
+        # The shadow program flips the facing of the triangle drawn at every odd vertex index
+        # (strip parity), so each 3-vertex strip sits at index 3t+2 and the odd ones are stored
+        # with their first two vertices swapped.  Verified on retail shadow1/2: with this rule
+        # all 64+28 solid triangles have a geometric normal exactly opposite their stored one.
+        order = ((b, nb_), (a, na), (c, nc)) if t % 2 else ((a, na), (b, nb_), (c, nc))
+        for k, (p, n) in enumerate(order):
+            verts.append((p, n, k < 2))
     stream = bytearray()
     batches = [verts[i:i + 96] for i in range(0, len(verts), 96)]
     allp = [v[0] for v in verts]
@@ -508,7 +514,7 @@ def encode_shadow_part(tris, first_q198_z, f30, tex=b'.tex'):
         q199 = (fbits(bases[0][1]), fbits(bases[1][1]), fbits(bases[2][1]), 0)
         stream += struct.pack('<I', 0x6C020000 | 0xC000 | 198) + struct.pack('<4I', *[x & 0xFFFFFFFF for x in q198]) \
             + struct.pack('<4I', *q199)
-        stream += struct.pack('<I', 0x14000004)          # MSCAL 4 (shadow program)
+        stream += struct.pack('<I', 0x14000004 if bi == 0 else 0x17000000)   # MSCAL 4, then MSCNT
     while len(stream) % 16:
         stream += b'\0\0\0\0'
     hdr = bytearray(0x38)
@@ -531,4 +537,37 @@ def hull_triangles(points):
         if ln < 1e-9:
             continue
         out.append(((pa, pb, pc), tuple(x / ln for x in n)))
+    return out
+
+
+def shadow_volume_triangles(tris):
+    """Turn closed-hull triangles ((a,b,c), outward normal) into a TDEOD shadow volume.
+
+    The shadow program (VU1 0x0020, config/vu/vu1_eb9855205ae4523b.bin) does not project a mesh:
+    it pushes every vertex whose *stored normal* faces the light (n.L > 0) along the light vector
+    and draws what is left.  A closed convex hull therefore tears apart as soon as whole faces are
+    pushed away: the faces facing the light are flung to the horizon as detached triangles, which
+    is the large dark triangle fans seen on the ground beside and behind the Cup car.  A volume
+    only closes if every edge between two faces carries a *fin*, a quad that is degenerate in the
+    rest pose and whose two vertex pairs carry the normals of the two adjacent faces, so that at
+    a silhouette edge one pair is pushed out and the fin stretches into the volume wall.  That is
+    what the retail meshes are (zero-area stitching triangles between the face triangles).
+
+    Winding follows the retail meshes: faces keep the outward counter-clockwise order with the
+    inward normal stored on all three vertices; a fin runs q1,p1,p2,q2 where face 1 contains the
+    directed edge p->q (the quad closes the surface between the two faces).
+    Returns [((p0,p1,p2), (n0,n1,n2)), ...]."""
+    out = []
+    edges = {}
+    for (a, b, c), n in tris:
+        inward = tuple(-x for x in n)
+        out.append(((a, b, c), (inward, inward, inward)))
+        for e in ((a, b), (b, c), (c, a)):
+            edges[e] = inward
+    for (p, q), n1 in sorted(edges.items()):
+        n2 = edges.get((q, p))
+        if n2 is None or (p, q) > (q, p):
+            continue
+        out.append(((q, p, p), (n1, n1, n2)))        # q1 p1 p2
+        out.append(((q, p, q), (n1, n2, n2)))        # q1 p2 q2
     return out
