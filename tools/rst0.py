@@ -50,6 +50,9 @@ CRC_TABLE = [
 ]
 
 
+STREAM_ALIGN = 0x800  # sector size: streamed (extractable) entries start on one
+
+
 def eod_crc(data: bytes) -> int:
     """Computes the game's exact CRC32 value."""
     if len(data) < 4:
@@ -308,6 +311,14 @@ def pack_archive(in_dir: str, out_archive_path: str):
     for i, e in enumerate(all_entries):
         # Recompute all positions: preserving offsets after edits overlaps entries.
         cur_file_offset = (cur_file_offset + 0x7F) & ~0x7F
+        if e["is_extractable"]:
+            # Streamed resources (the extractable block: .tm0 texture tails, .an0 animation tails)
+            # sit on 2048-byte file boundaries in every retail archive. The game's resource stream
+            # reader (0x131E88/0x132110) reads whole sectors and indexes them from the sector start,
+            # so an entry that does not start on a sector reads the wrong bytes: a spectator animation
+            # then decodes a garbage track number and writes past its fixed 0x740-byte "mranm" block,
+            # which is how a Career Battle crashed with "MemFree: bad cookie".
+            cur_file_offset = (cur_file_offset + STREAM_ALIGN - 1) & ~(STREAM_ALIGN - 1)
         rel_offset = cur_file_offset - dir_offset
         if i < len(all_entries) - 1:
             cur_file_offset += ((e["size"] + 0x80) & ~0x7F)

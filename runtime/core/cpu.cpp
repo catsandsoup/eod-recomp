@@ -2,6 +2,7 @@
 // coprocessor 0, FPU control registers and fault reporting.
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "cpu.h"
 #include "ee.h"
@@ -15,6 +16,46 @@ EEState g_ee;
 #ifdef EE_TRACE_CALLS
 uint32_t g_ee_trace[256];
 uint32_t g_ee_trace_pos;
+volatile uint32_t *g_ee_watch_ptr;
+uint32_t g_ee_watch_val;
+// The watched word changed since the last function entry: the code that wrote it ran in the calls
+// just before this one (oldest first; the last entry is the function being entered now).
+void ee_func_watch_hit(void) {
+    static int hits;
+    const uint32_t now = *g_ee_watch_ptr;
+    if (hits++ < 40) {
+        fprintf(stderr, "[FUNCWATCH] %08x -> %08x at call#%u ra=%08x sp=%08x\n  recent:", g_ee_watch_val, now, g_ee_trace_pos,
+                g_ee.r[31].uw[0], g_ee.r[29].uw[0]);
+        for (int i = 24; i >= 1; i--) fprintf(stderr, " %08x", g_ee_trace[(g_ee_trace_pos - i) & 255]);
+        fprintf(stderr, "\n  regs:");
+        static const int regs[] = {2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
+        for (int r : regs) fprintf(stderr, " r%d=%08x", r, g_ee.r[r].uw[0]);
+        fprintf(stderr, "\n");
+        for (int r : {4, 19}) {
+            const uint32_t p = g_ee.r[r].uw[0];
+            if (p < EE_RAM_SIZE - 0x40) {
+                fprintf(stderr, "  [r%d]:", r);
+                for (int i = 0; i < 24; i++) { uint32_t v; memcpy(&v, g_ram + p + 4 * i, 4); fprintf(stderr, " %08x", v); }
+                fprintf(stderr, "\n");
+            }
+        }
+        {
+            uint32_t buf = 0;
+            if (g_ee.r[4].uw[0] < EE_RAM_SIZE - 8) memcpy(&buf, g_ram + g_ee.r[4].uw[0] + 4, 4);
+            if (buf && buf < EE_RAM_SIZE - 0x80) {
+                fprintf(stderr, "  [stream buf %08x]:", buf);
+                for (int i = 0; i < 32; i++) { uint32_t v; memcpy(&v, g_ram + buf + 4 * i, 4); fprintf(stderr, " %08x", v); }
+                fprintf(stderr, "\n  [buf+0x600]:");
+                for (int i = 0; i < 24; i++) { uint32_t v; memcpy(&v, g_ram + buf + 0x600 + 4 * i, 4); fprintf(stderr, " %08x", v); }
+                fprintf(stderr, "\n  [stream struct 0x2c]:");
+                for (int i = 0; i < 11; i++) { uint32_t v; memcpy(&v, g_ram + g_ee.r[4].uw[0] + 4 * i, 4); fprintf(stderr, " %08x", v); }
+                fprintf(stderr, "\n");
+            }
+        }
+        fflush(stderr);
+    }
+    g_ee_watch_val = now;
+}
 #endif
 
 // ------------------------------------------------------------ lookup
@@ -146,6 +187,13 @@ void cpu_init() {
     g_cop0[12] = 0x70030C11;
     g_cop0[15] = 0x2E20;      // PRId: R5900 rev 2.0
     g_cop0[16] = 0x440;       // Config
+#ifdef EE_TRACE_CALLS
+    if (const char *w = getenv("EOD_FUNC_WATCH")) {
+        const uint32_t a = (uint32_t)strtoul(w, nullptr, 16) & ~3u;
+        g_ee_watch_ptr = (volatile uint32_t *)(g_ram + a);
+        g_ee_watch_val = *g_ee_watch_ptr;
+    }
+#endif
 }
 
 uint32_t cpu_cycles() {

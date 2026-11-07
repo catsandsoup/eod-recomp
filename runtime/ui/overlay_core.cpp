@@ -25,6 +25,7 @@
 
 [[noreturn]] void app_exit(int code);
 uint64_t gs_drawn_frames();
+void gs_overlay_redraw();
 extern std::string g_game_root;
 
 #ifndef EOD_RECOMP_VERSION
@@ -82,6 +83,7 @@ bool g_shift;
 // error screen
 OverlayDiscHandler g_disc_handler;
 std::atomic<int> g_error_result{0};
+bool g_fatal_screen = false;  // overlay_fatal_screen is running
 std::thread g_import;
 std::atomic<int> g_import_state{0};  // 0 idle, 1 running, 2 done ok, 3 failed
 std::string g_import_error;          // written by the import thread before state 3
@@ -357,7 +359,11 @@ void apply(const frontend::Effects &fx) {
     if (fx.swap_ports) overlay_platform_swap_ports();
     if (fx.save) config_save(g_config_path);
     if (fx.close) open_menu(false);
-    if (fx.quit) { g_error_result = 2; app_exit(0); }
+    if (fx.quit) {
+        g_error_result = 2;
+        if (g_fatal_screen) return;  // the panic screen's one choice: the caller restarts the game
+        app_exit(0);
+    }
     if (fx.retry) g_error_result = 1;
     if (fx.choose_disc && g_disc_handler && g_import_state != 1) {
         if (g_import.joinable()) g_import.join();
@@ -490,6 +496,23 @@ void overlay_show_error(const std::string &title, const std::string &message, bo
     g_error_result = 0;
     g_menu->show_error(title, message, offer_disc);
     g_open = true;
+}
+bool overlay_fatal_screen(const std::string &title, const std::string &message) {
+    g_fatal_screen = true;
+    g_available = true;
+    ensure_context();
+    g_disc_handler = nullptr;
+    g_error_result = 0;
+    g_menu->show_error(title, message, false, true);
+    g_open = true;
+    // The game is stopped for good: this is the same hold as the in-game menu's (kernel.cpp).
+    while (g_error_result == 0) {
+        gs_overlay_redraw();
+        platform_sleep_us(16000);
+        if (!platform_pump()) app_exit(0);
+        overlay_frame();
+    }
+    return true;
 }
 int overlay_error_result() { return g_error_result; }
 

@@ -66,3 +66,12 @@
 0012F3C8 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F470 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F4F0 wrap     # bounded opt-in RNG0 callsite diagnosis
+
+# Developer heap checker (EOD_HEAP_CHECK=1): verifies every stack-allocator block at each MemAlloc/MemFree; native behaviour unchanged when off.
+0012DDB8 wrap     # MemAlloc(pool, size, name)
+0012DB78 wrap     # MemFree(ptr)
+
+# Developer: EOD_CAREER_EVE=<n> enters Eve n of the loaded Career directly.
+002D58E8 wrap     # Career free-roam run (developer EOD_CAREER_EVE skips it once)
+0020D220 wrap     # MRAnim create (developer EOD_HEAP_CHECK logs its bone count against the fixed 0x740 block)
+00167D58 wrap     # Battle update (developer EOD_BATTLE_END_AFTER forces a winner)

@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Parser tests for the EOD_DIRECT_START developer hook (no guest memory needed).
 #include "session_start.h"
 #include "core/cpu.h"
@@ -5,6 +6,7 @@
 #include <cstdio>
 EEState g_ee{};
 uint8_t *g_ram = nullptr;
+[[noreturn]] void fatal(const char *, ...) { std::abort(); }  // developer EOD_FATAL_TEST path; never reached here
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
 extern "C" {

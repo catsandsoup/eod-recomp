@@ -192,10 +192,11 @@ void Menu::select(int row) {
     if (row >= 0 && row < (int)r.size() && r[row].kind != RowKind::Header) sel_[error_active() ? (int)Tab::Count : (int)tab_] = row;
 }
 
-void Menu::show_error(const std::string &title, const std::string &message, bool offer_disc) {
+void Menu::show_error(const std::string &title, const std::string &message, bool offer_disc, bool fatal) {
     error_title_ = title;
     error_message_ = message;
     error_disc_ = offer_disc;
+    error_fatal_ = fatal;
     browse_ = false;
     sel_[(int)Tab::Count] = 0;
 }
@@ -564,6 +565,10 @@ void Menu::rows_error(std::vector<Row> &r) {
     if (error_disc_) r.push_back(action("browse", "CHOOSE YOUR DISC", "[ BROWSE ]",
                                         "Pick your North American v1.00 disc image (.iso, .bin/.cue) or the folder holding "
                                         "SLUS_209.10 and DATA. Your original files stay untouched."));
+    if (error_fatal_) {  // a game panic: one plain choice (the id stays "quit"; the caller restarts the game)
+        r.push_back(action("quit", "RETURN TO TITLE SCREEN", "", "Starts the game again from the title screen."));
+        return;
+    }
     r.push_back(action("retry", "TRY AGAIN", "", "Checks the content again."));
     r.push_back(action("quit", "QUIT", "", "Closes Eve of Destruction."));
 }

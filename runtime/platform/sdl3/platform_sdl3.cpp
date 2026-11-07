@@ -21,13 +21,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "../../core/config.h"
 #include "audio_gain.h"
 #ifdef __APPLE__
 #include "../../app/macos_app.h"
+#include <crt_externs.h>
+#include <mach-o/dyld.h>
+#include <spawn.h>
+extern char **environ;
 #endif
 #include "../../gs/gs_hw.h"
 
@@ -57,6 +64,7 @@ PlatformConfig g_cfg;
 bool g_headless;
 bool g_vulkan_window;
 SDL_Window *g_window;
+std::thread::id g_main_thread;  // the thread that ran platform_init (the EE runs on it)
 SDL_Renderer *g_renderer;
 SDL_Texture *g_texture;
 int g_tex_w, g_tex_h;
@@ -241,6 +249,7 @@ void platform_configure_display(const PlatformConfig &cfg) {
 
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
+    g_main_thread = std::this_thread::get_id();
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
     const char *keyboard_override = getenv("EOD_KEYBOARD_PORT");
@@ -297,8 +306,62 @@ void platform_shutdown() {
     SDL_Quit();
 }
 
+// A fatal error never opens an OS dialog (no NSAlert / SDL message box). The message goes to
+// crash.log next to the settings, and, in a windowed run, onto the in-game error screen, which
+// holds the stopped game on screen until the player chooses QUIT.
+static std::string fatal_log_path() {
+#ifdef __APPLE__
+    return mac_app_support() + "/crash.log";
+#else
+    return "crash.log";
+#endif
+}
+
+#ifndef EOD_DISPLAY_BACKEND_TEST
+[[noreturn]] void app_exit(int code);
+// Starts a fresh copy of the game (its title screen) and lets this one go. The panicked
+// process cannot be reused: its guest memory is corrupt. From an app bundle it is a new
+// instance of the bundle; otherwise the same executable with the same arguments.
+static void relaunch_game() {
+#ifdef __APPLE__
+    char path[4096];
+    uint32_t size = sizeof path;
+    if (_NSGetExecutablePath(path, &size) != 0) return;
+    const std::string exe = path;
+    const size_t at = exe.find(".app/Contents/MacOS/");
+    pid_t pid = 0;
+    if (at != std::string::npos) {
+        const std::string bundle = exe.substr(0, at + 4);
+        char *args[] = {const_cast<char *>("open"), const_cast<char *>("-n"), const_cast<char *>(bundle.c_str()), nullptr};
+        posix_spawn(&pid, "/usr/bin/open", nullptr, nullptr, args, environ);
+    } else {
+        posix_spawn(&pid, exe.c_str(), nullptr, nullptr, *_NSGetArgv(), environ);
+    }
+#endif
+}
+#endif
+
 void platform_fatal_message(const char *msg) {
-    if (!g_headless) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Eve of Destruction", msg, g_window);
+    if (FILE *f = fopen(fatal_log_path().c_str(), "a")) {
+        const time_t now = time(nullptr);
+        char when[32] = "";
+        strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(f, "[%s] %s\n", when, msg);
+        fclose(f);
+    }
+    if (g_headless || !g_window) return;
+    // The screen runs the window's event loop, which only the thread that owns the window (the
+    // EE thread) may do; a fatal error from any other thread just logs and aborts.
+    if (std::this_thread::get_id() != g_main_thread) return;
+    if (g_audio) SDL_PauseAudioStreamDevice(g_audio);  // the stopped game would otherwise loop its last buffer
+#ifndef EOD_DISPLAY_BACKEND_TEST
+    // Plain words only; the technical message is in crash.log.
+    overlay_fatal_screen("SOMETHING WENT WRONG",
+                         "The game ran into a problem and has to start over. "
+                         "Choose RETURN TO TITLE SCREEN to start the game again.");
+    relaunch_game();
+    app_exit(0);  // no relaunch possible: close cleanly (the details are in crash.log)
+#endif
 }
 
 bool platform_pump() {

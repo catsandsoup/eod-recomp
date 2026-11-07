@@ -12,6 +12,7 @@
 #include "battle_layout.h"
 
 #include "core/cpu.h"
+#include "core/log.h"
 #include "core/memory.h"
 
 #include <cctype>
@@ -215,6 +216,9 @@ std::string session_event_name(const SessionRequest &r) {
 // Title screen ("press the START button", start.lyt): returns 1 once the player passed it.
 // A direct start is a request already made, so it is treated as passed.
 extern "C" void f_002BEC08(void) {
+    // Developer: EOD_FATAL_TEST=1 raises a game panic at the title screen, to check the in-game
+    // error screen and crash.log (a windowed run; headless runs just log and abort).
+    if (std::getenv("EOD_FATAL_TEST")) fatal("developer panic test (EOD_FATAL_TEST)");
     const char *text = std::getenv("EOD_DIRECT_START");
     if (text && *text) {
         std::fprintf(stderr, "[SESSION] title screen skipped (EOD_DIRECT_START)\n");
@@ -273,6 +277,20 @@ extern "C" void f_00120650(void) {
             log("event pre-selected: tracker position %u (contest %u)", (uint32_t)pos, P.contest);
         } else {
             log("contest %u is not in the tracker list (%u entries): native lobby", P.contest, count);
+        }
+    }
+    // Developer (EOD_CAREER_EVE + EOD_CAREER_LAST=1, src/hle_dev_career.cpp): a Career Eve starts
+    // its LAST listed event (an added Career Battle) instead of the opening lobby event.
+    static bool career_last_done = false;
+    if (!P.armed && !career_last_done && std::getenv("EOD_CAREER_EVE") && std::getenv("EOD_CAREER_LAST")) {
+        career_last_done = true;
+        const uint32_t tracker = ee_r32(kTrackerPtr);
+        const uint32_t count = tracker ? ee_r32(tracker + kTrackerCount) : 0;
+        if (count) {
+            std::fprintf(stderr, "[CAREER_EVE] event list (%u):", count);
+            for (uint32_t i = 0; i < count && i < 64; ++i) std::fprintf(stderr, " %u", ee_r32(tracker + kTrackerList + 4 * i));
+            std::fprintf(stderr, "; starting position %u\n", count - 1);
+            native(f_00120BE8, {count - 1});
         }
     }
     f_00120650_orig();

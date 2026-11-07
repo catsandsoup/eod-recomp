@@ -159,7 +159,8 @@ public:
     void store_mods();  // cfg().mods <- the discovered mods' toggles and order; marks the menu dirty
 
     // Error screen (missing/corrupt content, no disc): replaces the tabs until resolved.
-    void show_error(const std::string &title, const std::string &message, bool offer_disc);
+    // fatal: the game cannot continue (a game panic); the screen offers only QUIT.
+    void show_error(const std::string &title, const std::string &message, bool offer_disc, bool fatal = false);
     bool error_active() const { return !error_title_.empty(); }
     const std::string &error_title() const { return error_title_; }
     const std::string &error_message() const { return error_message_; }
@@ -205,7 +206,7 @@ private:
     bool dirty_ = false;
     std::string status_;
     std::string error_title_, error_message_;
-    bool error_disc_ = false, browse_ = false;
+    bool error_disc_ = false, error_fatal_ = false, browse_ = false;
     std::string browse_dir_;
     std::vector<std::string> browse_entries_;  // full paths; "" = "use this folder"
 };

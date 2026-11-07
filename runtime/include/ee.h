@@ -384,7 +384,13 @@ void ee_idle_poll(void);
 #ifdef EE_TRACE_CALLS
 extern uint32_t g_ee_trace[256];
 extern uint32_t g_ee_trace_pos;
-#define EE_FUNC_ENTRY(a) (g_ee_trace[(g_ee_trace_pos++) & 255] = (a))
+/* EOD_FUNC_WATCH=<hex EE address>: report the recent calls whenever that word changes (checked at
+ * every function entry; only in an EE_TRACE_CALLS build). */
+extern volatile uint32_t *g_ee_watch_ptr;
+extern uint32_t g_ee_watch_val;
+void ee_func_watch_hit(void);
+#define EE_FUNC_ENTRY(a) (g_ee_trace[(g_ee_trace_pos++) & 255] = (a), \
+    (EE_UNLIKELY(g_ee_watch_ptr && *g_ee_watch_ptr != g_ee_watch_val) ? ee_func_watch_hit() : (void)0))
 #else
 #define EE_FUNC_ENTRY(a) ((void)0)
 #endif

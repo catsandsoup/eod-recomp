@@ -88,6 +88,10 @@ void overlay_show_error(const std::string &title, const std::string &message, bo
                         OverlayDiscHandler handler = nullptr);
 // The error screen's result: 0 still open, 1 retry (or a disc was installed), 2 quit.
 int overlay_error_result();
+// A game panic (EE thread): shows the error screen with one choice, RETURN TO TITLE SCREEN, and
+// keeps the window and the menu alive. Returns true when the player chose it (the caller then
+// starts the game again); closing the window exits the process.
+bool overlay_fatal_screen(const std::string &title, const std::string &message);
 
 // ---- platform hooks the shared menu calls (per platform) -----------------------------
 struct HostPadState;

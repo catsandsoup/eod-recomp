@@ -5,6 +5,7 @@
 #include "../runtime/core/config.h"
 #include "../runtime/platform/platform.h"
 #include <cstdio>
+#include <string>
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
@@ -13,6 +14,7 @@ extern "C" { uint8_t *g_ram = nullptr; }
 uint64_t kernel_vblank_count() { return 0; }
 uint64_t platform_time_us() { return 0; }
 bool mac_app_settings() { return false; }
+std::string mac_app_support() { return "."; }  // the fatal-error log path (platform_fatal_message)
 #endif
 static int failures;
 static void rect(int aspect,int width,int height,DisplayRect expected) {
