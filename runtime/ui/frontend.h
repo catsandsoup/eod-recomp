@@ -44,7 +44,7 @@ struct Input {
     float mx = -1, my = -1, wheel = 0;
 };
 
-// Auto-repeat for held directions (the controller_navigation timing: 350 ms, then 100 ms).
+// Auto-repeat for held directions (350 ms, then 100 ms).
 class Repeater {
 public:
     // held: current direction (-1/0/1); returns the step to apply this frame.
