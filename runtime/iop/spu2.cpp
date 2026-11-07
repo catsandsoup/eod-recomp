@@ -345,10 +345,13 @@ bool g_audio_open;
 void spu2_init() {
     memset(g_sram, 0, sizeof g_sram);
     for (Core &c : g_core) c = Core();
-    // Test hook (never set in play): EOD_DIRECT_START skips the menus, which are where the game
-    // sets the SPU2 master volume, so a direct-start race is silent; this opens both cores.
-    if (const char *t = getenv("EOD_TEST_MASTER_VOL"); t && t[0] == '1')
-        for (Core &c : g_core) c.mvoll = c.mvolr = 0x3FFF;
+    // The game never sets the SPU2 master volume itself outside its SDK sound init
+    // (0x33C060: MVOL 0x3FFF on both cores), and that init only runs inside MoviePlay
+    // (0x3670C8). When no movie plays - EOD_SKIP_MOVIES, EOD_DIRECT_START, or the game's own
+    // "short of memory" skip at 0x3670F8 - nothing opens the master volume and the whole
+    // game stays silent at any volume setting. Start where that init leaves the SPU2; the
+    // game's own writes still replace it.
+    for (Core &c : g_core) c.mvoll = c.mvolr = 0x3FFF;
 }
 
 void spu2_set_callbacks(void (*trans_done)(int), void (*irq)(int)) {
@@ -373,8 +376,8 @@ void spu2_set_param(uint16_t entry, uint16_t value) {
     }
     switch (id) {
     case 0x08: c.mmix = value; break;
-    case 0x09: c.mvoll = value; break;
-    case 0x0A: c.mvolr = value; break;
+    case 0x09: c.mvoll = value; LOG(LOG_SND, "spu2: core %d master volume left = %04x", entry & 1, value); break;
+    case 0x0A: c.mvolr = value; LOG(LOG_SND, "spu2: core %d master volume right = %04x", entry & 1, value); break;
     case 0x0B: c.evoll = value; break;
     case 0x0C: c.evolr = value; break;
     case 0x0D: c.avoll = value; break;

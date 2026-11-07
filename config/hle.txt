@@ -42,6 +42,8 @@
 0010AFA0 wrap     # event-type name: Battle (4 AI)/(8 AI) only for an added contest in $v0/$s2
 001515B8 wrap     # Battle external table for tracks without c_battle (Welch); native otherwise
 00167C70 wrap     # Battle initial placement: offset cars beyond the native respawn count
+00119428 wrap     # Battle with AI: kill messages name a slot from its description record, not the 4 profile names
+00166B50 wrap     # Battle kill-message draw: marks the window where 0x119428 resolves a car name
 0012AEF0 wrap     # Battle (N AI): note the contest whose description is resolved next
 001116E0 wrap     # Battle (N AI) only: AI drivers/vehicles from every class; native records otherwise
 0020FD48 wrap     # optional Battle bots: create weapons through native scene factory

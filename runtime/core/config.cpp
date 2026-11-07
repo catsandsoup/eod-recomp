@@ -162,6 +162,12 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "BattleBots")) c.battle_bots = to_bool(v);
             else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
             else if (ieq(k, "Invincible") || ieq(k, "GodMode")) c.cheat_invincible = to_bool(v);
+        } else if (ieq(section, "Mods")) {
+            if (!k.empty()) {
+                bool found = false;
+                for (auto &m : c.mods) if (m.first == k) { m.second = to_bool(v); found = true; }
+                if (!found) c.mods.emplace_back(k, to_bool(v));
+            }
         } else if (ieq(section, "Career")) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
         } else if (ieq(section, "System")) {
@@ -255,6 +261,12 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);
     fprintf(f, "BattleBots=%d         ; 1: fill Battle to four participants; restart event to apply\n", c.battle_bots ? 1 : 0);
     fprintf(f, "SinglePlayerBattle=%d ; 1: inject Battle Mode into single player action menus with AI\n", c.sp_battle_mode ? 1 : 0);
+    fprintf(f, "\n[Mods]\n; MODS tab: <mod folder>=1 (on) or 0 (off), in load order; a mod not listed is on\n");
+    for (const auto &m : c.mods) {
+        // ids the ini syntax cannot carry are simply not remembered
+        if (m.first.empty() || m.first.find_first_of("=;[\r\n") != std::string::npos) continue;
+        fprintf(f, "%s=%d\n", m.first.c_str(), m.second ? 1 : 0);
+    }
     fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
     fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());
     fprintf(f, "\n[System]\n");

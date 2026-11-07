@@ -114,10 +114,42 @@ int main() {
     in = none(); in.accept = true; fx = m.update(in);
     CHECK(m.mods()[0].enabled && fx.sound == Sound::Error);
     m.select((int)a);
+    CHECK(m.mods()[a].enabled && m.mods()[a + 1].enabled);  // discovered mods start on
+    m.clear_dirty();
     m.update(in);
-    CHECK(m.mods()[a].enabled);
+    CHECK(!m.mods()[a].enabled && m.dirty());
     in = none(); in.move = 1; m.update(in);
     CHECK(m.mods()[a + 1].name == "Loud Music" && m.selected() == (int)a + 1);
+    // the toggle and the order are remembered in the Config and survive a save/load
+    CHECK(cfg.mods.size() == 2 && cfg.mods[0].first == "b_tex" && cfg.mods[0].second &&
+          cfg.mods[1].first == "a_music" && !cfg.mods[1].second);
+    {
+        const std::string ini = (root / "eod.ini").string();
+        CHECK(config_save(ini, cfg));
+        Config loaded;
+        CHECK(loaded.mods.empty() && config_load(ini, loaded));
+        CHECK(loaded.mods == cfg.mods);
+        Menu again(loaded);
+        again.set_host(h);
+        again.open();
+        CHECK(again.mods()[a].name == "HD Signs" && again.mods()[a].enabled);
+        CHECK(again.mods()[a + 1].name == "Loud Music" && !again.mods()[a + 1].enabled);
+        // a missing file and a partial one load as all on
+        Config none_cfg;
+        CHECK(!config_load((root / "absent.ini").string(), none_cfg) && none_cfg.mods.empty());
+        Menu fresh(none_cfg); fresh.set_host(h); fresh.open();
+        CHECK(fresh.mods()[a].enabled && fresh.mods()[a + 1].enabled);
+        std::ofstream(root / "partial.ini") << "[Mods]\nb_tex=0\n[Audio]\nVolume=30\n";
+        Config partial;
+        CHECK(config_load((root / "partial.ini").string(), partial) && partial.volume == 30);
+        Menu part(partial); part.set_host(h); part.open();
+        CHECK(part.mods()[a].name == "HD Signs" && !part.mods()[a].enabled && part.mods()[a + 1].enabled);  // listed first, off; unlisted on
+        // reset on the MODS tab turns everything back on
+        part.set_tab(Tab::Mods);
+        Input r = none(); r.reset = true; part.update(r);
+        CHECK(part.mods()[a].enabled && part.mods()[a + 1].enabled && part.dirty());
+        for (const auto &e : partial.mods) CHECK(e.second);
+    }
     in = none(); in.details = true; m.update(in);
     CHECK(m.details_open());
     in = none(); in.back = true; fx = m.update(in);

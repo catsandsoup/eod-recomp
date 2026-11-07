@@ -105,7 +105,7 @@ std::vector<ModEntry> discover_mods(const std::string &root) {
         ModEntry m;
         m.id = d.filename().string();
         m.name = m.id;
-        m.enabled = false;
+        m.enabled = true;  // on unless the user's saved choice (Config::mods) says otherwise
         std::ifstream f(d / "mod.json");
         if (!f) {
             m.conflict = "No mod.json: not a mod folder";
@@ -137,13 +137,38 @@ void Menu::rescan_mods() {
     std::vector<ModEntry> found = discover_mods(host_.mods_root);
     std::vector<ModEntry> next = builtin_mods();
     // keep the user's order/toggles of entries still present
+    bool kept = false;
     for (const ModEntry &old : mods_)
         if (!old.builtin)
             for (ModEntry &f : found)
-                if (f.id == old.id && !f.id.empty()) { f.enabled = old.enabled; next.push_back(f); f.id.clear(); }
+                if (f.id == old.id && !f.id.empty()) { f.enabled = old.enabled; next.push_back(f); f.id.clear(); kept = true; }
+    // otherwise the choice saved in eod.ini: its toggles and its load order (unlisted mods are on, after the listed ones)
+    if (!kept) {
+        for (const auto &saved : cfg_.mods)
+            for (ModEntry &f : found)
+                if (f.id == saved.first && !f.id.empty()) { f.enabled = saved.second; next.push_back(f); f.id.clear(); }
+    } else {
+        for (ModEntry &f : found)
+            if (!f.id.empty())
+                for (const auto &saved : cfg_.mods) if (saved.first == f.id) f.enabled = saved.second;
+    }
     for (ModEntry &f : found)
         if (!f.id.empty()) next.push_back(f);
     mods_ = next;
+}
+
+void Menu::store_mods() {
+    std::vector<std::pair<std::string, bool>> out;
+    for (const ModEntry &m : mods_)
+        if (!m.builtin) out.emplace_back(m.id, m.enabled);
+    // a mod whose folder is missing right now keeps its remembered choice
+    for (const auto &old : cfg_.mods) {
+        bool present = false;
+        for (const auto &o : out) present = present || o.first == old.first;
+        if (!present) out.push_back(old);
+    }
+    cfg_.mods = out;
+    dirty_ = true;
 }
 
 void Menu::open() {
@@ -595,7 +620,8 @@ void Menu::reset_tab(Tab t) {
 #endif
         break;
     case Tab::Mods:
-        for (ModEntry &m : mods_) m.enabled = m.builtin;
+        for (ModEntry &m : mods_) m.enabled = true;
+        store_mods();
         break;
     default: break;
     }
@@ -675,6 +701,7 @@ void Menu::activate(const Row &row, Effects &fx) {
         if (m.builtin) { set_status("Built-in content is always on (it is part of the integrated game)."); fx.sound = Sound::Error; return; }
         if (!m.conflict.empty() && !m.enabled) { set_status(m.conflict); }
         m.enabled = !m.enabled;
+        store_mods();
         return;
     }
     if (id.compare(0, 3, "key") == 0 && id.size() > 3) { rebind_ = std::stoi(id.substr(3)); return; }
@@ -783,6 +810,7 @@ Effects Menu::update(const Input &in) {
         const int i = std::stoi(row.id.substr(3)), j = i + in.move;
         if (j >= 0 && j < (int)mods_.size() && !mods_[i].builtin && !mods_[j].builtin) {
             std::swap(mods_[i], mods_[j]);
+            store_mods();
             sel = j;
             fx.sound = Sound::Move;
         } else fx.sound = Sound::Error;

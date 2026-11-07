@@ -156,6 +156,7 @@ public:
     // Mods tab state
     std::vector<ModEntry> &mods() { return mods_; }
     void rescan_mods();
+    void store_mods();  // cfg().mods <- the discovered mods' toggles and order; marks the menu dirty
 
     // Error screen (missing/corrupt content, no disc): replaces the tabs until resolved.
     void show_error(const std::string &title, const std::string &message, bool offer_disc);

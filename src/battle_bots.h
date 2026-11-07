@@ -16,3 +16,5 @@ extern "C" void f_00167C70(void);
 void battle_bots_mix_classes(uint32_t description);
 extern "C" void f_0012AEF0(void);
 extern "C" void f_001116E0(void);
+extern "C" void f_00119428(void);
+extern "C" void f_00166B50(void);

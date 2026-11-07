@@ -31,6 +31,7 @@ uint32_t nativeCountResult, suppressionResult;
 bool createSceneInOriginal, registerImmediately;
 EEState nativeWorldReturn{};
 uint32_t variantContest, variantAi;
+uint32_t drawSlot, drawResult;
 int placementOriginal, grounding, rosterOriginal, resolveOriginal;
 uint32_t resolvedDescription;
 uint32_t groundOut;
@@ -210,6 +211,28 @@ void placement() {
     g_ee.r[4].ud[0] = master; g_ee.r[5].ud[0] = out; g_ee.r[6].ud[0] = 3; f_00167C70();
     require(placementOriginal == 1 && !grounding, "no respawn records: native behaviour only");
 }
+void killNames() {
+    // The native lookup (0x119428) is replaced only inside the message draw of a Battle that has AI.
+    constexpr uint32_t native = 0x1119428;
+    auto lookup = [](uint32_t slot) { g_ee.r[4].ud[0] = slot; f_00119428(); return g_ee.r[2].uw[0]; };
+    auto inDraw = [](uint32_t slot) { drawSlot = slot; f_00166B50(); return drawResult; };
+    auto setName = [](uint32_t slot, const char *text) {
+        std::strcpy(reinterpret_cast<char *>(ram.data() + record(slot) + 4), text);
+    };
+    reset(); makeWorld();
+    setName(0, "Ben Adams"); setName(2, "Ben Adams"); setName(3, "Jeff Gaines");
+    require(lookup(3) == native, "outside the message draw the native lookup runs");
+    require(inDraw(3) == record(3) + 4 && std::strcmp(reinterpret_cast<char *>(ram.data() + record(3) + 4), "Jeff Gaines") == 0,
+            "an AI slot in a kill message is named from its description record");
+    require(inDraw(2) == record(2) + 4, "a slot below the profile count is named from the record too");
+    require(inDraw(4) == native && inDraw(11) == native, "slots past the roster keep the native lookup");
+    require(lookup(3) == native, "the draw window closes after the native draw");
+    require(inDraw(1) == native, "an empty record name falls back to the native lookup");
+    // No AI (native two-car Battle): native names, even inside the draw.
+    reset(); for (uint32_t i = 2; i < 4; ++i) ee_w32(record(i), 0x50);
+    makeWorld(); setName(0, "player1");
+    require(inDraw(0) == native, "a Battle without AI keeps the native kill-message names");
+}
 void capacity() {
     for (uint32_t address : {0x3CE4B8u, 0x495CACu, 0x495CB0u}) {
         reset(); ee_w32(address, address == 0x3CE4B8 ? 16 : 1200); makeWorld();
@@ -237,6 +260,10 @@ void capacity() {
 
 void battle_driver_reset() { ++resetCalls; }
 uint32_t battle_events_ai_for_contest(uint32_t c) { return c && c == variantContest ? variantAi : 0; }
+extern "C" void f_00166B50_orig() {
+    g_ee.r[4].ud[0] = drawSlot; f_00119428(); drawResult = g_ee.r[2].uw[0];
+}
+extern "C" void f_00119428_orig() { g_ee.r[2].ud[0] = 0x1119428; }
 extern "C" void f_001116E0_orig() { ++resolveOriginal; resolvedDescription = arg_u32(0); }
 extern "C" void f_0012AEF0_orig() { ++rosterOriginal; std::memset(&g_ee, 0x11, sizeof(g_ee)); g_ee.r[16].ud[0] = 55; }
 extern "C" void f_00167C70_orig() {
@@ -295,6 +322,6 @@ extern "C" void f_00227EE8() {
 }
 
 int main() {
-    countCases(); weaponsAndIdentity(); capacity(); variantCounts(); placement(); mixedClasses();
+    countCases(); killNames(); weaponsAndIdentity(); capacity(); variantCounts(); placement(); mixedClasses();
     std::puts("Battle construction bridge checks passed");
 }

@@ -23,6 +23,8 @@ void f_0020FD48_orig(void);
 void f_00167C70_orig(void);
 void f_0012AEF0_orig(void);
 void f_001116E0_orig(void);
+void f_00119428_orig(void);
+void f_00166B50_orig(void);
 void f_001D8F58(void);
 void f_0017DE78(void);
 void f_00227EE8(void);
@@ -41,6 +43,8 @@ constexpr uint32_t kWorldVisibleCount = 0x00495CB0;
 constexpr uint32_t kWorldObjects = 0x00495CB4;
 constexpr uint32_t kWorldVisibleObjects = 0x00495CB8;
 uint32_t ai_slots = 0;
+uint32_t battle_description = 0; // session description of the Battle world built last
+bool drawing_message = false;     // inside the native kill-message draw (0x166B50)
 
 bool ram_object(uint32_t address, uint32_t size) {
     return address && !(address & 3) && size <= EE_RAM_SIZE && address <= EE_RAM_SIZE - size;
@@ -84,6 +88,7 @@ extern "C" void f_0012C158(void) {
 extern "C" void f_0020FD48(void) {
     const uint32_t description = arg_u32(0);
     ai_slots = 0;
+    battle_description = description;
     battle_driver_reset();
     f_0020FD48_orig();
     if (!ram_object(description, 0x9A8) || ee_r32(description + 0x9A4) != kBattle) return;
@@ -130,6 +135,40 @@ extern "C" void f_0020FD48(void) {
         g_ee = saved;
         reserved_weapon_count = std::max(reserved_weapon_count + 1, ee_r32(kWeaponCount));
     }
+}
+
+// Kill messages ("You killed %s.", "You were killed by %s.", ...). The native
+// draw (0x166B50) names the other car with 0x119428(slot), which indexes the
+// four 18-byte profile names at 0x437F9C by participant slot. That is right
+// for humans in a native Battle, but an AI slot would show a profile name
+// (slots 0-3) or whatever follows the table (slots 4 and up: "Basher", "A").
+// While a Battle that has AI is drawing a message, a slot is named from its
+// session description record (+4: the driver name 0x1116E0 resolved, the same
+// native driver names the races show). Everything else keeps the native lookup.
+extern "C" void f_00166B50(void) {
+    drawing_message = true;
+    f_00166B50_orig();
+    drawing_message = false;
+}
+
+extern "C" void f_00119428(void) {
+    const uint32_t slot = arg_u32(0);
+    if (drawing_message && ai_slots && ee_r32(kEvent) == kBattle && slot < battle_layout::kCapacity &&
+        ram_object(battle_description, 0x9A8) && ee_r32(battle_description + 0x9A4) == kBattle &&
+        slot < ee_r32(battle_description + 0x98C)) {
+        const uint32_t name = battle_description + 0x2C + slot * 0x78 + 4;
+        if (ee_r8(name)) {
+            static const bool trace = std::getenv("EOD_BATTLE_TRACE") != nullptr;
+            if (trace) {
+                char text[0x41] = {};
+                for (uint32_t i = 0; i < 0x40 && ee_r8(name + i); ++i) text[i] = static_cast<char>(ee_r8(name + i));
+                std::fprintf(stderr, "[BATTLE_MESSAGE] slot %u named '%s'\n", slot, text);
+            }
+            ret_s32(static_cast<int32_t>(name));
+            return;
+        }
+    }
+    f_00119428_orig();
 }
 
 // Initial Battle placement (vtable +0x64): native places car i on respawn
