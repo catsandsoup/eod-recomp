@@ -10,6 +10,7 @@
 
 * **One app.** Open it, point it at your game, drive. There is no emulator to configure and no BIOS to hunt down.
 * **Built for today's machines.** Native Apple Silicon performance, widescreen and higher resolutions.
+* **Smooth when it all goes wrong.** Multi-car pile-ups, fires and flying debris run far lighter than before, while every pixel still looks exactly as the original drew it.
 * **The original game, untouched.** Everything from 2004 is preserved. Nothing is removed. New content is added on top.
 
 ## Features
@@ -28,6 +29,9 @@
 * **Battle on every map.** Pick 4 AI or 8 AI opponents, with mixed car classes.
 * **Battle for two.** 2-player split screen offers 1v1, 4 AI and 8 AI.
 * **Battle events in Career.** Fresh events appear in the Career event list.
+* **Every rival has a name.** Take out an AI driver, or get taken out, and the game tells you exactly who it was.
+
+![Battle message reading "You were killed by Kevin Valinski."](docs/img/battle-kill-message-named-rival.jpg)
 
 ![Battle event list showing 1v1, 4 AI and 8 AI battles on the Woodly demolition map](docs/img/battle-event-list.jpg)
 
@@ -47,7 +51,7 @@ Press **Start + Select** at any time to open the in-game menu, styled like the o
 
 ### Your own soundtrack
 
-Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongside the original songs, just like custom soundtracks on the Xbox version. Choose which ones are on from the Mods tab.
+Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongside the original songs, just like custom soundtracks on the Xbox version. Choose which ones are on from the Mods tab, and the game remembers your picks next time you play.
 
 ![Mods tab of the in-game menu showing custom music and bonus content toggles](docs/img/in-game-menu-mods-custom-music.jpg)
 
