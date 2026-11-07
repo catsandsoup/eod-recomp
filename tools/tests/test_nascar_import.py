@@ -115,7 +115,13 @@ class TestNascarImportPipeline(unittest.TestCase):
             m = parse_modl(low0_file.read_bytes())
             self.assertGreaterEqual(m["sub_version"], 9)
             valid_parts = [p for p in m["parts"] if p["valid"]]
-            self.assertGreaterEqual(len(valid_parts), 40)
+            # Header word0 is part count, not a format version. The old parser
+            # treated50 runtime records as part slots and counted memory-table
+            # garbage as model parts. Actual source cockpit has12 SPS parts.
+            expected_parts=struct.unpack_from('<I',low0_file.read_bytes())[0]
+            self.assertEqual(len([p for p in valid_parts if p['magic']=='4SPS']),expected_parts)
+            self.assertEqual(len([p for p in valid_parts if p['magic']=='TJRM']),1)
+            self.assertEqual(len(valid_parts),expected_parts+1)
 
             # Test Wavefront OBJ and JSON export
             obj_path = tmp / "stock_low0.obj"
@@ -124,7 +130,10 @@ class TestNascarImportPipeline(unittest.TestCase):
             export_json(str(low0_file), str(json_path))
             self.assertTrue(obj_path.exists())
             self.assertTrue(json_path.exists())
-            self.assertGreater(obj_path.stat().st_size, 1000)
+            obj=obj_path.read_text()
+            self.assertEqual(sum(line.startswith('v ') for line in obj.splitlines()),8)
+            self.assertEqual(sum(line.startswith('f ') for line in obj.splitlines()),6)
+            self.assertIn('BOUNDING BOX ONLY',obj)
 
             # Verify retexturing tool
             retextured = retexture_modl(low0_file.read_bytes(), "Stock1.tex", "Nascar.tex")

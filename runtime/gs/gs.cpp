@@ -1158,7 +1158,10 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             for (auto &ps : g_path) ps = PathState();
             break;
         case CMD_REDRAW:
-            if (hw::g_on) hw::redraw();
+            if (hw::g_on) {
+                hw::redraw();
+                hw::vblank();  // screenshots requested while the game is held (menu, first-run screen)
+            }
             break;
         }
         p += len;
@@ -1648,6 +1651,64 @@ void gs_priv_write32(uint32_t p, uint32_t v) {
         gs_priv_write64(off, (cur & ~0xFFFFFFFFull) | v);
 }
 
+// A self-contained PNG writer (RGB8, zlib "stored" blocks, no compression
+// library) so screenshots open directly in any viewer on every platform.
+static bool write_png(const char *path, const std::vector<uint32_t> &img, int w, int h) {
+    static uint32_t crc_table[256];
+    if (!crc_table[1])
+        for (uint32_t n = 0; n < 256; ++n) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crc_table[n] = c;
+        }
+    std::vector<uint8_t> raw;
+    raw.reserve((size_t)h * ((size_t)w * 3 + 1));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);  // filter: none
+        for (int x = 0; x < w; ++x) {
+            const uint32_t px = img[(size_t)y * w + x];
+            raw.push_back((uint8_t)px); raw.push_back((uint8_t)(px >> 8)); raw.push_back((uint8_t)(px >> 16));
+        }
+    }
+    std::vector<uint8_t> z = {0x78, 0x01};
+    uint32_t a = 1, b = 0;
+    for (uint8_t c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
+    for (size_t off = 0; off < raw.size() || off == 0; ) {
+        const size_t n = std::min<size_t>(65535, raw.size() - off);
+        const bool last = off + n >= raw.size();
+        z.push_back(last ? 1 : 0);
+        z.push_back((uint8_t)n); z.push_back((uint8_t)(n >> 8));
+        z.push_back((uint8_t)~n); z.push_back((uint8_t)(~n >> 8));
+        z.insert(z.end(), raw.begin() + off, raw.begin() + off + n);
+        off += n;
+        if (last) break;
+    }
+    const uint32_t adler = (b << 16) | a;
+    for (int i = 3; i >= 0; --i) z.push_back((uint8_t)(adler >> (i * 8)));
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    auto be32 = [&](uint32_t v) { uint8_t q[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v}; fwrite(q, 1, 4, f); };
+    auto chunk = [&](const char *type, const uint8_t *data, size_t n) {
+        be32((uint32_t)n);
+        uint32_t c = 0xFFFFFFFFu;
+        for (int i = 0; i < 4; ++i) c = crc_table[(c ^ (uint8_t)type[i]) & 0xFF] ^ (c >> 8);
+        for (size_t i = 0; i < n; ++i) c = crc_table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        fwrite(type, 1, 4, f);
+        if (n) fwrite(data, 1, n, f);
+        be32(c ^ 0xFFFFFFFFu);
+    };
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    fwrite(sig, 1, 8, f);
+    const uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                              (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
+    chunk("IHDR", ihdr, 13);
+    chunk("IDAT", z.data(), z.size());
+    chunk("IEND", nullptr, 0);
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
 bool gs_screenshot(const char *path) {
     std::vector<uint32_t> img;
     int w = 0, h = 0;
@@ -1660,6 +1721,9 @@ bool gs_screenshot(const char *path) {
         w = g_pub_w;
         h = g_pub_h;
     }
+    const size_t len = strlen(path);
+    if (len > 4 && (strcmp(path + len - 4, ".png") == 0 || strcmp(path + len - 4, ".PNG") == 0))
+        return write_png(path, img, w, h);
     FILE *f = fopen(path, "wb");
     if (!f) return false;
     fprintf(f, "P6\n%d %d\n255\n", w, h);
@@ -1771,7 +1835,7 @@ void gs_vblank() {
     if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0 &&
         (int)g_frames >= s_shot_start && (int)g_frames <= s_shot_end) {
         char path[1024];
-        snprintf(path, sizeof path, "%s/frame_%05llu.ppm", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
+        snprintf(path, sizeof path, "%s/frame_%05llu.png", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
         gs_screenshot(path);
         if (getenv("EOD_DUMP_VRAM")) {  // raw 4MB VRAM next to the screenshot
             gs_sync();

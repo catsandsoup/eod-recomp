@@ -191,6 +191,9 @@ struct Raster : Ref {
 struct Sampler : Ref {
     VkSampler sampler{};
 };
+// Shader id of the front-end overlay's vertex shader (gs_vulkan.cpp, runtime/ui/overlay.h):
+// like vs_draw it reads the 32-byte vertex buffer.
+constexpr int kOverlayVertexShader = 10;
 struct Context {
     uint64_t submit_count = 0, wait_us = 0, pipeline_us = 0;
     // Command-buffer serials: `serial` is the buffer being (or next) recorded;
@@ -864,7 +867,7 @@ inline VkPipeline Context::create_pipeline(const PipelineKey &k) {
                                                  {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 16},
                                                  {4, 0, VK_FORMAT_R32_SFLOAT, 28}};
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    if (vs->id == 0) {
+    if (vs->id == 0 || vs->id == kOverlayVertexShader) { // the front-end overlay reuses the GS vertex layout
         input.vertexBindingDescriptionCount = 1;
         input.pVertexBindingDescriptions = &binding;
         input.vertexAttributeDescriptionCount = 5;
@@ -1092,7 +1095,7 @@ inline void Context::Draw(UINT count, UINT first) {
         memcpy(boundImages, images, sizeof images);
         imagesValid = true;
     }
-    Buffer *cb = constants[vs->id == 0 ? 0 : 1];
+    Buffer *cb = constants[vs->id == 0 ? 0 : 1]; // the overlay's scale sits in slot 1
     const uint32_t constantBytes = (uint32_t)cb->data.size();
     if (!cacheState || !constantsValid || constantBytes != boundConstantBytes ||
         memcmp(boundConstants, cb->data.data(), constantBytes)) {
@@ -1102,7 +1105,7 @@ inline void Context::Draw(UINT count, UINT first) {
         boundConstantBytes = constantBytes;
         constantsValid = true;
     }
-    if (vs->id == 0) {
+    if (vs->id == 0 || vs->id == kOverlayVertexShader) {
         VkBuffer buffer;
         VkDeviceSize offset;
         UINT start = 0;

@@ -3,12 +3,14 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace sdl_input {
 
 namespace {
 
 int g_keyboard_port = -2; // automatic: keyboard alone P1, with a P1 pad P2
+bool g_keyboard_reserves_port = false; // only an explicit EOD_KEYBOARD_PORT override
 std::string g_port_identity[kPorts];
 bool g_modern_layout = false;
 SDL_JoystickID g_port_pad[kPorts];
@@ -73,10 +75,16 @@ std::string identity(SDL_Gamepad *gp, SDL_JoystickID id) {
     return key;
 }
 
+// Controller-first ownership: the first connected controller is P1 and the
+// second is P2 whatever the saved KeyboardPort says. A keyboard configured for
+// a port simply shares that port with its controller; the stored setting is
+// never rewritten and still decides where keyboard input is routed. Only an
+// explicit developer/test override (EOD_KEYBOARD_PORT) reserves the keyboard's
+// port for itself, the legacy behaviour.
 int free_port() {
     for (int p = 0; p < kPorts; p++)
-        if (p != g_keyboard_port && !g_port_pad[p]) return p;
-    if (g_keyboard_port >= 0 && !g_port_pad[g_keyboard_port]) return g_keyboard_port;  // shared with the keyboard
+        if ((!g_keyboard_reserves_port || p != g_keyboard_port) && !g_port_pad[p]) return p;
+    if (g_keyboard_reserves_port && g_keyboard_port >= 0 && !g_port_pad[g_keyboard_port]) return g_keyboard_port;
     return -1;
 }
 
@@ -110,7 +118,10 @@ int keyboard_port_from_env() {
 
 void set_controller_layout(bool modern) { g_modern_layout = modern; }
 
-void set_keyboard_port(int port) { g_keyboard_port = port == -2 || (port >= 0 && port < kPorts) ? port : -1; }
+void set_keyboard_port(int port, bool reserve_port) {
+    g_keyboard_port = port == -2 || (port >= 0 && port < kPorts) ? port : -1;
+    g_keyboard_reserves_port = reserve_port;
+}
 int keyboard_port() { return g_keyboard_port == -2 ? (!g_port_identity[0].empty() ? 1 : 0) : g_keyboard_port; }
 
 std::string help_text(bool racing_keyboard, const std::string &cross_keys) {
@@ -210,6 +221,26 @@ void assign_waiting() {
     SDL_free(ids);
 }
 
+void swap_ports() {
+    std::swap(g_port_identity[0], g_port_identity[1]);
+    std::swap(g_port_pad[0], g_port_pad[1]);
+    std::swap(g_port_gamepad[0], g_port_gamepad[1]);
+    std::swap(g_rumble[0], g_rumble[1]);
+    for (int p = 0; p < kPorts; p++)
+        if (g_port_gamepad[p]) SDL_SetGamepadPlayerIndex(g_port_gamepad[p], p);
+    fprintf(stderr, "[input] player ports swapped\n");
+}
+
+std::string port_description(int port, bool *xbox_glyphs) {
+    if (xbox_glyphs) *xbox_glyphs = false;  // no SDL pad (keyboard, test script): PlayStation prompts
+    SDL_Gamepad *gp = port_gamepad(port);
+    if (!gp) return port == g_keyboard_port || (g_keyboard_port == -2 && port == (port_gamepad(0) ? 1 : 0)) ? "Keyboard" : "";
+    const SDL_GamepadType t = SDL_GetGamepadType(gp);
+    if (xbox_glyphs) *xbox_glyphs = !(t == SDL_GAMEPAD_TYPE_PS3 || t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5);
+    const char *n = SDL_GetGamepadName(gp);
+    return n ? n : "Controller";
+}
+
 void close_all() {
     for (int p = 0; p < kPorts; p++) {
         g_port_identity[p].clear();
@@ -237,7 +268,7 @@ uint8_t trigger_byte(Sint16 v) {
     return (uint8_t)(a < 0 ? 0 : a > 255 ? 255 : a);
 }
 
-void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused) {
+static void read_mapped_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused, bool modern) {
     if (!focused) { *out = HostPadState(); out->connected = true; return; }
     static const struct {
         SDL_GamepadButton b;
@@ -260,15 +291,25 @@ void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused) {
     // pulling a trigger cannot also invoke its original shoulder action.
     uint8_t lt = trigger_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
     uint8_t rt = trigger_byte(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-    int left_pressure = g_modern_layout ? 7 : 10;
-    int right_pressure = g_modern_layout ? 6 : 11;
-    uint16_t left_button = g_modern_layout ? PAD_SQUARE : PAD_L2;
-    uint16_t right_button = g_modern_layout ? PAD_CROSS : PAD_R2;
+    int left_pressure = modern ? 7 : 10;
+    int right_pressure = modern ? 6 : 11;
+    uint16_t left_button = modern ? PAD_SQUARE : PAD_L2;
+    uint16_t right_button = modern ? PAD_CROSS : PAD_R2;
     // Physical face buttons and a keyboard sharing this player are full
     // travel; a partial trigger must not reduce their existing pressure.
-    if (g_modern_layout) {
+    if (modern) {
         if (out->buttons & PAD_CROSS) out->pressure[6] = 255;
         if (out->buttons & PAD_SQUARE) out->pressure[7] = 255;
+    }
+    if (modern) {
+        // The triggers now carry gas/brake, so the native L2/R2 actions move to the stick clicks:
+        // right stick click = L2 (Battle weapon "Use the L2 button to fire", Look Back in the
+        // default scheme), left stick click = R2 (Reverse, also on Triangle). L1/R1 stay on the
+        // bumpers and every face button keeps its PS2 meaning, so no native action is lost.
+        const uint16_t clicks = out->buttons & (PAD_L3 | PAD_R3);
+        out->buttons &= ~(PAD_L3 | PAD_R3);
+        if (clicks & PAD_R3) { out->buttons |= PAD_L2; out->pressure[10] = 255; }
+        if (clicks & PAD_L3) { out->buttons |= PAD_R2; out->pressure[11] = 255; }
     }
     if (lt > kTriggerDigital) out->buttons |= left_button;
     if (rt > kTriggerDigital) out->buttons |= right_button;
@@ -284,6 +325,13 @@ void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused) {
     if (ly != 128) out->ly = ly;
     if (rx != 128) out->rx = rx;
     if (ry != 128) out->ry = ry;
+}
+
+void read_gamepad(SDL_Gamepad *gp,HostPadState *out,bool focused){
+    read_mapped_gamepad(gp,out,focused,g_modern_layout);
+}
+void read_menu_gamepad(SDL_Gamepad *gp,HostPadState *out,bool focused){
+    read_mapped_gamepad(gp,out,focused,false);
 }
 
 bool rumble(int port, uint8_t small_motor, uint8_t large_motor) {

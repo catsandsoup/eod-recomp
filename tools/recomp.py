@@ -86,6 +86,73 @@ def FU(n):
 
 
 # ------------------------------------------------------------ instructions
+def _battle_layout():
+    """Constants shared with src/battle_layout.h (single source of truth)."""
+    text = open(os.path.join(ROOT, "src", "battle_layout.h")).read()
+    values = {}
+    import re
+    for name, expr in re.findall(r"constexpr uint32_t (k\w+) = ([^;]+);", text):
+        expr = re.sub(r"\bk\w+\b", lambda m: str(values[m.group(0)]), expr)
+        values[name] = int(eval(expr, {"__builtins__": {}}))  # noqa: S307 - literal arithmetic only
+    return values
+
+
+BATTLE = _battle_layout()
+
+# Eve contest table: SLUS_209.10 keeps 320 x 0x28 contests at 0x003C61A8 and every
+# access is one of these twelve `addiu rt, rs(=0x003C0000), 0x61A8/0x61AC` sites in
+# the Eve module (0x123A58-0x1257xx); a whole-ELF scan finds no other reference.
+# They now address the runtime-owned table in kernel RAM, and the append limit
+# (slti 0x140 at 0x124054) follows the larger capacity. Native contests keep their
+# indices, contents and order; only additional contests can use the new room.
+CONTEST_TABLE_SITES = {
+    0x00123AC8: 0x250661A8, 0x001240A4: 0x248461A8, 0x001249E8: 0x245661AC,
+    0x00124FA0: 0x244261A8, 0x0012511C: 0x244261A8, 0x001252D4: 0x244261A8,
+    0x00125320: 0x254761A8, 0x00125394: 0x244261A8, 0x001253E0: 0x254761A8,
+    0x00125474: 0x244261A8, 0x001254D4: 0x244261A8, 0x00125740: 0x256461A8,
+}
+# BattleMaster (0x166B00-0x168000 only): ranking/spawn/count words move past a
+# larger participant array and the factory allocates the larger object.
+_BATTLE_OFFSET = {0x594: BATTLE["kRanking"], 0x5A4: BATTLE["kSpawnIndex"],
+                  0x5A8: BATTLE["kCount"], 0x5AC: BATTLE["kMasterSize"]}
+_BATTLE_SITES = {
+    0x00166DB8: 0x8E2205A8, 0x00166DD4: 0x8E2205A8, 0x0016727C: 0x8E0305A8,
+    0x00167288: 0x8E0B05A8, 0x00167298: 0x26140594, 0x00167338: 0x8E0B05A8,
+    0x001673FC: 0x8E8405A8, 0x00167468: 0x8E8405A8, 0x00167684: 0x8D6C05A8,
+    0x00167690: 0x25700594, 0x001676A8: 0x8D6C05A8, 0x001676E0: 0x25700594,
+    0x0016778C: 0x8D6C05A8, 0x001678BC: 0xACC205A8, 0x001678EC: 0x8CC305A8,
+    0x0016797C: 0x8E8305A8, 0x001679BC: 0x8E8305A8, 0x00167B6C: 0xAE2205A4,
+    0x00167BF0: 0x8C8205A8, 0x00167C74: 0x8C8205A4, 0x00167D84: 0x8E0205A8,
+    0x00167DD8: 0x8E0205A8, 0x00167E00: 0x8E0505A8, 0x00167E04: 0x26040594,
+    0x00167F4C: 0x240405AC,
+}
+WORD_PATCHES = {0x00124054: (0x28A20140, 0x28A20000 | BATTLE["kContestCapacity"])}
+# AutoShop init (0x2E2FC0) reads every "vehicle" section of buycar.val into
+# ASCarList, a heap block of exactly 0xA28 bytes = 130 records x 0x14 with no
+# bound check; retail has exactly 130 vehicles. Any added purchasable vehicle
+# (Phantom/Cup dealer records) writes past the block, so MemFree panics on the
+# footer cookie when Career starts. Only the allocation size changes (a delay
+# slot `addiu $a0,$zero,0xA28` of the jal to the allocator at 0x2E31D0):
+# native records keep their index and layout, the extra room is simply unused.
+ASCARLIST_ALLOC_SITE = 0x002E31D4
+ASCARLIST_NATIVE_BYTES, ASCARLIST_RECORD_BYTES, ASCARLIST_CAPACITY = 0xA28, 0x14, 512
+assert ASCARLIST_NATIVE_BYTES == 130 * ASCARLIST_RECORD_BYTES
+WORD_PATCHES[ASCARLIST_ALLOC_SITE] = (0x24040000 | ASCARLIST_NATIVE_BYTES,
+                                      0x24040000 | (ASCARLIST_CAPACITY * ASCARLIST_RECORD_BYTES))
+for _va, _word in _BATTLE_SITES.items():
+    WORD_PATCHES[_va] = (_word, (_word & 0xFFFF0000) | _BATTLE_OFFSET[_word & 0xFFFF])
+
+
+def check_patch_sites(elf):
+    """Refuse to translate a different executable with these addresses."""
+    for va, (old, _new) in WORD_PATCHES.items():
+        if elf.read32(va) != old:
+            raise SystemExit("patch site %08x: expected %08x, found %08x" % (va, old, elf.read32(va)))
+    for va, old in CONTEST_TABLE_SITES.items():
+        if elf.read32(va) != old:
+            raise SystemExit("contest site %08x: expected %08x, found %08x" % (va, old, elf.read32(va)))
+
+
 class Gen:
     def __init__(self, elf, funcs, tables, hle):
         self.elf = elf
@@ -94,7 +161,8 @@ class Gen:
         self.hle = hle              # addr -> replaced (body not generated)
 
     def word(self, va):
-        return self.elf.read32(va)
+        patch = WORD_PATCHES.get(va)
+        return patch[1] if patch else self.elf.read32(va)
 
     def addr_expr(self, base, off):
         if base == 0:
@@ -103,7 +171,7 @@ class Gen:
             return "R[%d].uw[0]" % base
         return "(R[%d].uw[0] + %s)" % (base, simm(off))
 
-    def op(self, va):
+    def op(self, va, davmap_stack=False):
         """Return C for one non-control-flow instruction."""
         w = self.word(va)
         i = rz.Instruction(w, va, CAT)
@@ -115,6 +183,24 @@ class Gen:
         imm = w & 0xFFFF
         si = sx16(imm)
         ea = self.addr_expr(rs, si)
+        if va in CONTEST_TABLE_SITES:
+            # Absolute runtime-owned table: the paired lui of 0x003C0000 may be
+            # shared with Eve-table accesses, so only this addiu changes.
+            return set_s32(rt, hx(BATTLE["kContestTable"] + si - 0x61A8))
+        if davmap_stack and rs == 29:
+            # DAVMapMakeForEve's used-vehicle array begins at sp+A00 and
+            # occupies320 words before locals at sp+F00. With >320 vehicle
+            # records its native clear corrupts spilled arguments (F28) and
+            # eventually saved registers. Relocate only the following slots;
+            # all earlier arrays/call argument homes keep their native layout.
+            if si >= 0xF00:
+                ea = "(%s + eod_davmap_stack_growth)" % ea
+            if name in ("addiu", "addi"):
+                if rt == 29 and si in (-0x1010, 0x1010):
+                    sign = "-" if si < 0 else "+"
+                    return set_s32(rt, "%s + %s %s eod_davmap_stack_growth" % (U32(rs), hx(si), sign))
+                if si >= 0xF00:
+                    return set_s32(rt, "%s + %s + eod_davmap_stack_growth" % (U32(rs), hx(si)))
 
         # COP1 encodings rabbitizer doesn't know
         if (w & 0xFFE0003F) == 0x46000004:
@@ -682,7 +768,7 @@ class FuncEmitter:
         # COP2 macro instructions (CO bit set)
         if (w >> 26) == 0x12 and (w >> 25) & 1:
             return self.g.vu_macro(w, va)
-        return self.g.op(va)
+        return self.g.op(va, davmap_stack=self.start == 0x0012A700)
 
     def branch_cond(self, i, w):
         name = i.getOpcodeName()
@@ -716,6 +802,12 @@ class FuncEmitter:
         out = self.lines
         self.collect_labels()
         body = []
+        if self.start == 0x0012A700:
+            # Native profiles have <=320 vehicles and retain exact stack
+            # addresses. Larger opt-in rosters get an aligned scratch extension
+            # derived from the same native count used by the clear loop.
+            body += ["  const uint32_t eod_davmap_vehicle_count = MEM_LW(0x00439704);",
+                     "  const uint32_t eod_davmap_stack_growth = eod_davmap_vehicle_count > 320 ? ((eod_davmap_vehicle_count - 320) * 4 + 15) & ~15u : 0;"]
         addrs = self.addrs
         n = len(addrs)
         k = 0
@@ -833,6 +925,7 @@ def main():
     args = ap.parse_args()
 
     elf = Elf(os.path.join(ROOT, "SLUS_209.10"))
+    check_patch_sites(elf)
     fj = json.load(open(os.path.join(ROOT, "build", "functions.json")))
     funcs = {f["addr"]: f for f in fj["functions"]}
     tables = {int(k): v for k, v in fj["jump_tables"].items()}

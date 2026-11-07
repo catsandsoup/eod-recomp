@@ -27,6 +27,7 @@
 #include "core/memory.h"
 #include "funcs.h"
 #include "game_patches.h"
+#include "battle_layout.h"
 #include "iop/iop.h"
 #include "platform/platform.h"
 
@@ -374,12 +375,12 @@ static void trace_battle() {
     static unsigned tick;
     if (!enabled || ee_r32(0x003CF19C) != 0x18000224 || (++tick % 10)) return;
     uint32_t master = ee_r32(0x003CF194);
-    if (!master || (master & 3) || master > EE_RAM_SIZE - 0x5AC) return;
-    const uint32_t count = ee_r32(master + 0x5A8);
+    if (!master || (master & 3) || master > EE_RAM_SIZE - battle_layout::kMasterSize) return;
+    const uint32_t count = ee_r32(master + battle_layout::kCount);
     LOG(LOG_CORE, "[BATTLE] t=%.3f phase=%u humans=%u cars=%u gates=%u,%u bound=%08x flags=%x",
         ee_rf(0x003CDACC), ee_r32(master + 4), ee_r32(0x003C41AC), count,
         ee_r32(0x0044744C), ee_r32(0x00447454), ee_r32(0x003CD580), ee_r32(0x003C4190));
-    for (uint32_t i = 0; i < count && i < 4; ++i) {
+    for (uint32_t i = 0; i < count && i < battle_layout::kCapacity; ++i) {
         uint32_t car = ee_r32(0x00447458 + i * 4);
         if (!car || (car & 3) || car > EE_RAM_SIZE - 0x1C34) continue;
         LOG(LOG_CORE, "[BATTLE_CAR] slot=%u car=%08x pos=%.3f,%.3f,%.3f vel=%.3f,%.3f,%.3f steer=%.3f gas=%.3f gear=%d dead=%u score=%d",

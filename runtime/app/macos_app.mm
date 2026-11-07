@@ -6,6 +6,10 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <CommonCrypto/CommonDigest.h>
 
 namespace fs = std::filesystem;
 static std::string config_path;
@@ -19,57 +23,119 @@ std::string mac_app_support() {
     return std::string(p.UTF8String) + "/TDEODRecomp";
 }
 
-bool mac_app_set_mod_profile(const std::string &profile) {
-    if (profile == "native") { unsetenv("EOD_MOD_DIR"); return true; }
-    if (profile != "phantom" && profile != "battle" && profile != "combined") return false;
-    fs::path root = fs::path(mac_app_support()) / "mods" / profile;
-    if (!fs::exists(root)) {
-        NSString *resources = [NSBundle mainBundle].resourcePath;
-        if (resources) root = fs::path(resources.UTF8String) / "Mods" / profile;
-    }
-    std::vector<std::string> required = {"RES/COMMON.RES"};
-    if (profile != "battle") {
-        required.insert(required.end(), {"CAR/PHANTOM.CAR", "RES/CT.RES", "RES/UICAR.RES"});
-    }
-    if (profile != "phantom") required.push_back("TRACKS/WELCH.TRK");
-    for (const auto &file : required) {
-        std::error_code ec;
-        const auto path = root / "DATA" / file;
-        if (!fs::is_regular_file(path, ec) || fs::file_size(path, ec) == 0 || ec) return false;
-    }
-    return setenv("EOD_MOD_DIR", root.c_str(), 1) == 0;
+// The one player-facing content root. It is composed offline by
+// tools/build_integrated_profile.py (Phantom, Battle catalogs, NASCAR Cup, with every
+// native record preserved) and shipped inside the app. INTEGRATED.MANIFEST lists
+// "sha256 size relative-path" for every file; all required files must be listed
+// and match, so a damaged or half-copied root is an error, never a quieter game.
+static const char *const kIntegratedRequired[] = {
+    "DATA/RES/COMMON.RES", "DATA/RES/CT.RES", "DATA/RES/UICAR.RES", "DATA/RES/RACE.RES",
+    "DATA/CAR/PHANTOM.CAR", "DATA/CAR/CUPCAR.CAR"};
+
+static bool sha256_file(const fs::path &path, std::string &hex, uintmax_t &size) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
+    std::vector<unsigned char> buffer(1 << 20);
+    size = 0;
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), f)) > 0) { CC_SHA256_Update(&ctx, buffer.data(), (CC_LONG)n); size += n; }
+    const bool ok = !ferror(f);
+    fclose(f);
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(digest, &ctx);
+    char text[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(text + i * 2, 3, "%02x", digest[i]);
+    hex = text;
+    return ok;
 }
 
-bool mac_app_select_mods(bool headless) {
-    // Automation and an explicit developer overlay never open or override a chooser.
+std::string mac_app_validate_integrated(const std::string &root) {
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) return "The built-in game content folder is missing: " + root;
+    std::ifstream manifest(fs::path(root) / "INTEGRATED.MANIFEST");
+    if (!manifest) return "The built-in game content has no INTEGRATED.MANIFEST: " + root;
+    std::map<std::string, std::pair<std::string, uintmax_t>> listed;
+    std::string line;
+    while (std::getline(manifest, line)) {
+        std::istringstream in(line);
+        std::string hash, name; uintmax_t size = 0;
+        if (!(in >> hash >> size >> name)) { if (line.empty()) continue; return "The built-in game content manifest is damaged."; }
+        if (hash.size() != 64 || name.empty() || name[0] == '/' || name.find("..") != std::string::npos)
+            return "The built-in game content manifest is damaged.";
+        listed[name] = {hash, size};
+    }
+    for (const char *required : kIntegratedRequired) {
+        auto it = listed.find(required);
+        if (it == listed.end()) return std::string("The built-in game content is incomplete (not listed): ") + required;
+        std::string hash; uintmax_t size = 0;
+        const fs::path path = fs::path(root) / required;
+        if (!fs::is_regular_file(path, ec) || ec) return std::string("The built-in game content is missing ") + required;
+        if (!sha256_file(path, hash, size) || size != it->second.second || hash != it->second.first)
+            return std::string("The built-in game content is damaged: ") + required;
+    }
+    return "";
+}
+
+bool mac_app_activate_integrated(std::string *why) {
+    std::vector<fs::path> candidates;
+    if (NSString *resources = [NSBundle mainBundle].resourcePath) candidates.push_back(fs::path(resources.UTF8String) / "Mods" / "integrated");
+    candidates.push_back(fs::path(mac_app_support()) / "mods" / "integrated");
+    std::error_code ec;
+    fs::path root = candidates.back();
+    for (const auto &candidate : candidates) if (fs::exists(candidate, ec)) { root = candidate; break; }
+    const std::string problem = mac_app_validate_integrated(root.string());
+    if (!problem.empty()) { if (why) *why = problem; return false; }
+    if (setenv("EOD_MOD_DIR", root.c_str(), 1) != 0) { if (why) *why = "Could not select the built-in game content."; return false; }
+    return true;
+}
+
+bool mac_app_select_mods(bool headless) { return mac_app_select_mods(headless, nullptr); }
+
+bool mac_app_select_mods(bool headless, std::string *problem) {
+    // Automation and an explicit developer overlay never open or override anything.
     if (headless || getenv("EOD_MOD_DIR")) return true;
+    // Explicit diagnostic only: retail game without Phantom, Battle or NASCAR content.
+    if (const char *native = getenv("EOD_NATIVE_ONLY")) if (native[0] == '1') {
+        fprintf(stderr, "EOD_NATIVE_ONLY=1: launching the retail game without the integrated content\n");
+        return true;
+    }
+    std::string why;
+    if (mac_app_activate_integrated(&why)) {
+        // Everything lockable is unlocked by default in the player path, whatever eod.ini says; the
+        // stored file is not rewritten. EOD_UNLOCK_ALL stays an explicit override. The native
+        // mechanism (src/game_patches.cpp) writes global prize/feat/track flags, so Career shares them.
+        if (!getenv("EOD_UNLOCK_ALL")) g_config.unlock_all = true;
+        return true;
+    }
+    fprintf(stderr, "Integrated content: %s\n", why.c_str());
+    if (problem) {  // shown in-game by the front end (runtime/ui) instead of a Cocoa alert
+        *problem = why + "\n\nEve of Destruction will not start with only part of the game. Reinstall or restore the app, "
+                         "or restore the previous copy from backup.";
+        return false;
+    }
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
-    const char *profiles[] = {"native", "phantom", "battle", "combined"};
-    NSArray<NSString *> *titles = @[@"Native game", @"Phantom custom car", @"All-map Battle catalog", @"Phantom + all-map Battle"];
-    NSAlert *a = [NSAlert new];
-    a.messageText = @"Choose your mods";
-    a.informativeText = @"Choose a profile for this session. Press F1 during play for chickens, turbo, invincibility, recovery and other settings. F2 shows controls.\n\nBattle profiles keep Career but replace Action with race + Battle, and multiplayer with Battle. Battle supports four cars total. Change resource profiles by restarting the app.";
-    [a addButtonWithTitle:@"Play"]; [a addButtonWithTitle:@"Quit"];
-    NSPopUpButton *choice = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0,0,360,30) pullsDown:NO];
-    [choice addItemsWithTitles:titles];
-    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"EODModProfile"];
-    for (int i=0;i<4;i++) if ([saved isEqualToString:ns(profiles[i])]) [choice selectItemAtIndex:i];
-    a.accessoryView = choice;
-    while ([a runModal] == NSAlertFirstButtonReturn) {
-        const char *profile = profiles[choice.indexOfSelectedItem];
-        if (mac_app_set_mod_profile(profile)) {
-            [[NSUserDefaults standardUserDefaults] setObject:ns(profile) forKey:@"EODModProfile"];
-            fprintf(stderr, "Mod profile: %s\n", profile);
-            return true;
-        }
-        error("This mod profile is missing or incomplete. Install the local mod profiles in Application Support/TDEODRecomp/mods, or choose Native game.");
-    }
+    error(why + "\n\nEve of Destruction will not start with only part of the game. Reinstall or restore the app, or restore the previous copy from backup.");
     return false;
 }
 
 bool mac_app_prepare(std::string &data, const std::string &config, bool headless, const DiscId &id) {
+    return mac_app_prepare(data, config, headless, id, nullptr);
+}
+
+std::string mac_app_install_disc(const std::string &source, const std::string &config, const DiscId &id) {
+    const std::string data = mac_app_support() + "/disc";
+    DiscResult r = disc_import(source, data, id);
+    if (!r.ok()) return r.message;
+    g_config.data_dir = data;
+    std::error_code ec;
+    fs::create_directories(fs::path(config).parent_path(), ec);
+    if (!config_save(config)) return "Your disc is installed, but settings could not be saved. Check the folder permissions.";
+    return "";
+}
+
+bool mac_app_prepare(std::string &data, const std::string &config, bool headless, const DiscId &id, std::string *problem) {
     config_path = config;
     const std::string support = mac_app_support();
     std::error_code ec;
@@ -82,6 +148,7 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
         // established whether SDL dialogs are allowed for this launch.
         DiscResult r = disc_check_folder(data, id);
         if (r.ok()) return true;
+        if (problem && !headless) { *problem = r.message; return false; }
         if (headless) fprintf(stderr, "%s\n", r.message.c_str());
         else {
             [NSApplication sharedApplication];
@@ -94,6 +161,12 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
     data = support + "/disc";
     if (disc_check_folder(data, id).ok()) return true;
     if (headless) { fprintf(stderr, "No valid installed disc. Pass --data DIR or EOD_DATA; headless mode never opens dialogs.\n"); return false; }
+    if (problem) {  // first run: the in-game disc chooser (runtime/ui) replaces the Cocoa panels
+        *problem = "No game disc is installed yet. Choose your North American v1.00 disc image (.iso, .bin/.cue) or the "
+                   "folder that holds SLUS_209.10, SYSTEM.CNF and DATA. It is copied into the app's folder; your "
+                   "original files stay untouched.";
+        return false;
+    }
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];

@@ -26,12 +26,23 @@ bundled_mods=resources/'Mods'
 # must never enter Git or a public release. A normal source build includes none.
 if bundled_mods.exists(): shutil.rmtree(bundled_mods)
 if mod_source := os.environ.get('EOD_BUNDLE_MODS'):
-    mod_source=pathlib.Path(mod_source).resolve()
-    for profile in ('phantom','battle','combined'):
-        source=mod_source/profile
-        if not (source/'DATA/RES/COMMON.RES').is_file():
-            raise RuntimeError(f'Missing personal mod profile: {source}')
-        shutil.copytree(source,bundled_mods/profile)
+    # The single integrated root (tools/build_integrated_profile.py output: Phantom,
+    # Battle catalogs and NASCAR Cup composed against retail). The app activates it
+    # automatically and verifies INTEGRATED.MANIFEST at every launch.
+    import hashlib
+    source=pathlib.Path(mod_source).resolve()/'integrated'
+    required=('RES/COMMON.RES','RES/CT.RES','RES/UICAR.RES','RES/RACE.RES',
+              'CAR/PHANTOM.CAR','CAR/CUPCAR.CAR')
+    for name in required:
+        if not (source/'DATA'/name).is_file() or (source/'DATA'/name).stat().st_size==0:
+            raise RuntimeError(f'Missing integrated resource: {source/"DATA"/name}')
+    target=bundled_mods/'integrated'
+    shutil.copytree(source,target)
+    lines=[]
+    # Battle layout tables served only to Battle contests (battle-alternates/TRACKS/<TRACK>/).
+    for path in sorted(p for d in ('DATA','battle-alternates') if (target/d).is_dir() for p in (target/d).rglob('*') if p.is_file()):
+        lines.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()} {path.stat().st_size} {path.relative_to(target).as_posix()}')
+    (target/'INTEGRATED.MANIFEST').write_text('\n'.join(lines)+'\n')
 vulkan_resources=resources/'vulkan'
 if vulkan_resources.exists(): shutil.rmtree(vulkan_resources)
 # MoltenVK is dlopened by the Vulkan loader: it does not appear in its linked

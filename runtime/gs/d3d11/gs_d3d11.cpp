@@ -108,9 +108,6 @@ ID3D11InputLayout *g_layout_overlay;
 ID3D11BlendState *g_bs_overlay;
 ID3D11Buffer *g_cb_overlay, *g_vb_overlay, *g_ib_overlay;
 size_t g_vb_overlay_size, g_ib_overlay_size;
-ID3D11Texture2D *g_font_tex;
-ID3D11ShaderResourceView *g_font_srv;
-uint32_t g_font_gen;
 
 std::thread::id g_gs_thread;
 bool g_gs_thread_known;
@@ -2009,27 +2006,34 @@ namespace {
 void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
     static OverlayDraw d;
     if (!g_layout_overlay || !overlay_latest(d) || d.w <= 0 || d.h <= 0) return;
-    int fw, fh;
-    uint32_t gen;
-    const uint32_t *font = overlay_font(fw, fh, gen);
-    if (!font) return;
-    if (!g_font_srv || gen != g_font_gen) {
-        release(g_font_srv);
-        release(g_font_tex);
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = (UINT)fw;
-        td.Height = (UINT)fh;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_IMMUTABLE;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA init = {font, (UINT)fw * 4, 0};
-        if (FAILED(CHECK(g_dev->CreateTexture2D(&td, &init, &g_font_tex)))) return;
-        CHECK(g_dev->CreateShaderResourceView(g_font_tex, nullptr, &g_font_srv));
-        g_font_gen = gen;
-    }
+    // overlay textures (font atlas = 1, decoded game UI art = 2..), created on first use
+    auto srv_for = [](uint32_t id) -> ID3D11ShaderResourceView * {
+        static std::vector<ID3D11Texture2D *> texs;
+        static std::vector<ID3D11ShaderResourceView *> srvs;
+        static std::vector<uint32_t> gens;
+        OverlayTexture t;
+        if (!overlay_texture(id, t) || !t.rgba) return nullptr;
+        if (id >= srvs.size()) { texs.resize(id + 1); srvs.resize(id + 1); gens.resize(id + 1); }
+        if (!srvs[id] || gens[id] != t.generation) {
+            release(srvs[id]);
+            release(texs[id]);
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = (UINT)t.w;
+            td.Height = (UINT)t.h;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_IMMUTABLE;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA init = {t.rgba, (UINT)t.w * 4, 0};
+            if (FAILED(CHECK(g_dev->CreateTexture2D(&td, &init, &texs[id])))) return nullptr;
+            CHECK(g_dev->CreateShaderResourceView(texs[id], nullptr, &srvs[id]));
+            gens[id] = t.generation;
+        }
+        return srvs[id];
+    };
+    if (!srv_for(1)) return;
     if (!g_bs_overlay) {
         D3D11_BLEND_DESC bl = {};
         D3D11_RENDER_TARGET_BLEND_DESC &rt = bl.RenderTarget[0];
@@ -2091,7 +2095,6 @@ void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
     g_ctx->VSSetShader(g_vs_overlay, nullptr, 0);
     g_ctx->VSSetConstantBuffers(2, 1, &g_cb_overlay);
     g_ctx->PSSetShader(g_ps_overlay, nullptr, 0);
-    g_ctx->PSSetShaderResources(0, 1, &g_font_srv);
     ID3D11SamplerState *ss[2] = {g_point_clamp, g_linear_clamp};
     g_ctx->PSSetSamplers(0, 2, ss);
     float factor[4] = {0, 0, 0, 0};
@@ -2103,6 +2106,9 @@ void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
         D3D11_RECT r = {(LONG)(c.clip[0] * sx), (LONG)(c.clip[1] * sy), (LONG)(c.clip[2] * sx + 0.5f),
                         (LONG)(c.clip[3] * sy + 0.5f)};
         g_ctx->RSSetScissorRects(1, &r);
+        ID3D11ShaderResourceView *srv = srv_for(c.texture);
+        if (!srv) continue;
+        g_ctx->PSSetShaderResources(0, 1, &srv);
         g_ctx->DrawIndexed(c.index_count, c.first_index, (INT)c.base_vertex);
     }
     unbind_all();

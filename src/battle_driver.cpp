@@ -3,6 +3,7 @@
 // at vblank. NullDriver does not join the native driver update list. Native cars retain physics, damage, recovery and weapon ownership.
 #include "battle_driver.h"
 #include "battle_bots.h"
+#include "battle_layout.h"
 #include "battle_navigation.h"
 #include "core/config.h"
 #include "core/cpu.h"
@@ -22,11 +23,11 @@ bool valid(uint32_t a,uint32_t size) { return a && !(a&3) && size<=EE_RAM_SIZE &
 float rf(uint32_t a){uint32_t u=ee_r32(a);float f;std::memcpy(&f,&u,4);return f;}
 void wf(uint32_t a,float f){uint32_t u;std::memcpy(&u,&f,4);ee_w32(a,u);}
 struct State {
-    uint32_t car=0, target=4;
+    uint32_t car=0, target=UINT32_MAX;
     float last=0, choose_at=0, blocked=0, stalled=0, reverse_until=0, escape_until=0;
     float anchor_x=0,anchor_z=0,sample_at=0,turn=1,trace_at=0;
 };
-std::array<State,4> states{};
+std::array<State,battle_layout::kCapacity> states{};
 battle_navigation::Navigation navigation;
 uint32_t navigation_word(void *,uint32_t address) { return ee_r32(address); }
 void controls(uint32_t car,float steer,float gas,float brake,float handbrake,int gear) {
@@ -89,7 +90,7 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
     };
     uint32_t target=opponent(s.target);
     if(!target || now>=s.choose_at) {
-        float best=1e30f;uint32_t chosen=4;
+        float best=1e30f;uint32_t chosen=UINT32_MAX;
         for(uint32_t i=0;i<count;++i) if(uint32_t c=opponent(i)) {
             float dx=rf(c+0x88)-x,dz=rf(c+0x90)-z;
             float score=dx*dx+dz*dz;
@@ -174,9 +175,9 @@ extern "C" void f_001A2D20(){
     f_001A2D20_orig();
     if(ee_r32(0x3CF19C)!=0x18000224 || !valid(updated_car,0x1C34)) return;
     uint32_t master=ee_r32(0x3CF194);
-    if(!valid(master,0x5AC) || ee_r32(master)!=0x3F7770) return;
-    uint32_t count=ee_r32(master+0x5A8);
-    if(count<2 || count>4) return;
+    if(!valid(master,battle_layout::kMasterSize) || ee_r32(master)!=battle_layout::kMasterVtable) return;
+    uint32_t count=ee_r32(master+battle_layout::kCount);
+    if(count<2 || count>battle_layout::kCapacity) return;
     for(uint32_t i=0;i<count;++i) {
         if(!battle_bots_is_ai_slot(i)) continue;
         uint32_t car=ee_r32(0x447458+i*4);

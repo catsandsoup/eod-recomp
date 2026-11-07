@@ -16,6 +16,7 @@
 #include "../core/config.h"
 #include "../core/timing_trace.h"
 #include "../platform/platform.h"
+#include "../ui/overlay.h"
 #include "../core/prof.h"
 
 namespace {
@@ -531,6 +532,7 @@ void spu2_update() {
         int v = g_config.volume * 256 / 100;
         for (int16_t &x : buf) x = (int16_t)((x * v) >> 8);
     }
+    overlay_mix_audio(buf.data(), frames);  // the front end's menu sounds (runtime/ui)
     // (Sound can be switched on and off in the in-game menu)
     static bool tried = g_audio_open;
     if (!g_audio_open && !tried && g_config.audio) {

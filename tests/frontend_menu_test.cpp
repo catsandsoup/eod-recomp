@@ -1,0 +1,197 @@
+// Front end model tests: navigation state, tab changes, value rows, reset, rebinding,
+// mods list, online stub commands, stick shaping and the menu-input mapper.
+#include "ui/frontend.h"
+#include "ui/menu_input.h"
+#include "app/game_frontend.h"
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+
+static int failures = 0;
+#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+using namespace frontend;
+
+struct FakeNet : game_frontend::Network {
+    std::vector<game_frontend::Command> got;
+    game_frontend::Snapshot snapshot() const override { return {}; }
+    void submit(game_frontend::Command c) override { got.push_back(c); }
+};
+
+static Input none() { return Input(); }
+static int find(Menu &m, const std::string &id) {
+    const auto &r = m.rows();
+    for (size_t i = 0; i < r.size(); i++)
+        if (r[i].id == id) return (int)i;
+    return -1;
+}
+
+int main() {
+    Config cfg;
+    Menu m(cfg);
+    m.open();
+    // tabs: L1/R1 cycle with wrap
+    CHECK(m.tab() == Tab::Graphics);
+    Input in = none(); in.next_tab = true;
+    Effects fx = m.update(in);
+    CHECK(m.tab() == Tab::Mods && fx.sound == Sound::Tab);
+    in = none(); in.prev_tab = true;
+    m.update(in); m.update(in);
+    CHECK(m.tab() == Tab::Online);
+    in = none(); in.next_tab = true;
+    m.update(in);
+    CHECK(m.tab() == Tab::Graphics);
+
+    // down/up move and wrap; headers are skipped
+    int first = m.selected();
+    in = none(); in.dy = 1; m.update(in);
+    CHECK(m.selected() == first + 1);
+    in.dy = -1; m.update(in); m.update(in);
+    CHECK(m.selected() == (int)m.rows().size() - 1);
+
+    // < value > rows change the config, and mark dirty
+    m.select(find(m, "aspect"));
+    in = none(); in.dx = 1; m.update(in);
+    CHECK(cfg.aspect == "4:3");
+    m.update(in); m.update(in);
+    CHECK(cfg.aspect == "16:10");
+    CHECK(m.dirty());
+    m.select(find(m, "fullscreen"));
+    in = none(); in.accept = true; fx = m.update(in);
+    CHECK(cfg.fullscreen && fx.fullscreen);
+    // Triangle resets the tab
+    in = none(); in.reset = true; m.update(in);
+    CHECK(cfg.aspect == Config().aspect && !cfg.fullscreen);
+
+    // settings: volume steps by 5 and clamps
+    m.set_tab(Tab::Settings);
+    CHECK(m.rows()[m.selected()].kind != RowKind::Header || true);
+    m.select(find(m, "volume"));
+    in = none(); in.dx = 1; fx = m.update(in);
+    CHECK(cfg.volume == 100 && fx.audio);
+    in.dx = -1; m.update(in);
+    CHECK(cfg.volume == 95);
+    // the update skips a selected header row
+    m.select(0);
+    m.update(none());
+    CHECK(m.rows()[m.selected()].kind != RowKind::Header);
+
+    // inputs: keyboard rebinding waits for a key; Esc cancels
+    m.set_tab(Tab::Inputs);
+    m.select(find(m, "key4"));
+    in = none(); in.accept = true; m.update(in);
+    CHECK(m.rebinding() == 4);
+    in = none(); in.key = 'J'; fx = m.update(in);
+    CHECK(cfg.keys[4] == "J" && fx.keys && m.rebinding() < 0);
+    m.select(find(m, "dz1"));
+    in = none(); in.dx = 1; m.update(in);
+    CHECK(cfg.stick_deadzone[0] == 1);
+    m.select(find(m, "curve2"));
+    in = none(); in.dx = 1; m.update(in);
+    CHECK(cfg.stick_curve[1] == 110);
+    m.select(find(m, "dev1"));
+    in = none(); in.accept = true; fx = m.update(in);
+    CHECK(fx.swap_ports);
+
+    // mods: built-ins are locked; discovered mods toggle and reorder
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "eod_frontend_mods_test";
+    fs::remove_all(root);
+    fs::create_directories(root / "a_music");
+    fs::create_directories(root / "b_tex");
+    std::ofstream(root / "a_music" / "mod.json") << "{\"name\": \"Loud Music\", \"version\": \"1.2\", \"kind\": \"music\"}";
+    std::ofstream(root / "b_tex" / "mod.json") << "{\"name\": \"HD Signs\"}";
+    HostInfo h; h.mods_root = root.string();
+    m.set_host(h);
+    m.set_tab(Tab::Mods);
+    m.open();
+    CHECK(m.mods().size() == builtin_mods().size() + 2);
+    const size_t a = builtin_mods().size();
+    CHECK(m.mods()[a].name == "Loud Music" && m.mods()[a].version == "1.2");
+    CHECK(!m.mods()[a + 1].conflict.empty());  // no "kind": red with a reason
+    m.select(0);
+    in = none(); in.accept = true; fx = m.update(in);
+    CHECK(m.mods()[0].enabled && fx.sound == Sound::Error);
+    m.select((int)a);
+    m.update(in);
+    CHECK(m.mods()[a].enabled);
+    in = none(); in.move = 1; m.update(in);
+    CHECK(m.mods()[a + 1].name == "Loud Music" && m.selected() == (int)a + 1);
+    in = none(); in.details = true; m.update(in);
+    CHECK(m.details_open());
+    in = none(); in.back = true; fx = m.update(in);
+    CHECK(!m.details_open() && !fx.close);
+    fx = m.update(in);
+    CHECK(fx.close);
+    fs::remove_all(root);
+
+    // online: commands reach the network interface; text entry
+    auto net = std::make_shared<FakeNet>();
+    m.set_network(net);
+    m.set_tab(Tab::Online);
+    CHECK(m.rows()[0].value == "NOT CONNECTED");
+    m.select(find(m, "host"));
+    in = none(); in.accept = true; m.update(in);
+    CHECK(net->got.size() == 1 && net->got[0].kind == game_frontend::Command::Kind::Host);
+    m.select(find(m, "code"));
+    m.update(in);
+    CHECK(m.editing_text());
+    in = none(); in.ch = 'A'; m.update(in); in.ch = '7'; m.update(in);
+    in = none(); in.accept = true; m.update(in);
+    CHECK(!m.editing_text() && net->got.back().kind == game_frontend::Command::Kind::JoinCode && net->got.back().text == "A7");
+    // disabled while not connected
+    m.select(find(m, "ready"));
+    fx = m.update(in);
+    CHECK(fx.sound == Sound::Error && net->got.size() == 2);
+
+    // error screen replaces the tabs; Back never closes it
+    m.show_error("NO DISC", "x", true);
+    CHECK(m.rows()[0].id == "browse");
+    in = none(); in.back = true; fx = m.update(in);
+    CHECK(!fx.close);
+    m.select(2);
+    in = none(); in.accept = true; fx = m.update(in);
+    CHECK(fx.quit);
+
+    // auto-repeat timing
+    Repeater r;
+    CHECK(r.step(1, 0) == 1 && r.step(1, 100) == 0 && r.step(1, 351) == 1 && r.step(1, 400) == 0 && r.step(1, 452) == 1);
+    CHECK(r.step(0, 500) == 0 && r.step(-1, 501) == -1);
+
+    // stick shaping: neutral by default, dead zone, saturation, curve
+    CHECK(shape_axis(200, 0, 100, 100) == 200);
+    CHECK(shape_axis(140, 20, 100, 100) == 128);
+    CHECK(shape_axis(250, 0, 90, 100) == 255);
+    CHECK(shape_axis(0, 0, 90, 100) == 0);
+    CHECK(shape_axis(192, 0, 100, 200) < 192 && shape_axis(192, 0, 100, 200) > 128);
+
+    // trigger shaping: neutral default, dead zone, curve, full travel kept
+    CHECK(shape_trigger(128, 0, 100) == 128);
+    CHECK(shape_trigger(20, 10, 100) == 0);
+    CHECK(shape_trigger(255, 20, 200) == 255);
+    CHECK(shape_trigger(128, 0, 200) < 128 && shape_trigger(128, 0, 200) > 40);
+    CHECK(Config().controller_layout == "modern");
+
+    // menu input mapping: chords, edges, trigger-proof menus
+    menu_input::PadEdges pe;
+    HostPadState p; p.connected = true;
+    p.buttons = PAD_START;
+    CHECK(!pe.update(p).toggle);
+    p.buttons = PAD_START | PAD_SELECT;
+    CHECK(pe.update(p).toggle);
+    CHECK(!pe.update(p).toggle);  // held: once
+    p.buttons = 0; pe.update(p);
+    p.buttons = PAD_CROSS;
+    menu_input::PadFrame f = pe.update(p);
+    CHECK(f.pressed & PAD_CROSS);
+    p.buttons = PAD_CROSS;
+    CHECK(!(pe.update(p).pressed & PAD_CROSS));
+    p.buttons = PAD_LEFT; p.lx = 128;
+    CHECK(pe.update(p).dx == -1);
+    p.buttons = 0; p.lx = 20;
+    CHECK(pe.update(p).dx == -1);
+
+    std::printf("%s\n", failures ? "FAILED" : "ok");
+    return failures ? 1 : 0;
+}

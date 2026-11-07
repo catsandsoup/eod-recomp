@@ -136,7 +136,7 @@ void test_conversions() {
 }
 
 void test_rock_candy_with_keyboard() {
-    sdl_input::set_keyboard_port(0);
+    sdl_input::set_keyboard_port(0, true);  // explicit developer override: legacy reserved keyboard port
     Pad rc;
     attach(rc, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     CHECK(SDL_IsGamepad(rc.id), "virtual 360 pad is a gamepad");
@@ -347,7 +347,7 @@ void test_two_pads_no_keyboard() {
 }
 
 void test_keyboard_on_player_2() {
-    sdl_input::set_keyboard_port(1);
+    sdl_input::set_keyboard_port(1, true);
     Pad a;
     attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     CHECK(sdl_input::port_of(a.id) == 0, "EOD_KEYBOARD_PORT=2: pad is player 1");
@@ -361,9 +361,43 @@ void test_keyboard_on_player_2() {
     sdl_input::close_all();
 }
 
+// Saved KeyboardPort=1 (port 0) must not hand the first controller to P2.
+void test_saved_keyboard_port_does_not_take_controller_p1() {
+    sdl_input::set_keyboard_port(0);  // what a saved KeyboardPort=1 produces at runtime
+    Pad a, b, c;
+    attach(a, 0x045E, 0x028E, "Xbox 360 Controller");
+    CHECK(sdl_input::port_of(a.id) == 0, "first controller is P1 despite saved KeyboardPort=1 (port %d)",
+          sdl_input::port_of(a.id));
+    CHECK(sdl_input::keyboard_port() == 0, "saved keyboard port still routes keyboard (shares P1)");
+    HostPadState press = read_port(0);
+    set_button(a, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    press = read_port(0);
+    CHECK(press.buttons == PAD_CROSS, "P1 reads the first controller");
+    set_button(a, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    attach(b, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(b.id) == 1, "second controller is P2 (port %d)", sdl_input::port_of(b.id));
+    attach(c, 0x045E, 0x028E, "Xbox 360 Controller");
+    CHECK(sdl_input::port_of(c.id) == -1, "third controller waits");
+    detach(a);
+    CHECK(sdl_input::port_of(b.id) == 1 && sdl_input::port_of(c.id) == 0, "waiting pad takes freed P1, P2 stays P2");
+    detach(c);
+    attach(a, 0x045E, 0x028E, "Xbox 360 Controller");
+    CHECK(sdl_input::port_of(a.id) == 0, "reconnect returns to P1");
+    detach(a); detach(b);
+    sdl_input::close_all();  // forget remembered slots: this pad is now simply the first one connected
+    attach(b, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(b.id) == 0, "the only controller is P1 even with keyboard configured for P1");
+    detach(b);
+    sdl_input::set_keyboard_port(1);  // saved KeyboardPort=2: no change for controllers
+    attach(a, 0x045E, 0x028E, "Xbox 360 Controller");
+    attach(b, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
+    CHECK(sdl_input::port_of(a.id) == 0 && sdl_input::port_of(b.id) == 1, "KeyboardPort=2 keeps P1/P2 order");
+    detach(a); detach(b); sdl_input::close_all();
+}
+
 void test_modern_triggers() {
     sdl_input::set_controller_layout(true);
-    sdl_input::set_keyboard_port(0);
+    sdl_input::set_keyboard_port(0, true);  // legacy reserved port: P2 pad carries the trigger checks
     Pad a, b;
     attach(a, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     attach(b, 0x045E, 0x028E, "Xbox 360 Controller");
@@ -376,6 +410,11 @@ void test_modern_triggers() {
     CHECK(s.buttons == PAD_CROSS && s.pressure[6] > 100 && s.pressure[6] < 160, "RT half is analog Cross");
     CHECK(s.pressure[10] == 0 && s.pressure[11] == 0, "modern has no original L2/R2 pressure");
     CHECK(read_port(0).buttons == 0 && read_port(0).pressure[6] == 0, "P1 unaffected by P2 trigger");
+    HostPadState menu;
+    sdl_input::read_menu_gamepad(sdl_input::port_gamepad(1), &menu);
+    CHECK(menu.buttons == PAD_R2 && !(menu.buttons & PAD_CROSS), "menu RT cannot confirm in Modern driving layout");
+    CHECK(menu.pressure[11] > 100 && menu.pressure[6] == 0, "menu retains raw trigger pressure");
+
     set_axis(b, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
     HostPadState other = read_port(0);
     CHECK(other.buttons == PAD_SQUARE && other.pressure[7] == 255 && other.pressure[6] == 0, "P1 LT brakes independently");
@@ -401,6 +440,19 @@ void test_modern_triggers() {
     set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kTriggerRest);
     s = read_port(1);
     CHECK(s.buttons == 0 && s.pressure[6] == 0 && s.pressure[7] == 0, "released triggers return to neutral");
+    // native L2/R2 actions stay reachable on the stick clicks (Battle weapon = L2)
+    set_button(a, SDL_GAMEPAD_BUTTON_RIGHT_STICK, true);
+    s = read_port(1);
+    CHECK(s.buttons == PAD_L2 && s.pressure[10] == 255, "modern right stick click is L2 (weapon)");
+    set_button(a, SDL_GAMEPAD_BUTTON_RIGHT_STICK, false);
+    set_button(a, SDL_GAMEPAD_BUTTON_LEFT_STICK, true);
+    s = read_port(1);
+    CHECK(s.buttons == PAD_R2 && s.pressure[11] == 255, "modern left stick click is R2");
+    set_button(a, SDL_GAMEPAD_BUTTON_LEFT_STICK, false);
+    set_button(a, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
+    CHECK(read_port(1).buttons == PAD_L1, "modern bumpers stay L1/R1");
+    set_button(a, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, false);
+    sdl_input::read_menu_gamepad(sdl_input::port_gamepad(1), &menu);
     sdl_input::set_controller_layout(false);
     set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
     s = read_port(1);
@@ -425,6 +477,7 @@ int main() {
     test_identical_pads_keep_live_slots();
     test_two_pads_no_keyboard();
     test_keyboard_on_player_2();
+    test_saved_keyboard_port_does_not_take_controller_p1();
     test_modern_triggers();
     SDL_Quit();
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

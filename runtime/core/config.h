@@ -40,10 +40,18 @@ struct Config {
     // [Input] keyboard bindings: key names separated by commas (see key_code)
     std::string keys[KEY_COUNT];
     bool vibration = true;
+    // per player (P1, P2) left-stick shaping, input mapping only (frontend::shape_axis):
+    // inner dead zone %, outer saturation %, steering response curve (100 = linear)
+    int stick_deadzone[2] = {0, 0};
+    int stick_outer[2] = {100, 100};
+    int stick_curve[2] = {100, 100};
+    // per player trigger (Modern gas/brake) shaping: dead zone %, response curve (100 = linear)
+    int trigger_deadzone[2] = {0, 0};
+    int trigger_curve[2] = {100, 100};
 #ifndef _WIN32  // SDL3 input options
     int keyboard_port = -1;          // -1: automatic, 0: disabled, 1 or 2: player port
     std::string keyboard_layout = "racing"; // racing (context-aware WASD/arrows) | original (Key_* bindings)
-    std::string controller_layout = "original"; // original | modern (RT Cross, LT Square pressure)
+    std::string controller_layout = "modern"; // modern (default: RT = analog gas, LT = analog brake) | original (PS2 L2/R2)
 #endif
     // [System]
     std::string memcard_dir;  // empty: <game folder>/memcard

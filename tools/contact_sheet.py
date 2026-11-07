@@ -1,9 +1,19 @@
-# tools/contact_sheet.py <dir> <first_frame> [n] [cols] -- half-size contact sheet of frame_*.ppm (macOS: sips makes the PNG)
+# tools/contact_sheet.py <dir> <first_frame> [n] [cols] -- half-size contact sheet of frame_*.png or .ppm (macOS: sips makes the PNG)
 import glob, sys, os
 d=sys.argv[1]; first=int(sys.argv[2]); n=int(sys.argv[3]) if len(sys.argv)>3 else 9; cols=int(sys.argv[4]) if len(sys.argv)>4 else 3
-fs=[f for f in sorted(glob.glob(d+'/frame_*.ppm')) if int(os.path.basename(f)[6:11])>=first][:n]
+fs=[f for f in sorted(glob.glob(d+'/frame_*.png')+glob.glob(d+'/frame_*.ppm')) if int(os.path.basename(f)[6:11])>=first][:n]
+import struct, zlib
 def rd(p):
-    b=open(p,'rb').read(); parts=b.split(b'\n',3); w,h=map(int,parts[1].split()); return w,h,parts[3]
+    b=open(p,'rb').read()
+    if b[:8]==b'\x89PNG\r\n\x1a\n':  # the runtime's RGB8, filter-0 PNG
+        w,h=struct.unpack('>II',b[16:24]); z=b''; i=8
+        while i<len(b):
+            n=struct.unpack('>I',b[i:i+4])[0]; t=b[i+4:i+8]
+            if t==b'IDAT': z+=b[i+8:i+8+n]
+            i+=12+n
+        raw=zlib.decompress(z); s=w*3+1
+        return w,h,b''.join(raw[y*s+1:(y+1)*s] for y in range(h))
+    parts=b.split(b'\n',3); w,h=map(int,parts[1].split()); return w,h,parts[3]
 imgs=[rd(f) for f in fs]
 W,H,_=imgs[0]; sw,sh=W//2,H//2; rows=(len(imgs)+cols-1)//cols
 out=bytearray(sw*cols*sh*rows*3)

@@ -31,6 +31,7 @@
 #include "../gs_state.h"
 #include "../gs_swizzle.h"
 #include "vk_compat.h"
+#include "../../ui/overlay.h"
 #include "gs_page_coverage.h"
 #include "gpu_upload_blocks.h"
 
@@ -43,6 +44,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
 namespace {
 
 #include "gs_shaders_vk.inc"
+#include "overlay_vk.inc"
 
 template <class T> void release(T *&p) {
     if (p)
@@ -2092,6 +2094,7 @@ bool start(bool with_window) {
         memset(g_owner, 0, sizeof g_owner);
         memset(g_vram_ok, 0, sizeof g_vram_ok);
         g_on = true;
+        overlay_enable(); // the in-game front end can be drawn (window and offscreen captures)
         LOG(LOG_GS, "vulkan: render scale %d%s", g_scale, with_window ? (g_dev->wantVsync ? " launch VSync on (FIFO)" : " launch VSync off (immediate/mailbox when available)") : " offscreen");
         return true;
     } catch (const std::exception &e) {
@@ -2451,6 +2454,125 @@ void compose(ID3D11RenderTargetView *rtv, int tw, int th, int rx, int ry, int rw
     g_bound_rt = g_bound_ds = nullptr;
 }
 
+// ------------------------------------------------------- front-end overlay
+// The in-game front end (runtime/ui): ImGui draw lists over the composed image,
+// at the target's resolution, with their own shaders, blend state and textures
+// (font atlas + decoded game UI art). Indexed lists are expanded to the GS
+// vertex layout so the adapter's vertex path serves (ImGui lists are small).
+ID3D11VertexShader *g_vs_overlay;
+ID3D11PixelShader *g_ps_overlay;
+ID3D11BlendState *g_bs_overlay;
+ID3D11Buffer *g_cb_overlay, *g_vb_overlay;
+std::vector<ID3D11Texture2D *> g_overlay_tex;
+std::vector<uint32_t> g_overlay_gen;
+
+bool overlay_pipeline() {
+    if (g_vs_overlay) return true;
+    auto shader = [](const uint32_t *code, size_t bytes, const char *entry, int id) {
+        auto *sh = new vkgs::Shader;
+        sh->entry = entry;
+        sh->id = id;
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = bytes;
+        info.pCode = code;
+        vkgs::require(vkCreateShaderModule(g_dev->device, &info, nullptr, &sh->module), entry);
+        return sh;
+    };
+    g_vs_overlay = shader(k_spv_vs_overlay, sizeof k_spv_vs_overlay, "vs_overlay", vkgs::kOverlayVertexShader);
+    g_ps_overlay = shader(k_spv_ps_overlay, sizeof k_spv_ps_overlay, "ps_overlay", vkgs::kOverlayVertexShader + 1);
+    D3D11_BLEND_DESC bl = {};
+    D3D11_RENDER_TARGET_BLEND_DESC &rt = bl.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    rt.SrcBlend = VK_BLEND_FACTOR_SRC_ALPHA;
+    rt.DestBlend = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    rt.BlendOp = D3D11_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    CHECK(g_dev->CreateBlendState(&bl, &g_bs_overlay));
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = 16;
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_cb_overlay));
+    bd.ByteWidth = 32;
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_vb_overlay));
+    return true;
+}
+
+ID3D11ShaderResourceView *overlay_srv(uint32_t id) {
+    OverlayTexture t;
+    if (!overlay_texture(id, t) || !t.rgba || t.w <= 0 || t.h <= 0) return nullptr;
+    if (id >= g_overlay_tex.size()) {
+        g_overlay_tex.resize(id + 1, nullptr);
+        g_overlay_gen.resize(id + 1, 0);
+    }
+    if (!g_overlay_tex[id] || g_overlay_gen[id] != t.generation) {
+        release(g_overlay_tex[id]);
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)t.w;
+        td.Height = (UINT)t.h;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init = {t.rgba, (UINT)t.w * 4, 0};
+        if (FAILED(CHECK(g_dev->CreateTexture2D(&td, &init, &g_overlay_tex[id])))) return nullptr;
+        g_overlay_gen[id] = t.generation;
+    }
+    return g_overlay_tex[id];
+}
+
+// Draws the published overlay into rtv (tw x th pixels at its origin).
+void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
+    static OverlayDraw d;
+    if (!overlay_latest(d) || d.w <= 0 || d.h <= 0 || d.cmds.empty()) return;
+    try {
+        overlay_pipeline();
+    } catch (const std::exception &e) {
+        WARN("vulkan overlay: %s", e.what());
+        return;
+    }
+    // expand the indexed lists (all commands, in order)
+    size_t total = 0;
+    for (const OverlayCmd &c : d.cmds) total += c.index_count;
+    g_vb_overlay->data.resize(std::max<size_t>(32, total * sizeof(HwVertex)));
+    HwVertex *out = reinterpret_cast<HwVertex *>(g_vb_overlay->data.data());
+    size_t n = 0;
+    for (const OverlayCmd &c : d.cmds)
+        for (uint32_t i = 0; i < c.index_count; i++) {
+            const size_t vi = (size_t)c.base_vertex + d.indices[c.first_index + i];
+            const OverlayVertex &v = vi < d.verts.size() ? d.verts[vi] : d.verts[0];
+            out[n++] = {v.x, v.y, 0, v.rgba, v.u, v.v, 1.0f, 0.0f};
+        }
+    const float scale[4] = {2.0f / (float)d.w, 2.0f / (float)d.h, 0, 0};
+    memcpy(g_cb_overlay->data.data(), scale, sizeof scale);
+    unbind_all();
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    set_viewport(tw, th);
+    UINT stride = sizeof(HwVertex), offset = 0;
+    g_ctx->IASetVertexBuffers(0, 1, &g_vb_overlay, &stride, &offset);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(g_vs_overlay, nullptr, 0);
+    g_ctx->VSSetConstantBuffers(1, 1, &g_cb_overlay);
+    g_ctx->PSSetShader(g_ps_overlay, nullptr, 0);
+    ID3D11SamplerState *ss[2] = {g_point_clamp, g_linear_clamp};
+    g_ctx->PSSetSamplers(0, 2, ss);
+    float factor[4] = {0, 0, 0, 0};
+    g_ctx->OMSetBlendState(g_bs_overlay, factor, 0xFFFFFFFF);
+    g_ctx->OMSetDepthStencilState(g_ds_off, 0);
+    g_ctx->RSSetState(g_rs_scissor);
+    const float sx = (float)tw / (float)d.w, sy = (float)th / (float)d.h;
+    UINT first = 0;
+    for (const OverlayCmd &c : d.cmds) {
+        ID3D11ShaderResourceView *srv = overlay_srv(c.texture);
+        if (srv) {
+            D3D11_RECT r = {(int)(c.clip[0] * sx), (int)(c.clip[1] * sy), (int)(c.clip[2] * sx + 0.5f), (int)(c.clip[3] * sy + 0.5f)};
+            g_ctx->RSSetScissorRects(1, &r);
+            g_ctx->PSSetShaderResources(0, 1, &srv);
+            g_ctx->Draw(c.index_count, first);
+        }
+        first += c.index_count;
+    }
+    unbind_all();
+    g_bound_rt = g_bound_ds = nullptr;
+    g_state_valid = false;
+}
+
 std::mutex g_shot_mtx;
 std::condition_variable g_shot_cv;
 bool g_shot_wanted, g_shot_done;
@@ -2459,15 +2581,17 @@ int g_shot_w, g_shot_h;
 
 // Reads back the native GS image, or an explicitly sized display composition.
 bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
-    if (!g_have_last)
-        return false;
-    const Circuit &c = g_last[0].on ? g_last[0] : g_last[1];
-    if (!c.on)
+    // No game image yet (the first-run / error screen runs before the game): the front end
+    // alone, at the explicit screenshot size.
+    const Circuit none{};
+    const bool image = g_have_last && (g_last[0].on || g_last[1].on);
+    const Circuit &c = !image ? none : g_last[0].on ? g_last[0] : g_last[1];
+    if (!image && !(overlay_in_screenshots() && getenv("EOD_SCREENSHOT_WIDTH") && getenv("EOD_SCREENSHOT_HEIGHT")))
         return false;
     int shot_scale = 1;
     if (const char *scale = getenv("EOD_SCREENSHOT_SCALE"))
         shot_scale = std::clamp(atoi(scale), 1, g_scale);
-    const ScreenshotSize size=screenshot_size(c.w,c.h,shot_scale,getenv("EOD_SCREENSHOT_WIDTH"),getenv("EOD_SCREENSHOT_HEIGHT"));
+    const ScreenshotSize size=screenshot_size(image ? c.w : 640,image ? c.h : 448,shot_scale,getenv("EOD_SCREENSHOT_WIDTH"),getenv("EOD_SCREENSHOT_HEIGHT"));
     if (!size.valid) {
         WARN("Vulkan screenshot: set both EOD_SCREENSHOT_WIDTH/HEIGHT to pixel dimensions from 1 to 8192");
         return false;
@@ -2488,7 +2612,10 @@ bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
         platform_display_rect(w,h,&x,&y,&draw_w,&draw_h);
         presentation::set(queued_aspect);
     }
-    compose(t->rtv,t->w*g_scale,t->h*g_scale,x,y,draw_w,draw_h,size.composed ? g_config.smooth_display : shot_scale>1);
+    if (image)
+        compose(t->rtv,t->w*g_scale,t->h*g_scale,x,y,draw_w,draw_h,size.composed ? g_config.smooth_display : shot_scale>1);
+    if (overlay_in_screenshots())
+        draw_overlay(t->rtv, w, h); // the front end appears in screenshots as on screen
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)w;
     td.Height = (UINT)h;
@@ -2578,6 +2705,7 @@ void show(bool vsync) {
             platform_display_rect(g_dev->extent.width, g_dev->extent.height, &x, &y, &w, &h);
             if (g_have_last)
                 compose(back, g_dev->extent.width, g_dev->extent.height, x, y, w, h, g_config.smooth_display);
+            draw_overlay(back, g_dev->extent.width, g_dev->extent.height);
             g_dev->present();
             g_stats.presents++;
         }

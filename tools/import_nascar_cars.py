@@ -154,7 +154,16 @@ def transcode_modl(data: bytes) -> bytes:
     quadwords (size field = 0x38 + 16*qwc, qwc at +0x34), followed by 8 bytes
     before the next part; the TJRM helper block is last; u32 @0x40 = file size.
     """
-    nslots = struct.unpack_from("<I", data, 0x10)[0]
+    if not struct.unpack_from("<I", data, 8)[0]:
+        # Source Low5/6 legitimately omit TJRM. Reuse the existing MODL writer
+        # instead of manufacturing a helper block or throwing away distant LODs.
+        model = gen.read_modl(data)
+        for part in model["parts"]:
+            part["stream"] = transcode_vif_stream(part["stream"])
+            if part["hdr"][0x1C] == 4:
+                part["hdr"][0x1C] = 3
+        return gen.write_modl(model)
+    nslots = (struct.unpack_from("<I", data, 0x14)[0] - 0x58) // 4
     offsets = list(struct.unpack_from(f"<{nslots}I", data, 0x58))
     blocks = sorted({o for o in offsets if o != 0xE3E3E3E3 and data[o:o + 4] in (b"4SPS", b"TJRM")})
     if not blocks or data[blocks[-1]:blocks[-1] + 4] != b"TJRM":
@@ -389,7 +398,7 @@ def find_entry(directory: Path, name: str) -> Path:
     return hits[0]
 
 
-def merge_physics(eod_model: dict, nascar_model: dict) -> dict:
+def merge_physics(eod_model: dict, nascar_model: dict, wheel_class="ncu") -> dict:
     """Preserve every NASCAR value and translate the prototype's EOD-only fields.
 
     Gear, speedometer and engine-audio adapters still require the
@@ -423,7 +432,7 @@ def merge_physics(eod_model: dict, nascar_model: dict) -> dict:
             eod_model["sections"].append(section)
         target[name]["pairs"] = list(source[axle].items())
         normal = target[axle]
-        normal["pairs"] = list(dict(normal["pairs"], wheel_class="ncu").items())
+        normal["pairs"] = list(dict(normal["pairs"], wheel_class=wheel_class).items())
     return eod_model
 
 

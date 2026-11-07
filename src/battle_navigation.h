@@ -18,7 +18,7 @@ private:
     struct Node { Point position,tangent; float length=0,start=0; };
     struct Choice { uint32_t opponent=UINT32_MAX; int direction=0; };
     std::vector<Node> nodes_;
-    std::array<Choice,4> choices_{};
+    std::array<Choice,12> choices_{};
     uint32_t resource_=0,root_=0,count_=0;
     float length_=0;
 };

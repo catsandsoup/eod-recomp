@@ -38,8 +38,21 @@
 001244A8 wrap     # optional single player battle mode injection into action eves
 
 0012C158 wrap     # optional Battle bots: native roster builder fills to four cars
+001252C0 wrap     # Battle (4 AI)/(8 AI) contest display names; native names otherwise
+0010AFA0 wrap     # event-type name: Battle (4 AI)/(8 AI) only for an added contest in $v0/$s2
+001515B8 wrap     # Battle external table for tracks without c_battle (Welch); native otherwise
+00167C70 wrap     # Battle initial placement: offset cars beyond the native respawn count
+0012AEF0 wrap     # Battle (N AI): note the contest whose description is resolved next
+001116E0 wrap     # Battle (N AI) only: AI drivers/vehicles from every class; native records otherwise
 0020FD48 wrap     # optional Battle bots: create weapons through native scene factory
 001A2D20 wrap     # optional Battle bots: input after native AICar update
 
 0034CEF0 wrap     # optional Cup source fast wheel geometry; exact native fallback
 00220788 wrap     # bounded opt-in Cup actual slow/fast selection trace
+
+# Direct session start (src/session_start.cpp, EOD_DIRECT_START): inert unless the variable is set
+002BEC08 wrap     # title screen: passed immediately when EOD_DIRECT_START is set
+002A1298 wrap     # main menu: start the requested Action session when first reached
+002A75E0 wrap     # GameDoSingle car screen: answered once for a direct start
+002C7340 wrap     # GameDoSingle track screen: answered once for a direct start
+00120650 wrap     # per-event setup: pre-select the requested event once

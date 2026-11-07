@@ -33,6 +33,39 @@ were preserved under ignored `work/stopped-expansion-2026-10-19/`, then removed
 from the shipped source. The original inherited recovery backup is preserved.
 Known limitations and the exact verified journeys below remain authoritative.
 
+## Battle on every map — 2026-11-06
+
+Supersedes the "Solo menu exposure" capacity policy below. Player view: every
+Action/Single track Eve lists **Battle (4 AI)** and **Battle (8 AI)** after its
+native events; every local multiplayer Eve also lists **Battle (1v1)** (humans
+only). Native events, their order and the native multiplayer "Battle" are
+unchanged; Career, challenge and demo catalogs are never touched.
+
+- **Capacity.** The 320-entry contest table (0x003C61A8) is referenced only by
+  twelve `addiu` sites in the Eve module. `tools/recomp.py` points them at a
+  512-entry table in runtime-owned EE kernel RAM (0x00090000, see
+  `src/battle_layout.h`) and raises the append limit (0x124054). Native
+  contests keep their indices and bytes.
+- **Contests.** `src/battle_events.cpp` appends the variants after the outermost
+  0x1244A8 load (modes 0x12F/0x131), reusing each track's native Battle section.
+  Names come from hooks on 0x10AFA0/0x1252C0 that recognise an added contest.
+- **Welch.** Retail WELCH.TRK has no c_battle.va0. The composer keeps only the
+  added table (`battle-alternates/TRACKS/WELCH/c_battle.va0`, refusing any
+  archive that changes a native entry); 0x1515B8 relocates it like 0x134A70 for
+  a Battle contest only. Multiplayer gets a Welch Eve built from the Welch
+  Action Eve section, holding only the Battle variants.
+- **Cars.** BattleMaster grows from 4 to 12 participant records: ranking, spawn
+  and count words move to +0x814/+0x844/+0x848 and the factory allocates
+  0x84C bytes (25 audited sites in 0x166B00-0x168000). Variants hold humans+N
+  cars, at most ten. Cars beyond a track's respawn records are offset one lane
+  (6 m) and re-grounded with native 0x1D8F58 (hook on 0x167C70).
+- **Classes.** For a variant only, AI description records are re-pointed (before
+  native 0x1116E0 resolves them) to native driver+vehicle pairs taken in turn
+  from all four classes; each car keeps its own physics/damage.
+- Tests: `battle_events_test`, `battle_bots_test`, `battle_driver_test`,
+  `tools/tests/test_battle_layout.py`, `tools/tests/test_integrated_profile.py`.
+  Live evidence: read/outputs/BATTLE_EVERY_MAP_REPORT.md.
+
 ## Player success and acceptance
 
 The player can enter original two-player Battle with independent controls and

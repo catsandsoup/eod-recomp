@@ -229,6 +229,58 @@ static void on_signal(int sig) {
     _Exit(1);
 }
 
+#ifdef __APPLE__
+#include <atomic>
+#include <thread>
+#include "ui/overlay.h"
+namespace {
+std::string g_setup_config;
+std::string install_disc(const std::string &path) {
+    return mac_app_install_disc(path, g_setup_config, {ee_elf_size, ee_elf_crc32});
+}
+}  // namespace
+
+// The front end alone (no game yet): shows the problem in-game, lets the player choose a disc with
+// the controller (or keyboard/mouse), then relaunches. Returns the process exit code.
+static int run_setup_screen(PlatformConfig cfg, const std::string &config_path, const std::string &problem, bool disc,
+                            char **argv, const char *test) {
+    g_setup_config = config_path;
+    unsetenv("EOD_DUMP_RAM");  // no game memory exists in this mode
+    int test_frames = 0;
+    std::string test_shot;
+    if (test && *test) {
+        test_frames = atoi(test);
+        if (const char *colon = strchr(test, ':')) test_shot = colon + 1;
+    }
+    platform_configure_display(cfg);
+    if (!platform_init(cfg)) return 1;
+    gs_init();
+    overlay_show_error(disc ? "Game disc needed" : "Game content problem", problem, disc, disc ? install_disc : nullptr);
+    for (int frame = 0;; ++frame) {
+        if (!platform_pump()) app_exit(0);
+        overlay_frame();
+        gs_overlay_redraw();
+        platform_sleep_us(16000);
+        if (test_frames && frame == test_frames) {
+            // the capture waits for a GS vblank, which the redraws of this loop provide
+            std::atomic<int> shot{0};
+            std::thread t([&] { shot = test_shot.empty() || gs_screenshot(test_shot.c_str()) ? 1 : 2; });
+            while (!shot) { gs_overlay_redraw(); platform_sleep_us(16000); }
+            t.join();
+            fprintf(stderr, "[frontend] setup screen capture %s: %s\n", test_shot.c_str(), shot == 1 ? "ok" : "failed");
+            app_exit(0);
+        }
+        const int r = overlay_error_result();
+        if (r == 2) app_exit(0);
+        if (r == 1) {  // retry / disc installed: start again from the top with the same arguments
+            fflush(nullptr);
+            execv(argv[0], argv);
+            return 1;
+        }
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef __APPLE__
     mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
@@ -337,8 +389,24 @@ int main(int argc, char **argv) {
                 if (disc_check_folder(candidate, {ee_elf_size, ee_elf_crc32}).ok()) { data_dir = candidate; break; }
             }
         }
-        if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32})) return 1;
-        if (!mac_app_select_mods(headless)) return 0;
+        // Missing disc or damaged built-in content: the in-game error screen (runtime/ui) with a
+        // controller disc chooser replaces the Cocoa dialogs. Headless never opens UI, except the
+        // developer capture EOD_SETUP_SCREEN_TEST="frames:screenshot.png" (simulated first run).
+        const char *setup_test = getenv("EOD_SETUP_SCREEN_TEST");
+        std::string problem;
+        bool disc_problem = false;
+        if (setup_test && *setup_test) {
+            problem = "No game disc is installed yet. Choose your North American v1.00 disc image (.iso, .bin/.cue) or the "
+                      "folder that holds SLUS_209.10, SYSTEM.CNF and DATA. It is copied into the app's folder; your "
+                      "original files stay untouched.";
+            disc_problem = true;
+        } else if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32}, headless ? nullptr : &problem)) {
+            if (problem.empty()) return 1;
+            disc_problem = true;
+        } else if (!mac_app_select_mods(headless, headless ? nullptr : &problem)) {
+            if (problem.empty()) return 1;
+        }
+        if (!problem.empty()) return run_setup_screen(cfg, config_path, problem, disc_problem, argv, setup_test);
     }
 #endif
     platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.

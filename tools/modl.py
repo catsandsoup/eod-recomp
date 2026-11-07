@@ -22,6 +22,10 @@ def parse_modl(data: bytes) -> dict:
     radius, cx, cy, cz = struct.unpack("<ffff", data[24:40])
     bbox = struct.unpack("<ffffff", data[40:64])
 
+    # 0x10 is runtime-record count, not part slots (Pace cockpit has only one).
+    part_slots = (unk3 - 0x58) // 4
+    if part_slots < sub_ver or part_slots < 0:
+        raise ValueError("Invalid MODL part-table extent")
     # Part offsets table starts at 0x58
     if 0x58 + part_slots * 4 > len(data):
         raise ValueError("Truncated MODL part table")
@@ -70,7 +74,7 @@ def retexture_modl(data: bytes, old_tex: str, new_tex: str) -> bytes:
     if not new_tex or len(new_tex.encode("latin1")) > 15 or "\0" in new_tex:
         raise ValueError("Texture name must fit the 16-byte null-terminated MODL field")
     out = bytearray(data)
-    part_slots = struct.unpack("<I", data[0x10:0x14])[0]
+    part_slots = (struct.unpack_from("<I", data, 0x14)[0] - 0x58) // 4
     if 0x58 + part_slots * 4 > len(data):
         raise ValueError("Truncated MODL part table")
     offsets = struct.unpack(f"<{part_slots}I", data[0x58 : 0x58 + part_slots * 4])

@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 #include "../runtime/platform/sdl3/audio_gain.h"
 #include "../runtime/iop/spu2.cpp"
+void overlay_mix_audio(int16_t *, int) {}  // the front end's menu sounds are not part of this test
 #include <cmath>
 uint8_t *g_iop_ram;
 bool g_log_enabled[LOG_CAT_COUNT] = {};

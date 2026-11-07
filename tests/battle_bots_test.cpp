@@ -1,11 +1,13 @@
 // Tests the C++/native construction boundary with synthetic EE memory. Native
 // vehicle selection, driving and weapon physics need separate gameplay checks.
 #include "battle_bots.h"
+#include "battle_layout.h"
 #include "core/config.h"
 #include "core/cpu.h"
 #include "core/memory.h"
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,11 @@ int originalCountCalls, originalWorldCalls, lookupCalls, suppressionCalls, reset
 uint32_t nativeCountResult, suppressionResult;
 bool createSceneInOriginal, registerImmediately;
 EEState nativeWorldReturn{};
+uint32_t variantContest, variantAi;
+int placementOriginal, grounding, rosterOriginal, resolveOriginal;
+uint32_t resolvedDescription;
+uint32_t groundOut;
+float groundX, groundZ, groundFx, groundFz;
 
 void require(bool okay, const char *message) {
     if (!okay) { std::fprintf(stderr, "Battle bots: %s\n", message); std::exit(1); }
@@ -39,7 +46,7 @@ void reset() {
     originalCountCalls = originalWorldCalls = lookupCalls = suppressionCalls = resetCalls = 0;
     nativeCountResult = 2; suppressionResult = 0; createSceneInOriginal = true;
     registerImmediately = false; // Native factory queues physical registration.
-    g_config.battle_bots = true;
+    g_config.battle_bots = true; variantContest = variantAi = 0;
     ee_w32(contest + 8, battle); ee_w32(0x439858, 2);
     ee_w32(description + 0x9A4, battle); ee_w32(description + 0x98C, 4);
     ee_w32(0x3CF19C, battle);
@@ -109,8 +116,99 @@ void weaponsAndIdentity() {
     require(created.empty() && originalWorldCalls == 1 && !battle_bots_is_ai_slot(2), "disabled world remains native");
     reset(); ee_w32(description + 0x9A4, 0x18000223); makeWorld();
     require(created.empty() && !battle_bots_is_ai_slot(2), "other world clears previous AI identity");
-    reset(); ee_w32(description + 0x98C, 5); makeWorld();
-    require(created.empty(), "unsafe Battle participant count is rejected");
+    reset(); ee_w32(description + 0x98C, battle_layout::kCapacity + 1); makeWorld();
+    require(created.empty(), "participant count beyond the enlarged BattleMaster is rejected");
+    // Battle (8 AI) with two humans: ten records, eight AI armed natively even
+    // when the optional fill-to-four setting is off.
+    reset(); g_config.battle_bots = false; ee_w32(description + 0x98C, 10);
+    for (uint32_t i = 0; i < 10; ++i) ee_w32(record(i), i == 3 || i == 7 ? 0x50 : 0x51);
+    makeWorld();
+    require(created == std::vector<uint32_t>({0, 1, 2, 4, 5, 6, 8, 9}), "eight AI of a ten-car Battle get native weapons");
+    require(battle_bots_is_ai_slot(9) && !battle_bots_is_ai_slot(7) && !battle_bots_is_ai_slot(10),
+            "AI identity covers every enlarged slot");
+}
+void variantCounts() {
+    reset();
+    variantContest = contest; variantAi = 8;
+    for (uint32_t humans = 1; humans <= 4; ++humans) {
+        ee_w32(0x439858, humans); g_ee.r[4].ud[0] = contest; f_0012C158();
+        require(g_ee.r[2].uw[0] == std::min(humans + 8, battle_layout::kMaxCars), "Battle (8 AI) adds eight AI within ten cars");
+    }
+    variantAi = 4; ee_w32(0x439858, 1); g_ee.r[4].ud[0] = contest; f_0012C158();
+    require(g_ee.r[2].uw[0] == 5, "Battle (4 AI) with one human holds five cars");
+    g_config.battle_bots = false; ee_w32(0x439858, 2); g_ee.r[4].ud[0] = contest; f_0012C158();
+    require(g_ee.r[2].uw[0] == 6, "variant count does not depend on the fill-to-four setting");
+    variantAi = 1; g_config.battle_bots = true; ee_w32(0x439858, 2); g_ee.r[4].ud[0] = contest; f_0012C158();
+    require(g_ee.r[2].uw[0] == 2, "Battle (1v1) holds only the two humans, even with fill-to-four on");
+    g_config.battle_bots = false;
+    variantContest = 0; g_ee.r[4].ud[0] = contest; f_0012C158();
+    require(g_ee.r[2].uw[0] == nativeCountResult, "native Battle with the setting off stays native");
+}
+float getf(uint32_t a) { const uint32_t u = ee_r32(a); float f; std::memcpy(&f, &u, 4); return f; }
+void putf(uint32_t a, float v) { uint32_t u; std::memcpy(&u, &v, 4); ee_w32(a, u); }
+void mixedClasses() {
+    // Native tables: vehicle and driver per number; classes 0..3, two of each.
+    constexpr uint32_t vehicles = 0x70000, drivers = 0x74000;
+    reset();
+    ee_w32(0x3CBEE4, vehicles); ee_w32(0x439704, 8); ee_w32(0x3CBEE0, drivers); ee_w32(0x439700, 8);
+    const char *names[8] = {"Hurricane", "Bulldog", "Empire", "Arrow", "Cannon", "Rocket", "Hearse", "Bus"};
+    for (uint32_t i = 0; i < 8; ++i) {
+        const uint32_t v = vehicles + i * 0x54, d = drivers + i * 0x54;
+        ee_w32(v, i); ee_w32(v + 4, 100 + i); std::memcpy(g_ram + v + 8, names[i], std::strlen(names[i]) + 1);
+        ee_w32(v + 0x40, i / 2);
+        ee_w32(d, i); ee_w32(d + 4, 100 + i); std::snprintf(reinterpret_cast<char *>(g_ram + d + 8), 32, "Driver %u", i);
+    }
+    // One human (number 100, class 0) between four native same-class AI picks.
+    ee_w32(0x439858, 1); ee_w32(0x439708 + 4, 100);
+    auto setup = [&] {
+        ee_w32(description + 0x98C, 5);
+        for (uint32_t i = 0; i < 5; ++i) {
+            ee_w32(record(i) + 0x68, i == 2 ? 100 : 101); ee_w32(record(i) + 0x6C, i == 2 ? 100 : 101);
+        }
+    };
+    setup();
+    g_ee.r[4].ud[0] = 0x78000; g_ee.r[5].ud[0] = 7; g_ee.r[16].ud[0] = 55; f_0012AEF0();
+    g_ee.r[4].ud[0] = description; f_001116E0();
+    require(rosterOriginal == 1 && resolveOriginal == 1, "native roster and resolver always run");
+    for (uint32_t i = 0; i < 5; ++i) require(ee_r32(record(i) + 0x68) == (i == 2 ? 100u : 101u), "native contests keep the native roster");
+    variantAi = 4; variantContest = battle_layout::kContestTable + 7 * battle_layout::kContestStride;
+    g_ee.r[4].ud[0] = 0x78000; g_ee.r[5].ud[0] = 7; f_0012AEF0();
+    require(g_ee.r[16].ud[0] == 55, "native roster return context survives");
+    g_ee.r[4].ud[0] = description; f_001116E0();
+    require(resolveOriginal == 2 && resolvedDescription == description, "native resolver runs on the mixed description");
+    require(ee_r32(description + 0x98C) == 5 && ee_r32(record(2) + 0x68) == 100 && ee_r32(record(2) + 0x6C) == 100,
+            "car count and the human's record are kept");
+    std::vector<uint32_t> numbers, classes;
+    for (uint32_t i : {0u, 1u, 3u, 4u}) {
+        const uint32_t n = ee_r32(record(i) + 0x68);
+        require(n >= 101 && n <= 107 && ee_r32(record(i) + 0x6C) == n, "AI record names a native driver with its own vehicle");
+        numbers.push_back(n); classes.push_back(ee_r32(vehicles + (n - 100) * 0x54 + 0x40));
+    }
+    std::sort(numbers.begin(), numbers.end());
+    require(std::adjacent_find(numbers.begin(), numbers.end()) == numbers.end(), "no driver/vehicle is used twice");
+    std::sort(classes.begin(), classes.end());
+    require(classes == std::vector<uint32_t>({0, 1, 2, 3}), "four AI cover every class, including the human's");
+    setup(); g_ee.r[4].ud[0] = description; f_001116E0();
+    require(ee_r32(record(0) + 0x68) == 101, "a mix applies once, to the description after its roster");
+}
+void placement() {
+    constexpr uint32_t master = 0x60000, out = 0x61000;
+    for (uint32_t index : {0u, 5u, 6u, 9u}) {
+        reset(); placementOriginal = grounding = 0;
+        ee_w32(master, battle_layout::kMasterVtable); ee_w32(master + battle_layout::kRespawnCount, 6);
+        g_ee.r[4].ud[0] = master; g_ee.r[5].ud[0] = out; g_ee.r[6].ud[0] = index; g_ee.r[16].ud[0] = 77;
+        f_00167C70();
+        require(placementOriginal == 1 && g_ee.r[2].uw[0] == 1 && g_ee.r[16].ud[0] == 77,
+                "native placement always runs and its return context survives");
+        if (index < 6) { require(!grounding, "cars within the native respawn count keep the native pose"); continue; }
+        require(grounding == 1 && groundOut == out, "extra cars are re-grounded by the native respawn builder");
+        require(std::fabs(groundX - 16.0f) < 1e-4f && std::fabs(groundZ - 20.0f) < 1e-4f &&
+                groundFx == 0.0f && groundFz == 1.0f, "extra car moves one car-width lane along the record's right axis");
+    }
+    reset(); placementOriginal = grounding = 0;
+    ee_w32(master, battle_layout::kMasterVtable); ee_w32(master + battle_layout::kRespawnCount, 0);
+    g_ee.r[4].ud[0] = master; g_ee.r[5].ud[0] = out; g_ee.r[6].ud[0] = 3; f_00167C70();
+    require(placementOriginal == 1 && !grounding, "no respawn records: native behaviour only");
 }
 void capacity() {
     for (uint32_t address : {0x3CE4B8u, 0x495CACu, 0x495CB0u}) {
@@ -138,6 +236,23 @@ void capacity() {
 } // namespace
 
 void battle_driver_reset() { ++resetCalls; }
+uint32_t battle_events_ai_for_contest(uint32_t c) { return c && c == variantContest ? variantAi : 0; }
+extern "C" void f_001116E0_orig() { ++resolveOriginal; resolvedDescription = arg_u32(0); }
+extern "C" void f_0012AEF0_orig() { ++rosterOriginal; std::memset(&g_ee, 0x11, sizeof(g_ee)); g_ee.r[16].ud[0] = 55; }
+extern "C" void f_00167C70_orig() {
+    ++placementOriginal;
+    const uint32_t out = arg_u32(1);
+    // Native pose copy: right (1,0,0), up, forward (0,0,1), position (10,0,20).
+    putf(out, 1); putf(out + 0x10, 1); putf(out + 0x20, 1); putf(out + 0x24, 10); putf(out + 0x2C, 20);
+    ee_w32(out + 0x44, 2);
+    std::memset(&g_ee, 0x3C, sizeof(g_ee)); g_ee.r[2].ud[0] = 1; g_ee.r[16].ud[0] = 77;
+}
+extern "C" void f_001D8F58() {
+    ++grounding; groundOut = arg_u32(0);
+    groundX = getf(arg_u32(1)); groundZ = getf(arg_u32(1) + 4);
+    groundFx = getf(arg_u32(2)); groundFz = getf(arg_u32(2) + 4);
+    std::memset(&g_ee, 0x77, sizeof(g_ee));
+}
 extern "C" uint32_t ee_read32_slow(uint32_t) { std::abort(); }
 extern "C" void ee_write32_slow(uint32_t, uint32_t) { std::abort(); }
 extern "C" uint8_t ee_read8_slow(uint32_t) { std::abort(); }
@@ -149,7 +264,7 @@ extern "C" void f_0020FD48_orig() {
     require(arg_u32(0) == description, "native world receives original description");
     ++originalWorldCalls;
     if (createSceneInOriginal)
-        for (uint32_t i = 0; i < 4; ++i) ee_w32(0x3D1C90 + 4 * i, sceneBase + 0x1000 * i);
+        for (uint32_t i = 0; i < 12; ++i) ee_w32(0x3D1C90 + 4 * i, sceneBase + 0x1000 * i);
     std::memset(&g_ee, 0x5A, sizeof(g_ee));
     g_ee.r[29].ud[0] = 0x100000;
     nativeWorldReturn = g_ee;
@@ -160,12 +275,12 @@ extern "C" void f_002CE180() {
 }
 extern "C" void f_0017DE78() {
     require(originalWorldCalls > 0, "lookup must follow native car construction");
-    require(arg_u32(0) < 4 && arg_u32(1) == 0, "weapon lookup uses car owner and weapon slot zero");
-    ++lookupCalls; g_ee.r[2].ud[0] = registry[arg_u32(0)];
+    require(arg_u32(0) < battle_layout::kCapacity && arg_u32(1) == 0, "weapon lookup uses car owner and weapon slot zero");
+    ++lookupCalls; g_ee.r[2].ud[0] = arg_u32(0) < registry.size() ? registry[arg_u32(0)] : 0;
 }
 extern "C" void f_00227EE8() {
     const uint32_t owner = arg_u32(0);
-    require(owner < 4 && ee_r32(record(owner)) == 0x51, "only native AI records get weapons");
+    require(owner < battle_layout::kCapacity && ee_r32(record(owner)) == 0x51, "only native AI records get weapons");
     require(arg_u32(1) == 0x51 && arg_u32(2) == record(owner) + 0x44,
             "weapon bridge retains native call argument layout");
     require(g_ee.r[29].uw[0] == 0x100000, "native factory gets restored EE stack");
@@ -180,6 +295,6 @@ extern "C" void f_00227EE8() {
 }
 
 int main() {
-    countCases(); weaponsAndIdentity(); capacity();
+    countCases(); weaponsAndIdentity(); capacity(); variantCounts(); placement(); mixedClasses();
     std::puts("Battle construction bridge checks passed");
 }

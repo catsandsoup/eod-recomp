@@ -36,6 +36,20 @@
 #include "../pad_script.h"
 #include "../platform.h"
 #include "sdl_input.h"
+#ifndef EOD_DISPLAY_BACKEND_TEST
+#include "../../ui/frontend.h"
+#include "../../ui/overlay.h"
+#else  // the display composition test links this file without the front end
+inline bool overlay_key(int, bool) { return false; }
+inline void overlay_char(unsigned) {}
+inline void overlay_mouse_move(float, float) {}
+inline void overlay_mouse_button(bool) {}
+inline void overlay_mouse_wheel(float) {}
+inline bool overlay_menu_open() { return false; }
+inline bool overlay_captures_input() { return false; }
+namespace frontend { inline uint8_t shape_axis(uint8_t v, int, int, int) { return v; }
+inline uint8_t shape_trigger(uint8_t v, int, int) { return v; } }
+#endif
 
 namespace {
 
@@ -140,6 +154,28 @@ SDL_Scancode vk_to_scancode(int vk) {
     return SDL_SCANCODE_UNKNOWN;
 }
 
+int scancode_to_vk(SDL_Scancode sc) {
+    for (int vk = 1; vk < 256; ++vk)
+        if (vk_to_scancode(vk) == sc) return vk;
+    if (sc == SDL_SCANCODE_RSHIFT) return 0x10;
+    if (sc == SDL_SCANCODE_KP_ENTER) return 0x0D;
+    return 0;
+}
+
+// Printable character of a key for the front end's text fields (codes, addresses).
+char key_char(int vk, bool shift) {
+    if (vk >= 'A' && vk <= 'Z') return shift ? (char)vk : (char)(vk - 'A' + 'a');
+    if (vk >= '0' && vk <= '9') return vk == '0' || !shift ? (char)vk : 0;
+    switch (vk) {
+    case 0xBE: return '.';
+    case 0xBD: return shift ? '_' : '-';
+    case 0xBA: return shift ? ':' : ';';
+    case 0xBF: return '/';
+    case 0x20: return ' ';
+    default: return 0;
+    }
+}
+
 void build_key_map() {
     g_key_map.clear();
     g_keyboard = {};
@@ -208,8 +244,10 @@ bool platform_init(const PlatformConfig &cfg) {
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
     const char *keyboard_override = getenv("EOD_KEYBOARD_PORT");
-    sdl_input::set_keyboard_port(keyboard_override && keyboard_override[0]
-        ? sdl_input::keyboard_port_from_env() : g_config.keyboard_port - 1);
+    const bool explicit_keyboard_port = keyboard_override && keyboard_override[0];
+    // Saved KeyboardPort never takes a port away from the first/second controller.
+    sdl_input::set_keyboard_port(explicit_keyboard_port
+        ? sdl_input::keyboard_port_from_env() : g_config.keyboard_port - 1, explicit_keyboard_port);
     sdl_input::set_controller_layout(g_config.controller_layout == "modern");
     sdl_input::set_hints();
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
@@ -278,31 +316,38 @@ bool platform_pump() {
         case SDL_EVENT_GAMEPAD_REMOVED:
             sdl_input::on_removed(e.gdevice.which);
             break;
+        case SDL_EVENT_MOUSE_MOTION: {
+            const float d = g_window ? SDL_GetWindowPixelDensity(g_window) : 1.0f;
+            overlay_mouse_move(e.motion.x * d, e.motion.y * d);
+            break;
+        }
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            if (e.button.button == SDL_BUTTON_LEFT) overlay_mouse_button(e.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            overlay_mouse_wheel(e.wheel.y);
+            break;
         case SDL_EVENT_KEY_UP:
             time_key_event(e.key);
+            overlay_key(scancode_to_vk(e.key.scancode), false);
             break;
         case SDL_EVENT_KEY_DOWN:
             time_key_event(e.key);
+            if (!g_headless && !(e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_F && (e.key.mod & SDL_KMOD_GUI)))) {
+                // the in-game front end: F1 / Esc / Cmd+, open it; while open it takes every key
+                const int vk = (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)) ? 0x70 : scancode_to_vk(e.key.scancode);
+                const bool open = overlay_menu_open();
+                if (vk && (!e.key.repeat || open) && overlay_key(vk, true)) {
+                    if (open) if (char c = key_char(vk, (e.key.mod & SDL_KMOD_SHIFT) != 0)) overlay_char((unsigned char)c);
+                    break;
+                }
+            }
             if (!g_headless && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F2) {
                 const std::string help = sdl_input::help_text(g_config.keyboard_layout == "racing", g_config.keys[KEY_CROSS]);
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Controls and player 2", help.c_str(), g_window);
                 break;
             }
-#ifdef __APPLE__
-            if (!g_headless && !e.key.repeat && (e.key.scancode == SDL_SCANCODE_F1 ||
-                (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)))) {
-                if (mac_app_settings()) {
-                    build_key_map();
-                    update_audio_gain();
-                    // Aspect and camera projection both change on the next launch.
-                    g_cfg.smooth = g_config.smooth_display;
-                    if (g_texture) SDL_SetTextureScaleMode(g_texture, g_cfg.smooth ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
-                    SDL_SetWindowSize(g_window, g_config.width, g_config.height);
-                    SDL_SetWindowFullscreen(g_window, g_config.fullscreen);
-                }
-                break;
-            }
-#endif
             // Cmd+F / F11: toggle fullscreen
             if (g_window && (e.key.scancode == SDL_SCANCODE_F11 ||
                              (e.key.scancode == SDL_SCANCODE_F && (e.key.mod & SDL_KMOD_GUI)))) {
@@ -497,13 +542,55 @@ void platform_set_mod_overlay(bool visible) {
     g_mod_overlay_visible = visible;
 }
 
+#ifndef EOD_DISPLAY_BACKEND_TEST
+void overlay_platform_pad(int port, HostPadState *out) {
+    // menus read buttons only (Original mapping): a Modern trigger's gas/brake pressure never selects
+    *out = HostPadState();
+    if (port < 0 || port >= kPorts) return;
+    if (pad_script_state(port, out)) return;
+    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port))
+        sdl_input::read_menu_gamepad(gp, out, g_headless || (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
+}
+std::string overlay_platform_device(int port, bool *xbox) { return sdl_input::port_description(port, xbox); }
+void overlay_platform_apply() {
+    build_key_map();
+    update_audio_gain();
+    sdl_input::set_controller_layout(g_config.controller_layout == "modern");
+    const char *keyboard_override = getenv("EOD_KEYBOARD_PORT");
+    if (!(keyboard_override && keyboard_override[0])) sdl_input::set_keyboard_port(g_config.keyboard_port - 1, false);
+}
+void overlay_platform_swap_ports() { sdl_input::swap_ports(); }
+bool overlay_platform_display(int *w, int *h) {
+    if (!g_window) return false;
+    return SDL_GetWindowSizeInPixels(g_window, w, h) && *w > 0 && *h > 0;
+}
+std::string overlay_platform_mods_root() {
+#ifdef __APPLE__
+    return mac_app_support() + "/mods";
+#else
+    return "mods";
+#endif
+}
+#endif
+
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     if (port < 0 || port >= kPorts) return;
+    if (overlay_captures_input()) {  // the front end has the input: the game sees a neutral pad
+        out->connected = true;
+        return;
+    }
     auto ctx = keyboard_context(); // also observed in headless/scripted tests
     if (port == sdl_input::keyboard_port()) read_keyboard(out, ctx);
-    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) sdl_input::read_gamepad(gp, out, g_headless ||
-        (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
+    if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) {
+        sdl_input::read_gamepad(gp, out, g_headless || (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
+        // per-player stick shaping and trigger response (front end INPUTS tab): input mapping only
+        const int p = port & 1;
+        out->lx = frontend::shape_axis(out->lx, g_config.stick_deadzone[p], g_config.stick_outer[p], g_config.stick_curve[p]);
+        out->ly = frontend::shape_axis(out->ly, g_config.stick_deadzone[p], g_config.stick_outer[p], g_config.stick_curve[p]);
+        for (int i : {6, 7, 10, 11})  // Modern gas/brake (Cross/Square) or Original L2/R2 pressure
+            out->pressure[i] = frontend::shape_trigger(out->pressure[i], g_config.trigger_deadzone[p], g_config.trigger_curve[p]);
+    }
     // EOD_PAD_SCRIPT / EOD_PAD_SCRIPT1 (automated tests) replace the port
     if (!pad_script_state(port, out)) {
         static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,

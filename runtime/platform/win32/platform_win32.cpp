@@ -375,7 +375,7 @@ void platform_get_pad(int port, HostPadState *out) {
         out->pressure[11] = c.pressure[11];
     }
     // the in-game menu has the input
-    if (overlay_menu_open()) {
+    if (overlay_captures_input()) {
         *out = HostPadState();
         out->connected = true;
     }

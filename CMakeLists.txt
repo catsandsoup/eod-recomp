@@ -119,6 +119,14 @@ else()
     list(APPEND PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/platform_sdl3.cpp
                                  ${CMAKE_SOURCE_DIR}/runtime/platform/sdl3/sdl_input.cpp)
   endif()
+  # The in-game front end (runtime/ui; overlay.cpp is the Win32 plumbing) and Dear ImGui,
+  # drawn by the Vulkan presenter on macOS.
+  set(IMGUI_SOURCES ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
+      ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_widgets.cpp)
+  set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+  list(APPEND PLATFORM_SOURCES ${IMGUI_SOURCES} ${CMAKE_SOURCE_DIR}/runtime/ui/overlay_core.cpp
+       ${CMAKE_SOURCE_DIR}/runtime/ui/frontend.cpp ${CMAKE_SOURCE_DIR}/runtime/ui/frontend_draw.cpp
+       ${CMAKE_SOURCE_DIR}/runtime/ui/ui_art.cpp)
 endif()
 
 if(NOT WIN32)
@@ -217,6 +225,13 @@ if(BUILD_TESTING)
   target_include_directories(battle_events_test PRIVATE runtime runtime/include src)
   add_test(NAME battle_event_resources COMMAND battle_events_test)
   set_tests_properties(battle_event_resources PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
+  add_executable(session_start_test tests/session_start_test.cpp src/session_start.cpp)
+  target_include_directories(session_start_test PRIVATE runtime runtime/include src)
+  add_test(NAME session_start_parser COMMAND session_start_test)
+  add_executable(frontend_menu_test tests/frontend_menu_test.cpp runtime/ui/frontend.cpp runtime/core/config.cpp)
+  target_include_directories(frontend_menu_test PRIVATE runtime runtime/include)
+  add_test(NAME frontend_menu COMMAND frontend_menu_test)
+  set_tests_properties(frontend_menu PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   add_executable(battle_bots_test tests/battle_bots_test.cpp src/battle_bots.cpp)
   target_include_directories(battle_bots_test PRIVATE runtime runtime/include src)
   add_test(NAME battle_bot_construction COMMAND battle_bots_test)
@@ -412,6 +427,11 @@ if(APPLE)
   target_sources(eod PRIVATE runtime/app/macos_vulkan.cpp runtime/app/macos_app.mm runtime/app/disc_import.cpp runtime/app/iso9660.cpp)
   target_link_libraries(eod PRIVATE "-framework Cocoa")
   set_source_files_properties(runtime/app/macos_app.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  add_executable(eod_mac_mod_profile_test tools/tests/mac_mod_profile_test.cpp
+    runtime/app/macos_app.mm runtime/core/config.cpp runtime/app/disc_import.cpp runtime/app/iso9660.cpp)
+  target_include_directories(eod_mac_mod_profile_test PRIVATE runtime runtime/include)
+  target_link_libraries(eod_mac_mod_profile_test PRIVATE "-framework Cocoa")
+  add_test(NAME mac_mod_profiles COMMAND eod_mac_mod_profile_test "${CMAKE_CURRENT_BINARY_DIR}/test-mac-mod-profiles")
   option(EOD_MAC_APP "Build a local, ad-hoc signed macOS application bundle" OFF)
   if(EOD_MAC_APP)
     set(EOD_APP_OUTPUT "$ENV{HOME}/Library/Application Support/TDEODRecomp/local-build"

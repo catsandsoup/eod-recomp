@@ -82,6 +82,7 @@ bool config_load(const std::string &path, Config &c) {
     if (&c == &g_config) g_config_path = path;
     FILE *f = fopen(path.c_str(), "r");
     const bool file_loaded = f != nullptr;
+    int input_defaults = 0;  // [Input] InputDefaults: 2 = written after triggers became the default
     char line[1024];
     std::string section;
     while (f && fgets(line, sizeof line, f)) {
@@ -114,7 +115,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "Width")) c.width = num(320, 16384);
             else if (ieq(k, "Height")) c.height = num(240, 16384);
             else if (ieq(k, "VSync")) c.vsync = to_bool(v);
-            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "stretch") ? "stretch" : ieq(v, "4:3") ? "4:3" : "auto";
+            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "16:10") ? "16:10" : ieq(v, "stretch") ? "stretch" : ieq(v, "4:3") ? "4:3" : "auto";
 #ifdef __APPLE__
             else if (ieq(k, "RenderScale")) c.render_scale = num(0, 6);  // 0 = auto (Vulkan)
 #else
@@ -128,8 +129,19 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "Volume")) c.volume = num(0, 100);
         } else if (ieq(section, "Input")) {
             if (ieq(k, "Vibration")) c.vibration = to_bool(v);
+            else if (ieq(k, "P1Deadzone")) c.stick_deadzone[0] = num(0, 50);
+            else if (ieq(k, "P2Deadzone")) c.stick_deadzone[1] = num(0, 50);
+            else if (ieq(k, "P1OuterDeadzone")) c.stick_outer[0] = num(50, 100);
+            else if (ieq(k, "P2OuterDeadzone")) c.stick_outer[1] = num(50, 100);
+            else if (ieq(k, "P1SteeringCurve")) c.stick_curve[0] = num(50, 300);
+            else if (ieq(k, "P2SteeringCurve")) c.stick_curve[1] = num(50, 300);
+            else if (ieq(k, "P1TriggerDeadzone")) c.trigger_deadzone[0] = num(0, 50);
+            else if (ieq(k, "P2TriggerDeadzone")) c.trigger_deadzone[1] = num(0, 50);
+            else if (ieq(k, "P1TriggerCurve")) c.trigger_curve[0] = num(50, 300);
+            else if (ieq(k, "P2TriggerCurve")) c.trigger_curve[1] = num(50, 300);
 #ifndef _WIN32  // SDL3 input options
             else if (ieq(k, "KeyboardPort")) c.keyboard_port = num(-1, 2);
+            else if (ieq(k, "InputDefaults")) input_defaults = atoi(v.c_str());
             else if (ieq(k, "ControllerLayout") && (ieq(v, "original") || ieq(v, "modern")))
                 c.controller_layout = ieq(v, "modern") ? "modern" : "original";
             else if (ieq(k, "KeyboardLayout") && (ieq(v, "original") || ieq(v, "racing")))
@@ -159,6 +171,11 @@ bool config_load(const std::string &path, Config &c) {
         }
     }
     if (f) fclose(f);
+#ifndef _WIN32
+    // Older files stored ControllerLayout=original only because it was the default then; analog
+    // trigger gas/brake is the default now (an explicit choice is kept once the file is rewritten).
+    if (file_loaded && input_defaults < 2) c.controller_layout = "modern";
+#endif
 
     // Environment variable overrides apply even on first launch without an ini.
     if (const char *e = getenv("EOD_UNLOCK_ALL")) c.unlock_all = to_bool(e);
@@ -211,8 +228,16 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "KeyboardPort=%d\n", c.keyboard_port);
 #endif
     fprintf(f, "Vibration=%d\n", c.vibration ? 1 : 0);
+    for (int p = 0; p < 2; p++) {
+        fprintf(f, "P%dDeadzone=%d        ; left stick inner dead zone, percent (input mapping only)\n", p + 1, c.stick_deadzone[p]);
+        fprintf(f, "P%dOuterDeadzone=%d  ; stick travel that already counts as full lock, percent\n", p + 1, c.stick_outer[p]);
+        fprintf(f, "P%dSteeringCurve=%d  ; 100 = linear, higher = finer near the centre\n", p + 1, c.stick_curve[p]);
+        fprintf(f, "P%dTriggerDeadzone=%d ; analog gas/brake trigger dead zone, percent\n", p + 1, c.trigger_deadzone[p]);
+        fprintf(f, "P%dTriggerCurve=%d   ; 100 = linear trigger travel\n", p + 1, c.trigger_curve[p]);
+    }
 #ifndef _WIN32
-    fprintf(f, "ControllerLayout=%s\n", c.controller_layout.c_str());
+    fprintf(f, "ControllerLayout=%s     ; modern: RT/LT analog gas/brake, stick clicks = L2/R2; original: PS2 L2/R2\n", c.controller_layout.c_str());
+    fprintf(f, "InputDefaults=2\n");
     fprintf(f, "KeyboardLayout=%s\n", c.keyboard_layout.c_str());
 #endif
     fprintf(f, "\n[Gameplay]\n");

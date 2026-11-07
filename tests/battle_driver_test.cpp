@@ -1,5 +1,6 @@
 #include "core/config.h"
 #include "battle_driver.h"
+#include "battle_layout.h"
 #include "core/cpu.h"
 #include <cmath>
 #include <cstdio>
@@ -35,7 +36,7 @@ static void reset() {
     battle_driver_reset(); bots_active=true;
     std::fill(ram.begin(),ram.end(),0);g_ram=ram.data();g_ee={};g_config=Config{};
     MEM_SW(0x3C4190,9);MEM_SW(0x3CF19C,0x18000224);MEM_SW(0x3CF194,bm);MEM_SW(bm,0x3F7770);
-    MEM_SW(bm+4,1);MEM_SW(bm+0x5A8,2);MEM_SW(0x3CF198,1);MEM_SW(0x3C41AC,1);
+    MEM_SW(bm+4,1);MEM_SW(bm+battle_layout::kCount,2);MEM_SW(0x3CF198,1);MEM_SW(0x3C41AC,1);
     MEM_SW(0x447458,human);MEM_SW(0x44745C,bot);MEM_SW(bot+0x1C1C,ctrl);
     MEM_SW(ctrl,0x3F2FB0);putf(bot+0x64,1);putf(bot+0x84,1);putf(human+0x90,25);
     MEM_SW(0x3CE4B8,1);MEM_SW(0x3CE3F8,1);MEM_SW(0x3CE3FC,0);
@@ -67,7 +68,8 @@ int main(){
     for(uint32_t flags:{0u,1u,8u}) {reset();MEM_SW(0x3C4190,flags);tick(1);require(!fire_calls,"native master and weapon gates required");}
     reset();putf(bot+0x104,10);tick(1);for(int i=1;i<=19;++i)tick(1+i*.1f);
     require((int)MEM_LW(bot+0x1B90)==-1,"no displacement triggers recovery even with nonzero reported velocity");
-    reset();MEM_SW(bm+0x5A8,5);tick(1);require(!fire_calls,"reject unsupported participant count");
+    reset();MEM_SW(bm+battle_layout::kCount,battle_layout::kCapacity+1);tick(1);require(!fire_calls,"reject participant count beyond the enlarged BattleMaster");
+    reset();MEM_SW(bm+battle_layout::kCount,10);tick(1);require(fire_calls==1,"ten-car Battle (8 AI + 2 humans) is driven");
     reset();tick(1);for(int i=1;i<=19;++i)tick(1+i*.1f);
     require((int)MEM_LW(bot+0x1B90)==-1,"stationary bot reverses out of pin");
     tick(5.0f);require((int)MEM_LW(bot+0x1B90)==-10,"recovery returns to forward driving");

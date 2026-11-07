@@ -1,4 +1,4 @@
-// Optional source Cup fast geometry. Native classes and absent extensions retain
+// Optional source Cup/Pace fast geometry. Native classes and absent extensions retain
 // the exact original path. No extra model submission or texture/depth workaround.
 #include <cstdio>
 #include <cstdlib>
@@ -17,11 +17,11 @@ extern "C" void f_0034CEF0(){
         f_0034CEF0_orig();return;
     }
     char before[16];std::memcpy(before,g_ram+address,16);
-    if(std::memcmp(before,"ncu",3) || before[3]<'0' || before[3]>'4' ||
+    if((std::memcmp(before,"ncu",3) && std::memcmp(before,"npc",3)) || before[3]<'0' || before[3]>'4' ||
        std::memcmp(before+4,".mod\0",5)){
         f_0034CEF0_orig();return;
     }
-    char fast[10]={'n','c','u',before[3],'f','.','m','o','d',0};
+    char fast[10]={before[0],before[1],before[2],before[3],'f','.','m','o','d',0};
     std::memcpy(g_ram+address,fast,sizeof fast);
     // Use the native resident-resource lookup. It may overwrite every EE
     // register; restore all input state before the one actual model load.
@@ -41,7 +41,7 @@ extern "C" void f_00220788(){
     const uint32_t wheel=arg_u32(0),lod=arg_u32(1);
     if(trace() && wheel && wheel<EE_RAM_SIZE-0x44 && lod<5){
         const uint32_t klass=ee_r32(wheel);
-        if(klass && klass<EE_RAM_SIZE-0xb4 && !std::memcmp(g_ram+klass,"ncu\0",4)){
+        if(klass && klass<EE_RAM_SIZE-0xb4 && (!std::memcmp(g_ram+klass,"ncu\0",4) || !std::memcmp(g_ram+klass,"npc\0",4))){
             const uint32_t car=ee_r32(wheel+8),side=ee_r32(wheel+12);
             const bool fast=(ee_r32(wheel+4)&0x10)!=0;
             static uint32_t states[160]{};static unsigned lines;
