@@ -195,6 +195,8 @@ struct Session::Impl {
     // ---- voice chat (Opus 48 kHz mono + Halo HUD indicator)
     netplay::voice::Session voice;
     bool mic_enabled = false, muted_all = false, deafened = false, mic_open = false;
+    std::string host_address;
+    uint64_t mic_retry_at = 0;
     uint64_t speaking_until[kMaxPlayers] = {};
     uint64_t last_voice_playout = 0;
     mutable std::mutex voice_mtx;
@@ -212,9 +214,10 @@ struct Session::Impl {
         } else {
             if (voice.active()) voice.stop();
         }
-        const bool want_mic = mic_enabled && !deafened;
+        const bool want_mic = connected && voice.active() && mic_enabled && !deafened;
         if (want_mic && !mic_open) {
             mic_open = platform_mic_open((int)netplay::voice::SampleRate);
+            mic_retry_at = now_us() + 3000000;
         } else if (!want_mic && mic_open) {
             platform_mic_close();
             mic_open = false;
@@ -222,15 +225,18 @@ struct Session::Impl {
     }
     void poll_voice(uint64_t t) {
         const uint8_t local_id = (role == Role::Guest && welcomed) ? my_id : 0;
-        if (mic_enabled && !deafened) {
-            if (!mic_open) mic_open = platform_mic_open((int)netplay::voice::SampleRate);
+        if (voice.active() && mic_enabled && !deafened) {
+            if (!mic_open && t >= mic_retry_at) {
+                mic_open = platform_mic_open((int)netplay::voice::SampleRate);
+                mic_retry_at = t + 3000000;
+            }
             netplay::voice::Frame frame{};
             int batches = 0;
             while (mic_open && batches++ < 4 && platform_mic_read(frame.data(), (int)netplay::voice::FrameSamples) == (int)netplay::voice::FrameSamples) {
                 int peak = 0;
                 for (int16_t s : frame) peak = std::max(peak, std::abs((int)s));
                 if (peak > 500 && local_id < kMaxPlayers) speaking_until[local_id] = t + 300000;
-                if (voice.active() && local_id < kMaxPlayers && t < speaking_until[local_id]) {
+                if ((role != Role::Host || alive_count() > 0) && local_id < kMaxPlayers && t < speaking_until[local_id]) {
                     netplay::voice::Packet pkt;
                     if (voice.encode(frame, pkt) && pkt.size > 0) {
                         Writer w;
@@ -244,7 +250,7 @@ struct Session::Impl {
                 }
             }
         }
-        if (!voice.active()) { last_voice_playout = t; return; }
+        if (!voice.active() || (role == Role::Host && alive_count() == 0)) { last_voice_playout = t; return; }
         if (!last_voice_playout || t - last_voice_playout > 100000) last_voice_playout = t - 20000;
         while (t - last_voice_playout >= 20000) {
             last_voice_playout += 20000;
@@ -483,13 +489,15 @@ game_frontend::Snapshot Session::snapshot() const {
     s.direct_connect = true; s.internet_invites = true; s.native_race_sync = true;
     s.voice = netplay::voice::Session::available();
     s.microphone_enabled = d.mic_enabled;
+    s.microphone_capture = d.mic_open;
     s.muted = d.muted_all;
     s.deafened = d.deafened;
     s.error = d.last_error;
     s.content_problem = d.content_note;
     s.is_host = d.role == Impl::Role::Host;
     if (d.role == Impl::Role::None) {
-        s.phase = S::Phase::Offline; s.status = "Not connected";
+        s.phase = in_event_ ? S::Phase::Results : S::Phase::Offline;
+        s.status = in_event_ ? "Leaving the match" : "Not connected";
         if (d.online_on) s.route = d.route_text;
         uint64_t t = now_us();
         for (auto &kv : d.crew)
@@ -498,10 +506,13 @@ game_frontend::Snapshot Session::snapshot() const {
         s.phase = S::Phase::Connecting; s.status = d.join_note.empty() ? "Connecting..." : d.join_note; s.can_cancel = true;
         s.route = d.route_text;
     } else {
-        s.phase = in_event_ ? S::Phase::Racing : (d.role == Impl::Role::Host ? S::Phase::Hosting : S::Phase::Lobby);
-        if (d.role == Impl::Role::Host) { s.phase = in_event_ ? S::Phase::Racing : S::Phase::Lobby; }
-        s.status = d.status; s.can_cancel = true;
-        s.invite = d.role == Impl::Role::Host ? local_ip() + ":" + std::to_string(d.port) : "";
+        s.phase = d.abort_requested ? S::Phase::Results : in_event_ && d.bound ? S::Phase::Racing :
+                  (in_event_ || d.pending_start) ? S::Phase::Loading : S::Phase::Lobby;
+        s.status = s.phase == S::Phase::Results ? "Returning to lobby" :
+                   s.phase == S::Phase::Racing ? "Racing" :
+                   s.phase == S::Phase::Loading ? "Loading race" : d.status;
+        s.can_cancel = true;
+        s.invite = d.role == Impl::Role::Host ? d.host_address : "";
         s.address = s.invite;
         s.code = d.role == Impl::Role::Host ? d.code : "";
         s.track_pic = d.role == Impl::Role::Host ? d.track_name : d.lobby_track; s.car_pic = d.my_vehicle;
@@ -514,7 +525,10 @@ game_frontend::Snapshot Session::snapshot() const {
                 const bool mtd = p.id != local_id && (d.muted_all || d.deafened);
                 s.players.push_back({p.id, p.name + "  " + p.vname + (p.id ? "  " + std::to_string(p.ping) + "ms" : ""), p.ready, mtd, spk});
             }
-            s.can_start = !in_event_ && session_catalog::ready();
+            s.can_start = s.phase == S::Phase::Lobby && d.in_menu && session_catalog::ready() &&
+                          d.all_peers([](const Peer &p) { return p.at_menu && p.ready; });
+            if (!s.can_start && s.phase == S::Phase::Lobby)
+                s.status = d.in_menu ? "Waiting for game data or players to be ready" : "Waiting for the game main menu";
             s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, true, "The host chooses the track. Left/right changes it."});
             s.options.push_back({"mode", "MODE", d.mode_name(), true, "The event everyone plays. The host chooses; left/right changes it."});
         } else {
@@ -529,9 +543,10 @@ game_frontend::Snapshot Session::snapshot() const {
         }
         s.options.push_back({"car", "YOUR CAR", d.my_model.empty() ? "Loading game data..." : d.my_model, true, "Your own car. Left/right changes it; everybody picks their own."});
         s.options.push_back({"paint", "PAINT", d.my_model.empty() ? "-" : "PAINT " + std::to_string(d.my_paint + 1) + " OF " + std::to_string(std::max<size_t>(1, session_catalog::paints(d.my_model).size())), true, "The paint of your car."});
-        s.options.push_back({"info", "HOW IT STARTS", "HOST PRESSES START", false,
+        if (s.phase == S::Phase::Lobby) s.options.push_back({"info", "HOW IT STARTS", "HOST PRESSES START", false,
                              "START loads the event straight away on every machine, each player in their own car."});
     }
+    if (s.phase != S::Phase::Lobby) for (auto &o : s.options) o.editable = false;
     uint64_t t = now_us();
     for (auto &kv : d.lan) if (t - kv.second.seen < 4000000) s.lan.push_back({kv.second.name, kv.first, kv.second.players});
     s.strip = d.strip;
@@ -542,11 +557,21 @@ void Session::submit(game_frontend::Command c) {
     Impl &d = *d_;
     using K = game_frontend::Command::Kind;
     d.last_error.clear();
+    const bool joining = c.kind == K::Host || c.kind == K::JoinCode || c.kind == K::JoinAddress || c.kind == K::JoinCrew;
+    if (joining) {
+        if (in_event_ || d.role != Impl::Role::None) return;
+        d.event_id = 0;
+        d.pending_start = false;
+        d.abort_requested = false;
+        d.inject_count = 0;
+        d.my_phase = P_LOBBY;
+    }
     switch (c.kind) {
     case K::Host: {
         if (d.role != Impl::Role::None) return;
         if (!d.open(kGamePort, true)) { d.last_error = "Could not open the network port. Another copy of the game may already be hosting; close it and try again."; return; }
         d.load_friends();
+        d.host_address = local_ip() + ":" + std::to_string(d.port);
         d.role = Impl::Role::Host; d.peers.clear(); d.status = "Waiting for friends"; d.my_phase = P_LOBBY;
         d.my_vehicle = d.my_vehicle ? d.my_vehicle : 0;
         d.code = std::getenv("EOD_NETPLAY_CODE") ? std::getenv("EOD_NETPLAY_CODE") : Impl::new_code();
@@ -597,12 +622,13 @@ void Session::submit(game_frontend::Command c) {
         break;
     }
     case K::Ready:
-        if (d.role == Impl::Role::Guest) d.guest_ready = c.enabled;
+        if (d.role == Impl::Role::Guest && d.welcomed && !in_event_ && !d.pending_start) d.guest_ready = c.enabled;
         break;
     case K::Start: {
-        if (d.role != Impl::Role::Host || in_event_) return;
+        if (d.role != Impl::Role::Host || d.pending_start || in_event_) return;
         if (!d.in_menu) { d.last_error = "Go back to the game's main menu first (leave the current event), then press START."; return; }
         for (auto &kv : d.peers) if (kv.second.alive && !kv.second.at_menu) { d.last_error = kv.second.name + " is not at the main menu yet."; return; }
+        for (const auto &kv : d.peers) if (kv.second.alive && !kv.second.ready) { d.last_error = kv.second.name + " is not ready."; return; }
         if (!session_catalog::ready() || d.track_name.empty()) { d.last_error = "The game data is still loading. Wait a moment at the main menu, then press START."; return; }
         d.ensure_defaults();
         d.event_id++; d.start_info = {d.mode_name(), d.track_name, d.event_id, (uint32_t)now_us() ^ 0x5bd1e995u, d.my_vehicle, true};
@@ -613,9 +639,15 @@ void Session::submit(game_frontend::Command c) {
         break;
     }
     case K::EndEvent: {
-        if (d.role != Impl::Role::Host || !in_event_) return;
+        if (d.role != Impl::Role::Host || (!in_event_ && !d.pending_start)) return;
         Writer w; w.u32(d.event_id);
         for (auto &kv : d.peers) if (kv.second.alive) d.send_to(kv.second.addr, K_END, 0, w);
+        if (d.pending_start) {
+            d.pending_start = false;
+            d.status = "Back in the lobby";
+            overlay_show_online();
+            return;
+        }
         d.strip = "Returning to lobby...";
         d.abort_requested = true;
         session_abort_event();
@@ -627,12 +659,14 @@ void Session::submit(game_frontend::Command c) {
         for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
         d.puppet_cars.clear(); d.remote.clear(); d.shown.clear();
         if (in_event_) { d.abort_requested = true; session_abort_event(); }
-        d.role = Impl::Role::None; d.peers.clear(); d.close_game(); d.status.clear(); d.welcomed = false; d.lobby_players.clear();
+        d.pending_start = false; d.role = Impl::Role::None; d.peers.clear(); d.close_game(); d.status.clear(); d.welcomed = false; d.lobby_players.clear();
         d.joining_online = false; d.code.clear(); d.route_text.clear(); d.crew.clear(); d.content_note.clear();
         d.sync_voice();
         break;
     }
     case K::Option: {
+        if (d.role == Impl::Role::None || d.pending_start || in_event_) return;
+        if (d.role == Impl::Role::Guest && (c.text == "car" || c.text == "paint")) d.guest_ready = false;
         d.cycle(c.text, c.value >= 0 ? 1 : -1);
         break;
     }
@@ -676,9 +710,17 @@ void Session::auto_drive(uint64_t t) {
         t0 = t;
     }
     { static uint64_t lastp = 0; if (d.role == Impl::Role::Host && t - lastp > 3000000) { lastp = t; std::fprintf(stderr, "[netplay] auto: peers=%d in_menu=%d event=%u\n", d.alive_count(), (int)d.in_menu, d.event_id); } }
-    if (d.role == Impl::Role::Host && !s.event_active() && !d.event_id && d.alive_count() >= 1 && d.in_menu) {
+    if (d.role == Impl::Role::Guest && d.welcomed && d.in_menu && !d.guest_ready) {
+        Command ready{}; ready.kind = Command::Kind::Ready; ready.enabled = true; s.submit(ready);
+    }
+    const bool repeat = std::getenv("EOD_NETPLAY_TEST_REMATCH") != nullptr;
+    if (repeat && s.is_host() && in_event_ && !d.abort_requested && d.tick >= 120) {
+        Command end{}; end.kind = Command::Kind::EndEvent; s.submit(end);
+    }
+    if (d.role == Impl::Role::Host && !s.event_active() && !d.pending_start &&
+        (!d.event_id || (repeat && d.event_id == 1)) && (d.alive_count() >= 1 || std::getenv("EOD_NETPLAY_TEST_SOLO")) && d.in_menu) {
         if (!ready_since) ready_since = t;
-        if (t - ready_since > 3000000) { Command c{}; c.kind = Command::Kind::Start; s.submit(c); if (!d.last_error.empty()) { std::fprintf(stderr, "[netplay] start refused: %s\n", d.last_error.c_str()); ready_since = t; } }
+        if (t - ready_since > 3000000) { ready_since = t; Command c{}; c.kind = Command::Kind::Start; s.submit(c); if (!d.last_error.empty()) { std::fprintf(stderr, "[netplay] start refused: %s\n", d.last_error.c_str()); ready_since = t; } }
     }
 }
 
@@ -686,7 +728,20 @@ void Session::poll() {
     Impl &d = *d_;
     if (d.abort_requested && g_ram && ee_r32(0x00437BB8) != 0) {
         session_abort_event();
-        d.abort_requested = false;
+    }
+    static const bool trace = std::getenv("EOD_NETPLAY_LIFECYCLE") != nullptr;
+    if (trace) {
+        static std::string previous;
+        const char *state = d.abort_requested ? "returning" : in_event_ ? (d.bound ? "racing" : "loading") :
+                            d.pending_start ? "starting" : d.role == Impl::Role::None ? "offline" :
+                            d.role == Impl::Role::Guest && !d.welcomed ? "connecting" : "lobby";
+        const std::string key = std::string(state) + ":" + std::to_string(d.event_id) + ":" +
+                                std::to_string(d.in_menu) + ":" + std::to_string((int)d.role);
+        if (key != previous) {
+            previous = key;
+            std::fprintf(stderr, "[lifecycle] ms=%u role=%d event=%u state=%s native_main=%d peers=%d\n",
+                         now_ms(), (int)d.role, d.event_id, state, (int)d.in_menu, d.alive_count());
+        }
     }
     auto_drive(now_us());
     const uint64_t t = now_us();
@@ -827,7 +882,7 @@ void Session::poll() {
                 for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
                 d.puppet_cars.clear(); d.remote.clear(); d.shown.clear();
                 if (in_event_) { d.abort_requested = true; session_abort_event(); }
-                d.role = Impl::Role::None; d.close_game(); d.lobby_players.clear(); d.sync_voice();
+                d.pending_start = false; d.role = Impl::Role::None; d.close_game(); d.lobby_players.clear(); d.sync_voice();
                 if (overlay_menu_open() || !in_event_) overlay_show_online();
                 return;
             } else if (kind == K_LOBBY) {
@@ -840,7 +895,7 @@ void Session::poll() {
                 if (r.ok && !d.remembered && !v.empty() && d.join_secret.size() == 32) { d.remembered = true; d.remember(v[0].name, d.join_secret); }
             } else if (kind == K_START) {
                 uint32_t id = r.u32(); std::string ev = r.str(); uint32_t seed = r.u32(); std::string tr = r.str();
-                if (r.ok && id != d.event_id) {
+                if (r.ok && id > d.event_id) {
                     d.ensure_defaults();
                     d.event_id = id; d.event_name = ev; d.pending_start = true; d.start_info = {ev, tr, id, seed, d.my_vehicle, false};
                     d.have_track = false; d.have_roster = false; d.go = false; d.car_done = false; d.loaded_sent = false; d.my_phase = P_LOBBY;
@@ -857,7 +912,11 @@ void Session::poll() {
                 uint32_t id = r.u32(); if (r.ok && id == d.event_id) d.go = true;
             } else if (kind == K_END) {
                 uint32_t id = r.u32();
-                if (r.ok && id == d.event_id) {
+                if (r.ok && id == d.event_id && d.pending_start) {
+                    d.pending_start = false;
+                    d.status = "Back in the lobby";
+                    overlay_show_online();
+                } else if (r.ok && id == d.event_id && in_event_) {
                     d.strip = "Returning to lobby...";
                     if (in_event_) { d.abort_requested = true; session_abort_event(); }
                 }
@@ -932,6 +991,15 @@ void Session::poll() {
                 if (d.go && !p.got_go) { Writer w; w.u32(d.event_id); d.send_to(p.addr, K_GO, 0, w); }
             }
         }
+        // Repeat the end notice until the guest heartbeat acknowledges the lobby.
+        if (!in_event_ && !d.pending_start && d.event_id) {
+            for (auto &kv : d.peers) {
+                const Peer &p = kv.second;
+                if (p.alive && p.seen_event == d.event_id && p.phase != P_LOBBY) {
+                    Writer end; end.u32(d.event_id); d.send_to(p.addr, K_END, 0, end);
+                }
+            }
+        }
         // LAN beacon
         if (!in_event_ && !std::getenv("EOD_NETPLAY_NO_LAN") && t - d.last_beacon > 1000000) {
             d.last_beacon = t;
@@ -988,7 +1056,8 @@ void Session::poll() {
             for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
             d.puppet_cars.clear(); d.remote.clear(); d.shown.clear();
             if (in_event_) { d.abort_requested = true; session_abort_event(); }
-            d.role = Impl::Role::None; d.close_game(); d.lobby_players.clear();
+            d.pending_start = false; d.role = Impl::Role::None; d.close_game(); d.lobby_players.clear(); d.sync_voice();
+            if (!in_event_) overlay_show_online();
         }
     }
 }
@@ -1025,8 +1094,6 @@ uint16_t Session::menu_buttons() {
     if (!d.in_menu || !d.pending_start || d.role == Impl::Role::None) return 0;
     const uint32_t c = d.inject_count++;
     if ((c % 6) >= 2) return 0;
-    const uint32_t sel = ee_r32(0x003D73FC);   // highlighted main menu row, 1 = ACTION (found by diffing RAM)
-    if (sel > 1 && sel < 16) return 0x10;      // UP
     StartInfo info;
     if (take_start(info) && netplay_hooks::arm) netplay_hooks::arm(info);
     return 0x4000;                             // CROSS
@@ -1059,7 +1126,7 @@ bool Session::wait_track(std::string &track) {
     return true;
 }
 std::string Session::strip() const { return d_->strip; }
-bool Session::active() const { return d_->role != Impl::Role::None; }
+bool Session::active() const { return in_event_ || d_->role != Impl::Role::None; }
 bool Session::is_host() const { return d_->role == Impl::Role::Host; }
 uint32_t Session::remote_humans() const { return in_event_ ? (uint32_t)(d_->role == Impl::Role::Host ? d_->alive_count() : (d_->lobby_players.size() > 1 ? d_->lobby_players.size() - 1 : 0)) : 0; }
 
@@ -1177,13 +1244,15 @@ void Session::event_ended() {
     Impl &d = *d_;
     if (!in_event_) return;
     in_event_ = false;
+    d.abort_requested = false;
     for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
     d.puppet_cars.clear(); d.remote.clear(); d.shown.clear(); d.bound = false; d.my_phase = P_DONE;
     if (d.role == Impl::Role::Host) { Writer w; w.u32(d.event_id); for (auto &kv : d.peers) d.send_to(kv.second.addr, K_END, 0, w); }
     d.my_phase = P_LOBBY; d.strip.clear();
     d.status = "Back in the lobby";
+    d.guest_ready = false;
     std::fprintf(stderr, "[netplay] event ended\n");
-    if (d.role != Impl::Role::None) overlay_show_online();
+    overlay_show_online();
 }
 
 void Session::step_begin() {

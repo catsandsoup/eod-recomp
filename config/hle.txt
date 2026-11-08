@@ -92,3 +92,4 @@
 002E3E70 wrap     # used value of an owned car (90 % of its price): FreeSwap = the full price
 003702F0 wrap     # dealer car list: per-frame selection details; tells career_vblank the dealer screen is up (page banner)
 001741C0 wrap     # Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck
+00114358 wrap     # Finish one online contest after native race cleanup

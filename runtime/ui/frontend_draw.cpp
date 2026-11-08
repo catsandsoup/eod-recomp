@@ -410,7 +410,17 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
             y += 8 * s;
             if (m.details_open() || true) paragraph(d, 21 * s, x0, y, x1 - x0, IM_COL32(210, 205, 196, 255), mod.description);
         } else if (r) {
-            if (m.tab() == frontend::Tab::Online && !m.pic_track().empty()) {
+            if (m.tab() == frontend::Tab::Online) {
+                for (const auto &row : rows) {
+                    if (row.id != "gcode" && row.id != "player") continue;
+                    const std::string line = row.label + "   " + row.value;
+                    float px = fit(d, 22 * s, x1 - x0, line.c_str());
+                    text(d, px, x0, y, row.id == "gcode" ? kOrange : kWhite, line.c_str());
+                    y += 28 * s;
+                }
+            }
+            if (m.tab() == frontend::Tab::Online && !m.pic_track().empty() &&
+                (r->id == "opt:track" || r->id == "opt:car" || r->id == "opt:paint" || r->id == "opt:mode")) {
                 // lobby pictures from the player's own disc: the host's track, then your car
                 auto draw_pic = [&](const ui_preview::Pic &p, float maxh) {
                     if (!p.ok()) return;
@@ -433,12 +443,7 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
                 y += 32 * s;
             }
             y += paragraph(d, 22 * s, x0, y, x1 - x0, IM_COL32(214, 208, 200, 255), r->help) + 18 * s;
-            if (m.tab() == frontend::Tab::Online) {
-                text(d, 22 * s, x0, y, kOrange, "NETWORK PLAY");
-                y += 30 * s;
-                paragraph(d, 20 * s, x0, y, x1 - x0, kGrey,
-                          "One player hosts, the others join with the Garage Code. Everybody drives their own car on their own screen.");
-            }
+
         }
         if (!m.status().empty()) {
             const float py = rb.y - pad - 52 * s;

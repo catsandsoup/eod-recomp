@@ -525,36 +525,48 @@ void Menu::rows_online(std::vector<Row> &r) {
         e.warn = true;
         r.push_back(e);
     }
-    r.push_back(header("SESSION"));
+    r.push_back(header(s.is_host ? "HOST LOBBY" : connected ? "SESSION" : "PLAY ONLINE"));
     if (!s.code.empty()) {
         Row gc = info("gcode", "YOUR GARAGE CODE", s.code, "Tell your friends this code (Cmd+C copies it). They choose JOIN BY CODE and type or paste it.");
         gc.good = true;
         r.push_back(gc);
     }
+    if (connected) {
+        r.push_back(header(("PLAYERS (" + std::to_string(s.players.size()) + ")").c_str()));
+        if (s.players.empty()) r.push_back(info("noplayers", "PLAYERS", "WAITING FOR LOBBY"));
+        for (const auto &p : s.players) {
+            Row pr = info("player", ("P" + std::to_string(p.slot + 1) + "  " + upper(p.name)).c_str(),
+                          std::string(s.phase == P::Racing ? "IN RACE" : p.ready ? "READY" : "NOT READY") + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
+            pr.good = p.ready || p.speaking;
+            r.push_back(pr);
+        }
+    }
     if (!s.route.empty()) r.push_back(info("route", "INTERNET LINK", upper(s.route), "How friends outside your home network can reach you. Nothing to set up."));
-    r.push_back(action("host", "HOST GAME", "[ HOST ]", "Hosts a lobby; friends join with the Garage Code shown here, or find you on the network."));
-    Row code = action("code", "JOIN BY CODE", text_id_ == "code" ? text_ + "_" : "[ ENTER CODE ]",
-                      "Type or paste (Cmd+V) the host's 5-character Garage Code, then Enter to join.");
-    code.kind = RowKind::Text;
-    r.push_back(code);
-    Row addr = action("addr", "JOIN BY ADDRESS", text_id_ == "addr" ? text_ + "_" : "[ ENTER ADDRESS ]",
-                      "Enter host:port for a direct connection.");
-    addr.kind = RowKind::Text;
-    r.push_back(addr);
+    if (!connected) {
+        r.push_back(action("host", "HOST GAME", "[ HOST ]", "Hosts a lobby; friends join with the Garage Code shown here, or find you on the network."));
+        Row code = action("code", "JOIN BY CODE", text_id_ == "code" ? text_ + "_" : "[ ENTER CODE ]",
+                          "Type or paste (Cmd+V) the host's 5-character Garage Code, then Enter to join.");
+        code.kind = RowKind::Text;
+        r.push_back(code);
+        Row addr = action("addr", "JOIN BY ADDRESS", text_id_ == "addr" ? text_ + "_" : "[ ENTER ADDRESS ]",
+                          "Enter host:port for a direct connection.");
+        addr.kind = RowKind::Text;
+        r.push_back(addr);
+    }
     Row ready = toggle("ready", "READY", s.ready, "", "Marks you ready in the lobby.");
     ready.enabled = connected && !s.is_host;
-    if (!s.is_host) r.push_back(ready);
-    if (s.is_host && s.phase == P::Racing) {
-        r.push_back(action("end_event", "BACK TO LOBBY", "[ END RACE ]",
+    if (s.phase == P::Lobby && !s.is_host) r.push_back(ready);
+    if (s.is_host && (s.phase == P::Racing || s.phase == P::Loading)) {
+        r.push_back(action("end_event", "BACK TO LOBBY", s.phase == P::Loading ? "[ CANCEL START ]" : "[ END RACE ]",
                            "Ends the current race for everyone and returns the whole party to the lobby."));
     }
     const bool guest_in_race = !s.is_host && s.phase == P::Racing;
-    Row leave = action("leave", guest_in_race ? "LEAVE MATCH" : "LEAVE / CANCEL",
+    Row leave = action("leave", s.is_host ? "CLOSE LOBBY" : guest_in_race ? "LEAVE MATCH" : "LEAVE / CANCEL",
                        guest_in_race ? "[ LEAVE RACE ]" : "[ DISCONNECT ]",
                        guest_in_race ? "Leaves the match and returns you to the main menu while the others keep racing."
                                      : "Leaves the lobby or cancels the connection.");
     leave.enabled = connected || s.can_cancel;
-    r.push_back(leave);
+    if (connected || s.can_cancel) r.push_back(leave);
     if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, "Friends on your network see your game listed. Others can join by typing this address."));
     if (!connected && !s.crew.empty()) {
         r.push_back(header("FRIENDS HOSTING NOW"));
@@ -570,29 +582,29 @@ void Menu::rows_online(std::vector<Row> &r) {
         if (o.editable) r.push_back(choice(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), "", o.help.c_str()));
         else r.push_back(info(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), o.help.c_str()));
     }
-    if (s.can_start) r.push_back(action("start", "START EVENT", "[ START ]", "Starts the event for everyone: you pick the track, each player picks their car, then the race loads."));
-    r.push_back(header("LOBBY"));
-    if (s.players.empty()) r.push_back(info("noplayers", "PLAYERS", "NO LOBBY"));
-    for (const auto &p : s.players) {
-        Row pr = info("player", ("P" + std::to_string(p.slot + 1) + "  " + upper(p.name)).c_str(),
-                      std::string(p.ready ? "READY" : "NOT READY") + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
-        pr.good = p.ready || p.speaking;
-        r.push_back(pr);
+    if (s.is_host && s.phase == P::Lobby) {
+        Row start = action("start", "START EVENT", s.can_start ? "[ START ]" : "WAITING",
+                           s.can_start ? "Starts the selected event with this lobby." : s.status.c_str());
+        start.enabled = s.can_start;
+        r.push_back(start);
     }
-    Row mods = info("modset", "MOD SET / VERSION", s.content_problem.empty() ? (connected ? "MATCH" : "-") : upper(s.content_problem),
+    if (!connected) return;
+    Row mods = info("modset", "MOD SET / VERSION", s.content_problem.empty() ? (s.players.size() <= 1 ? "NO GUESTS" : "UNVERIFIED") : upper(s.content_problem),
                     "Both players need the same game build and the same gameplay mods (MOD_SYSTEM_SCOPE.md 5.6).");
     mods.warn = !s.content_problem.empty();
     r.push_back(mods);
-    r.push_back(info("ping", "PING", connected ? s.status : "-", "Round trip to the other player."));
+
     r.push_back(header("VOICE"));
     Row mic = toggle("mic", "MICROPHONE", s.microphone_enabled, "LIVE", "Sends your voice to the lobby and race.");
-    mic.enabled = s.voice;
+    mic.enabled = connected && s.voice;
+    if (s.microphone_enabled && !s.microphone_capture)
+        mic.value = s.deafened ? "DEAFENED" : "NO INPUT";
     r.push_back(mic);
     Row mute = toggle("mute", "MUTE OTHERS", s.muted, "LIVE", "Stops playing the other players' voices.");
-    mute.enabled = s.voice;
+    mute.enabled = connected && s.voice;
     r.push_back(mute);
     Row deaf = toggle("deafen", "DEAFEN", s.deafened, "LIVE", "Mutes your microphone and all incoming voice.");
-    deaf.enabled = s.voice;
+    deaf.enabled = connected && s.voice;
     r.push_back(deaf);
 }
 
@@ -791,7 +803,7 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (id == "host" && net_) { c.kind = game_frontend::Command::Kind::Host; net_->submit(c); return; }
     if (id == "code" || id == "addr") { text_id_ = id; text_.clear(); return; }
     if (id == "ready" && net_) { c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); return; }
-    if (id == "end_event" && net_) { c.kind = game_frontend::Command::Kind::EndEvent; net_->submit(c); fx.close = true; return; }
+    if (id == "end_event" && net_) { c.kind = game_frontend::Command::Kind::EndEvent; net_->submit(c); return; }
     if (id == "leave" && net_) { c.kind = game_frontend::Command::Kind::Disconnect; net_->submit(c); return; }
     if (id == "mic" && net_) { c.kind = game_frontend::Command::Kind::MicrophoneEnabled; c.enabled = !row.checked; net_->submit(c); return; }
     if (id == "mute" && net_) { c.kind = game_frontend::Command::Kind::Muted; c.enabled = !row.checked; net_->submit(c); return; }

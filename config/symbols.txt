@@ -24,6 +24,7 @@
 00100138 main [V]  # Game main(argc, argv); boots IOP, mounts archives, runs frame loop -> docs/INDEX.md
 0010AFA0 EventTypeGetDisplayName [V]  # Resolves event-type ID to localized display string; wrapped for Battle (4 AI)/(8 AI) -> docs/BATTLE_RECOVERY.md
 001116E0 RosterResolveCarDescriptions [V]  # Resolves driver/vehicle description records for event roster; wrapped for multi-class Battle AI -> docs/BATTLE_RECOVERY.md
+00114358 RunRaceContest [I]  # Race lifecycle and cleanup; checked by the Eve loop -> docs/NETPLAY_STATE_SYNC.md
 00119428 HudGetParticipantDisplayName [V]  # Returns participant display name for HUD/kill messages -> docs/BATTLE_RECOVERY.md
 00119888 HudDrawLeftRaceRows [V]  # Draws left-anchored position/lap/damage HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
 00119F40 HudDrawRightSpeedRows [V]  # Draws right-anchored speedometer/tachometer HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md

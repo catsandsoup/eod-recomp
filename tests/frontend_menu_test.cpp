@@ -192,17 +192,24 @@ int main() {
     in = none(); in.ch = 'A'; m.update(in); in.ch = '7'; m.update(in);
     in = none(); in.accept = true; m.update(in);
     CHECK(!m.editing_text() && net->got.back().kind == game_frontend::Command::Kind::JoinCode && net->got.back().text == "A7");
-    // disabled while not connected
-    m.select(find(m, "ready"));
-    fx = m.update(in);
-    CHECK(fx.sound == Sound::Error && net->got.size() == 2);
-    // host racing: BACK TO LOBBY (EndEvent) is shown and closes the overlay
+    CHECK(find(m, "ready") < 0 && find(m, "leave") < 0);
+    net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
+    net->snap.is_host = true;
+    net->snap.code = "ABCDE";
+    net->snap.players.push_back({1, "Guest  Trailer2", true, false, true});
+    CHECK(find(m, "host") < 0 && find(m, "code") < 0 && find(m, "addr") < 0);
+    CHECK(find(m, "gcode") >= 0 && find(m, "player") >= 0);
+    net->snap.is_host = false;
+    CHECK(find(m, "ready") >= 0);
+    net->snap.phase = game_frontend::Snapshot::Phase::Connecting;
+    CHECK(find(m, "ready") < 0 && find(m, "addr") < 0 && find(m, "leave") >= 0);
+    // host racing: BACK TO LOBBY (EndEvent) keeps the overlay open through cleanup
     net->snap.phase = game_frontend::Snapshot::Phase::Racing;
     net->snap.is_host = true;
     CHECK(find(m, "end_event") >= 0);
     m.select(find(m, "end_event"));
     in = none(); in.accept = true; fx = m.update(in);
-    CHECK(fx.close && net->got.back().kind == game_frontend::Command::Kind::EndEvent);
+    CHECK(!fx.close && net->got.back().kind == game_frontend::Command::Kind::EndEvent);
     // guest racing: LEAVE MATCH is shown, and gameplay-diverging cheats in SETTINGS are locked to host rules
     net->snap.is_host = false;
     CHECK(find(m, "end_event") < 0 && m.rows()[find(m, "leave")].label == "LEAVE MATCH");

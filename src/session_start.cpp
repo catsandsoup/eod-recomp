@@ -255,7 +255,7 @@ void arm_net(const netplay_hooks::StartInfo &info) {
     P.req.event = info.event;
     P.requested = true;
     P.armed = true;
-    if (!info.track.empty() && info.car) {
+    if (!info.track.empty()) {
         const int eve = find_eve(info.track);
         const int contest = eve < 0 ? -1 : find_contest((uint32_t)eve, info.event);
         if (eve >= 0 && contest >= 0) {
@@ -338,7 +338,18 @@ extern "C" void f_002A1298(void) {
 // "single" (1). When that single-player session returns the prompt loops; answering "back" (-1) leaves
 // the Arcade menu for the main menu, where the lobby reopens.
 extern "C" void f_00270C10(void) {
-    if (P.armed && P.net && g_ee.r[31].uw[0] == 0x002C0DC8) {
+    const uint32_t caller = g_ee.r[31].uw[0];
+    if (caller == 0x002A16D8) {
+        f_00270C10_orig();
+        // The main dispatcher maps result 16 to Arcade. Preserve MenuRun cleanup.
+        if (P.armed && P.net) ret_s32(16);
+        return;
+    }
+    if (caller == 0x002C1108 && P.armed && P.net) {
+        ret_s32(P.mode_answered ? -1 : 0); // Arcade: Race on entry, Back on return.
+        return;
+    }
+    if (P.armed && P.net && caller == 0x002C0DC8) {
         if (!P.mode_answered) { P.mode_answered = true; ret_s32(1); log("online: single/multi prompt answered 'single'"); }
         else ret_s32(-1);
         return;
@@ -497,4 +508,13 @@ void session_abort_event() {
         ee_w32(0x00437BB8, 0);
         log("online: aborted active race loop -> unwinding to main menu");
     }
+}
+
+// The native contest clears the exit flag during teardown. Its caller checks it
+// immediately after return to decide whether to open the Eve event list again.
+extern "C" void f_00114358_orig();
+extern "C" void f_00114358() {
+    const bool online = P.net && P.armed && g_ee.r[31].uw[0] == 0x00114BA0;
+    f_00114358_orig();
+    if (online) ee_w32(0x00437BA8, 1);
 }
