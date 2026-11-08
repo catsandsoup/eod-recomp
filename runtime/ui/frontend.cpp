@@ -488,7 +488,7 @@ void Menu::rows_mods(std::vector<Row> &r) {
     r.push_back(toggle("cu_open", "ALL SHOPS AND EVES OPEN", cfg_.career_open, "LIVE",
                        "Upgrades, Time Challenges, Troy's Place, the dealer and every Eve are open from the start."));
     r.push_back(toggle("cu_cars", "DEALER SELLS EVERY CAR", cfg_.career_all_cars, "NEXT VISIT",
-                       "The dealer pages through all cars, Phantom and the Cup car included (L2 / R2 on the dealer screen)."));
+                       "The dealer shows a new page of cars on every visit and covers every car, Phantom, the Cup car and the special vehicles included."));
     r.push_back(toggle("cu_swap", "FREE CAR SWAPPING", cfg_.career_free_swap, "LIVE",
                        "Selling or trading a car refunds its full price, so you can try every car at no loss."));
     r.push_back(toggle("cu_kill", "KILLABLE CHALLENGERS", cfg_.career_killable, "LIVE",

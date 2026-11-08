@@ -29,7 +29,6 @@ void f_002E3E70_orig(void);
 void f_002E35F0_orig(void);
 void f_0018AAD0_orig(void);
 void f_001741C0_orig(void);
-void f_003698E8_orig(void);
 void f_003702F0_orig(void);
 }
 
@@ -50,16 +49,15 @@ bool sane(uint32_t p, uint32_t span) { return p && !(p & 3) && p <= EE_RAM_SIZE 
 // ---- dealer ---------------------------------------------------------------------------------
 // The native dealer offers five cars picked by wealth tier and chance. With AllCars the five
 // slots are filled from one list of every chassis in the shop (cheapest first, Phantom and the
-// Cup car included); the dealer screen's L2 / R2 (game_patches.cpp -> career_dealer_turn_page)
-// turn the page, and every visit to the dealer also moves one page on.
+// Cup car included). Every visit (every build of the Homebase hub menu, which asks for the stock)
+// shows the next page. The dealer yard's cars are placed when the place loads, so the stock cannot
+// change while its screen is up (turning the page there panics in get_slot_for_car).
 int s_page = 0;            // current page of the dealer list
 int s_variant = 0;         // paint job rotation, so every ASCarList entry shows up over time
 std::atomic<int> s_dealer_frames{0};   // vblanks since the dealer's selection callback (f_003702F0) last ran
-std::atomic<int> s_turn{0};
-std::atomic<bool> s_banner_due{true};   // say once per visit how to turn the page
-int s_pages = 0;                       // pages of the dealer list, for the banner            // a page turn the screen has still to show (L2 / R2)
-uint32_t s_menu = 0;                   // the hub menu descriptor f_003698E8 filled (in the caller's stack frame)
-bool s_building = false;
+std::atomic<bool> s_banner_due{true};   // say once per visit which page this is
+int s_pages = 0;                       // pages of the dealer list, for the banner
+bool s_visited = false;                // a first visit shows the first page
 
 struct Offer {
     uint32_t index;   // ASCarList index
@@ -116,33 +114,16 @@ extern "C" void f_002E35F0(void) {
     const uint32_t out = g_ee.r[4].uw[0];
     f_002E35F0_orig();
     if (!g_config.career_all_cars) return;
+    static const char *start = std::getenv("EOD_CAREER_DEALER_PAGE");  // developer: the first page shown (0-based)
+    if (!s_visited && start) s_page = std::atoi(start);
+    else if (s_visited) { s_page++; s_variant++; }
+    s_visited = true;
     fill_dealer(sane(out, 20) ? out : 0);
 }
 
-// The hub menu (every Homebase place) is built once by f_003698E8 into a descriptor in the
-// caller's stack frame. The dealer's per-frame selection callback (f_003702F0) only runs while the
-// dealer's car list is on screen: that is when L2 / R2 turn the page, by running the native menu
-// build again (it asks f_002E35F0 for the stock, which is the next page) and forgetting the
-// callback's cached selection so the details refresh.
-extern "C" void f_003698E8(void) {
-    if (!s_building) s_menu = g_ee.r[4].uw[0];
-    f_003698E8_orig();
-}
-
+// The dealer's per-frame selection callback runs only while its car list is on screen.
 extern "C" void f_003702F0(void) {
     s_dealer_frames.store(0);
-    const int turn = s_turn.exchange(0);
-    if (turn && g_config.career_all_cars && sane(s_menu, 0x100)) {
-        career_dealer_turn_page(turn);
-        const EEState saved = g_ee;
-        s_building = true;
-        g_ee.r[4].ud[0] = s_menu;
-        f_003698E8_orig();
-        s_building = false;
-        g_ee = saved;
-        ee_w32(0x4DD388 + 0x280, 0xFFFFFFFFu);  // f_003702F0's remembered selection
-        LOG(LOG_CORE, "career dealer: turned page %+d", turn);
-    }
     f_003702F0_orig();
 }
 
@@ -290,11 +271,6 @@ const uint32_t kFreeRoamEvent = 0x8000226;
 const int32_t kMoneyFloor = 10000;      // the dearest car (Rocket) costs $10,000
 }  // namespace
 
-void career_dealer_turn_page(int delta) {
-    s_page += delta;
-    if (delta > 0) s_variant++;
-}
-
 // Developer probes (docs/CAREER_UNLOCKS.md, "Challengers"): EOD_CAREER_TRACE logs the native damage test and the
 // event word; EOD_CAREER_CRASH_TEST=<world car index of an AI> (after a Jump To TJ's) drives the player at it.
 // Developer probe (EOD_CAREER_CRASH_TEST=<world car index of an AI>): in Career free roam, throws the
@@ -331,11 +307,12 @@ static void crash_probe() {
 
 static void career_show_page_banner() {
     char text[96];
-    std::snprintf(text, sizeof text, "DEALER: PAGE %d OF %d - L2 / R2 FOR MORE CARS", s_page + 1, s_pages);
+    std::snprintf(text, sizeof text, "DEALER: PAGE %d OF %d - LEAVE AND COME BACK FOR MORE CARS", s_page + 1, s_pages);
     platform_show_hud_banner(text, 3000);
 }
 
 void career_vblank(uint16_t pressed) {
+    (void)pressed;
     // the idle state: the Career's free-roam world (event word 0x8000226; a race or Battle has another value)
     const uint32_t event = ee_r32(kEventWord);
     const bool idle = event == kFreeRoamEvent;
@@ -349,15 +326,9 @@ void career_vblank(uint16_t pressed) {
         }
     }
     if (idle) crash_probe();
-    // the dealer's car list is on screen (its callback ran within the last few vblanks): L2 / R2 turn the page
-    if (g_config.career_all_cars) {
-        const int idle_frames = s_dealer_frames.fetch_add(1);
-        if (idle_frames < 4) {
-            if (pressed & 0x0100) s_turn.store(-1);       // L2
-            else if (pressed & 0x0200) s_turn.store(+1);  // R2
-            if (s_banner_due.exchange(false)) career_show_page_banner();
-        }
-    }
+    // the dealer's car list is on screen (its callback ran within the last few vblanks): say which page it is
+    if (g_config.career_all_cars && s_dealer_frames.fetch_add(1) < 4 && s_banner_due.exchange(false))
+        career_show_page_banner();
     // The rank gate table (data in the executable's image, read by f_002E27F8 / f_002E2838): the
     // Upgrades and the Time Challenges ask for rank 80th, the dealer's full stock and Highway for
     // 50th, the champion lock-out for 1st. All open with OpenCareer; the champion entry stays 0.

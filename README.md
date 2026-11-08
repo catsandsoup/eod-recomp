@@ -49,7 +49,7 @@
 ### Career, wide open
 
 * **Every shop and event open from day one.** Upgrades, Time Challenges, the Highway, Troy's Place and all 25 Eves are open right away.
-* **The dealer sells every car.** Page through the entire roster at the auto shop with **L2 / R2** — including the Phantom, the NASCAR stock car and all six special vehicles — and swap or trade in cars for a 100% refund so you can try anything at no loss.
+* **The dealer sells every car.** Every visit to the auto shop brings in a fresh line-up until you've seen the entire roster — including the Phantom, the NASCAR stock car and all six special vehicles — and swap or trade in cars for a 100% refund so you can try anything at no loss.
 * **Never broke, never locked out.** Career cash stays topped up to at least $10,000 in free roam while winnings still add on top, and your rank stays at **1st** without ending the Career.
 * **Killable challengers.** Highway and Malt Shop challengers in Career free roam no longer stop taking damage at 90% — you can wreck them outright. Every Career unlock can be toggled live in the **Mods** tab.
 

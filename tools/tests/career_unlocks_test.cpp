@@ -30,7 +30,6 @@ bool platform_find_file(const char *, const char *, char *, size_t) { return fal
 
 // the native functions the wrappers sit on
 static int s_orig_calls[8];
-static void f_002E35F0_hub();  // the hub build asks for the dealer stock (defined below)
 static int32_t s_orig_result;
 extern "C" void f_002E5200_orig() { s_orig_calls[0]++; g_ee.r[2].sd[0] = 0; }
 extern "C" void f_002E6C78_orig() { s_orig_calls[1]++; g_ee.r[2].sd[0] = s_orig_result; }
@@ -46,7 +45,6 @@ extern "C" void f_002E35F0_orig() {
 }
 extern "C" void f_0018AAD0_orig() { s_orig_calls[6]++; g_ee.r[2].sd[0] = 1; }
 extern "C" void f_001741C0_orig() { g_ee.r[2].ud[0] = MEM_LW(0x3CDA24) != 6 ? 1 : 0; }
-extern "C" void f_003698E8_orig() { s_orig_calls[7]++; f_002E35F0_hub(); }
 static int s_info_calls;
 extern "C" void f_003702F0_orig() { s_info_calls++; }
 extern "C" void f_002E5200();
@@ -57,9 +55,7 @@ extern "C" void f_002E3BC8();
 extern "C" void f_002E3E70();
 extern "C" void f_002E35F0();
 extern "C" void f_001741C0();
-extern "C" void f_003698E8();
 extern "C" void f_003702F0();
-static void f_002E35F0_hub() { g_ee.r[4].uw[0] = 0x63000; f_002E35F0(); }
 
 static int failures = 0;
 static void check(bool ok, const char *what) {
@@ -224,49 +220,27 @@ int main() {
     check(MEM_LW(0x3D93D0) == 5, "five dealer slots");
     check(v[0] == 800 + 0 * 3 && v[1] == 800 + 1 * 3 && v[2] == 800 + 5 * 3 && v[3] == 800 + 2 * 3 && v[4] == 800 + 4 * 3,
           "page 1: cheapest first (Top, Moth, Algar, then the two 1200 cars in list order)");
-    career_dealer_turn_page(+1);
-    visit(v);
+    visit(v);                                       // the next visit: the next page
     bool phantom = false, cup = false, rocket = false;
     for (int round = 0; round < 3; round++) {
         for (uint32_t x : v) {
             const uint32_t chassis_idx = (x - 800) / 3;
             phantom |= chassis_idx == 2; cup |= chassis_idx == 4; rocket |= chassis_idx == 3;
         }
-        career_dealer_turn_page(+1);
         visit(v);
     }
     check(phantom && cup && rocket, "Phantom, the Cup car and the dearest car turn up while paging");
 
-    // L2 / R2 on the dealer screen: the hub menu is built again for the next page
-    visit(v);
-    const std::vector<uint32_t> shown = v;
-    g_ee.r[4].uw[0] = 0x64000;
-    f_003698E8();                                   // the hub menu is built (the descriptor is remembered)
+    // the dealer screen says which page it is, once per visit
     f_003702F0();                                   // the dealer's car list is on screen
     career_vblank(0);
-    check(s_banner.find("L2 / R2") != std::string::npos && s_banner.find("PAGE") != std::string::npos, "the dealer says how to turn the page");
+    check(s_banner.find("PAGE") != std::string::npos && s_banner.find("OF 2") != std::string::npos, "the dealer says which page it is");
+    s_banner.clear();
+    f_003702F0(); career_vblank(0);
+    check(s_banner.empty(), "...once");
     s_info_calls = 0;
-    career_vblank(0x0200);                          // R2
-    MEM_SW(0x4DD388 + 0x280, 3);
-    g_ee.r[4].uw[0] = 0x1234; g_ee.r[16].uw[0] = 0x5678;
     f_003702F0();
-    check(s_info_calls == 1 && MEM_LW(0x4DD388 + 0x280) == 0xFFFFFFFFu, "the page turn refreshes the selection details");
-    check(g_ee.r[4].uw[0] == 0x1234 && g_ee.r[16].uw[0] == 0x5678, "the page turn leaves the callback's registers alone");
-    auto chassis_of = [&](const std::vector<uint32_t> &x) { std::vector<uint32_t> o; for (uint32_t i : x) o.push_back((i - 800) / 3); return o; };
-    std::vector<uint32_t> turned;
-    for (int i = 0; i < 5; i++) turned.push_back(800 + MEM_LW(0x4AB130 + 4 * i));
-    check(chassis_of(turned) != chassis_of(shown), "R1 shows the next page");
-    career_vblank(0x0100);                          // L2: back
-    f_003702F0();
-    std::vector<uint32_t> back;
-    for (int i = 0; i < 5; i++) back.push_back(MEM_LW(0x4AB130 + 4 * i) / 3);
-    check(chassis_of(shown) == back, "L2 shows the previous page");
-    // R1 pressed when the dealer's car list is not on screen (its callback has not run for a while)
-    for (int i = 0; i < 6; i++) career_vblank(0);
-    career_vblank(0x0200);
-    MEM_SW(0x4DD388 + 0x280, 3);
-    f_003702F0();
-    check(MEM_LW(0x4DD388 + 0x280) == 3, "R1 elsewhere does not rebuild the hub menu");
+    check(s_info_calls == 1, "the selection callback still runs the native code");
     g_config.career_all_cars = false;
     std::memset(s_orig_calls, 0, sizeof s_orig_calls);
     visit(v);

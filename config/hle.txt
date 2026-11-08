@@ -85,6 +85,5 @@
 002E3BC8 wrap     # depreciation of a car being sold or traded in: FreeSwap = none (full refund)
 0018AAD0 wrap     # can this car be damaged: pass-through; EOD_CAREER_TRACE logs it (challenger probe)
 002E3E70 wrap     # used value of an owned car (90 % of its price): FreeSwap = the full price
-003698E8 wrap     # Homebase hub menu build (dealer stock, owned cars, challengers): remembers the menu so the dealer can rebuild it
-003702F0 wrap     # dealer car list: per-frame selection details; runs a page turn (L1 / R1) when one is pending
+003702F0 wrap     # dealer car list: per-frame selection details; tells career_vblank the dealer screen is up (page banner)
 001741C0 wrap     # Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck
