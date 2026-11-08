@@ -9,7 +9,7 @@
 namespace game_frontend {
 struct Player {unsigned slot=0;std::string name;bool ready=false,muted=false,deafened=false,speaking=false;};
 struct Option {std::string id,label,value;bool editable=false;std::string help;};   // lobby rows (host edits, guests read)
-struct LanGame {std::string name,address;unsigned players=0;};                       // games found on the same network
+struct LanGame {std::string name,address;unsigned players=0;};                       // games found on the same network / friends hosting (address = friend id)
 struct Snapshot {
     enum class Phase {Offline,Hosting,Connecting,CheckingCompatibility,Lobby,Loading,WaitingForStart,Racing,Results,Disconnected,Error};
     Phase phase=Phase::Offline;
@@ -24,10 +24,13 @@ struct Snapshot {
     std::vector<Option>options;
     std::vector<LanGame>lan;
     std::string strip;   // short text shown over the game while players choose ("Waiting for ...")
+    std::string code;    // host: the Garage Code to share (Cmd+C copies it)
+    std::string route;   // plain-words state of the internet link ("Internet play ready", ...)
+    std::vector<LanGame>crew;   // remembered friends who are hosting right now (one press to join)
 };
 struct Command {
     enum class Kind {Host,JoinAddress,JoinCode,Ready,Start,Cancel,Disconnect,Rematch,RejoinLobby,
-        MicrophoneEnabled,Muted,Deafened,VoiceVolume,Option};
+        MicrophoneEnabled,Muted,Deafened,VoiceVolume,Option,JoinCrew};
     Kind kind;std::string text;uint16_t port=0;bool enabled=false;float value=0;
 };
 class Network {

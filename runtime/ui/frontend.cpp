@@ -511,9 +511,15 @@ void Menu::rows_online(std::vector<Row> &r) {
         r.push_back(e);
     }
     r.push_back(header("SESSION"));
-    r.push_back(action("host", "HOST GAME", "[ HOST ]", "Hosts a lobby; the other player joins with the code shown here."));
+    if (!s.code.empty()) {
+        Row gc = info("gcode", "YOUR GARAGE CODE", s.code, "Tell your friends this code (Cmd+C copies it). They choose JOIN BY CODE and type or paste it.");
+        gc.good = true;
+        r.push_back(gc);
+    }
+    if (!s.route.empty()) r.push_back(info("route", "INTERNET LINK", upper(s.route), "How friends outside your home network can reach you. Nothing to set up."));
+    r.push_back(action("host", "HOST GAME", "[ HOST ]", "Hosts a lobby; friends join with the Garage Code shown here, or find you on the network."));
     Row code = action("code", "JOIN BY CODE", text_id_ == "code" ? text_ + "_" : "[ ENTER CODE ]",
-                      "Enter the host's join code, then Start/Enter to join.");
+                      "Type or paste (Cmd+V) the host's 5-character Garage Code, then Enter to join.");
     code.kind = RowKind::Text;
     r.push_back(code);
     Row addr = action("addr", "JOIN BY ADDRESS", text_id_ == "addr" ? text_ + "_" : "[ ENTER ADDRESS ]",
@@ -527,6 +533,11 @@ void Menu::rows_online(std::vector<Row> &r) {
     leave.enabled = connected || s.can_cancel;
     r.push_back(leave);
     if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, "Friends on your network see your game listed. Others can join by typing this address."));
+    if (!connected && !s.crew.empty()) {
+        r.push_back(header("FRIENDS HOSTING NOW"));
+        for (const auto &g : s.crew)
+            r.push_back(action(("crew:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", "Joins your friend's game. No code needed."));
+    }
     if (!connected && !s.lan.empty()) {
         r.push_back(header("GAMES ON YOUR NETWORK"));
         for (const auto &g : s.lan)
@@ -749,6 +760,7 @@ void Menu::activate(const Row &row, Effects &fx) {
     game_frontend::Command c{};
     if (id == "start" && net_) { c.kind = game_frontend::Command::Kind::Start; net_->submit(c); fx.close = true; return; }
     if (id.compare(0, 4, "lan:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinAddress; c.text = id.substr(4); net_->submit(c); return; }
+    if (id.compare(0, 5, "crew:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinCrew; c.text = id.substr(5); net_->submit(c); return; }
     if (id == "host" && net_) { c.kind = game_frontend::Command::Kind::Host; net_->submit(c); return; }
     if (id == "code" || id == "addr") { text_id_ = id; text_.clear(); return; }
     if (id == "ready" && net_) { c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); return; }
@@ -802,6 +814,7 @@ Effects Menu::update(const Input &in) {
     // text entry (online codes/addresses): typed characters, Backspace, Enter/Start confirms, Esc/Circle cancels
     if (!text_id_.empty()) {
         if (in.ch >= ' ' && in.ch <= '~' && text_.size() < 64) text_.push_back(in.ch);
+        for (char pc : in.paste) if (pc >= ' ' && pc <= '~' && text_.size() < 64) text_.push_back(pc);
         if (in.erase && !text_.empty()) text_.pop_back();
         if (in.back) { text_id_.clear(); fx.sound = Sound::Back; return fx; }
         if (in.accept || in.close) {
@@ -859,6 +872,13 @@ Effects Menu::update(const Input &in) {
     }
     if (fx.sound == Sound::None && in.dx) fx.sound = Sound::None;
     return fx;
+}
+
+std::string Menu::copy_text() {
+    if (!net_ || tab_ != Tab::Online) return {};
+    std::string code = net_->snapshot().code;
+    if (!code.empty()) set_status("Garage Code " + code + " copied");
+    return code;
 }
 
 }  // namespace frontend

@@ -53,6 +53,7 @@ std::vector<frontend_draw::Hit> g_hits;
 struct KeyEvent { int vk; bool down; };
 std::vector<KeyEvent> g_keys;
 std::vector<unsigned> g_chars;
+std::string g_paste;
 float g_mx = -1, g_my = -1, g_wheel;
 bool g_mouse_moved, g_click;
 bool g_shift;
@@ -296,11 +297,14 @@ frontend::Input gather_input(bool &toggled) {
         }
         in.key = k.vk;
     }
-    if (typing)
+    if (typing) {
         for (unsigned c : g_chars)
-            if (c >= 32 && c < 127) in.ch = (char)c;
+            if (c >= 32 && c < 127) in.paste.push_back((char)c);
+        in.paste += g_paste;
+    }
     g_keys.clear();
     g_chars.clear();
+    g_paste.clear();
     if (g_mouse_moved || g_click || g_wheel != 0) {
         in.mouse_moved = g_mouse_moved;
         in.mx = g_mx;
@@ -454,6 +458,8 @@ bool overlay_key(int vk, bool down) {
     return true;
 }
 void overlay_char(unsigned c) { if (g_open) g_chars.push_back(c); }
+void overlay_paste(const char *utf8) { if (g_open && utf8) g_paste.append(utf8, strnlen(utf8, 256)); }
+std::string overlay_copy_text() { return g_open && g_menu ? g_menu->copy_text() : std::string(); }
 void overlay_mouse_move(float x, float y) {
     if (x == g_mx && y == g_my) return;
     g_mx = x;

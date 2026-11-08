@@ -38,6 +38,7 @@ struct Input {
     bool close = false;           // Start / F1: close the menu
     int key = 0;                  // a keyboard key pressed (Windows VK code, for rebinding / text)
     char ch = 0;                  // printable character typed (text fields)
+    std::string paste;            // text pasted with Cmd+V / Ctrl+V into a text field
     bool erase = false;           // backspace in a text field
     // mouse (window pixels; hit-testing uses the rectangles of the last View)
     bool mouse_moved = false, click = false;
@@ -150,6 +151,7 @@ public:
     int rebinding() const { return rebind_; }   // pad key index waiting for a keyboard key, -1 none
     bool editing_text() const { return !text_id_.empty(); }
     const std::string &text_value() const { return text_; }
+    std::string copy_text();       // what Cmd+C copies on this screen (the hosted Garage Code), "" if nothing
     bool dirty() const { return dirty_; }
     void clear_dirty() { dirty_ = false; }
 

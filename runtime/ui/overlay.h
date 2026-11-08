@@ -76,6 +76,9 @@ bool overlay_wndproc(void *hwnd, unsigned msg, uintptr_t wp, intptr_t lp);
 // Windows virtual-key codes (what eod.ini key names use); true = consumed by the menu.
 bool overlay_key(int vk, bool down);
 void overlay_char(unsigned c);
+// Clipboard (Cmd/Ctrl+V into a text field, Cmd/Ctrl+C on the ONLINE tab copies the hosted Garage Code).
+void overlay_paste(const char *utf8);
+std::string overlay_copy_text();
 void overlay_mouse_move(float x, float y);
 void overlay_mouse_button(bool down);
 void overlay_mouse_wheel(float dy);

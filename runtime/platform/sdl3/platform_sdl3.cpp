@@ -49,6 +49,8 @@ extern char **environ;
 #else  // the display composition test links this file without the front end
 inline bool overlay_key(int, bool) { return false; }
 inline void overlay_char(unsigned) {}
+inline void overlay_paste(const char *) {}
+inline std::string overlay_copy_text() { return {}; }
 inline void overlay_mouse_move(float, float) {}
 inline void overlay_mouse_button(bool) {}
 inline void overlay_mouse_wheel(float) {}
@@ -401,6 +403,11 @@ bool platform_pump() {
                 // the in-game front end: F1 / Cmd+, open it (Esc stays the game's); while open it takes every key
                 const int vk = (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)) ? 0x70 : scancode_to_vk(e.key.scancode);
                 const bool open = overlay_menu_open();
+                // clipboard in the menu: Cmd+V / Ctrl+V pastes into a text field, Cmd+C / Ctrl+C copies the Garage Code
+                if (open && (e.key.mod & (SDL_KMOD_GUI | SDL_KMOD_CTRL)) && !e.key.repeat) {
+                    if (e.key.scancode == SDL_SCANCODE_V) { if (char *clip = SDL_GetClipboardText()) { overlay_paste(clip); SDL_free(clip); } break; }
+                    if (e.key.scancode == SDL_SCANCODE_C) { const std::string text = overlay_copy_text(); if (!text.empty()) SDL_SetClipboardText(text.c_str()); break; }
+                }
                 if (vk && (!e.key.repeat || open) && overlay_key(vk, true)) {
                     if (open) if (char c = key_char(vk, (e.key.mod & SDL_KMOD_SHIFT) != 0)) overlay_char((unsigned char)c);
                     break;

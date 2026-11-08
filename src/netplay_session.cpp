@@ -1,6 +1,9 @@
 // Online play session: see netplay_session.h and docs/NETPLAY_STATE_SYNC.md.
 #include "netplay_session.h"
+#include "../runtime/core/config.h"
 #include "../runtime/core/memory.h"
+#include "netplay_online.h"
+#include "netplay_online_wire.h"
 #include "../runtime/platform/platform.h"
 #include "../runtime/ui/overlay.h"
 #include <algorithm>
@@ -8,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <random>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -97,7 +102,7 @@ bool parse_endpoint(const std::string &text, uint32_t &ip, uint16_t &port, uint1
 struct Peer {
     sockaddr_in addr{};
     uint8_t id = 0;
-    std::string name;
+    std::string name, secret;
     bool ready = false, at_menu = true, car_done = false, got_track = false, got_roster = false, got_go = false, got_start = false;
     uint32_t vehicle = 0;
     std::string vname;
@@ -111,6 +116,8 @@ struct Peer {
 };
 struct LobbyPlayer { uint8_t id; std::string name; bool ready; std::string vname; uint16_t ping; };
 struct LanEntry { sockaddr_in addr; std::string name; uint8_t players; uint64_t seen; };
+struct Friend { std::string secret, name; };                 // remembered crew: a shared random secret per friend
+struct CrewHost { sockaddr_in addr{}; std::string name; uint8_t players = 0; uint64_t seen = 0; };
 
 struct Session::Impl {
     int fd = -1, disc_fd = -1;
@@ -152,6 +159,109 @@ struct Session::Impl {
     std::map<std::string, LanEntry> lan;
     bool discovering = false;
     std::string last_error;
+    // ---- internet (Garage Code), see docs/NETPLAY_INTERNET.md
+    netplay_online::Online online;
+    bool online_on = false;
+    std::string code;                          // host: the code to share; guest: the code being joined
+    std::string join_secret;                   // guest: secret (code or friend secret) the rendezvous runs on
+    uint32_t join_tag = 0;
+    std::vector<Friend> friends; bool friends_loaded = false;
+    std::vector<sockaddr_in> targets;          // guest: host candidates from the rendezvous (JOIN is sent to all)
+    std::vector<sockaddr_in> punch_targets;    // host: joiners found at the trackers (we send them a punch)
+    uint64_t join_started = 0, last_punch = 0, last_probe = 0, ui_seen = 0, last_remember = 0;
+    bool joining_online = false, remembered = false;
+    std::string join_note;
+    std::map<std::string, CrewHost> crew;      // remembered friends currently hosting, by secret
+    std::string route_text;
+
+    // ---------------------------------------------------------------- friends file (next to eod.ini)
+    std::string friends_path() const {
+        std::string p = g_config_path;
+        size_t sl = p.find_last_of("/\\");
+        return (sl == std::string::npos ? std::string() : p.substr(0, sl + 1)) + "friends.txt";
+    }
+    void load_friends() {
+        if (friends_loaded) return;
+        friends_loaded = true;
+        std::ifstream in(friends_path());
+        std::string line;
+        while (std::getline(in, line)) {
+            size_t t = line.find('\t');
+            if (t == std::string::npos) continue;
+            Friend f{line.substr(0, t), line.substr(t + 1)};
+            std::vector<uint8_t> raw;
+            if (!netplay_online::unhex(f.secret, raw) || raw.size() != 16 || f.name.empty()) continue;
+            friends.push_back(f);
+        }
+    }
+    void save_friends() {
+        std::ofstream out(friends_path(), std::ios::trunc);
+        for (auto &f : friends) out << f.secret << '\t' << f.name << '\n';
+    }
+    void remember(const std::string &friend_name, const std::string &secret) {
+        load_friends();
+        if (friend_name.empty() || secret.size() != 32) return;
+        friends.erase(std::remove_if(friends.begin(), friends.end(), [&](const Friend &f) { return f.name == friend_name || f.secret == secret; }), friends.end());
+        friends.insert(friends.begin(), Friend{secret, friend_name});
+        if (friends.size() > 12) friends.resize(12);
+        save_friends();
+        std::fprintf(stderr, "[netplay] remembered friend '%s'\n", friend_name.c_str());
+    }
+    static std::string new_secret() { uint8_t b[16]; std::random_device rd; for (auto &x : b) x = (uint8_t)rd(); return netplay_online::hex(b, 16); }
+    static std::string new_code() { uint8_t b[5]; std::random_device rd; for (auto &x : b) x = (uint8_t)rd(); return netplay_online::code_from_bytes(b, 5); }
+    // The secret a JOIN tag belongs to ("" when it matches nothing we know).
+    bool tag_known(uint32_t tag, std::string *secret) const {
+        if (!code.empty() && tag == netplay_online::join_tag(code)) { if (secret) secret->clear(); return true; }
+        for (auto &f : friends) if (tag == netplay_online::join_tag(f.secret)) { if (secret) *secret = f.secret; return true; }
+        return false;
+    }
+
+    // ---------------------------------------------------------------- internet jobs
+    static sockaddr_in to_sockaddr(const netplay_online::Addr &a) { sockaddr_in s{}; s.sin_family = AF_INET; s.sin_addr.s_addr = htonl(a.ip); s.sin_port = htons(a.port); return s; }
+    void online_start(bool want_mapping) {
+        if (online_on || fd < 0) return;
+        online.start(fd, port, want_mapping);
+        online_on = true;
+    }
+    void online_stop() {
+        if (!online_on) return;
+        online.stop();
+        online_on = false; targets.clear(); punch_targets.clear(); crew.clear();
+    }
+    void host_jobs() {
+        using namespace netplay_online;
+        std::vector<Job> jobs;
+        jobs.push_back({"code", rendezvous_hash('H', code), true, false, false, 5000});
+        jobs.push_back({"joiners", rendezvous_hash('J', code), false, false, true, 4000});
+        for (auto &f : friends) {
+            jobs.push_back({"ch:" + f.secret, rendezvous_hash('H', f.secret), true, false, false, 5000});
+            jobs.push_back({"cj:" + f.secret, rendezvous_hash('J', f.secret), false, false, true, 8000});
+        }
+        online.set_jobs(jobs);
+    }
+    void guest_jobs(const std::string &secret) {
+        using namespace netplay_online;
+        std::vector<Job> jobs;
+        jobs.push_back({"me", rendezvous_hash('J', secret), true, true, false, 5000});
+        jobs.push_back({"hosts", rendezvous_hash('H', secret), false, false, true, 3000});
+        online.set_jobs(jobs);
+    }
+    void watch_jobs() {   // ONLINE tab open, not in a game: look for remembered friends who are hosting
+        using namespace netplay_online;
+        std::vector<Job> jobs;
+        for (auto &f : friends) {
+            jobs.push_back({"w:" + f.secret, rendezvous_hash('J', f.secret), true, true, false, 5000});
+            jobs.push_back({"ch:" + f.secret, rendezvous_hash('H', f.secret), false, false, true, 8000});
+        }
+        online.set_jobs(jobs);
+    }
+    std::string route_description(const netplay_online::Report &r) const {
+        if (!r.stun_done) return "Looking for the best route...";
+        if (!r.stun_ok && r.trackers_ok == 0) return "No internet link found. Friends on your network can still join.";
+        if (r.mapped) return "Internet play ready (router port opened by " + r.map_kind + ")";
+        if (r.symmetric) return "Internet play limited: your connection is strict, friends may not be able to connect";
+        return "Internet play ready";
+    }
 
     // ---------------------------------------------------------------- sockets
     bool open(uint16_t want_port, bool listen_range) {
@@ -162,14 +272,18 @@ struct Session::Impl {
         int one = 1; setsockopt(fd, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
         for (uint16_t p = want_port; p < want_port + (listen_range ? 16 : 1); ++p) {
             sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(p);
-            if (bind(fd, (sockaddr *)&a, sizeof a) == 0) { port = p; return true; }
+            if (bind(fd, (sockaddr *)&a, sizeof a) == 0) {
+                port = p;
+                if (!port) { sockaddr_in me{}; socklen_t ml = sizeof me; if (getsockname(fd, (sockaddr *)&me, &ml) == 0) port = ntohs(me.sin_port); }
+                return true;
+            }
         }
         EOD_CLOSESOCK(fd); fd = -1;
         return false;
     }
-    void close_game() { if (fd >= 0) EOD_CLOSESOCK(fd); fd = -1; }
+    void close_game() { online_stop(); if (fd >= 0) EOD_CLOSESOCK(fd); fd = -1; }
     void ensure_discovery() {
-        if (discovering) return;
+        if (discovering || std::getenv("EOD_NETPLAY_NO_LAN")) return;   // NO_LAN: developer switch that forces the internet path
         discovering = true;
         disc_fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
         if (disc_fd < 0) return;
@@ -209,27 +323,36 @@ struct Session::Impl {
 };
 
 Session::Session() : d_(new Impl) {}
-Session::~Session() { if (d_->fd >= 0) EOD_CLOSESOCK(d_->fd); if (d_->disc_fd >= 0) EOD_CLOSESOCK(d_->disc_fd); }
+Session::~Session() { d_->close_game(); if (d_->disc_fd >= 0) EOD_CLOSESOCK(d_->disc_fd); netplay_online::Online::wait_cleanup(2500); }
 
 // ====================================================================== UI side
 game_frontend::Snapshot Session::snapshot() const {
     Impl &d = *d_;
-    const_cast<Session *>(this)->d_->ensure_discovery();
+    Session *self = const_cast<Session *>(this);
+    self->d_->ensure_discovery();
+    d.ui_seen = now_us();
     using S = game_frontend::Snapshot;
     S s;
-    s.direct_connect = true; s.internet_invites = false; s.native_race_sync = true;
+    s.direct_connect = true; s.internet_invites = true; s.native_race_sync = true;
     s.error = d.last_error;
     s.is_host = d.role == Impl::Role::Host;
     if (d.role == Impl::Role::None) {
         s.phase = S::Phase::Offline; s.status = "Not connected";
+        if (d.online_on) s.route = d.route_text;
+        uint64_t t = now_us();
+        for (auto &kv : d.crew)
+            if (t - kv.second.seen < 9000000) s.crew.push_back({kv.second.name, kv.first, kv.second.players});
     } else if (d.role == Impl::Role::Guest && !d.welcomed) {
-        s.phase = S::Phase::Connecting; s.status = "Connecting..."; s.can_cancel = true;
+        s.phase = S::Phase::Connecting; s.status = d.join_note.empty() ? "Connecting..." : d.join_note; s.can_cancel = true;
+        s.route = d.route_text;
     } else {
         s.phase = in_event_ ? S::Phase::Racing : (d.role == Impl::Role::Host ? S::Phase::Hosting : S::Phase::Lobby);
         if (d.role == Impl::Role::Host) { s.phase = in_event_ ? S::Phase::Racing : S::Phase::Lobby; }
         s.status = d.status; s.can_cancel = true;
         s.invite = d.role == Impl::Role::Host ? local_ip() + ":" + std::to_string(d.port) : "";
         s.address = s.invite;
+        s.code = d.role == Impl::Role::Host ? d.code : "";
+        s.route = d.route_text;
         if (d.role == Impl::Role::Host) {
             for (auto &p : d.make_lobby()) s.players.push_back({p.id, p.name + "  " + p.vname + (p.id ? "  " + std::to_string(p.ping) + "ms" : ""), p.ready});
             s.can_start = !in_event_;
@@ -255,10 +378,14 @@ void Session::submit(game_frontend::Command c) {
     switch (c.kind) {
     case K::Host: {
         if (d.role != Impl::Role::None) return;
-        if (!d.open(kGamePort, true)) { d.last_error = "Could not open the network port. Check that another copy of the game is not blocking it."; return; }
+        if (!d.open(kGamePort, true)) { d.last_error = "Could not open the network port. Another copy of the game may already be hosting; close it and try again."; return; }
+        d.load_friends();
         d.role = Impl::Role::Host; d.peers.clear(); d.status = "Waiting for friends"; d.my_phase = P_LOBBY;
         d.my_vehicle = d.my_vehicle ? d.my_vehicle : 0;
-        std::fprintf(stderr, "[netplay] hosting on %s:%u\n", local_ip().c_str(), d.port);
+        d.code = std::getenv("EOD_NETPLAY_CODE") ? std::getenv("EOD_NETPLAY_CODE") : Impl::new_code();
+        d.route_text = "Looking for the best route...";
+        if (!std::getenv("EOD_NETPLAY_NO_INTERNET")) { d.online_start(true); d.host_jobs(); }
+        std::fprintf(stderr, "[netplay] hosting on %s:%u, Garage Code %s\n", local_ip().c_str(), d.port, d.code.c_str());
         break;
     }
     case K::JoinAddress: {
@@ -267,13 +394,40 @@ void Session::submit(game_frontend::Command c) {
         if (d.role != Impl::Role::None) return;
         if (!d.open(0, false)) { d.last_error = "Could not open the network port."; return; }
         d.role = Impl::Role::Guest; d.host_addr = d.addr_of(ip, port); d.welcomed = false; d.last_join = 0;
+        d.joining_online = false; d.join_tag = 0; d.targets.clear(); d.join_note.clear(); d.remembered = false; d.join_started = now_us();
         d.host_last_heard = now_us(); d.status = "Connecting..."; d.guest_ready = false;
         std::fprintf(stderr, "[netplay] joining %s from local port %d\n", c.text.c_str(), [&] { sockaddr_in me{}; socklen_t ml = sizeof me; getsockname(d.fd, (sockaddr *)&me, &ml); return (int)ntohs(me.sin_port); }());
         break;
     }
-    case K::JoinCode:
-        d.last_error = "Garage Codes need the internet link, which is not in this build yet. Use the address shown on the host's screen, or pick a game found on your network.";
+    case K::JoinCode: case K::JoinCrew: {
+        if (d.role != Impl::Role::None) return;
+        std::string secret, shown;
+        d.load_friends();
+        if (c.kind == K::JoinCode) {
+            using netplay_online::CodeCheck;
+            CodeCheck ck = netplay_online::normalize_code(c.text, secret);
+            if (ck == CodeCheck::TooShort) { d.last_error = "A Garage Code has 5 characters, like K7QD2. Check the code your friend sent you."; return; }
+            if (ck == CodeCheck::TooLong) { d.last_error = "That is longer than a Garage Code (5 characters, like K7QD2). Check what you pasted."; return; }
+            if (ck == CodeCheck::BadChar) { d.last_error = "A Garage Code never contains 0, O, 1, I or L. Check the code your friend sent you."; return; }
+            shown = secret;
+        } else {
+            for (auto &f : d.friends) if (f.secret == c.text) { secret = f.secret; shown = f.name; }
+            if (secret.empty()) { d.last_error = "That friend is not in your list any more."; return; }
+        }
+        // keep the watcher's socket (its router mapping is what the host just opened a path to)
+        if (d.fd < 0 && !d.open(0, false)) { d.last_error = "Could not open the network port."; return; }
+        d.role = Impl::Role::Guest; d.welcomed = false; d.last_join = 0; d.host_addr = sockaddr_in{};
+        d.code = c.kind == K::JoinCode ? secret : std::string();
+        d.join_secret = secret; d.join_tag = netplay_online::join_tag(secret);
+        d.joining_online = true; d.targets.clear(); d.remembered = false; d.join_started = now_us(); d.guest_ready = false;
+        d.host_last_heard = now_us(); d.status = "Connecting..."; d.join_note = "Looking for " + (c.kind == K::JoinCode ? "game " + shown : shown + "'s game") + "...";
+        d.route_text = "Looking for the best route...";
+        d.online_start(false);
+        d.guest_jobs(secret);
+        d.online.poke();
+        std::fprintf(stderr, "[netplay] joining by %s %s\n", c.kind == K::JoinCode ? "code" : "friend", shown.c_str());
         break;
+    }
     case K::Ready:
         if (d.role == Impl::Role::Guest) d.guest_ready = c.enabled;
         break;
@@ -289,9 +443,10 @@ void Session::submit(game_frontend::Command c) {
         break;
     }
     case K::Cancel: case K::Disconnect: {
-        if (d.role == Impl::Role::Guest) { Writer w; d.send_to(d.host_addr, K_LEAVE, d.my_id, w); }
+        if (d.role == Impl::Role::Guest && d.welcomed) { Writer w; d.send_to(d.host_addr, K_LEAVE, d.my_id, w); }
         if (d.role == Impl::Role::Host) { Writer w; for (auto &kv : d.peers) d.send_to(kv.second.addr, K_KICK, 0, w); }
         d.role = Impl::Role::None; d.peers.clear(); d.close_game(); d.status.clear(); d.welcomed = false; d.lobby_players.clear();
+        d.joining_online = false; d.code.clear(); d.route_text.clear(); d.crew.clear();
         break;
     }
     case K::Option: {
@@ -316,6 +471,11 @@ void Session::auto_drive(uint64_t t) {
         Command c{};
         if (!std::strcmp(mode, "host")) c.kind = Command::Kind::Host;
         else if (!std::strncmp(mode, "join:", 5)) { c.kind = Command::Kind::JoinAddress; c.text = mode + 5; }
+        else if (!std::strncmp(mode, "joincode:", 9)) { c.kind = Command::Kind::JoinCode; c.text = mode + 9; }
+        else if (!std::strncmp(mode, "joinfriend", 10)) {   // first remembered friend
+            d.load_friends(); if (d.friends.empty()) return;
+            c.kind = Command::Kind::JoinCrew; c.text = d.friends[0].secret;
+        }
         else return;
         s.submit(c);
         t0 = t;
@@ -345,21 +505,53 @@ void Session::poll() {
             d.lan[sockaddr_text(a)] = {a, nm, pc, t};
         }
     }
-    if (d.fd < 0 || d.role == Impl::Role::None) return;
+    // Remembered friends: while the ONLINE tab is open (and no game is joined/hosted) look for hosts among them.
+    if (d.role == Impl::Role::None && !std::getenv("EOD_NETPLAY_NO_INTERNET")) {
+        const bool tab_open = t - d.ui_seen < 3000000;
+        d.load_friends();
+        if (tab_open && !d.friends.empty()) {
+            if (d.fd < 0) d.open(0, false);
+            if (d.fd >= 0 && !d.online_on) { d.online_start(false); d.watch_jobs(); }
+        } else if (d.online_on && !tab_open) {
+            d.close_game(); d.crew.clear(); d.route_text.clear();
+        }
+    }
+    if (d.fd < 0) return;
+    if (d.online_on) d.route_text = d.route_description(d.online.report());
 
     uint8_t buf[1500]; sockaddr_in from; socklen_t fl = sizeof from;
     for (int n; (n = (int)recvfrom(d.fd, (char *)buf, sizeof buf, 0, (sockaddr *)&from, &fl)) > 0; fl = sizeof from) {
+        if (d.online_on && netplay_online::looks_like_stun(buf, (size_t)n)) { d.online.feed_stun(buf, (size_t)n); continue; }
         Reader r(buf, (size_t)n);
         if (r.u16() != kMagic) continue;
         const uint8_t kind = (uint8_t)r.u8(), sender = (uint8_t)r.u8();
         if (!r.ok) continue;
+        if (kind == K_PUNCH) continue;                      // its only job was to open our router for the sender
+        if (kind == K_PROBE) {                              // a remembered friend asks whether we are hosting
+            const uint32_t tag = r.u32();
+            if (r.ok && d.role == Impl::Role::Host && !in_event_ && d.tag_known(tag, nullptr)) {
+                Writer w; w.u32(tag); w.str(d.name, 16); w.u8(1 + (uint32_t)d.alive_count());
+                d.send_to(from, K_PROBE_REPLY, 0, w);
+            }
+            continue;
+        }
+        if (kind == K_PROBE_REPLY) {
+            const uint32_t tag = r.u32(); std::string nm = r.str(); const uint32_t pc = r.u8();
+            if (!r.ok) continue;
+            for (auto &f : d.friends)
+                if (tag == netplay_online::join_tag(f.secret)) { CrewHost &c = d.crew[f.secret]; c.addr = from; c.name = f.name; c.players = (uint8_t)pc; c.seen = t; }
+            continue;
+        }
+        if (d.role == Impl::Role::None) continue;
         static const bool dbg = std::getenv("EOD_NETPLAY_DEBUG") != nullptr;
         if (dbg && kind != K_SNAP && kind != K_HEARTBEAT && kind != K_LOBBY) std::fprintf(stderr, "[netplay] rx kind %u from %s (%d bytes)\n", kind, sockaddr_text(from).c_str(), n);
         if (d.role == Impl::Role::Host) {
             // ---- host receives
             if (kind == K_JOIN) {
-                uint32_t proto = r.u16(); std::string nm = r.str(); (void)r.u32();
+                uint32_t proto = r.u16(); std::string nm = r.str(); const uint32_t tag = r.u32();
                 if (!r.ok) continue;
+                std::string friend_secret;
+                if (tag != 0 && !d.tag_known(tag, &friend_secret)) continue;   // meant for another game: say nothing
                 Peer *pp = nullptr;
                 for (auto &kv : d.peers) if (same_addr(kv.second.addr, from)) pp = &kv.second;
                 Writer w;
@@ -369,10 +561,14 @@ void Session::poll() {
                     uint8_t id = 1; while (d.peers.count(id) && d.peers[id].alive) ++id;
                     if (id >= kMaxPlayers) { w.u8(3); d.send_to(from, K_REFUSE, 0, w); continue; }
                     Peer p; p.addr = from; p.id = id; p.name = nm; p.last_heard = t;
+                    p.secret = !friend_secret.empty() ? friend_secret : Impl::new_secret();
                     d.peers[id] = p; pp = &d.peers[id];
+                    d.remember(nm, p.secret);
                     std::fprintf(stderr, "[netplay] %s joined from %s as player %u\n", nm.c_str(), sockaddr_text(from).c_str(), id);
                 }
-                w.u8(pp->id); d.send_to(from, K_WELCOME, 0, w);
+                w.u8(pp->id);
+                { std::vector<uint8_t> raw; netplay_online::unhex(pp->secret, raw); for (uint8_t b : raw) w.u8(b); }
+                d.send_to(from, K_WELCOME, 0, w);
                 pp->last_heard = t;
                 d.status = std::to_string(1 + d.alive_count()) + " players in the lobby";
                 continue;
@@ -401,9 +597,17 @@ void Session::poll() {
             }
         } else {
             // ---- guest receives (only from the host)
+            if (!d.welcomed && d.joining_online && (kind == K_WELCOME || kind == K_REFUSE)) {
+                for (auto &a : d.targets) if (same_addr(a, from)) { d.host_addr = from; break; }
+            }
             if (!same_addr(from, d.host_addr)) { static int warned = 0; if (warned++ < 5) std::fprintf(stderr, "[netplay] ignoring packet kind %u from %s (host is %s)\n", kind, sockaddr_text(from).c_str(), sockaddr_text(d.host_addr).c_str()); continue; }
             d.host_last_heard = t;
-            if (kind == K_WELCOME) { d.my_id = (uint8_t)r.u8(); d.welcomed = true; d.status = "Connected"; std::fprintf(stderr, "[netplay] connected, player %u\n", d.my_id); }
+            if (kind == K_WELCOME) {
+                d.my_id = (uint8_t)r.u8(); d.welcomed = true; d.status = "Connected";
+                uint8_t raw[16]; bool have = true; for (auto &b : raw) { b = (uint8_t)r.u8(); } have = r.ok;
+                d.join_secret = have ? netplay_online::hex(raw, 16) : std::string();
+                std::fprintf(stderr, "[netplay] connected, player %u (via %s)\n", d.my_id, sockaddr_text(from).c_str());
+            }
             else if (kind == K_REFUSE) {
                 uint32_t why = r.u8();
                 d.last_error = why == 1 ? "The host has a different game version." : why == 2 ? "An event is running. You can join when it ends." : "The game is full.";
@@ -418,6 +622,7 @@ void Session::poll() {
                 for (uint32_t i = 0; i < n && r.ok; ++i) { LobbyPlayer p; p.id = (uint8_t)r.u8(); p.name = r.str(); p.ready = r.u8(); p.vname = r.str(); p.ping = (uint16_t)r.u16(); v.push_back(p); }
                 if (r.ok) d.lobby_players = v;
                 (void)ev;
+                if (r.ok && !d.remembered && !v.empty() && d.join_secret.size() == 32) { d.remembered = true; d.remember(v[0].name, d.join_secret); }
             } else if (kind == K_START) {
                 uint32_t id = r.u32(); std::string ev = r.str(); uint32_t seed = r.u32();
                 if (r.ok && id != d.event_id) {
@@ -447,7 +652,27 @@ void Session::poll() {
         }
     }
 
+    if (d.role == Impl::Role::None) {
+        // watching friends: ask every host the trackers know under a friend's key whether it is really hosting now
+        if (d.online_on && t - d.last_probe > 1500000) {
+            d.last_probe = t;
+            for (auto &f : d.friends)
+                for (auto &a : d.online.found("ch:" + f.secret)) {
+                    Writer w; w.u32(netplay_online::join_tag(f.secret));
+                    sockaddr_in to = Impl::to_sockaddr(a);
+                    d.send_to(to, K_PROBE, 0, w);
+                }
+        }
+        return;
+    }
     if (d.role == Impl::Role::Host) {
+        // internet: punch towards whoever registered as a joiner (opens our router for their JOIN)
+        if (d.online_on && !in_event_ && t - d.last_punch > 400000) {
+            d.last_punch = t;
+            std::vector<netplay_online::Addr> addrs = d.online.found("joiners");
+            for (auto &f : d.friends) { auto more = d.online.found("cj:" + f.secret); addrs.insert(addrs.end(), more.begin(), more.end()); }
+            for (auto &a : addrs) { Writer w; sockaddr_in to = Impl::to_sockaddr(a); d.send_to(to, K_PUNCH, 0, w); }
+        }
         // timeouts
         for (auto &kv : d.peers) {
             Peer &p = kv.second;
@@ -484,7 +709,7 @@ void Session::poll() {
             }
         }
         // LAN beacon
-        if (!in_event_ && t - d.last_beacon > 1000000) {
+        if (!in_event_ && !std::getenv("EOD_NETPLAY_NO_LAN") && t - d.last_beacon > 1000000) {
             d.last_beacon = t;
             Writer w; w.u16(kProtocol); w.u16(d.port); w.str(d.name, 16); w.u8(1 + (uint32_t)d.alive_count());
             sockaddr_in b{}; b.sin_family = AF_INET; b.sin_addr.s_addr = htonl(INADDR_BROADCAST); b.sin_port = htons(kDiscoveryPort);
@@ -493,6 +718,33 @@ void Session::poll() {
             d.send_to(lo, K_BEACON, 0, w);
         }
     } else if (d.role == Impl::Role::Guest) {
+        if (!d.welcomed && d.joining_online) {
+            // Garage Code / friend: JOIN goes to every address the rendezvous found for the host (hole punching: both sides send)
+            const netplay_online::Report rep = d.online.report();
+            d.route_text = d.route_description(rep);
+            std::vector<sockaddr_in> cand;
+            for (auto &a : d.online.found("hosts")) cand.push_back(Impl::to_sockaddr(a));
+            if (!cand.empty() && cand.size() != d.targets.size()) std::fprintf(stderr, "[netplay] found %zu candidate address(es) for the host\n", cand.size());
+            d.targets = cand;
+            if (t - d.last_join > 400000) {
+                d.last_join = t;
+                Writer w; w.u16(kProtocol); w.str(d.name, 16); w.u32(d.join_tag);
+                for (auto &a : d.targets) d.send_to(a, K_JOIN, 0, w);
+            }
+            const std::string what = d.code.empty() ? "your friend's game" : "game " + d.code;
+            d.join_note = !rep.stun_done ? "Looking for the best route..." : d.targets.empty() ? "Looking for " + what + "..." : "Found " + what + ", connecting...";
+            const uint64_t elapsed = t - d.join_started;
+            if (elapsed > 30000000 || (elapsed > 12000000 && rep.stun_done && !rep.internet())) {
+                if (!rep.internet()) d.last_error = "Could not reach the internet. Check your connection, then try again.";
+                else if (d.targets.empty()) d.last_error = d.code.empty() ? "Your friend is not hosting right now. Ask them to press HOST GAME, then try again."
+                                                                          : "Nobody is hosting " + d.code + ". Check the code, or ask the host to press HOST GAME again.";
+                else if (rep.symmetric) d.last_error = "Found the game, but your internet connection is too strict for direct play (it uses a different address for every destination). Try home Wi-Fi instead of a phone hotspot.";
+                else d.last_error = "Found the game, but no connection could be made (a router is blocking it). Try again; if it keeps failing, join from the host's Wi-Fi or ask them to turn on UPnP in their router.";
+                std::fprintf(stderr, "[netplay] join failed: %s\n%s", d.last_error.c_str(), d.online.log_tail().c_str());
+                d.role = Impl::Role::None; d.close_game(); d.joining_online = false; d.route_text.clear();
+            }
+            return;
+        }
         if (!d.welcomed) {
             if (t - d.last_join > 400000) { d.last_join = t; Writer w; w.u16(kProtocol); w.str(d.name, 16); w.u32(0); d.send_to(d.host_addr, K_JOIN, 0, w); }
             if (t - d.host_last_heard > 8000000) { d.last_error = "Could not reach the host. Check the address and that both of you are on the same network."; d.role = Impl::Role::None; d.close_game(); }
