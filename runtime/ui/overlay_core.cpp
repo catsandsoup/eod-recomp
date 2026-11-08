@@ -464,7 +464,9 @@ bool overlay_in_screenshots() {
 bool overlay_key(int vk, bool down) {
     if (vk == 0x10) g_shift = down;
     if (!g_available) return false;
-    if (down && (vk == 0x70 || (vk == 0x1B && !g_open))) {  // F1, Esc
+    // F1 (and Cmd+, on the Mac) opens/closes it. Esc is the game's own pause/back key, so it never
+    // opens the menu (it only backs out while the menu is open).
+    if (down && vk == 0x70) {
         if (!g_context) ensure_context();
         if (g_menu && g_menu->error_active()) return true;
         if (vk == 0x70 && g_open && g_menu && g_menu->rebinding() < 0) { open_menu(false); play(frontend::Sound::Back); return true; }
@@ -553,6 +555,7 @@ void overlay_frame() {
             overlay_platform_pad(p, &s);
             any |= s.connected && s.buttons;
         }
+        any |= overlay_platform_keys_held();  // e.g. the Esc/Enter that closed the menu: not a game press
         if (!any) g_release_wait = false;
     }
     if (!g_open && !g_config.show_fps) {

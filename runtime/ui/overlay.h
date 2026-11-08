@@ -8,8 +8,9 @@
 // frontend.cpp, frontend_draw.cpp) is shared by both; only the event plumbing is
 // per platform (overlay.cpp: Win32 messages; platform_sdl3.cpp: SDL events).
 //
-// Open/close: Start+Select on any controller, F1 or Esc on the
-// keyboard. While it is open the game gets neutral input.
+// Open/close: Start+Select on any controller, F1 (or Cmd+,) on the keyboard. Esc stays the
+// game's pause/back key. While it is open, and after it closes until every key and button
+// is released, the game gets neutral input.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -97,6 +98,8 @@ bool overlay_fatal_screen(const std::string &title, const std::string &message);
 struct HostPadState;
 // The controller states for the menu (keyboard excluded), before the menu's input gate.
 void overlay_platform_pad(int port, HostPadState *out);
+// Any keyboard key still physically held (the release wait after the menu closes).
+bool overlay_platform_keys_held();
 // Short device name on a player port ("" = none), and whether it has Xbox-style glyphs.
 std::string overlay_platform_device(int port, bool *xbox);
 // Settings changed: audio gain, key map, controller/keyboard layout, stick shaping.

@@ -28,7 +28,7 @@ bool overlay_wndproc(void *hwnd, unsigned msg, uintptr_t wp, intptr_t lp) {
     case WM_SYSKEYDOWN:
         // Alt+Enter and F11 still switch fullscreen
         if (wp == VK_F11 || (msg == WM_SYSKEYDOWN && wp == VK_RETURN)) return false;
-        if (lp & (1 << 30) && (wp == VK_F1 || wp == VK_ESCAPE) && !overlay_menu_open()) return true;  // auto-repeat
+        if (lp & (1 << 30) && wp == VK_F1 && !overlay_menu_open()) return true;  // auto-repeat
         return overlay_key((int)wp, true);
     case WM_KEYUP:
     case WM_SYSKEYUP:
@@ -61,6 +61,11 @@ bool overlay_wndproc(void *hwnd, unsigned msg, uintptr_t wp, intptr_t lp) {
 }
 
 void overlay_platform_pad(int port, HostPadState *out) { platform_get_controller(port, out); }
+bool overlay_platform_keys_held() {
+    for (int vk = 0x08; vk < 0x100; vk++)
+        if (GetAsyncKeyState(vk) & 0x8000) return true;
+    return false;
+}
 
 std::string overlay_platform_device(int port, bool *xbox) {
     HostPadState s;

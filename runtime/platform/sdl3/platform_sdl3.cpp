@@ -398,7 +398,7 @@ bool platform_pump() {
         case SDL_EVENT_KEY_DOWN:
             time_key_event(e.key);
             if (!g_headless && !(e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_F && (e.key.mod & SDL_KMOD_GUI)))) {
-                // the in-game front end: F1 / Esc / Cmd+, open it; while open it takes every key
+                // the in-game front end: F1 / Cmd+, open it (Esc stays the game's); while open it takes every key
                 const int vk = (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)) ? 0x70 : scancode_to_vk(e.key.scancode);
                 const bool open = overlay_menu_open();
                 if (vk && (!e.key.repeat || open) && overlay_key(vk, true)) {
@@ -613,6 +613,14 @@ void overlay_platform_pad(int port, HostPadState *out) {
     if (pad_script_state(port, out)) return;
     if (SDL_Gamepad *gp = sdl_input::port_gamepad(port))
         sdl_input::read_menu_gamepad(gp, out, g_headless || (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
+}
+bool overlay_platform_keys_held() {
+    if (g_headless) return false;
+    int n = 0;
+    const bool *keys = SDL_GetKeyboardState(&n);
+    for (int i = 0; keys && i < n; i++)
+        if (keys[i]) return true;
+    return false;
 }
 std::string overlay_platform_device(int port, bool *xbox) { return sdl_input::port_description(port, xbox); }
 void overlay_platform_apply() {
