@@ -60,6 +60,7 @@
 00176698 RaceSessionInitPhase [V]  # Initializes race-start phase and RNG epoch; wrapped for netplay lockstep -> docs/INDEX.md
 00176918 RaceSessionSeedRng [V]  # Seeds per-session race RNG state; wrapped for netplay lockstep -> docs/INDEX.md
 00177718 WorldSimulationStep [V]  # Main per-tick world physics and entity simulation step; netplay lockstep boundary -> docs/INDEX.md
+00178670 WorldStepCount [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 00179A08 CarGetByParticipantIndex [V]  # Returns Car pointer for participant slot index -> docs/BATTLE_RECOVERY.md
 0017A498 SceneObjectUpdateBounds [I]  # Propagates world transform to scene bounding sphere -> docs/BATTLE_RECOVERY.md
 0017AF80 SceneObjectSetPose [V]  # Copies 4x3 pose matrix into object+0x64 and updates scene bounds -> docs/BATTLE_RECOVERY.md
@@ -123,6 +124,7 @@
 0021C6E0 VisualCarSelectLodIndex [V]  # Computes camera distance and selects LOD index (+0x54C) for a single visual car -> docs/LOD_RUNTIME.md
 00220788 WheelSelectSlowOrFastModel [V]  # Chooses 3D slow wheel mesh vs card fast wheel by speed/LOD; wrapped for Cup wheels -> docs/NASCAR_CUP_WHEELS.md
 00227EE8 ChickenWeaponCreateForCar [V]  # Constructs and registers a chicken launcher for car slot -> docs/BATTLE_RECOVERY.md
+00270C10 MenuRun [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 
 # ---------------------------------------------------------------------------
 # 0x002A0000 - 0x002FFFFF : Frontend Menus, Career Mode, AutoShop & Eves
@@ -246,6 +248,7 @@
 003CD910 g_CareerChallengesTable [V]  # Loaded Career challenges.val / home_challenges.val table -> docs/CAREER_UNLOCKS.md
 003CDA24 g_CareerChallengePromptState [V]  # Career free-roam challenger prompt state (0=wait, 1=prompt, 6=dismissed) -> docs/CAREER_UNLOCKS.md
 003CDA78 g_CareerActiveChallengerPtr [V]  # Pointer to active Highway challenger entry (+8 = car_idx) -> docs/CAREER_UNLOCKS.md
+003CDA8C g_RaceTick [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 003CDACC g_RaceClockSeconds [V]  # Monotonic race simulation clock in seconds (float) -> docs/BATTLE_RECOVERY.md
 003CE3F8 g_WeaponRegistry [V]  # 12-byte weapon registry rows {owner_idx, slot, interface_ptr} -> docs/BATTLE_RECOVERY.md
 003CE4B8 g_WeaponRegistryCount [V]  # Active row count in g_WeaponRegistry -> docs/BATTLE_RECOVERY.md
@@ -254,13 +257,18 @@
 003D18E4 g_FeatCheatUnlockMask [V]  # Bitmask of unlocked feat cheats -> docs/GAMEPLAY_MODS_RE.md
 003D1A74 g_ActiveViewportCount [V]  # Active player/viewport count (1..4) -> docs/LOD_CULLING_INVESTIGATION.md
 003D1C90 g_VisualCarList [V]  # Array of up to 20 active visual car pointers (count at 0x003D1CE0) -> docs/LOD_RUNTIME.md
+003D73FC g_MainMenuHighlight [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 003D80E0 g_CheatMenuToggles [V]  # 8-entry int32 toggle array for the UI cheat menu -> docs/GAMEPLAY_MODS_RE.md
 003D8180 g_EventUnlockOverride [V]  # Non-zero unlocks all Action events in menus -> docs/GAMEPLAY_MODS_RE.md
 003DD658 g_DisplayAspectXScale [V]  # Horizontal projection scale (1.0 for 4:3, 0.75 for 16:9, 0.8333 for 16:10) -> docs/NATIVE_CAMERA_ASPECT.md
 004062A8 g_ViewCountLodFactors [V]  # Float[4] per-view-count LOD distance multipliers ({1.0, 1.0, 2.0, 2.0}) -> docs/LOD_CULLING_INVESTIGATION.md
+00447458 g_ParticipantCarTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 0044AE68 g_DetachablePanelSpecTable [V]  # 8-entry detachable car panel helper/group/threshold table -> docs/NASCAR_A2_RECOVERY.md
 00484E68 g_DetachedWheelPhobPool [V]  # 16-entry detached wheel phob pointer ring (count at 0x00484EA8, next at 0x00484EAC) -> docs/INDEX.md
 00485098 g_RecoveryConfigFlag [V]  # Vehicle recovery enable flag read by f_001B8370 -> docs/MANUAL_RECOVERY.md
+0048522C g_ParticipantCount [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00485230 g_DriverTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00494000 g_PhysicsBodyTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 00494D60 g_DetachedPanelPhobPool [V]  # 16-entry detached body panel phob pointer pool (count at 0x00494DA0) -> docs/INDEX.md
 00495D58 g_DrawDistanceFar [V]  # Active world far clip / fog distance float (300 / 725 / 1150) -> docs/LOD_CULLING_INVESTIGATION.md
 00496E80 g_CareerState [V]  # Career state root (+0x10=cash, +0x1C8=rank, +0x2C4=garage, +0x3D4=stock[5]) -> docs/CAREER_UNLOCKS.md
@@ -268,11 +276,3 @@
 004A9830 g_TextureMip0CacheState [V]  # Dynamic .tm0 mip0 streaming pool state (+0x10=budget, +0x1C=base, +0x24=end) -> docs/TEXTURE_FORMAT_NOTES.md
 004CD31C g_CameraWorldPos [V]  # Active camera world position (vec3) -> docs/LOD_CULLING_INVESTIGATION.md
 004CD370 g_ProjectionNearFar [V]  # Active projection near (0x004CD370) and far (0x004CD374) planes -> docs/LOD_CULLING_INVESTIGATION.md
-00178670 WorldStepCount [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-00270C10 MenuRun [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-0048522C g_ParticipantCount [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-00485230 g_DriverTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-00447458 g_ParticipantCarTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-003CDA8C g_RaceTick [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-003D73FC g_MainMenuHighlight [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
-00494000 g_PhysicsBodyTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md

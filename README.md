@@ -59,6 +59,15 @@ Press **Start + Select** on a controller (or **F1** / **Cmd+,** on a keyboard) a
 
 ![In-game menu Graphics tab with render scale, aspect ratio and fullscreen options](docs/img/in-game-menu-graphics.jpg)
 
+### Online multiplayer
+
+Race and battle your friends on their own screens. Everyone drives their own car in their own game, full-screen, with zero input lag, and every car is solid metal. No ghosting, ever.
+
+* **Host in one press.** Open **Online**, choose **Host**, pick a mode (No-Rules Race, Battle (4 AI) or Battle (8 AI)) and press **Start**.
+* **Join in one press.** Games on your home network show up by themselves. Anyone else joins by typing the host's address.
+* **The game's own screens.** The host picks the track and everyone picks their own car on the original selection screens, then the whole lobby starts together.
+* **Straight back to the lobby** after the results, ready for the next one.
+
 ### Your own soundtrack
 
 Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongside the original songs, just like custom soundtracks on the Xbox version. Choose which ones are on from the Mods tab, and the game remembers your picks next time you play.
@@ -73,7 +82,7 @@ Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongs
 
 No dates, just where we are headed:
 
-* **Online play with friends** through simple join codes, plus voice chat
+* **Online play across the internet** with simple join codes, remembered friends and voice chat
 * **Higher draw distance and more detail**
 * **More cars on track**
 * **Texture packs**, including 4K
