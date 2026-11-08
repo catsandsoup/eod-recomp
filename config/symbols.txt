@@ -268,3 +268,11 @@
 004A9830 g_TextureMip0CacheState [V]  # Dynamic .tm0 mip0 streaming pool state (+0x10=budget, +0x1C=base, +0x24=end) -> docs/TEXTURE_FORMAT_NOTES.md
 004CD31C g_CameraWorldPos [V]  # Active camera world position (vec3) -> docs/LOD_CULLING_INVESTIGATION.md
 004CD370 g_ProjectionNearFar [V]  # Active projection near (0x004CD370) and far (0x004CD374) planes -> docs/LOD_CULLING_INVESTIGATION.md
+00178670 WorldStepCount [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00270C10 MenuRun [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+0048522C g_ParticipantCount [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00485230 g_DriverTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00447458 g_ParticipantCarTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+003CDA8C g_RaceTick [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+003D73FC g_MainMenuHighlight [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00494000 g_PhysicsBodyTable [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md

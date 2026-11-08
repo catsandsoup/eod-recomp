@@ -53,6 +53,8 @@ bool overlay_captures_input();
 // The game is held while the menu is open (Settings > Pause game in this menu).
 bool overlay_paused();
 void overlay_toggle();
+// Opens the menu on the ONLINE tab (the lobby comes back after an online event).
+void overlay_show_online();
 
 // GS thread: the latest published overlay (false: nothing to draw).
 bool overlay_latest(OverlayDraw &out);

@@ -10,6 +10,7 @@
 //   0x120BE8  SelectEvent(pos): tracker vtable +0x14 (0x121850: pending = pos) then 0x3C4BE8 = 1, the flag the in-world event list sets
 #include "session_start.h"
 #include "battle_layout.h"
+#include "netplay_hooks.h"
 
 #include "core/cpu.h"
 #include "core/log.h"
@@ -86,6 +87,7 @@ struct Plan {
     SessionRequest req;
     uint32_t eve = 0, contest = 0, car = 0;
     bool car_done = false, track_done = false, event_done = false;
+    bool net = false;   // online event: native car screen shown for real; track real (host) or the host's pick (guest)
 } P;
 
 void log(const char *fmt, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
@@ -176,6 +178,19 @@ void start() {
     P.armed = false;
     std::fprintf(stderr, "[SESSION] session returned to the front end\n");
 }
+// Online event (lobby START): the next GameDoSingle (reached through the native main menu's
+// ACTION item) runs with the native car screen shown for real on every machine and the track
+// screen real on the host / answered with the host's pick on guests. The remote players are
+// puppet cars (src/netplay_session.cpp).
+void arm_net(const netplay_hooks::StartInfo &info) {
+    P = Plan{};
+    P.net = true;
+    P.req.event = info.event;
+    P.requested = true;
+    P.armed = true;
+    std::fprintf(stderr, "[SESSION] online event %u: %s (%s)\n", info.event_id, info.event.c_str(), info.host ? "host" : "guest");
+}
+const bool g_arm_registered = [] { netplay_hooks::arm = &arm_net; return true; }();
 } // namespace
 
 bool session_parse(const char *text, SessionRequest &out, std::string &err) {
@@ -231,12 +246,27 @@ extern "C" void f_002BEC08(void) {
 extern "C" void f_002A1298(void) {
     static bool tried = false;
     if (!tried) { tried = true; start(); }
+    if (P.net) {   // the online event that was running has returned to the main menu
+        P = Plan{};
+        if (netplay_hooks::event_ended) netplay_hooks::event_ended();
+    }
+    if (netplay_hooks::menu_enter) netplay_hooks::menu_enter();
     f_002A1298_orig();
+    if (netplay_hooks::menu_leave) netplay_hooks::menu_leave();
 }
 
 // GameDoSingle opens the car screen first. The answer is the human's vehicle number, which
 // the loop body hands to 0x12A0B8 (Garage: set human driver); nonzero return = proceed.
 extern "C" void f_002A75E0(void) {
+    if (P.armed && P.net) {
+        const uint32_t number_ptr = arg_u32(0);
+        f_002A75E0_orig();
+        if (g_ee.r[2].uw[0] && !P.car_done) {
+            P.car_done = true;
+            if (netplay_hooks::car_chosen) netplay_hooks::car_chosen(ee_r32(number_ptr));
+        }
+        return;
+    }
     if (P.armed && !P.car_done) {
         P.car_done = true;
         ee_w32(arg_u32(0), P.car);
@@ -250,6 +280,33 @@ extern "C" void f_002A75E0(void) {
 // Track screen: *eve = chosen Eve, *aux = 5 (its initial value), options+0x28 = 1 (both
 // written by the native screen before it opens); nonzero return = play.
 extern "C" void f_002C7340(void) {
+    if (P.armed && P.net && !P.track_done) {
+        const uint32_t eve_ptr = arg_u32(0), aux_ptr = arg_u32(1), options = arg_u32(2);
+        std::string track;
+        if (netplay_hooks::is_host && netplay_hooks::is_host()) {
+            f_002C7340_orig();
+            if (g_ee.r[2].uw[0]) {
+                P.track_done = true;
+                P.eve = ee_r32(eve_ptr);
+                track = guest_text(kEves + P.eve * kEveStride + 0x28, 40);
+                if (netplay_hooks::track_chosen) netplay_hooks::track_chosen(track);
+                const int c = find_contest(P.eve, P.req.event);
+                P.contest = c < 0 ? 0xFFFFFFFFu : (uint32_t)c;
+                if (c < 0) std::fprintf(stderr, "[SESSION] '%s' has no event '%s': native lobby event\n", track.c_str(), P.req.event.c_str());
+            }
+            return;
+        }
+        if (!netplay_hooks::wait_track(track)) { ret_s32(0); return; }
+        const int eve = find_eve(track);
+        if (eve < 0) { std::fprintf(stderr, "[SESSION] unknown track '%s'\n", track.c_str()); ret_s32(0); return; }
+        P.track_done = true; P.eve = (uint32_t)eve;
+        const int c = find_contest(P.eve, P.req.event);
+        P.contest = c < 0 ? 0xFFFFFFFFu : (uint32_t)c;
+        ee_w32(eve_ptr, P.eve); ee_w32(aux_ptr, 5); ee_w32(options + 0x28, 1);
+        log("online track answered: Eve %u", P.eve);
+        ret_s32(1);
+        return;
+    }
     if (P.armed && !P.track_done) {
         P.track_done = true;
         ee_w32(arg_u32(0), P.eve);

@@ -501,7 +501,7 @@ void Menu::rows_online(std::vector<Row> &r) {
     using P = game_frontend::Snapshot::Phase;
     const bool connected = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
     Row st = info("status", "STATUS", connected ? upper(s.status.empty() ? "CONNECTED" : s.status) : "NOT CONNECTED",
-                  "Network play setup. The netplay transport is a later task: this screen talks to the stub backend.");
+                  "Online play: one player hosts, the others join. Each player drives their own car on their own screen.");
     st.warn = !connected;
     st.good = connected;
     r.push_back(st);
@@ -521,11 +521,22 @@ void Menu::rows_online(std::vector<Row> &r) {
     addr.kind = RowKind::Text;
     r.push_back(addr);
     Row ready = toggle("ready", "READY", s.ready, "", "Marks you ready in the lobby.");
-    ready.enabled = connected;
-    r.push_back(ready);
+    ready.enabled = connected && !s.is_host;
+    if (!s.is_host) r.push_back(ready);
     Row leave = action("leave", "LEAVE / CANCEL", "[ DISCONNECT ]", "Leaves the lobby or cancels the connection.");
     leave.enabled = connected || s.can_cancel;
     r.push_back(leave);
+    if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, "Friends on your network see your game listed. Others can join by typing this address."));
+    if (!connected && !s.lan.empty()) {
+        r.push_back(header("GAMES ON YOUR NETWORK"));
+        for (const auto &g : s.lan)
+            r.push_back(action(("lan:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", "Joins this game."));
+    }
+    for (const auto &o : s.options) {
+        if (o.editable) r.push_back(choice(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), "", o.help.c_str()));
+        else r.push_back(info(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), o.help.c_str()));
+    }
+    if (s.can_start) r.push_back(action("start", "START EVENT", "[ START ]", "Starts the event for everyone: you pick the track, each player picks their car, then the race loads."));
     r.push_back(header("LOBBY"));
     if (s.players.empty()) r.push_back(info("noplayers", "PLAYERS", "NO LOBBY"));
     for (const auto &p : s.players) {
@@ -677,6 +688,7 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "smooth") cfg_.smooth_display = !cfg_.smooth_display;
     else if (id == "frameskip") cfg_.frame_skip = !cfg_.frame_skip;
     else if (id == "detail") cycle(kDetails, 3, cfg_.detail);
+    else if (id.compare(0, 4, "opt:") == 0 && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Option; c.text = id.substr(4); c.value = (float)dir; net_->submit(c); }
     else if (id == "fps") cfg_.show_fps = !cfg_.show_fps;
     else if (id == "audio") { cfg_.audio = !cfg_.audio; fx.audio = true; }
     else if (id == "volume") { step(cfg_.volume, 0, 100, 5); fx.audio = true; }
@@ -735,6 +747,8 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (id.compare(0, 3, "key") == 0 && id.size() > 3) { rebind_ = std::stoi(id.substr(3)); return; }
     if (id == "dev1" || id == "dev2") { fx.swap_ports = true; return; }
     game_frontend::Command c{};
+    if (id == "start" && net_) { c.kind = game_frontend::Command::Kind::Start; net_->submit(c); fx.close = true; return; }
+    if (id.compare(0, 4, "lan:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinAddress; c.text = id.substr(4); net_->submit(c); return; }
     if (id == "host" && net_) { c.kind = game_frontend::Command::Kind::Host; net_->submit(c); return; }
     if (id == "code" || id == "addr") { text_id_ = id; text_.clear(); return; }
     if (id == "ready" && net_) { c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); return; }

@@ -22,6 +22,7 @@
 #include "frontend_draw.h"
 #include "menu_input.h"
 #include "ui_art.h"
+#include "../../src/netplay_session.h"
 
 [[noreturn]] void app_exit(int code);
 uint64_t gs_drawn_frames();
@@ -34,37 +35,13 @@ extern std::string g_game_root;
 
 namespace {
 
-// ------------------------------------------------------------------ network stub
-// The netplay transport is a later task; the ONLINE tab talks to this backend.
-class StubNetwork : public game_frontend::Network {
-public:
-    game_frontend::Snapshot snapshot() const override {
-        std::lock_guard<std::mutex> lk(m_);
-        game_frontend::Snapshot s;
-        s.phase = game_frontend::Snapshot::Phase::Offline;
-        s.status = "Not connected";
-        s.error = last_;
-        return s;
-    }
-    void submit(game_frontend::Command c) override {
-        std::lock_guard<std::mutex> lk(m_);
-        using K = game_frontend::Command::Kind;
-        if (c.kind == K::Host || c.kind == K::JoinCode || c.kind == K::JoinAddress)
-            last_ = "Online play is not available in this build yet (netplay transport pending)";
-        fprintf(stderr, "[frontend] online command %d '%s' (stub backend: not connected)\n", (int)c.kind, c.text.c_str());
-    }
-private:
-    mutable std::mutex m_;
-    std::string last_;
-};
-
 std::atomic<bool> g_available{false};
 std::atomic<bool> g_open{false};
 bool g_context;
 bool g_published_any;
 uint64_t g_last_time;
 std::unique_ptr<frontend::Menu> g_menu;
-std::shared_ptr<StubNetwork> g_net;
+std::shared_ptr<game_frontend::Network> g_net;
 ImFont *g_font_main;
 menu_input::PadEdges g_pads[2];
 frontend::Repeater g_rep_x, g_rep_y;
@@ -239,7 +216,7 @@ void ensure_context() {
     ui_art::load(g_game_root, add_texture);
     g_menu = std::make_unique<frontend::Menu>(g_config);
     g_menu->set_music(std::make_shared<MusicAdapter>());
-    g_net = std::make_shared<StubNetwork>();
+    g_net = std::shared_ptr<game_frontend::Network>(&netplay::session(), [](game_frontend::Network *) {});
     g_menu->set_network(g_net);
     g_context = true;
 }
@@ -518,7 +495,15 @@ bool overlay_fatal_screen(const std::string &title, const std::string &message) 
 }
 int overlay_error_result() { return g_error_result; }
 
+void overlay_show_online() {
+    if (!g_available) return;
+    ensure_context();
+    if (g_menu) g_menu->set_tab(frontend::Tab::Online);
+    if (!g_open) { open_menu(true); play(frontend::Sound::Select); }
+}
+
 void overlay_frame() {
+    netplay::session().poll();   // network pump: every vblank, also with the menu closed or headless
     if (!g_available) return;
     if (!g_context) {
         // the chord before the first use (no context yet: nothing else to do)
@@ -529,7 +514,7 @@ void overlay_frame() {
             if (g_pads[p].update(s).toggle) toggled = true;
         }
         if (toggled || g_open) { ensure_context(); g_open = false; open_menu(true); play(frontend::Sound::Select); }
-        if (!g_open && !g_config.show_fps) return;
+        if (!g_open && !g_config.show_fps && netplay::session().strip().empty()) return;
     }
     ensure_context();
     refresh_host();
@@ -558,7 +543,8 @@ void overlay_frame() {
         any |= overlay_platform_keys_held();  // e.g. the Esc/Enter that closed the menu: not a game press
         if (!any) g_release_wait = false;
     }
-    if (!g_open && !g_config.show_fps) {
+    const std::string strip = netplay::session().strip();
+    if (!g_open && !g_config.show_fps && strip.empty()) {
         if (g_published_any) {
             g_published_any = false;
             std::lock_guard<std::mutex> lk(g_pub_mtx);
@@ -588,6 +574,11 @@ void overlay_frame() {
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     if (g_open) frontend_draw::draw_menu(dl, *g_menu, c, g_hits);
     else g_hits.clear();
+    if (!strip.empty()) {
+        dl->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, 38), IM_COL32(24, 14, 8, 215));
+        dl->AddRectFilled(ImVec2(0, 36), ImVec2((float)w, 38), IM_COL32(230, 120, 30, 255));
+        dl->AddText(g_font_main, 22.f, ImVec2(18, 7), IM_COL32(255, 160, 50, 255), strip.c_str());
+    }
     if (g_config.show_fps) {
         char t[32];
         fps_text(t, sizeof t);

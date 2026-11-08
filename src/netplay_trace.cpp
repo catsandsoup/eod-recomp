@@ -1,6 +1,8 @@
 // Default-off native diagnostics; separate explicit test controls/seed options
 // modify native inputs only when requested. Normal offline behavior is retained.
 #include "netplay_trace.h"
+#include "netplay_car.h"
+#include "netplay_session.h"
 #include "../runtime/core/memory.h"
 #include "../runtime/kernel/kernel.h"
 #include <cstdio>
@@ -77,12 +79,17 @@ void netplay_trace_pad(int port,int slot,uint32_t length,const uint8_t *data) {
  std::fputs("\"}\n",f);
 }
 extern "C" void f_00177718_orig(void);
-extern "C" void f_00177718(void) { f_00177718_orig(); ++step; record_step(); }
+extern "C" void f_00177718(void) { netplay_car::before_step(); netplay::session().step_begin(); f_00177718_orig(); ++step; record_step(); netplay_car::after_step(); netplay::session().step_end(); }
 
 extern "C" void f_0038FF40_orig(void);
 extern "C" void f_0038FF40(void) {
  const uint32_t port=R[4].uw[0], slot=R[5].uw[0], dst=R[6].uw[0];
  f_0038FF40_orig();
+ if(port==0 && dst<EE_RAM_SIZE-32 && R[2].uw[0]>=4) {
+  // online lobby START while the native main menu waits: press ACTION for the player
+  const uint16_t press=netplay::session().menu_buttons();
+  if(press){uint16_t keys=uint16_t(~(ee_r8(dst+2)|(ee_r8(dst+3)<<8)));keys|=press;ee_w8(dst+2,uint8_t(~keys));ee_w8(dst+3,uint8_t(~keys>>8));}
+ }
  if(trace() && R[2].uw[0] && dst<EE_RAM_SIZE-32) {
   uint8_t bytes[20]={}; const uint32_t n=R[2].uw[0]<20?R[2].uw[0]:20;
   ee_read_block(dst,bytes,n);netplay_trace_pad(port,slot,R[2].uw[0],bytes);

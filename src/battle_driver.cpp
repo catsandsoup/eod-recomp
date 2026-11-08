@@ -3,6 +3,7 @@
 // at vblank. NullDriver does not join the native driver update list. Native cars retain physics, damage, recovery and weapon ownership.
 #include "battle_driver.h"
 #include "battle_bots.h"
+#include "netplay_puppet.h"
 #include "battle_layout.h"
 #include "battle_navigation.h"
 #include "core/config.h"
@@ -172,6 +173,7 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
 void battle_driver_reset(){states={};navigation.reset();}
 extern "C" void f_001A2D20(){
     uint32_t updated_car=g_ee.r[4].uw[0];
+    if(netplay_car::is_puppet(updated_car)) return;  // remote player's car: state comes from the network
     f_001A2D20_orig();
     if(ee_r32(0x3CF19C)!=0x18000224 || !valid(updated_car,0x1C34)) return;
     uint32_t master=ee_r32(0x3CF194);

@@ -1,6 +1,7 @@
 // Native Battle participant and weapon construction bridges. These hooks run
 // during session creation; they do not advance physics, weapons or the clock.
 #include "battle_bots.h"
+#include "netplay_hooks.h"
 #include "battle_driver.h"
 #include "battle_events.h"
 #include "battle_layout.h"
@@ -81,7 +82,11 @@ extern "C" void f_0012C158(void) {
     // This is before 12AEF0 fills the DAVMap and 111E10/1116E0 resolve
     // driver/vehicle IDs and Human/AI types. Do not append blank car records.
     // Variant 1 is "Battle (1v1)": the humans only, never AI.
-    if (ai) ret_s32(static_cast<int32_t>(std::min(humans + (ai == 1 ? 0 : ai), battle_layout::kMaxCars)));
+    if (ai) {
+        // online: remote players are extra cars in the same world (puppets driven by their owners)
+        const uint32_t remote = netplay_hooks::remote_humans ? netplay_hooks::remote_humans() : 0;
+        ret_s32(static_cast<int32_t>(std::min(humans + remote + (ai == 1 ? 0 : ai), battle_layout::kMaxCars)));
+    }
     else if (fill) ret_s32(4);
 }
 
@@ -325,5 +330,7 @@ extern "C" void f_001116E0(void) {
             std::fprintf(stderr, "\n");
         }
     }
+    if (netplay_hooks::event_active && netplay_hooks::event_active()) netplay_hooks::roster_pre(description);
     f_001116E0_orig();
+    if (netplay_hooks::event_active && netplay_hooks::event_active()) netplay_hooks::roster_post(description);
 }
