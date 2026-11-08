@@ -22,14 +22,33 @@ bool is_human(uint32_t car) { return valid(car, 0x1C34) && ee_r32(car + kType) =
 
 uint32_t body_of(uint32_t car) {
     if (!valid(car, 0x1C34)) return 0;
-    const float px = rf(car + 0x88), pz = rf(car + 0x90);
-    for (uint32_t a = 0x494000; a < 0x496000; a += 4) {
-        uint32_t p = ee_r32(a);
-        if (p > 0x100000 && p < EE_RAM_SIZE - 0x80 && !(p & 3) && std::fabs(rf(p) - px) < 1e-4f && std::fabs(rf(p + 8) - pz) < 1e-4f &&
-            std::fabs(rf(p + 0x10) - rf(car + 0x64)) < 1e-4f)
-            return p;
-    }
+    // CarBase constructor 185390 allocates a body (1DD2F8), then appends
+    // the car to 3CE4F8. Bodies are contiguous 0xB0-byte records, NOT a
+    // pointer table. The old address scan could find only body zero.
+    const uint32_t count = ee_r32(0x3CE548), body_count = ee_r32(0x494D28);
+    const uint32_t base = ee_r32(0x494D30);
+    if (!count || count > 20 || body_count != count || !valid(base, count * 0xB0)) return 0;
+    for (uint32_t i = 0; i < count; ++i)
+        if (ee_r32(0x3CE4F8 + 4 * i) == car) return base + i * 0xB0;
     return 0;
+}
+uint32_t human_controller_of(uint32_t car) {
+    if (!is_human(car)) return 0;
+    const uint32_t driver = ee_r32(car + 0x1C1C);
+    if (!valid(driver, 0x38) || ee_r32(driver) != 0x3FA4B0) return 0;
+    const uint32_t human = ee_r32(driver + 0x10);
+    if (!valid(human, 0x44) || ee_r32(human) != 0x3FA450 || ee_r32(human + 0x38) != car) return 0;
+    const uint32_t input = ee_r32(human + 0x3C);
+    return valid(input, 0x38) && ee_r32(input + 0x34) == 0 ? human : 0;
+}
+bool valid_state(const State &s) {
+    for (int i = 0; i < 12; ++i)
+        if (!std::isfinite(s.pose[i]) || std::fabs(s.pose[i]) > (i < 9 ? 1.01f : 100000.f)) return false;
+    for (int i = 0; i < 3; ++i)
+        if (!std::isfinite(s.vel[i]) || std::fabs(s.vel[i]) > 10000.f ||
+            !std::isfinite(s.ang[i]) || std::fabs(s.ang[i]) > 10000.f) return false;
+    return std::isfinite(s.steer) && std::isfinite(s.gas) && std::isfinite(s.brake) &&
+           std::isfinite(s.handbrake) && std::isfinite(s.damage);
 }
 bool read(uint32_t car, State &s) {
     if (!valid(car, 0x1C34)) return false;
@@ -37,7 +56,7 @@ bool read(uint32_t car, State &s) {
     for (int i = 0; i < 3; ++i) { s.vel[i] = rf(car + kVel + 4 * i); s.ang[i] = rf(car + kAngVel + 4 * i); }
     s.steer = rf(car + kSteer); s.gas = rf(car + kGas); s.brake = rf(car + kBrake); s.handbrake = rf(car + kHandbrake);
     s.gear = (int32_t)ee_r32(car + kGear); s.damage = rf(car + kDamage);
-    return true;
+    return valid_state(s);
 }
 void matrix_to_quat(const float m[9], float q[4]) {
     float w = std::sqrt(std::fmax(0.f, 1.f + m[0] + m[4] + m[8])) * 0.5f, x, y, z;
@@ -63,11 +82,11 @@ static void write_body(uint32_t B, const State &s) {
     for (int i = 0; i < 3; ++i) { wf(B + 0x50 + 4 * i, s.vel[i]); wf(B + 0x60 + 4 * i, s.ang[i]); }
 }
 void write(uint32_t car, const State &s) {
-    if (!valid(car, 0x1C34)) return;
-    static uint32_t cached_car[16], cached_body[16];
-    uint32_t B = 0;
-    for (int i = 0; i < 16; ++i) if (cached_car[i] == car) B = cached_body[i];
-    if (!B) { B = body_of(car); if (B) for (int i = 0; i < 16; ++i) if (!cached_car[i]) { cached_car[i] = car; cached_body[i] = B; break; } }
+    if (!valid(car, 0x1C34) || !valid_state(s)) return;
+    // Resolve against the current world on every write. Native car addresses are
+    // reused after a rematch; a process-lifetime car -> body cache can therefore
+    // write the previous world's unrelated allocation.
+    const uint32_t B = body_of(car);
     if (B) write_body(B, s);
     for (int i = 0; i < 12; ++i) wf(car + kPose + 4 * i, s.pose[i]);
     for (int i = 0; i < 3; ++i) { wf(car + kVel + 4 * i, s.vel[i]); wf(car + kAngVel + 4 * i, s.ang[i]); }
@@ -103,10 +122,10 @@ State extrapolate(const State &s, float seconds) {
 }
 
 void Remote::push(uint32_t tick, const State &s) {
-    if (!ring_.empty() && tick <= ring_.back().tick) {
-        if (tick + 600 < ring_.back().tick) reset();   // sender restarted its clock
-        else return;                                   // stale / duplicate
-    }
+    if (!valid_state(s)) return;
+    // Event changes reset this timeline explicitly. A very late UDP packet in
+    // the same event must never masquerade as a restarted sender clock.
+    if (!ring_.empty() && tick <= ring_.back().tick) return;
     ring_.push_back({tick, s});
     if (ring_.size() > 90) ring_.erase(ring_.begin(), ring_.begin() + 30);
 }

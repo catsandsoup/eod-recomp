@@ -196,10 +196,30 @@ int main() {
     net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
     net->snap.is_host = true;
     net->snap.code = "ABCDE";
-    net->snap.players.push_back({1, "Guest  Trailer2", true, false, true});
+    net->snap.players.push_back({1, "Guest  Trailer2", true, false, false, true});
     CHECK(find(m, "host") < 0 && find(m, "code") < 0 && find(m, "addr") < 0);
     CHECK(find(m, "gcode") >= 0 && find(m, "player") >= 0);
+    // Controller moderation requires two accepts and binds confirmation to a
+    // particular occupant, so a reused slot can never remove a later joiner.
+    net->snap.players[0].identity = 41;
+    m.select(find(m, "kick:1:41"));
+    in = none(); in.accept = true;
+    size_t before_kick = net->got.size();
+    m.update(in);
+    CHECK(net->got.size() == before_kick);
+    in = none(); in.back = true;
+    CHECK(!m.update(in).close);
+    CHECK(net->got.size() == before_kick);
+    in = none(); in.accept = true;
+    m.update(in);
+    net->snap.players[0].identity = 42;
+    m.select(find(m, "kick:1:42"));
+    m.update(in);
+    CHECK(net->got.size() == before_kick);
+    m.update(in);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::Kick && net->got.back().text == "1:42");
     net->snap.is_host = false;
+    CHECK(find(m, "kick:1:42") < 0);
     CHECK(find(m, "ready") >= 0);
     net->snap.phase = game_frontend::Snapshot::Phase::Connecting;
     CHECK(find(m, "ready") < 0 && find(m, "addr") < 0 && find(m, "leave") >= 0);
@@ -279,7 +299,9 @@ int main() {
     CHECK(shape_trigger(20, 10, 100) == 0);
     CHECK(shape_trigger(255, 20, 200) == 255);
     CHECK(shape_trigger(128, 0, 200) < 128 && shape_trigger(128, 0, 200) > 40);
+#ifndef _WIN32  // This setting belongs to the SDL input backend.
     CHECK(Config().controller_layout == "modern");
+#endif
 
     // menu input mapping: chords, edges, trigger-proof menus
     menu_input::PadEdges pe;

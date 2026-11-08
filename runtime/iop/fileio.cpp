@@ -10,6 +10,7 @@
 //    in EE memory and sends SIF command 0x80000011 with opt = slot index;
 //    the EE handler copies `data` to `dest` and signals the semaphore.
 // Paths ("host0:data\x", "cdrom0:\DATA\X;1") map onto the game directory.
+#include "../core/host_file.h"
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -126,8 +127,8 @@ int file_open(const char *name, uint32_t flags) {
         else if (flags & 0x200) mode = "r+b";
         else mode = "r+b";
     }
-    FILE *f = fopen(host.c_str(), mode);
-    if (!f && wr && (flags & 0x200)) f = fopen(host.c_str(), "w+b");
+    FILE *f = host_fopen(host.c_str(), mode);
+    if (!f && wr && (flags & 0x200)) f = host_fopen(host.c_str(), "w+b");
     if (!f) {
         LOG(LOG_FILE, "open '%s' (%s) failed: %s", name, host.c_str(), strerror(errno));
         return kENOENT;

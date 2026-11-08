@@ -1,16 +1,26 @@
 // disc_import.cpp - see disc_import.h.
 #include "disc_import.h"
 
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/statvfs.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/file.h>
+#include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <fstream>
 #include <vector>
 
 #include "iso9660.h"
@@ -24,7 +34,7 @@ constexpr size_t kChunk = 4 << 20;
 std::string basename_of(const std::string &p) {
     std::string s = p;
     while (s.size() > 1 && s.back() == '/') s.pop_back();
-    size_t k = s.find_last_of('/');
+    size_t k = s.find_last_of("/\\");
     return k == std::string::npos ? s : s.substr(k + 1);
 }
 
@@ -70,18 +80,62 @@ class Source {
     virtual bool read_file(const SrcFile &f, const std::function<bool(const uint8_t *, size_t)> &cb) = 0;
 };
 
-// Case-insensitive name of a child of dir (empty when absent).
-std::string ci_child(const std::string &dir, const std::string &name) {
-    DIR *d = opendir(dir.c_str());
-    if (!d) return "";
-    std::string hit;
-    while (dirent *e = readdir(d)) {
-        if (!strcasecmp(e->d_name, name.c_str())) {
-            hit = e->d_name;
-            if (hit == name) break;
-        }
+bool ci_equal(const std::string &a, const std::string &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+FILE *open_read(const std::string &path) {
+#ifdef _WIN32
+    return _wfopen(fs::u8path(path).c_str(), L"rb");
+#else
+    return fopen(path.c_str(), "rb");
+#endif
+}
+
+// Lock the destination, rather than the UI: every importer entry point shares it.
+// The lock file is deliberately retained; unlinking it would allow a second inode
+// to be locked by another process while the first process still holds its lock.
+class ImportLock {
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int handle_ = -1;
+#endif
+public:
+    explicit ImportLock(const fs::path &path) {
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+        handle_ = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (handle_ >= 0 && flock(handle_, LOCK_EX | LOCK_NB) != 0) { close(handle_); handle_ = -1; }
+#endif
     }
-    closedir(d);
+    bool acquired() const {
+#ifdef _WIN32
+        return handle_ != INVALID_HANDLE_VALUE;
+#else
+        return handle_ >= 0;
+#endif
+    }
+    ~ImportLock() {
+#ifdef _WIN32
+        if (acquired()) CloseHandle(handle_);
+#else
+        if (acquired()) close(handle_);
+#endif
+    }
+};
+
+std::string ci_child(const std::string &dir, const std::string &name) {
+    std::error_code ec;
+    std::string hit;
+    for (fs::directory_iterator it(fs::u8path(dir), ec), end; !ec && it != end; it.increment(ec)) {
+        auto child = it->path().filename().u8string();
+        if (ci_equal(child, name)) { hit = child; if (hit == name) break; }
+    }
     return hit;
 }
 
@@ -101,10 +155,12 @@ class FolderSource : public Source {
             cur += "/" + r;
             out += (out.empty() ? "" : "/") + r;
         }
-        struct stat st;
-        if (stat(cur.c_str(), &st) != 0) return false;
-        is_dir = S_ISDIR(st.st_mode);
-        size = (uint64_t)st.st_size;
+        std::error_code ec;
+        auto path = fs::u8path(cur);
+        is_dir = fs::is_directory(path, ec);
+        if (ec) return false;
+        size = is_dir ? 0 : fs::file_size(path, ec);
+        if (ec) return false;
         real = out;
         return true;
     }
@@ -112,29 +168,30 @@ class FolderSource : public Source {
     bool list_files(const std::string &dir, std::vector<SrcFile> &out) override {
         if (depth_ >= 64) return false;
         DepthGuard guard(depth_);
-        DIR *d = opendir((root_ + "/" + dir).c_str());
-        if (!d) return false;
-        std::vector<std::string> names;
-        while (dirent *e = readdir(d)) {
-            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !strcmp(e->d_name, ".DS_Store")) continue;
-            names.push_back(e->d_name);
-        }
-        closedir(d);
-        for (const std::string &n : names) {
-            std::string rel = dir + "/" + n;
-            struct stat st;
-            if (lstat((root_ + "/" + rel).c_str(), &st) != 0) return false;
-            if (S_ISDIR(st.st_mode)) {
+        std::error_code ec;
+        auto path = fs::u8path(root_) / fs::u8path(dir);
+        for (fs::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+            const auto &entry = *it;
+            auto name = entry.path().filename().u8string();
+            if (name == ".DS_Store") continue;
+            if (entry.is_symlink(ec)) continue;
+            if (ec) return false;
+            std::string rel = dir + "/" + name;
+            if (entry.is_directory(ec)) {
                 if (!list_files(rel, out)) return false;
-            } else if (S_ISREG(st.st_mode)) {
-                out.push_back({rel, (uint64_t)st.st_size});
+            } else if (entry.is_regular_file(ec)) {
+                auto size = entry.file_size(ec);
+                if (ec) return false;
+                out.push_back({rel, size});
             }
+            if (ec) return false;
         }
+        if (ec) return false;
         return true;
     }
 
     bool read_file(const SrcFile &f, const std::function<bool(const uint8_t *, size_t)> &cb) override {
-        FILE *in = fopen((root_ + "/" + f.rel).c_str(), "rb");
+        FILE *in = open_read(root_ + "/" + f.rel);
         if (!in) return false;
         std::vector<uint8_t> buf(kChunk);
         uint64_t left = f.size;
@@ -180,7 +237,7 @@ class IsoSource : public Source {
             std::vector<Iso9660::Entry> kids;
             iso_.list(cur, kids);
             for (auto &k : kids)
-                if (!strcasecmp(k.name.c_str(), part.c_str())) {
+                if (ci_equal(k.name, part)) {
                     cur = k;
                     real += (real.empty() ? "" : "/") + k.name;
                     break;
@@ -226,7 +283,7 @@ class IsoSource : public Source {
 
 // The .bin named by the first FILE line of a .cue sheet.
 std::string bin_of_cue(const std::string &cue) {
-    FILE *f = fopen(cue.c_str(), "r");
+    FILE *f = open_read(cue);
     if (!f) return "";
     char line[1024];
     std::string bin;
@@ -240,9 +297,7 @@ std::string bin_of_cue(const std::string &cue) {
     }
     fclose(f);
     if (bin.empty()) return "";
-    if (bin[0] == '/') return bin;
-    size_t slash = cue.find_last_of('/');
-    return (slash == std::string::npos ? std::string(".") : cue.substr(0, slash)) + "/" + bin;
+    return (fs::u8path(cue).parent_path() / fs::u8path(bin)).u8string();
 }
 
 DiscResult check_elf(Source &src, const DiscId &id, const std::string &source_path, SrcFile &elf) {
@@ -266,7 +321,7 @@ DiscResult check_elf(Source &src, const DiscId &id, const std::string &source_pa
         char buf[512];
         snprintf(buf, sizeof buf,
                  "This copy of the game is a different version (SLUS_209.10: %llu bytes, checksum %08X; "
-                 "expected %u bytes, checksum %08X). Eve of Destruction for Mac only runs the North American "
+                 "expected %u bytes, checksum %08X). Eve of Destruction only runs the North American "
                  "release (NTSC-U, SLUS-20910, version 1.00): the game code was translated from that exact file.",
                  (unsigned long long)size, crc, id.elf_size, id.elf_crc32);
         return result(DiscStatus::WrongVersion, buf);
@@ -283,21 +338,35 @@ DiscResult no_data() {
 }  // namespace
 
 uint32_t disc_crc32(const uint8_t *p, size_t n, uint32_t crc) {
-    static uint32_t table[256];
-    if (!table[1])
+    static const auto table = [] {
+        std::array<uint32_t, 256> table{};
         for (uint32_t i = 0; i < 256; i++) {
             uint32_t c = i;
             for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
             table[i] = c;
         }
+        return table;
+    }();
     uint32_t c = crc ^ 0xFFFFFFFFu;
     for (size_t i = 0; i < n; i++) c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
 
+DiscResult disc_recover_install(const std::string &dest) try {
+    const auto path = fs::absolute(fs::u8path(dest));
+    const auto old = fs::u8path(path.u8string() + ".old");
+    if (fs::exists(path) || !fs::exists(old)) return {};
+    ImportLock lock(fs::u8path(path.u8string() + ".import-lock"));
+    if (!lock.acquired()) return result(DiscStatus::IoError, "Another copy may be installing the game disc. Try again when it finishes.");
+    if (!fs::exists(path) && fs::exists(old)) fs::rename(old, path);
+    return {};
+} catch (const fs::filesystem_error &e) {
+    return result(DiscStatus::IoError, "Could not restore the previous game installation: " + e.code().message());
+}
+
 DiscResult disc_check_folder(const std::string &dir, const DiscId &id) {
-    struct stat st;
-    if (dir.empty() || stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+    std::error_code ec;
+    if (dir.empty() || !fs::is_directory(fs::u8path(dir), ec))
         return result(DiscStatus::NotFound, "No game disc has been set up yet.");
     FolderSource src(dir);
     SrcFile elf;
@@ -311,26 +380,23 @@ DiscResult disc_check_folder(const std::string &dir, const DiscId &id) {
 }
 
 DiscResult disc_import(const std::string &source0, const std::string &dest, const DiscId &id,
-                       const DiscProgress &progress) {
+                       const DiscProgress &progress) try {
     std::string source = source0;
     while (source.size() > 1 && source.back() == '/') source.pop_back();
-    struct stat st;
-    if (stat(source.c_str(), &st) != 0)
+    if (!fs::exists(fs::u8path(source)))
         return result(DiscStatus::NotFound, curly(source) + " could not be found.");
 
     std::unique_ptr<Source> src;
     std::string ext = lower_ext(source);
-    if (S_ISDIR(st.st_mode)) {
+    if (fs::is_directory(fs::u8path(source))) {
         // A folder: the disc's files, or a folder holding a single disc image.
         std::string elf = ci_child(source, "SLUS_209.10");
         if (elf.empty()) {
             std::vector<std::string> images;
-            if (DIR *d = opendir(source.c_str())) {
-                while (dirent *e = readdir(d)) {
-                    std::string x = lower_ext(e->d_name);
-                    if (x == "iso" && e->d_name[0] != '.') images.push_back(source + "/" + e->d_name);
-                }
-                closedir(d);
+            for (const auto &entry : fs::directory_iterator(fs::u8path(source))) {
+                const auto name = entry.path().filename().u8string();
+                if (!name.empty() && name[0] != '.' && lower_ext(name) == "iso" && entry.is_regular_file())
+                    images.push_back(entry.path().u8string());
             }
             if (images.size() == 1) return disc_import(images[0], dest, id, progress);
         }
@@ -338,12 +404,12 @@ DiscResult disc_import(const std::string &source0, const std::string &dest, cons
     } else {
         if (ext == "zip" || ext == "7z" || ext == "rar" || ext == "gz")
             return result(DiscStatus::NotDisc, curly(source) +
-                                                   " is a compressed archive. Open it in Finder to extract the "
+                                                   " is a compressed archive. Unzip it first to extract the "
                                                    "disc image, then choose the .iso file inside.");
         std::string image = source;
         if (ext == "cue") {
             image = bin_of_cue(source);
-            if (image.empty() || stat(image.c_str(), &st) != 0)
+            if (image.empty() || !fs::exists(fs::u8path(image)))
                 return result(DiscStatus::NotFound, "The .bin file named in " + curly(source) + " was not found.");
         }
         auto iso = std::make_unique<IsoSource>();
@@ -374,25 +440,45 @@ DiscResult disc_import(const std::string &source0, const std::string &dest, cons
     for (const SrcFile &f : files) total += f.size;
 
     // room for the copy (and a little slack)
-    fs::path dest_path(dest);
+    fs::path dest_path = fs::absolute(fs::u8path(dest));
     std::error_code ec;
     fs::create_directories(dest_path.parent_path(), ec);
-    struct statvfs vfs;
-    if (statvfs(dest_path.parent_path().c_str(), &vfs) == 0) {
-        uint64_t free_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    if (ec) return result(DiscStatus::IoError, "Could not create the installation folder: " + ec.message());
+    ImportLock lock(fs::u8path(dest_path.u8string() + ".import-lock"));
+    if (!lock.acquired()) return result(DiscStatus::IoError,
+        "Could not open the installation folder for writing. Another copy may be installing the disc; close it and try again, or check folder permissions.");
+    const fs::path old = fs::u8path(dest_path.u8string() + ".old");
+    // Recover a prior process interrupted between the two final renames.
+    if (!fs::exists(dest_path) && fs::exists(old)) fs::rename(old, dest_path);
+    // A killed import can leave its uniquely named temporary copy. The lock
+    // proves no writer is using these reserved paths, so reclaim it before the
+    // free-space check rather than making the next attempt need twice the room.
+    const std::string partial_prefix = dest_path.filename().u8string() + ".partial.";
+    for (const auto &entry : fs::directory_iterator(dest_path.parent_path())) {
+        if (entry.path().filename().u8string().compare(0, partial_prefix.size(), partial_prefix) == 0)
+            fs::remove_all(entry.path());
+    }
+    const auto space = fs::space(dest_path.parent_path(), ec);
+    if (!ec) {
+        const uint64_t free_bytes = space.available;
         if (free_bytes < total + (64u << 20))
             return result(DiscStatus::NoSpace, "Not enough free disk space: the game files need " + gb(total) +
                                                    ", and " + gb(free_bytes) + " is free.");
     }
 
-    std::string pattern = dest + ".partial.XXXXXX";
-    std::vector<char> temp_name(pattern.begin(), pattern.end()); temp_name.push_back(0);
-    if (!mkdtemp(temp_name.data()))
-        return result(DiscStatus::IoError, "Could not create import folder: " + std::string(strerror(errno)));
-    std::string tmp = temp_name.data();
+    fs::path tmp_path;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+        tmp_path = fs::u8path(dest_path.u8string() + ".partial." + std::to_string(nonce) + "." + std::to_string(attempt));
+        if (fs::create_directory(tmp_path, ec)) break;
+        if (ec) return result(DiscStatus::IoError, "Could not create import folder: " + ec.message());
+        tmp_path.clear();
+    }
+    if (tmp_path.empty()) return result(DiscStatus::IoError, "Could not create a temporary import folder. Try again.");
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code e; fs::remove_all(path, e); } } cleanup{tmp_path};
     auto fail = [&](DiscStatus s, const std::string &msg) {
         std::error_code e2;
-        fs::remove_all(tmp, e2);
+        fs::remove_all(tmp_path, e2);
         return result(s, msg);
     };
 
@@ -400,11 +486,15 @@ DiscResult disc_import(const std::string &source0, const std::string &dest, cons
     bool cancelled = false;
     if (progress && !progress(0, total, files[0].rel)) return fail(DiscStatus::Cancelled, "Cancelled.");
     for (const SrcFile &f : files) {
-        fs::path out_path = fs::path(tmp) / f.rel;
+        fs::path out_path = tmp_path / fs::u8path(f.rel);
         fs::create_directories(out_path.parent_path(), ec);
+#ifdef _WIN32
+        FILE *out = _wfopen(out_path.c_str(), L"wb");
+#else
         FILE *out = fopen(out_path.c_str(), "wb");
+#endif
         if (!out)
-            return fail(DiscStatus::IoError, "Could not write " + out_path.string() + ": " + strerror(errno));
+            return fail(DiscStatus::IoError, "Could not write " + out_path.u8string() + ": " + strerror(errno));
         bool write_ok = true;
         uint32_t crc = 0;
         bool ok = src->read_file(f, [&](const uint8_t *p, size_t n) {
@@ -423,26 +513,28 @@ DiscResult disc_import(const std::string &source0, const std::string &dest, cons
         if (fclose(out) != 0) write_ok = false;
         if (cancelled) return fail(DiscStatus::Cancelled, "Cancelled.");
         if (!write_ok)
-            return fail(DiscStatus::IoError, "Could not write " + out_path.string() + " (is the disk full?).");
+            return fail(DiscStatus::IoError, "Could not write " + out_path.u8string() + " (is the disk full?).");
         if (!ok) return fail(DiscStatus::IoError, "Could not read " + f.rel + " from " + curly(source) + ".");
         if (&f == &files[0] && crc != id.elf_crc32)
             return fail(DiscStatus::IoError, "SLUS_209.10 changed while it was being copied. Try again.");
     }
 
     // swap the new copy in
-    std::string old = dest + ".old";
     fs::remove_all(old, ec);
-    if (fs::exists(dest, ec)) {
-        fs::rename(dest, old, ec);
+    if (ec) return fail(DiscStatus::IoError, "Could not remove the previous installation backup: " + ec.message());
+    if (fs::exists(dest_path, ec)) {
+        fs::rename(dest_path, old, ec);
         if (ec) return fail(DiscStatus::IoError, "Could not replace " + dest + ": " + ec.message());
     }
-    fs::rename(tmp, dest, ec);
+    fs::rename(tmp_path, dest_path, ec);
     if (ec) {
         std::string message = ec.message();
         std::error_code restore;
-        if (fs::exists(old)) fs::rename(old, dest, restore);
+        if (fs::exists(old)) fs::rename(old, dest_path, restore);
         return fail(DiscStatus::IoError, "Could not move the game files into " + dest + ": " + message);
     }
     fs::remove_all(old, ec);
     return DiscResult();
+} catch (const fs::filesystem_error &e) {
+    return result(DiscStatus::IoError, "Could not access the selected disc or installation folder: " + e.code().message());
 }

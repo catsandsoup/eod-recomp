@@ -2,7 +2,9 @@
 // (nothing is stored or committed):
 //   tracks: the Eve loading-screen art in DATA/RES/UIBIG.RES (l-<track>.img: 512x512, 8-bit; the
 //           lower part is the map with the track's photo and name label),
-//   cars:   the car-select portraits in DATA/RES/CT.RES (<vehicle number>.tex, 256x128).
+//   cars:   the car-select portraits in DATA/RES/UICAR.RES (uicar_<vehicle number>.tm0).
+//           Native special vehicles without art and unverified custom portrait identities
+//           return an empty Pic; flat livery/HUD swatches are never shown as portraits.
 #pragma once
 #include <cstdint>
 #include <string>

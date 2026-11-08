@@ -1,12 +1,12 @@
-# Test Drive: Eve of Destruction · PC and Mac
+# Eve of Destruction Remaster 1.0 · PC and Mac
 
 **Take the dirt oval at night, or trade paint under the floodlights.** The 2004 PS2 demolition racer runs as a native app on Apple Silicon and Windows x64. Bring your North American game disc, plug in a controller and pick your first event.
 
-[Download the Mac and Windows preview](https://github.com/catsandsoup/eod-recomp/releases/tag/preview-2026-11-08-couch)
+[Download 1.0 for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
 
 ![Two cars collide under the floodlights during a night demolition derby](docs/img/night-battle-demolition-derby.jpg)
 
-Play a local split-screen Battle with a friend beside you, or gather your friends in the online lobby with a whole screen to yourself. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
+Play a local split-screen Battle with a friend beside you, or host an online race with friends. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
 
 The screenshots show the remaster with its bonus car and event pack.
 
@@ -56,7 +56,7 @@ Press **Start + Select** on a controller (or **F1** / **Cmd+,** on a keyboard) a
 
 ![In-game menu Graphics tab with render scale, aspect ratio and fullscreen options](docs/img/in-game-menu-graphics.jpg)
 
-### One lobby, another race
+### Online racing
 
 The host picks the track and event. Each driver chooses a car and paint, sees their friend's choice, and marks Ready. End Race returns the party to Online, where the same Garage Code and roster are waiting for the next start.
 
@@ -66,12 +66,19 @@ The host picks the track and event. Each driver chooses a car and paint, sees th
 * **Online lobby.** Host a game, join by Garage Code or select a LAN game.
 * **Race selection.** The host chooses the track and event. Each player chooses a car and paint.
 * **Rematches.** Return to the lobby, change selections and start the next race.
+* **Nicknames.** Choose a screen name or use a random callsign. Duplicate names receive a number.
+* **Lobby controls.** Set a room limit up to 16, remove a guest or close the lobby. Race capacity follows the selected event.
+* **Shared rules.** The host enables turbo, Chicken Fight, invincibility, durability and manual recovery for the race. Personal cheat settings do not override the host.
+* **Matching content.** Online admission checks the installed game archives and car mods. Your music library stays local.
+* **Voice controls.** Toggle your microphone, mute incoming voices or deafen.
 
 ![Choose the next race together with your Garage Code and friends in view](docs/img/online-rematch-lobby.jpg)
 
+![Moth car selection in the 1.0 online lobby](docs/img/online-car-picker-1.0.jpg)
+
 ### Your own soundtrack
 
-Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongside the original songs, just like custom soundtracks on the Xbox version. Choose which ones are on from the Mods tab, and the game remembers your picks next time you play.
+Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongside the original songs, just like custom soundtracks on the Xbox version. Choose which ones are on from the Mods tab, and the game remembers your picks next time you play. Adjust **Music Volume** in Settings, including mute, independently of engines, effects and voice.
 
 ![Mods tab of the in-game menu showing custom music and bonus content toggles](docs/img/in-game-menu-mods-custom-music.jpg)
 
@@ -91,10 +98,10 @@ No dates, just where we are headed:
 
 ## Getting started
 
-1. **Get the preview.** Download the archive for your platform from [catsandsoup/eod-recomp Releases](https://github.com/catsandsoup/eod-recomp/releases). On Mac, open **Eve of Destruction.app**. On Windows x64, extract the ZIP, put your extracted disc files beside **eod.exe** or pass `--data <disc-folder>`, and use **eodsetup.exe** for settings.
-2. **Bring your own game.** You need your own legally obtained copy of Test Drive: Eve of Destruction (North American PS2 version).
-3. **On Mac, pick your disc image.** On first launch the app asks you to choose your game's disc image (or the disc's folder). It checks that it is the right game, copies what it needs, and shows you progress.
-4. **Play.** That is the whole setup. Next time, it launches straight into the game.
+1. **Download 1.0.** Unzip the [Mac or Windows archive](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0).
+2. **Open the app.** Launch **Eve of Destruction.app** on Mac or **eod.exe** on Windows.
+3. **Choose your game ISO.** The app checks your North American PS2 copy and installs the game files automatically. It remembers the installation for future launches.
+4. **Plug in a controller and play.** Open the remaster menu with **Start + Select** or **F1**.
 
 ## Frequently asked questions
 
@@ -102,7 +109,7 @@ No dates, just where we are headed:
 
 **Does it include the game?** No. You must own the game and supply your own copy.
 
-**Which platforms?** Apple Silicon macOS and Windows x64 preview builds are available.
+**Which platforms?** Apple Silicon macOS and Windows x64.
 
 ## Legal, credits and licences
 

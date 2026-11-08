@@ -1,4 +1,5 @@
 // CPU-only production wrapper contract; no generated game code or GPU.
+#include "../../tests/test_env.h"
 #include "core/cpu.h"
 #include "lod_thresholds.h"
 #include "core/config.h"

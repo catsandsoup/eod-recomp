@@ -2,12 +2,13 @@
 #include "iso9660.h"
 
 #include <cctype>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 
 namespace {
 
@@ -30,40 +31,26 @@ const uint8_t kSync[12] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x
 
 }  // namespace
 
-Iso9660::~Iso9660() {
-    if (fd_ >= 0) close(fd_);
-}
+Iso9660::~Iso9660() = default;
 
 bool Iso9660::open_file(const std::string &path, std::string *err) {
-    if (fd_ >= 0) close(fd_);
-    fd_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) {
-        if (err) *err = "Cannot open " + path + ": " + strerror(errno);
+    auto file = std::make_shared<std::ifstream>(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
+    const auto size = file->tellg();
+    if (size < 0) {
+        if (err) *err = "Cannot open the selected disc image.";
         return false;
     }
-    struct stat st;
-    if (fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode)) {
-        if (err) *err = path + " is not a disc image file.";
-        return false;
-    }
-    int fd = fd_;
-    ReadFn rd = [fd](uint64_t off, void *buf, size_t n) {
-        uint8_t *p = (uint8_t *)buf;
-        while (n > 0) {
-            ssize_t got = pread(fd, p, n, (off_t)off);
-            if (got < 0 && errno == EINTR) continue;
-            if (got <= 0) return false;
-            p += got;
-            off += (uint64_t)got;
-            n -= (size_t)got;
-        }
-        return true;
-    };
-    return open(rd, (uint64_t)st.st_size, err);
+    return open([file](uint64_t offset, void *buffer, size_t n) {
+        file->clear();
+        file->seekg(static_cast<std::streamoff>(offset));
+        return static_cast<bool>(file->read(static_cast<char *>(buffer), n));
+    }, static_cast<uint64_t>(size), err);
 }
 
 bool Iso9660::open(ReadFn read, uint64_t image_size, std::string *err) {
-    read_ = std::move(read);
+    read_ = [read = std::move(read), image_size](uint64_t off, void *buf, size_t n) {
+        return off <= image_size && n <= image_size - off && read(off, buf, n);
+    };
     image_size_ = image_size;
     auto fail = [&](const char *msg) {
         if (err) *err = msg;
@@ -123,6 +110,8 @@ bool Iso9660::parse_record(const uint8_t *r, size_t avail, Entry &e, bool &multi
     if (semi != std::string::npos) n.resize(semi);
     if (!n.empty() && n.back() == '.') n.pop_back();  // "README." (no extension)
     if (n.empty() || n == "." || n == ".." || n.find_first_of("/\\") != std::string::npos) return false;
+    for (unsigned char c : n)
+        if (c < 32 || c == ':' || c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*') return false;
     e.name = n;
     return true;
 }
@@ -146,7 +135,7 @@ bool Iso9660::list(const Entry &dir, std::vector<Entry> &out) {
         }
         Entry e;
         bool multi = false;
-        if (!parse_record(r, in_sector, e, multi)) return false;
+        if (!parse_record(r, std::min(in_sector, (size_t)size - pos), e, multi)) return false;
         pos += r[0];
         if (e.name == "." || e.name == "..") continue;
         if (pending_multi && !out.empty() && ieq(out.back().name, e.name)) {

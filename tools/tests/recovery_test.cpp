@@ -1,4 +1,5 @@
 // CPU boundary contract, not a substitute for native game validation.
+#include <cstring>
 #include "core/cpu.h"
 #include "core/config.h"
 #include <vector>

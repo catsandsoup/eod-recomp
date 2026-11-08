@@ -79,7 +79,15 @@ void netplay_trace_pad(int port,int slot,uint32_t length,const uint8_t *data) {
  std::fputs("\"}\n",f);
 }
 extern "C" void f_00177718_orig(void);
-extern "C" void f_00177718(void) { netplay_car::before_step(); netplay::session().step_begin(); f_00177718_orig(); ++step; record_step(); netplay_car::after_step(); netplay::session().step_end(); }
+extern "C" void f_00177718(void) {
+ netplay::session().step_begin();
+ // This hook wraps only the simulation step. The enclosing native race loop
+ // still runs, sees session_abort_event's exit flags and performs teardown.
+ if (!netplay::session().step_allowed()) return;
+ netplay_car::before_step();
+ f_00177718_orig(); ++step; record_step();
+ netplay_car::after_step(); netplay::session().step_end();
+}
 
 extern "C" void f_0038FF40_orig(void);
 extern "C" void f_0038FF40(void) {

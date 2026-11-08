@@ -1,3 +1,4 @@
+#include "../core/host_file.h"
 #include "music_decode.h"
 
 #include <algorithm>
@@ -171,7 +172,7 @@ DecodeResult decode_file(const std::string &path, const DecodeSink &sink) {
 
 DecodeResult decode_file(const std::string &path, const DecodeSink &sink) {
     DecodeResult res;
-    FILE *fp = fopen(path.c_str(), "rb");
+    FILE *fp = host_fopen(path.c_str(), "rb");
     if (!fp) { res.reason = "Cannot open"; return res; }
     std::vector<uint8_t> d;
     uint8_t tmp[65536];

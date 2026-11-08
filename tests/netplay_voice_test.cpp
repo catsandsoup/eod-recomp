@@ -14,7 +14,7 @@ bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){r
 [[maybe_unused]] void prime(Session& s){Frame out;assert(s.playout(0,out)==Playback::Priming&&silent(out));assert(s.playout(0,out)==Playback::Priming&&silent(out));}
 [[maybe_unused]] void lifecycle(){
  Session tx,rx;Packet p;Frame out;
- assert(!tx.encode(input(0),p)&&p.size==0);assert(!tx.start(0,1,0));assert(!tx.start(nonce,1,4));
+ assert(!tx.encode(input(0),p)&&p.size==0);assert(!tx.start(0,1,0));assert(!tx.start(nonce,1,MaxPeers));
  assert(tx.start(nonce,1,0)&&rx.start(nonce,1,1));assert(!tx.transmit_enabled());
  assert(!tx.encode(input(0),p));tx.set_transmit_enabled(true);assert(tx.encode(input(1),p));
  assert(p.size<=MaxPacketBytes&&p.bytes[0]==0&&p.bytes[1]==1&&p.bytes[2]==0x10&&p.bytes[9]==0x80);
@@ -53,7 +53,7 @@ bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){r
  auto q=p;q.bytes[1]=2;assert(rx.receive(0,q.bytes.data(),q.size)==Receive::Invalid);
  q=p;q.bytes[2]^=1;assert(rx.receive(0,q.bytes.data(),q.size)==Receive::WrongSession);
  q=p;q.bytes[14]^=1;assert(rx.receive(0,q.bytes.data(),q.size)==Receive::WrongSession);
- assert(rx.receive(2,p.bytes.data(),p.size)==Receive::WrongSender);assert(rx.receive(4,p.bytes.data(),p.size)==Receive::WrongSender);
+ assert(rx.receive(2,p.bytes.data(),p.size)==Receive::WrongSender);assert(rx.receive(MaxPeers,p.bytes.data(),p.size)==Receive::WrongSender);
  q=p;q.bytes[10]=1;assert(rx.receive(1,q.bytes.data(),q.size)==Receive::WrongSender);
  // TOC: stereo is forbidden, a valid40ms packet is forbidden, malformed frame count is forbidden.
  q=p;q.bytes[HeaderBytes]|=4;assert(rx.receive(0,q.bytes.data(),q.size)==Receive::Invalid);
@@ -86,9 +86,41 @@ bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){r
  rx.set_peer_muted(0,true);rx.stop();assert(!rx.peer_muted(0));assert(rx.start(nonce,2,1));assert(rx.playout(0,out)==Playback::Silence&&silent(out));
 }
 }
+#ifdef EOD_HAVE_OPUS
+void resumes_after_silence() {
+ using namespace netplay::voice;
+ Session tx,rx; assert(tx.start(nonce,1,0)&&rx.start(nonce,1,1));
+ tx.set_transmit_enabled(true); Packet p; Frame out;
+ assert(tx.encode(input(0),p)); assert(rx.receive(0,p.bytes.data(),p.size)==Receive::Accepted);
+ for(unsigned i=0;i<80;++i)rx.playout(0,out);
+ assert(tx.encode(input(1),p)); assert(rx.receive(0,p.bytes.data(),p.size)==Receive::Accepted);
+ bool decoded=false;
+ for(unsigned i=0;i<8;++i)if(rx.playout(0,out)==Playback::Decoded)decoded=!silent(out);
+ assert(decoded);
+}
+#endif
+void full_lobby_voice() {
+ Session rx; assert(rx.start(nonce,1,MaxPeers-1));
+ std::array<Session,MaxPeers-1> tx;
+ Packet p; Frame out;
+ for(unsigned i=0;i<MaxPeers-1;++i) {
+  assert(tx[i].start(nonce,1,uint8_t(i)));tx[i].set_transmit_enabled(true);
+  assert(tx[i].encode(input(i),p));
+  assert(rx.receive(uint8_t(i),p.bytes.data(),p.size)==Receive::Accepted);
+ }
+ for(unsigned i=0;i<MaxPeers-1;++i) {
+  for(unsigned j=0;j<StartupFrames;++j)assert(rx.playout(uint8_t(i),out)==Playback::Priming);
+  assert(rx.playout(uint8_t(i),out)==Playback::Decoded&&!silent(out));
+ }
+ // The last legal sender also works when the host is the receiver.
+ Session host;assert(host.start(nonce,1,0));rx.set_transmit_enabled(true);
+ assert(rx.encode(input(0),p));assert(host.receive(MaxPeers-1,p.bytes.data(),p.size)==Receive::Accepted);
+ for(unsigned j=0;j<StartupFrames;++j)assert(host.playout(MaxPeers-1,out)==Playback::Priming);
+ assert(host.playout(MaxPeers-1,out)==Playback::Decoded&&!silent(out));
+}
 int main(){
 #ifdef EOD_HAVE_OPUS
- assert(Session::available());lifecycle();reorder_loss_and_bounds();invalid_packets();separate_peers();mute_and_deafen();std::puts("Voice codec/session/jitter checks passed");
+ assert(Session::available());resumes_after_silence();full_lobby_voice();lifecycle();reorder_loss_and_bounds();invalid_packets();separate_peers();mute_and_deafen();std::puts("Voice codec/session/jitter checks passed");
 #else
  Session s;assert(!Session::available()&&!s.start(nonce,1,0));Packet p;assert(!s.encode(input(0),p));Frame out;assert(s.playout(1,out)==Playback::Silence&&silent(out));std::puts("Voice unavailable fallback checks passed");
 #endif

@@ -411,14 +411,29 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
             if (m.details_open() || true) paragraph(d, 21 * s, x0, y, x1 - x0, IM_COL32(210, 205, 196, 255), mod.description);
         } else if (r) {
             if (m.tab() == frontend::Tab::Online) {
-                for (const auto &row : rows) {
-                    if (row.id != "gcode" && row.id != "player") continue;
+                // Invite and errors precede the roster in a fixed area. A full
+                // room uses two columns so its settings and recovery reason stay visible.
+                for (const auto &row : rows) if (row.id == "gcode") {
                     const std::string line = row.label + "   " + row.value;
-                    float px = fit(d, 22 * s, x1 - x0, line.c_str());
-                    text(d, px, x0, y, row.id == "gcode" ? kOrange : kWhite, line.c_str());
-                    y += 28 * s;
+                    text(d, fit(d,22*s,x1-x0,line.c_str()), x0,y,kOrange,line.c_str());
+                    y += 30*s;
                 }
+                for (const auto &row : rows) if (row.id == "error")
+                    y += paragraph(d,20*s,x0,y,x1-x0,kRed,row.value)+10*s;
+                std::vector<const frontend::Row*> players;
+                for (const auto &row : rows) if(row.id == "player") players.push_back(&row);
+                const int columns=players.size()>6 ? 2 : 1;
+                const float cell=(x1-x0)/columns, line_h=(columns==2 ? 23 : 28)*s;
+                for(size_t i=0;i<players.size();++i) {
+                    const auto &row=*players[i];
+                    const std::string line=row.label+"   "+row.value;
+                    const float x=x0+(i%columns)*cell;
+                    text(d,fit(d,(columns==2 ? 18 : 22)*s,cell-8*s,line.c_str()),
+                         x,y+(i/columns)*line_h,row.good?kGreen:kWhite,line.c_str());
+                }
+                y += ((players.size()+columns-1)/columns)*line_h+8*s;
             }
+            dl->PushClipRect(ImVec2(x0,y),ImVec2(x1,rb.y-pad),true);
             if (m.tab() == frontend::Tab::Online && !m.pic_track().empty() &&
                 (r->id == "opt:track" || r->id == "opt:car" || r->id == "opt:paint" || r->id == "opt:mode")) {
                 // lobby pictures from the player's own disc: the host's track, then your car
@@ -431,8 +446,14 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
                     dl->AddRect(ImVec2(px0, y), ImVec2(px0 + w, y + h), IM_COL32(110, 98, 86, 255), 0, 0, 2 * s);
                     y += h + 10 * s;
                 };
-                draw_pic(ui_preview::track(m.pic_track()), 190 * s);
-                if (m.pic_car()) draw_pic(ui_preview::car(m.pic_car()), 130 * s);
+                if (r->id == "opt:track" || r->id == "opt:mode") {
+                    draw_pic(ui_preview::track(m.pic_track()), 190 * s);
+                } else if (m.pic_car()) {
+                    const auto portrait = ui_preview::car(m.pic_car());
+                    if (portrait.ok()) draw_pic(portrait, 220 * s);
+                    else y += paragraph(d, 22 * s, x0, y, x1 - x0, IM_COL32(214, 208, 200, 255),
+                                        "No preview available for this car.") + 14 * s;
+                }
             }
             text(d, fit(d, 30 * s, x1 - x0, r->label.c_str()), x0, y, kOrange, r->label.c_str());
             y += 42 * s;
@@ -443,7 +464,7 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
                 y += 32 * s;
             }
             y += paragraph(d, 22 * s, x0, y, x1 - x0, IM_COL32(214, 208, 200, 255), r->help) + 18 * s;
-
+            dl->PopClipRect();
         }
         if (!m.status().empty()) {
             const float py = rb.y - pad - 52 * s;

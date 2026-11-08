@@ -386,6 +386,55 @@ int main() {
     CHECK(!fs::exists(dest + ".partial"));
     CHECK(disc_check_folder(dest, id).ok());
 
+    // UTF-8 image and install paths, including a read-only owner disc image.
+    const auto unicode_image = tmp + "/Montréal 日本語.iso";
+    spit(unicode_image, img);
+    fs::permissions(unicode_image, fs::perms::owner_read, fs::perm_options::replace);
+    const auto unicode_dest = tmp + "/Jeux 日本語/disc";
+    CHECK(disc_import(unicode_image, unicode_dest, id).ok());
+    CHECK(disc_check_folder(unicode_dest, id).ok());
+    CHECK(fs::file_size(unicode_image) == img.size());
+
+    // A second importer cannot alter the same destination while its first
+    // importer holds the lock; the first install still completes successfully.
+    bool conflict_checked = false;
+    r = disc_import(iso_path, dest, id, [&](uint64_t, uint64_t, const std::string &) {
+        if (!conflict_checked) {
+            conflict_checked = true;
+            auto conflicting = disc_import(iso_path, dest, id);
+            CHECK(conflicting.status == DiscStatus::IoError);
+        }
+        return true;
+    });
+    CHECK(r.ok() && conflict_checked);
+    CHECK(disc_check_folder(dest, id).ok());
+
+    // Recover an interrupted final rename and discard an interrupted copy.
+    fs::rename(dest, dest + ".old");
+    fs::create_directories(dest + ".partial.123");
+    spit(dest + ".partial.123/stale", pattern(100, 7));
+    r = disc_import(iso_path, dest, id, [](uint64_t, uint64_t, const std::string &) { return false; });
+    CHECK(r.status == DiscStatus::Cancelled);
+    CHECK(disc_check_folder(dest, id).ok());
+    CHECK(!fs::exists(dest + ".old"));
+    CHECK(!fs::exists(dest + ".partial.123"));
+    fs::rename(dest, dest + ".old");
+    CHECK(disc_recover_install(dest).ok());
+    CHECK(disc_check_folder(dest, id).ok());
+    CHECK(!fs::exists(dest + ".old"));
+    CHECK(disc_recover_install(dest).ok());
+    // Retry after cancellation and then relaunch validation.
+    CHECK(disc_import(iso_path, dest, id).ok());
+    CHECK(disc_check_folder(dest, id).ok());
+    for (const auto &entry : fs::directory_iterator(fs::path(dest).parent_path()))
+        CHECK(entry.path().filename().string().find("disc.partial.") != 0);
+
+    // A file where the parent folder should be is a player-visible error.
+    spit(tmp + "/blocked", pattern(10, 2));
+    r = disc_import(iso_path, tmp + "/blocked/disc", id);
+    CHECK(r.status == DiscStatus::IoError && !r.message.empty());
+    CHECK(disc_check_folder(dest, id).ok());
+
     std::error_code ec;
     fs::remove_all(tmp, ec);
     if (g_failures) {

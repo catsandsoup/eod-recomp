@@ -11,6 +11,7 @@
 #include "core/log.h"
 #include "iop/custom_music.h"
 #include "iop/music_core.h"
+#include "iop/music_blocks.h"
 #include "iop/music_decode.h"
 
 bool g_log_enabled[LOG_CAT_COUNT];
@@ -38,6 +39,22 @@ static void write_wav(const fs::path &p, int rate, int ch, double secs, double h
 }
 
 int main() {
+    { // Songs and speech share stream rings; stale music tags must not mute speech.
+        using namespace music_blocks;
+        reset();
+        set(first, true);set(end - 16, true);
+        CHECK(contains(first) && contains(first + 15) && contains(end - 1));
+        CHECK(!contains(first - 1) && !contains(end));
+        clear(first + 15, 2); // A partial write covers two ADPCM blocks.
+        CHECK(!contains(first) && contains(end - 16));
+        set(first + 16, true);set(first + 32, true);
+        clear(first + 16, 16);
+        CHECK(!contains(first + 16) && contains(first + 32));
+        clear(end - 1, 2); // Wrapped RAM write clears the final block.
+        CHECK(!contains(end - 16) && contains(first + 32));
+        reset();CHECK(!contains(first + 32));
+    }
+
     const fs::path dir = fs::temp_directory_path() / "eod_custom_music_test";
     fs::remove_all(dir);
     fs::create_directories(dir / "lib" / "sub");

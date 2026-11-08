@@ -6,9 +6,11 @@
 // DIR is the root of the game disc (the directory that contains
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
+#include "core/host_file.h"
 #include <csignal>
 #ifdef _WIN32
 #include <process.h>
+#include "app/windows_disc.h"
 #else
 #include <unistd.h>
 #endif
@@ -147,7 +149,7 @@ static int save_edit(int argc, char **argv) {
 [[noreturn]] void app_exit(int code) {
     gs_shutdown();  // drains and joins the GS worker (docs/WORKER_SHUTDOWN.md)
     if (const char *path = getenv("EOD_DUMP_RAM")) {  // EE main memory at exit (debugging)
-        if (FILE *f = fopen(path, "wb")) {
+        if (FILE *f = host_fopen(path, "wb")) {
             std::vector<uint8_t> buf(32u << 20);
             ee_read_block(0, buf.data(), (uint32_t)buf.size());
             fwrite(buf.data(), 1, buf.size(), f);
@@ -175,7 +177,7 @@ uint32_t crc32_buf(const uint8_t *p, size_t n) {
 }
 
 bool read_file(const std::string &path, std::vector<uint8_t> &out) {
-    FILE *f = fopen(path.c_str(), "rb");
+    FILE *f = host_fopen(path.c_str(), "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
@@ -282,6 +284,9 @@ static int run_setup_screen(PlatformConfig cfg, const std::string &config_path, 
 #endif
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    windows_utf8_arguments(argc, argv);
+#endif
 #ifdef __APPLE__
     mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
 #endif
@@ -400,7 +405,7 @@ int main(int argc, char **argv) {
                       "folder that holds SLUS_209.10, SYSTEM.CNF and DATA. It is copied into the app's folder; your "
                       "original files stay untouched.";
             disc_problem = true;
-        } else if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32}, headless ? nullptr : &problem)) {
+        } else if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32}, (headless || data_dir.empty()) ? nullptr : &problem)) {
             if (problem.empty()) return 1;
             disc_problem = true;
         } else if (!mac_app_select_mods(headless, headless ? nullptr : &problem)) {
@@ -421,6 +426,14 @@ int main(int argc, char **argv) {
     _mm_setcsr(_mm_getcsr() | 0x8040);
 #endif
 
+#ifdef _WIN32
+    if (data_dir.empty()) {
+        const char *env_data = getenv("EOD_DATA");
+        if (env_data && env_data[0]) data_dir = env_data;
+    }
+    const bool disc_headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
+    if (!windows_prepare_disc(data_dir, dir_of(argv[0]), disc_headless, {ee_elf_size, ee_elf_crc32})) return 1;
+#endif
     // locate the game data
     std::vector<std::string> roots;
     if (!data_dir.empty()) roots.push_back(data_dir);

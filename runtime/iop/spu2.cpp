@@ -1,3 +1,4 @@
+#include "music_blocks.h"
 // spu2.cpp - SPU2 emulation at the libsd level.
 //
 // Voices play 4-bit ADPCM ("VAG") from the 2MB sound RAM with pitch,
@@ -274,6 +275,7 @@ void mix(int16_t *out, int frames) {
             for (int i = 0; i < 24; i++) {
                 Voice &v = c.v[i];
                 if (v.phase == OFF) continue;
+                const bool stock_music = ci == 0 && i < 2 && music_blocks::contains(v.cur);
                 int s = voice_sample(c, ci, i);
                 update_envelope(v);
                 // A custom song bound to a stream voice (core 0 voice 0/1, stream.cpp): its host
@@ -281,10 +283,11 @@ void mix(int16_t *out, int frames) {
                 // stay the game's, so music volume, spotter ducking and stop/start still apply.
                 int hl, hr;
                 if (ci == 0 && i < 2 && custom_music::host_frame(i, hl, hr)) {
-                    music::host_voice_mix(hl, hr, v.env.level, vol_value(v.voll, v.fixed_l), vol_value(v.volr, v.fixed_r),
+                    music::host_voice_mix(hl * g_config.music_volume / 100, hr * g_config.music_volume / 100, v.env.level, vol_value(v.voll, v.fixed_l), vol_value(v.volr, v.fixed_r),
                                           (c.vmixl & (1u << i)) != 0, (c.vmixr & (1u << i)) != 0, dl, dr);
                     continue;
                 }
+                if (stock_music && g_config.music_volume != 100) s = s * g_config.music_volume / 100;
                 s = (s * v.env.level) >> 15;
                 int vl = vol_value(v.voll, v.fixed_l), vr = vol_value(v.volr, v.fixed_r);
                 if (c.vmixl & (1u << i)) dl += (s * vl) >> 15;
@@ -344,6 +347,7 @@ bool g_audio_open;
 
 void spu2_init() {
     memset(g_sram, 0, sizeof g_sram);
+    music_blocks::reset();
     for (Core &c : g_core) c = Core();
     // The game never sets the SPU2 master volume itself outside its SDK sound init
     // (0x33C060: MVOL 0x3FFF on both cores), and that init only runs inside MoviePlay
@@ -500,6 +504,7 @@ void spu2_set_core_attr(uint16_t entry, uint16_t value) { g_core[entry & 1].attr
 uint16_t spu2_get_core_attr(uint16_t entry) { return g_core[entry & 1].attr[(entry >> 1) & 7]; }
 
 void spu2_sram_write(uint32_t spu_addr, const uint8_t *src, uint32_t size) {
+    music_blocks::clear(spu_addr, size);
     for (uint32_t i = 0; i < size; i++) g_sram[(spu_addr + i) & (kRamSize - 1)] = src[i];
 }
 
@@ -509,8 +514,10 @@ int spu2_voice_trans(int channel, int mode, uint32_t iop_addr, uint32_t spu_addr
     if (iop_addr + size > IOP_RAM_SIZE) size = IOP_RAM_SIZE > iop_addr ? IOP_RAM_SIZE - iop_addr : 0;
     if (mode & 1)
         memcpy(g_iop_ram + iop_addr, g_sram + spu_addr, size);
-    else
+    else {
+        music_blocks::clear(spu_addr, size);
         memcpy(g_sram + spu_addr, g_iop_ram + iop_addr, size);
+    }
     LOG(LOG_SND, "spu2: voice transfer ch%d %s iop %06x spu %06x size %x", channel, (mode & 1) ? "read" : "write",
         iop_addr, spu_addr, size);
     if (g_trans_cb) g_trans_cb(channel & 1);

@@ -15,6 +15,7 @@
 #include <mmsystem.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -671,27 +672,31 @@ bool platform_find_file(const char *root, const char *rel, char *out, size_t out
     std::string p = root;
     p += "\\";
     for (const char *c = rel; *c; c++) p += (*c == '/') ? '\\' : *c;
-    DWORD a = GetFileAttributesA(p.c_str());
+    DWORD a = GetFileAttributesW(std::filesystem::u8path(p).c_str());
     if (a == INVALID_FILE_ATTRIBUTES) return false;
-    snprintf(out, out_size, "%s", p.c_str());
+    if (p.size() >= out_size) return false;
+    memcpy(out, p.c_str(), p.size() + 1);
     return true;
 }
 
-bool platform_mkdir(const char *path) { return CreateDirectoryA(path, nullptr) != 0; }
+bool platform_mkdir(const char *path) { return CreateDirectoryW(std::filesystem::u8path(path).c_str(), nullptr) != 0; }
 
 bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out) {
     std::string pat = std::string(path) + "\\*";
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(std::filesystem::u8path(pat).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return false;
     do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
         DirEntryInfo info = {};
-        snprintf(info.name, sizeof info.name, "%s", fd.cFileName);
+        const auto name = std::filesystem::path(fd.cFileName).u8string();
+        if (name.size() >= sizeof info.name) continue;
+        memcpy(info.name, name.c_str(), name.size() + 1);
         info.is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         info.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         out.push_back(info);
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
+    const DWORD error = GetLastError();
     FindClose(h);
-    return true;
+    return error == ERROR_NO_MORE_FILES;
 }

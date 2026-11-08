@@ -37,7 +37,7 @@ try:
             raise RuntimeError('game failed')
     for name in ('host','guest'):
         log = (root/name/'game.log').read_text()
-        if (log.count('[netplay] event ended') != 2 or 'online event 2:' not in log
+        if (log.count('[netplay] GO (slot ') != 2 or log.count('[netplay] event ended') != 2 or 'online event 2:' not in log
                 or log.count('my car: Trailer2') != 2 or 'event=2 state=lobby native_main=1' not in log):
             raise RuntimeError(f'{name} did not return from both races; see {root/name}')
 finally:

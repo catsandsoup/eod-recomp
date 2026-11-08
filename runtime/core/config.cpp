@@ -1,4 +1,5 @@
 // config.cpp - eod.ini reading and writing.
+#include "host_file.h"
 #include "config.h"
 
 #include <cctype>
@@ -80,7 +81,7 @@ std::string g_config_path = "eod.ini";
 
 bool config_load(const std::string &path, Config &c) {
     if (&c == &g_config) g_config_path = path;
-    FILE *f = fopen(path.c_str(), "r");
+    FILE *f = host_fopen(path.c_str(), "r");
     const bool file_loaded = f != nullptr;
     int input_defaults = 0;  // [Input] InputDefaults: 2 = written after triggers became the default
     char line[1024];
@@ -126,6 +127,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "ShowFps")) c.show_fps = to_bool(v);
         } else if (ieq(section, "Audio")) {
             if (ieq(k, "Enabled")) c.audio = to_bool(v);
+            else if (ieq(k, "MusicVolume")) c.music_volume = num(0, 100);
             else if (ieq(k, "Volume")) c.volume = num(0, 100);
         } else if (ieq(section, "Input")) {
             if (ieq(k, "Vibration")) c.vibration = to_bool(v);
@@ -176,6 +178,8 @@ bool config_load(const std::string &path, Config &c) {
             }
         } else if (ieq(section, "Career")) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
+        } else if (ieq(section, "Online")) {
+            if (ieq(k, "Nickname")) c.nickname = v;
         } else if (ieq(section, "System")) {
             if (ieq(k, "MemoryCard")) c.memcard_dir = v;
             else if (ieq(k, "DataPath")) c.data_dir = v;
@@ -212,7 +216,7 @@ bool config_load(const std::string &path, Config &c) {
 }
 
 bool config_save(const std::string &path, const Config &c) {
-    FILE *f = fopen(path.c_str(), "w");
+    FILE *f = host_fopen(path.c_str(), "w");
     if (!f) return false;
     fprintf(f, "; Test Drive: Eve of Destruction - PC port settings (written by eodsetup and the in-game menu)\n\n");
     fprintf(f, "[Video]\n");
@@ -239,7 +243,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "ShowFps=%d\n", c.show_fps ? 1 : 0);
     fprintf(f, "\n[Audio]\n");
     fprintf(f, "Enabled=%d\n", c.audio ? 1 : 0);
-    fprintf(f, "Volume=%d\n", c.volume);
+    fprintf(f, "Volume=%d\nMusicVolume=%d\n", c.volume, c.music_volume);
     fprintf(f, "\n[Input]\n; keyboard keys for each PS2 button, separated by commas\n");
     for (int i = 0; i < KEY_COUNT; i++) fprintf(f, "%s=%s\n", kPadKeyNames[i], c.keys[i].c_str());
 #ifndef _WIN32
@@ -287,6 +291,7 @@ bool config_save(const std::string &path, const Config &c) {
     }
     fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
     fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());
+    fprintf(f, "\n[Online]\nNickname=%s\n", c.nickname.c_str());
     fprintf(f, "\n[System]\n");
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
     fprintf(f, "DataPath=%s\n", c.data_dir.c_str());

@@ -12,5 +12,5 @@
 <key>NSHighResolutionCapable</key><true/>
 <key>NSMicrophoneUsageDescription</key><string>Eve of Destruction uses the microphone for live voice chat in online multiplayer.</string>
 <key>LSEnvironment</key><dict><key>EOD_SKIP_MOVIES</key><string>1</string></dict>
-<key>NSHumanReadableCopyright</key><string>Personal build. Requires your own game disc.</string>
+<key>NSHumanReadableCopyright</key><string>Unofficial fan remaster. Requires your own game disc.</string>
 </dict></plist>

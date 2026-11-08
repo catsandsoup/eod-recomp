@@ -8,8 +8,9 @@
 //   nameParam (0x414 bytes): +0 port, +4 slot, +8 flags, +0xC max entries,
 //     +0x10 table address, +0x14 name
 // All calls complete immediately; the reply word is the result.
+#include "../core/host_file.h"
 #include <cstdlib>
-#include <sys/stat.h>
+#include <filesystem>
 
 #include <cstdio>
 #include <cstring>
@@ -22,12 +23,7 @@
 #include "iop.h"
 #include "../core/cpu.h"
 
-#ifdef _WIN32
-#include <direct.h>
-#define mkdir_host(p) _mkdir(p)
-#else
-#define mkdir_host(p) mkdir(p, 0755)
-#endif
+static int mkdir_host(const char *path) { return platform_mkdir(path) ? 0 : -1; }
 
 namespace {
 
@@ -49,9 +45,10 @@ bool g_seen[2];
 std::string g_cwd[2] = {"/", "/"};
 
 bool exists(const std::string &p, bool *is_dir = nullptr) {
-    struct stat s;
-    if (stat(p.c_str(), &s) != 0) return false;
-    if (is_dir) *is_dir = (s.st_mode & S_IFDIR) != 0;
+    std::error_code ec;
+    const auto status = std::filesystem::status(std::filesystem::u8path(p), ec);
+    if (ec || !std::filesystem::exists(status)) return false;
+    if (is_dir) *is_dir = std::filesystem::is_directory(status);
     return true;
 }
 
@@ -72,8 +69,12 @@ std::string port_root(int port) {
         std::string old_dir = r + "/US-20910DRIVEN", new_dir = r + "/BASLUS-20910DRIVEN";
         bool d;
         if (exists(old_dir, &d) && d && !exists(new_dir)) {
-            rename((old_dir + "/US-20910DRIVEN").c_str(), (old_dir + "/BASLUS-20910DRIVEN").c_str());
-            if (rename(old_dir.c_str(), new_dir.c_str()) == 0)
+            std::error_code ec;
+            std::filesystem::rename(std::filesystem::u8path(old_dir + "/US-20910DRIVEN"),
+                                    std::filesystem::u8path(old_dir + "/BASLUS-20910DRIVEN"), ec);
+            ec.clear();
+            std::filesystem::rename(std::filesystem::u8path(old_dir), std::filesystem::u8path(new_dir), ec);
+            if (!ec)
                 LOG(LOG_MC, "memory card: moved the save in %s to %s", old_dir.c_str(), new_dir.c_str());
         }
     }
@@ -108,7 +109,7 @@ int mc_open(int port, const char *name, uint32_t flags) {
     if (create) mode = "w+b";
     else if (write) mode = "r+b";
     if (!create && !exists(p)) return MC_NOENTRY;
-    FILE *f = fopen(p.c_str(), mode);
+    FILE *f = host_fopen(p.c_str(), mode);
     if (!f) return MC_NOENTRY;
     g_fds[fd].f = f;
     g_fds[fd].port = port;
@@ -220,7 +221,8 @@ void iop_mc_init() {
             char name[1024] = {};
             memcpy(name, buf + 0x14, 1023);
             std::string p = host_path(port, name);
-            r = (remove(p.c_str()) == 0) ? 0 : MC_NOENTRY;
+            std::error_code ec;
+            r = std::filesystem::remove(std::filesystem::u8path(p), ec) ? 0 : MC_NOENTRY;
             LOG(LOG_MC, "mc delete '%s' -> %d", name, r);
             break;
         }

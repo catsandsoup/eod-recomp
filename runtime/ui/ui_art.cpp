@@ -1,4 +1,5 @@
 // ui_art.cpp - see ui_art.h.
+#include "../core/host_file.h"
 #include "ui_art.h"
 
 #include <algorithm>
@@ -19,7 +20,7 @@ uint32_t rd32(const uint8_t *p) {
 }  // namespace
 
 bool Archive::load(const std::string &path) {
-    FILE *f = fopen(path.c_str(), "rb");
+    FILE *f = host_fopen(path.c_str(), "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);

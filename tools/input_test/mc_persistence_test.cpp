@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static uint8_t ram[65536];
@@ -12,6 +13,9 @@ uint8_t *g_ram = ram;
 bool g_log_enabled[LOG_CAT_COUNT] = {};
 std::string g_game_root;
 void log_write(LogCat, const char *, ...) {}
+// MC uses the platform mkdir boundary; keep the standalone test's implementation
+// equivalent to the POSIX backend without linking window/input dependencies.
+bool platform_mkdir(const char *path) { return mkdir(path, 0755) == 0; }
 void *ee_ptr(uint32_t a) { if (a >= sizeof ram) std::abort(); return ram + a; }
 void ee_write8_slow(uint32_t, uint8_t) { std::abort(); }
 uint8_t ee_read8_slow(uint32_t) { std::abort(); }

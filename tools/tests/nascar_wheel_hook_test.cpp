@@ -1,4 +1,5 @@
 // CPU contract: optional Cup fast mesh; ordinary/native call semantics survive.
+#include "../../tests/test_env.h"
 #include "core/cpu.h"
 #include <cstdio>
 #include <cstdlib>

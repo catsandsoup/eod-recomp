@@ -15,7 +15,7 @@ struct Session::Impl {
     uint64_t nonce=0;uint32_t epoch=0,sequence=0;uint8_t local=0;
     struct Entry {bool used=false;uint32_t seq=0;size_t size=0;std::array<uint8_t,MaxPayloadBytes> payload{};};
     struct Peer {
-        bool muted=false,started=false;uint32_t next=0;unsigned priming=0;
+        bool muted=false,started=false;uint32_t next=0;unsigned priming=0, missing=0;
         std::array<Entry,JitterFrames> queue{};
 #ifdef EOD_HAVE_OPUS
         OpusDecoder* decoder=nullptr;
@@ -27,6 +27,7 @@ struct Session::Impl {
 #endif
     void flush(Peer& p) {
         p.queue={};
+        p.missing=0;
 #ifdef EOD_HAVE_OPUS
         if(p.decoder)opus_decoder_ctl(p.decoder,OPUS_RESET_STATE);
 #endif
@@ -71,7 +72,8 @@ void Session::stop(){
         if(p.decoder)opus_decoder_destroy(p.decoder);
         p.decoder=nullptr;
 #endif
-        p.queue={};p.started=false;p.next=0;p.priming=0;p.muted=false;
+        p.queue={};
+        p.started=false;p.next=0;p.priming=0;p.missing=0;p.muted=false;
     }
 }
 bool Session::active()const{return impl_->running;}
@@ -143,9 +145,9 @@ Playback Session::playout(uint8_t peer,Frame& pcm){
     int samples;Playback result;
     if(slot!=p.queue.end()){
         samples=opus_decode(p.decoder,slot->payload.data(),int(slot->size),pcm.data(),FrameSamples,0);
-        *slot={};result=Playback::Decoded;
+        p.missing=0;*slot={};result=Playback::Decoded;
         if(samples<0){samples=opus_decode(p.decoder,nullptr,0,pcm.data(),FrameSamples,0);result=Playback::Concealed;}
-    }else{samples=opus_decode(p.decoder,nullptr,0,pcm.data(),FrameSamples,0);result=Playback::Concealed;}
+    }else{if(++p.missing>JitterFrames){s.flush(p);p.started=false;p.priming=0;return Playback::Silence;}samples=opus_decode(p.decoder,nullptr,0,pcm.data(),FrameSamples,0);result=Playback::Concealed;}
     if(samples!=int(FrameSamples)||p.muted||s.deafen)pcm.fill(0);
     return result;
 #else

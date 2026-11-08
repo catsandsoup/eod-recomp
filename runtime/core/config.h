@@ -38,6 +38,7 @@ struct Config {
     bool show_fps = false;           // frame rate in a corner (d3d11 renderer)
     // [Audio]
     bool audio = true;
+    int music_volume = 100;
     int volume = 100;  // percent
     // [Input] keyboard bindings: key names separated by commas (see key_code)
     std::string keys[KEY_COUNT];
@@ -64,6 +65,7 @@ struct Config {
     bool car_durability = false;
     bool manual_recovery = false; // humans: SELECT recovery only, no countdown reset
     // [Cheats & Gameplay Mods]
+    std::string nickname; // empty chooses a new callsign for each online session
     bool unlock_all = true;            // unlock all cars, tracks, dares, and feats out of the box
     bool career_cheats = true;         // allow cheats in career mode (master cheat flag)
     bool cheat_turbo = false;          // turbo boost active on L2

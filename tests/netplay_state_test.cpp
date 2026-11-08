@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <limits>
 using namespace netplay_car;
 uint8_t *g_ram;
 extern "C" uint8_t ee_read8_slow(uint32_t a) { return g_ram[a]; }
@@ -78,6 +79,13 @@ int main() {
         for (uint32_t t = 40; t < 400; ++t) shown = live.advance();
         require(shown.pose[9] > at_stop && shown.pose[9] < at_stop + 10.f * 0.5f, "late car is dead-reckoned briefly, then held");
     }
+    // A long-delayed datagram cannot rewind a current-event remote timeline.
+    {
+        Remote remote; remote.push(5000, make(20, 0, 0, 0, 0));
+        remote.push(2, make(1000, 0, 0, 0, 0));
+        require(remote.newest_tick() == 5000, "very old reordered snapshot rejected");
+        require(remote.advance().pose[9] == 20, "late snapshot cannot replace current pose");
+    }
     // writing a puppet updates the physics body record, found through the body table
     {
         g_ram = ram.data();
@@ -86,7 +94,7 @@ int main() {
         auto putf = [](uint32_t a, float f) { std::memcpy(g_ram + a, &f, 4); };
         putf(car + 0x64, 1); putf(car + 0x74, 1); putf(car + 0x84, 1); putf(car + 0x88, 5); putf(car + 0x90, 7);
         putf(body, 5); putf(body + 8, 7); putf(body + 0x10, 1);
-        MEM_SW(0x494010, body);
+        MEM_SW(0x494D30, body); MEM_SW(0x494D28, 1); MEM_SW(0x3CE548, 1); MEM_SW(0x3CE4F8, car);
         require(body_of(car) == body, "body record located");
         State s = make(50, -20, 0.5f, 1, 2); write(car, s);
         require(std::fabs(getf(body) - 50) < 1e-4f && std::fabs(getf(body + 8) + 20) < 1e-4f && std::fabs(getf(body + 0x50) - 1) < 1e-4f, "body updated");
@@ -94,6 +102,50 @@ int main() {
         float q[4] = {getf(body + 0x40), getf(body + 0x44), getf(body + 0x48), getf(body + 0x4C)};
         require(std::fabs(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3] - 1.f) < 1e-3f, "unit quaternion written");
         set_puppet(car, true); require(is_puppet(car), "puppet registered"); set_puppet(car, false); require(!is_puppet(car), "puppet removed");
+    }
+    // The allocator can reuse a car address on rematch while its body changes.
+    // A cached mapping would corrupt the old allocation and leave the new body behind.
+    {
+        const uint32_t car = 0x100000, old_body = 0x200000, new_body = 0x210000;
+        auto putf = [](uint32_t a, float f) { std::memcpy(g_ram + a, &f, 4); };
+        State s = make(91, 37, 0, 0, 0);
+        for (int i = 0; i < 12; ++i) putf(car + kPose + 4 * i, s.pose[i]);
+        putf(new_body, 91); putf(new_body + 8, 37); putf(new_body + 0x10, 1);
+        MEM_SW(0x494D30, new_body);
+        const float old_x = getf(old_body);
+        s.pose[9] = 112; write(car, s);
+        require(getf(new_body) == 112, "rematch resolves the new physics body");
+        require(getf(old_body) == old_x, "rematch never writes the stale body");
+    }
+    // Every body after zero is an array element, not another global pointer.
+    // Repeated/overlapping positions must still resolve by native ownership.
+    {
+        const uint32_t car0 = 0x100000, car1 = 0x110000, base = 0x210000;
+        MEM_SW(0x494D28, 2); MEM_SW(0x3CE548, 2); MEM_SW(0x3CE4F8 + 4, car1);
+        require(body_of(car0) == base && body_of(car1) == base + 0xB0,
+                "all contiguous native bodies resolve by car ownership");
+        State s = make(57, 19, 0, 2, 3); write(car1, s);
+        require(getf(base + 0xB0) == 57 && getf(base) == 112, "second car write targets its own body");
+        // Native Human driver wrapper, controller, and controller's input pad.
+        const uint32_t driver = 0x220000, human = 0x221000, input = 0x222000;
+        MEM_SW(car1 + kType, 0x50); MEM_SW(car1 + 0x1C1C, driver); MEM_SW(driver, 0x3FA4B0);
+        MEM_SW(driver + 0x10, human); MEM_SW(human, 0x3FA450); MEM_SW(human + 0x38, car1);
+        MEM_SW(human + 0x3C, input); MEM_SW(input + 0x34, 0);
+        require(human_controller_of(car1) == human, "native local human controller verified");
+        MEM_SW(input + 0x34, 1); require(!human_controller_of(car1), "wrong input pad rejected");
+        MEM_SW(input + 0x34, 0); MEM_SW(human + 0x38, car0);
+        require(!human_controller_of(car1), "human controller bound to another car rejected");
+    }
+    // Reject invalid native/network state before it reaches terrain or physics.
+    {
+        State bad = make(1, 2, 0, 0, 0);
+        bad.pose[9] = std::numeric_limits<float>::infinity();
+        require(!valid_state(bad), "nonfinite native position rejected");
+        Remote remote; remote.push(1, bad); require(!remote.ready(), "invalid snapshot never enters timeline");
+        netplay::Writer w; netplay::put_car(w, 0, 1, bad);
+        netplay::Reader r(w.b.data(), w.b.size()); uint8_t slot; uint32_t tick; State decoded;
+        require(!netplay::get_car(r, slot, tick, decoded), "invalid wire position rejected");
+        bad.pose[9] = 1e30f; require(!valid_state(bad), "corrupt terrain-scale position rejected");
     }
     std::puts("netplay_state_test ok");
     return 0;

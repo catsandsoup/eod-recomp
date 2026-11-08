@@ -1,6 +1,7 @@
 // SLUS-209.10: preserve native recovery detection and SELECT eligibility while
 // disabling only the countdown's automatic relocation for local human cars.
 #include <cstring>
+#include "netplay_hooks.h"
 #include "core/cpu.h"
 #include "core/config.h"
 extern "C" void f_001B8370_orig();
@@ -12,7 +13,7 @@ void storef(uint32_t a,float f) { uint32_t u; std::memcpy(&u,&f,4); MEM_SW(a,u);
 }
 extern "C" void f_001B8370() {
     const uint32_t timer=arg_u32(0),person=arg_u32(1);
-    if (!g_config.manual_recovery || !ram(person,200) || !ram(timer,84)) {
+    if (!netplay_hooks::rule(netplay_hooks::ManualRecovery, g_config.manual_recovery) || !ram(person,200) || !ram(timer,84)) {
         f_001B8370_orig(); return;
     }
     const uint32_t car=MEM_LW(person+4);

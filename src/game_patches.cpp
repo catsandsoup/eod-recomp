@@ -10,6 +10,7 @@
 //
 // EOD_POKE=addr=value,... (hex, 32-bit words) writes arbitrary words every
 // vblank (testing patches).
+#include "../runtime/core/host_file.h"
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -191,7 +192,7 @@ static float car_file_damage_scale(const std::string &model) {
         if (env_mod && *env_mod)
             found = platform_find_file(env_mod, rel.c_str(), path, sizeof path);
         if (!found && !platform_find_file(g_game_root.c_str(), rel.c_str(), path, sizeof path)) continue;
-        FILE *f = fopen(path, "rb");
+        FILE *f = host_fopen(path, "rb");
         if (!f) continue;
         fseek(f, 0, SEEK_END);
         long size = ftell(f);
@@ -256,7 +257,7 @@ extern "C" void f_0018AFE0(void) {
     f_0018AFE0_orig();
     char name[32] = {};
     for (int i = 0; i < 31; i++) name[i] = (char)ee_r8(par + 0xAC + i);
-    float damage = ee_rf(car + 0x4B0), scale = g_config.car_durability ? car_damage_scale(name) : 1.0f;
+    float damage = ee_rf(car + 0x4B0), scale = netplay_hooks::rule(netplay_hooks::Durability, g_config.car_durability) ? car_damage_scale(name) : 1.0f;
     if (scale != 1.0f) ee_wf(car + 0x4B0, damage * scale);
     LOG(LOG_CORE, "car %s: mass %.0f, damage x%.3f%s", name, ee_rf(par + 8), damage * scale,
         scale != 1.0f ? " (with its damage_scale)" : "");
@@ -269,7 +270,7 @@ extern "C" void f_0018AFE0(void) {
 // This covers P1-P4 regardless of world slot, leaving AI damage native.
 // Existing damage and already detached panels are not repaired.
 static bool invincible_human(uint32_t car) {
-    return g_config.cheat_invincible && car && !(car & 3) &&
+    return netplay_hooks::rule(netplay_hooks::Invincible, g_config.cheat_invincible) && car && !(car & 3) &&
         car <= EE_RAM_SIZE - 0x1E4 && ee_r32(car + 0x1E0) == 0x50;
 }
 extern "C" void f_0018AD20_orig(void);
@@ -315,11 +316,11 @@ extern "C" void f_0017DA58(void) {
                 ee_rf(position + 4), ee_rf(position + 8),
                 g_ee.fpr[12].f, g_ee.fpr[13].f);
     }
-    if (g_config.chicken_radius_scale > 0.0f && g_config.chicken_radius_scale != 1.0f) {
-        g_ee.fpr[12].f *= g_config.chicken_radius_scale;
+    if (netplay_hooks::race_scale(g_config.chicken_radius_scale, 1.0f) > 0.0f && netplay_hooks::race_scale(g_config.chicken_radius_scale, 1.0f) != 1.0f) {
+        g_ee.fpr[12].f *= netplay_hooks::race_scale(g_config.chicken_radius_scale, 1.0f);
     }
-    if (g_config.chicken_force_scale > 0.0f && g_config.chicken_force_scale != 1.0f) {
-        g_ee.fpr[13].f *= g_config.chicken_force_scale;
+    if (netplay_hooks::race_scale(g_config.chicken_force_scale, 1.0f) > 0.0f && netplay_hooks::race_scale(g_config.chicken_force_scale, 1.0f) != 1.0f) {
+        g_ee.fpr[13].f *= netplay_hooks::race_scale(g_config.chicken_force_scale, 1.0f);
     }
     f_0017DA58_orig();
 }
@@ -333,7 +334,7 @@ extern "C" void f_0018F2A8(void) {
     const uint32_t car = valid ? ee_r32(controller + 0x38) : 0;
     const uint32_t driver = valid ? ee_r32(controller + 0x3C) : 0;
     f_0018F2A8_orig();
-    if (g_config.cheat_turbo && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
+    if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
         driver && !(driver & 3) && driver <= EE_RAM_SIZE - 4) {
         uint32_t vtbl = ee_r32(driver);
         uint32_t is_l2_fn = (vtbl && !(vtbl & 3) && vtbl <= EE_RAM_SIZE - 0x30) ? ee_r32(vtbl + 0x2C) : 0;
@@ -349,7 +350,7 @@ extern "C" void f_0018F2A8(void) {
         const uint32_t cheats = ee_r32(0x003C4190);
         if (l2_pressed) {
             // Turbo boost while L2 is held:
-            if (g_config.cheat_turbo && (cheats & 0x3) == 0x3 && g_config.turbo_scale > 1.0f) {
+            if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && (cheats & 0x3) == 0x3 && netplay_hooks::race_scale(g_config.turbo_scale, 1.75f) > 1.0f) {
                 float fwd_x = ee_rf(car + 0x7C);
                 float fwd_y = ee_rf(car + 0x80);
                 float fwd_z = ee_rf(car + 0x84);
@@ -359,10 +360,10 @@ extern "C" void f_0018F2A8(void) {
                 float vel_z = ee_rf(car + 0x10C);
 
                 float forward_speed = vel_x * fwd_x + vel_y * fwd_y + vel_z * fwd_z;
-                float speed_cap = 44.444447f * g_config.turbo_scale;
+                float speed_cap = 44.444447f * netplay_hooks::race_scale(g_config.turbo_scale, 1.75f);
 
                 if (forward_speed < speed_cap) {
-                    float extra_accel = (g_config.turbo_scale - 1.0f) * 20.0f;
+                    float extra_accel = (netplay_hooks::race_scale(g_config.turbo_scale, 1.75f) - 1.0f) * 20.0f;
                     float dt = 1.0f / 60.0f;
                     ee_wf(car + 0x104, vel_x + fwd_x * extra_accel * dt);
                     ee_wf(car + 0x108, vel_y + fwd_y * extra_accel * dt);
@@ -456,8 +457,7 @@ void game_patches_vblank() {
     career_vblank(pressed);
 
     bool l1_r1_held = (b & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1);
-    const bool online_guest = (netplay_hooks::active && netplay_hooks::active()) &&
-                              !(netplay_hooks::is_host && netplay_hooks::is_host());
+    const bool online_guest = netplay_hooks::active && netplay_hooks::active(); // Both roles use lobby rules.
     platform_set_mod_overlay(l1_r1_held && !online_guest);
 
     // Track button suppression to protect driving and pause menus
@@ -562,27 +562,30 @@ void game_patches_vblank() {
     }
 
     uint32_t cheats = ee_r32(0x003C4190);
-    if (g_config.career_cheats || g_config.cheat_chickens || g_config.cheat_turbo) {
+    const bool turbo = netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo);
+    const bool chickens = netplay_hooks::rule(netplay_hooks::Chickens, g_config.cheat_chickens);
+    if ((!online_guest && g_config.career_cheats) || chickens || turbo) {
         cheats |= 0x1; // Master cheat enable
     }
     static bool turbo_mod_was_enabled = false;
-    if (g_config.cheat_turbo) {
+    if (turbo) {
         cheats |= 0x3; // Bit 1: Turbo boost enabled + Bit 0: Master enable
-    } else if (turbo_mod_was_enabled) {
+    } else if (turbo_mod_was_enabled || online_guest) {
         cheats &= ~0x2u;
     }
-    turbo_mod_was_enabled = g_config.cheat_turbo;
+    turbo_mod_was_enabled = turbo;
     static bool chicken_mod_was_enabled = false;
     const bool battle = ee_r32(0x003CF19C) == 0x18000224;
-    if (g_config.cheat_chickens) {
+    if (chickens) {
         // Native trigger 0x17E000: bit 0x10 is the feat mortar, NOT weapon enable.
         cheats = (cheats | 0x09) & ~0x90u;
-    } else if (chicken_mod_was_enabled) {
+    } else if (chicken_mod_was_enabled || online_guest) {
         if (!battle && !(cheats & 0x80)) cheats &= ~0x08u;
     }
-    chicken_mod_was_enabled = g_config.cheat_chickens;
-    // Battle owns its weapon even when the optional Chicken Fight mod is off.
-    // Leave native feat selections alone when the mod has never been enabled.
+    chicken_mod_was_enabled = chickens;
+    // Shared room rules also remove offline combo remnants. Battle owns its
+    // native weapon independently of the optional Chicken Fight rule.
+    if (online_guest) cheats = netplay_hooks::online_cheats(cheats, battle, turbo, chickens);
     ee_w32(0x003C4190, cheats);
 
     int aspect;

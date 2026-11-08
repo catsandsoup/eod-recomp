@@ -1,4 +1,5 @@
 // ui_preview.cpp - see ui_preview.h.
+#include "../core/host_file.h"
 #include "ui_preview.h"
 
 #include <algorithm>
@@ -22,13 +23,17 @@ struct Index {
     bool tried = false;
     struct E { uint32_t off, size; };
     std::map<std::string, E> entries;
-    bool open(const char *rel) {
+    bool open(const char *rel, bool allow_mods = true) {
         if (tried) return !entries.empty();
         tried = true;
         char found[1024];
-        if (g_root.empty() || !platform_find_file(g_root.c_str(), rel, found, sizeof found)) return false;
-        path = found;
-        FILE *f = fopen(found, "rb");
+        const char *mods = getenv("EOD_MOD_DIR");
+        if (allow_mods && mods && *mods && platform_find_file(mods, rel, found, sizeof found)) path = found;
+        if (path.empty()) {
+            if (g_root.empty() || !platform_find_file(g_root.c_str(), rel, found, sizeof found)) return false;
+            path = found;
+        }
+        FILE *f = host_fopen(found, "rb");
         if (!f) return false;
         uint8_t head[0x28];
         if (fread(head, 1, sizeof head, f) != sizeof head || memcmp(head, "0TSR", 4) != 0 || rd32(head + 8) != 6) { fclose(f); return false; }
@@ -46,14 +51,14 @@ struct Index {
     bool read(const std::string &name, std::vector<uint8_t> &out) {
         auto it = entries.find(name);
         if (it == entries.end() || it->second.size > (4u << 20)) return false;
-        FILE *f = fopen(path.c_str(), "rb");
+        FILE *f = host_fopen(path.c_str(), "rb");
         if (!f) return false;
         out.resize(it->second.size);
         const bool ok = fseek(f, (long)it->second.off, SEEK_SET) == 0 && fread(out.data(), 1, out.size(), f) == out.size();
         fclose(f);
         return ok;
     }
-} g_big, g_ct;
+} g_big, g_uicar, g_retail_uicar;
 
 std::string slug(const std::string &name) {
     std::string s;
@@ -93,8 +98,14 @@ Pic car(uint32_t number) {
     Pic p;
     std::vector<uint8_t> t;
     ui_art::Image img;
-    if (g_add && g_ct.open("DATA/RES/CT.RES") && g_ct.read(std::to_string(number) + ".tex", t) && ui_art::decode_tex(t, img)) {
-        for (uint32_t &px : img.rgba) px |= 0xFF000000u;
+    const std::string entry = "uicar_" + std::to_string(number) + ".tm0";
+    // Added mod entries may be livery/HUD swatches rather than car portraits.
+    // Only native portrait identities are verified for this preview surface;
+    // custom cars stay explicitly unavailable until real portrait art is supplied.
+    if (g_add && g_retail_uicar.open("DATA/RES/UICAR.RES", false) &&
+        g_retail_uicar.entries.count(entry) && g_uicar.open("DATA/RES/UICAR.RES") &&
+        (g_uicar.read(entry, t) || g_retail_uicar.read(entry, t)) && ui_art::decode_tex(t, img)) {
+
         p.tex = g_add(img.w, img.h, img.rgba.data());
         p.aspect = (float)img.w / (float)img.h;
     }

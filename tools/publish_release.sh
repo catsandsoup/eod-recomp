@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a public macOS prerelease from a committed revision on origin/main.
+# Build a public macOS release from a committed revision on origin/main.
 set -euo pipefail
 repo=catsandsoup/eod-recomp
 root=$(git rev-parse --show-toplevel)
@@ -15,7 +15,7 @@ trap 'rm -rf "$stage"' EXIT
 export EOD_HEADLESS=1 EOD_MUTE=1
 "$python" tools/recomp.py
 cmake --build "$build"
-ctest --test-dir "$build" -j4 -E AssetTools --output-on-failure
+ctest --test-dir "$build" -j4 --output-on-failure
 app="$stage/Eve of Destruction.app"
 env -u EOD_BUNDLE_MODS "$python" tools/macos/bundle.py "$app" "$build/eod"
 # Public packages launch with the player's own disc and no personal mod data.
@@ -24,4 +24,13 @@ codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
 [[ ! -e "$app/Contents/Resources/Mods" && ! -e "$app/Contents/Resources/DATA" ]]
 ditto -c -k --keepParent --norsrc "$app" "$stage/Eve-of-Destruction-macOS-arm64.zip"
-gh release create "$tag" "$stage/Eve-of-Destruction-macOS-arm64.zip" --repo "$repo" --target "$revision" --prerelease --title "Online play preview ($tag)" --notes "Experimental online lobby, car and track selection, voice and loading changes. Requires your own North American game disc. macOS download is for Apple Silicon, locally signed, without personal mods. Internet and hardware voice testing are ongoing."
+assets=("$stage/Eve-of-Destruction-macOS-arm64.zip")
+# Supply the matching, tested Windows package to publish both platforms together.
+if [[ -n ${EOD_WINDOWS_ARCHIVE:-} ]]; then
+  cp "$EOD_WINDOWS_ARCHIVE" "$stage/Eve-of-Destruction-Windows-x64.zip"
+  assets+=("$stage/Eve-of-Destruction-Windows-x64.zip")
+fi
+(cd "$stage" && shasum -a 256 ./*.zip > SHA256SUMS)
+assets+=("$stage/SHA256SUMS")
+gh release create "$tag" "${assets[@]}" --repo "$repo" --target "$revision" --draft --title "Eve of Destruction Remaster ${tag#v}" --notes-file "$root/dist/release-v1.0.md"
+gh release edit "$tag" --repo "$repo" --draft=false --prerelease=false --latest

@@ -97,6 +97,8 @@ with tempfile.TemporaryDirectory(prefix='eod-icon-') as temp:
                 check=True,stdout=subprocess.DEVNULL)
     subprocess.run(['iconutil','-c','icns',str(iconset),'-o',str(resources/'AppIcon.icns')],check=True)
 licenses=resources/'Licenses'; licenses.mkdir(exist_ok=True)
+for source in (pathlib.Path(__file__).resolve().parents[2]/'dist/licenses').glob('*.txt'):
+    shutil.copyfile(source,licenses/source.name)
 # Prefer the license belonging to the pinned SDL source actually compiled.
 sdl_license=pathlib.Path(sys.argv[2]).resolve().parent/'_deps/sdl3-src/LICENSE.txt' if len(sys.argv)>2 else pathlib.Path('/opt/homebrew/opt/sdl3/LICENSE.txt')
 if not sdl_license.is_file(): sdl_license=pathlib.Path('/opt/homebrew/opt/sdl3/LICENSE.txt')
@@ -113,6 +115,7 @@ for binary in [*frameworks.iterdir(),exe]:
     for version in versions: minimum=max(minimum,tuple(map(int,version.split('.'))))
 plist_path=app/'Contents/Info.plist'
 with plist_path.open('rb') as f: info=plistlib.load(f)
+info['CFBundleShortVersionString'] = info['CFBundleVersion'] = (pathlib.Path(__file__).resolve().parents[2]/'VERSION').read_text().strip()
 info['LSMinimumSystemVersion']='.'.join(map(str,minimum))
 with plist_path.open('wb') as f: plistlib.dump(info,f)
 # macOS may propagate Finder metadata from Documents into linker outputs.

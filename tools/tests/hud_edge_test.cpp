@@ -1,4 +1,5 @@
 // Production HUD wrapper contract, without a game process or graphics device.
+#include "../../tests/test_env.h"
 #include "core/cpu.h"
 #include <cmath>
 #include <cstdio>

@@ -56,7 +56,6 @@ class Iso9660 {
 
     ReadFn read_;
     uint64_t image_size_ = 0;
-    int fd_ = -1;
     uint32_t raw_sector_ = 2048;  // bytes per sector in the image
     uint32_t data_offset_ = 0;    // user data offset inside a raw sector
     uint32_t block_size_ = 2048;  // logical block size from the PVD

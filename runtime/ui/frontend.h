@@ -206,6 +206,7 @@ private:
     std::shared_ptr<MusicSource> music_;
     std::vector<MusicSong> music_songs_;  // as of the last rows_mods()
     bool music_open_ = false;
+    std::string remove_player_;
     bool details_ = false;
     int rebind_ = -1;
     std::string text_id_, text_, text_before_;

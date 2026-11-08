@@ -9,8 +9,8 @@
 # executable nor the generated sources are uploaded anywhere.
 #
 # Run it from the Actions tab ("Run workflow"; a tag such as v1.0 makes a
-# version release with dist/release-notes.md, an empty tag a build-<n>
-# prerelease), or push a tag named v*.
+# version release with dist/release-v1.0.md, an empty tag a build-<n>
+# prerelease). The local tools/publish_release.sh path uses the owner's disc.
 
 name: Release builds
 
@@ -21,8 +21,6 @@ on:
         description: "Release tag, e.g. v1.0 (leave empty for a build-<run number> prerelease)"
         required: false
         default: ""
-  push:
-    tags: ["v*"]
 
 permissions:
   contents: write
@@ -117,13 +115,14 @@ jobs:
         run: |
           mkdir -p pkg out
           cp dist/README.txt pkg/
+          cp -R dist/licenses pkg/
           if [ "${{ matrix.target }}" = linux-x86_64 ]; then
             ${{ matrix.strip }} -o pkg/eod build/eod
-            tar czf out/${{ matrix.archive }} -C pkg eod README.txt
+            tar czf out/${{ matrix.archive }} -C pkg eod README.txt licenses
           else
             ${{ matrix.strip }} -o pkg/eod.exe build/eod.exe
             ${{ matrix.strip }} -o pkg/eodsetup.exe build/eodsetup.exe
-            (cd pkg && zip -9 -q ../out/${{ matrix.archive }} eod.exe eodsetup.exe README.txt)
+            (cd pkg && zip -9 -q ../out/${{ matrix.archive }} eod.exe eodsetup.exe README.txt licenses/*)
           fi
 
       - uses: actions/upload-artifact@v4
@@ -136,7 +135,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4  # dist/release-notes.md
+      - uses: actions/checkout@v4  # dist/release-v1.0.md
 
       - uses: actions/download-artifact@v4
         with:
@@ -159,16 +158,16 @@ jobs:
           sha256sum eod-win64.zip eod-win32.zip eod-linux-x86_64.tar.gz > SHA256SUMS
           files="eod-win64.zip eod-win32.zip eod-linux-x86_64.tar.gz SHA256SUMS"
           case "$tag" in
-            v*)  # a version: full release with the notes from dist/release-notes.md
-              sed "s/@VERSION@/${tag#v}/g; s/@COMMIT@/${GITHUB_SHA::7}/g" ../dist/release-notes.md > notes.md
+            v*)  # a version: full release with the notes from dist/release-v1.0.md
+              sed "s/@VERSION@/${tag#v}/g; s/@COMMIT@/${GITHUB_SHA::7}/g" ../dist/release-v1.0.md > notes.md
               gh release create "$tag" $files --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-                --title "Version ${tag#v}" --notes-file notes.md --latest
+                --title "Eve of Destruction Remaster ${tag#v}" --notes-file notes.md --latest
               ;;
             *)
               cat > notes.md <<EOF
           Development build of the native PC port, from commit ${GITHUB_SHA::7}.
 
-          The game is **not** included: you need your own copy of the NTSC-U disc (SLUS_209.10, v1.00). Copy the whole disc into a folder and put \`eod.exe\` there. See README.txt inside the archive.
+          The game is **not** included: you need your own copy of the NTSC-U disc (SLUS_209.10, v1.00). Choose your game ISO when the Windows app asks. See README.txt inside the archive.
 
           * \`eod-win64.zip\`: Windows 7 or later, 64-bit (recommended)
           * \`eod-win32.zip\`: Windows 7 or later, 32-bit

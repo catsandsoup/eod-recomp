@@ -20,6 +20,7 @@
 //
 // The "disc" is the game directory: SLUS_209.10, SYSTEM.CNF and DATA/.
 // Sectors are assigned to files in TOC order.
+#include "../core/host_file.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -32,6 +33,7 @@
 #include "custom_music.h"
 #include "iop.h"
 #include "music_core.h"
+#include "music_blocks.h"
 #include "spu2.h"
 
 namespace {
@@ -245,7 +247,7 @@ void disc_read(uint32_t lsn, uint8_t *out, uint32_t bytes) {
             memcpy(out + (a - pos), f.synthetic.data() + (a - fs), (size_t)(b - a));
             continue;
         }
-        FILE *h = fopen(f.host_path.c_str(), "rb");
+        FILE *h = host_fopen(f.host_path.c_str(), "rb");
         if (!h) continue;
         fseek(h, (long)(a - fs), SEEK_SET);
         size_t got = fread(out + (a - pos), 1, (size_t)(b - a), h);
@@ -274,6 +276,7 @@ struct StreamChannel {
         uint32_t lsn, bytes;
         // A custom (host) song: virtual id; its PCM is mixed by the SPU2 in place of the
         // ADPCM, while this ring holds silence (see custom_music.h).
+        bool song = false;
         uint32_t host = 0;
         bool preloaded = false, started = false;
         uint64_t start_at = 0;  // ring stream position where the song begins
@@ -289,6 +292,7 @@ uint16_t voice_entry(int voice, uint16_t param) { return (uint16_t)(param | (voi
 void feed(StreamChannel &c, uint32_t off, uint32_t n, uint64_t base) {
     static std::vector<uint8_t> buf;
     buf.assign(n, 0);
+    std::vector<bool> song_blocks((n + 15) / 16, false);
     uint32_t got = 0;
     while (got < n && !c.queue.empty()) {
         StreamChannel::Req &r = c.queue.front();
@@ -308,6 +312,7 @@ void feed(StreamChannel &c, uint32_t off, uint32_t n, uint64_t base) {
         static std::vector<uint8_t> tmp;
         tmp.resize((size_t)secs * kSector);
         disc_read(first, tmp.data(), secs * kSector);
+        for (uint32_t i = got / 16; i < (got + take + 15) / 16; ++i) song_blocks[i] = r.song;
         memcpy(buf.data() + got, tmp.data() + skip, take);
         got += take;
         c.done += take;
@@ -330,6 +335,7 @@ void feed(StreamChannel &c, uint32_t off, uint32_t n, uint64_t base) {
         if (o == c.size - 16) f |= 3;     // loop end + repeat
     }
     spu2_sram_write(c.start + off, buf.data(), n);
+    for (uint32_t i = 0; i < n; i += 16) music_blocks::set(c.start + ((off + i) % c.size), song_blocks[i / 16]);
 }
 
 void start_channel(StreamChannel &c) {
@@ -397,9 +403,10 @@ void read_bank() {
 }
 
 // 0: play the queued song; otherwise the virtual id of the custom song replacing it.
-uint32_t custom_for(uint32_t lsn, uint32_t bytes) {
+uint32_t custom_for(uint32_t lsn, uint32_t bytes, bool &song) {
     if (!g_bank_read) read_bank();
     const music::BankRecord *r = music::find_music_record(g_music_recs, g_bank_lsn, lsn, bytes);
+    song = r != nullptr;
     if (!r) return 0;
     const uint32_t v = custom_music::pick_for_native();
     LOG(LOG_SND, "stream: song %u queued -> %s%x", r->id, v ? "custom song id " : "native, bag says ", v);
@@ -493,7 +500,7 @@ void iop_stream_init() {
                 }
                 if (lsn != 0xFFFFFFFFu && bytes && bytes != 0xFFFFFFFFu) {
                     StreamChannel::Req rq{lsn, bytes};
-                    if (!(flags & 1)) rq.host = custom_for(lsn, bytes);
+                    if (!(flags & 1)) rq.host = custom_for(lsn, bytes, rq.song);
                     sc.queue.push_back(rq);
                 }
                 if (!sc.running && !sc.queue.empty()) start_channel(sc);

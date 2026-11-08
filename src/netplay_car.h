@@ -3,7 +3,7 @@
 // Layout verified in docs/NETPLAY_STATE_SYNC.md (all offsets SLUS_209.10):
 //   car object: 4x3 pose at +0x64 (right,up,forward,position), linear velocity +0x104,
 //   angular velocity +0x110, controls +0x1B6C.., damage +0x1BEC.
-//   physics master: body record in the global body table (0x494000..0x496000):
+//   physics master: contiguous 0xB0-byte records at *(0x494D30), count *(0x494D28):
 //   +0x00 position, +0x10/+0x20/+0x30 rotation rows, +0x40 quaternion xyzw, +0x50 linear
 //   velocity, +0x60 angular velocity. The car's copies are refreshed from it every step.
 #include <cstdint>
@@ -23,7 +23,9 @@ constexpr uint32_t kParticipantTable = 0x447458;   // car by description slot (0
 uint32_t slot_count();
 uint32_t car_of_slot(uint32_t slot);        // 0 when absent
 bool is_human(uint32_t car);                // type 0x50
+uint32_t human_controller_of(uint32_t car); // verifies native HumanDriver + pad zero input
 uint32_t body_of(uint32_t car);             // physics master record, 0 if not found
+bool valid_state(const State &s);           // finite pose/controls within native world limits
 bool read(uint32_t car, State &s);
 void write(uint32_t car, const State &s);   // body record + car copies
 void before_step();                         // world-step wrapper hooks

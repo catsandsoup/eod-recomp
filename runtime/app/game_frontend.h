@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 namespace game_frontend {
-struct Player {unsigned slot=0;std::string name;bool ready=false,muted=false,deafened=false,speaking=false;};
+struct Player {unsigned slot=0;std::string name;bool ready=false,muted=false,deafened=false,speaking=false;uint64_t identity=0;};
 struct Option {std::string id,label,value;bool editable=false;std::string help;};   // lobby rows (host edits, guests read)
 struct LanGame {std::string name,address;unsigned players=0;};                       // games found on the same network / friends hosting (address = friend id)
 struct Snapshot {
@@ -32,7 +32,7 @@ struct Snapshot {
 };
 struct Command {
     enum class Kind {Host,JoinAddress,JoinCode,Ready,Start,EndEvent,Cancel,Disconnect,Rematch,RejoinLobby,
-        MicrophoneEnabled,Muted,Deafened,VoiceVolume,Option,JoinCrew};
+        MicrophoneEnabled,Muted,Deafened,VoiceVolume,Option,JoinCrew,Nickname,Kick};
     Kind kind;std::string text;uint16_t port=0;bool enabled=false;float value=0;
 };
 class Network {

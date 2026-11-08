@@ -8,14 +8,18 @@
 #include <vector>
 #include "netplay_car.h"
 namespace netplay {
-constexpr uint16_t kMagic = 0x7D3E, kProtocol = 3;
+constexpr uint16_t kMagic = 0x7D3E, kProtocol = 5;
 constexpr int kMaxPlayers = 16;
 enum Kind : uint8_t {
     K_JOIN = 1, K_WELCOME, K_REFUSE, K_HEARTBEAT, K_LOBBY, K_START, K_TRACK, K_ROSTER, K_GO, K_END, K_LEAVE,
     K_SNAP, K_BEACON, K_KICK,
     K_PUNCH, K_PROBE, K_PROBE_REPLY,     // internet: NAT punch, friend-presence probe and its answer
-    K_VOICE                              // Opus voice frame (netplay::voice::Packet)
+    K_VOICE,                             // Opus voice frame (netplay::voice::Packet)
 };
+// Initial grid is event-scoped and must be applied before the guest acknowledges it.
+// GRID uses the same bounded car records as SNAP, including the local human.
+// GRID_ACK contains the event ID only.
+constexpr uint8_t K_GRID = K_VOICE + 1, K_GRID_ACK = K_GRID + 1;
 // guest phase, reported in heartbeats
 enum Phase : uint8_t { P_LOBBY = 0, P_STARTED, P_CAR_DONE, P_LOADED, P_RACING, P_DONE };
 
@@ -58,6 +62,6 @@ inline bool get_car(Reader &r, uint8_t &slot, uint32_t &tick, netplay_car::State
     netplay_car::quat_to_matrix(q, s.pose);
     s.steer = r.i16(30000.f); s.gas = r.i16(30000.f); s.brake = r.i16(30000.f); s.handbrake = r.u8() ? 1.f : 0.f; s.gear = (int8_t)r.u8();
     s.damage = r.i16(8000.f);
-    return r.ok;
+    return r.ok && netplay_car::valid_state(s);
 }
 }  // namespace netplay

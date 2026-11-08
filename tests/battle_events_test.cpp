@@ -90,7 +90,7 @@ void reset(uint32_t mode = 0x12F) {
         eve(0, "Anoka", anoka_eve, 2); eve(1, "Welch", welch_eve, 1);
         contest(0, 0, 0x2110); contest(1, 0, 0x8125); contest(2, 1, 0x2110);
     }
-    battle_events_set_alternate_root(alternates.c_str());
+    battle_events_set_alternate_root(alternates.u8string().c_str());
 }
 uint32_t name_of(uint32_t index) { g_ee.r[4].ud[0] = index; f_001252C0(); return g_ee.r[2].uw[0]; }
 

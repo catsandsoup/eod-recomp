@@ -1,5 +1,7 @@
 // tools/tests/live_cheats_test.cpp - Verification for live controller cheat combos,
 // feats unlocking out of the box, and Battle Mode Eve contest injection.
+#include <atomic>
+#include "../../tests/test_env.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

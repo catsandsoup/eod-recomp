@@ -42,6 +42,7 @@ public:
     bool wait_track(std::string &track);          // guest: blocks for the host's pick
     void event_ended();                           // GameDoSingle returned
     bool event_active() const { return in_event_; }
+    int online_rules() const;
     bool active() const;                          // true whenever hosting, connecting, in lobby, or racing
     bool is_host() const;
     uint32_t remote_humans() const;               // extra cars the roster needs (Battle size)
@@ -49,6 +50,7 @@ public:
     void roster_post(uint32_t description);
     void step_begin();                            // world-step hooks
     void step_end();
+    bool step_allowed() const;                    // false while online grid is blocked/aborting
     const std::string &last_error() const { return error_; }
     std::string strip() const;
     void mix_voice(int16_t *stereo, int frames);

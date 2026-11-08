@@ -172,6 +172,7 @@ void Menu::store_mods() {
 }
 
 void Menu::open() {
+    remove_player_.clear();
     details_ = false;
     music_open_ = false;
     if (music_) music_->rescan();
@@ -317,7 +318,8 @@ void Menu::rows_settings(std::vector<Row> &r) {
     r.push_back(header("AUDIO"));
     r.push_back(toggle("audio", "SOUND", cfg_.audio, "LIVE", "All game sound on or off."));
     r.push_back(choice("volume", "MASTER VOLUME", percent(cfg_.volume), "LIVE",
-                       "The game mixes music and effects itself; this is the one volume the port has."));
+                       "Overall game and voice volume."));
+    r.push_back(choice("musicvolume", "MUSIC VOLUME", percent(cfg_.music_volume), "LIVE", "Turn down or mute your soundtrack independently of engines, effects and voice."));
     r.push_back(header("FRONT END"));
     r.push_back(toggle("pause", "PAUSE GAME IN THIS MENU", cfg_.pause_in_menu, "LIVE",
                        "Holds the game while this menu is open (never during online play)."));
@@ -336,7 +338,7 @@ void Menu::rows_settings(std::vector<Row> &r) {
         if (!net_) return false;
         const auto s = net_->snapshot();
         using P = game_frontend::Snapshot::Phase;
-        return s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error && !s.is_host;
+        return s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
     }();
     auto host_rule = [&](Row row) {
         if (guest_online) { row.enabled = false; row.note = "HOST RULES"; }
@@ -599,9 +601,13 @@ void Menu::rows_online(std::vector<Row> &r) {
         start.enabled = s.can_start;
         r.push_back(start);
     }
+    Row nick = action("nickname", "SCREEN NAME", text_id_ == "nickname" ? text_ + "_" :
+                      (cfg_.nickname.empty() ? "RANDOM" : cfg_.nickname), "Choose a nickname, or clear it for a random callsign.");
+    nick.kind = RowKind::Text;
+    r.push_back(nick);
     if (!connected) return;
-    Row mods = info("modset", "MOD SET / VERSION", s.content_problem.empty() ? (s.players.size() <= 1 ? "NO GUESTS" : "UNVERIFIED") : upper(s.content_problem),
-                    "Both players need the same game build and the same gameplay mods (MOD_SYSTEM_SCOPE.md 5.6).");
+    Row mods = info("modset", "MOD SET / VERSION", s.content_problem.empty() ? (s.players.size() <= 1 ? "NO GUESTS" : "MATCHED") : upper(s.content_problem),
+                    "Players need matching game content and gameplay mods. Music stays local.");
     mods.warn = !s.content_problem.empty();
     r.push_back(mods);
 
@@ -617,6 +623,15 @@ void Menu::rows_online(std::vector<Row> &r) {
     Row deaf = toggle("deafen", "DEAFEN", s.deafened, "LIVE", "Mutes your microphone and all incoming voice.");
     deaf.enabled = connected && s.voice;
     r.push_back(deaf);
+    if (s.is_host) {
+        r.push_back(header("MANAGE PLAYERS"));
+        for (const auto &player : s.players) if (player.slot) {
+            const auto id = "kick:" + std::to_string(player.slot) + ":" + std::to_string(player.identity);
+            r.push_back(action(id.c_str(), ("REMOVE " + upper(player.name)).c_str(),
+                               remove_player_ == id ? "[ CONFIRM REMOVE ]" : "[ REMOVE ]",
+                               "Removes this player only. Select again to confirm; Back cancels."));
+        }
+    }
     if (connected || s.can_cancel) r.push_back(leave);
 }
 
@@ -691,7 +706,7 @@ void Menu::reset_tab(Tab t) {
         cfg_.smooth_display = d.smooth_display; cfg_.frame_skip = d.frame_skip; cfg_.detail = d.detail; cfg_.show_fps = d.show_fps;
         break;
     case Tab::Settings:
-        cfg_.audio = d.audio; cfg_.volume = d.volume; cfg_.pause_in_menu = d.pause_in_menu; cfg_.unlock_all = d.unlock_all;
+        cfg_.audio = d.audio; cfg_.volume = d.volume; cfg_.music_volume = d.music_volume; cfg_.pause_in_menu = d.pause_in_menu; cfg_.unlock_all = d.unlock_all;
         cfg_.career_cheats = d.career_cheats; cfg_.battle_bots = d.battle_bots; cfg_.sp_battle_mode = d.sp_battle_mode;
         cfg_.manual_recovery = d.manual_recovery; cfg_.car_durability = d.car_durability; cfg_.cheat_turbo = d.cheat_turbo;
         cfg_.cheat_chickens = d.cheat_chickens; cfg_.cheat_invincible = d.cheat_invincible;
@@ -753,6 +768,7 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "deafen" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Deafened; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
     else if (id == "fps") cfg_.show_fps = !cfg_.show_fps;
     else if (id == "audio") { cfg_.audio = !cfg_.audio; fx.audio = true; }
+    else if (id == "musicvolume") { step(cfg_.music_volume, 0, 100, 5); fx.audio = true; }
     else if (id == "volume") { step(cfg_.volume, 0, 100, 5); fx.audio = true; }
     else if (id == "pause") cfg_.pause_in_menu = !cfg_.pause_in_menu;
     else if (id == "unlock") cfg_.unlock_all = !cfg_.unlock_all;
@@ -813,7 +829,12 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (id.compare(0, 4, "lan:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinAddress; c.text = id.substr(4); net_->submit(c); return; }
     if (id.compare(0, 5, "crew:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinCrew; c.text = id.substr(5); net_->submit(c); return; }
     if (id == "host" && net_) { c.kind = game_frontend::Command::Kind::Host; net_->submit(c); return; }
-    if (id == "code" || id == "addr") { text_id_ = id; text_.clear(); return; }
+    if (id == "code" || id == "addr" || id == "nickname") { text_id_ = id; text_ = id == "nickname" ? cfg_.nickname : ""; return; }
+    if (id.compare(0,5,"kick:") == 0 && net_) {
+        if (remove_player_ != id) { remove_player_=id; return; }
+        c.kind=game_frontend::Command::Kind::Kick; c.text=id.substr(5); net_->submit(c);
+        remove_player_.clear(); return;
+    }
     if (id == "ready" && net_) { c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); return; }
     if (id == "end_event" && net_) { c.kind = game_frontend::Command::Kind::EndEvent; net_->submit(c); return; }
     if (id == "leave" && net_) { c.kind = game_frontend::Command::Kind::Disconnect; net_->submit(c); return; }
@@ -870,9 +891,10 @@ Effects Menu::update(const Input &in) {
         if (in.erase && !text_.empty()) text_.pop_back();
         if (in.back) { text_id_.clear(); fx.sound = Sound::Back; return fx; }
         if (in.accept || in.close) {
-            if (net_ && !text_.empty()) {
+            if (net_ && (!text_.empty() || text_id_ == "nickname")) {
                 game_frontend::Command c{};
-                c.kind = text_id_ == "code" ? game_frontend::Command::Kind::JoinCode : game_frontend::Command::Kind::JoinAddress;
+                if (text_id_ == "nickname") dirty_ = true;
+                c.kind = text_id_ == "nickname" ? game_frontend::Command::Kind::Nickname : text_id_ == "code" ? game_frontend::Command::Kind::JoinCode : game_frontend::Command::Kind::JoinAddress;
                 c.text = text_;
                 net_->submit(c);
             }
@@ -892,6 +914,7 @@ Effects Menu::update(const Input &in) {
         return fx;
     }
     if (in.back) {
+        if (!remove_player_.empty()) { remove_player_.clear(); fx.sound=Sound::Back; return fx; }
         if (music_open_) { music_open_ = false; sel_[(int)Tab::Mods] = 0; scroll_[(int)Tab::Mods] = 0; fx.sound = Sound::Back; return fx; }
         if (details_) { details_ = false; fx.sound = Sound::Back; return fx; }
         if (err && browse_) { browse_ = false; sel_[(int)Tab::Count] = 0; fx.sound = Sound::Back; return fx; }

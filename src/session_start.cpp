@@ -317,7 +317,9 @@ extern "C" void f_002BEC08(void) {
         ret_s32(1);
         return;
     }
+    netplay_hooks::title_screen = true;
     f_002BEC08_orig();
+    netplay_hooks::title_screen = false;
 }
 
 extern "C" void f_002A1298(void) {

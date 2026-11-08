@@ -37,6 +37,10 @@ struct DiscResult {
 
 uint32_t disc_crc32(const uint8_t *p, size_t n, uint32_t crc = 0);
 
+// Restores the previous installation if a process stopped during the final swap.
+// Safe to call on every launch; no work is performed for an existing install.
+DiscResult disc_recover_install(const std::string &dest);
+
 // Checks an installed disc folder: SLUS_209.10 with the expected CRC and a
 // DATA folder (case-insensitive names).
 DiscResult disc_check_folder(const std::string &dir, const DiscId &id);
@@ -46,7 +50,7 @@ DiscResult disc_check_folder(const std::string &dir, const DiscId &id);
 using DiscProgress = std::function<bool(uint64_t done, uint64_t total, const std::string &file)>;
 
 // Validates source, then copies SLUS_209.10, SYSTEM.CNF and DATA/ into dest
-// (built in dest + ".partial" and swapped in at the end, so a failed or
+// (built in a unique dest + ".partial.*" folder and swapped in at the end, so a failed or
 // cancelled import leaves any previous install untouched).
 DiscResult disc_import(const std::string &source, const std::string &dest, const DiscId &id,
                        const DiscProgress &progress = nullptr);

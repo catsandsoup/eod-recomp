@@ -11,6 +11,16 @@
 #include <sstream>
 #include <CommonCrypto/CommonDigest.h>
 
+// A small target keeps the synchronous copy cancellable while Cocoa events are
+// pumped between chunks. The importer owns cleanup and preserves prior installs.
+@interface EODDiscCancel : NSObject
+@property(nonatomic) BOOL cancelled;
+- (void)cancel:(id)sender;
+@end
+@implementation EODDiscCancel
+- (void)cancel:(id)sender { (void)sender; self.cancelled = YES; }
+@end
+
 namespace fs = std::filesystem;
 static std::string config_path;
 static NSString *ns(const std::string &s) { return [NSString stringWithUTF8String:s.c_str()]; }
@@ -138,6 +148,8 @@ std::string mac_app_install_disc(const std::string &source, const std::string &c
 bool mac_app_prepare(std::string &data, const std::string &config, bool headless, const DiscId &id, std::string *problem) {
     config_path = config;
     const std::string support = mac_app_support();
+    const auto recovery = disc_recover_install(support + "/disc");
+    if (!recovery.ok()) fprintf(stderr, "%s\n", recovery.message.c_str());
     std::error_code ec;
     fs::create_directories(support + "/memcard", ec);
     if (ec) { fprintf(stderr, "Application Support: %s\n", ec.message().c_str()); return false; }
@@ -148,6 +160,17 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
         // established whether SDL dialogs are allowed for this launch.
         DiscResult r = disc_check_folder(data, id);
         if (r.ok()) return true;
+        // --data and EOD_DATA accept an ISO directly, just like the first-run picker.
+        if (fs::exists(fs::u8path(data), ec)) {
+            const std::string installed = support + "/disc";
+            r = disc_import(data, installed, id);
+            if (r.ok()) {
+                data = installed;
+                g_config.data_dir = data;
+                if (!config_save(config)) fprintf(stderr, "Disc installed; settings could not be saved.\n");
+                return true;
+            }
+        }
         if (problem && !headless) { *problem = r.message; return false; }
         if (headless) fprintf(stderr, "%s\n", r.message.c_str());
         else {
@@ -176,19 +199,27 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
         picker.message = @"Choose your North American v1.00 ISO, or the folder containing SLUS_209.10, SYSTEM.CNF and DATA. Your original files stay untouched.";
         picker.canChooseFiles = YES; picker.canChooseDirectories = YES; picker.allowsMultipleSelection = NO;
         if ([picker runModal] != NSModalResponseOK) return false;
-        NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0,0,470,110) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+        NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0,0,470,150) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
         panel.title = @"Installing your disc";
         NSTextField *label = [NSTextField labelWithString:@"Checking game version…"];
-        label.frame = NSMakeRect(20,60,430,30); [panel.contentView addSubview:label];
-        NSProgressIndicator *bar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20,25,430,20)];
+        label.frame = NSMakeRect(20,100,430,30); [panel.contentView addSubview:label];
+        NSProgressIndicator *bar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20,70,430,20)];
         bar.indeterminate = NO; bar.minValue = 0; bar.maxValue = 100; [panel.contentView addSubview:bar];
+        EODDiscCancel *cancel = [EODDiscCancel new];
+        NSButton *cancelButton = [NSButton buttonWithTitle:@"Cancel" target:cancel action:@selector(cancel:)];
+        cancelButton.frame = NSMakeRect(350,20,100,30); cancelButton.keyEquivalent = @"\x1b";
+        [panel.contentView addSubview:cancelButton];
         [panel center]; [panel makeKeyAndOrderFront:nil];
         DiscResult r = disc_import(picker.URL.path.UTF8String, data, id, [&](uint64_t done, uint64_t total, const std::string &file) {
             bar.doubleValue = total ? 100.0 * done / total : 0;
             label.stringValue = ns("Copying " + file); [panel displayIfNeeded];
-            return true;
+            NSEvent *event;
+            while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate distantPast]
+                                                 inMode:NSDefaultRunLoopMode dequeue:YES])) [NSApp sendEvent:event];
+            return !cancel.cancelled;
         });
         [panel orderOut:nil];
+        if (r.status == DiscStatus::Cancelled) return false;
         if (r.ok()) break;
         error(r.message);
     }

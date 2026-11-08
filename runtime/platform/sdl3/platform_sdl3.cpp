@@ -31,6 +31,9 @@
 #include "audio_gain.h"
 #ifdef __APPLE__
 #include "../../app/macos_app.h"
+#ifndef EOD_DISPLAY_BACKEND_TEST
+#include "../../app/microphone_permission.h"
+#endif
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #include <spawn.h>
@@ -752,7 +755,14 @@ bool platform_audio_open(int sample_rate) {
         return false;
     }
     update_audio_gain();
-    SDL_ResumeAudioStreamDevice(g_audio);
+    if (!SDL_ResumeAudioStreamDevice(g_audio)) {
+        fprintf(stderr, "SDL audio resume: %s\n", SDL_GetError());
+        SDL_DestroyAudioStream(g_audio);
+        g_audio = nullptr;
+        return false;
+    }
+    fprintf(stderr, "SDL audio: playback device=%s rate=%d\n",
+            SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(g_audio)), sample_rate);
     return true;
 }
 
@@ -766,6 +776,26 @@ bool platform_mic_open(int sample_rate) {
     const char *m = getenv("EOD_MUTE");
     if (g_headless || (m && m[0] == '1')) return false;
     if (g_mic) return true;
+#if defined(__APPLE__) && !defined(EOD_DISPLAY_BACKEND_TEST)
+    // This function is reached only after the player opts into microphone use.
+    // Ask through AVFoundation before opening SDL's CoreAudio recording device.
+    const auto permission = microphone_permission::state();
+    static int previous_permission = -1;
+    if (previous_permission != int(permission)) {
+        previous_permission = int(permission);
+        fprintf(stderr, "SDL mic: macOS permission state=%d (0=not requested, 1=granted, 2=denied, 3=restricted)\n", previous_permission);
+    }
+    if (permission != microphone_permission::State::Granted) {
+        static std::atomic<bool> requesting{false};
+        if (permission == microphone_permission::State::NotRequested && !requesting.exchange(true)) {
+            microphone_permission::request([](microphone_permission::State result) {
+                fprintf(stderr, "SDL mic: macOS permission request completed state=%d\n", int(result));
+                requesting.store(false);
+            });
+        }
+        return false;
+    }
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         fprintf(stderr, "SDL audio: %s\n", SDL_GetError());
         return false;
@@ -776,7 +806,14 @@ bool platform_mic_open(int sample_rate) {
         fprintf(stderr, "SDL mic stream: %s\n", SDL_GetError());
         return false;
     }
-    SDL_ResumeAudioStreamDevice(g_mic);
+    if (!SDL_ResumeAudioStreamDevice(g_mic)) {
+        fprintf(stderr, "SDL mic resume: %s\n", SDL_GetError());
+        SDL_DestroyAudioStream(g_mic);
+        g_mic = nullptr;
+        return false;
+    }
+    fprintf(stderr, "SDL mic: recording device=%s rate=%d\n",
+            SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(g_mic)), sample_rate);
     return true;
 }
 
@@ -789,12 +826,27 @@ void platform_mic_close() {
 
 int platform_mic_read(int16_t *samples, int max_samples) {
     if (!g_mic || max_samples <= 0) return 0;
-    const int avail = SDL_GetAudioStreamAvailable(g_mic) / 2;
+    const int available_bytes = SDL_GetAudioStreamAvailable(g_mic);
+    if (available_bytes < 0) {
+        fprintf(stderr, "SDL mic read: %s\n", SDL_GetError());
+        platform_mic_close();
+        return -1;
+    }
+    const int avail = available_bytes / 2;
     if (avail < max_samples) return 0;
     if (avail > max_samples * 8) {
         std::vector<int16_t> discard((size_t)(avail - max_samples * 2));
-        SDL_GetAudioStreamData(g_mic, discard.data(), (int)discard.size() * 2);
+        if (SDL_GetAudioStreamData(g_mic, discard.data(), (int)discard.size() * 2) < 0) {
+            fprintf(stderr, "SDL mic backlog: %s\n", SDL_GetError());
+            platform_mic_close();
+            return -1;
+        }
     }
     const int got = SDL_GetAudioStreamData(g_mic, samples, max_samples * 2);
+    if (got < 0) {
+        fprintf(stderr, "SDL mic read: %s\n", SDL_GetError());
+        platform_mic_close();
+        return -1;
+    }
     return got > 0 ? got / 2 : 0;
 }

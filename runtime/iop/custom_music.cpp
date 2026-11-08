@@ -1,3 +1,4 @@
+#include "../core/host_file.h"
 #include "custom_music.h"
 
 #include <algorithm>
@@ -65,24 +66,24 @@ std::string cache_path(const std::string &key) { return g.cache + "/" + key + ".
 
 std::string make_key(const fs::path &p, uint64_t size, int64_t mtime) {
     char b[40];
-    snprintf(b, sizeof b, "%016llx", (unsigned long long)music::fnv1a(p.string() + "|" + std::to_string(size) + "|" + std::to_string(mtime)));
+    snprintf(b, sizeof b, "%016llx", (unsigned long long)music::fnv1a(p.u8string() + "|" + std::to_string(size) + "|" + std::to_string(mtime)));
     return b;
 }
 
 void save_state_locked() {
     std::vector<std::string> d(g.disabled.begin(), g.disabled.end());
     std::error_code ec;
-    fs::create_directories(g.root, ec);
+    fs::create_directories(fs::u8path(g.root), ec);
     const std::string tmp = g.root + "/state.json.tmp", fin = g.root + "/state.json";
     {
-        std::ofstream o(tmp, std::ios::binary);
+        std::ofstream o(fs::u8path(tmp), std::ios::binary);
         o << music::state_to_json(d);
     }
-    fs::rename(tmp, fin, ec);
+    fs::rename(fs::u8path(tmp), fs::u8path(fin), ec);
 }
 
 bool read_header(const std::string &path, music::CacheHeader &h) {
-    FILE *f = fopen(path.c_str(), "rb");
+    FILE *f = host_fopen(path.c_str(), "rb");
     if (!f) return false;
     const bool ok = fread(&h, sizeof h, 1, f) == 1 && music::cache_header_ok(h);
     fclose(f);
@@ -99,14 +100,14 @@ void process(Song &local, const fs::path &file, const std::string &key) {
         return;
     }
     const std::string tmp = cache_path(key) + ".tmp";
-    FILE *out = fopen(tmp.c_str(), "wb");
+    FILE *out = host_fopen(tmp.c_str(), "wb");
     if (!out) { local.state = State::Skipped; local.reason = "Cannot write the music cache"; return; }
     music::CacheHeader hd = {};
     fwrite(&hd, sizeof hd, 1, out);
     music::LoudnessMeter meter;
     uint64_t frames = 0;
     bool too_long = false;
-    music::DecodeResult r = music::decode_file(file.string(), [&](const int16_t *s, size_t n) {
+    music::DecodeResult r = music::decode_file(file.u8string(), [&](const int16_t *s, size_t n) {
         if (frames + n > kMaxFrames) { too_long = true; return false; }
         meter.add(s, n);
         frames += n;
@@ -122,7 +123,7 @@ void process(Song &local, const fs::path &file, const std::string &key) {
         fwrite(&hd, sizeof hd, 1, out);
         fclose(out);
         std::error_code ec;
-        fs::rename(tmp, cache_path(key), ec);
+        fs::rename(fs::u8path(tmp), fs::u8path(cache_path(key)), ec);
         if (ec) { local.state = State::Skipped; local.reason = "Cannot write the music cache"; return; }
         local.state = State::Ready;
         local.seconds = (double)frames / 48000.0;
@@ -131,7 +132,7 @@ void process(Song &local, const fs::path &file, const std::string &key) {
     }
     fclose(out);
     std::error_code ec;
-    fs::remove(tmp, ec);
+    fs::remove(fs::u8path(tmp), ec);
     local.state = r.status == music::DecodeStatus::Protected ? State::Protected : State::Skipped;
     local.reason = too_long ? "Longer than 20 minutes" : r.reason.empty() ? "Cannot be decoded" : r.reason;
 }
@@ -145,22 +146,22 @@ void scan_pass() {
         g.prog = {0, 0, true};
     }
     std::error_code ec;
-    fs::create_directories(cache, ec);
+    fs::create_directories(fs::u8path(cache), ec);
     struct Item { fs::path file; std::string rel, key; };
     std::vector<Item> items;
-    if (fs::is_directory(root, ec)) {
-        for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
+    if (fs::is_directory(fs::u8path(root), ec)) {
+        for (auto it = fs::recursive_directory_iterator(fs::u8path(root), fs::directory_options::skip_permission_denied, ec);
              !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            const std::string name = it->path().filename().string();
+            const std::string name = it->path().filename().u8string();
             if (name.empty() || name[0] == '.') continue;  // hidden files, AppleDouble "._x"
             std::error_code e2;
             if (!it->is_regular_file(e2)) continue;
-            std::string ext = it->path().extension().string();
+            std::string ext = it->path().extension().u8string();
             for (char &c : ext) c = (char)tolower((unsigned char)c);
             if (!music::is_music_extension(ext)) continue;
             Item i;
             i.file = it->path();
-            i.rel = fs::relative(i.file, root, e2).generic_string();
+            i.rel = fs::relative(i.file, fs::u8path(root), e2).generic_u8string();
             const uint64_t size = (uint64_t)it->file_size(e2);
             const auto mt = fs::last_write_time(i.file, e2);
             i.key = make_key(i.file, size, (int64_t)mt.time_since_epoch().count());
@@ -177,7 +178,7 @@ void scan_pass() {
         for (size_t i = 0; i < items.size(); i++) {
             Song s;
             s.rel = items[i].rel;
-            s.name = fs::path(items[i].rel).stem().string();
+            s.name = fs::u8path(items[i].rel).stem().u8string();
             s.enabled = !g.disabled.count(s.rel);
             s.id = music::kVirtualBase + (uint32_t)i;
             for (size_t o = 0; o < old.size() && o < old_keys.size(); o++)  // unchanged file: stays as it was
@@ -214,10 +215,10 @@ void scan_pass() {
     std::set<std::string> live;
     for (auto &i : items) live.insert(i.key + ".pcm");
     std::vector<std::pair<fs::file_time_type, fs::path>> orphans;
-    for (auto &e : fs::directory_iterator(cache, ec)) {
+    for (auto &e : fs::directory_iterator(fs::u8path(cache), ec)) {
         std::error_code e2;
         total += (uint64_t)e.file_size(e2);
-        if (!live.count(e.path().filename().string())) orphans.push_back({e.last_write_time(e2), e.path()});
+        if (!live.count(e.path().filename().u8string())) orphans.push_back({e.last_write_time(e2), e.path()});
     }
     std::sort(orphans.begin(), orphans.end());
     for (auto &o : orphans) {
@@ -253,7 +254,7 @@ void load_loop() {
         std::shared_ptr<std::vector<int16_t>> data;
         float gain = 1;
         if (!key.empty()) {
-            FILE *f = fopen(cache_path(key).c_str(), "rb");
+            FILE *f = host_fopen(cache_path(key).c_str(), "rb");
             music::CacheHeader h;
             if (f && fread(&h, sizeof h, 1, f) == 1 && music::cache_header_ok(h)) {
                 data = std::make_shared<std::vector<int16_t>>((size_t)h.frames * 2);
@@ -295,8 +296,8 @@ void init(const std::string &root, const std::string &cache_dir) {
         g.root = root;
         g.cache = cache_dir;
         std::error_code ec;
-        fs::create_directories(root, ec);
-        std::ifstream f(root + "/state.json");
+        fs::create_directories(fs::u8path(root), ec);
+        std::ifstream f(fs::u8path(root + "/state.json"));
         std::stringstream ss;
         ss << f.rdbuf();
         for (auto &s : music::state_from_json(ss.str())) g.disabled.insert(s);
