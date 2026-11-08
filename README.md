@@ -41,13 +41,21 @@
 
 * **The Phantom.** A mean, black-and-white new ride for the demolition derby.
 * **A NASCAR stock car.** Take a Cup-style racer through the mud. It crumples, sheds bumpers and panels, and casts a proper shadow, just like the original cars. More are on the way.
+* **Special vehicles in Career.** The School Bus, Hearse, Ambulance, Taxi, Mail Van and Police Car are now stocked at the Career car dealer and eligible for Career events.
 
 ![The bonus #24 NASCAR stock car trading paint with a station wagon in a night battle](docs/img/nascar-stock-car-night-battle.jpg)
 ![The bonus Phantom car lining up at the start of a race](docs/img/phantom-bonus-car.jpg)
 
+### Career, wide open
+
+* **Every shop and event open from day one.** Upgrades, Time Challenges, the Highway, Troy's Place and all 25 Eves are open right away.
+* **The dealer sells every car.** Page through the entire roster at the auto shop with **L2 / R2** — including the Phantom, the NASCAR stock car and all six special vehicles — and swap or trade in cars for a 100% refund so you can try anything at no loss.
+* **Never broke, never locked out.** Career cash stays topped up to at least $10,000 in free roam while winnings still add on top, and your rank stays at **1st** without ending the Career.
+* **Killable challengers.** Highway and Malt Shop challengers in Career free roam no longer stop taking damage at 90% — you can wreck them outright. Every Career unlock can be toggled live in the **Mods** tab.
+
 ### A modern menu that looks like the original
 
-Press **Start + Select** at any time to open the in-game menu, styled like the original game. Tabs for **Graphics, Mods, Settings, Inputs and Online** let you change things without leaving your race.
+Press **Start + Select** on a controller (or **F1** / **Cmd+,** on a keyboard) at any time to open the in-game menu, styled like the original game. Tabs for **Graphics, Mods, Settings, Inputs and Online** let you change things without leaving your race.
 
 ![In-game menu Graphics tab with render scale, aspect ratio and fullscreen options](docs/img/in-game-menu-graphics.jpg)
 

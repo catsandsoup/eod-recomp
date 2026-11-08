@@ -74,6 +74,13 @@ struct Config {
     float chicken_radius_scale = 1.0f; // multiplier for chicken explosion blast radius
     bool battle_bots = true;          // fill Battle to four cars with AI; restart event to apply
     bool sp_battle_mode = true;        // inject Battle Mode into single player action menus with AI
+    // Career unlocks (docs/CAREER_UNLOCKS.md); all on out of the box, each live in the MODS tab
+    bool career_money = true;          // Career money never below a floor (raise-to-floor on an idle frame)
+    bool career_rank = true;           // Career rank held at the top (stored 1, shown 1st) without ending the Career
+    bool career_open = true;           // every shop, upgrade, time challenge, Troy's Place and Eve open from the start
+    bool career_all_cars = true;       // the dealer pages through every car (Phantom and the Cup car included)
+    bool career_free_swap = true;      // selling or trading a car refunds its full price
+    bool career_killable = true;       // highway and Malt Shop challengers in Career free roam can be wrecked
     // [Mods] the MODS tab: each listed mod's id and whether it is on, in load order. A mod with no
     // entry is on, so a missing or partial file leaves everything enabled.
     std::vector<std::pair<std::string, bool>> mods;

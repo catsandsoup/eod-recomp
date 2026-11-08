@@ -479,6 +479,20 @@ void Menu::rows_mods(std::vector<Row> &r) {
         r.push_back(row);
     }
     if (mods_.empty() && !music_) r.push_back(info("nomods", "NO MODS", ""));
+    // Career unlocks (docs/CAREER_UNLOCKS.md): all on out of the box, saved under [Cheats] in eod.ini
+    r.push_back(header("CAREER UNLOCKS"));
+    r.push_back(toggle("cu_money", "CAREER MONEY FLOOR", cfg_.career_money, "LIVE",
+                       "Career money never drops below $10,000, so every car and part can be bought. Winnings still add."));
+    r.push_back(toggle("cu_rank", "CAREER RANK ON TOP", cfg_.career_rank, "LIVE",
+                       "Your Career rank is held at the top (shown 1st) without ending the Career."));
+    r.push_back(toggle("cu_open", "ALL SHOPS AND EVES OPEN", cfg_.career_open, "LIVE",
+                       "Upgrades, Time Challenges, Troy's Place, the dealer and every Eve are open from the start."));
+    r.push_back(toggle("cu_cars", "DEALER SELLS EVERY CAR", cfg_.career_all_cars, "NEXT VISIT",
+                       "The dealer pages through all cars, Phantom and the Cup car included (L2 / R2 on the dealer screen)."));
+    r.push_back(toggle("cu_swap", "FREE CAR SWAPPING", cfg_.career_free_swap, "LIVE",
+                       "Selling or trading a car refunds its full price, so you can try every car at no loss."));
+    r.push_back(toggle("cu_kill", "KILLABLE CHALLENGERS", cfg_.career_killable, "LIVE",
+                       "Highway and Malt Shop challengers in Career free roam can take full damage and be wrecked."));
 }
 
 void Menu::rows_online(std::vector<Row> &r) {
@@ -627,6 +641,9 @@ void Menu::reset_tab(Tab t) {
     case Tab::Mods:
         for (ModEntry &m : mods_) m.enabled = true;
         store_mods();
+        cfg_.career_money = d.career_money; cfg_.career_rank = d.career_rank; cfg_.career_open = d.career_open;
+        cfg_.career_all_cars = d.career_all_cars; cfg_.career_free_swap = d.career_free_swap;
+        cfg_.career_killable = d.career_killable;
         break;
     default: break;
     }
@@ -674,6 +691,12 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "chickens") cfg_.cheat_chickens = !cfg_.cheat_chickens;
     else if (id == "invincible") cfg_.cheat_invincible = !cfg_.cheat_invincible;
     else if (id == "vibration") cfg_.vibration = !cfg_.vibration;
+    else if (id == "cu_money") cfg_.career_money = !cfg_.career_money;
+    else if (id == "cu_rank") cfg_.career_rank = !cfg_.career_rank;
+    else if (id == "cu_open") cfg_.career_open = !cfg_.career_open;
+    else if (id == "cu_cars") cfg_.career_all_cars = !cfg_.career_all_cars;
+    else if (id == "cu_swap") cfg_.career_free_swap = !cfg_.career_free_swap;
+    else if (id == "cu_kill") cfg_.career_killable = !cfg_.career_killable;
 #ifndef _WIN32
     else if (id == "kbport") { cfg_.keyboard_port = (cfg_.keyboard_port + 1 + dir + 4) % 4 - 1; fx.input_layout = true; }
     else if (id == "padlayout") { cfg_.controller_layout = cfg_.controller_layout == "modern" ? "original" : "modern"; fx.input_layout = true; }

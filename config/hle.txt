@@ -75,3 +75,16 @@
 002D58E8 wrap     # Career free-roam run (developer EOD_CAREER_EVE skips it once)
 0020D220 wrap     # MRAnim create (developer EOD_HEAP_CHECK logs its bone count against the fixed 0x740 block)
 00167D58 wrap     # Battle update (developer EOD_BATTLE_END_AFTER forces a winner)
+
+# Career unlocks (src/hle_career.cpp, docs/CAREER_UNLOCKS.md): each does nothing unless its [Cheats] setting is on
+002E35F0 wrap     # dealer stock: AutoShopSetAvailable(out[5], mincap); AllCars pages through every car
+002E5200 wrap     # Eve rank window test (rank, eve): OpenCareer = every Eve open
+002E5758 wrap     # challenges.val / home_challenges.val loader: OpenCareer clears rep_required (Troy's Place)
+002E6C78 wrap     # new rank after an Eve: CareerRank never reaches 0 (champion ends the Career)
+002E0F10 wrap     # get Career rank: CareerRank shows 1st on the Career screens that only display it
+002E3BC8 wrap     # depreciation of a car being sold or traded in: FreeSwap = none (full refund)
+0018AAD0 wrap     # can this car be damaged: pass-through; EOD_CAREER_TRACE logs it (challenger probe)
+002E3E70 wrap     # used value of an owned car (90 % of its price): FreeSwap = the full price
+003698E8 wrap     # Homebase hub menu build (dealer stock, owned cars, challengers): remembers the menu so the dealer can rebuild it
+003702F0 wrap     # dealer car list: per-frame selection details; runs a page turn (L1 / R1) when one is pending
+001741C0 wrap     # Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck

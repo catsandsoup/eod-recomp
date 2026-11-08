@@ -28,8 +28,12 @@
 #include "funcs.h"
 #include "game_patches.h"
 #include "battle_layout.h"
+#include "hle_career.h"
 #include "iop/iop.h"
 #include "platform/platform.h"
+
+// The Career unlocks (hle_career.cpp); standalone unit tests that do not link it get this no-op.
+__attribute__((weak)) void career_vblank(uint16_t) {}
 
 void game_patches_init(const Config &) {
     // Config parameters are accessed directly via g_config
@@ -448,6 +452,7 @@ void game_patches_vblank() {
     static uint16_t s_prev_pad = 0;
     uint16_t pressed = b & ~s_prev_pad;
     s_prev_pad = b;
+    career_vblank(pressed);
 
     bool l1_r1_held = (b & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1);
     platform_set_mod_overlay(l1_r1_held);

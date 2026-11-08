@@ -162,6 +162,12 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "BattleBots")) c.battle_bots = to_bool(v);
             else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
             else if (ieq(k, "Invincible") || ieq(k, "GodMode")) c.cheat_invincible = to_bool(v);
+            else if (ieq(k, "CareerMoney")) c.career_money = to_bool(v);
+            else if (ieq(k, "CareerRank")) c.career_rank = to_bool(v);
+            else if (ieq(k, "OpenCareer")) c.career_open = to_bool(v);
+            else if (ieq(k, "AllCars")) c.career_all_cars = to_bool(v);
+            else if (ieq(k, "FreeSwap")) c.career_free_swap = to_bool(v);
+            else if (ieq(k, "KillableChallengers")) c.career_killable = to_bool(v);
         } else if (ieq(section, "Mods")) {
             if (!k.empty()) {
                 bool found = false;
@@ -195,6 +201,12 @@ bool config_load(const std::string &path, Config &c) {
     if (const char *e = getenv("EOD_CHICKEN_RADIUS")) c.chicken_radius_scale = (float)atof(e);
     if (const char *e = getenv("EOD_BATTLE_BOTS")) c.battle_bots = to_bool(e);
     if (const char *e = getenv("EOD_SP_BATTLE")) c.sp_battle_mode = to_bool(e);
+    if (const char *e = getenv("EOD_CAREER_MONEY")) c.career_money = to_bool(e);
+    if (const char *e = getenv("EOD_CAREER_RANK")) c.career_rank = to_bool(e);
+    if (const char *e = getenv("EOD_OPEN_CAREER")) c.career_open = to_bool(e);
+    if (const char *e = getenv("EOD_ALL_CARS")) c.career_all_cars = to_bool(e);
+    if (const char *e = getenv("EOD_FREE_SWAP")) c.career_free_swap = to_bool(e);
+    if (const char *e = getenv("EOD_KILLABLE_CHALLENGERS")) c.career_killable = to_bool(e);
 
     return file_loaded;
 }
@@ -261,6 +273,12 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);
     fprintf(f, "BattleBots=%d         ; 1: fill Battle to four participants; restart event to apply\n", c.battle_bots ? 1 : 0);
     fprintf(f, "SinglePlayerBattle=%d ; 1: inject Battle Mode into single player action menus with AI\n", c.sp_battle_mode ? 1 : 0);
+    fprintf(f, "CareerMoney=%d        ; 1: Career money never drops below $10,000 (winnings still add)\n", c.career_money ? 1 : 0);
+    fprintf(f, "CareerRank=%d         ; 1: Career rank held at the top (shown 1st) without ending the Career\n", c.career_rank ? 1 : 0);
+    fprintf(f, "OpenCareer=%d         ; 1: every Career shop, upgrade, time challenge, Troy's Place and Eve open from the start\n", c.career_open ? 1 : 0);
+    fprintf(f, "AllCars=%d            ; 1: the Career dealer pages through every car, Phantom and the Cup car included\n", c.career_all_cars ? 1 : 0);
+    fprintf(f, "FreeSwap=%d           ; 1: selling or trading a Career car refunds its full price\n", c.career_free_swap ? 1 : 0);
+    fprintf(f, "KillableChallengers=%d; 1: Highway and Malt Shop challengers in Career free roam can be wrecked\n", c.career_killable ? 1 : 0);
     fprintf(f, "\n[Mods]\n; MODS tab: <mod folder>=1 (on) or 0 (off), in load order; a mod not listed is on\n");
     for (const auto &m : c.mods) {
         // ids the ini syntax cannot carry are simply not remembered

@@ -150,6 +150,25 @@ int main() {
         CHECK(part.mods()[a].enabled && part.mods()[a + 1].enabled && part.dirty());
         for (const auto &e : partial.mods) CHECK(e.second);
     }
+    // Career unlocks (docs/CAREER_UNLOCKS.md): all on by default, live rows in MODS, saved under [Cheats]
+    {
+        CHECK(cfg.career_money && cfg.career_rank && cfg.career_open && cfg.career_all_cars && cfg.career_free_swap &&
+              cfg.career_killable);
+        m.set_tab(Tab::Mods);
+        for (const char *id : {"cu_money", "cu_rank", "cu_open", "cu_cars", "cu_swap", "cu_kill"}) CHECK(find(m, id) >= 0);
+        Input go = none(); go.accept = true;
+        m.select(find(m, "cu_money")); m.update(go);
+        m.select(find(m, "cu_swap")); m.update(go);
+        m.select(find(m, "cu_kill")); m.update(go);
+        CHECK(!cfg.career_money && !cfg.career_free_swap && !cfg.career_killable && cfg.career_rank && cfg.career_open && m.dirty());
+        const std::string ini = (root / "career.ini").string();
+        CHECK(config_save(ini, cfg));
+        Config loaded;
+        CHECK(config_load(ini, loaded) && !loaded.career_money && !loaded.career_free_swap && !loaded.career_killable &&
+              loaded.career_rank && loaded.career_open && loaded.career_all_cars);
+        Input r = none(); r.reset = true; m.update(r);
+        CHECK(cfg.career_money && cfg.career_free_swap && cfg.career_killable);
+    }
     in = none(); in.details = true; m.update(in);
     CHECK(m.details_open());
     in = none(); in.back = true; fx = m.update(in);
