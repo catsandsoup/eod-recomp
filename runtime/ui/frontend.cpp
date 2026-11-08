@@ -373,7 +373,11 @@ void Menu::rows_inputs(std::vector<Row> &r) {
     }
     r.push_back(header("CONTROLLER BINDINGS (READ-ONLY)"));
     {
+#ifdef _WIN32
+        const bool modern = false; // XInput maps the triggers to native L2/R2.
+#else
         const bool modern = cfg_.controller_layout == "modern";
+#endif
         struct B { const char *pad, *ps2, *use; };
         const B list[] = {
             {"A / CROSS", "CROSS", "accept / gas (digital)"},

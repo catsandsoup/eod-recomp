@@ -1,5 +1,6 @@
 // SLUS-209.10: preserve native recovery detection and SELECT eligibility while
 // disabling only the countdown's automatic relocation for local human cars.
+#include <cstring>
 #include "core/cpu.h"
 #include "core/config.h"
 extern "C" void f_001B8370_orig();

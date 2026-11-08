@@ -10,6 +10,7 @@
 #define NOMINMAX
 #endif
 #include <atomic>
+#include <winsock2.h>
 #include <windows.h>
 #include <mmsystem.h>
 
@@ -32,6 +33,7 @@ std::atomic<int> g_aspect{0};  // display aspect (platform_set_aspect)
 HWND g_hwnd;
 bool g_quit;
 bool g_fullscreen;
+bool g_winsock_ready;
 WINDOWPLACEMENT g_prev_placement = {sizeof(WINDOWPLACEMENT)};
 std::vector<uint32_t> g_bgra;
 int g_fw = 640, g_fh = 448;
@@ -205,6 +207,8 @@ DWORD WINAPI ticker_thread(LPVOID p) {
 
 // ================================================================= API
 bool platform_init(const PlatformConfig &cfg) {
+    WSADATA winsock{};
+    g_winsock_ready = WSAStartup(MAKEWORD(2, 2), &winsock) == 0;
     g_cfg = cfg;
     g_aspect = cfg.aspect;
     QueryPerformanceFrequency(&g_qpf);
@@ -237,6 +241,8 @@ void platform_shutdown() {
         waveOutClose(g_wave);
         g_wave = nullptr;
     }
+    platform_mic_close();
+    if (g_winsock_ready) { WSACleanup(); g_winsock_ready = false; }
     timeEndPeriod(1);
 }
 
@@ -553,7 +559,7 @@ static WAVEHDR g_in_hdr[4] = {};
 static std::vector<int16_t> g_in_buf[4];
 
 bool platform_mic_open(int sample_rate) {
-    if (g_headless) return false;
+    if (g_cfg.headless) return false;
     if (g_wave_in) return true;
     WAVEFORMATEX wf = {};
     wf.wFormatTag = WAVE_FORMAT_PCM;

@@ -1,7 +1,6 @@
 // Online play session: see netplay_session.h and docs/NETPLAY_STATE_SYNC.md.
 #include "netplay_session.h"
 #include "../runtime/core/config.h"
-#include "../runtime/core/memory.h"
 #include "netplay_online.h"
 #include "netplay_online_wire.h"
 #include "netplay_voice.h"
@@ -34,6 +33,8 @@ static void set_nonblock(int fd) { u_long on = 1; ioctlsocket(fd, FIONBIO, &on);
 #define EOD_CLOSESOCK close
 static void set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); }
 #endif
+
+#include "../runtime/core/memory.h"
 
 namespace netplay {
 namespace {

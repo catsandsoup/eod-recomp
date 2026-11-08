@@ -395,7 +395,7 @@ if(WIN32)
   target_compile_definitions(eod PRIVATE _WIN32_WINNT=0x0601 WINVER=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX
                              IMGUI_DISABLE_DEMO_WINDOWS IMGUI_DISABLE_DEBUG_TOOLS IMGUI_DISABLE_WIN32_DEFAULT_IME_FUNCTIONS
                              IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
-  target_link_libraries(eod PRIVATE d3d11 dxgi gdi32 user32 winmm mfplat mfreadwrite mfuuid ole32)
+  target_link_libraries(eod PRIVATE d3d11 dxgi gdi32 user32 ws2_32 winmm mfplat mfreadwrite mfuuid ole32)
   if(MINGW)
     target_link_options(eod PRIVATE -static -static-libgcc -static-libstdc++ -mwindows)
   endif()
