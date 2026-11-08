@@ -124,7 +124,7 @@
 0021C6E0 VisualCarSelectLodIndex [V]  # Computes camera distance and selects LOD index (+0x54C) for a single visual car -> docs/LOD_RUNTIME.md
 00220788 WheelSelectSlowOrFastModel [V]  # Chooses 3D slow wheel mesh vs card fast wheel by speed/LOD; wrapped for Cup wheels -> docs/NASCAR_CUP_WHEELS.md
 00227EE8 ChickenWeaponCreateForCar [V]  # Constructs and registers a chicken launcher for car slot -> docs/BATTLE_RECOVERY.md
-00270C10 MenuRun [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
+00270C10 MenuRun [I]  # Runs one menu screen to a result; wrapped to auto-answer the Arcade single/multi prompt for online events -> docs/NETPLAY_STATE_SYNC.md
 
 # ---------------------------------------------------------------------------
 # 0x002A0000 - 0x002FFFFF : Frontend Menus, Career Mode, AutoShop & Eves
@@ -133,6 +133,7 @@
 002A75E0 SinglePlayerCarSelectUpdate [V]  # Action/Single car selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002B6DB8 CheatExecuteMasterUnlock [V]  # Master unlock helper calling track, feat, Eve, and Dare unlock routines -> docs/GAMEPLAY_MODS_RE.md
 002BEC08 TitleScreenUpdate [V]  # Title screen update; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+002C0BB8 ArcadeSingleOrMultiPromptScreen [I]  # Main menu ACTION: s_and_m.lyt 'single / multi' prompt (MenuRun call at 0x2C0DC0 returns 1 = single, 4 = multi, -1 = back), then GameDoSingle; auto-answered single for online events -> docs/NETPLAY_STATE_SYNC.md
 002C1224 CareerStripMasterCheatBit [V]  # Clears bit 0 of g_CheatMask (0x003C4190) on Career entry -> docs/GAMEPLAY_MODS_RE.md
 002C7340 SinglePlayerTrackSelectUpdate [V]  # Action/Single track selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002CD418 CareerUnlockAllVenueEves [V]  # Unlocks all Eve events across Career venues -> docs/GAMEPLAY_MODS_RE.md

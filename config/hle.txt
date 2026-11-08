@@ -57,6 +57,7 @@
 002A1298 wrap     # main menu: start the requested Action session when first reached
 002A75E0 wrap     # GameDoSingle car screen: answered once for a direct start
 002C7340 wrap     # GameDoSingle track screen: answered once for a direct start
+00270C10 wrap     # MenuRun: the Arcade 'single / multi' prompt is auto-answered (single) for online events
 00120650 wrap     # per-event setup: pre-select the requested event once
 00177718 wrap     # default-off netplay world-step diagnostic boundary
 0038FF40 wrap     # default-off netplay consumed SDK pad reply trace

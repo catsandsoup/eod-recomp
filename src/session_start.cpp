@@ -28,6 +28,7 @@ void f_002A1298_orig(void);
 void f_002BEC08_orig(void);
 void f_002A75E0_orig(void);
 void f_002C7340_orig(void);
+void f_00270C10_orig(void);
 void f_00120650_orig(void);
 void f_002A2C98(void);
 void f_00119428(void);
@@ -87,6 +88,7 @@ struct Plan {
     SessionRequest req;
     uint32_t eve = 0, contest = 0, car = 0;
     bool car_done = false, track_done = false, event_done = false;
+    bool mode_answered = false;   // online: the Arcade single/multi prompt was answered once
     bool net = false;   // online event: native car screen shown for real; track real (host) or the host's pick (guest)
 } P;
 
@@ -253,6 +255,20 @@ extern "C" void f_002A1298(void) {
     if (netplay_hooks::menu_enter) netplay_hooks::menu_enter();
     f_002A1298_orig();
     if (netplay_hooks::menu_leave) netplay_hooks::menu_leave();
+}
+
+// MenuRun runs every native menu screen. The only one answered here is the Arcade "single player or
+// multiplayer?" prompt (s_and_m.lyt, the call at 0x2C0DC0 in ArcadeSingleOrMultiPromptScreen 0x2C0BB8):
+// online, every game has exactly one local human and the others are puppets, so the answer is always
+// "single" (1). When that single-player session returns the prompt loops; answering "back" (-1) leaves
+// the Arcade menu for the main menu, where the lobby reopens.
+extern "C" void f_00270C10(void) {
+    if (P.armed && P.net && g_ee.r[31].uw[0] == 0x002C0DC8) {
+        if (!P.mode_answered) { P.mode_answered = true; ret_s32(1); log("online: single/multi prompt answered 'single'"); }
+        else ret_s32(-1);
+        return;
+    }
+    f_00270C10_orig();
 }
 
 // GameDoSingle opens the car screen first. The answer is the human's vehicle number, which
