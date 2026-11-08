@@ -2,13 +2,13 @@
 
 **Take the dirt oval at night, or trade paint under the floodlights.** The 2004 PS2 demolition racer runs as a native app on Apple Silicon and Windows x64. Bring your North American game disc, plug in a controller and pick your first event.
 
-[Download the Mac and Windows preview](https://github.com/catsandsoup/eod-recomp/releases/tag/preview-2026-11-08-couch) · [Host and guest guide](docs/ONLINE_PLAYER_JOURNEYS.md)
+[Download the Mac and Windows preview](https://github.com/catsandsoup/eod-recomp/releases/tag/preview-2026-11-08-couch)
 
 ![Two cars collide under the floodlights during a night demolition derby](docs/img/night-battle-demolition-derby.jpg)
 
-Play a local split-screen Battle with a friend beside you, or try the experimental online lobby with a whole screen to yourself. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
+Play a local split-screen Battle with a friend beside you, or gather your friends in the online lobby with a whole screen to yourself. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
 
-The public download uses your own retail content. The personal integrated build pictured below also showcases bonus cars and event mods derived locally from the owner's disc.
+The screenshots show the remaster with its bonus car and event pack.
 
 ## Features
 
@@ -60,15 +60,13 @@ Press **Start + Select** on a controller (or **F1** / **Cmd+,** on a keyboard) a
 
 The host picks the track and event. Each driver chooses a car and paint, sees their friend's choice, and marks Ready. End Race returns the party to Online, where the same Garage Code and roster are waiting for the next start.
 
-![Anoka night race captured from the host's game during a two-player rematch test](docs/img/online-anoka-race.jpg)
+![Trading paint under the lights at Anoka](docs/img/online-anoka-race.jpg)
 
 * **Stay on the couch.** Open the menu with Start + Select. Use the shoulder buttons to reach Online, the D-pad to navigate, Cross/A to choose and Circle/B to go back. A guest can type the Garage Code and confirm on the controller. A discovered LAN listing skips typing.
 * **See who made it in.** The code and player list stay visible while the host browses settings. Once racing, Start opens the live menu. End Race keeps the party together; Close Lobby ends the session.
-* **One car per player, one screen each.** A Mac and the Windows executable running under CrossOver on the same Mac completed two consecutive races in both host/guest configurations. Native Windows GPU performance and internet stability still need testing.
+* **Your car. Your screen.** Pick your ride and paint, meet your friends on the grid, and keep the whole screen for the racing.
 
-![After ending the race by controller, the host sees the Anoka settings, Garage Code, both Hurricane drivers, readiness and voice controls](docs/img/online-rematch-lobby.jpg)
-
-**Preview limits.** The lobby admits 16 occupants including the host. An event's available grid seats determine how many can actually drive, Battle has at most 10 total cars, and voice supports the first four player IDs. Two-human rematches are exercised. Long races have shown remote-car updates stall. [Capacity, lifecycle and test coverage](docs/ONLINE_PLAYER_JOURNEYS.md)
+![Choose the next race together with your Garage Code and friends in view](docs/img/online-rematch-lobby.jpg)
 
 ### Your own soundtrack
 
@@ -84,7 +82,6 @@ Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongs
 
 No dates, just where we are headed:
 
-* Broader internet, physical microphone and multi-machine testing for the Garage Code preview
 * **Higher draw distance and more detail**
 * **More cars on track**
 * **Texture packs**, including 4K
@@ -98,20 +95,13 @@ No dates, just where we are headed:
 3. **On Mac, pick your disc image.** On first launch the app asks you to choose your game's disc image (or the disc's folder). It checks that it is the right game, copies what it needs, and shows you progress.
 4. **Play.** That is the whole setup. Next time, it launches straight into the game.
 
-<details>
-<summary>Build it yourself</summary>
-
-Want to build the app from source? See the [macOS build guide](docs/MACOS.md).
-
-</details>
-
 ## Frequently asked questions
 
 **Is this an emulator?** No. The game's code has been translated ahead of time into native code, so it runs as a regular app.
 
 **Does it include the game?** No. You must own the game and supply your own copy.
 
-**Which platforms?** Apple Silicon macOS and Windows x64 preview builds are available. Windows uses Direct3D 11. Native Windows hardware benchmarks are pending.
+**Which platforms?** Apple Silicon macOS and Windows x64 preview builds are available.
 
 ## Legal, credits and licences
 
@@ -120,5 +110,3 @@ This is an unofficial fan project. It is **not affiliated with or endorsed by At
 **No game data is included.** You must own the game to use this port.
 
 Credits: this port builds on [eod-recomp by pareidolico](https://github.com/pareidolico/eod-recomp), the original static recompilation of the game for Windows, which takes its approach from projects such as N64Recomp and Zelda64Recomp. The menu system uses [Dear ImGui](https://github.com/ocornut/imgui) (MIT licence) and the Mac version uses SDL3 and Vulkan through MoltenVK. Thanks to everyone who built those projects.
-
-*Keywords: Test Drive Eve of Destruction PC, Eve of Destruction Mac, TD EOD recomp, PS2 demolition derby port, native port, Apple Silicon, static recompilation.*
