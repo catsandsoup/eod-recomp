@@ -126,7 +126,7 @@ else()
   set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
   list(APPEND PLATFORM_SOURCES ${IMGUI_SOURCES} ${CMAKE_SOURCE_DIR}/runtime/ui/overlay_core.cpp
        ${CMAKE_SOURCE_DIR}/runtime/ui/frontend.cpp ${CMAKE_SOURCE_DIR}/runtime/ui/frontend_draw.cpp
-       ${CMAKE_SOURCE_DIR}/runtime/ui/ui_art.cpp)
+       ${CMAKE_SOURCE_DIR}/runtime/ui/ui_art.cpp ${CMAKE_SOURCE_DIR}/runtime/ui/ui_preview.cpp)
 endif()
 
 if(NOT WIN32)

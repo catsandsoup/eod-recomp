@@ -151,6 +151,8 @@ public:
     int rebinding() const { return rebind_; }   // pad key index waiting for a keyboard key, -1 none
     bool editing_text() const { return !text_id_.empty(); }
     const std::string &text_value() const { return text_; }
+    const std::string &pic_track() const { return pic_track_; }
+    uint32_t pic_car() const { return pic_car_; }
     std::string copy_text();       // what Cmd+C copies on this screen (the hosted Garage Code), "" if nothing
     bool dirty() const { return dirty_; }
     void clear_dirty() { dirty_ = false; }
@@ -179,6 +181,8 @@ public:
     void reset_tab(Tab t);
 
 private:
+    std::string pic_track_;
+    uint32_t pic_car_ = 0;
     void rebuild(Tab t);
     void rows_graphics(std::vector<Row> &r);
     void rows_mods(std::vector<Row> &r);

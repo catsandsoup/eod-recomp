@@ -23,6 +23,7 @@
 #include "core/config.h"
 #include "core/cpu.h"
 #include "core/eodsave.h"
+#include "netplay_hooks.h"
 #include "core/log.h"
 #include "core/memory.h"
 #include "funcs.h"
@@ -455,14 +456,20 @@ void game_patches_vblank() {
     career_vblank(pressed);
 
     bool l1_r1_held = (b & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1);
-    platform_set_mod_overlay(l1_r1_held);
+    const bool online_guest = (netplay_hooks::active && netplay_hooks::active()) &&
+                              !(netplay_hooks::is_host && netplay_hooks::is_host());
+    platform_set_mod_overlay(l1_r1_held && !online_guest);
 
     // Track button suppression to protect driving and pause menus
     s_suppressed_pad0_buttons = 0;
+    if (netplay_hooks::event_active && netplay_hooks::event_active()) {
+        // Suppress native PS2 freeze-pause (PAD_START) during an online race; START opens the live overlay instead.
+        s_suppressed_pad0_buttons |= PAD_START;
+    }
 
     // Track holding Select (30 vblanks = ~500ms quick chicken toggle)
     static int s_select_hold_frames = 0;
-    if (!l1_r1_held && (b & PAD_SELECT)) {
+    if (!online_guest && !l1_r1_held && (b & PAD_SELECT)) {
         s_select_hold_frames++;
         if (s_select_hold_frames == 30) {
             g_config.cheat_chickens = !g_config.cheat_chickens;
@@ -478,7 +485,7 @@ void game_patches_vblank() {
         s_select_hold_frames = 0;
     }
 
-    if (l1_r1_held) {
+    if (!online_guest && l1_r1_held) {
         // While L1+R1 modifier is held, suppress chord and navigation buttons from being sent to the game
         s_suppressed_pad0_buttons |= (PAD_L1 | PAD_R1 | PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT | PAD_TRIANGLE | PAD_SELECT | PAD_SQUARE);
 
@@ -545,7 +552,7 @@ void game_patches_vblank() {
             platform_audio_feedback(g_config.cheat_invincible);
             LOG(LOG_CORE, "[MOD COMBO L1+R1+SQUARE] Invincibility: %s", g_config.cheat_invincible ? "ON" : "OFF");
         }
-    } else if ((pressed & (PAD_L3 | PAD_R3)) && (b & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3)) {
+    } else if (!online_guest && (pressed & (PAD_L3 | PAD_R3)) && (b & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3)) {
         s_suppressed_pad0_buttons |= (PAD_L3 | PAD_R3);
         g_config.cheat_chickens = !g_config.cheat_chickens;
         platform_show_hud_banner(g_config.cheat_chickens ? "★ CHICKEN FIGHT: ON (Press L2 to Fire) ★" : "★ CHICKEN FIGHT: OFF ★");

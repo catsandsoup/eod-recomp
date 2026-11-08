@@ -14,7 +14,7 @@ uint32_t ee_read32_slow(uint32_t) { return 0; }
 void ee_write32_slow(uint32_t, uint32_t) {}
 // Hook entry points are not exercised here; satisfy the linker.
 void f_002A1298_orig(void) {} void f_002BEC08_orig(void) {} void f_002A75E0_orig(void) {}
-void f_002C7340_orig(void) {} void f_00270C10_orig(void) {} void f_00120650_orig(void) {} void f_002A2C98(void) {}
+void f_002C7340_orig(void) {} void f_00270C10_orig(void) {} void f_00120650_orig(void) {} void f_00120FB8_orig(void) {} void f_002A2C98(void) {}
 void f_00119428(void) {} void f_00128CB0(void) {} void f_002C1338(void) {} void f_00120BE8(void) {}
 void f_001252C0(void) {} void f_00123958(void) {}
 }

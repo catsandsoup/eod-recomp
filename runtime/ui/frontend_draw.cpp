@@ -13,6 +13,7 @@
 
 #include "../../third_party/imgui/imgui.h"
 #include "ui_art.h"
+#include "ui_preview.h"
 
 namespace frontend_draw {
 namespace {
@@ -409,6 +410,20 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
             y += 8 * s;
             if (m.details_open() || true) paragraph(d, 21 * s, x0, y, x1 - x0, IM_COL32(210, 205, 196, 255), mod.description);
         } else if (r) {
+            if (m.tab() == frontend::Tab::Online && !m.pic_track().empty()) {
+                // lobby pictures from the player's own disc: the host's track, then your car
+                auto draw_pic = [&](const ui_preview::Pic &p, float maxh) {
+                    if (!p.ok()) return;
+                    float w = x1 - x0, h = w / p.aspect;
+                    if (h > maxh) { h = maxh; w = h * p.aspect; }
+                    const float px0 = x0 + (x1 - x0 - w) * 0.5f;
+                    dl->AddImage((ImTextureID)p.tex, ImVec2(px0, y), ImVec2(px0 + w, y + h), ImVec2(p.u0, p.v0), ImVec2(p.u1, p.v1));
+                    dl->AddRect(ImVec2(px0, y), ImVec2(px0 + w, y + h), IM_COL32(110, 98, 86, 255), 0, 0, 2 * s);
+                    y += h + 10 * s;
+                };
+                draw_pic(ui_preview::track(m.pic_track()), 190 * s);
+                if (m.pic_car()) draw_pic(ui_preview::car(m.pic_car()), 130 * s);
+            }
             text(d, fit(d, 30 * s, x1 - x0, r->label.c_str()), x0, y, kOrange, r->label.c_str());
             y += 42 * s;
             if (!r->note.empty()) {
@@ -422,8 +437,7 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
                 text(d, 22 * s, x0, y, kOrange, "NETWORK PLAY");
                 y += 30 * s;
                 paragraph(d, 20 * s, x0, y, x1 - x0, kGrey,
-                          "Host or join a two-player session. Both machines then start the agreed Race or Battle "
-                          "directly. The transport is not built yet: this build always shows NOT CONNECTED.");
+                          "One player hosts, the others join with the Garage Code. Everybody drives their own car on their own screen.");
             }
         }
         if (!m.status().empty()) {

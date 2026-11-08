@@ -14,8 +14,9 @@ static int failures = 0;
 using namespace frontend;
 
 struct FakeNet : game_frontend::Network {
+    game_frontend::Snapshot snap;
     std::vector<game_frontend::Command> got;
-    game_frontend::Snapshot snapshot() const override { return {}; }
+    game_frontend::Snapshot snapshot() const override { return snap; }
     void submit(game_frontend::Command c) override { got.push_back(c); }
 };
 
@@ -195,6 +196,20 @@ int main() {
     m.select(find(m, "ready"));
     fx = m.update(in);
     CHECK(fx.sound == Sound::Error && net->got.size() == 2);
+    // host racing: BACK TO LOBBY (EndEvent) is shown and closes the overlay
+    net->snap.phase = game_frontend::Snapshot::Phase::Racing;
+    net->snap.is_host = true;
+    CHECK(find(m, "end_event") >= 0);
+    m.select(find(m, "end_event"));
+    in = none(); in.accept = true; fx = m.update(in);
+    CHECK(fx.close && net->got.back().kind == game_frontend::Command::Kind::EndEvent);
+    // guest racing: LEAVE MATCH is shown, and gameplay-diverging cheats in SETTINGS are locked to host rules
+    net->snap.is_host = false;
+    CHECK(find(m, "end_event") < 0 && m.rows()[find(m, "leave")].label == "LEAVE MATCH");
+    m.set_tab(Tab::Settings);
+    CHECK(!m.rows()[find(m, "turbo")].enabled && !m.rows()[find(m, "chickens")].enabled && !m.rows()[find(m, "invincible")].enabled);
+    m.set_tab(Tab::Online);
+    net->snap = {};
 
     // error screen replaces the tabs; Back never closes it
     m.show_error("NO DISC", "x", true);

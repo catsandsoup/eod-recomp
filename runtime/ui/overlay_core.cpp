@@ -22,6 +22,7 @@
 #include "frontend_draw.h"
 #include "menu_input.h"
 #include "ui_art.h"
+#include "ui_preview.h"
 #include "../../src/netplay_session.h"
 
 [[noreturn]] void app_exit(int code);
@@ -215,6 +216,7 @@ void ensure_context() {
     io.Fonts->SetTexID((ImTextureID)1);
     g_font_gen++;
     ui_art::load(g_game_root, add_texture);
+    ui_preview::init(g_game_root, add_texture);
     g_menu = std::make_unique<frontend::Menu>(g_config);
     g_menu->set_music(std::make_shared<MusicAdapter>());
     g_net = std::shared_ptr<game_frontend::Network>(&netplay::session(), [](game_frontend::Network *) {});
@@ -252,6 +254,11 @@ frontend::Input gather_input(bool &toggled) {
         overlay_platform_pad(p, &s);
         menu_input::PadFrame f = g_pads[p].update(s);
         if (f.toggle) { toggled = true; continue; }
+        if (!g_open && netplay::session().event_active() && (f.pressed & PAD_START) && !(f.held & PAD_SELECT)) {
+            if (g_menu) g_menu->set_tab(frontend::Tab::Online);
+            toggled = true;
+            continue;
+        }
         if (!g_open) continue;
         const uint16_t pr = f.pressed;
         if (pr || f.dx || f.dy) {
@@ -435,7 +442,12 @@ void pump_paused_audio() {
 void overlay_enable() { g_available = true; }
 bool overlay_menu_open() { return g_open; }
 bool overlay_captures_input() { return g_open || g_release_wait; }
-bool overlay_paused() { return g_open && g_config.pause_in_menu && !(g_menu && g_menu->error_active()); }
+// Never hold the game when an online session is active (Hosting, Connecting, Lobby, or Racing) or on the ONLINE tab:
+// pausing the EE thread freezes the local simulation and network pump, which desyncs multiplayer.
+bool overlay_paused() {
+    return g_open && g_config.pause_in_menu && !netplay::session().active() &&
+           !(g_menu && (g_menu->error_active() || g_menu->tab() == frontend::Tab::Online));
+}
 void overlay_toggle() { open_menu(!g_open); }
 bool overlay_in_screenshots() {
     const char *e = getenv("EOD_SCREENSHOT_OVERLAY");
@@ -445,8 +457,12 @@ bool overlay_in_screenshots() {
 bool overlay_key(int vk, bool down) {
     if (vk == 0x10) g_shift = down;
     if (!g_available) return false;
-    // F1 (and Cmd+, on the Mac) opens/closes it. Esc is the game's own pause/back key, so it never
-    // opens the menu (it only backs out while the menu is open).
+    // F1 (and Cmd+, on the Mac) opens/closes it. During an online race, Esc also opens the non-pausing
+    // Online overlay instead of triggering the PS2 single-player freeze-pause.
+    if (!g_open && down && vk == 0x1B && netplay::session().event_active()) {
+        overlay_show_online();
+        return true;
+    }
     if (down && vk == 0x70) {
         if (!g_context) ensure_context();
         if (g_menu && g_menu->error_active()) return true;

@@ -28,6 +28,7 @@
 00119888 HudDrawLeftRaceRows [V]  # Draws left-anchored position/lap/damage HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
 00119F40 HudDrawRightSpeedRows [V]  # Draws right-anchored speedometer/tachometer HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
 00120650 EventSetupSelectInitial [V]  # Per-event setup screen initial contest selection; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+00120FB8 EveHasMoreEvents [V]  # Returns whether the current Eve has remaining contests; wrapped to unwind after an online event -> docs/INDEX.md
 001244A8 EveLoadContests [V]  # Loads Eve contest descriptors into g_EveContestTable; wrapped to inject solo/AI Battle events -> docs/BATTLE_RECOVERY.md
 001252C0 EveGetContestDisplayName [V]  # Returns display title for an Eve contest entry -> docs/BATTLE_RECOVERY.md
 0012AEF0 RosterSelectContest [V]  # Records active contest before resolving AI car descriptions -> docs/BATTLE_RECOVERY.md

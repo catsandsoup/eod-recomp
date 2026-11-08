@@ -18,6 +18,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -30,6 +31,7 @@ void f_002A75E0_orig(void);
 void f_002C7340_orig(void);
 void f_00270C10_orig(void);
 void f_00120650_orig(void);
+void f_00120FB8_orig(void);
 void f_002A2C98(void);
 void f_00119428(void);
 void f_00128CB0(void);
@@ -89,7 +91,8 @@ struct Plan {
     uint32_t eve = 0, contest = 0, car = 0;
     bool car_done = false, track_done = false, event_done = false;
     bool mode_answered = false;   // online: the Arcade single/multi prompt was answered once
-    bool net = false;   // online event: native car screen shown for real; track real (host) or the host's pick (guest)
+    bool net = false;   // online event (lobby START)
+    bool direct = false; // online event with track, event and car chosen in the lobby: every native screen is auto-answered
 } P;
 
 void log(const char *fmt, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
@@ -146,6 +149,68 @@ long find_car(const std::string &car, int paint) {
     return -1;
 }
 
+
+}  // namespace
+namespace session_catalog {
+namespace {
+std::vector<Track> g_tracks;
+std::vector<Vehicle> g_vehicles;
+bool g_ready = false;
+}
+bool ready() { return g_ready; }
+const std::vector<Track> &tracks() { return g_tracks; }
+const std::vector<Vehicle> &vehicles() { return g_vehicles; }
+bool refresh() {
+    if (g_ready) return true;
+    if (ee_r32(kEveCount) == 0 || ee_r32(kMode) != kActionMode) native(f_00123958);
+    const uint32_t n = ee_r32(kEveCount), contests = ee_r32(kContestCount);
+    const uint32_t table = ee_r32(kVehicleTable), nv = ee_r32(kVehicleCount);
+    if (n == 0 || n > 64 || !table || nv == 0 || nv > 4096) return false;
+    g_tracks.clear(); g_vehicles.clear();
+    for (uint32_t i = 0; i < n; ++i) {
+        Track t; t.eve = (int)i; t.name = guest_text(kEves + i * kEveStride + 0x28, 40);
+        if (t.name.empty() || ieq(t.name.substr(0, 5), "test:") || ieq(t.name, "test")) continue;   // developer test tracks
+        for (uint32_t c = 0; c < contests && c < battle_layout::kContestCapacity; ++c) {
+            const uint32_t cp = battle_layout::kContestTable + c * battle_layout::kContestStride;
+            if (ee_r32(cp + 4) != i) continue;
+            const std::string name = guest_text(native(f_001252C0, {c}), 40);
+            if (!name.empty()) t.events.push_back(name);
+        }
+        if (!t.events.empty()) g_tracks.push_back(t);
+    }
+    for (uint32_t i = 0; i < nv; ++i) {
+        const uint32_t v = table + i * kVehicleStride;
+        Vehicle e; e.number = ee_r32(v + 4); e.name = guest_text(v + 8, 32); e.record = v;
+        if (!e.name.empty()) g_vehicles.push_back(e);
+    }
+    g_ready = !g_tracks.empty() && !g_vehicles.empty();
+    if (g_ready) std::fprintf(stderr, "[SESSION] catalog: %zu tracks, %zu vehicles\n", g_tracks.size(), g_vehicles.size());
+    return g_ready;
+}
+std::vector<std::string> models() {
+    std::vector<std::string> m;
+    for (auto &v : g_vehicles) if (std::find(m.begin(), m.end(), v.name) == m.end()) m.push_back(v.name);
+    return m;
+}
+std::vector<uint32_t> paints(const std::string &model) {
+    std::vector<uint32_t> p;
+    for (auto &v : g_vehicles) if (v.name == model) p.push_back(v.number);
+    return p;
+}
+void dump() {
+    for (auto &t : g_tracks) { std::fprintf(stderr, "[CATALOG] track %d '%s':", t.eve, t.name.c_str()); for (auto &e : t.events) std::fprintf(stderr, " [%s]", e.c_str()); std::fprintf(stderr, "\n"); }
+    int k = 0;
+    for (auto &v : g_vehicles) {
+        if (k++ > 40) break;
+        std::fprintf(stderr, "[CATALOG] veh #%u '%s' raw:", v.number, v.name.c_str());
+        for (uint32_t o = 0; o < 0x54; o += 4) std::fprintf(stderr, " %08x", ee_r32(v.record + o));
+        std::fprintf(stderr, "\n");
+    }
+    std::fprintf(stderr, "[CATALOG] %zu models\n", models().size());
+}
+}  // namespace session_catalog
+namespace {
+
 void start() {
     const char *text = std::getenv("EOD_DIRECT_START");
     if (!text || !*text) return;
@@ -190,7 +255,17 @@ void arm_net(const netplay_hooks::StartInfo &info) {
     P.req.event = info.event;
     P.requested = true;
     P.armed = true;
-    std::fprintf(stderr, "[SESSION] online event %u: %s (%s)\n", info.event_id, info.event.c_str(), info.host ? "host" : "guest");
+    if (!info.track.empty() && info.car) {
+        const int eve = find_eve(info.track);
+        const int contest = eve < 0 ? -1 : find_contest((uint32_t)eve, info.event);
+        if (eve >= 0 && contest >= 0) {
+            P.direct = true; P.eve = (uint32_t)eve; P.contest = (uint32_t)contest; P.car = info.car;
+        } else {
+            std::fprintf(stderr, "[SESSION] online direct start impossible (track '%s' event '%s'): native screens\n", info.track.c_str(), info.event.c_str());
+        }
+    }
+    std::fprintf(stderr, "[SESSION] online event %u: %s on %s, vehicle %u (%s, %s)\n", info.event_id, info.event.c_str(), info.track.c_str(), info.car,
+                 info.host ? "host" : "guest", P.direct ? "direct" : "native screens");
 }
 const bool g_arm_registered = [] { netplay_hooks::arm = &arm_net; return true; }();
 } // namespace
@@ -247,7 +322,7 @@ extern "C" void f_002BEC08(void) {
 
 extern "C" void f_002A1298(void) {
     static bool tried = false;
-    if (!tried) { tried = true; start(); }
+    if (!tried) { tried = true; start(); if (std::getenv("EOD_CATALOG_DUMP") && session_catalog::refresh()) session_catalog::dump(); }
     if (P.net) {   // the online event that was running has returned to the main menu
         P = Plan{};
         if (netplay_hooks::event_ended) netplay_hooks::event_ended();
@@ -273,7 +348,22 @@ extern "C" void f_00270C10(void) {
 
 // GameDoSingle opens the car screen first. The answer is the human's vehicle number, which
 // the loop body hands to 0x12A0B8 (Garage: set human driver); nonzero return = proceed.
+// When the online event finishes and unwinds back to the outer loop, P.car_done is already
+// true, so returning 0 exits GameDoSingle back to ArcadeSingleOrMultiPromptScreen (0x2C0BB8).
 extern "C" void f_002A75E0(void) {
+    if (P.armed && P.net && P.car_done) {
+        log("online: car screen unwind -> leave GameDoSingle");
+        ret_s32(0);
+        return;
+    }
+    if (P.armed && P.net && P.direct) {
+        P.car_done = true;
+        ee_w32(arg_u32(0), P.car);
+        if (netplay_hooks::car_chosen) netplay_hooks::car_chosen(P.car);
+        log("online: car screen answered, vehicle %u", P.car);
+        ret_s32(1);
+        return;
+    }
     if (P.armed && P.net) {
         const uint32_t number_ptr = arg_u32(0);
         f_002A75E0_orig();
@@ -295,7 +385,22 @@ extern "C" void f_002A75E0(void) {
 
 // Track screen: *eve = chosen Eve, *aux = 5 (its initial value), options+0x28 = 1 (both
 // written by the native screen before it opens); nonzero return = play.
+// When the online event finishes and unwinds back to the middle loop, P.track_done is already
+// true, so returning 0 exits the middle loop back to the outer loop (f_002A75E0).
 extern "C" void f_002C7340(void) {
+    if (P.armed && P.net && P.track_done) {
+        log("online: track screen unwind -> outer loop");
+        ret_s32(0);
+        return;
+    }
+    if (P.armed && P.net && P.direct) {
+        P.track_done = true;
+        ee_w32(arg_u32(0), P.eve); ee_w32(arg_u32(1), 5); ee_w32(arg_u32(2) + 0x28, 1);
+        if (netplay_hooks::track_chosen) netplay_hooks::track_chosen(guest_text(kEves + P.eve * kEveStride + 0x28, 40));
+        log("online: track screen answered, Eve %u", P.eve);
+        ret_s32(1);
+        return;
+    }
     if (P.armed && P.net && !P.track_done) {
         const uint32_t eve_ptr = arg_u32(0), aux_ptr = arg_u32(1), options = arg_u32(2);
         std::string track;
@@ -367,4 +472,29 @@ extern "C" void f_00120650(void) {
         }
     }
     f_00120650_orig();
+}
+
+// EveHasMoreEvents (0x120FB8) is checked before each contest in GameDoSingle's inner loop
+// (0x2A2FC4). Once the single online event has run (P.event_done is true), returning 0 exits
+// the inner Eve loop instead of opening the native in-world Eve event selection screen (0x11F640).
+extern "C" void f_00120FB8(void) {
+    if (P.armed && P.net && P.event_done) {
+        log("online: event finished -> leave Eve inner loop");
+        ret_s32(0);
+        return;
+    }
+    f_00120FB8_orig();
+}
+
+void session_abort_event() {
+    if (!g_ram) return;
+    // 0x00437BB8: race frame loop active flag (f_00114020)
+    // 0x00437BAC: race quit flag (prevents retry and skips post-race scoring in f_00114358)
+    // 0x00437BA8: contest loop exit flag (exits f_00114860 back to GameDoSingle)
+    if (ee_r32(0x00437BB8) != 0) {
+        ee_w32(0x00437BAC, 1);
+        ee_w32(0x00437BA8, 1);
+        ee_w32(0x00437BB8, 0);
+        log("online: aborted active race loop -> unwinding to main menu");
+    }
 }

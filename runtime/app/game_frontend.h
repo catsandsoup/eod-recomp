@@ -24,12 +24,14 @@ struct Snapshot {
     std::vector<Option>options;
     std::vector<LanGame>lan;
     std::string strip;   // short text shown over the game while players choose ("Waiting for ...")
+    std::string track_pic;      // lobby: the track whose picture to show (display name)
+    uint32_t car_pic=0;         // lobby: the vehicle number whose portrait to show
     std::string code;    // host: the Garage Code to share (Cmd+C copies it)
     std::string route;   // plain-words state of the internet link ("Internet play ready", ...)
     std::vector<LanGame>crew;   // remembered friends who are hosting right now (one press to join)
 };
 struct Command {
-    enum class Kind {Host,JoinAddress,JoinCode,Ready,Start,Cancel,Disconnect,Rematch,RejoinLobby,
+    enum class Kind {Host,JoinAddress,JoinCode,Ready,Start,EndEvent,Cancel,Disconnect,Rematch,RejoinLobby,
         MicrophoneEnabled,Muted,Deafened,VoiceVolume,Option,JoinCrew};
     Kind kind;std::string text;uint16_t port=0;bool enabled=false;float value=0;
 };

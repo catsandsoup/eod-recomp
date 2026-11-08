@@ -42,6 +42,7 @@ public:
     bool wait_track(std::string &track);          // guest: blocks for the host's pick
     void event_ended();                           // GameDoSingle returned
     bool event_active() const { return in_event_; }
+    bool active() const;                          // true whenever hosting, connecting, in lobby, or racing
     bool is_host() const;
     uint32_t remote_humans() const;               // extra cars the roster needs (Battle size)
     void roster_pre(uint32_t description);        // before 0x1116E0 resolves names

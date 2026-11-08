@@ -321,12 +321,22 @@ void Menu::rows_settings(std::vector<Row> &r) {
                        "Adds Battle to the solo Action tracks."));
     r.push_back(toggle("recovery", "MANUAL RECOVERY ONLY", cfg_.manual_recovery, "LIVE",
                        "No automatic wrong-way or upside-down countdown for humans; SELECT still recovers. AI unchanged."));
-    r.push_back(toggle("durability", "PER-CAR DURABILITY", cfg_.car_durability, "LIVE",
-                       "Each car's own damage scale from its files (the game's menus already rate cars by it)."));
-    r.push_back(toggle("turbo", "TURBO BOOST (L2)", cfg_.cheat_turbo, "LIVE", "Optional cheat: L2 boosts."));
-    r.push_back(toggle("chickens", "CHICKEN FIGHT (L2)", cfg_.cheat_chickens, "LIVE", "Optional cheat: L2 fires chickens."));
-    r.push_back(toggle("invincible", "INVINCIBLE HUMANS", cfg_.cheat_invincible, "LIVE",
-                       "Optional cheat: human players take no damage; AI stay vulnerable."));
+    const bool guest_online = [&] {
+        if (!net_) return false;
+        const auto s = net_->snapshot();
+        using P = game_frontend::Snapshot::Phase;
+        return s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error && !s.is_host;
+    }();
+    auto host_rule = [&](Row row) {
+        if (guest_online) { row.enabled = false; row.note = "HOST RULES"; }
+        return row;
+    };
+    r.push_back(host_rule(toggle("durability", "PER-CAR DURABILITY", cfg_.car_durability, "LIVE",
+                       "Each car's own damage scale from its files (the game's menus already rate cars by it).")));
+    r.push_back(host_rule(toggle("turbo", "TURBO BOOST (L2)", cfg_.cheat_turbo, "LIVE", "Optional cheat: L2 boosts.")));
+    r.push_back(host_rule(toggle("chickens", "CHICKEN FIGHT (L2)", cfg_.cheat_chickens, "LIVE", "Optional cheat: L2 fires chickens.")));
+    r.push_back(host_rule(toggle("invincible", "INVINCIBLE HUMANS", cfg_.cheat_invincible, "LIVE",
+                       "Optional cheat: human players take no damage; AI stay vulnerable.")));
 }
 
 void Menu::rows_inputs(std::vector<Row> &r) {
@@ -498,6 +508,7 @@ void Menu::rows_mods(std::vector<Row> &r) {
 void Menu::rows_online(std::vector<Row> &r) {
     game_frontend::Snapshot s;
     if (net_) s = net_->snapshot();
+    pic_track_ = s.track_pic; pic_car_ = s.car_pic;
     using P = game_frontend::Snapshot::Phase;
     const bool connected = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
     Row st = info("status", "STATUS", connected ? upper(s.status.empty() ? "CONNECTED" : s.status) : "NOT CONNECTED",
@@ -529,7 +540,15 @@ void Menu::rows_online(std::vector<Row> &r) {
     Row ready = toggle("ready", "READY", s.ready, "", "Marks you ready in the lobby.");
     ready.enabled = connected && !s.is_host;
     if (!s.is_host) r.push_back(ready);
-    Row leave = action("leave", "LEAVE / CANCEL", "[ DISCONNECT ]", "Leaves the lobby or cancels the connection.");
+    if (s.is_host && s.phase == P::Racing) {
+        r.push_back(action("end_event", "BACK TO LOBBY", "[ END RACE ]",
+                           "Ends the current race for everyone and returns the whole party to the lobby."));
+    }
+    const bool guest_in_race = !s.is_host && s.phase == P::Racing;
+    Row leave = action("leave", guest_in_race ? "LEAVE MATCH" : "LEAVE / CANCEL",
+                       guest_in_race ? "[ LEAVE RACE ]" : "[ DISCONNECT ]",
+                       guest_in_race ? "Leaves the match and returns you to the main menu while the others keep racing."
+                                     : "Leaves the lobby or cancels the connection.");
     leave.enabled = connected || s.can_cancel;
     r.push_back(leave);
     if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, "Friends on your network see your game listed. Others can join by typing this address."));
@@ -764,6 +783,7 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (id == "host" && net_) { c.kind = game_frontend::Command::Kind::Host; net_->submit(c); return; }
     if (id == "code" || id == "addr") { text_id_ = id; text_.clear(); return; }
     if (id == "ready" && net_) { c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); return; }
+    if (id == "end_event" && net_) { c.kind = game_frontend::Command::Kind::EndEvent; net_->submit(c); fx.close = true; return; }
     if (id == "leave" && net_) { c.kind = game_frontend::Command::Kind::Disconnect; net_->submit(c); return; }
     if (id == "mic" && net_) { c.kind = game_frontend::Command::Kind::MicrophoneEnabled; c.enabled = !row.checked; net_->submit(c); return; }
     if (id == "mute" && net_) { c.kind = game_frontend::Command::Kind::Muted; c.enabled = !row.checked; net_->submit(c); return; }
