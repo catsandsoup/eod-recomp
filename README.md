@@ -1,17 +1,14 @@
-# Test Drive: Eve of Destruction on PC and Mac — the native port
+# Test Drive: Eve of Destruction · PC and Mac
 
-**Smash, crash and race the 2004 PS2 demolition derby classic as a real native app. No emulator. Just one app and a controller.**
+**Take the dirt oval at night, or trade paint under the floodlights.** The 2004 PS2 demolition racer runs as a native app on Apple Silicon and Windows x64. Bring your North American game disc, plug in a controller and pick your first event.
 
-**Test Drive: Eve of Destruction** ("TD EOD" to fans) is back. This fan-made **native PC and Mac port** is built with static recompilation, so the original game's code runs directly on your computer instead of inside a PS2 emulator. It runs on **macOS with Apple Silicon** today, with **Windows** on the way.
+[Download the Mac and Windows preview](https://github.com/catsandsoup/eod-recomp/releases/tag/preview-2026-11-08-couch) · [Host and guest guide](docs/ONLINE_PLAYER_JOURNEYS.md)
 
-![Night demolition derby battle in Test Drive: Eve of Destruction, running natively on Mac](docs/img/night-battle-demolition-derby.jpg)
+![Two cars collide under the floodlights during a night demolition derby](docs/img/night-battle-demolition-derby.jpg)
 
-## Why play it this way?
+Play a local split-screen Battle with a friend beside you, or try the experimental online lobby with a whole screen to yourself. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
 
-* **One app.** Open it, point it at your game, drive. There is no emulator to configure and no BIOS to hunt down.
-* **Built for today's machines.** Native Apple Silicon performance, widescreen and higher resolutions.
-* **Smooth when it all goes wrong.** Multi-car pile-ups, fires and flying debris run far lighter than before, while every pixel still looks exactly as the original drew it.
-* **The original game, untouched.** Everything from 2004 is preserved. Nothing is removed. New content is added on top.
+The public download uses your own retail content. The personal integrated build pictured below also showcases bonus cars and event mods derived locally from the owner's disc.
 
 ## Features
 
@@ -59,14 +56,19 @@ Press **Start + Select** on a controller (or **F1** / **Cmd+,** on a keyboard) a
 
 ![In-game menu Graphics tab with render scale, aspect ratio and fullscreen options](docs/img/in-game-menu-graphics.jpg)
 
-### Online multiplayer
+### One lobby, another race
 
-Race and battle your friends on their own screens. Everyone drives their own car in their own game, full-screen, with zero input lag, and every car is solid metal. No ghosting, ever.
+The host picks the track and event. Each driver chooses a car and paint, sees their friend's choice, and marks Ready. End Race returns the party to Online, where the same Garage Code and roster are waiting for the next start.
 
-* **Host in one press.** Open **Online**, choose **Host**, pick a mode (No-Rules Race, Battle (4 AI) or Battle (8 AI)) and press **Start**.
-* **Join in one press.** Games on your home network show up by themselves. Anyone else joins by typing the host's address.
-* **The game's own screens.** The host picks the track and everyone picks their own car on the original selection screens, then the whole lobby starts together.
-* **Straight back to the lobby** after the results, ready for the next one.
+![Anoka night race captured from the host's game during a two-player rematch test](docs/img/online-anoka-race.jpg)
+
+* **Stay on the couch.** Open the menu with Start + Select. Use the shoulder buttons to reach Online, the D-pad to navigate, Cross/A to choose and Circle/B to go back. A guest can type the Garage Code and confirm on the controller. A discovered LAN listing skips typing.
+* **See who made it in.** The code and player list stay visible while the host browses settings. Once racing, Start opens the live menu. End Race keeps the party together; Close Lobby ends the session.
+* **One car per player, one screen each.** A Mac and the Windows executable running under CrossOver on the same Mac completed two consecutive races in both host/guest configurations. Native Windows GPU performance and internet stability still need testing.
+
+![After ending the race by controller, the host sees the Anoka settings, Garage Code, both Hurricane drivers, readiness and voice controls](docs/img/online-rematch-lobby.jpg)
+
+**Preview limits.** The lobby admits 16 occupants including the host. An event's available grid seats determine how many can actually drive, Battle has at most 10 total cars, and voice supports the first four player IDs. Two-human rematches are exercised. Long races have shown remote-car updates stall. [Capacity, lifecycle and test coverage](docs/ONLINE_PLAYER_JOURNEYS.md)
 
 ### Your own soundtrack
 
@@ -82,7 +84,7 @@ Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongs
 
 No dates, just where we are headed:
 
-* **Online play across the internet** with simple join codes, remembered friends and voice chat
+* Broader internet, physical microphone and multi-machine testing for the Garage Code preview
 * **Higher draw distance and more detail**
 * **More cars on track**
 * **Texture packs**, including 4K
@@ -91,9 +93,9 @@ No dates, just where we are headed:
 
 ## Getting started
 
-1. **Get the app.** On Mac, open **Eve of Destruction.app**.
+1. **Get the preview.** Download the archive for your platform from [catsandsoup/eod-recomp Releases](https://github.com/catsandsoup/eod-recomp/releases). On Mac, open **Eve of Destruction.app**. On Windows x64, extract the ZIP, put your extracted disc files beside **eod.exe** or pass `--data <disc-folder>`, and use **eodsetup.exe** for settings.
 2. **Bring your own game.** You need your own legally obtained copy of Test Drive: Eve of Destruction (North American PS2 version).
-3. **Pick your disc image.** On first launch the app asks you to choose your game's disc image (or the disc's folder). It checks that it is the right game, copies what it needs, and shows you progress.
+3. **On Mac, pick your disc image.** On first launch the app asks you to choose your game's disc image (or the disc's folder). It checks that it is the right game, copies what it needs, and shows you progress.
 4. **Play.** That is the whole setup. Next time, it launches straight into the game.
 
 <details>
@@ -109,7 +111,7 @@ Want to build the app from source? See the [macOS build guide](docs/MACOS.md).
 
 **Does it include the game?** No. You must own the game and supply your own copy.
 
-**Which platforms?** macOS on Apple Silicon now. Windows is coming.
+**Which platforms?** Apple Silicon macOS and Windows x64 preview builds are available. Windows uses Direct3D 11. Native Windows hardware benchmarks are pending.
 
 ## Legal, credits and licences
 

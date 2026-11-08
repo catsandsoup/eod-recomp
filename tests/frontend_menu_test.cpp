@@ -210,12 +210,47 @@ int main() {
     m.select(find(m, "end_event"));
     in = none(); in.accept = true; fx = m.update(in);
     CHECK(!fx.close && net->got.back().kind == game_frontend::Command::Kind::EndEvent);
+    // While scrolling with a controller, a join must not move focus to another action.
+    m.select(find(m, "mic"));
+    net->snap.players.push_back({2, "New guest", false, false, false});
+    CHECK(m.rows()[m.selected()].id == "mic");
+    CHECK(find(m, "leave") > find(m, "mic"));
     // guest racing: LEAVE MATCH is shown, and gameplay-diverging cheats in SETTINGS are locked to host rules
     net->snap.is_host = false;
     CHECK(find(m, "end_event") < 0 && m.rows()[find(m, "leave")].label == "LEAVE MATCH");
     m.set_tab(Tab::Settings);
     CHECK(!m.rows()[find(m, "turbo")].enabled && !m.rows()[find(m, "chickens")].enabled && !m.rows()[find(m, "invincible")].enabled);
     m.set_tab(Tab::Online);
+    net->snap = {};
+
+    // Couch route: shoulders, D-pad, accept/back. The only typing is the code.
+    Config couch_cfg;
+    Menu couch(couch_cfg);
+    couch.set_network(net);
+    couch.open();
+    Input shoulder = none(); shoulder.prev_tab = true;
+    couch.update(shoulder); // Graphics wraps left to Online
+    CHECK(couch.tab() == Tab::Online);
+    Input down = none(); down.dy = 1;
+    Input accept = none(); accept.accept = true;
+    couch.update(none());
+    CHECK(couch.rows()[couch.selected()].id == "host");
+    couch.update(down);
+    CHECK(couch.rows()[couch.selected()].id == "code");
+    couch.update(accept);
+    for (char c : std::string("DEMO2")) { Input key = none(); key.ch = c; couch.update(key); }
+    couch.update(accept);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::JoinCode && net->got.back().text == "DEMO2");
+    net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
+    couch.update(none());
+    CHECK(couch.rows()[couch.selected()].id == "ready");
+    couch.update(accept);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::Ready && net->got.back().enabled);
+    net->snap.phase = game_frontend::Snapshot::Phase::Racing;
+    net->snap.is_host = true;
+    couch.update(none());
+    CHECK(couch.rows()[couch.selected()].id == "end_event");
+    CHECK(!couch.update(accept).close && net->got.back().kind == game_frontend::Command::Kind::EndEvent);
     net->snap = {};
 
     // error screen replaces the tabs; Back never closes it

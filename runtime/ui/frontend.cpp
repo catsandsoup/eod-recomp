@@ -208,13 +208,24 @@ std::vector<Row> &Menu::rows_for(Tab t) {
 
 void Menu::rebuild(Tab t) {
     std::vector<Row> &r = rows_[(int)t];
+    // A roster update may insert rows above the selected control.
+    const int old = sel_[(int)t];
+    const std::string selected = t == Tab::Online && old >= 0 && old < (int)r.size() ? r[old].id : "";
     r.clear();
     switch (t) {
     case Tab::Graphics: rows_graphics(r); break;
     case Tab::Mods: rows_mods(r); break;
     case Tab::Settings: rows_settings(r); break;
     case Tab::Inputs: rows_inputs(r); break;
-    case Tab::Online: rows_online(r); break;
+    case Tab::Online: {
+        rows_online(r);
+        if (!selected.empty()) {
+            auto it = std::find_if(r.begin(), r.end(), [&](const Row &row) { return row.id == selected; });
+            if (it != r.end()) sel_[(int)t] = (int)(it - r.begin());
+            else sel_[(int)t] = 0;
+        }
+        break;
+    }
     default: rows_error(r); break;
     }
 }
@@ -566,7 +577,7 @@ void Menu::rows_online(std::vector<Row> &r) {
                        guest_in_race ? "Leaves the match and returns you to the main menu while the others keep racing."
                                      : "Leaves the lobby or cancels the connection.");
     leave.enabled = connected || s.can_cancel;
-    if (connected || s.can_cancel) r.push_back(leave);
+
     if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, "Friends on your network see your game listed. Others can join by typing this address."));
     if (!connected && !s.crew.empty()) {
         r.push_back(header("FRIENDS HOSTING NOW"));
@@ -606,6 +617,7 @@ void Menu::rows_online(std::vector<Row> &r) {
     Row deaf = toggle("deafen", "DEAFEN", s.deafened, "LIVE", "Mutes your microphone and all incoming voice.");
     deaf.enabled = connected && s.voice;
     r.push_back(deaf);
+    if (connected || s.can_cancel) r.push_back(leave);
 }
 
 void Menu::rows_error(std::vector<Row> &r) {
@@ -894,7 +906,7 @@ Effects Menu::update(const Input &in) {
     if (in.dx && row.enabled && (row.kind == RowKind::Choice || row.kind == RowKind::Toggle)) change(row, in.dx, fx);
     if (in.accept) activate(row, fx);
     if (in.details && !err) { details_ = !details_; fx.sound = Sound::Select; }
-    if (in.reset && !err) {
+    if (in.reset && !err && tab_ != Tab::Online) {
         reset_tab(tab_);
         dirty_ = true;
         fx.sound = Sound::Select;

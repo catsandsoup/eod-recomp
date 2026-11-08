@@ -473,7 +473,7 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
                 ps.push_back({G::Details, "MOD DETAILS"});
                 ps.push_back({G::Move, "LOAD ORDER"});
             }
-            ps.push_back({G::Reset, "RESET DEFAULTS"});
+            if (m.tab() != frontend::Tab::Online) ps.push_back({G::Reset, "RESET DEFAULTS"});
         }
         const float gh = 32 * s, px = 24 * s;
         float total = 0;
