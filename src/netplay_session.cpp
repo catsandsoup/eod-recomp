@@ -4,6 +4,7 @@
 #include "../runtime/core/memory.h"
 #include "netplay_online.h"
 #include "netplay_online_wire.h"
+#include "netplay_voice.h"
 #include "session_start.h"
 #include "../runtime/platform/platform.h"
 #include "../runtime/ui/overlay.h"
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <random>
 
 #ifdef _WIN32
@@ -189,6 +191,86 @@ struct Session::Impl {
     std::string join_note;
     std::map<std::string, CrewHost> crew;      // remembered friends currently hosting, by secret
     std::string route_text;
+    // ---- voice chat (Opus 48 kHz mono + Halo HUD indicator)
+    netplay::voice::Session voice;
+    bool mic_enabled = false, muted_all = false, deafened = false, mic_open = false;
+    uint64_t speaking_until[kMaxPlayers] = {};
+    uint64_t last_voice_playout = 0;
+    mutable std::mutex voice_mtx;
+    std::vector<int16_t> voice_out;
+    size_t voice_pos = 0;
+
+    void sync_voice() {
+        const bool connected = (role == Role::Host) || (role == Role::Guest && welcomed);
+        const uint8_t local_id = role == Role::Host ? 0 : my_id;
+        if (connected && local_id < netplay::voice::MaxPeers) {
+            if (!voice.active()) voice.start(0x454F44564F494345ull, 1, local_id);
+            voice.set_transmit_enabled(mic_enabled && !deafened);
+            voice.set_microphone_muted(!mic_enabled || deafened);
+            voice.set_deafened(deafened || muted_all);
+        } else {
+            if (voice.active()) voice.stop();
+        }
+        const bool want_mic = mic_enabled && !deafened;
+        if (want_mic && !mic_open) {
+            mic_open = platform_mic_open((int)netplay::voice::SampleRate);
+        } else if (!want_mic && mic_open) {
+            platform_mic_close();
+            mic_open = false;
+        }
+    }
+    void poll_voice(uint64_t t) {
+        const uint8_t local_id = (role == Role::Guest && welcomed) ? my_id : 0;
+        if (mic_enabled && !deafened) {
+            if (!mic_open) mic_open = platform_mic_open((int)netplay::voice::SampleRate);
+            netplay::voice::Frame frame{};
+            int batches = 0;
+            while (mic_open && batches++ < 4 && platform_mic_read(frame.data(), (int)netplay::voice::FrameSamples) == (int)netplay::voice::FrameSamples) {
+                int peak = 0;
+                for (int16_t s : frame) peak = std::max(peak, std::abs((int)s));
+                if (peak > 500 && local_id < kMaxPlayers) speaking_until[local_id] = t + 300000;
+                if (voice.active() && local_id < kMaxPlayers && t < speaking_until[local_id]) {
+                    netplay::voice::Packet pkt;
+                    if (voice.encode(frame, pkt) && pkt.size > 0) {
+                        Writer w;
+                        w.b.assign(pkt.bytes.data(), pkt.bytes.data() + pkt.size);
+                        if (role == Role::Host) {
+                            for (auto &kv : peers) if (kv.second.alive) send_to(kv.second.addr, K_VOICE, 0, w);
+                        } else if (role == Role::Guest && welcomed) {
+                            send_to(host_addr, K_VOICE, my_id, w);
+                        }
+                    }
+                }
+            }
+        }
+        if (!voice.active()) { last_voice_playout = t; return; }
+        if (!last_voice_playout || t - last_voice_playout > 100000) last_voice_playout = t - 20000;
+        while (t - last_voice_playout >= 20000) {
+            last_voice_playout += 20000;
+            int32_t mixed[netplay::voice::FrameSamples] = {};
+            bool any = false;
+            for (uint8_t peer = 0; peer < netplay::voice::MaxPeers; ++peer) {
+                if (peer == local_id) continue;
+                netplay::voice::Frame pf;
+                auto res = voice.playout(peer, pf);
+                if (res == netplay::voice::Playback::Decoded || res == netplay::voice::Playback::Concealed) {
+                    for (size_t i = 0; i < netplay::voice::FrameSamples; ++i) {
+                        if (pf[i] != 0) any = true;
+                        mixed[i] += pf[i];
+                    }
+                }
+            }
+            if (any && !deafened && !muted_all) {
+                std::lock_guard<std::mutex> lk(voice_mtx);
+                if (voice_pos > 0 && voice_pos >= voice_out.size()) { voice_out.clear(); voice_pos = 0; }
+                else if (voice_pos >= 4800) { voice_out.erase(voice_out.begin(), voice_out.begin() + (ptrdiff_t)voice_pos); voice_pos = 0; }
+                if (voice_out.size() - voice_pos < 9600) {
+                    for (size_t i = 0; i < netplay::voice::FrameSamples; ++i)
+                        voice_out.push_back((int16_t)std::clamp(mixed[i], -32768, 32767));
+                }
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- friends file (next to eod.ini)
     std::string friends_path() const {
@@ -387,7 +469,7 @@ struct Session::Impl {
 };
 
 Session::Session() : d_(new Impl) {}
-Session::~Session() { d_->close_game(); if (d_->disc_fd >= 0) EOD_CLOSESOCK(d_->disc_fd); netplay_online::Online::wait_cleanup(2500); }
+Session::~Session() { if (d_->mic_open) platform_mic_close(); d_->close_game(); if (d_->disc_fd >= 0) EOD_CLOSESOCK(d_->disc_fd); netplay_online::Online::wait_cleanup(2500); }
 
 // ====================================================================== UI side
 game_frontend::Snapshot Session::snapshot() const {
@@ -398,6 +480,10 @@ game_frontend::Snapshot Session::snapshot() const {
     using S = game_frontend::Snapshot;
     S s;
     s.direct_connect = true; s.internet_invites = true; s.native_race_sync = true;
+    s.voice = netplay::voice::Session::available();
+    s.microphone_enabled = d.mic_enabled;
+    s.muted = d.muted_all;
+    s.deafened = d.deafened;
     s.error = d.last_error;
     s.content_problem = d.content_note;
     s.is_host = d.role == Impl::Role::Host;
@@ -419,13 +505,23 @@ game_frontend::Snapshot Session::snapshot() const {
         s.code = d.role == Impl::Role::Host ? d.code : "";
         s.track_pic = d.role == Impl::Role::Host ? d.track_name : d.lobby_track; s.car_pic = d.my_vehicle;
         s.route = d.route_text;
+        const uint64_t t_now = now_us();
+        const uint8_t local_id = d.role == Impl::Role::Host ? 0 : d.my_id;
         if (d.role == Impl::Role::Host) {
-            for (auto &p : d.make_lobby()) s.players.push_back({p.id, p.name + "  " + p.vname + (p.id ? "  " + std::to_string(p.ping) + "ms" : ""), p.ready});
+            for (auto &p : d.make_lobby()) {
+                const bool spk = p.id < kMaxPlayers && t_now < d.speaking_until[p.id];
+                const bool mtd = p.id != local_id && (d.muted_all || d.deafened);
+                s.players.push_back({p.id, p.name + "  " + p.vname + (p.id ? "  " + std::to_string(p.ping) + "ms" : ""), p.ready, mtd, spk});
+            }
             s.can_start = !in_event_ && session_catalog::ready();
             s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, true, "The host chooses the track. Left/right changes it."});
             s.options.push_back({"mode", "MODE", d.mode_name(), true, "The event everyone plays. The host chooses; left/right changes it."});
         } else {
-            for (auto &p : d.lobby_players) s.players.push_back({p.id, p.name + "  " + p.vname + "  " + std::to_string(p.ping) + "ms", p.ready});
+            for (auto &p : d.lobby_players) {
+                const bool spk = p.id < kMaxPlayers && t_now < d.speaking_until[p.id];
+                const bool mtd = p.id != local_id && (d.muted_all || d.deafened);
+                s.players.push_back({p.id, p.name + "  " + p.vname + "  " + std::to_string(p.ping) + "ms", p.ready, mtd, spk});
+            }
             s.ready = d.guest_ready;
             s.options.push_back({"track", "TRACK", d.lobby_track, false, "The host chooses the track."});
             s.options.push_back({"mode", "MODE", d.lobby_event, false, "The host chooses the event."});
@@ -455,6 +551,7 @@ void Session::submit(game_frontend::Command c) {
         d.code = std::getenv("EOD_NETPLAY_CODE") ? std::getenv("EOD_NETPLAY_CODE") : Impl::new_code();
         d.route_text = "Looking for the best route...";
         if (!std::getenv("EOD_NETPLAY_NO_INTERNET")) { d.online_start(true); d.host_jobs(); }
+        d.sync_voice();
         std::fprintf(stderr, "[netplay] hosting on %s:%u, Garage Code %s\n", local_ip().c_str(), d.port, d.code.c_str());
         break;
     }
@@ -531,12 +628,25 @@ void Session::submit(game_frontend::Command c) {
         if (in_event_) { d.abort_requested = true; session_abort_event(); }
         d.role = Impl::Role::None; d.peers.clear(); d.close_game(); d.status.clear(); d.welcomed = false; d.lobby_players.clear();
         d.joining_online = false; d.code.clear(); d.route_text.clear(); d.crew.clear(); d.content_note.clear();
+        d.sync_voice();
         break;
     }
     case K::Option: {
         d.cycle(c.text, c.value >= 0 ? 1 : -1);
         break;
     }
+    case K::MicrophoneEnabled:
+        d.mic_enabled = c.enabled;
+        d.sync_voice();
+        break;
+    case K::Muted:
+        d.muted_all = c.enabled;
+        d.sync_voice();
+        break;
+    case K::Deafened:
+        d.deafened = c.enabled;
+        d.sync_voice();
+        break;
     default: break;
     }
 }
@@ -579,6 +689,7 @@ void Session::poll() {
     }
     auto_drive(now_us());
     const uint64_t t = now_us();
+    d.poll_voice(t);
     { static uint64_t last = 0; static const bool dbg = std::getenv("EOD_NETPLAY_DEBUG") != nullptr; if (dbg && t - last > 20000000) { last = t; std::fprintf(stderr, "[netplay] poll role=%d fd=%d welcomed=%d\n", (int)d.role, d.fd, (int)d.welcomed); } }
     // LAN discovery listener
     if (d.disc_fd >= 0) {
@@ -632,7 +743,7 @@ void Session::poll() {
         }
         if (d.role == Impl::Role::None) continue;
         static const bool dbg = std::getenv("EOD_NETPLAY_DEBUG") != nullptr;
-        if (dbg && kind != K_SNAP && kind != K_HEARTBEAT && kind != K_LOBBY) std::fprintf(stderr, "[netplay] rx kind %u from %s (%d bytes)\n", kind, sockaddr_text(from).c_str(), n);
+        if (dbg && kind != K_SNAP && kind != K_HEARTBEAT && kind != K_LOBBY && kind != K_VOICE) std::fprintf(stderr, "[netplay] rx kind %u from %s (%d bytes)\n", kind, sockaddr_text(from).c_str(), n);
         if (d.role == Impl::Role::Host) {
             // ---- host receives
             if (kind == K_JOIN) {
@@ -682,6 +793,14 @@ void Session::poll() {
                     if (!get_car(r, slot, tick, s)) break;
                     if (d.roster.size() > slot && d.roster[slot].owner == p.id) { d.remote[slot].push(tick, s); p.latest = s; p.latest_tick = tick; p.has_latest = true; p.latest_at = t; }
                 }
+            } else if (kind == K_VOICE) {
+                if (d.voice.receive(sender, r.p, (size_t)(r.e - r.p)) == netplay::voice::Receive::Accepted) {
+                    if (sender < kMaxPlayers) d.speaking_until[sender] = t + 300000;
+                    Writer w; w.b.assign(r.p, r.e);
+                    for (auto &kv : d.peers)
+                        if (kv.second.alive && kv.first != sender)
+                            d.send_to(kv.second.addr, K_VOICE, sender, w);
+                }
             }
         } else {
             // ---- guest receives (only from the host)
@@ -692,6 +811,7 @@ void Session::poll() {
             d.host_last_heard = t;
             if (kind == K_WELCOME) {
                 d.my_id = (uint8_t)r.u8(); d.welcomed = true; d.status = "Connected";
+                d.sync_voice();
                 uint8_t raw[16]; bool have = true; for (auto &b : raw) { b = (uint8_t)r.u8(); } have = r.ok;
                 d.join_secret = have ? netplay_online::hex(raw, 16) : std::string();
                 std::fprintf(stderr, "[netplay] connected, player %u (via %s)\n", d.my_id, sockaddr_text(from).c_str());
@@ -699,14 +819,14 @@ void Session::poll() {
             else if (kind == K_REFUSE) {
                 uint32_t why = r.u8();
                 d.last_error = why == 1 ? "The host has a different game version." : why == 2 ? "An event is running. You can join when it ends." : "The game is full.";
-                d.role = Impl::Role::None; d.close_game();
+                d.role = Impl::Role::None; d.close_game(); d.sync_voice();
                 return;
             } else if (kind == K_KICK) {
                 d.last_error = "The host closed the game.";
                 for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
                 d.puppet_cars.clear(); d.remote.clear(); d.shown.clear();
                 if (in_event_) { d.abort_requested = true; session_abort_event(); }
-                d.role = Impl::Role::None; d.close_game(); d.lobby_players.clear();
+                d.role = Impl::Role::None; d.close_game(); d.lobby_players.clear(); d.sync_voice();
                 if (overlay_menu_open() || !in_event_) overlay_show_online();
                 return;
             } else if (kind == K_LOBBY) {
@@ -746,6 +866,10 @@ void Session::poll() {
                     uint8_t slot; uint32_t tick; netplay_car::State s;
                     if (!get_car(r, slot, tick, s)) break;
                     if ((int)slot != d.my_slot) d.remote[slot].push(tick, s);
+                }
+            } else if (kind == K_VOICE) {
+                if (d.voice.receive(sender, r.p, (size_t)(r.e - r.p)) == netplay::voice::Receive::Accepted) {
+                    if (sender < kMaxPlayers) d.speaking_until[sender] = t + 300000;
                 }
             }
         }
@@ -937,6 +1061,43 @@ std::string Session::strip() const { return d_->strip; }
 bool Session::active() const { return d_->role != Impl::Role::None; }
 bool Session::is_host() const { return d_->role == Impl::Role::Host; }
 uint32_t Session::remote_humans() const { return in_event_ ? (uint32_t)(d_->role == Impl::Role::Host ? d_->alive_count() : (d_->lobby_players.size() > 1 ? d_->lobby_players.size() - 1 : 0)) : 0; }
+
+void Session::mix_voice(int16_t *stereo, int frames) {
+    Impl &d = *d_;
+    std::lock_guard<std::mutex> lk(d.voice_mtx);
+    if (d.voice_pos >= d.voice_out.size()) return;
+    const int vol = std::clamp(g_config.volume, 0, 100);
+    for (int i = 0; i < frames && d.voice_pos < d.voice_out.size(); ++i, ++d.voice_pos) {
+        const int s = (int)d.voice_out[d.voice_pos] * vol / 100;
+        stereo[i * 2 + 0] = (int16_t)std::clamp(stereo[i * 2 + 0] + s, -32768, 32767);
+        stereo[i * 2 + 1] = (int16_t)std::clamp(stereo[i * 2 + 1] + s, -32768, 32767);
+    }
+    if (d.voice_pos >= d.voice_out.size()) {
+        d.voice_out.clear();
+        d.voice_pos = 0;
+    }
+}
+
+std::vector<std::string> Session::speakers() const {
+    const Impl &d = *d_;
+    const uint64_t t = now_us();
+    std::vector<std::string> out;
+    if (d.role == Impl::Role::Host) {
+        if (t < d.speaking_until[0]) out.push_back(d.name);
+        for (const auto &kv : d.peers)
+            if (kv.second.alive && kv.first < kMaxPlayers && t < d.speaking_until[kv.first])
+                out.push_back(kv.second.name);
+    } else if (d.role == Impl::Role::Guest && d.welcomed) {
+        for (const auto &p : d.lobby_players)
+            if (p.id < kMaxPlayers && t < d.speaking_until[p.id])
+                out.push_back(p.name);
+        if (out.empty() && d.my_id < kMaxPlayers && t < d.speaking_until[d.my_id])
+            out.push_back(d.name);
+    } else {
+        if (t < d.speaking_until[0]) out.push_back(d.name);
+    }
+    return out;
+}
 
 void Session::roster_pre(uint32_t description) {
     Impl &d = *d_;

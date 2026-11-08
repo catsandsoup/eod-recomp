@@ -571,8 +571,8 @@ void Menu::rows_online(std::vector<Row> &r) {
     if (s.players.empty()) r.push_back(info("noplayers", "PLAYERS", "NO LOBBY"));
     for (const auto &p : s.players) {
         Row pr = info("player", ("P" + std::to_string(p.slot + 1) + "  " + upper(p.name)).c_str(),
-                      std::string(p.ready ? "READY" : "NOT READY") + (p.muted ? " - MUTED" : ""));
-        pr.good = p.ready;
+                      std::string(p.ready ? "READY" : "NOT READY") + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
+        pr.good = p.ready || p.speaking;
         r.push_back(pr);
     }
     Row mods = info("modset", "MOD SET / VERSION", s.content_problem.empty() ? (connected ? "MATCH" : "-") : upper(s.content_problem),
@@ -581,14 +581,14 @@ void Menu::rows_online(std::vector<Row> &r) {
     r.push_back(mods);
     r.push_back(info("ping", "PING", connected ? s.status : "-", "Round trip to the other player."));
     r.push_back(header("VOICE"));
-    Row mic = toggle("mic", "MICROPHONE", s.microphone_enabled, "", "Sends your voice to the lobby.");
-    mic.enabled = connected;
+    Row mic = toggle("mic", "MICROPHONE", s.microphone_enabled, "LIVE", "Sends your voice to the lobby and race.");
+    mic.enabled = s.voice;
     r.push_back(mic);
-    Row mute = toggle("mute", "MUTE OTHERS", s.muted, "", "Stops playing the other players' voices.");
-    mute.enabled = connected;
+    Row mute = toggle("mute", "MUTE OTHERS", s.muted, "LIVE", "Stops playing the other players' voices.");
+    mute.enabled = s.voice;
     r.push_back(mute);
-    Row deaf = toggle("deafen", "DEAFEN", s.deafened, "", "Mutes your microphone and all incoming voice.");
-    deaf.enabled = connected;
+    Row deaf = toggle("deafen", "DEAFEN", s.deafened, "LIVE", "Mutes your microphone and all incoming voice.");
+    deaf.enabled = s.voice;
     r.push_back(deaf);
 }
 
@@ -718,7 +718,11 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "smooth") cfg_.smooth_display = !cfg_.smooth_display;
     else if (id == "frameskip") cfg_.frame_skip = !cfg_.frame_skip;
     else if (id == "detail") cycle(kDetails, 3, cfg_.detail);
-    else if (id.compare(0, 4, "opt:") == 0 && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Option; c.text = id.substr(4); c.value = (float)dir; net_->submit(c); }
+    else if (id.compare(0, 4, "opt:") == 0 && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Option; c.text = id.substr(4); c.value = (float)dir; net_->submit(c); fx.sound = Sound::Move; return; }
+    else if (id == "ready" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
+    else if (id == "mic" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::MicrophoneEnabled; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
+    else if (id == "mute" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Muted; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
+    else if (id == "deafen" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Deafened; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
     else if (id == "fps") cfg_.show_fps = !cfg_.show_fps;
     else if (id == "audio") { cfg_.audio = !cfg_.audio; fx.audio = true; }
     else if (id == "volume") { step(cfg_.volume, 0, 100, 5); fx.audio = true; }

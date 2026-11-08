@@ -548,6 +548,61 @@ int platform_audio_queued_frames() {
     return n;
 }
 
+static HWAVEIN g_wave_in = nullptr;
+static WAVEHDR g_in_hdr[4] = {};
+static std::vector<int16_t> g_in_buf[4];
+
+bool platform_mic_open(int sample_rate) {
+    if (g_headless) return false;
+    if (g_wave_in) return true;
+    WAVEFORMATEX wf = {};
+    wf.wFormatTag = WAVE_FORMAT_PCM;
+    wf.nChannels = 1;
+    wf.nSamplesPerSec = (DWORD)sample_rate;
+    wf.wBitsPerSample = 16;
+    wf.nBlockAlign = 2;
+    wf.nAvgBytesPerSec = wf.nSamplesPerSec * 2;
+    if (waveInOpen(&g_wave_in, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        g_wave_in = nullptr;
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        g_in_buf[i].assign(960, 0);
+        memset(&g_in_hdr[i], 0, sizeof(WAVEHDR));
+        g_in_hdr[i].lpData = (LPSTR)g_in_buf[i].data();
+        g_in_hdr[i].dwBufferLength = 960 * 2;
+        waveInPrepareHeader(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
+        waveInAddBuffer(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
+    }
+    waveInStart(g_wave_in);
+    return true;
+}
+
+void platform_mic_close() {
+    if (!g_wave_in) return;
+    waveInReset(g_wave_in);
+    for (int i = 0; i < 4; i++)
+        if (g_in_hdr[i].dwFlags & WHDR_PREPARED)
+            waveInUnprepareHeader(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
+    waveInClose(g_wave_in);
+    g_wave_in = nullptr;
+}
+
+int platform_mic_read(int16_t *samples, int max_samples) {
+    if (!g_wave_in || max_samples < 960) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (g_in_hdr[i].dwFlags & WHDR_DONE) {
+            int got = (int)(g_in_hdr[i].dwBytesRecorded / 2);
+            if (got > max_samples) got = max_samples;
+            if (got > 0) memcpy(samples, g_in_buf[i].data(), (size_t)got * 2);
+            g_in_hdr[i].dwBytesRecorded = 0;
+            waveInAddBuffer(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
+            if (got > 0) return got;
+        }
+    }
+    return 0;
+}
+
 // ----------------------------------------------------------------- fibers
 struct HostFiber {
     LPVOID fiber;

@@ -114,6 +114,9 @@ void platform_audio_submit(const int16_t *samples, int frames) {
     fseek(f, pos, SEEK_SET);
 }
 int platform_audio_queued_frames() { return 0; }
+bool platform_mic_open(int) { return false; }
+void platform_mic_close() {}
+int platform_mic_read(int16_t *, int) { return 0; }
 
 // Exposes the last presented frame for screenshots in headless mode.
 bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {

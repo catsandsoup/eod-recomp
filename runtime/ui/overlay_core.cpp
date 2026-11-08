@@ -566,7 +566,8 @@ void overlay_frame() {
         if (!any) g_release_wait = false;
     }
     const std::string strip = netplay::session().strip();
-    if (!g_open && !g_config.show_fps && strip.empty()) {
+    const std::vector<std::string> speakers = netplay::session().speakers();
+    if (!g_open && !g_config.show_fps && strip.empty() && speakers.empty()) {
         if (g_published_any) {
             g_published_any = false;
             std::lock_guard<std::mutex> lk(g_pub_mtx);
@@ -600,6 +601,23 @@ void overlay_frame() {
         dl->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, 38), IM_COL32(24, 14, 8, 215));
         dl->AddRectFilled(ImVec2(0, 36), ImVec2((float)w, 38), IM_COL32(230, 120, 30, 255));
         dl->AddText(g_font_main, 22.f, ImVec2(18, 7), IM_COL32(255, 160, 50, 255), strip.c_str());
+    }
+    if (!speakers.empty()) {
+        float y = strip.empty() ? 18.f : 48.f;
+        for (const std::string &spk : speakers) {
+            const float x = 18.f, bh = 32.f, bw = 210.f;
+            dl->AddRectFilled(ImVec2(x, y), ImVec2(x + bw, y + bh), IM_COL32(18, 24, 18, 220), 4.f);
+            dl->AddRect(ImVec2(x, y), ImVec2(x + bw, y + bh), IM_COL32(110, 235, 120, 240), 4.f, 0, 1.5f);
+            // Halo-style speaker cone + radiating voice waves
+            const float cx = x + 14.f, cy = y + bh * 0.5f;
+            dl->AddRectFilled(ImVec2(cx - 5.f, cy - 3.5f), ImVec2(cx - 1.f, cy + 3.5f), IM_COL32(130, 255, 140, 255));
+            ImVec2 cone[4] = {ImVec2(cx - 1.f, cy - 3.5f), ImVec2(cx + 4.f, cy - 8.f), ImVec2(cx + 4.f, cy + 8.f), ImVec2(cx - 1.f, cy + 3.5f)};
+            dl->AddConvexPolyFilled(cone, 4, IM_COL32(130, 255, 140, 255));
+            dl->AddBezierQuadratic(ImVec2(cx + 7.f, cy - 5.f), ImVec2(cx + 11.f, cy), ImVec2(cx + 7.f, cy + 5.f), IM_COL32(130, 255, 140, 255), 1.8f);
+            dl->AddBezierQuadratic(ImVec2(cx + 10.f, cy - 8.f), ImVec2(cx + 16.f, cy), ImVec2(cx + 10.f, cy + 8.f), IM_COL32(130, 255, 140, 200), 1.8f);
+            dl->AddText(g_font_main, 19.f, ImVec2(x + 36.f, y + 6.f), IM_COL32(235, 255, 235, 255), spk.c_str());
+            y += bh + 6.f;
+        }
     }
     if (g_config.show_fps) {
         char t[32];
@@ -645,6 +663,7 @@ const uint32_t *overlay_font(int &w, int &h, uint32_t &generation) {
 }
 
 void overlay_mix_audio(int16_t *stereo, int frames) {
+    netplay::session().mix_voice(stereo, frames);
     std::lock_guard<std::mutex> lk(g_snd_mtx);
     if (g_snd.empty()) return;
     const double step = (double)g_snd_rate / 48000.0;

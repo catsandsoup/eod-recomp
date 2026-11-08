@@ -136,6 +136,8 @@
 002BEC08 TitleScreenUpdate [V]  # Title screen update; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002C0BB8 ArcadeSingleOrMultiPromptScreen [I]  # Main menu ACTION: s_and_m.lyt 'single / multi' prompt (MenuRun call at 0x2C0DC0 returns 1 = single, 4 = multi, -1 = back), then GameDoSingle; auto-answered single for online events -> docs/NETPLAY_STATE_SYNC.md
 002C1224 CareerStripMasterCheatBit [V]  # Clears bit 0 of g_CheatMask (0x003C4190) on Career entry -> docs/GAMEPLAY_MODS_RE.md
+002C1A20 LoadingScreenEventProgress [V]  # Event/race archive loading progress callback (0x004AF6C0); wrapped for NVMe turbo loading -> docs/INDEX.md
+002C2188 LoadingScreenMenuProgress [V]  # Front-end/menu archive loading progress callback (0x004AF6C0); wrapped for NVMe turbo loading -> docs/INDEX.md
 002C7340 SinglePlayerTrackSelectUpdate [V]  # Action/Single track selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002CD418 CareerUnlockAllVenueEves [V]  # Unlocks all Eve events across Career venues -> docs/GAMEPLAY_MODS_RE.md
 002D58E8 CareerFreeRoamRun [V]  # Runs Career dirt free-roam / challenge driving loop; wrapped by EOD_CAREER_EVE -> docs/CAREER_UNLOCKS.md
@@ -154,6 +156,7 @@
 # ---------------------------------------------------------------------------
 00331DF0 Panic [V]  # Fatal error handler panic(fmt, ...); logs message and halts -> docs/INDEX.md
 00331E48 DebugPrintf [V]  # Retail stripped debug printf(fmt, ...); replaced by runtime logger (--log game) -> docs/INDEX.md
+00337718 TimerGetMs [V]  # Returns elapsed timer milliseconds; wrapped to skip artificial post-load & memory card wait loops -> docs/INDEX.md
 0033D408 StrmMountArchive [V]  # Mounts stream archive ("strm: '%s' not found") -> docs/INDEX.md
 0033D4F8 StrmFindFile [V]  # Looks up file path in mounted stream TOC; wrapped for mod overlay & missing-file log -> docs/INDEX.md
 0033D8E8 StrmOpenFile [V]  # Opens stream file handle by TOC index -> docs/INDEX.md

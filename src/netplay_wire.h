@@ -13,7 +13,8 @@ constexpr int kMaxPlayers = 16;
 enum Kind : uint8_t {
     K_JOIN = 1, K_WELCOME, K_REFUSE, K_HEARTBEAT, K_LOBBY, K_START, K_TRACK, K_ROSTER, K_GO, K_END, K_LEAVE,
     K_SNAP, K_BEACON, K_KICK,
-    K_PUNCH, K_PROBE, K_PROBE_REPLY      // internet: NAT punch, friend-presence probe and its answer
+    K_PUNCH, K_PROBE, K_PROBE_REPLY,     // internet: NAT punch, friend-presence probe and its answer
+    K_VOICE                              // Opus voice frame (netplay::voice::Packet)
 };
 // guest phase, reported in heartbeats
 enum Phase : uint8_t { P_LOBBY = 0, P_STARTED, P_CAR_DONE, P_LOADED, P_RACING, P_DONE };

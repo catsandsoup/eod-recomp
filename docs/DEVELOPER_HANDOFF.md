@@ -387,3 +387,41 @@ Battle damage kills. Hands-on collision/deformation acceptance remains separate
 from the callback/identity regression.
 After this correction, all 62 active CTests pass again (50.02 s); NASCAR remains
 excluded. The personal app and ZIP were rebuilt with the human-only behavior.
+
+
+## Compiler recovery — 2026-11-08
+
+**Situation.** The owner requested a compiling game after stopping other LLMs.
+The exact Claude conversation was recovered from local session
+`b2d5f7ea-95e4-4e01-aebf-345c2cdea13c` (TDEOD: continue from handoff 4).
+Its final online agent stopped at the credit limit; its statements are history,
+not fresh evidence of current gameplay acceptance.
+
+**Task.** Produce a linked arm64 executable from the current source and verify
+startup with the installed disc. Online play and loading performance require
+separate player acceptance.
+
+**Action.** Reproduced undeclared loading callback originals in hle_stream.cpp.
+The source had already changed to actual function entries, but HLE/symbol
+configuration still included interior addresses 0x002C1A68/0x002C21A8 and the
+generated header was stale. Corrected configuration to entries
+0x002C1A20/0x002C2188, removed duplicate timer/callback declarations, and ran
+tools/recomp.py with the nascar-wheels build-venv Python. Generated 117 files,
+13,481 functions, zero errors. No generated files are committed.
+Reviewed https://github.com/silentsudin/RoadTripAdventure-recomp on 2026-11-08;
+this repair uses this repository's existing wrap/original generator interface.
+The specific EOD addresses come from its analyzed function boundaries, so an
+upstream game-specific hook cannot substitute for them.
+
+**Result.** Full ninja -j4 build in
+/Users/USER/Documents/Codex/2026-11-06/read/work/nascar-wheels/build linked eod
+successfully. EOD_HEADLESS=1 EOD_MUTE=1 ctest -j4 -E AssetTools
+--output-on-failure passed 78/78 (7.73 seconds). SymbolsDB also passed directly.
+A separate headless, muted 600-frame startup using installed disc data and
+isolated test configuration/memory cards exited 0 at its frame limit.
+Its log is in the current compiler-recovery chat workspace at
+work/compiler-check/startup.log. This proves startup through the intro movie,
+not a full race, online sync, microphone operation or faster loading.
+Existing unrelated working-tree changes were preserved. No publication or app
+replacement was performed. Next decisive acceptance: complete a race and
+return to the online lobby on two machines with the current packaged build.

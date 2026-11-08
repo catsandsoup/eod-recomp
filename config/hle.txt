@@ -6,6 +6,9 @@
 00331DF0 wrap     # panic(fmt, ...) - game fatal error
 00331E48 replace  # debug printf (formats and discards in the release build) - logged with --log game
 0033D4F8 wrap     # StrmFindFile(path) -> TOC index: logs files missing from the disc
+002C1A20 wrap     # LoadingScreenEventProgress: rate-limits 3-vblank per-chunk wait for NVMe speed
+002C2188 wrap     # LoadingScreenMenuProgress: rate-limits 3-vblank per-chunk wait for NVMe speed
+00337718 wrap     # TimerGetMs: skips artificial 2-4s post-load and memory card banner hold loops
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
 00212B58 wrap     # optional Maximum: matched 1P projection/fog range in 2P
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier

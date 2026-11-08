@@ -51,6 +51,8 @@ public:
     void step_end();
     const std::string &last_error() const { return error_; }
     std::string strip() const;
+    void mix_voice(int16_t *stereo, int frames);
+    std::vector<std::string> speakers() const;
 
 private:
     void auto_drive(uint64_t t);

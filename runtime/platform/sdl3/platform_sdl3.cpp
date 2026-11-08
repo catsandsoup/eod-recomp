@@ -71,6 +71,7 @@ SDL_Renderer *g_renderer;
 SDL_Texture *g_texture;
 int g_tex_w, g_tex_h;
 SDL_AudioStream *g_audio;
+SDL_AudioStream *g_mic;
 float g_volume = 1.0f;
 
 void update_audio_gain() {
@@ -300,6 +301,7 @@ bool platform_init(const PlatformConfig &cfg) {
 }
 
 void platform_shutdown() {
+    if (g_mic) { SDL_DestroyAudioStream(g_mic); g_mic = nullptr; }
     if (g_audio) SDL_DestroyAudioStream(g_audio);
     sdl_input::close_all();
     if (g_texture) SDL_DestroyTexture(g_texture);
@@ -759,3 +761,40 @@ void platform_audio_submit(const int16_t *samples, int frames) {
 }
 
 int platform_audio_queued_frames() { return g_audio ? SDL_GetAudioStreamQueued(g_audio) / 4 : 0; }
+
+bool platform_mic_open(int sample_rate) {
+    const char *m = getenv("EOD_MUTE");
+    if (g_headless || (m && m[0] == '1')) return false;
+    if (g_mic) return true;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "SDL audio: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_AudioSpec spec = {SDL_AUDIO_S16LE, 1, sample_rate};
+    g_mic = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, nullptr, nullptr);
+    if (!g_mic) {
+        fprintf(stderr, "SDL mic stream: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_ResumeAudioStreamDevice(g_mic);
+    return true;
+}
+
+void platform_mic_close() {
+    if (g_mic) {
+        SDL_DestroyAudioStream(g_mic);
+        g_mic = nullptr;
+    }
+}
+
+int platform_mic_read(int16_t *samples, int max_samples) {
+    if (!g_mic || max_samples <= 0) return 0;
+    const int avail = SDL_GetAudioStreamAvailable(g_mic) / 2;
+    if (avail < max_samples) return 0;
+    if (avail > max_samples * 8) {
+        std::vector<int16_t> discard((size_t)(avail - max_samples * 2));
+        SDL_GetAudioStreamData(g_mic, discard.data(), (int)discard.size() * 2);
+    }
+    const int got = SDL_GetAudioStreamData(g_mic, samples, max_samples * 2);
+    return got > 0 ? got / 2 : 0;
+}

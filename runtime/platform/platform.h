@@ -103,6 +103,10 @@ int platform_list_pads(int watch_seconds);
 bool platform_audio_open(int sample_rate);
 void platform_audio_submit(const int16_t *samples, int frames);
 int platform_audio_queued_frames();
+// 48 kHz signed 16-bit mono microphone capture for online voice chat.
+bool platform_mic_open(int sample_rate);
+void platform_mic_close();
+int platform_mic_read(int16_t *samples, int max_samples);
 
 // ----------------------------------------------------------------- fibers
 struct HostFiber;
