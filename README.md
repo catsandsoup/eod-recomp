@@ -62,9 +62,10 @@ The host picks the track and event. Each driver chooses a car and paint, sees th
 
 ![Trading paint under the lights at Anoka](docs/img/online-anoka-race.jpg)
 
-* **Stay on the couch.** Open the menu with Start + Select. Use the shoulder buttons to reach Online, the D-pad to navigate, Cross/A to choose and Circle/B to go back. A guest can type the Garage Code and confirm on the controller. A discovered LAN listing skips typing.
-* **See who made it in.** The code and player list stay visible while the host browses settings. Once racing, Start opens the live menu. End Race keeps the party together; Close Lobby ends the session.
-* **Your car. Your screen.** Pick your ride and paint, meet your friends on the grid, and keep the whole screen for the racing.
+* **Controller support.** D-pad navigation, shoulder-button tabs, Cross/A to select and Circle/B to go back.
+* **Online lobby.** Host a game, join by Garage Code or select a LAN game.
+* **Race selection.** The host chooses the track and event. Each player chooses a car and paint.
+* **Rematches.** Return to the lobby, change selections and start the next race.
 
 ![Choose the next race together with your Garage Code and friends in view](docs/img/online-rematch-lobby.jpg)
 
