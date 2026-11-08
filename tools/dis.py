@@ -26,20 +26,35 @@ def word(a):
 
 def load_symbols():
     syms = {}
+    meta = {}
     p = os.path.join(ROOT, "config", "symbols.txt")
     if os.path.exists(p):
-        for line in open(p):
-            line = line.split("#")[0].split()
-            if len(line) >= 2:
-                syms[int(line[0], 16)] = line[1]
-    return syms
+        for raw in open(p):
+            body, _, comment = raw.partition("#")
+            parts = body.split()
+            if len(parts) >= 2:
+                addr = int(parts[0], 16)
+                sname = parts[1]
+                tag = parts[2] if len(parts) >= 3 and parts[2] in ("[V]", "[I]") else ""
+                syms[addr] = sname
+                meta[addr] = (sname, tag, comment.strip())
+    return syms, meta
 
 
-SYMS = load_symbols()
+SYMS, SYM_META = load_symbols()
 
 
 def name(a):
     return SYMS.get(a, "f_%08X" % a)
+
+
+def label_header(a):
+    if a not in SYM_META:
+        return ""
+    sname, tag, comment = SYM_META[a]
+    tag_s = (" %s" % tag) if tag else ""
+    note_s = (" ; %s" % comment) if comment else ""
+    return "%s%s:%s\n" % (sname, tag_s, note_s)
 
 
 def string_at(a):
@@ -87,7 +102,7 @@ def dis(va, n):
         w = word(a)
         i = rz.Instruction(w, a, rz.InstrCategory.R5900)
         note = annotate(i, hi)
-        lab = ("%s:\n" % name(a)) if a in SYMS else ""
+        lab = label_header(a)
         print("%s%08x %08x %-40s %s" % (lab, a, w, i.disassemble(), ("; " + note) if note else ""))
 
 

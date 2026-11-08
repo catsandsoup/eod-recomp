@@ -154,11 +154,12 @@ def check_patch_sites(elf):
 
 
 class Gen:
-    def __init__(self, elf, funcs, tables, hle):
+    def __init__(self, elf, funcs, tables, hle, syms=None):
         self.elf = elf
         self.funcs = funcs          # set of function start addresses
         self.tables = tables        # jr_addr -> targets
         self.hle = hle              # addr -> replaced (body not generated)
+        self.syms = syms or {}      # addr -> (name, tag, note)
 
     def word(self, va):
         patch = WORD_PATCHES.get(va)
@@ -821,7 +822,7 @@ class FuncEmitter:
             i = self.ins(va)
             w = i.getRaw()
             name = i.getOpcodeName()
-            lab = ("L_%08X:;" % va) if va in self.labels else None
+            lab = ("L_%08X:; /* %s */" % (va, g.syms[va][0]) if va in g.syms else "L_%08X:;" % va) if va in self.labels else None
             if lab:
                 body.append(lab)
             if name == "eret":
@@ -861,7 +862,9 @@ class FuncEmitter:
                 t = i.getInstrIndexAsVram()
                 body.append("  R[31].ud[0] = %s; %s" % (hx(after), dcode))
                 if t in g.funcs:
-                    body.append("  %s();" % self.ref(t))
+                    sym = g.syms.get(t)
+                    comment = (" /* %s */" % sym[0]) if sym else ""
+                    body.append("  %s();%s" % (self.ref(t), comment))
                 else:
                     body.append("  ee_call_unknown(%s);" % hx(t))
                 self.fallthrough(body, after, k)
@@ -930,7 +933,8 @@ def main():
     funcs = {f["addr"]: f for f in fj["functions"]}
     tables = {int(k): v for k, v in fj["jump_tables"].items()}
     hle = load_hle(os.path.join(ROOT, "config", "hle.txt"))
-    gen = Gen(elf, set(funcs), tables, hle)
+    syms = load_symbols(os.path.join(ROOT, "config", "symbols.txt"))
+    gen = Gen(elf, set(funcs), tables, hle, syms)
 
     os.makedirs(args.out, exist_ok=True)
     only = set(int(x, 16) for x in args.only.split(",")) if args.only else None
@@ -953,7 +957,16 @@ def main():
             print("unsupported in %08x: %s" % (addr, e))
             errors += 1
             body = ["  ee_bad_instruction(%s, 0); /* unsupported: %s */" % (hx(addr), str(e).replace("*/", ""))]
-        text = ["", "/* %08X  (%s, %d instructions) */" % (addr, f["kind"], len(addrs)),
+        sym = syms.get(addr)
+        if sym:
+            sname, stag, snote = sym
+            tag_s = (" %s" % stag) if stag else ""
+            note_s = (" -- %s" % snote.replace("*/", "* /")) if snote else ""
+            hdr_comment = "/* %08X %s%s (%s, %d instructions)%s */" % (
+                addr, sname, tag_s, f["kind"], len(addrs), note_s)
+        else:
+            hdr_comment = "/* %08X  (%s, %d instructions) */" % (addr, f["kind"], len(addrs))
+        text = ["", hdr_comment,
                 "void %s(void) {" % fname, "  EE_FUNC_ENTRY(0x%08X);" % addr]
         text += [l for l in body if l.strip()]
         text.append("}")
@@ -992,6 +1005,21 @@ def main():
     write_if_changed(os.path.join(args.out, "table.c"), "\n".join(tab))
     print("wrote %d files, %d functions, %d errors" % (len(files), len(funcs), errors))
     return 1 if errors else 0
+
+
+def load_symbols(path):
+    """config/symbols.txt: '<addr> <name> [V|I]  # <note>'."""
+    out = {}
+    if os.path.exists(path):
+        for raw in open(path):
+            body, _, comment = raw.partition("#")
+            parts = body.split()
+            if len(parts) >= 2:
+                addr = int(parts[0], 16)
+                name = parts[1]
+                tag = parts[2] if len(parts) >= 3 and parts[2] in ("[V]", "[I]") else ""
+                out[addr] = (name, tag, comment.strip())
+    return out
 
 
 def load_hle(path):

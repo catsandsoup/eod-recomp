@@ -1,30 +1,270 @@
-# Known symbols: <address> <name>
-# Used by tools/dis.py for annotation; grows as functions are identified.
-00100008 _start
-0032E7F8 main
-003A22B8 exit
-003A60E0 printf
-003AB680 vsprintf
-003A778C strcpy
-003A78A0 strlen
-003A738C strcat
-003A5D88 strncmp
-003A5FD0 memset
-00331DF0 panic
-00331E48 dprintf_stub
-003B1BD0 scePrintf
-003B15A0 _sceVprintf
-003B2408 sceSifInitRpc
-003B2BA0 sceSifBindRpc
-003B2D70 sceSifCallRpc
-003B8030 sceSifRebootIop
-003B7FE0 sceSifSyncIop
-003B7290 sceSifLoadFileReset
-003B3DC0 sceFsReset
-003AFFF0 SifGetReg
-003AFE60 FlushCache
-0033DD90 StreamFS_Create
-0033D4F8 StrmFindFile
-0033DAB0 StrmRead
-0033CAD8 StrmReadSectors
-0033D078 StrmLoadBank
+# Known symbols in SLUS_209.10 (Test Drive: Eve of Destruction, PS2 NTSC-U).
+#
+# Format:
+#   <hex_addr> <SymbolName> [V|I]  # <description> [-> docs/<file>.md]
+#
+# Confidence tags:
+#   [V] Verified from retail debug strings, Sony PS2SDK / newlib signatures,
+#       or runtime-traced HLE contracts.
+#   [I] Inferred from call-graph structure, register/struct layouts, and caller
+#       behavior.
+#
+# Consumed by:
+#   - tools/recomp.py : emits function header comments and inline /* Name */
+#                       comments at jal call sites in gen/rec_*.c.
+#   - tools/dis.py    : displays symbol names, confidence tags, and notes in
+#                       disassembly listings and operand annotations.
+#
+#Subsystem index: see docs/INDEX.md.
+
+# ---------------------------------------------------------------------------
+# 0x00100000 - 0x0012FFFF : Entry, HUD, Event / Roster Tables, Memory & RNG
+# ---------------------------------------------------------------------------
+00100008 _start [V]  # ELF entry point -> docs/INDEX.md
+00100138 main [V]  # Game main(argc, argv); boots IOP, mounts archives, runs frame loop -> docs/INDEX.md
+0010AFA0 EventTypeGetDisplayName [V]  # Resolves event-type ID to localized display string; wrapped for Battle (4 AI)/(8 AI) -> docs/BATTLE_RECOVERY.md
+001116E0 RosterResolveCarDescriptions [V]  # Resolves driver/vehicle description records for event roster; wrapped for multi-class Battle AI -> docs/BATTLE_RECOVERY.md
+00119428 HudGetParticipantDisplayName [V]  # Returns participant display name for HUD/kill messages -> docs/BATTLE_RECOVERY.md
+00119888 HudDrawLeftRaceRows [V]  # Draws left-anchored position/lap/damage HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
+00119F40 HudDrawRightSpeedRows [V]  # Draws right-anchored speedometer/tachometer HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
+00120650 EventSetupSelectInitial [V]  # Per-event setup screen initial contest selection; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+001244A8 EveLoadContests [V]  # Loads Eve contest descriptors into g_EveContestTable; wrapped to inject solo/AI Battle events -> docs/BATTLE_RECOVERY.md
+001252C0 EveGetContestDisplayName [V]  # Returns display title for an Eve contest entry -> docs/BATTLE_RECOVERY.md
+0012AEF0 RosterSelectContest [V]  # Records active contest before resolving AI car descriptions -> docs/BATTLE_RECOVERY.md
+0012C158 RosterBuildEventParticipants [V]  # Builds participant slot count and AI fill for an event -> docs/BATTLE_RECOVERY.md
+0012C940 PointsRosterLoad [V]  # Parses points-based track/car unlock roster -> docs/GAMEPLAY_MODS_RE.md
+0012CAB8 PointsRosterUnlockAll [V]  # Sets unlocked flag on all loaded rows in g_PointsUnlockRoster -> docs/GAMEPLAY_MODS_RE.md
+0012CC40 TrackPickerIsUnlocked [V]  # Checks whether a track row is unlocked in g_PointsUnlockRoster -> docs/GAMEPLAY_MODS_RE.md
+0012CF98 UnlockAllActionPrizes [V]  # Unlocks action-mode tracks, vehicles, and reputation prizes -> docs/GAMEPLAY_MODS_RE.md
+0012DB78 MemFree [V]  # Stack/pool allocator free(ptr); checked by EOD_HEAP_CHECK -> docs/INDEX.md
+0012DDB8 MemAlloc [V]  # Stack/pool allocator alloc(pool, size, name); asserts "Out of memory (requested=%d, available=%d)" -> docs/INDEX.md
+0012DEC8 MemPoolGetAvailable [I]  # Returns available bytes in memory pool -> docs/INDEX.md
+0012F3C8 RngNextFloat01 [V]  # Advances primary LCG (g_RngState0) and returns float in [0, 1) -> docs/INDEX.md
+0012F470 RngNextRange [V]  # Advances primary LCG (g_RngState0) and returns bounded integer -> docs/INDEX.md
+0012F4F0 RngNextSignedFloat [V]  # Advances primary LCG (g_RngState0) and returns signed float -> docs/INDEX.md
+001323E8 ResLoadAsset [V]  # Loads asset from mounted .car/.trk/.res archive into memory pool -> docs/LOD_CULLING_INVESTIGATION.md
+00134A70 TrackRelocateSectionTable [I]  # Relocates loaded track section pointers in place -> docs/BATTLE_RECOVERY.md
+00138288 DriverFactoryCreate [V]  # Creates human/AI/null driver controller for a participant slot -> docs/GAMEPLAY_MODS_RE.md
+
+# ---------------------------------------------------------------------------
+# 0x00150000 - 0x0017FFFF : Track Sections, Battle Mode, Race Loop & Weapons
+# ---------------------------------------------------------------------------
+001515B8 TrackLookupBattleSection [V]  # Looks up c_battle section for a track; wrapped to supply Welch Battle table -> docs/BATTLE_RECOVERY.md
+00166B50 BattleDrawKillMessages [V]  # Draws HUD kill attribution banner during Battle matches -> docs/BATTLE_RECOVERY.md
+00166C38 BattleCreate [V]  # Allocates and initializes BattleMaster match controller -> docs/BATTLE_RECOVERY.md
+00167340 BattleInitParticipants [V]  # Initializes per-car BattleMaster participant records and spawns -> docs/BATTLE_RECOVERY.md
+001675C0 BattleRespawnCar [V]  # Resets damage, detaches/reattaches parts, and teleports wrecked car to spawn point -> docs/BATTLE_RECOVERY.md
+00167C70 BattlePlaceInitialCars [V]  # Places Battle participants on initial spawn transforms; wrapped for >4 cars -> docs/BATTLE_RECOVERY.md
+00167D58 BattleUpdate [V]  # Per-frame BattleMaster state machine, scoring, and respawn tick -> docs/BATTLE_RECOVERY.md
+001741C0 CareerIsFreeRoamActive [V]  # Returns non-zero during Career free-roam / challenge staging; wrapped by KillableChallengers -> docs/CAREER_UNLOCKS.md
+00176698 RaceSessionInitPhase [V]  # Initializes race-start phase and RNG epoch; wrapped for netplay lockstep -> docs/INDEX.md
+00176918 RaceSessionSeedRng [V]  # Seeds per-session race RNG state; wrapped for netplay lockstep -> docs/INDEX.md
+00177718 WorldSimulationStep [V]  # Main per-tick world physics and entity simulation step; netplay lockstep boundary -> docs/INDEX.md
+00179A08 CarGetByParticipantIndex [V]  # Returns Car pointer for participant slot index -> docs/BATTLE_RECOVERY.md
+0017A498 SceneObjectUpdateBounds [I]  # Propagates world transform to scene bounding sphere -> docs/BATTLE_RECOVERY.md
+0017AF80 SceneObjectSetPose [V]  # Copies 4x3 pose matrix into object+0x64 and updates scene bounds -> docs/BATTLE_RECOVERY.md
+0017B708 RigidBodyApplyImpulseAtOffset [V]  # Applies world force/impulse vector at offset on rigid body -> docs/GAMEPLAY_MODS_RE.md
+0017DA58 ChickenExplosionApplyShockwave [V]  # Applies radial blast damage and physics impulse; wrapped for ChickenForceScale/RadiusScale -> docs/BATTLE_RECOVERY.md
+0017DE30 WeaponRegistryRegister [V]  # Registers (interface, owner_idx, slot) into g_WeaponRegistry -> docs/BATTLE_RECOVERY.md
+0017DE78 WeaponRegistryQuery [V]  # Looks up registered weapon interface for (owner_idx, slot) -> docs/BATTLE_RECOVERY.md
+0017DFA8 ChickenWeaponAlloc [V]  # Allocates 0x228-byte Ball/chicken projectile object -> docs/BATTLE_RECOVERY.md
+0017E000 ChickenWeaponTrigger [V]  # Fires chicken projectile from car muzzle pose (straight Battle, mortar, or rain) -> docs/BATTLE_RECOVERY.md
+0017E4D8 ChickenWeaponStartCooldown [V]  # Starts 3.0s reload cooldown timer at body+0x1E0/0x1E4 -> docs/BATTLE_RECOVERY.md
+0017E5C8 ChickenWeaponUpdate [V]  # Advances projectile flight, reload state machine, and collision checks -> docs/BATTLE_RECOVERY.md
+0017E718 ChickenWeaponDetonate [V]  # Triggers explosion SFX, particle burst, and radial shockwave at impact point -> docs/BATTLE_RECOVERY.md
+0017EA10 ChickenWeaponInit [V]  # Initializes projectile scene nodes, SFX handles, and weapon registry entry -> docs/BATTLE_RECOVERY.md
+
+# ---------------------------------------------------------------------------
+# 0x00180000 - 0x001FFFFF : Cars, Damage, Deformation, Recovery & Debris Phobs
+# ---------------------------------------------------------------------------
+00188F20 CarResetForRespawn [V]  # Clears velocity, repairs damage/wheels/panels, and resets deform bones -> docs/BATTLE_RECOVERY.md
+0018AA80 CarSetSteering [V]  # Writes normalized steering angle [-1, 1] to car+0x1B6C -> docs/BATTLE_RECOVERY.md
+0018AAD0 CarCanTakeDamage [V]  # Returns whether car can take damage in current mode; traced by EOD_CAREER_TRACE -> docs/CAREER_UNLOCKS.md
+0018AD20 CarSetScalarDamage [V]  # Sets normalized scalar damage (car+0x1B54); wrapped for Invincible/GodMode -> docs/GAMEPLAY_MODS_RE.md
+0018AFE0 CarSetupDamageAndPanels [V]  # Computes chassis mass damage multiplier (car+0x4B0) and panel table; wrapped for DamageScale -> docs/NASCAR_A2_RECOVERY.md
+0018CA98 CarApplyCollisionDamage [V]  # Evaluates collision impulse, deforms Bone.mvl, and updates damage/wreck state -> docs/CAREER_UNLOCKS.md
+0018CFE8 CarUpdateDetachablePanels [V]  # Checks bone displacement thresholds against 8 detachable panel rows -> docs/NASCAR_A2_RECOVERY.md
+0018DBF8 CarInitDetachablePanelTable [V]  # Populates 8 detachable panel entries (doors, hood, decklid, bumpers, fenders) -> docs/NASCAR_A2_RECOVERY.md
+0018F2A8 HumanDriverUpdate [V]  # Reads pad input, updates steering/ pedals, triggers weapons and Turbo Boost -> docs/GAMEPLAY_MODS_RE.md
+00191548 ReplayRecordHumanTick [V]  # Encodes/decodes 6-byte per-tick human control record -> docs/INDEX.md
+001A2D20 AICarUpdate [V]  # Per-frame AI vehicle controller update; wrapped to drive Battle bots -> docs/BATTLE_RECOVERY.md
+001B2868 DetachedWheelPoolReset [V]  # Clears 16-entry detached wheel phob ring buffer at 0x00484E68 -> docs/INDEX.md
+001B2DD8 DetachedWheelPoolFreeAll [V]  # Frees all active detached wheel phobs in 0x00484E68 -> docs/INDEX.md
+001B2E78 DetachedWheelPhobUpdate [V]  # Steps detached wheel rigid body and settles after 40s lifetime -> docs/INDEX.md
+001B3068 DetachedWheelSpawn [V]  # Spawns flying wheel phob when a car hub shears off -> docs/INDEX.md
+001B5840 TimedDamageFeatUpdate [V]  # Applies leader/timed damage feat; wrapped for Invincible -> docs/GAMEPLAY_MODS_RE.md
+001B8370 CarRecoveryCountdownUpdate [V]  # Updates rollover/wrong-way reset timer and SELECT manual recovery -> docs/MANUAL_RECOVERY.md
+001D8F58 TerrainSnapTransformToGround [V]  # Raycasts terrain and aligns 4x3 transform to ground height/normal -> docs/BATTLE_RECOVERY.md
+001DF9A0 DeformResetMeshVertices [I]  # Resets deformed car mesh vertices and bone offsets to rest state -> docs/NASCAR_A2_RECOVERY.md
+001E0DC8 DetachedPanelPoolInit [V]  # Initializes detached body panel phob pool at 0x00494D60 -> docs/INDEX.md
+001E1E88 DetachedPanelSpawn [V]  # Spawns detached hood/door/bumper/fender/decklid phob into 0x00494D60 -> docs/INDEX.md
+001E25C8 DetachedPanelPhobUpdate [V]  # Steps detached panel rigid body physics and ground contacts -> docs/INDEX.md
+001E29C0 DetachedPanelPoolClear [V]  # Releases all detached panel phobs in 0x00494D60 -> docs/INDEX.md
+
+# ---------------------------------------------------------------------------
+# 0x00200000 - 0x0022FFFF : Animation, Scene Graph, Camera, LOD & Car Models
+# ---------------------------------------------------------------------------
+00205218 FeatsUnlockAllCheats [V]  # Writes 0xFFFFFFFF to g_FeatCheatUnlockMask (0x003D18E4) -> docs/GAMEPLAY_MODS_RE.md
+00205368 FeatsGetCompletedUnion [V]  # Returns union of completed feat bits across career/profile -> docs/GAMEPLAY_MODS_RE.md
+0020D220 MRAnimCreate [V]  # Creates skeletal animation instance ("mrAnim: num_bones < 60"); checked by EOD_HEAP_CHECK -> docs/INDEX.md
+0020FD48 SceneCreateCarAndWeapons [V]  # Constructs visual/physics car scene and attaches weapons; wrapped for AI Battle bots -> docs/BATTLE_RECOVERY.md
+00211318 ViewGetLodDistanceFactor [V]  # Returns view-count LOD distance multiplier from 0x004062A8 ({1, 1, 2, 2}) -> docs/LOD_CULLING_INVESTIGATION.md
+00211378 ViewGetActiveViewportCount [V]  # Returns active split-screen viewport count (g_ActiveViewportCount at 0x003D1A74) -> docs/LOD_CULLING_INVESTIGATION.md
+00212808 DrawDistanceApplyOption [V]  # Maps draw_distance option (0/1/2) to 1150/725/300 at g_DrawDistanceFar (0x00495D58) -> docs/LOD_CULLING_INVESTIGATION.md
+00212B58 CameraBuildViewportProjection [V]  # Configures per-viewport near/far plane and fog range; wrapped for 2P/Horizon draw distance -> docs/LOD_CULLING_INVESTIGATION.md
+00212DB0 DrawDistanceGetFar [V]  # Returns g_DrawDistanceFar (0x00495D58) -> docs/LOD_CULLING_INVESTIGATION.md
+00212DF0 ConfigGetHighDetailCar [V]  # Returns high_detail_car flag -> docs/LOD_CULLING_INVESTIGATION.md
+00217DF0 VisualCarInit [V]  # Initializes visual car struct (+0x74 handles, +0xF8 LOD records, +0x21C/+0x220/+0x224 pointers) -> docs/LOD_RUNTIME.md
+002189C8 VisualCarSubmitModel [V]  # Selects active LOD handle from +0x21C[+0x54C] and submits to renderer -> docs/LOD_CULLING_INVESTIGATION.md
+00218C38 VisualCarSubmitWheelsAndParts [V]  # Submits car wheels, windows, and detachable parts for selected LOD -> docs/LOD_CULLING_INVESTIGATION.md
+00218E68 VisualCarBatchSelectAndSubmit [V]  # Selects LOD index and submits all active visual cars in g_VisualCarList (0x003D1C90) -> docs/LOD_RUNTIME.md
+0021ABF8 VisualCarLoadLodTable [V]  # Parses %s.car/lod.val, loads Low0..LowN.mod handles; wrapped for LOD threshold scaling -> docs/LOD_RUNTIME.md
+0021C130 VisualCarCloneShared [V]  # Clones visual car object aliasing shared model handles (+0x74) and LOD table (+0xF8) -> docs/LOD_RUNTIME.md
+0021C6E0 VisualCarSelectLodIndex [V]  # Computes camera distance and selects LOD index (+0x54C) for a single visual car -> docs/LOD_RUNTIME.md
+00220788 WheelSelectSlowOrFastModel [V]  # Chooses 3D slow wheel mesh vs card fast wheel by speed/LOD; wrapped for Cup wheels -> docs/NASCAR_CUP_WHEELS.md
+00227EE8 ChickenWeaponCreateForCar [V]  # Constructs and registers a chicken launcher for car slot -> docs/BATTLE_RECOVERY.md
+
+# ---------------------------------------------------------------------------
+# 0x002A0000 - 0x002FFFFF : Frontend Menus, Career Mode, AutoShop & Eves
+# ---------------------------------------------------------------------------
+002A1298 MainMenuUpdate [V]  # Main menu state machine; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+002A75E0 SinglePlayerCarSelectUpdate [V]  # Action/Single car selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+002B6DB8 CheatExecuteMasterUnlock [V]  # Master unlock helper calling track, feat, Eve, and Dare unlock routines -> docs/GAMEPLAY_MODS_RE.md
+002BEC08 TitleScreenUpdate [V]  # Title screen update; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+002C1224 CareerStripMasterCheatBit [V]  # Clears bit 0 of g_CheatMask (0x003C4190) on Career entry -> docs/GAMEPLAY_MODS_RE.md
+002C7340 SinglePlayerTrackSelectUpdate [V]  # Action/Single track selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+002CD418 CareerUnlockAllVenueEves [V]  # Unlocks all Eve events across Career venues -> docs/GAMEPLAY_MODS_RE.md
+002D58E8 CareerFreeRoamRun [V]  # Runs Career dirt free-roam / challenge driving loop; wrapped by EOD_CAREER_EVE -> docs/CAREER_UNLOCKS.md
+002E0948 CareerGetPlayerCash [V]  # Returns current Career cash balance from 0x00496E90 -> docs/CAREER_UNLOCKS.md
+002E0958 CareerAddPlayerCash [V]  # Adds delta to Career cash balance (clamped to [0, 9999999]) -> docs/CAREER_UNLOCKS.md
+002E0F10 CareerGetPlayerRank [V]  # Returns player rank index in 0x00497048; wrapped by CareerRank -> docs/CAREER_UNLOCKS.md
+002E35F0 AutoShopSetAvailable [V]  # Builds 5-slot dealer stock array at 0x00497254; wrapped by AllCars with L1/R1 paging -> docs/CAREER_UNLOCKS.md
+002E3BC8 CareerCalcTradeInDepreciation [V]  # Computes 10% trade-in depreciation; wrapped by FreeSwap to return 0 -> docs/CAREER_UNLOCKS.md
+002E3E70 CareerGetOwnedCarResaleValue [V]  # Computes 90% resale value of owned car; wrapped by FreeSwap for 100% refund -> docs/CAREER_UNLOCKS.md
+002E5200 CareerIsEveRankEligible [V]  # Tests whether player rank qualifies for an Eve; wrapped by OpenCareer -> docs/CAREER_UNLOCKS.md
+002E5758 CareerLoadChallengesVal [V]  # Loads challenges.val / home_challenges.val into 0x003CD910; wrapped by OpenCareer -> docs/CAREER_UNLOCKS.md
+002E6C78 CareerApplyPostEveRank [V]  # Applies new player rank after an Eve; wrapped by CareerRank to prevent forced retirement -> docs/CAREER_UNLOCKS.md
+
+# ---------------------------------------------------------------------------
+# 0x00330000 - 0x0037FFFF : Logging, StreamFS, Projection, Culling, Textures & UI
+# ---------------------------------------------------------------------------
+00331DF0 Panic [V]  # Fatal error handler panic(fmt, ...); logs message and halts -> docs/INDEX.md
+00331E48 DebugPrintf [V]  # Retail stripped debug printf(fmt, ...); replaced by runtime logger (--log game) -> docs/INDEX.md
+0033D408 StrmMountArchive [V]  # Mounts stream archive ("strm: '%s' not found") -> docs/INDEX.md
+0033D4F8 StrmFindFile [V]  # Looks up file path in mounted stream TOC; wrapped for mod overlay & missing-file log -> docs/INDEX.md
+0033D8E8 StrmOpenFile [V]  # Opens stream file handle by TOC index -> docs/INDEX.md
+0033ECB8 FogConfigureRange [V]  # Sets scene fog start/end distances from camera far plane -> docs/LOD_CULLING_INVESTIGATION.md
+0034BDA8 ModelSubmitVu1Packets [V]  # Submits loaded .mod VIF/VU1 packet chain to scene draw list -> docs/LOD_CULLING_INVESTIGATION.md
+0034CEF0 ModelLoadFromArchive [V]  # Parses .mod geometry from archive and returns model handle -> docs/LOD_CULLING_INVESTIGATION.md
+0034D328 DisplaySetAspectMode [V]  # Sets aspect mode (0=4:3, 1=16:9 widescreen, 2=letterbox) and xScale at 0x003DD658 -> docs/NATIVE_CAMERA_ASPECT.md
+0034E308 FrustumTestSphere [V]  # Tests world sphere (center $a0, radius $f12) against camera frustum -> docs/LOD_CULLING_INVESTIGATION.md
+0034E530 ProjectionSetPerspective [V]  # Computes perspective projection matrix, near/far (0x004CD370), and frustum tangents -> docs/NATIVE_CAMERA_ASPECT.md
+0034F620 ProjectionGetFovLodScale [V]  # Returns tan(ref_fov/2)/tan(cur_fov/2) LOD distance compensation -> docs/LOD_CULLING_INVESTIGATION.md
+0034FA98 CameraCalcDistanceToPoint [V]  # Returns Euclidean distance from active camera (0x004CD31C) to world point -> docs/LOD_CULLING_INVESTIGATION.md
+00352D28 TextureSubsystemInit [V]  # Initializes GS texture manager and allocates mip0 streaming cache (0x64000 bytes) -> docs/TEXTURE_FORMAT_NOTES.md
+003537F0 TextureRegisterHiResMip0 [V]  # Registers loaded .tm0 hi-res texture payload with texture cache entry -> docs/LOD_CULLING_INVESTIGATION.md
+003543D0 TextureMip0PoolInit [V]  # Allocates ring buffer for on-demand .tm0 high-res mip0 textures (0x004A9830) -> docs/TEXTURE_FORMAT_NOTES.md
+003545B8 TextureLoadHiResTm0 [V]  # Streams .tm0 high-res mip0 companion for a .tex texture -> docs/LOD_CULLING_INVESTIGATION.md
+00354838 TextureMip0PoolResize [V]  # Resizes on-demand .tm0 ring buffer allocation -> docs/TEXTURE_FORMAT_NOTES.md
+0035C460 FrameWaitVblank [V]  # Idle busy-wait loop for vblank counter increment -> docs/INDEX.md
+0035C528 FrameWaitDrawDone [V]  # Idle busy-wait loop for GS draw-done state (1 or 7) -> docs/INDEX.md
+003653F8 GsFogWriteTables [V]  # Computes and uploads GS FOG / fog-table values for current pass -> docs/LOD_CULLING_INVESTIGATION.md
+003670C8 MoviePlay [V]  # Plays PSS/IPU full-motion video by name; wrapped for EOD_SKIP_MOVIES -> docs/INDEX.md
+003698E8 HomebaseBuildMenu [V]  # Builds Homebase hub / AutoShop / Garage / Challengers UI menu list -> docs/CAREER_UNLOCKS.md
+003702F0 AutoShopUpdateSelection [V]  # Per-frame AutoShop car list update; wrapped to turn dealer pages on L1/R1 -> docs/CAREER_UNLOCKS.md
+
+# ---------------------------------------------------------------------------
+# 0x00380000 - 0x003BC290 : PS2SDK Kernel, SIF/DMA, libpad, libmc, IOP & libc
+# ---------------------------------------------------------------------------
+00381BB8 ResetEE [V]  # PS2SDK syscall 0x01
+00381BC8 SetGsCrt [V]  # PS2SDK syscall 0x02 (interlace, display mode, frame/field)
+00381BD8 Exit [V]  # PS2SDK syscall 0x04
+00381C38 ExecPS2 [V]  # PS2SDK syscall 0x07
+00381C78 AddIntcHandler [V]  # PS2SDK syscall 0x10
+00381C88 RemoveIntcHandler [V]  # PS2SDK syscall 0x11
+00381C98 AddDmacHandler [V]  # PS2SDK syscall 0x12
+00381CA8 RemoveDmacHandler [V]  # PS2SDK syscall 0x13
+00381CB8 _EnableIntc [V]  # PS2SDK syscall 0x14
+00381CC8 _DisableIntc [V]  # PS2SDK syscall 0x15
+00381CD8 _EnableDmac [V]  # PS2SDK syscall 0x16
+00381CE8 _DisableDmac [V]  # PS2SDK syscall 0x17
+00382198 TerminateThread [V]  # PS2SDK syscall 0x25
+00382218 ChangeThreadPriority [V]  # PS2SDK syscall 0x29
+00382238 RotateThreadReadyQueue [V]  # PS2SDK syscall 0x2B
+00382278 GetThreadId [V]  # PS2SDK syscall 0x2F
+003822A8 SleepThread [V]  # PS2SDK syscall 0x32
+003822B8 WakeupThread [V]  # PS2SDK syscall 0x33
+003822C8 iWakeupThread [V]  # PS2SDK syscall 0x34
+00382398 EndOfHeap [V]  # PS2SDK syscall 0x3E
+00382468 CreateSema [V]  # PS2SDK syscall 0x40
+00382478 DeleteSema [V]  # PS2SDK syscall 0x41
+00382488 SignalSema [V]  # PS2SDK syscall 0x42
+00382498 iSignalSema [V]  # PS2SDK syscall 0x43
+003824A8 WaitSema [V]  # PS2SDK syscall 0x44
+003824B8 PollSema [V]  # PS2SDK syscall 0x45
+00382528 FlushCache [V]  # PS2SDK syscall 0x64
+00382568 GsGetIMR [V]  # PS2SDK syscall 0x70
+00382578 GsPutIMR [V]  # PS2SDK syscall 0x71
+00382598 SetVSyncFlag [V]  # PS2SDK syscall 0x73
+003825B8 sceSifSetDma [V]  # PS2SDK syscall 0x77
+003835B0 sceSifSendCmd [V]  # SIF command packet send
+00383AA0 sceSifBindRpc [V]  # SIF RPC bind client to IOP server SID
+00383C40 sceSifCallRpc [V]  # SIF RPC synchronous/asynchronous call
+00383DF0 sceSifCheckStatRpc [V]  # SIF RPC completion check
+0038F868 scePadInit [V]  # libpad init (SID 0x80000100) -> docs/INPUT_CONTINUATION.md
+0038FB40 scePadPortOpen [V]  # libpad open controller port/slot -> docs/INPUT_CONTINUATION.md
+0038FF40 scePadRead [V]  # libpad read 32-byte DualShock2 pad DMA buffer -> docs/INPUT_CONTINUATION.md
+00390228 scePadGetState [V]  # libpad query controller state (6 = PadStateStable) -> docs/INPUT_CONTINUATION.md
+003906A0 scePadSetMainMode [V]  # libpad enable DualShock analog mode & lock -> docs/INPUT_CONTINUATION.md
+00390B60 scePadSetActDirect [V]  # libpad send actuator rumble speeds -> docs/INPUT_CONTINUATION.md
+003919A0 sceMcInit [V]  # libmc memory card init -> docs/INDEX.md
+00395118 sceCdRead [V]  # libcdvd sector read -> docs/INDEX.md
+00399090 sceIpuInit [V]  # libipu MPEG/IPU decoder init -> docs/INDEX.md
+0039AFB0 MovieBitBufferRefill [V]  # Consumes/refills IPU video bitstream buffer; fast-pathed in movie_bits.cpp -> docs/INDEX.md
+003A4A10 sceSifRebootIop [V]  # Reboots IOP with replacement image -> docs/INDEX.md
+003A4CD8 sceSifLoadModule [V]  # Loads IRX module onto IOP -> docs/INDEX.md
+003A6010 malloc [V]  # newlib heap malloc
+003A6030 free [V]  # newlib heap free
+003A60E0 printf [V]  # newlib printf; mirrored to host log -> docs/INDEX.md
+003A6470 sprintf [V]  # newlib sprintf
+003A6BC0 memcpy [V]  # newlib memcpy
+003A6EB0 memset [V]  # newlib memset
+003A7620 strcmp [V]  # newlib strcmp
+003A77C8 strcpy [V]  # newlib strcpy
+003A79A0 strlen [V]  # newlib strlen
+
+# ---------------------------------------------------------------------------
+# 0x003C0000 - 0x004CD384 : Verified Global Variables & Runtime Tables
+# ---------------------------------------------------------------------------
+003C4190 g_CheatMask [V]  # Active gameplay cheat bitmask (bit 0=master, 1=turbo, 3=weapon, 4=mortar, 8=onehit) -> docs/GAMEPLAY_MODS_RE.md
+003C4370 g_HudLeftQueueX [V]  # Left race HUD anchor X coordinate -> docs/HUD_EDGE_ANCHORS.md
+003C4600 g_HudRightQueueX [V]  # Right race HUD anchor X coordinate -> docs/HUD_EDGE_ANCHORS.md
+003C61A8 g_EveContestTable [V]  # Retail 320-entry Eve contest descriptor table (relocated to 512 entries at 0x00090000) -> docs/BATTLE_RECOVERY.md
+003CBF48 g_PointsUnlockCount [V]  # Number of loaded rows in g_PointsUnlockRoster -> docs/GAMEPLAY_MODS_RE.md
+003CBF58 g_PointsUnlockRoster [V]  # 32-entry points unlock table (16-byte stride) -> docs/GAMEPLAY_MODS_RE.md
+003CD190 g_PrimaryCourseCache [V]  # Loaded primary course waypoint cache (tag 0x104F128B, 60-byte nodes) -> docs/BATTLE_NAVIGATION.md
+003CD910 g_CareerChallengesTable [V]  # Loaded Career challenges.val / home_challenges.val table -> docs/CAREER_UNLOCKS.md
+003CDA24 g_CareerChallengePromptState [V]  # Career free-roam challenger prompt state (0=wait, 1=prompt, 6=dismissed) -> docs/CAREER_UNLOCKS.md
+003CDA78 g_CareerActiveChallengerPtr [V]  # Pointer to active Highway challenger entry (+8 = car_idx) -> docs/CAREER_UNLOCKS.md
+003CDACC g_RaceClockSeconds [V]  # Monotonic race simulation clock in seconds (float) -> docs/BATTLE_RECOVERY.md
+003CE3F8 g_WeaponRegistry [V]  # 12-byte weapon registry rows {owner_idx, slot, interface_ptr} -> docs/BATTLE_RECOVERY.md
+003CE4B8 g_WeaponRegistryCount [V]  # Active row count in g_WeaponRegistry -> docs/BATTLE_RECOVERY.md
+003CF194 g_BattleMasterPtr [V]  # Active BattleMaster instance pointer -> docs/BATTLE_RECOVERY.md
+003D18E0 g_FeatCompletedMask [V]  # Bitmask of completed Career feats -> docs/GAMEPLAY_MODS_RE.md
+003D18E4 g_FeatCheatUnlockMask [V]  # Bitmask of unlocked feat cheats -> docs/GAMEPLAY_MODS_RE.md
+003D1A74 g_ActiveViewportCount [V]  # Active player/viewport count (1..4) -> docs/LOD_CULLING_INVESTIGATION.md
+003D1C90 g_VisualCarList [V]  # Array of up to 20 active visual car pointers (count at 0x003D1CE0) -> docs/LOD_RUNTIME.md
+003D80E0 g_CheatMenuToggles [V]  # 8-entry int32 toggle array for the UI cheat menu -> docs/GAMEPLAY_MODS_RE.md
+003D8180 g_EventUnlockOverride [V]  # Non-zero unlocks all Action events in menus -> docs/GAMEPLAY_MODS_RE.md
+003DD658 g_DisplayAspectXScale [V]  # Horizontal projection scale (1.0 for 4:3, 0.75 for 16:9, 0.8333 for 16:10) -> docs/NATIVE_CAMERA_ASPECT.md
+004062A8 g_ViewCountLodFactors [V]  # Float[4] per-view-count LOD distance multipliers ({1.0, 1.0, 2.0, 2.0}) -> docs/LOD_CULLING_INVESTIGATION.md
+0044AE68 g_DetachablePanelSpecTable [V]  # 8-entry detachable car panel helper/group/threshold table -> docs/NASCAR_A2_RECOVERY.md
+00484E68 g_DetachedWheelPhobPool [V]  # 16-entry detached wheel phob pointer ring (count at 0x00484EA8, next at 0x00484EAC) -> docs/INDEX.md
+00485098 g_RecoveryConfigFlag [V]  # Vehicle recovery enable flag read by f_001B8370 -> docs/MANUAL_RECOVERY.md
+00494D60 g_DetachedPanelPhobPool [V]  # 16-entry detached body panel phob pointer pool (count at 0x00494DA0) -> docs/INDEX.md
+00495D58 g_DrawDistanceFar [V]  # Active world far clip / fog distance float (300 / 725 / 1150) -> docs/LOD_CULLING_INVESTIGATION.md
+00496E80 g_CareerState [V]  # Career state root (+0x10=cash, +0x1C8=rank, +0x2C4=garage, +0x3D4=stock[5]) -> docs/CAREER_UNLOCKS.md
+004A8AF8 g_PrizeUnlockBytes [V]  # 7-byte prize unlock bitmask array -> docs/GAMEPLAY_MODS_RE.md
+004A9830 g_TextureMip0CacheState [V]  # Dynamic .tm0 mip0 streaming pool state (+0x10=budget, +0x1C=base, +0x24=end) -> docs/TEXTURE_FORMAT_NOTES.md
+004CD31C g_CameraWorldPos [V]  # Active camera world position (vec3) -> docs/LOD_CULLING_INVESTIGATION.md
+004CD370 g_ProjectionNearFar [V]  # Active projection near (0x004CD370) and far (0x004CD374) planes -> docs/LOD_CULLING_INVESTIGATION.md
