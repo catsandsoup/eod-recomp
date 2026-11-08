@@ -35,3 +35,13 @@ then validate higher resolutions sequentially (2x, 4x, 6x); higher FPS follows.
 DLSS is explicitly last. Preserve faithful simulation/physics and verify solo/local
 multiplayer with real rendering outputs. Other mods remain deferred. Read
 `docs/DEVELOPER_HANDOFF.md` for the published branches and current acceptance gaps.
+
+## Product language — hard rule
+
+UI copy must identify something, explain a consequence, resolve uncertainty, or
+help recovery. Otherwise, delete it. This applies to UI, help, onboarding,
+marketing and release notes. Use language appropriate to commercial software
+and a human-led project. Do not narrate visible controls, paraphrase labels,
+reassure users about expected behavior, or fill empty space with explanations.
+Review every line with: “What would the player misunderstand without this text?”
+No concrete answer means remove it.

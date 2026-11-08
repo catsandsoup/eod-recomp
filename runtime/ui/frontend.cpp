@@ -529,7 +529,7 @@ void Menu::rows_online(std::vector<Row> &r) {
     using P = game_frontend::Snapshot::Phase;
     const bool connected = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
     Row st = info("status", "STATUS", connected ? upper(s.status.empty() ? "CONNECTED" : s.status) : "NOT CONNECTED",
-                  "Online play: one player hosts, the others join. Each player drives their own car on their own screen.");
+                  "");
     st.warn = !connected;
     st.good = connected;
     r.push_back(st);
@@ -540,7 +540,7 @@ void Menu::rows_online(std::vector<Row> &r) {
     }
     r.push_back(header(s.is_host ? "HOST LOBBY" : connected ? "SESSION" : "PLAY ONLINE"));
     if (!s.code.empty()) {
-        Row gc = info("gcode", "YOUR GARAGE CODE", s.code, "Tell your friends this code (Cmd+C copies it). They choose JOIN BY CODE and type or paste it.");
+        Row gc = info("gcode", "YOUR GARAGE CODE", s.code, "");
         gc.good = true;
         r.push_back(gc);
     }
@@ -554,42 +554,43 @@ void Menu::rows_online(std::vector<Row> &r) {
             r.push_back(pr);
         }
     }
-    if (!s.route.empty()) r.push_back(info("route", "INTERNET LINK", upper(s.route), "How friends outside your home network can reach you. Nothing to set up."));
+    if (!s.route.empty()) r.push_back(info("route", "INTERNET LINK", upper(s.route), ""));
     if (!connected) {
-        r.push_back(action("host", "HOST GAME", "[ HOST ]", "Hosts a lobby; friends join with the Garage Code shown here, or find you on the network."));
+        r.push_back(action("host", "HOST GAME", "[ HOST ]", ""));
         Row code = action("code", "JOIN BY CODE", text_id_ == "code" ? text_ + "_" : "[ ENTER CODE ]",
-                          "Type or paste (Cmd+V) the host's 5-character Garage Code, then Enter to join.");
+                          "5-character Garage Code.");
         code.kind = RowKind::Text;
         r.push_back(code);
         Row addr = action("addr", "JOIN BY ADDRESS", text_id_ == "addr" ? text_ + "_" : "[ ENTER ADDRESS ]",
-                          "Enter host:port for a direct connection.");
+                          "Example: 192.168.1.20:27015.");
         addr.kind = RowKind::Text;
         r.push_back(addr);
     }
-    Row ready = toggle("ready", "READY", s.ready, "", "Marks you ready in the lobby.");
+    Row ready = toggle("ready", "READY", s.ready, "", "");
     ready.enabled = connected && !s.is_host;
     if (s.phase == P::Lobby && !s.is_host) r.push_back(ready);
     if (s.is_host && (s.phase == P::Racing || s.phase == P::Loading)) {
         r.push_back(action("end_event", "BACK TO LOBBY", s.phase == P::Loading ? "[ CANCEL START ]" : "[ END RACE ]",
-                           "Ends the current race for everyone and returns the whole party to the lobby."));
+                           "Ends the race for everyone. Keeps the lobby open."));
     }
     const bool guest_in_race = !s.is_host && s.phase == P::Racing;
     Row leave = action("leave", s.is_host ? "CLOSE LOBBY" : guest_in_race ? "LEAVE MATCH" : "LEAVE / CANCEL",
                        guest_in_race ? "[ LEAVE RACE ]" : "[ DISCONNECT ]",
-                       guest_in_race ? "Leaves the match and returns you to the main menu while the others keep racing."
-                                     : "Leaves the lobby or cancels the connection.");
+                       guest_in_race ? "Disconnects you. Other players keep racing."
+                                     : "");
+    if (s.is_host) leave.help = "Disconnects everyone.";
     leave.enabled = connected || s.can_cancel;
 
-    if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, "Friends on your network see your game listed. Others can join by typing this address."));
+    if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, ""));
     if (!connected && !s.crew.empty()) {
         r.push_back(header("FRIENDS HOSTING NOW"));
         for (const auto &g : s.crew)
-            r.push_back(action(("crew:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", "Joins your friend's game. No code needed."));
+            r.push_back(action(("crew:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", ""));
     }
     if (!connected && !s.lan.empty()) {
         r.push_back(header("GAMES ON YOUR NETWORK"));
         for (const auto &g : s.lan)
-            r.push_back(action(("lan:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", "Joins this game."));
+            r.push_back(action(("lan:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", ""));
     }
     for (const auto &o : s.options) {
         if (o.editable) r.push_back(choice(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), "", o.help.c_str()));
@@ -597,12 +598,12 @@ void Menu::rows_online(std::vector<Row> &r) {
     }
     if (s.is_host && s.phase == P::Lobby) {
         Row start = action("start", "START EVENT", s.can_start ? "[ START ]" : "WAITING",
-                           s.can_start ? "Starts the selected event with this lobby." : s.status.c_str());
+                           s.can_start ? "" : s.status.c_str());
         start.enabled = s.can_start;
         r.push_back(start);
     }
     Row nick = action("nickname", "SCREEN NAME", text_id_ == "nickname" ? text_ + "_" :
-                      (cfg_.nickname.empty() ? "RANDOM" : cfg_.nickname), "Choose a nickname, or clear it for a random callsign.");
+                      (cfg_.nickname.empty() ? "RANDOM" : cfg_.nickname), "Leave blank for a random name.");
     nick.kind = RowKind::Text;
     r.push_back(nick);
     if (!connected) return;
@@ -612,15 +613,18 @@ void Menu::rows_online(std::vector<Row> &r) {
     r.push_back(mods);
 
     r.push_back(header("VOICE"));
-    Row mic = toggle("mic", "MICROPHONE", s.microphone_enabled, "LIVE", "Sends your voice to the lobby and race.");
+    Row mic = toggle("mic", "MICROPHONE", s.microphone_enabled, "LIVE", "");
     mic.enabled = connected && s.voice;
-    if (s.microphone_enabled && !s.microphone_capture)
+    if (s.microphone_enabled && !s.microphone_capture) {
         mic.value = s.deafened ? "DEAFENED" : "NO INPUT";
+        mic.help = s.deafened ? "Turn off Deafen to use your microphone."
+                             : "Check microphone permission and the selected input device.";
+    }
     r.push_back(mic);
-    Row mute = toggle("mute", "MUTE OTHERS", s.muted, "LIVE", "Stops playing the other players' voices.");
+    Row mute = toggle("mute", "MUTE OTHERS", s.muted, "LIVE", "");
     mute.enabled = connected && s.voice;
     r.push_back(mute);
-    Row deaf = toggle("deafen", "DEAFEN", s.deafened, "LIVE", "Mutes your microphone and all incoming voice.");
+    Row deaf = toggle("deafen", "DEAFEN", s.deafened, "LIVE", "Mutes your microphone and incoming voice.");
     deaf.enabled = connected && s.voice;
     r.push_back(deaf);
     if (s.is_host) {
@@ -629,7 +633,7 @@ void Menu::rows_online(std::vector<Row> &r) {
             const auto id = "kick:" + std::to_string(player.slot) + ":" + std::to_string(player.identity);
             r.push_back(action(id.c_str(), ("REMOVE " + upper(player.name)).c_str(),
                                remove_player_ == id ? "[ CONFIRM REMOVE ]" : "[ REMOVE ]",
-                               "Removes this player only. Select again to confirm; Back cancels."));
+                               "Disconnects this player."));
         }
     }
     if (connected || s.can_cancel) r.push_back(leave);

@@ -609,9 +609,9 @@ game_frontend::Snapshot Session::snapshot() const {
                           d.all_peers([](const Peer &p) { return p.at_menu && p.ready; });
             if (!s.can_start && s.phase == S::Phase::Lobby)
                 s.status = d.in_menu ? "Waiting for game data or players to be ready" : "Waiting for the game main menu";
-            s.options.push_back({"players","MAX PLAYERS",std::to_string(d.max_players),s.phase == S::Phase::Lobby,"Maximum lobby occupants including the host. The selected event also needs enough grid seats."});
-            s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, true, "The host chooses the track. Left/right changes it."});
-            s.options.push_back({"mode", "MODE", d.mode_name(), true, "The event everyone plays. The host chooses; left/right changes it."});
+            s.options.push_back({"players","MAX PLAYERS",std::to_string(d.max_players),s.phase == S::Phase::Lobby,"Includes the host. Race capacity depends on the event."});
+            s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, true, ""});
+            s.options.push_back({"mode", "MODE", d.mode_name(), true, ""});
         } else {
             for (auto &p : d.lobby_players) {
                 const bool spk = p.id < kMaxPlayers && t_now < d.speaking_until[p.id];
@@ -619,17 +619,16 @@ game_frontend::Snapshot Session::snapshot() const {
                 s.players.push_back({p.id, p.name + (p.id == local_id ? " (YOU)  " : "  ") + p.vname + "  " + std::to_string(p.ping) + "ms", p.ready, mtd, false, spk});
             }
             s.ready = d.guest_ready;
-            s.options.push_back({"players","MAX PLAYERS",std::to_string(d.max_players),false,"The host chooses the lobby capacity."});
-            s.options.push_back({"track", "TRACK", d.lobby_track, false, "The host chooses the track."});
-            s.options.push_back({"mode", "MODE", d.lobby_event, false, "The host chooses the event."});
+            if (s.phase == S::Phase::Lobby && s.ready) s.status = "Waiting for host";
+            s.options.push_back({"players","MAX PLAYERS",std::to_string(d.max_players),false,"Host only."});
+            s.options.push_back({"track", "TRACK", d.lobby_track, false, "Host only."});
+            s.options.push_back({"mode", "MODE", d.lobby_event, false, "Host only."});
         }
-        s.options.push_back({"car", "YOUR CAR", d.my_model.empty() ? "Loading game data..." : d.my_model, true, "Your own car. Left/right changes it; everybody picks their own."});
-        s.options.push_back({"paint", "PAINT", d.my_model.empty() ? "-" : "PAINT " + std::to_string(d.my_paint + 1) + " OF " + std::to_string(std::max<size_t>(1, session_catalog::paints(d.my_model).size())), true, "The paint of your car."});
+        s.options.push_back({"car", "YOUR CAR", d.my_model.empty() ? "Loading game data..." : d.my_model, true, ""});
+        s.options.push_back({"paint", "PAINT", d.my_model.empty() ? "-" : "PAINT " + std::to_string(d.my_paint + 1) + " OF " + std::to_string(std::max<size_t>(1, session_catalog::paints(d.my_model).size())), true, ""});
         for (const auto &opt : Impl::rule_options)
             s.options.push_back({opt.id,opt.label,(d.rules & opt.bit) ? "ON" : "OFF",s.is_host,
-                                 "The host sets this for every driver before starting."});
-        if (s.phase == S::Phase::Lobby) s.options.push_back({"info", "HOW IT STARTS", "HOST PRESSES START", false,
-                             "START loads the event straight away on every machine, each player in their own car."});
+                                 "Applies to all players. Locked during the race."});
     }
     if (s.phase != S::Phase::Lobby) for (auto &o : s.options) o.editable = false;
     uint64_t t = now_us();
