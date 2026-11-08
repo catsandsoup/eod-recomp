@@ -33,6 +33,8 @@
 
 ![Battle message reading "You were killed by Kevin Valinski."](docs/img/battle-kill-message-named-rival.jpg)
 
+![A school bus T-bones the Phantom under a floodlit suspension bridge in an 8-AI night battle](docs/img/school-bus-battle-floodlit-bridge.jpg)
+
 ![Battle event list showing 1v1, 4 AI and 8 AI battles on the Woodly demolition map](docs/img/battle-event-list.jpg)
 
 ### Bonus cars
@@ -40,7 +42,7 @@
 * **The Phantom.** A mean, black-and-white new ride for the demolition derby.
 * **A NASCAR stock car.** Take a Cup-style racer through the mud. It crumples, sheds bumpers and panels, and casts a proper shadow, just like the original cars. More are on the way.
 
-![Bonus NASCAR stock car launching off a dirt jump in Eve of Destruction](docs/img/nascar-stock-car-bonus.jpg)
+![The bonus #24 NASCAR stock car trading paint with a station wagon in a night battle](docs/img/nascar-stock-car-night-battle.jpg)
 ![The bonus Phantom car lining up at the start of a race](docs/img/phantom-bonus-car.jpg)
 
 ### A modern menu that looks like the original
