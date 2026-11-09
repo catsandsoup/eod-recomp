@@ -93,3 +93,15 @@
 003702F0 wrap     # dealer car list: per-frame selection details; tells career_vblank the dealer screen is up (page banner)
 001741C0 wrap     # Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck
 00114358 wrap     # Finish one online contest after native race cleanup
+0036E9C0 wrap     # dealer Buy screen: pass-through to MenuRun loop
+00370DD8 wrap     # dealer get_slot_for_car: maps vehicle to yard slot without panicking
+0016F4E8 wrap     # HomebaseGetSlotForCar: maps car index to homebase lot slot safely
+0016F748 wrap     # HomebaseGetBuySlotForCar: maps car to homebase buy slot 0..4 without asserting
+
+001C31A0 wrap     # CameraDirectorUpdate: injects 360 orbit & turntable in showroom/garage
+001D2DC8 wrap     # CameraDirectorPlayTrack: tracks active clip track
+002DFDF8 wrap     # Career part compatibility bitmask lookup: universal cross-class part fitting
+002DED18 wrap     # Career part purchase validation: multi-stage upgrades and category swapping
+002E1BB0 wrap     # Career garage car count: extended garage slots (up to 16 cars)
+002E1BC0 wrap     # Career add car to garage: routes vehicles 4..15 into extended garage
+002E1380 wrap     # Career get car tuning block: tuning parameters for extended garage slots

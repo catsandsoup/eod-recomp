@@ -78,9 +78,15 @@ $10,000 rather than $9,999 because the dearest car (Rocket) costs $10,000.
   five slots (ASCarList indices at `0x4AB130`, vehicles in `out[5]`) by one page of a list of **every chassis**
   in ASChassisList, cheapest first (so Phantom and the Cup car, price 1200, are on page 5 and the Rocket on the
   last page); the paint job shown rotates with every page turn, so every ASCarList entry shows up. Native prices.
-* **L2 / R2 on the dealer screen** turn the page: the hub menu (all Homebase places, built once by
-  `f_003698E8`) is built again into the same descriptor, from the dealer's per-frame callback `f_003702F0`
-  (which only runs while the dealer's car list is up), and the callback's cached selection is cleared.
+* **Live dealer paging (L2 / R2, L1 / R1, Q / E, 1 / 3, Left / Right)**:
+  `f_0036E9C0` (the Buy car screen) is wrapped to capture its local stack frame pointer while active.
+  When the player presses page-cycling controls (`PAD_L2`, `PAD_L1`, `PAD_LEFT` for previous page;
+  `PAD_R2`, `PAD_R1`, `PAD_RIGHT` for next page), `career_vblank` queues a page delta.
+  The dealer's per-frame callback `f_003702F0` applies the turn: it calls `fill_dealer(0)` to update
+  `kShopSlots` (0x4AB130), writes the new 5 car names, formatted prices, `ASCarList` indices, and widget
+  result values directly into the active stack frame, and invalidates the cached selection (`0x004DD388 + 0x280`).
+  `f_00370DD8` (`get_slot_for_car`) is wrapped so that off-page cars focus the highlighted lot bay
+  smoothly without asserting in the native code or panic handlers.
 * The garage keeps its four slots (`0xC68` bytes of CDBupgr is exactly the 0x68 header plus four 0x300 slots, so
   a bigger garage means a new save layout; not done). FreeSwap: `f_002E3BC8` (depreciation by condition, used
   when selling and trading in through `f_002E3F20` / `f_002E4178`) returns 0: the full chassis and parts price

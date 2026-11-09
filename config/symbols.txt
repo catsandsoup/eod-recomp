@@ -1,25 +1,3 @@
-# Known symbols in SLUS_209.10 (Test Drive: Eve of Destruction, PS2 NTSC-U).
-#
-# Format:
-#   <hex_addr> <SymbolName> [V|I]  # <description> [-> docs/<file>.md]
-#
-# Confidence tags:
-#   [V] Verified from retail debug strings, Sony PS2SDK / newlib signatures,
-#       or runtime-traced HLE contracts.
-#   [I] Inferred from call-graph structure, register/struct layouts, and caller
-#       behavior.
-#
-# Consumed by:
-#   - tools/recomp.py : emits function header comments and inline /* Name */
-#                       comments at jal call sites in gen/rec_*.c.
-#   - tools/dis.py    : displays symbol names, confidence tags, and notes in
-#                       disassembly listings and operand annotations.
-#
-#Subsystem index: see docs/INDEX.md.
-
-# ---------------------------------------------------------------------------
-# 0x00100000 - 0x0012FFFF : Entry, HUD, Event / Roster Tables, Memory & RNG
-# ---------------------------------------------------------------------------
 00100008 _start [V]  # ELF entry point -> docs/INDEX.md
 00100138 main [V]  # Game main(argc, argv); boots IOP, mounts archives, runs frame loop -> docs/INDEX.md
 0010AFA0 EventTypeGetDisplayName [V]  # Resolves event-type ID to localized display string; wrapped for Battle (4 AI)/(8 AI) -> docs/BATTLE_RECOVERY.md
@@ -34,6 +12,7 @@
 001252C0 EveGetContestDisplayName [V]  # Returns display title for an Eve contest entry -> docs/BATTLE_RECOVERY.md
 0012AEF0 RosterSelectContest [V]  # Records active contest before resolving AI car descriptions -> docs/BATTLE_RECOVERY.md
 0012C158 RosterBuildEventParticipants [V]  # Builds participant slot count and AI fill for an event -> docs/BATTLE_RECOVERY.md
+0012C898 CarStatsLookup [V]  # Looks up 20-byte CarStatsEntry by chassis name string -> docs/CAREER_UPGRADES_DECOMPILATION.md
 0012C940 PointsRosterLoad [V]  # Parses points-based track/car unlock roster -> docs/GAMEPLAY_MODS_RE.md
 0012CAB8 PointsRosterUnlockAll [V]  # Sets unlocked flag on all loaded rows in g_PointsUnlockRoster -> docs/GAMEPLAY_MODS_RE.md
 0012CC40 TrackPickerIsUnlocked [V]  # Checks whether a track row is unlocked in g_PointsUnlockRoster -> docs/GAMEPLAY_MODS_RE.md
@@ -47,10 +26,6 @@
 001323E8 ResLoadAsset [V]  # Loads asset from mounted .car/.trk/.res archive into memory pool -> docs/LOD_CULLING_INVESTIGATION.md
 00134A70 TrackRelocateSectionTable [I]  # Relocates loaded track section pointers in place -> docs/BATTLE_RECOVERY.md
 00138288 DriverFactoryCreate [V]  # Creates human/AI/null driver controller for a participant slot -> docs/GAMEPLAY_MODS_RE.md
-
-# ---------------------------------------------------------------------------
-# 0x00150000 - 0x0017FFFF : Track Sections, Battle Mode, Race Loop & Weapons
-# ---------------------------------------------------------------------------
 001515B8 TrackLookupBattleSection [V]  # Looks up c_battle section for a track; wrapped to supply Welch Battle table -> docs/BATTLE_RECOVERY.md
 00166B50 BattleDrawKillMessages [V]  # Draws HUD kill attribution banner during Battle matches -> docs/BATTLE_RECOVERY.md
 00166C38 BattleCreate [V]  # Allocates and initializes BattleMaster match controller -> docs/BATTLE_RECOVERY.md
@@ -76,10 +51,6 @@
 0017E5C8 ChickenWeaponUpdate [V]  # Advances projectile flight, reload state machine, and collision checks -> docs/BATTLE_RECOVERY.md
 0017E718 ChickenWeaponDetonate [V]  # Triggers explosion SFX, particle burst, and radial shockwave at impact point -> docs/BATTLE_RECOVERY.md
 0017EA10 ChickenWeaponInit [V]  # Initializes projectile scene nodes, SFX handles, and weapon registry entry -> docs/BATTLE_RECOVERY.md
-
-# ---------------------------------------------------------------------------
-# 0x00180000 - 0x001FFFFF : Cars, Damage, Deformation, Recovery & Debris Phobs
-# ---------------------------------------------------------------------------
 00188F20 CarResetForRespawn [V]  # Clears velocity, repairs damage/wheels/panels, and resets deform bones -> docs/BATTLE_RECOVERY.md
 0018AA80 CarSetSteering [V]  # Writes normalized steering angle [-1, 1] to car+0x1B6C -> docs/BATTLE_RECOVERY.md
 0018AAD0 CarCanTakeDamage [V]  # Returns whether car can take damage in current mode; traced by EOD_CAREER_TRACE -> docs/CAREER_UNLOCKS.md
@@ -103,10 +74,6 @@
 001E1E88 DetachedPanelSpawn [V]  # Spawns detached hood/door/bumper/fender/decklid phob into 0x00494D60 -> docs/INDEX.md
 001E25C8 DetachedPanelPhobUpdate [V]  # Steps detached panel rigid body physics and ground contacts -> docs/INDEX.md
 001E29C0 DetachedPanelPoolClear [V]  # Releases all detached panel phobs in 0x00494D60 -> docs/INDEX.md
-
-# ---------------------------------------------------------------------------
-# 0x00200000 - 0x0022FFFF : Animation, Scene Graph, Camera, LOD & Car Models
-# ---------------------------------------------------------------------------
 00205218 FeatsUnlockAllCheats [V]  # Writes 0xFFFFFFFF to g_FeatCheatUnlockMask (0x003D18E4) -> docs/GAMEPLAY_MODS_RE.md
 00205368 FeatsGetCompletedUnion [V]  # Returns union of completed feat bits across career/profile -> docs/GAMEPLAY_MODS_RE.md
 0020D220 MRAnimCreate [V]  # Creates skeletal animation instance ("mrAnim: num_bones < 60"); checked by EOD_HEAP_CHECK -> docs/INDEX.md
@@ -127,10 +94,6 @@
 00220788 WheelSelectSlowOrFastModel [V]  # Chooses 3D slow wheel mesh vs card fast wheel by speed/LOD; wrapped for Cup wheels -> docs/NASCAR_CUP_WHEELS.md
 00227EE8 ChickenWeaponCreateForCar [V]  # Constructs and registers a chicken launcher for car slot -> docs/BATTLE_RECOVERY.md
 00270C10 MenuRun [I]  # Runs one menu screen to a result; wrapped to auto-answer the Arcade single/multi prompt for online events -> docs/NETPLAY_STATE_SYNC.md
-
-# ---------------------------------------------------------------------------
-# 0x002A0000 - 0x002FFFFF : Frontend Menus, Career Mode, AutoShop & Eves
-# ---------------------------------------------------------------------------
 002A1298 MainMenuUpdate [V]  # Main menu state machine; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002A75E0 SinglePlayerCarSelectUpdate [V]  # Action/Single car selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002B6DB8 CheatExecuteMasterUnlock [V]  # Master unlock helper calling track, feat, Eve, and Dare unlock routines -> docs/GAMEPLAY_MODS_RE.md
@@ -142,19 +105,24 @@
 002C7340 SinglePlayerTrackSelectUpdate [V]  # Action/Single track selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002CD418 CareerUnlockAllVenueEves [V]  # Unlocks all Eve events across Career venues -> docs/GAMEPLAY_MODS_RE.md
 002D58E8 CareerFreeRoamRun [V]  # Runs Career dirt free-roam / challenge driving loop; wrapped by EOD_CAREER_EVE -> docs/CAREER_UNLOCKS.md
+002DED18 AutoShopPurchasePart [V]  # Validates and purchases an upgrade part; wrapped by MultiStageUpgrades -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002DFDF8 AutoShopGetClassPartMask [V]  # Returns 32-bit part eligibility bitmask for chassis class -> docs/CAREER_UPGRADES_DECOMPILATION.md
 002E0948 CareerGetPlayerCash [V]  # Returns current Career cash balance from 0x00496E90 -> docs/CAREER_UNLOCKS.md
 002E0958 CareerAddPlayerCash [V]  # Adds delta to Career cash balance (clamped to [0, 9999999]) -> docs/CAREER_UNLOCKS.md
 002E0F10 CareerGetPlayerRank [V]  # Returns player rank index in 0x00497048; wrapped by CareerRank -> docs/CAREER_UNLOCKS.md
+002E1380 CDBupgr_GetCarTuningBlock [V]  # Copies 0x4C-byte CarTuningBlock for car slot -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002E1870 CDBupgr_GetCarPart [V]  # Queries installed part key for car slot and category -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002E18E0 CDBupgr_RemovePart [V]  # Removes installed part from car slot and category -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002E1960 CDBupgr_AddPart [V]  # Appends installed part record to CDBupgr -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002E1BB0 CareerGetGarageCarCount [V]  # Returns number of cars currently owned in garage -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002E1BC0 CareerAddCarToGarage [V]  # Allocates and initializes new 0x300-byte garage slot -> docs/CAREER_UPGRADES_DECOMPILATION.md
+002E2708 AutoShopGetVehicleStats [V]  # Computes ratings and applies +1 per installed category -> docs/CAREER_UPGRADES_DECOMPILATION.md
 002E35F0 AutoShopSetAvailable [V]  # Builds 5-slot dealer stock array at 0x00497254; wrapped by AllCars with L1/R1 paging -> docs/CAREER_UNLOCKS.md
 002E3BC8 CareerCalcTradeInDepreciation [V]  # Computes 10% trade-in depreciation; wrapped by FreeSwap to return 0 -> docs/CAREER_UNLOCKS.md
 002E3E70 CareerGetOwnedCarResaleValue [V]  # Computes 90% resale value of owned car; wrapped by FreeSwap for 100% refund -> docs/CAREER_UNLOCKS.md
 002E5200 CareerIsEveRankEligible [V]  # Tests whether player rank qualifies for an Eve; wrapped by OpenCareer -> docs/CAREER_UNLOCKS.md
 002E5758 CareerLoadChallengesVal [V]  # Loads challenges.val / home_challenges.val into 0x003CD910; wrapped by OpenCareer -> docs/CAREER_UNLOCKS.md
 002E6C78 CareerApplyPostEveRank [V]  # Applies new player rank after an Eve; wrapped by CareerRank to prevent forced retirement -> docs/CAREER_UNLOCKS.md
-
-# ---------------------------------------------------------------------------
-# 0x00330000 - 0x0037FFFF : Logging, StreamFS, Projection, Culling, Textures & UI
-# ---------------------------------------------------------------------------
 00331DF0 Panic [V]  # Fatal error handler panic(fmt, ...); logs message and halts -> docs/INDEX.md
 00331E48 DebugPrintf [V]  # Retail stripped debug printf(fmt, ...); replaced by runtime logger (--log game) -> docs/INDEX.md
 00337718 TimerGetMs [V]  # Returns elapsed timer milliseconds; wrapped to skip artificial post-load & memory card wait loops -> docs/INDEX.md
@@ -180,10 +148,6 @@
 003670C8 MoviePlay [V]  # Plays PSS/IPU full-motion video by name; wrapped for EOD_SKIP_MOVIES -> docs/INDEX.md
 003698E8 HomebaseBuildMenu [V]  # Builds Homebase hub / AutoShop / Garage / Challengers UI menu list -> docs/CAREER_UNLOCKS.md
 003702F0 AutoShopUpdateSelection [V]  # Per-frame AutoShop car list update; wrapped to turn dealer pages on L1/R1 -> docs/CAREER_UNLOCKS.md
-
-# ---------------------------------------------------------------------------
-# 0x00380000 - 0x003BC290 : PS2SDK Kernel, SIF/DMA, libpad, libmc, IOP & libc
-# ---------------------------------------------------------------------------
 00381BB8 ResetEE [V]  # PS2SDK syscall 0x01
 00381BC8 SetGsCrt [V]  # PS2SDK syscall 0x02 (interlace, display mode, frame/field)
 00381BD8 Exit [V]  # PS2SDK syscall 0x04
@@ -240,10 +204,6 @@
 003A7620 strcmp [V]  # newlib strcmp
 003A77C8 strcpy [V]  # newlib strcpy
 003A79A0 strlen [V]  # newlib strlen
-
-# ---------------------------------------------------------------------------
-# 0x003C0000 - 0x004CD384 : Verified Global Variables & Runtime Tables
-# ---------------------------------------------------------------------------
 003C4190 g_CheatMask [V]  # Active gameplay cheat bitmask (bit 0=master, 1=turbo, 3=weapon, 4=mortar, 8=onehit) -> docs/GAMEPLAY_MODS_RE.md
 003C4370 g_HudLeftQueueX [V]  # Left race HUD anchor X coordinate -> docs/HUD_EDGE_ANCHORS.md
 003C4600 g_HudRightQueueX [V]  # Right race HUD anchor X coordinate -> docs/HUD_EDGE_ANCHORS.md

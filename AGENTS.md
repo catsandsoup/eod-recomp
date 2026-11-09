@@ -45,3 +45,15 @@ and a human-led project. Do not narrate visible controls, paraphrase labels,
 reassure users about expected behavior, or fill empty space with explanations.
 Review every line with: “What would the player misunderstand without this text?”
 No concrete answer means remove it.
+Never use redundant instructional copy in the UI where buttons and logic already dictate functionality.
+
+## Verification Rule: Real Game Testing Only (Hard Enforcement)
+
+Never rely on synthetic unit tests or mocked RAM harnesses alone to declare work complete. Passing synthetic tests (ctest, *_test.exe) verifies only isolated compilation; it does NOT establish player success or absence of crashes, stack corruption, or asset desynchronization.
+
+Every code change, fix, and feature MUST be verified against the real game:
+1. Build eod.exe via ninja -C build eod.
+2. Deploy to the real extracted game directory: D:\Test Drive - Eve of Destruction (USA)\eod.exe.
+3. Launch the actual game process with real retail disc assets (DATA/, SLUS_209.10, eod.ini).
+4. Verify the player experience end-to-end (game boot, menu navigation, 3D world state, memory allocator integrity, scene transitions, and clean exit without panics).
+5. Reports without real in-game execution evidence are strictly forbidden.

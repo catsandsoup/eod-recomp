@@ -170,6 +170,9 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "AllCars")) c.career_all_cars = to_bool(v);
             else if (ieq(k, "FreeSwap")) c.career_free_swap = to_bool(v);
             else if (ieq(k, "KillableChallengers")) c.career_killable = to_bool(v);
+            else if (ieq(k, "UniversalParts") || ieq(k, "CareerUniversalParts")) c.career_universal_parts = to_bool(v);
+            else if (ieq(k, "MultiStageUpgrades") || ieq(k, "CareerMultiStage")) c.career_multistage_upgrades = to_bool(v);
+            else if (ieq(k, "GarageExpansion") || ieq(k, "CareerGarageExpansion")) c.career_garage_expansion = to_bool(v);
         } else if (ieq(section, "Mods")) {
             if (!k.empty()) {
                 bool found = false;
@@ -211,6 +214,9 @@ bool config_load(const std::string &path, Config &c) {
     if (const char *e = getenv("EOD_ALL_CARS")) c.career_all_cars = to_bool(e);
     if (const char *e = getenv("EOD_FREE_SWAP")) c.career_free_swap = to_bool(e);
     if (const char *e = getenv("EOD_KILLABLE_CHALLENGERS")) c.career_killable = to_bool(e);
+    if (const char *e = getenv("EOD_UNIVERSAL_PARTS")) c.career_universal_parts = to_bool(e);
+    if (const char *e = getenv("EOD_MULTISTAGE_UPGRADES")) c.career_multistage_upgrades = to_bool(e);
+    if (const char *e = getenv("EOD_GARAGE_EXPANSION")) c.career_garage_expansion = to_bool(e);
 
     return file_loaded;
 }
@@ -283,6 +289,9 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "AllCars=%d            ; 1: the Career dealer pages through every car, Phantom and the Cup car included\n", c.career_all_cars ? 1 : 0);
     fprintf(f, "FreeSwap=%d           ; 1: selling or trading a Career car refunds its full price\n", c.career_free_swap ? 1 : 0);
     fprintf(f, "KillableChallengers=%d; 1: Highway and Malt Shop challengers in Career free roam can be wrecked\n", c.career_killable ? 1 : 0);
+    fprintf(f, "UniversalParts=%d     ; 1: allow any upgrade part to be installed on any chassis regardless of class\n", c.career_universal_parts ? 1 : 0);
+    fprintf(f, "MultiStageUpgrades=%d ; 1: allow multi-stage tuning (stages 1-5, aero, brakes) with auto-swap refund\n", c.career_multistage_upgrades ? 1 : 0);
+    fprintf(f, "GarageExpansion=%d    ; 1: expand career garage capacity from 4 to 16 slots with UI pagination\n", c.career_garage_expansion ? 1 : 0);
     fprintf(f, "\n[Mods]\n; MODS tab: <mod folder>=1 (on) or 0 (off), in load order; a mod not listed is on\n");
     for (const auto &m : c.mods) {
         // ids the ini syntax cannot carry are simply not remembered

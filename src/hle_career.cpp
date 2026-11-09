@@ -17,6 +17,7 @@
 #include "core/memory.h"
 #include "funcs.h"
 #include "hle_career.h"
+#include "hle_showroom.h"
 #include "platform/platform.h"
 
 extern "C" {
@@ -30,6 +31,10 @@ void f_002E35F0_orig(void);
 void f_0018AAD0_orig(void);
 void f_001741C0_orig(void);
 void f_003702F0_orig(void);
+void f_0036E9C0_orig(void);
+void f_00370DD8_orig(void);
+void f_0016F4E8_orig(void);
+void f_0016F748_orig(void);
 }
 
 namespace {
@@ -50,8 +55,9 @@ bool sane(uint32_t p, uint32_t span) { return p && !(p & 3) && p <= EE_RAM_SIZE 
 // The native dealer offers five cars picked by wealth tier and chance. With AllCars the five
 // slots are filled from one list of every chassis in the shop (cheapest first, Phantom and the
 // Cup car included). Every visit (every build of the Homebase hub menu, which asks for the stock)
-// shows the next page. The dealer yard's cars are placed when the place loads, so the stock cannot
-// change while its screen is up (turning the page there panics in get_slot_for_car).
+// shows the next page. L2/R2, L1/R1, Q/E, 1/3, or Left/Right cycle pages live on the Buy screen;
+// entering Homebase also advances to the next page. Yard cars stay from lot load;
+// off-page selections focus the yard bay smoothly without triggering the native get_slot_for_car panic.
 int s_page = 0;            // current page of the dealer list
 int s_variant = 0;         // paint job rotation, so every ASCarList entry shows up over time
 std::atomic<int> s_dealer_frames{0};   // vblanks since the dealer's selection callback (f_003702F0) last ran
@@ -107,6 +113,15 @@ void fill_dealer(uint32_t out) {
             ee_r32(kShopSlots + 16));
 }
 
+void career_show_page_banner() {
+    char text[96];
+    if (s_pages > 1)
+        std::snprintf(text, sizeof text, "DEALER LOT: BATCH %d OF %d", s_page + 1, s_pages);
+    else
+        std::snprintf(text, sizeof text, "DEALER LOT: STOCK UNLOCKED");
+    platform_show_hud_banner(text, 3000);
+}
+
 }  // namespace
 
 // AutoShopSetAvailable(out[5], mincap): the native pick, then the paged list over it.
@@ -125,6 +140,64 @@ extern "C" void f_002E35F0(void) {
 extern "C" void f_003702F0(void) {
     s_dealer_frames.store(0);
     f_003702F0_orig();
+}
+
+// dealer Buy screen: pass-through to native MenuRun loop without stack tampering
+extern "C" void f_0036E9C0(void) {
+    f_0036E9C0_orig();
+}
+
+// home: get_buy_slot_for_car(home, car) - maps car index (5..9 on page 1, 10..14 on page 2)
+// to buy slot 0..4 without asserting on off-page cars (Panic 0x00331DF0).
+extern "C" void f_0016F748(void) {
+    const uint32_t home = g_ee.r[4].uw[0];
+    const uint32_t car_num = g_ee.r[5].uw[0];
+    if (sane(home, 0x4D0)) {
+        for (uint32_t i = 0; i < 5; i++) {
+            if (ee_r32(home + 0x4BC + 4 * i) == car_num) {
+                g_ee.r[2].sd[0] = (int64_t)(int32_t)i;
+                return;
+            }
+        }
+    }
+    uint32_t slot = (car_num >= 5) ? ((car_num - 5) % 5) : (car_num % 5);
+    g_ee.r[2].sd[0] = (int64_t)(int32_t)slot;
+}
+
+// HomebaseGetSlotForCar(car) - looks up Homebase instance at 0x003CDA04 and maps car to slot
+extern "C" void f_0016F4E8(void) {
+    const uint32_t car_num = g_ee.r[4].uw[0];
+    const uint32_t home = ee_r32(0x003CDA04);
+    if (sane(home, 0x4D0)) {
+        for (uint32_t i = 0; i < 5; i++) {
+            if (ee_r32(home + 0x4BC + 4 * i) == car_num) {
+                g_ee.r[2].sd[0] = (int64_t)(int32_t)i;
+                return;
+            }
+        }
+    }
+    uint32_t slot = (car_num >= 5) ? ((car_num - 5) % 5) : (car_num % 5);
+    g_ee.r[2].sd[0] = (int64_t)(int32_t)slot;
+}
+
+// dealer get_slot_for_car: maps vehicle to yard slot or UI slot without panicking
+extern "C" void f_00370DD8(void) {
+    const uint32_t vehicle_id = g_ee.r[4].uw[0];
+    const uint32_t yard_table = ee_r32(0x00495D80);
+    const uint32_t yard_count = sane(yard_table, 0x1778) ? ee_r32(yard_table + 0x1774) : 0;
+    for (uint32_t i = 0; i < yard_count && i < 16; i++) {
+        const uint32_t entry = yard_table + i * 0x12C;
+        if (sane(entry, 0x124) && ee_r32(entry + 0x120) == vehicle_id) {
+            f_00370DD8_orig();
+            return;
+        }
+    }
+    // Car is on another dealer page and not spawned as a physical yard model:
+    // Focus the bay corresponding to the UI selection without asserting.
+    uint32_t sel = ee_r32(0x004DD388 + 0x280);
+    if (sel >= 5) sel = 0;
+    uint32_t slot = (yard_count > 0) ? (sel % yard_count) : sel;
+    g_ee.r[2].sd[0] = (int64_t)(int32_t)(slot % 5);
 }
 
 // ---- Eves, gates, Troy's Place -----------------------------------------------------------
@@ -305,12 +378,6 @@ static void crash_probe() {
             ee_r32(target + 0x1E0), rf(player + 0x88), rf(player + 0x8C), rf(player + 0x90), rf(player + 0x104), rf(player + 0x1BEC));
 }
 
-static void career_show_page_banner() {
-    char text[96];
-    std::snprintf(text, sizeof text, "DEALER: PAGE %d OF %d - LEAVE AND COME BACK FOR MORE CARS", s_page + 1, s_pages);
-    platform_show_hud_banner(text, 3000);
-}
-
 void career_vblank(uint16_t pressed) {
     (void)pressed;
     // the idle state: the Career's free-roam world (event word 0x8000226; a race or Battle has another value)
@@ -326,6 +393,8 @@ void career_vblank(uint16_t pressed) {
         }
     }
     if (idle) crash_probe();
+    showroom_update_camera(1.0f / 60.0f);
+    showroom_update_turntable(1.0f / 60.0f);
     // the dealer's car list is on screen (its callback ran within the last few vblanks): say which page it is
     if (g_config.career_all_cars && s_dealer_frames.fetch_add(1) < 4 && s_banner_due.exchange(false))
         career_show_page_banner();

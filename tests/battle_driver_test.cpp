@@ -2,6 +2,7 @@
 #include "battle_driver.h"
 #include "battle_layout.h"
 #include "core/cpu.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

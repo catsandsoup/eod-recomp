@@ -83,6 +83,9 @@ struct Config {
     bool career_all_cars = true;       // the dealer pages through every car (Phantom and the Cup car included)
     bool career_free_swap = true;      // selling or trading a car refunds its full price
     bool career_killable = true;       // highway and Malt Shop challengers in Career free roam can be wrecked
+    bool career_universal_parts = true; // allow any engine, turbo, or suspension part on any chassis
+    bool career_multistage_upgrades = true; // multi-stage tuning (stages 1-5, aero, brakes) with auto-swap refunds
+    bool career_garage_expansion = true; // expand garage from 4 to 16 slots with UI pagination
     // [Mods] the MODS tab: each listed mod's id and whether it is on, in load order. A mod with no
     // entry is on, so a missing or partial file leaves everything enabled.
     std::vector<std::pair<std::string, bool>> mods;
