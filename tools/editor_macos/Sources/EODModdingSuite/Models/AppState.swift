@@ -83,8 +83,13 @@ enum RuntimePaths {
     static var repository: URL {
         if let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),
            let data = try? Data(contentsOf: resource),
-           let config = try? JSONDecoder().decode([String: String].self, from: data),
-           let root = config["repository"] { return URL(fileURLWithPath: root) }
+           let config = try? JSONDecoder().decode([String: String].self, from: data) {
+            if config["portable"] == "1" {
+                return FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Application Support/EODCreationKit")
+            }
+            if let root = config["repository"] { return URL(fileURLWithPath: root) }
+        }
         var source = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { source.deleteLastPathComponent() }
         return source
@@ -94,6 +99,9 @@ enum RuntimePaths {
               let data = try? Data(contentsOf: resource),
               let config = try? JSONDecoder().decode([String: String].self, from: data)
         else { return "" }
+        if let relative = config["bundledGameExecutable"], let resources = Bundle.main.resourceURL {
+            return resources.appendingPathComponent(relative).path
+        }
         return config["gameExecutable"] ?? ""
     }
     static var initialProject: String? {
