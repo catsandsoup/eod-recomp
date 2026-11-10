@@ -13,6 +13,7 @@ let package = Package(
         .executableTarget(
             name: "EODModdingSuite",
             path: "Sources/EODModdingSuite"
-        )
+        ),
+        .testTarget(name: "StudioTests", dependencies: ["EODModdingSuite"], path: "Tests")
     ]
 )
