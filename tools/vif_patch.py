@@ -53,7 +53,7 @@ def scan_part(data, part):
     cl = wl = 1
     mode = mask = 0
     row = [0] * 4
-    recs, batches = [], []
+    recs, batches, users, row_off = [], [], Counter(), -1
     p, end = part['offset'] + 0x38, part['offset'] + part['size']
     while p + 4 <= end:
         w = u32(data, p)
@@ -64,7 +64,8 @@ def scan_part(data, part):
             n = num or 256
             bpe = 2 if vl == 3 else [4, 2, 1][vl] * (vn + 1)
             recs.append(dict(addr=imm & 0x3FF, vn=vn, vl=vl, n=n, off=p, cl=cl, wl=wl, mode=mode,
-                             mask=mask if (cmd >> 4) & 1 else 0, row=list(row)))
+                             mask=mask if (cmd >> 4) & 1 else 0, row=list(row), row_off=row_off))
+            users[row_off] += 1
             p += (n * bpe + 3) & ~3
         elif cmd == 0x01:
             cl, wl = imm & 0xFF, (imm >> 8) & 0xFF
@@ -75,6 +76,7 @@ def scan_part(data, part):
         elif cmd in (0x30, 0x31):
             if cmd == 0x30:
                 row = list(struct.unpack_from('<4I', data, p))
+                row_off = p
             p += 16
         elif cmd in (0x14, 0x15, 0x17):
             batches.append(_batch(data, recs, imm if cmd != 0x17 else -1))
@@ -85,6 +87,10 @@ def scan_part(data, part):
             p += imm * 16
         elif cmd not in (0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x11, 0x13):
             raise PatchError('unknown VIF cmd %02x at %x' % (cmd, p - 4))
+    for b in batches:
+        for role in ('pos', 'uv'):
+            if role in b:
+                b[role]['shared'] = users[b[role]['row_off']] > 1
     return batches
 
 
@@ -114,7 +120,7 @@ def _batch(data, recs, mscal):
         if not ok:
             b['unsupported'].append(role)
             continue
-        b[role] = dict(off=r['off'], stride=stride, cl=r['cl'], row=r['row'][:3 if role == 'pos' else 2], bits=8 * size)
+        b[role] = dict(off=r['off'], stride=stride, cl=r['cl'], row=r['row'][:3 if role == 'pos' else 2], bits=8 * size, row_off=r['row_off'])
     if 'off' in slots and slots['off']['n'] >= 2 and slots['off']['mode'] == 0:
         b['q198'] = slots['off']['off']
         b['q199'] = slots['off']['off'] + 16
@@ -237,7 +243,9 @@ def export_model(data, obj_path, member='', archive=''):
 def parse_obj(path):
     """Objects -> {'v': [...], 'vt': {corner->..}, faces: [[(v,vt,vn)...]]} with part-local indices."""
     V, VT, VN, objs, cur = [], [], [], {}, None
-    for line in open(path):
+    with open(path) as fh:
+        lines = fh.read().split('\n')
+    for line in lines:
         t = line.split()
         if not t:
             continue
@@ -270,22 +278,36 @@ def canon(tri):
 
 # ----------------------------------------------------------------------------- encode
 
-def _fit_lane(vals, base_bits, off, ulp, bits, clamp, what):
-    """vals: desired decoded values per vertex. Returns (u list, new_off or None)."""
-    base = fbits(base_bits)
-    us = [(x - off - base) / ulp for x in vals]
+def _fit_lane(vals, row, off, bits, shared, clamp, what):
+    """Re-encode one lane. Returns (u list, new_off|None, new_rowbits|None).
+    Order: keep row+offset; else shift offset by whole ulps; else raise the row exponent (coarser ulp)."""
     top = (1 << bits) - 1
     if bits == 32:    # raw float lane (row 0): store f32(target - offset) directly
-        return [struct.unpack('<I', struct.pack('<f', x - off))[0] for x in vals], None
+        return [struct.unpack('<I', struct.pack('<f', x - off))[0] for x in vals], None, None
+
+    def enc(r, o):
+        b, u = fbits(r), ulp_of(r)
+        return [(x - o - b) / u for x in vals]
+    us = enc(row, off)
+    rnd = lambda us: [min(top, max(0, round(u))) for u in us]
     if all(-0.5 <= u < top + 0.5 for u in us):
-        return [min(top, max(0, round(u))) for u in us], None
+        return rnd(us), None, None
     k = round(min(us))
-    if max(us) - k >= top + 0.5 and not clamp:
-        raise PatchError('%s span %.4g exceeds the %d-bit slot range (%.4g); use --clamp to saturate'
-                         % (what, (max(us) - min(us)) * ulp, bits, top * ulp))
-    new_off = f32round(off + k * ulp)
-    us = [(x - new_off - base) / ulp for x in vals]
-    return [min(top, max(0, round(u))) for u in us], new_off
+    if max(us) - k < top + 0.5:
+        no = f32round(off + k * ulp_of(row))
+        return rnd(enc(row, no)), no, None
+    if not shared:
+        lo = min(vals)
+        for e in range(((row >> 23) & 0xFF) + 1, 150):
+            r = e << 23
+            no = f32round(lo - ulp_of(r) - fbits(r))
+            us = enc(r, no)
+            if max(us) < top + 0.5 and min(us) > -0.5:
+                return rnd(us), no, r
+    if not clamp:
+        raise PatchError('%s span %.4g cannot be encoded in a %d-bit slot%s; use --clamp to saturate'
+                         % (what, max(vals) - min(vals), bits, ' (STROW shared)' if shared else ''))
+    return rnd(us), None, None
 
 
 def patch_member(data, mp, obj_path, channels=('pos', 'uv', 'nrm'), clamp=False):
@@ -299,7 +321,7 @@ def patch_member(data, mp, obj_path, channels=('pos', 'uv', 'nrm'), clamp=False)
     V, VT, VN, objs = parse_obj(obj_path)
     out = bytearray(data)
     rep = dict(parts=0, vertices=0, changed_vertices=0, max_err=dict(pos=0.0, uv=0.0, nrm=0.0),
-               out_of_range=[], refit_batches=0, warnings=[], clamped=0)
+               out_of_range=[], refit_batches=0, rebased_batches=0, warnings=[], clamped=0)
     byslot = {}
     for name, o in objs.items():
         mm = re.search(r'slot(\d+)', name)
@@ -367,63 +389,47 @@ def _patch_batch(out, data, b, part, pos, uvs, nrm, channels, clamp, rep, name):
     n, vb = b['count'], b['vbase']
     v = part['v']
     spans = []
-    if 'pos' in channels:
-        tgt = [pos[vb + j] for j in range(n)]
-        old = v['p'][vb:vb + n]
-        chg = [j for j in range(n) if max(abs(tgt[j][c] - old[j][c]) for c in range(3)) > POS_TOL]
-        if chg:
+    for role, lanes, qkey, tgts in (('pos', 3, 'q199', {vb + j: pos[vb + j] for j in range(n)} if 'pos' in channels else {}),
+                                    ('uv', 2, 'q198', uvs if 'uv' in channels and 'uv' in b else {})):
+        if not tgts or role not in b:
+            continue
+        sl = b[role]
+        old = v['p' if role == 'pos' else 'uv'][vb:vb + n]
+        tol = POS_TOL if role == 'pos' else UV_TOL
+        chg = [j for j in range(n) if (vb + j) in tgts and max(abs(tgts[vb + j][c] - old[j][c]) for c in range(lanes)) > tol]
+        if not chg:
+            continue
+        if role == 'pos':
             rep['changed_vertices'] += len(chg)
-            want = [tgt[j] if j in set(chg) else old[j] for j in range(n)]
-            pb = b['pos']
-            o199 = list(struct.unpack_from('<3f', data, b['q199']))
-            cols, new_off = [], list(o199)
-            for c in range(3):
-                us, no = _fit_lane([w[c] for w in want], pb['row'][c], o199[c], ulp_of(pb['row'][c]), pb['bits'], clamp,
-                                   '%s batch pos lane %s' % (name, 'xyz'[c]))
-                cols.append(us)
-                if no is not None:
-                    new_off[c] = no
-            refit = new_off != o199
-            if refit:
-                rep['refit_batches'] += 1
-                struct.pack_into('<3f', out, b['q199'], *new_off)
-                spans.append((b['q199'], b['q199'] + 12))
-            idx = range(n) if refit else chg
-            for j in idx:
-                struct.pack_into(UF[pb['bits']] % 3, out, pb['off'] + j * pb['stride'], *(cols[c][j] for c in range(3)))
-            spans.append((pb['off'], pb['off'] + n * pb['stride']))
-            for j in chg:
-                dec = [fbits(pb['row'][c] + cols[c][j]) + new_off[c] for c in range(3)]
-                rep['max_err']['pos'] = max(rep['max_err']['pos'], *(abs(dec[c] - tgt[j][c]) for c in range(3)))
-                for c in range(3):
-                    if pb['bits'] < 32 and not (-0.5 <= (tgt[j][c] - new_off[c] - fbits(pb['row'][c])) / ulp_of(pb['row'][c]) < (1 << pb['bits']) - 0.5):
-                        rep['clamped'] += 1
-                        rep['out_of_range'].append(dict(part=name, vertex=vb + j, axis='xyz'[c]))
-    if 'uv' in channels and 'uv' in b and uvs:
-        old = v['uv'][vb:vb + n]
-        chg = [j for j in range(n) if (vb + j) in uvs and max(abs(uvs[vb + j][c] - old[j][c]) for c in range(2)) > UV_TOL]
-        if chg:
-            ub = b['uv']
-            o198 = list(struct.unpack_from('<2f', data, b['q198']))
-            want = [uvs[vb + j] if j in set(chg) else old[j] for j in range(n)]
-            cols, new_off = [], list(o198)
-            for c in range(2):
-                us, no = _fit_lane([w[c] for w in want], ub['row'][c], o198[c], ulp_of(ub['row'][c]), ub['bits'], clamp,
-                                   '%s batch uv lane %s' % (name, 'st'[c]))
-                cols.append(us)
-                if no is not None:
-                    new_off[c] = no
-            refit = new_off != o198
-            if refit:
-                rep['refit_batches'] += 1
-                struct.pack_into('<2f', out, b['q198'], *new_off)
-                spans.append((b['q198'], b['q198'] + 8))
-            for j in (range(n) if refit else chg):
-                struct.pack_into(UF[ub['bits']] % 2, out, ub['off'] + j * ub['stride'], *(cols[c][j] for c in range(2)))
-            spans.append((ub['off'], ub['off'] + n * ub['stride']))
-            for j in chg:
-                dec = [fbits(ub['row'][c] + cols[c][j]) + new_off[c] for c in range(2)]
-                rep['max_err']['uv'] = max(rep['max_err']['uv'], *(abs(dec[c] - want[j][c]) for c in range(2)))
+        cs = set(chg)
+        want = [tgts[vb + j] if j in cs else old[j] for j in range(n)]
+        offs = list(struct.unpack_from('<%df' % lanes, data, b[qkey]))
+        cols, new_off, new_row = [], list(offs), list(sl['row'])
+        for c in range(lanes):
+            us, no, nr = _fit_lane([w[c] for w in want], sl['row'][c], offs[c], sl['bits'], sl['shared'], clamp,
+                                   '%s batch %s lane %s' % (name, role, ('xyz' if role == 'pos' else 'st')[c]))
+            cols.append(us)
+            new_off[c] = offs[c] if no is None else no
+            new_row[c] = sl['row'][c] if nr is None else nr
+        if new_off != offs:
+            rep['refit_batches'] += 1
+            struct.pack_into('<%df' % lanes, out, b[qkey], *new_off)
+            spans.append((b[qkey], b[qkey] + 4 * lanes))
+        if new_row != sl['row']:
+            rep['rebased_batches'] += 1
+            struct.pack_into('<%dI' % lanes, out, sl['row_off'], *new_row)
+            spans.append((sl['row_off'], sl['row_off'] + 4 * lanes))
+        full = new_off != offs or new_row != sl['row']
+        for j in (range(n) if full else chg):
+            struct.pack_into(UF[sl['bits']] % lanes, out, sl['off'] + j * sl['stride'], *(cols[c][j] for c in range(lanes)))
+        spans.append((sl['off'], sl['off'] + n * sl['stride']))
+        for j in chg:
+            dec = [fbits(new_row[c] + cols[c][j]) + new_off[c] for c in range(lanes)]
+            err = max(abs(dec[c] - want[j][c]) for c in range(lanes))
+            rep['max_err'][role] = max(rep['max_err'][role], err)
+            if err > 1.0001 * max(ulp_of(new_row[c]) for c in range(lanes)) and sl['bits'] < 32:
+                rep['clamped'] += 1
+                rep['out_of_range'].append(dict(part=name, vertex=vb + j, role=role))
     if 'nrm' in channels and 'nrm' in b and nrm:
         old = v['n'][vb:vb + n]
         for j in range(n):
