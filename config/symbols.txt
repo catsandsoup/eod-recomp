@@ -33,6 +33,8 @@
 001675C0 BattleRespawnCar [V]  # Resets damage, detaches/reattaches parts, and teleports wrecked car to spawn point -> docs/BATTLE_RECOVERY.md
 00167C70 BattlePlaceInitialCars [V]  # Places Battle participants on initial spawn transforms; wrapped for >4 cars -> docs/BATTLE_RECOVERY.md
 00167D58 BattleUpdate [V]  # Per-frame BattleMaster state machine, scoring, and respawn tick -> docs/BATTLE_RECOVERY.md
+0016F4E8 HomebaseGetSlotForCar [V]  # Maps car index to homebase lot slot safely -> docs/CAREER_UNLOCKS.md
+0016F748 HomebaseGetBuySlotForCar [V]  # Maps car to homebase buy slot 0..4 without asserting -> docs/CAREER_UNLOCKS.md
 001741C0 CareerIsFreeRoamActive [V]  # Returns non-zero during Career free-roam / challenge staging; wrapped by KillableChallengers -> docs/CAREER_UNLOCKS.md
 00176698 RaceSessionInitPhase [V]  # Initializes race-start phase and RNG epoch; wrapped for netplay lockstep -> docs/INDEX.md
 00176918 RaceSessionSeedRng [V]  # Seeds per-session race RNG state; wrapped for netplay lockstep -> docs/INDEX.md
@@ -68,6 +70,8 @@
 001B3068 DetachedWheelSpawn [V]  # Spawns flying wheel phob when a car hub shears off -> docs/INDEX.md
 001B5840 TimedDamageFeatUpdate [V]  # Applies leader/timed damage feat; wrapped for Invincible -> docs/GAMEPLAY_MODS_RE.md
 001B8370 CarRecoveryCountdownUpdate [V]  # Updates rollover/wrong-way reset timer and SELECT manual recovery -> docs/MANUAL_RECOVERY.md
+001C31A0 CameraDirectorUpdate [V]  # CameraDirectorUpdate: injects 360 orbit & turntable in showroom/garage -> docs/CAREER_UNLOCKS.md
+001D2DC8 CameraDirectorPlayTrack [V]  # CameraDirectorPlayTrack: tracks active clip track -> docs/CAREER_UNLOCKS.md
 001D8F58 TerrainSnapTransformToGround [V]  # Raycasts terrain and aligns 4x3 transform to ground height/normal -> docs/BATTLE_RECOVERY.md
 001DF9A0 DeformResetMeshVertices [I]  # Resets deformed car mesh vertices and bone offsets to rest state -> docs/NASCAR_A2_RECOVERY.md
 001E0DC8 DetachedPanelPoolInit [V]  # Initializes detached body panel phob pool at 0x00494D60 -> docs/INDEX.md
@@ -147,7 +151,9 @@
 003653F8 GsFogWriteTables [V]  # Computes and uploads GS FOG / fog-table values for current pass -> docs/LOD_CULLING_INVESTIGATION.md
 003670C8 MoviePlay [V]  # Plays PSS/IPU full-motion video by name; wrapped for EOD_SKIP_MOVIES -> docs/INDEX.md
 003698E8 HomebaseBuildMenu [V]  # Builds Homebase hub / AutoShop / Garage / Challengers UI menu list -> docs/CAREER_UNLOCKS.md
+0036E9C0 DealerBuyScreen [V]  # Dealership Buy screen MenuRun execution loop -> docs/CAREER_UNLOCKS.md
 003702F0 AutoShopUpdateSelection [V]  # Per-frame AutoShop car list update; wrapped to turn dealer pages on L1/R1 -> docs/CAREER_UNLOCKS.md
+00370DD8 DealerGetSlotForCar [V]  # Maps vehicle to dealer yard slot without panicking -> docs/CAREER_UNLOCKS.md
 00381BB8 ResetEE [V]  # PS2SDK syscall 0x01
 00381BC8 SetGsCrt [V]  # PS2SDK syscall 0x02 (interlace, display mode, frame/field)
 00381BD8 Exit [V]  # PS2SDK syscall 0x04
