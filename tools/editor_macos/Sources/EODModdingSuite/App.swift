@@ -1,63 +1,43 @@
 import SwiftUI
 
+@MainActor
+final class StudioAppDelegate: NSObject, NSApplicationDelegate {
+    weak var state: StudioState?
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let state, state.prepareToQuit() else { return .terminateCancel }
+        return .terminateNow
+    }
+}
+
 @main
 struct EODModdingSuiteApp: App {
-    @StateObject private var appState = AppState()
-
-    init() {
-        if CommandLine.arguments.contains("--test") || CommandLine.arguments.contains("--headless") {
-            let state = AppState()
-            state.triggerBuild()
-            print("[EODModdingSuite] Headless test validation: \(state.buildStatus)")
-            exit(state.buildStatus.contains("Successful") ? 0 : 1)
-        }
-    }
-
+    @StateObject private var state = StudioState()
+    @NSApplicationDelegateAdaptor(StudioAppDelegate.self) private var delegate
     var body: some Scene {
         WindowGroup {
-            MainView(state: appState)
+            MainView(state: state)
+                .frame(minWidth: 1040, minHeight: 700)
                 .preferredColorScheme(.dark)
-                .frame(minWidth: 1280, minHeight: 800)
+                .onAppear { delegate.state = state }
+                .task { await state.startup() }
         }
-        .windowStyle(.titleBar)
-        .windowToolbarStyle(.unifiedCompact)
         .commands {
-            SidebarCommands()
             CommandGroup(replacing: .newItem) {
-                Button("New Mod Project...") {
-                    // New project action
-                }
-                .keyboardShortcut("n", modifiers: [.command])
-                
-                Button("Open Mod Project...") {
-                    // Open project action
-                }
-                .keyboardShortcut("o", modifiers: [.command])
-                
-                Divider()
-                
-                Button("Save Mod") {
-                    appState.triggerBuild()
-                }
-                .keyboardShortcut("s", modifiers: [.command])
+                Button("New Mod Project…") { state.newProject() }.keyboardShortcut("n")
+                Button("Open Mod Project…") { state.openProject() }.keyboardShortcut("o")
+                Button("Save Project & Build Overlay") { state.save() }
+                    .keyboardShortcut("s").disabled(!state.canSave)
             }
-            
-            CommandMenu("Modding") {
-                Button("Build Mod Package") {
-                    appState.triggerBuild()
-                }
-                .keyboardShortcut("b", modifiers: [.command])
-                
-                Button("Test Drive (Play)") {
-                    appState.buildStatus = "Launching Game..."
-                }
-                .keyboardShortcut("r", modifiers: [.command])
-                
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") { state.undo() }.keyboardShortcut("z").disabled(!state.canUndo)
+                Button("Redo") { state.redo() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!state.canRedo)
+            }
+            CommandMenu("Game") {
+                Button("Test Saved Mod in Game") { state.testGame() }.keyboardShortcut("r").disabled(!state.canTest)
+                Button("Stop Test Session") { state.stopGame() }.disabled(!state.gameRunning)
                 Divider()
-                
-                Button("Validate All Manifests") {
-                    appState.buildStatus = "All manifests validated successfully."
-                }
+                Button("Choose Game Installation…") { state.chooseDisc() }
+                Button("Choose Game Executable…") { state.chooseExecutable() }
             }
         }
     }

@@ -83,8 +83,84 @@ def write_png(filename: str, width: int, height: int, rgba_data: bytes):
         f.write(sig + ihdr + idat + iend)
 
 
+_PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+_PNG_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def _png_unfilter(raw, pos, rows, stride, bpp):
+    """Undo PNG scanline filters; returns (list of rows, next position)."""
+    out, prev = [], bytearray(stride)
+    for _ in range(rows):
+        filter_type = raw[pos]
+        row = bytearray(raw[pos + 1:pos + 1 + stride])
+        pos += 1 + stride
+        if filter_type == 1:  # Sub
+            for i in range(bpp, stride):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+        elif filter_type == 2:  # Up
+            for i in range(stride):
+                row[i] = (row[i] + prev[i]) & 0xFF
+        elif filter_type == 3:  # Average
+            for i in range(stride):
+                left = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif filter_type == 4:  # Paeth
+            for i in range(stride):
+                a = row[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                row[i] = (row[i] + (a if (pa <= pb and pa <= pc) else (b if pb <= pc else c))) & 0xFF
+        elif filter_type != 0:
+            raise ValueError(f"Unsupported PNG filter {filter_type}")
+        out.append(row)
+        prev = row
+    return out, pos
+
+
+def _png_row_rgba(row, width, ctype, depth, palette, trns):
+    """One unfiltered scanline -> 8-bit RGBA bytes (16-bit scaled with rounding)."""
+    if ctype == 6 and depth == 8:
+        return bytes(row[:width * 4])
+    count = width * _PNG_CHANNELS[ctype]
+    if depth == 8:
+        s = row[:count]
+    elif depth == 16:
+        s = [(row[i] << 8) | row[i + 1] for i in range(0, count * 2, 2)]
+    else:
+        per, mask = 8 // depth, (1 << depth) - 1
+        s = [(row[i // per] >> (8 - depth * (i % per + 1))) & mask for i in range(count)]
+    top = (1 << depth) - 1
+    sc = (lambda v: v) if depth == 8 or ctype == 3 else (lambda v: (v * 255 + top // 2) // top)
+    out = bytearray(width * 4)
+    for x in range(width):
+        if ctype == 6:
+            out[x*4:x*4+4] = bytes((sc(s[4*x]), sc(s[4*x+1]), sc(s[4*x+2]), sc(s[4*x+3])))
+        elif ctype == 2:
+            px = (s[3*x], s[3*x+1], s[3*x+2])
+            out[x*4:x*4+4] = bytes((sc(px[0]), sc(px[1]), sc(px[2]), 0 if px == trns else 255))
+        elif ctype == 0:
+            g = sc(s[x])
+            out[x*4:x*4+4] = bytes((g, g, g, 0 if s[x] == trns else 255))
+        elif ctype == 4:
+            g = sc(s[2*x])
+            out[x*4:x*4+4] = bytes((g, g, g, sc(s[2*x+1])))
+        else:
+            i = s[x]
+            if i >= len(palette) // 3:
+                raise ValueError("PNG palette index out of range")
+            out[x*4:x*4+4] = bytes((palette[3*i], palette[3*i+1], palette[3*i+2],
+                                    trns[i] if trns and i < len(trns) else 255))
+    return bytes(out)
+
+
 def read_png(filename: str) -> tuple:
-    """Reads a PNG and returns (width, height, rgba_bytes)."""
+    """Reads a PNG and returns (width, height, rgba_bytes), always 8-bit RGBA.
+
+    Accepts colour types 0, 2, 3, 4, 6 at the depths PNG allows (16-bit samples
+    are scaled to 8-bit with rounding), tRNS transparency and Adam7 interlace.
+    """
     with open(filename, "rb") as f:
         data = f.read()
 
@@ -92,74 +168,68 @@ def read_png(filename: str) -> tuple:
         raise ValueError(f"{filename} is not a valid PNG")
 
     pos = 8
-    width = height = bit_depth = color_type = 0
-    idat_chunks = []
+    width = height = bit_depth = color_type = interlace = 0
+    idat_chunks, palette, trns = [], b"", None
 
-    while pos < len(data):
+    while pos + 8 <= len(data):
         length, chunk_type = struct.unpack(">I4s", data[pos : pos + 8])
         pos += 8
         chunk_data = data[pos : pos + length]
         pos += length + 4  # skip crc
 
         if chunk_type == b"IHDR":
-            width, height, bit_depth, color_type = struct.unpack(">IIBB", chunk_data[:10])
+            width, height, bit_depth, color_type, method, filt, interlace = struct.unpack(">IIBBBBB", chunk_data[:13])
+            if method or filt or interlace > 1:
+                raise ValueError("Unsupported PNG compression, filter or interlace method")
+        elif chunk_type == b"PLTE":
+            palette = chunk_data
+        elif chunk_type == b"tRNS":
+            trns = chunk_data
         elif chunk_type == b"IDAT":
             idat_chunks.append(chunk_data)
         elif chunk_type == b"IEND":
             break
 
-    if bit_depth != 8 or color_type != 6:
-        raise ValueError("PNG input must be 8-bit RGBA (export as RGBA before compiling)")
-    if data[28] != 0:
-        raise ValueError("Interlaced PNG is not supported")
-    raw = zlib.decompress(b"".join(idat_chunks))
-    if len(raw) != height * (width * 4 + 1):
+    if bit_depth not in _PNG_DEPTHS.get(color_type, ()):
+        raise ValueError(f"Unsupported PNG colour type {color_type} at {bit_depth} bits")
+    if not width or not height:
+        raise ValueError("PNG has no IHDR dimensions")
+    if color_type == 3 and not palette:
+        raise ValueError("Palette PNG without PLTE")
+    if trns is not None:
+        if color_type == 0 and len(trns) >= 2:
+            trns = struct.unpack(">H", trns[:2])[0]
+        elif color_type == 2 and len(trns) >= 6:
+            trns = struct.unpack(">3H", trns[:6])
+        elif color_type != 3:
+            trns = None
+    channels = _PNG_CHANNELS[color_type]
+    bpp = max(1, channels * bit_depth // 8)
+    try:
+        raw = zlib.decompress(b"".join(idat_chunks))
+    except zlib.error as error:
+        raise ValueError(f"Invalid PNG image data: {error}") from error
+    passes = _ADAM7 if interlace else ((0, 0, 1, 1),)
+    sizes = [((width - x0 + dx - 1) // dx, (height - y0 + dy - 1) // dy) for x0, y0, dx, dy in passes]
+    strides = [(pw * channels * bit_depth + 7) // 8 for pw, _ in sizes]
+    if len(raw) != sum((ph * (st + 1)) if pw and ph else 0 for (pw, ph), st in zip(sizes, strides)):
         raise ValueError("Invalid PNG scanline length")
-    # Unfilter PNG scanlines (supports basic filters)
-    stride = width * 4
+
     rgba = bytearray(width * height * 4)
-
     raw_pos = 0
-    prev_row = bytearray(stride)
-
-    for y in range(height):
-        filter_type = raw[raw_pos]
-        raw_pos += 1
-        row = bytearray(raw[raw_pos : raw_pos + stride])
-        raw_pos += stride
-
-        if filter_type == 0:  # None
-            cur_row = row
-        elif filter_type == 1:  # Sub
-            cur_row = bytearray(stride)
-            for i in range(stride):
-                left = cur_row[i - 4] if i >= 4 else 0
-                cur_row[i] = (row[i] + left) & 0xFF
-        elif filter_type == 2:  # Up
-            cur_row = bytearray(stride)
-            for i in range(stride):
-                cur_row[i] = (row[i] + prev_row[i]) & 0xFF
-        elif filter_type == 3:  # Average
-            cur_row = bytearray(stride)
-            for i in range(stride):
-                left = cur_row[i - 4] if i >= 4 else 0
-                up = prev_row[i]
-                cur_row[i] = (row[i] + ((left + up) >> 1)) & 0xFF
-        elif filter_type == 4:  # Paeth
-            cur_row = bytearray(stride)
-            for i in range(stride):
-                a = cur_row[i - 4] if i >= 4 else 0
-                b = prev_row[i]
-                c = prev_row[i - 4] if i >= 4 else 0
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                cur_row[i] = (row[i] + pr) & 0xFF
-        else:
-            raise ValueError(f"Unsupported PNG filter {filter_type}")
-
-        rgba[y * stride : (y + 1) * stride] = cur_row
-        prev_row = cur_row
+    for (x0, y0, dx, dy), (pw, ph), stride in zip(passes, sizes, strides):
+        if not pw or not ph:
+            continue
+        rows, raw_pos = _png_unfilter(raw, raw_pos, ph, stride, bpp)
+        for r, row in enumerate(rows):
+            line = _png_row_rgba(row, pw, color_type, bit_depth, palette, trns)
+            y = y0 + r * dy
+            if dx == 1:
+                rgba[y * width * 4:(y + 1) * width * 4] = line
+            else:
+                for c in range(pw):
+                    o = (y * width + x0 + c * dx) * 4
+                    rgba[o:o + 4] = line[c * 4:c * 4 + 4]
 
     return width, height, bytes(rgba)
 

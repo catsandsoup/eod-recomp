@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define XXH_INLINE_ALL
@@ -22,6 +23,7 @@
 #include "../../platform/platform.h"
 #include "../../platform/screenshot_size.h"
 #include "../../platform/presentation.h"
+#include "../../platform/editor_test_startup.h"
 #include "alpha_order.h"
 #include "alpha_tiles.h"
 #include "alpha_range.h"
@@ -30,6 +32,7 @@
 #include "../gs_mem.h"
 #include "../gs_state.h"
 #include "../gs_swizzle.h"
+#include "../texture_replacements.h"
 #include "vk_compat.h"
 #include "../../ui/overlay.h"
 #include "gs_page_coverage.h"
@@ -1558,13 +1561,37 @@ Surface *get_surface(uint32_t bp, uint32_t bw, uint32_t psm, bool depth, int row
 // --------------------------------------------------------- texture cache
 struct TexObj {
     ID3D11Texture2D *tex = nullptr;
-    ID3D11ShaderResourceView *srv = nullptr;
+    ID3D11ShaderResourceView *srv = nullptr; // a host replacement's srv holds its own reference
     uint32_t bytes = 0;
     alpha_order::Range alpha;
     uint64_t last_use = 0;
+    float scale = 1;   // bound texels per GS texel (host replacement factor)
+    uint64_t host = 0; // g_host_gpu key of the bound replacement, 0 = native
 };
 std::unordered_map<uint64_t, TexObj> g_tex;
 uint64_t g_tex_bytes;
+
+// ------------------------------------------------- host texture replacements
+// docs/HOST_TEXTURE_REPLACEMENT.md. Keys are computed only on a texture-cache
+// miss and only when replacements are loaded or EOD_HOST_TEXTURE_LOG is set.
+constexpr uint32_t kTexHostFlag = 0x8000; // F_TEX_HOST in gs_shaders_vk.hlsl
+struct HostGpu {
+    ID3D11Texture2D *tex = nullptr;
+    ID3D11ShaderResourceView *srv = nullptr;
+    uint64_t bytes = 0, last_use = 0;
+    alpha_order::Range alpha;
+};
+hosttex::Store g_host;
+bool g_host_on;   // replacements loaded
+FILE *g_host_log; // EOD_HOST_TEXTURE_LOG
+uint64_t g_host_budget = 1536ull << 20;
+std::unordered_map<uint64_t, HostGpu> g_host_gpu; // (entry << 1 | GS alpha domain) + 1
+uint64_t g_host_gpu_bytes;
+std::unordered_set<uint64_t> g_host_logged, g_host_noted;
+struct HostStats {
+    uint32_t hits, misses, fallbacks, uploads, evictions;
+    double upload_ms;
+} g_hstats;
 // validation shortcut: texture description -> (content key, VRAM clock when
 // checked)
 struct TexCheck {
@@ -1663,7 +1690,37 @@ void decode_level(const Env &e, int lvl, int w, int h, std::vector<uint32_t> &ou
 
 int tex_levels(const Env &e) { return (e.mmin >= 2 && e.mxl > 0) ? std::min(e.mxl, 6) + 1 : 1; }
 
-ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) {
+ID3D11ShaderResourceView *host_texture(int idx, uint32_t native_alpha_high, alpha_order::Range &alpha, uint64_t &id);
+
+// Palette indices of mip 0, row-major (PSMT8/PSMT4 and the high-bit forms).
+void host_index_plane(const Env &e, std::vector<uint8_t> &out) {
+    out.resize((size_t)e.tw * e.th);
+    const SwizzleTab *T = swizzle_table(e.tpsm, e.mip_tbw[0]);
+    uint32_t bp = e.mip_tbp[0];
+    for (uint32_t y = 0; y < e.th; y++) {
+        uint32_t rb = T->row_base(bp, (int)y), rc = T->rowC[y & 2047];
+        uint8_t *d = &out[(size_t)y * e.tw];
+        switch (e.tpsm) {
+        case PSMT8:
+            for (uint32_t x = 0; x < e.tw; x++) d[x] = byte(T->addr_row(rb, rc, (int)x));
+            break;
+        case PSMT4:
+            for (uint32_t x = 0; x < e.tw; x++) d[x] = (uint8_t)nibble(T->addr_row(rb, rc, (int)x));
+            break;
+        case PSMT8H:
+            for (uint32_t x = 0; x < e.tw; x++) d[x] = (uint8_t)(word(T->addr_row(rb, rc, (int)x)) >> 24);
+            break;
+        case PSMT4HL:
+            for (uint32_t x = 0; x < e.tw; x++) d[x] = (uint8_t)((word(T->addr_row(rb, rc, (int)x)) >> 24) & 15);
+            break;
+        default: // PSMT4HH
+            for (uint32_t x = 0; x < e.tw; x++) d[x] = (uint8_t)(word(T->addr_row(rb, rc, (int)x)) >> 28);
+            break;
+        }
+    }
+}
+
+ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, float &scale, uint32_t &flags) {
     int levels = tex_levels(e);
     // description key: what identifies the texture apart from the memory contents
     uint64_t desc = mix64(0, e.tpsm | (e.tw << 8) | ((uint64_t)e.th << 20) | ((uint64_t)levels << 40));
@@ -1707,6 +1764,14 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) 
         it->second.last_use = g_frame_no;
         g_stats.tex_hit++;
         alpha=it->second.alpha;
+        scale = it->second.scale;
+        if (it->second.host) {
+            flags |= kTexHostFlag;
+            g_hstats.hits++;
+            auto h = g_host_gpu.find(it->second.host);
+            if (h != g_host_gpu.end())
+                h->second.last_use = g_frame_no;
+        }
         return it->second.srv;
     }
     // decode and upload
@@ -1740,6 +1805,51 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) 
         init[i].SysMemSlicePitch = 0;
         bytes += (uint32_t)(w * h * 4);
     }
+    if (pal && (g_host_on || g_host_log)) {
+        bool candidate = g_host_on && g_host.has_dims(e.tw, e.th);
+        if (candidate || g_host_log) {
+            static std::vector<uint8_t> plane;
+            host_index_plane(e, plane);
+            const uint32_t bits = (e.tpsm == PSMT8 || e.tpsm == PSMT8H) ? 8 : 4;
+            const uint64_t ik = hosttex::index_key(bits, e.tw, e.th, plane.data());
+            const uint64_t pk = hosttex::palette_key(e.pal, bits == 8 ? 256 : 16);
+            if (g_host_log && g_host_logged.insert(mix64(mix64(ik, pk), e.mip_tbp[0] | (uint64_t)e.tpsm << 32)).second) {
+                fprintf(g_host_log, "%016llx %016llx %02x %u %u %x %llu\n", (unsigned long long)ik,
+                        (unsigned long long)pk, e.tpsm, e.tw, e.th, e.mip_tbp[0], (unsigned long long)g_frame_no);
+                fflush(g_host_log);
+            }
+            if (candidate) {
+                std::string why;
+                int idx = g_host.find(ik, pk, e.tw, e.th, why);
+                if (idx < 0 && why.empty()) {
+                    g_hstats.misses++;
+                } else if (idx < 0) {
+                    g_hstats.fallbacks++;
+                    if (g_host_noted.insert(mix64(ik, pk)).second)
+                        WARN("host textures: %016llx %016llx %ux%u not bound: %s; native texture kept",
+                             (unsigned long long)ik, (unsigned long long)pk, e.tw, e.th, why.c_str());
+                } else {
+                    alpha_order::Range ha;
+                    uint64_t id = 0;
+                    ID3D11ShaderResourceView *srv = host_texture(idx, decoded_alpha.high, ha, id);
+                    if (srv) {
+                        TexObj t;
+                        srv->AddRef();
+                        t.srv = srv;
+                        t.alpha = alpha = ha;
+                        t.last_use = g_frame_no;
+                        t.scale = scale = (float)g_host.entries()[(size_t)idx].scale;
+                        t.host = id;
+                        flags |= kTexHostFlag;
+                        g_hstats.hits++;
+                        g_stats.tex_new++;
+                        return g_tex.emplace(key, t).first->second.srv;
+                    }
+                    g_hstats.fallbacks++;
+                }
+            }
+        }
+    }
     TexObj t;
     if (FAILED(CHECK(g_dev->CreateTexture2D(&td, init, &t.tex))))
         return nullptr;
@@ -1766,6 +1876,147 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha) 
         }
     }
     return g_tex.emplace(key, t).first->second.srv;
+}
+
+// Drops a resident replacement and every cached texture that borrowed it.
+void host_evict(uint64_t id) {
+    auto h = g_host_gpu.find(id);
+    if (h == g_host_gpu.end())
+        return;
+    flush(); // queued draws may still reference the view
+    for (auto i = g_tex.begin(); i != g_tex.end();) {
+        if (i->second.host == id) {
+            release(i->second.srv);
+            i = g_tex.erase(i);
+        } else {
+            ++i;
+        }
+    }
+    g_host_gpu_bytes -= h->second.bytes;
+    release(h->second.srv);
+    release(h->second.tex);
+    g_host_gpu.erase(h);
+    g_hstats.evictions++;
+}
+
+// The GPU texture of replacement idx in the alpha domain of the native
+// texture (native alpha <= 0x80: GS domain), uploading it within the budget.
+ID3D11ShaderResourceView *host_texture(int idx, uint32_t native_alpha_high, alpha_order::Range &alpha, uint64_t &id) {
+    const hosttex::Entry &en = g_host.entries()[(size_t)idx];
+    const bool gs_alpha = hosttex::gs_alpha_domain(native_alpha_high);
+    id = ((uint64_t)idx << 1 | (gs_alpha ? 1 : 0)) + 1;
+    auto it = g_host_gpu.find(id);
+    if (it != g_host_gpu.end()) {
+        it->second.last_use = g_frame_no;
+        alpha = it->second.alpha;
+        return it->second.srv;
+    }
+    const uint64_t need = hosttex::htx_total_bytes(en.w, en.h, en.levels) - hosttex::kHtxHeaderBytes;
+    while (g_host_gpu_bytes + need > g_host_budget) {
+        uint64_t victim = 0, oldest = UINT64_MAX;
+        for (auto &h : g_host_gpu)
+            if (h.second.last_use < g_frame_no && h.second.last_use < oldest) {
+                oldest = h.second.last_use;
+                victim = h.first;
+            }
+        if (!victim) {
+            if (g_host_noted.insert(id ^ 0x8000000000000000ull).second)
+                WARN("host textures: %s (%s) not bound: GPU budget %llu MB full (%llu MB resident, %llu MB needed); "
+                     "native texture kept",
+                     en.asset_id.c_str(), en.package_id.c_str(), (unsigned long long)(g_host_budget >> 20),
+                     (unsigned long long)(g_host_gpu_bytes >> 20), (unsigned long long)(need >> 20));
+            return nullptr;
+        }
+        host_evict(victim);
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = en.w;
+    td.Height = en.h;
+    td.MipLevels = en.levels;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    HostGpu g;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g.tex))))
+        return nullptr;
+    uint32_t lo = 255, hi = 0;
+    g_dev->UploadLevels(g.tex, [&](UINT l, uint8_t *dst) {
+        size_t n = (size_t)std::max(1u, en.w >> l) * std::max(1u, en.h >> l);
+        hosttex::convert_texels(en.data + hosttex::htx_level_offset(en.w, en.h, l), dst, n, gs_alpha, lo, hi);
+    });
+    CHECK(g_dev->CreateShaderResourceView(g.tex, nullptr, &g.srv));
+    g.bytes = need;
+    g.last_use = g_frame_no;
+    g.alpha = alpha = alpha_order::vertex_range(lo, hi);
+    g_host_gpu_bytes += need;
+    g_host_gpu.emplace(id, g);
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    g_hstats.uploads++;
+    g_hstats.upload_ms += ms;
+    WARN("host textures: bound %s (%s) %ux%u x%u, native alpha max 0x%02x -> %s, replacement alpha %u..%u, "
+         "%.1f MB uploaded in %.1f ms, %.1f MB resident",
+         en.asset_id.c_str(), en.package_id.c_str(), en.w, en.h, en.scale, native_alpha_high,
+         gs_alpha ? "GS domain (a*128+127)/255" : "straight 0..255", lo, hi, need / 1048576.0, ms,
+         g_host_gpu_bytes / 1048576.0);
+    return g.srv;
+}
+
+void host_textures_init() {
+    auto sink = [](const std::string &m) { WARN("%s", m.c_str()); };
+    const char *root = std::getenv("EOD_MOD_DIR");
+    const char *off = std::getenv("EOD_HOST_TEXTURES");
+    const bool disabled = off && std::strcmp(off, "0") == 0;
+    if (root && *root) {
+        char path[4096];
+        if (platform_find_file(root, "PROFILE.TXT", path, sizeof path))
+            if (FILE *f = fopen(path, "r")) {
+                char line[1024];
+                while (fgets(line, sizeof line, f)) {
+                    size_t n = strlen(line);
+                    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+                        line[--n] = 0;
+                    WARN("profile: %s", line);
+                }
+                fclose(f);
+            }
+        if (disabled) {
+            WARN("host textures: disabled (EOD_HOST_TEXTURES=0)");
+        } else {
+            auto find = [](const std::string &dir, const std::string &rel, std::string &out) {
+                char p[4096];
+                if (!platform_find_file(dir.c_str(), rel.c_str(), p, sizeof p))
+                    return false;
+                out = p;
+                return true;
+            };
+            auto t0 = std::chrono::steady_clock::now();
+            size_t n = g_host.load(root, sink, find);
+            g_host_on = n > 0;
+            if (const char *b = std::getenv("EOD_HOST_TEXTURE_BUDGET_MB"))
+                if (std::atoll(b) > 0)
+                    g_host_budget = (uint64_t)std::atoll(b) << 20;
+            uint64_t cpu_budget = 2048ull << 20;
+            if (const char *b = std::getenv("EOD_HOST_TEXTURE_CPU_BUDGET_MB"))
+                if (std::atoll(b) >= 0)
+                    cpu_budget = (uint64_t)std::atoll(b) << 20;
+            if (g_host_on) {
+                uint64_t total = 0;
+                for (const auto &en : g_host.entries())
+                    total += en.bytes;
+                WARN("host textures: %zu replacements, %.1f MB on disk, manifest parsed in %.1f ms; GPU budget %llu MB",
+                     n, total / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                     (unsigned long long)(g_host_budget >> 20));
+                g_host.prefetch(cpu_budget, sink);
+            }
+        }
+    }
+    if (const char *p = std::getenv("EOD_HOST_TEXTURE_LOG"))
+        if (*p && !(g_host_log = fopen(p, "a")))
+            WARN("host textures: cannot open EOD_HOST_TEXTURE_LOG %s", p);
 }
 
 // Temporary colour textures (conversions of surfaces for sampling, feedback
@@ -1862,7 +2113,7 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (cpu_current) {
-        ts.srv = vram_texture(e,ts.alpha);
+        ts.srv = vram_texture(e, ts.alpha, ts.scale, ts.flags);
         ts.w = (float)e.tw;
         ts.h = (float)e.th;
         return ts;
@@ -1913,7 +2164,7 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (!gpu) {
-        ts.srv = vram_texture(e,ts.alpha);
+        ts.srv = vram_texture(e, ts.alpha, ts.scale, ts.flags);
         ts.w = (float)e.tw;
         ts.h = (float)e.th;
         return ts;
@@ -1978,7 +2229,7 @@ TexSource texture_for(const Env &e, Surface *target) {
         readback_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0, std::max(1, (int)e.tw >> i),
                        std::max(1, (int)e.th >> i));
     g_rb_reason = 0;
-    ts.srv = vram_texture(e,ts.alpha);
+    ts.srv = vram_texture(e, ts.alpha, ts.scale, ts.flags);
     ts.w = (float)e.tw;
     ts.h = (float)e.th;
     return ts;
@@ -2252,6 +2503,7 @@ bool start(bool with_window) {
         g_scale = std::clamp(g_config.render_scale > 0 ? g_config.render_scale : automatic_scale, 1, 6);
         if (!create_shaders() || !create_raw_textures())
             return false;
+        host_textures_init();
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = kVBBytes;
         bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -2883,7 +3135,7 @@ void vblank() {
     }
 }
 
-namespace { void show(bool vsync); }
+namespace { void show(bool vsync, bool fresh_scanout = false); }
 void present(bool vsync) {
     if (!g_on)
         return;
@@ -2894,7 +3146,7 @@ void present(bool vsync) {
     g_have_last = g_last[0].on || g_last[1].on;
     g_frame_no++;
     g_state_valid = false;
-    show(vsync);
+    show(vsync, true);
 }
 
 // Presents the last composed image again (upstream's in-game menu pauses the game).
@@ -2907,21 +3159,32 @@ void redraw() {
 }
 
 namespace {
-void show(bool vsync) {
+void show(bool vsync, bool fresh_scanout) {
     if (g_dev->surface) {
         if (auto *back = g_dev->acquire(vsync)) {
             float black[4] = {0, 0, 0, 1};
             g_ctx->ClearRenderTargetView(back, black);
             int x, y, w, h;
             platform_display_rect(g_dev->extent.width, g_dev->extent.height, &x, &y, &w, &h);
-            if (g_have_last)
+            if (g_have_last) {
                 compose(back, g_dev->extent.width, g_dev->extent.height, x, y, w, h, g_config.smooth_display);
+                if (fresh_scanout && editor_test_startup::state().hardware_composed())
+                    std::fprintf(stderr, "[editor-test] Vulkan race scanout composed: frame=%llu size=%dx%d pmode=%llx dispfb=%llx/%llx\n",
+                        (unsigned long long)g_frame_no, w, h, (unsigned long long)st.pmode,
+                        (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
+            }
             draw_overlay(back, g_dev->extent.width, g_dev->extent.height);
-            g_dev->present();
+            if (g_dev->present() && g_have_last && editor_test_startup::state().hardware_presented())
+                std::fprintf(stderr, "[editor-test] Vulkan race scanout present accepted: frame=%llu\n",
+                    (unsigned long long)g_frame_no);
             g_stats.presents++;
         }
-    } else
+    } else {
         g_dev->submit(false);
+        // No window exists headlessly. Freeze valid fresh circuit registers for
+        // the existing screenshot compositor; never acknowledge presentation.
+        if (fresh_scanout && g_have_last) editor_test_startup::state().hardware_composed();
+    }
 }
 }  // namespace
 
@@ -3006,6 +3269,14 @@ void stats_line(char *buf, size_t size) {
     snprintf(buf + used, size > used ? size - used : 0, "; lazy CLUT %llu (waited %llu)",
              (unsigned long long)g_clut_lazy, (unsigned long long)g_clut_lazy_waits);
     g_clut_lazy = g_clut_lazy_waits = 0;
+    if (g_host_on) {
+        used = strlen(buf);
+        snprintf(buf + used, size > used ? size - used : 0,
+                 "; host textures %u hits %u misses %u fallbacks, %u uploads (%.1f ms) %u evictions, %llu MB resident",
+                 g_hstats.hits, g_hstats.misses, g_hstats.fallbacks, g_hstats.uploads, g_hstats.upload_ms,
+                 g_hstats.evictions, (unsigned long long)(g_host_gpu_bytes >> 20));
+    }
+    g_hstats = HostStats();
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = g_dev->chunk_submits = 0;

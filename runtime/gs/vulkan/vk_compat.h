@@ -700,6 +700,34 @@ struct Context {
         c.imageExtent = {w, h, 1};
         vkCmdCopyBufferToImage(cmd, u.first->buffer, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
+    // Uploads every level of t through one dedicated staging buffer freed when
+    // this command buffer completes. Large host replacement textures would
+    // otherwise grow the recycled per-flight upload chunks permanently.
+    // fill(level, dst) writes level `level` as tight RGBA8 rows.
+    template <class Fill> void UploadLevels(Texture *t, Fill fill) {
+        barrier(1);
+        const UINT n = t->desc.MipLevels;
+        std::vector<VkBufferImageCopy> regions(n);
+        VkDeviceSize total = 0;
+        for (UINT l = 0; l < n; l++) {
+            UINT w = std::max(1u, t->desc.Width >> l), h = std::max(1u, t->desc.Height >> l);
+            VkBufferImageCopy &c = regions[l];
+            c = VkBufferImageCopy{};
+            c.bufferOffset = total;
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+            c.imageExtent = {w, h, 1};
+            total += ((VkDeviceSize)w * h * 4 + 15) & ~VkDeviceSize(15);
+        }
+        HostBuffer b = host_buffer(total);
+        for (UINT l = 0; l < n; l++) fill(l, (uint8_t *)b.map + regions[l].bufferOffset);
+        vkCmdCopyBufferToImage(cmd, b.buffer, t->image, VK_IMAGE_LAYOUT_GENERAL, n, regions.data());
+        auto d = device;
+        garbage.push_back([=] {
+            vkUnmapMemory(d, b.memory);
+            vkDestroyBuffer(d, b.buffer, nullptr);
+            vkFreeMemory(d, b.memory, nullptr);
+        });
+    }
     void CopySubresourceRegion(Texture *d, UINT, UINT x, UINT y, UINT, Texture *s, UINT, const D3D11_BOX *b) {
         barrier(2);
         auto aspect = s->desc.Format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -806,7 +834,7 @@ struct Context {
     bool init(bool withWindow);
     bool resize();
     Texture *acquire(bool vsync);
-    void present();
+    bool present();
 };
 inline Texture::~Texture() {
     auto d = ctx->device;
@@ -1433,7 +1461,7 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     transition(t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     return t;
 }
-inline void Context::present() {
+inline bool Context::present() {
     auto *t = back[backIndex];
     transition(t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     signalPresent = true;
@@ -1456,6 +1484,7 @@ inline void Context::present() {
         resize();
     else
         require(r, "present");
+    return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
 }
 } // namespace vkgs
 using ID3D11Texture2D = vkgs::Texture;
