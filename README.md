@@ -4,6 +4,10 @@
 
 [Download 1.0 for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
 
+**Development:** [Repository and branch guide](docs/REPOSITORY_MAP.md) · [Creation Kit preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.1-preview) · [Claude Kit handoff](https://github.com/catsandsoup/eod-recomp/tree/dev/creation-kit/docs/handoffs/2026-11-10-claude-opus)
+
+The Creation Kit is a separate development app in this repository. Use `dev/creation-kit` for Kit work; `main` remains the published game baseline.
+
 ![Two cars collide under the floodlights during a night demolition derby](docs/img/night-battle-demolition-derby.jpg)
 
 Play a local split-screen Battle with a friend beside you, or host an online race with friends. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
