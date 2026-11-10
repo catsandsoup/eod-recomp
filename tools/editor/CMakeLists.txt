@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(eod_editor LANGUAGES C CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -12,8 +14,8 @@ set(EDITOR_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cgltf
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imguizmo
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
-  ${CMAKE_SOURCE_DIR}/runtime/include
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../src
 )
 
 # Core editor library sources

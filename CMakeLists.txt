@@ -627,7 +627,7 @@ if(BUILD_TESTING)
 endif()
 
 # ---------------------------------------------------------------- Modding Editor
-option(EOD_BUILD_EDITOR "Build native desktop modding suite editor" ON)
+option(EOD_BUILD_EDITOR "Build legacy experimental C++ editor (independent of game)" OFF)
 if(EOD_BUILD_EDITOR)
   add_subdirectory(tools/editor)
 endif()

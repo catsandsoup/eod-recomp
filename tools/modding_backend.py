@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native retail asset/project backend for the macOS editor. JSON in, JSON out.
+"""Native retail asset/project backend shared by editor clients. JSON in, JSON out.
 
 Uses the existing EOD format tools. It does not implement the proposed modern
 engine manifests, arbitrary geometry compilation, or simulated game results.
@@ -421,7 +421,7 @@ def launch_plan(request, disc):
     args = ["--data", str(disc), "--config", str(config)]
     environment = dict(EOD_MOD_DIR=checked["overlay"], EOD_MEMCARD=str(storage_path(project_file, "runs/memcard")),
         EOD_DIRECT_START=f"mode=action;track=Anoka;event=No-Rules Race;car={car};paint=0;humans=1",
-        EOD_SKIP_MOVIES="1", EOD_EDITOR_TEST="1")
+        EOD_SKIP_MOVIES="1")
     if request.get("headless"):
         args += ["--headless"]
         environment.update(EOD_HEADLESS="1", EOD_MUTE="1")

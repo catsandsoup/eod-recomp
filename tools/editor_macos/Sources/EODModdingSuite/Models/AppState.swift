@@ -78,6 +78,13 @@ enum RuntimePaths {
         for _ in 0..<6 { source.deleteLastPathComponent() }
         return source
     }
+    static var gameExecutable: String {
+        guard let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),
+              let data = try? Data(contentsOf: resource),
+              let config = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return "" }
+        return config["gameExecutable"] ?? ""
+    }
     static var helper: URL {
         if let resources = Bundle.main.resourceURL {
             let bundled = resources.appendingPathComponent("Backend/modding_backend.py")
@@ -147,14 +154,14 @@ final class StudioState: ObservableObject {
     private var sessionStopped = false
     private let preferences: UserDefaults
 
-    init(preferences: UserDefaults = .standard) {
+    init(preferences: UserDefaults = UserDefaults(suiteName: "org.eod-recomp.creationkit.development")!) {
         self.preferences = preferences
         let prefs = preferences
         disc = prefs.string(forKey: "retailStudio.disc") ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/TDEODRecomp/disc").path
         let root = RuntimePaths.repository
-        executable = prefs.string(forKey: "retailStudio.executable") ?? root.appendingPathComponent("build/eod").path
-        project = prefs.string(forKey: "retailStudio.project") ?? root.appendingPathComponent("mods/Studio/project.eodproject").path
+        executable = prefs.string(forKey: "retailStudio.executable") ?? RuntimePaths.gameExecutable
+        project = prefs.string(forKey: "retailStudio.project") ?? root.appendingPathComponent("mods/CreationKitDevelopment/project.eodproject").path
         if let data = try? Data(contentsOf: URL(fileURLWithPath: project)),
            let saved = try? JSONDecoder().decode(LoadedProject.self, from: data) {
             savedTestArchive = saved.testCarArchive ?? (saved.selectedArchive.lowercased().hasSuffix(".car") ? saved.selectedArchive : "DATA/CAR/ALGAR.CAR")
