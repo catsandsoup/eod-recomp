@@ -28,6 +28,7 @@
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
 #include "../platform/presentation.h"
+#include "../platform/editor_test_startup.h"
 #include "gs_mem.h"
 #include "gs_replay_types.h"
 #include "gs_capture_io.h"
@@ -833,6 +834,7 @@ void gs_flush();
 void gs_sync();
 [[noreturn]] void app_exit(int code);  // main.cpp
 void gs_frame_end(uint64_t frame, int aspect);
+namespace { void editor_preview_capture(uint64_t frame, bool offscreen, bool software_locked); }
 
 // ------------------------------------------------------------ GS thread
 // With a second CPU core the GIF stream is executed on a worker thread:
@@ -841,7 +843,7 @@ void gs_frame_end(uint64_t frame, int aspect);
 // it when it reads state the worker produces.
 namespace {
 
-enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW };
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME };
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -890,6 +892,7 @@ uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mt
 std::mutex &g_pub_mtx = *new std::mutex;
 std::vector<uint32_t> g_pub;
 int g_pub_w, g_pub_h, g_pub_aspect = -1;
+uint64_t g_pub_frame;
 
 void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t size) {
     uint32_t h[4] = {kind, a, b, size};
@@ -907,10 +910,12 @@ void gs_frame_end(uint64_t frame, int aspect) {
     presentation::set(aspect);
     if (hw::g_on) {
         bool changed = display_changed();
+        if (changed) editor_test_startup::state().hardware_display_changed(g_flips.load());
         if (overlay_changed() || changed) {  // (the in-game menu or frame counter changed too)
             // no vsync wait while the GS thread trails the EE
             uint64_t lag = g_ee_vblanks.load() - frame;
             hw::present(g_config.vsync && lag < 2);
+            editor_preview_capture(frame, platform_native_window() == nullptr, false);
         }
         hw::vblank();
     } else if (compose_display()) {
@@ -919,6 +924,11 @@ void gs_frame_end(uint64_t frame, int aspect) {
         g_pub_w = g_frame_w;
         g_pub_h = g_frame_h;
         g_pub_aspect = aspect;
+        g_pub_frame = frame;
+        if ((st.pmode & 3) && editor_test_startup::state().software_composed(g_flips.load()))
+            std::fprintf(stderr, "[editor-test] software race scanout composed: vblank=%llu size=%dx%d pmode=%llx dispfb=%llx/%llx\n",
+                (unsigned long long)frame, g_pub_w, g_pub_h, (unsigned long long)st.pmode,
+                (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
@@ -1088,7 +1098,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         memcpy(h, &c[p], 16);
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
-        if (live && g_cold_zip) {
+        // Presentation-only markers are not part of the portable GS capture format.
+        if (live && h[0] != CMD_EDITOR_RACE_FRAME && g_cold_zip) {
             if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
             else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
                 close_cold_zip("stopped at compressed limit or write error");
@@ -1106,6 +1117,12 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             }
         }
         switch (h[0]) {
+        case CMD_EDITOR_RACE_FRAME:
+            if (live && editor_test_startup::state().race_submitted(g_flips.load()))
+                std::fprintf(stderr, "[editor-test] native race draw consumed by GS: vblank=%llu drawn=%llu pmode=%llx dispfb=%llx/%llx\n",
+                    (unsigned long long)g_gs_vblanks.load(), (unsigned long long)g_flips.load(),
+                    (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
+            break;
         case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
         case CMD_PRIV: {
             uint64_t v;
@@ -1737,7 +1754,46 @@ bool gs_screenshot(const char *path) {
     return true;
 }
 
+namespace {
+void editor_preview_capture(uint64_t frame, bool offscreen, bool software_locked) {
+    const char *path = std::getenv("EOD_EDITOR_PREVIEW");
+    if (!path || !*path || !editor_test_startup::state().claim_preview(offscreen)) return;
+    // Reuse the existing screenshot readback/PNG writer. Publish only a complete
+    // PNG; a missing/unwritable project path must never prevent the race running.
+    const std::string temporary = std::string(path) + ".tmp.png";
+    const bool written = software_locked ? write_png(temporary.c_str(), g_pub, g_pub_w, g_pub_h)
+                                         : gs_screenshot(temporary.c_str());
+    const bool published = written && std::rename(temporary.c_str(), path) == 0;
+    if (!published) std::remove(temporary.c_str());
+    std::fprintf(stderr, "[editor-test] first race preview %s: vblank=%llu drawn=%llu source=%s path=%s\n",
+        published ? "saved" : "failed", (unsigned long long)frame, (unsigned long long)g_flips.load(),
+        offscreen ? "offscreen scanout (no window presentation)" : "accepted presentation", path);
+}
+} // namespace
+
+void gs_editor_preview_software_frame(bool offscreen) {
+    // Called by the SDL presenter while gs_vblank holds g_pub_mtx, after the
+    // exact published image was accepted or copied by the headless presenter.
+    editor_preview_capture(g_pub_frame, offscreen, true);
+}
+
 uint64_t gs_drawn_frames() { return g_flips.load(); }
+
+void gs_editor_race_frame_submitted() {
+    if (!editor_test_startup::state().enabled()) return;
+    if (g_threaded) {
+        offload_run([] {
+            push_cmd(CMD_EDITOR_RACE_FRAME, 0, 0, nullptr, 0);
+            gs_flush();
+        });
+    } else {
+        offload_run([] {
+            if (editor_test_startup::state().race_submitted(g_flips.load()))
+                std::fprintf(stderr, "[editor-test] native race draw consumed by GS (unthreaded): vblank=%llu drawn=%llu\n",
+                    (unsigned long long)g_frames, (unsigned long long)g_flips.load());
+        });
+    }
+}
 
 // Shows the last image again with the overlay (the game is paused in the in-game menu).
 void gs_overlay_redraw() {

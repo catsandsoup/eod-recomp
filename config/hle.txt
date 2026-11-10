@@ -21,6 +21,9 @@
 00119F40 wrap     # right speed rows in each supported race viewport
 
 003670C8 wrap     # MoviePlay(name) - EOD_SKIP_MOVIES
+00113FF8 wrap     # scope the generic session draw; loading states never establish readiness
+00106338 wrap     # actual gameplay world/HUD callback: editor-only first-race evidence
+0033EC78 wrap     # wait for native race frame publication before editor readiness
 0034D328 wrap     # display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it
 0018AFE0 wrap     # car setup: computes the damage multiplier (car+0x4B0) from the chassis mass - DamageScale
 

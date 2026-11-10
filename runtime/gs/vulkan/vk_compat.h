@@ -806,7 +806,7 @@ struct Context {
     bool init(bool withWindow);
     bool resize();
     Texture *acquire(bool vsync);
-    void present();
+    bool present();
 };
 inline Texture::~Texture() {
     auto d = ctx->device;
@@ -1433,7 +1433,7 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     transition(t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     return t;
 }
-inline void Context::present() {
+inline bool Context::present() {
     auto *t = back[backIndex];
     transition(t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     signalPresent = true;
@@ -1456,6 +1456,7 @@ inline void Context::present() {
         resize();
     else
         require(r, "present");
+    return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
 }
 } // namespace vkgs
 using ID3D11Texture2D = vkgs::Texture;

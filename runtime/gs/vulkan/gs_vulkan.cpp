@@ -22,6 +22,7 @@
 #include "../../platform/platform.h"
 #include "../../platform/screenshot_size.h"
 #include "../../platform/presentation.h"
+#include "../../platform/editor_test_startup.h"
 #include "alpha_order.h"
 #include "alpha_tiles.h"
 #include "alpha_range.h"
@@ -2883,7 +2884,7 @@ void vblank() {
     }
 }
 
-namespace { void show(bool vsync); }
+namespace { void show(bool vsync, bool fresh_scanout = false); }
 void present(bool vsync) {
     if (!g_on)
         return;
@@ -2894,7 +2895,7 @@ void present(bool vsync) {
     g_have_last = g_last[0].on || g_last[1].on;
     g_frame_no++;
     g_state_valid = false;
-    show(vsync);
+    show(vsync, true);
 }
 
 // Presents the last composed image again (upstream's in-game menu pauses the game).
@@ -2907,21 +2908,32 @@ void redraw() {
 }
 
 namespace {
-void show(bool vsync) {
+void show(bool vsync, bool fresh_scanout) {
     if (g_dev->surface) {
         if (auto *back = g_dev->acquire(vsync)) {
             float black[4] = {0, 0, 0, 1};
             g_ctx->ClearRenderTargetView(back, black);
             int x, y, w, h;
             platform_display_rect(g_dev->extent.width, g_dev->extent.height, &x, &y, &w, &h);
-            if (g_have_last)
+            if (g_have_last) {
                 compose(back, g_dev->extent.width, g_dev->extent.height, x, y, w, h, g_config.smooth_display);
+                if (fresh_scanout && editor_test_startup::state().hardware_composed())
+                    std::fprintf(stderr, "[editor-test] Vulkan race scanout composed: frame=%llu size=%dx%d pmode=%llx dispfb=%llx/%llx\n",
+                        (unsigned long long)g_frame_no, w, h, (unsigned long long)st.pmode,
+                        (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
+            }
             draw_overlay(back, g_dev->extent.width, g_dev->extent.height);
-            g_dev->present();
+            if (g_dev->present() && g_have_last && editor_test_startup::state().hardware_presented())
+                std::fprintf(stderr, "[editor-test] Vulkan race scanout present accepted: frame=%llu\n",
+                    (unsigned long long)g_frame_no);
             g_stats.presents++;
         }
-    } else
+    } else {
         g_dev->submit(false);
+        // No window exists headlessly. Freeze valid fresh circuit registers for
+        // the existing screenshot compositor; never acknowledge presentation.
+        if (fresh_scanout && g_have_last) editor_test_startup::state().hardware_composed();
+    }
 }
 }  // namespace
 

@@ -1,7 +1,9 @@
 00100008 _start [V]  # ELF entry point -> docs/INDEX.md
 00100138 main [V]  # Game main(argc, argv); boots IOP, mounts archives, runs frame loop -> docs/INDEX.md
+00106338 RaceDrawGameplayViewports [V]  # Gameplay-state draw callback: world viewport overlays and per-player HUD via 00101618/00101C00; editor readiness evidence -> docs/TRACK_ENVIRONMENT_WORKFLOW.md
 0010AFA0 EventTypeGetDisplayName [V]  # Resolves event-type ID to localized display string; wrapped for Battle (4 AI)/(8 AI) -> docs/BATTLE_RECOVERY.md
 001116E0 RosterResolveCarDescriptions [V]  # Resolves driver/vehicle description records for event roster; wrapped for multi-class Battle AI -> docs/BATTLE_RECOVERY.md
+00113FF8 SessionDrawFrame [V]  # Dispatches current session scene through table 003C3CF8, including loading/interlude states; wraps frame draw scope -> docs/TRACK_ENVIRONMENT_WORKFLOW.md
 00114358 RunRaceContest [I]  # Race lifecycle and cleanup; checked by the Eve loop -> docs/NETPLAY_STATE_SYNC.md
 00119428 HudGetParticipantDisplayName [V]  # Returns participant display name for HUD/kill messages -> docs/BATTLE_RECOVERY.md
 00119888 HudDrawLeftRaceRows [V]  # Draws left-anchored position/lap/damage HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
@@ -133,6 +135,7 @@
 0033D408 StrmMountArchive [V]  # Mounts stream archive ("strm: '%s' not found") -> docs/INDEX.md
 0033D4F8 StrmFindFile [V]  # Looks up file path in mounted stream TOC; wrapped for mod overlay & missing-file log -> docs/INDEX.md
 0033D8E8 StrmOpenFile [V]  # Opens stream file handle by TOC index -> docs/INDEX.md
+0033EC78 FrameWaitAndService [V]  # Waits vblank/draw completion via 0035C3F8, services system work, then clears transient input; editor publication boundary -> docs/TRACK_ENVIRONMENT_WORKFLOW.md
 0033ECB8 FogConfigureRange [V]  # Sets scene fog start/end distances from camera far plane -> docs/LOD_CULLING_INVESTIGATION.md
 0034BDA8 ModelSubmitVu1Packets [V]  # Submits loaded .mod VIF/VU1 packet chain to scene draw list -> docs/LOD_CULLING_INVESTIGATION.md
 0034CEF0 ModelLoadFromArchive [V]  # Parses .mod geometry from archive and returns model handle -> docs/LOD_CULLING_INVESTIGATION.md
