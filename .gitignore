@@ -20,3 +20,6 @@ work/
 
 # Local mod packages contain retail-derived assets; publish source tools only.
 mods/
+imgui.ini
+.build/
+tools/editor_macos/.build/

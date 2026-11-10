@@ -625,3 +625,10 @@ if(BUILD_TESTING)
     target_link_libraries(netplay_online_probe PRIVATE Threads::Threads)
   endif()
 endif()
+
+# ---------------------------------------------------------------- Modding Editor
+option(EOD_BUILD_EDITOR "Build native desktop modding suite editor" ON)
+if(EOD_BUILD_EDITOR)
+  add_subdirectory(tools/editor)
+endif()
+

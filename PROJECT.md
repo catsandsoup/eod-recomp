@@ -52,6 +52,8 @@
 | 26 | PC-Native Audio & I/O Replacement Roadmap | Migration roadmap for native spatial audio (OpenAL/miniaudio) and PC memory/streaming | M5 | Survey R5 |
 | 27 | Central Integration & Searchable Catalogue | Unified architecture map, cross-subsystem dependency graph, searchable function/asset index | M6 | Survey R4 |
 | 28 | Modding Suite Architectural Foundations | Data structures & specs for custom vehicles, damage hierarchies, track imports, and event scripting | M6 | Survey R3 |
+| 29 | Cross-Platform Modding Backend & Validator | Schema validation (`eod_validator`), project state management, undo/redo command stack, and camera math | M7 | Survey R3 |
+| 30 | Native Swift 6 / SwiftUI macOS Modding Suite | Studio tabs, SceneKit 3D viewport, 32-component groups, AI spline canvas, terrain tools, game preview & runner | M7 | Survey R3 |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
@@ -61,7 +63,8 @@
 | M3 | Environment, Tracks, Collision & AI Track | Features 12, 13, 14, 15, 16, 17 (Tracks, SOBL/SCOL Collision, AI Waypoints, Events) | none | DONE |
 | M4 | UI, Career, Loading & Memory Architecture | Features 18, 19, 20, 21, 22, 23 (UI, Career, Save/Load, Lifecycle, 32MB Memory) | none | DONE |
 | M5 | Rendering & Native Architecture Roadmap | Features 24, 25, 26 (GS/VU/DMA Hardware Bottlenecks, GPU Pipeline, Migration Specs) | none | DONE |
-| M6 | Central Integration & Modding Foundations | Features 1, 27, 28 (Unified Architecture Map, Searchable Catalogue, Modding Suite Specs) | M1, M2, M3, M4, M5 | IN_PROGRESS |
+| M6 | Central Integration & Modding Foundations | Features 1, 27, 28 (Unified Architecture Map, Searchable Catalogue, Modding Suite Specs) | M1, M2, M3, M4, M5 | DONE |
+| M7 | Desktop Modding Suite & Engine Integration | Features 29, 30 (Cross-Platform Backend, Swift 6 macOS Studio, Schema Validator, Test-Drive Runner) | M6 | DONE |
 
 ## Interface Contracts
 
