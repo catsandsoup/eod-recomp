@@ -233,12 +233,19 @@ def decode_part(data, part):
         q199 = mem.get(199, [0, 0, 0, 0])
         soff, toff = f32(q198[0]), f32(q198[1])
         pox, poy, poz = f32(q199[0]), f32(q199[1]), f32(q199[2])
+        # The shadow program at VU1 byte0x20 (MSCAL4) reads a two-qword
+        # normal/position pair: lq0(vi2), lq1(vi2), then vi2+=2. Body
+        # programs use three qwords (normal/position/UV), plus separate skin.
+        # Reading shadow data at stride3 mistakes a position for a normal,
+        # whose raw fourth lane was never supplied by V3-16 UNPACK.
+        shadow = st.mscal[-1] == 4
+        stride = 2 if shadow else 3
         verts = []
         for i in range(count):
-            nq = raw.get(1 + 3 * i)
-            pq = mem.get(2 + 3 * i)
-            tq = mem.get(3 + 3 * i)
-            bq = raw.get(150 + i)
+            nq = raw.get(1 + stride * i)
+            pq = mem.get(2 + stride * i)
+            tq = None if shadow else mem.get(3 + stride * i)
+            bq = None if shadow else raw.get(150 + i)
             if pq is None:
                 break
             pos = (f32(pq[0]) + pox, f32(pq[1]) + poy, f32(pq[2]) + poz)
@@ -293,6 +300,21 @@ def fix_winding(verts, tris):
     return out
 
 
+def triangulate_batch(batch):
+    """Return native preview triangles for a decoded VU batch.
+
+    Shadow entry4 uses continuous vertex parity, including ADC vertices. Its
+    normals point inward for light extrusion: do not flip faces to match them.
+    The body preview retains the existing normal-aligned winding contract.
+    This shows the source shadow mesh, not a light-extruded in-game volume.
+    """
+    verts = batch['verts']
+    if batch['mscal'] == 4:
+        return [(i - 2, i - 1, i) if i % 2 == 0 else (i - 1, i - 2, i)
+                for i in range(2, len(verts)) if not verts[i]['adc']]
+    return fix_winding(verts, strip_triangles(verts))
+
+
 def load_mesh(path):
     data = open(path, 'rb').read()
     m = parse_modl(data)
@@ -301,8 +323,7 @@ def load_mesh(path):
         verts, tris = [], []
         for bt in batches:
             base = len(verts)
-            t = strip_triangles(bt['verts'])
-            t = fix_winding(bt['verts'], t)
+            t = triangulate_batch(bt)
             # drop degenerate (repeated-index / zero-area) triangles
             for (a, b, c) in t:
                 pa, pb, pc = bt['verts'][a]['p'], bt['verts'][b]['p'], bt['verts'][c]['p']
