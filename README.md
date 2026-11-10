@@ -4,7 +4,7 @@
 
 [Download 1.0 for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
 
-**Development:** [Repository and branch guide](docs/REPOSITORY_MAP.md) · [Creation Kit preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.1-preview) · [Claude Kit handoff](https://github.com/catsandsoup/eod-recomp/tree/dev/creation-kit/docs/handoffs/2026-11-10-claude-opus)
+**Development:** [Repository and branch guide](docs/REPOSITORY_MAP.md) · [Creation Kit preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.2-preview) · [Claude Kit handoff](https://github.com/catsandsoup/eod-recomp/tree/dev/creation-kit/docs/handoffs/2026-11-10-claude-opus)
 
 The Creation Kit is a separate development app in this repository. Use `dev/creation-kit` for Kit work; `main` remains the published game baseline.
 

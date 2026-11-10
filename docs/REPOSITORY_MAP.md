@@ -15,11 +15,21 @@ Promote specific verified changes only through a reviewed integration decision.
 ## Releases
 
 - [Game v1.0](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0): existing game download; unchanged by this cleanup.
-- [Creation Kit 0.3.1 development preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.1-preview): separate macOS arm64 app; packaged runtime requires macOS 27. Source/package checkpoint `aac177aed793158fda91397a46e431963b42a29e`. Subsequent documentation commits clarify the handoff.
+- [Creation Kit 0.3.2 development preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.2-preview): separate macOS arm64 app; packaged runtime requires macOS 27. Source/package checkpoint `fa36148` (Bus sticker workflow fix). The previous 0.3.1 release remains historical. Subsequent documentation commits clarify the handoff.
 
 Older preview releases remain historical artifacts. Their existence is not an
 instruction to use them or evidence that current features are complete. Read
 release-specific limitations; the Kit preview is not the stable game release.
+
+## Installed modding app
+
+The sole installed tool is `/Applications/EOD Creation Kit.app`, version 0.3.2.
+The owner explicitly retired the old Modding Suite and duplicate development
+bundles after the Git cleanup. They are preserved as verified recovery ZIPs at
+`/Users/USER/Documents/Codex/2026-11-10/read/outputs/retired-modding-apps/`.
+User projects, saves and the working game remain. Historical app paths/hashes
+must not be treated as current launch targets. The detailed Kit record is
+`docs/BUS_STICKER_WORKFLOW.md` on `dev/creation-kit`.
 
 ## Local checkouts
 
