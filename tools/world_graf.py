@@ -59,6 +59,7 @@ DISPLAY_SUBTYPES = [
 
 DYNO = 3
 SKY = 4
+OPTIONAL_TERRAIN = 20
 # Dyno record offsets (relative to the model record). The spawn block
 # (f_00223128 -> f_002243E0 returns record+0x2C) is read by f_00225808.
 DYNO_MODE = 0x2C        # s32; -1 never spawned, else game-mode bit (1-based) in session+0x3C
@@ -220,6 +221,12 @@ def _leaf(data, node, m, path):
                 leaf["dyno"].update(matrix=_f32s(data, m + DYNO_MATRIX, 12),
                                     params=_f32s(data, m + DYNO_PARAMS, 3),
                                     matrix_offset=m + DYNO_MATRIX)
+        elif st == OPTIONAL_TERRAIN:
+            # f_002230F8 turns +0x2C (1-based mode) into a bit mask at fixup;
+            # f_00223008 tests it against session(0x495BE0)+0x3C and toggles
+            # mlist A entry +0x1C / mlist B entry +0x18 via f_00359248.
+            leaf["optional_terrain"] = dict(mode=_s32(data, m + 0x2C), mlist_a_entry=_u32(data, m + 0x1C),
+                                            mlist_b_entry=_u32(data, m + 0x18))
         elif st in (1, 2, 5):
             leaf["anchor"] = _f32s(data, m + 0x20, 3)
     return leaf
