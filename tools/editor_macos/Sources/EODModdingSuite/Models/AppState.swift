@@ -95,6 +95,13 @@ enum RuntimePaths {
         else { return "" }
         return config["gameExecutable"] ?? ""
     }
+    static var initialProject: String? {
+        guard let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),
+              let data = try? Data(contentsOf: resource),
+              let config = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return nil }
+        return config["initialProject"]
+    }
     static var helper: URL {
         if let resources = Bundle.main.resourceURL {
             let bundled = resources.appendingPathComponent("Backend/modding_backend.py")
@@ -170,15 +177,16 @@ final class StudioState: ObservableObject {
     private var process: Process?
     private var sessionStopped = false
     private let preferences: UserDefaults
+    private var started = false
 
-    init(preferences: UserDefaults = UserDefaults(suiteName: "org.eod-recomp.creationkit.development")!) {
+    init(preferences: UserDefaults = .standard) {
         self.preferences = preferences
         let prefs = preferences
         disc = prefs.string(forKey: "retailStudio.disc") ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/TDEODRecomp/disc").path
         let root = RuntimePaths.repository
         executable = prefs.string(forKey: "retailStudio.executable") ?? RuntimePaths.gameExecutable
-        project = prefs.string(forKey: "retailStudio.project") ?? root.appendingPathComponent("mods/CreationKitDevelopment/project.eodproject").path
+        project = prefs.string(forKey: "retailStudio.project") ?? RuntimePaths.initialProject ?? root.appendingPathComponent("mods/CreationKitDevelopment/project.eodproject").path
         if let data = try? Data(contentsOf: URL(fileURLWithPath: project)),
            let saved = try? JSONDecoder().decode(LoadedProject.self, from: data) {
             savedTestTrack = saved.testTrackArchive
@@ -209,6 +217,17 @@ final class StudioState: ObservableObject {
         dialog.addButton(withTitle: "Cancel")
         dialog.addButton(withTitle: "Discard")
         return dialog.runModal() == .alertSecondButtonReturn
+    }
+    func startup() async {
+        guard !started else { return }
+        started = true
+        if FileManager.default.fileExists(atPath: project) {
+            await loadProject(project)
+            if let openingError = error {
+                await refresh()
+                error = openingError
+            }
+        } else { await refresh() }
     }
     func refresh() async {
         guard !busy else { return }

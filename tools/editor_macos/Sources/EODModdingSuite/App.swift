@@ -19,7 +19,7 @@ struct EODModdingSuiteApp: App {
                 .frame(minWidth: 1040, minHeight: 700)
                 .preferredColorScheme(.dark)
                 .onAppear { delegate.state = state }
-                .task { await state.refresh() }
+                .task { await state.startup() }
         }
         .commands {
             CommandGroup(replacing: .newItem) {

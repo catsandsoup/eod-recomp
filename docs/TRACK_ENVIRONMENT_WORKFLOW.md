@@ -44,3 +44,12 @@ Final actual retail capture: `work/track-environment/direct-race-fade-clear/firs
 Desktop UI inspection could not be completed: Computer Use could not attach the development app, and Finder reported concurrent user state changes. No working app was changed to force a GUI test. Production Swift handler tests cover track selection/preview/save/reopen, and the signed app is available for direct inspection.
 
 Initial full runtime85/87 failures were corrected by selecting installed Python3.13 with Tk and adding verified native hook names; rerunning those2 tests passed. Final full runtime run:87/87 tests passed in52.53 seconds; exact output is in ignored runtime-tests-final.log. Kit7/7 suites and Swift2/2 production integration tests passed. Native input acceptance is bounded to one Anoka race; this is not all modes/vehicle types or HDR/PBR support.
+
+
+## Packaged startup correction
+
+The first distributed0.3.0 bundle crashed before creating a window: UserDefaults(suiteName: its own bundle identifier) returns nil in the real app, and the default StudioState initializer force-unwrapped it. The macOS crash report confirms this exact call. Injected-suite unit tests did not exercise the packaged default and did not justify a ready-to-open claim.
+
+Version0.3.1 uses the app's standard preferences domain (already isolated by its distinct bundle identifier), removes that forced unwrap, accepts an explicit first-launch project in packaging, and opens the saved project during startup. The Anoka example is configured for this local build. The bundle now includes the existing EOD artwork as a proper macOS ICNS icon. Previous bundles use `.app.backup` so two live `.app` bundles with the same ID are not produced.
+
+Actual Computer Use verification after rebuild: development window opened successfully, displayed AnokaEnvironment, selected ANOKA.TRK and sky01A.tex, showed32 sky tiles/311 textures, and exposed Export PNG, Replace PNG, Preview Whole Sky Tint and enabled Run Mod in Game. The user changed the window before further clicks, so no additional UI edit/save sequence is claimed. Swift startup handler tests and packaging checks passed. Accepted app/game/project hashes unchanged.

@@ -35,5 +35,8 @@ class IsolationTests(unittest.TestCase):
             self.assertEqual(config['gameExecutable'], str(game))
             self.assertEqual(game.read_bytes(), b'unchanged')
             self.assertEqual(builder.bundle_info()['CFBundleIdentifier'], 'org.eod-recomp.creationkit.development')
+            self.assertEqual(builder.bundle_info()['CFBundleIconFile'], 'AppIcon')
+            project = root / 'project.eodproject'; project.write_text('{}')
+            self.assertEqual(builder.runtime_config(root, game, project)['initialProject'], str(project))
 
 if __name__ == '__main__': unittest.main()

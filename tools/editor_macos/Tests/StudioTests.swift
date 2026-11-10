@@ -111,7 +111,7 @@ final class StudioTests: XCTestCase {
         XCTAssertNil(state.error); XCTAssertFalse(state.dirty); XCTAssertTrue(state.canTest)
         XCTAssertEqual(state.savedTestTrack, "DATA/TRACKS/ANOKA.TRK")
         let reopened = StudioState(preferences: prefs)
-        await reopened.loadProject(state.project)
+        await reopened.startup()
         XCTAssertNil(reopened.error)
         XCTAssertEqual(reopened.environmentDetail?.track, "Anoka")
         XCTAssertEqual(reopened.detail?.kind, "texture")
