@@ -27,6 +27,8 @@ uint32_t gs_get_imr();
 void gs_put_imr(uint32_t v);
 // Called at vblank start: presents the displayed framebuffer.
 void gs_vblank();
+// Editor-only marker ordered behind the first native race render submission.
+void gs_editor_race_frame_submitted();
 // Game frames drawn so far (frame rate counter).
 uint64_t gs_drawn_frames();
 // Presents the last image again (with the in-game menu over it) while the game is paused.

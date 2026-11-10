@@ -10,6 +10,8 @@
 #include "platform/platform.h"
 #include "funcs.h"
 #include "movie_bits.h"
+#include "gs/gs.h"
+#include "platform/editor_test_startup.h"
 
 // set while a movie plays (shown in 4:3 whatever the game's aspect setting)
 std::atomic<bool> g_movie_playing{false};
@@ -22,7 +24,8 @@ void f_0039AFB0(void) {
 }
 
 void f_003670C8(void) {
-    static bool skip = getenv("EOD_SKIP_MOVIES") && atoi(getenv("EOD_SKIP_MOVIES"));
+    static bool skip = (getenv("EOD_SKIP_MOVIES") && atoi(getenv("EOD_SKIP_MOVIES"))) ||
+                       editor_test_startup::state().enabled();
     char name[256];
     ee_read_string(arg_u32(0), name, sizeof name);
     if (skip) {
@@ -36,6 +39,20 @@ void f_003670C8(void) {
     f_003670C8_orig();
     g_movie_playing = false;
     LOG(LOG_CORE, "movie %s ended after %.1f s", name, (platform_time_us() - t0) / 1e6);
+}
+
+// The native race loop calls this at return address 0x1140E0, after its
+// simulation/update and before end-of-frame housekeeping. Preserve the entire
+// draw/submit implementation; the marker follows its VIF/GIF work in FIFO order.
+extern "C" void f_00113FF8_orig(void);
+extern "C" void f_00113FF8(void) {
+    const bool race_frame = g_ee.r[31].uw[0] == 0x001140E0;
+    f_00113FF8_orig();
+    static bool marked = false;
+    if (!marked && race_frame && editor_test_startup::state().enabled()) {
+        marked = true;
+        gs_editor_race_frame_submitted();
+    }
 }
 
 }

@@ -168,6 +168,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(editor_test_startup_test tools/tests/editor_test_startup_test.cpp)
+  add_test(NAME EditorTestStartup COMMAND editor_test_startup_test)
   if(Python3_FOUND)
     add_test(NAME AssetTools COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/tests/test_custom_car.py)
     add_test(NAME AudioTools COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/tests/test_audio.py)

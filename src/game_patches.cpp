@@ -232,7 +232,7 @@ static float car_file_damage_scale(const std::string &model) {
             for (char &c : key) c = (char)tolower((unsigned char)c);
             if (key != "damage_scale") continue;
             float v = (float)atof(str(u32(base + list + i * 8 + 4)).c_str());
-            return v > 0.05f && v < 10.0f ? v : 1.0f;
+            return std::isfinite(v) ? v : 1.0f;
         }
     }
     return 1.0f;

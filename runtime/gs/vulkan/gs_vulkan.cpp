@@ -22,6 +22,7 @@
 #include "../../platform/platform.h"
 #include "../../platform/screenshot_size.h"
 #include "../../platform/presentation.h"
+#include "../../platform/editor_test_startup.h"
 #include "alpha_order.h"
 #include "alpha_tiles.h"
 #include "alpha_range.h"
@@ -2917,7 +2918,8 @@ void show(bool vsync) {
             if (g_have_last)
                 compose(back, g_dev->extent.width, g_dev->extent.height, x, y, w, h, g_config.smooth_display);
             draw_overlay(back, g_dev->extent.width, g_dev->extent.height);
-            g_dev->present();
+            if (g_dev->present() && g_have_last)
+                editor_test_startup::state().hardware_presented();
             g_stats.presents++;
         }
     } else

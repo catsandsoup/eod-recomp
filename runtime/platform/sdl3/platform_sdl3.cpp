@@ -1,5 +1,6 @@
 #include "../display_rect.h"
 #include "../presentation.h"
+#include "../editor_test_startup.h"
 // platform_sdl3.cpp - window, audio and controllers through SDL3 (macOS;
 // also builds on Linux). Time, fibers, files and the ticker stay in
 // posix/platform_posix.cpp.
@@ -67,6 +68,7 @@ namespace {
 
 PlatformConfig g_cfg;
 bool g_headless;
+bool g_editor_window_hidden = false;
 bool g_vulkan_window;
 SDL_Window *g_window;
 std::thread::id g_main_thread;  // the thread that ran platform_init (the EE runs on it)
@@ -276,6 +278,8 @@ bool platform_init(const PlatformConfig &cfg) {
 
     if (!g_headless) {
         SDL_WindowFlags wf = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        g_editor_window_hidden = editor_test_startup::state().hide_window(g_headless);
+        if (g_editor_window_hidden) wf |= SDL_WINDOW_HIDDEN;
 #ifdef EOD_VULKAN
         if (g_config.renderer == "vulkan") { wf |= SDL_WINDOW_VULKAN; g_vulkan_window=true; }
 #endif
@@ -372,6 +376,14 @@ void platform_fatal_message(const char *msg) {
 }
 
 bool platform_pump() {
+    // Window operations stay on the main/EE thread. The GS worker only publishes
+    // the readiness acknowledgement after a real race image has been presented.
+    if (g_window && g_editor_window_hidden && editor_test_startup::state().ready()) {
+        if (SDL_ShowWindow(g_window)) {
+            g_editor_window_hidden = false;
+            std::fputs("[editor-test] first native race frame presented; showing game window\n", stderr);
+        }
+    }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
@@ -488,6 +500,7 @@ void platform_present(const uint32_t *pixels, int width, int height, int stride)
     if (!g_headless && !g_renderer && g_vulkan_window && !gs::hw::g_on) {
         SDL_DestroyWindow(g_window);
         SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        if (g_editor_window_hidden) flags |= SDL_WINDOW_HIDDEN;
         if (g_cfg.fullscreen) flags |= SDL_WINDOW_FULLSCREEN;
         g_window = SDL_CreateWindow(g_cfg.title, g_cfg.width, g_cfg.height, flags);
         g_vulkan_window = false;
@@ -582,7 +595,7 @@ void platform_present(const uint32_t *pixels, int width, int height, int stride)
         SDL_SetRenderScale(g_renderer, 1.0f, 1.0f);
     }
 
-    SDL_RenderPresent(g_renderer);
+    if (SDL_RenderPresent(g_renderer)) editor_test_startup::state().software_presented();
 }
 
 bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {

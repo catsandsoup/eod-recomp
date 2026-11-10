@@ -28,6 +28,7 @@
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
 #include "../platform/presentation.h"
+#include "../platform/editor_test_startup.h"
 #include "gs_mem.h"
 #include "gs_replay_types.h"
 #include "gs_capture_io.h"
@@ -841,7 +842,7 @@ void gs_frame_end(uint64_t frame, int aspect);
 // it when it reads state the worker produces.
 namespace {
 
-enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW };
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME };
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -919,6 +920,7 @@ void gs_frame_end(uint64_t frame, int aspect) {
         g_pub_w = g_frame_w;
         g_pub_h = g_frame_h;
         g_pub_aspect = aspect;
+        editor_test_startup::state().software_composed();
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
@@ -1106,6 +1108,9 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             }
         }
         switch (h[0]) {
+        case CMD_EDITOR_RACE_FRAME:
+            if (live) editor_test_startup::state().race_submitted();
+            break;
         case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
         case CMD_PRIV: {
             uint64_t v;
@@ -1738,6 +1743,18 @@ bool gs_screenshot(const char *path) {
 }
 
 uint64_t gs_drawn_frames() { return g_flips.load(); }
+
+void gs_editor_race_frame_submitted() {
+    if (!editor_test_startup::state().enabled()) return;
+    if (g_threaded) {
+        offload_run([] {
+            push_cmd(CMD_EDITOR_RACE_FRAME, 0, 0, nullptr, 0);
+            gs_flush();
+        });
+    } else {
+        offload_run([] { editor_test_startup::state().race_submitted(); });
+    }
+}
 
 // Shows the last image again with the overlay (the game is paused in the in-game menu).
 void gs_overlay_redraw() {
