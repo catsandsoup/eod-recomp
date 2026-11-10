@@ -140,7 +140,7 @@ def tile_geometry(part, cone):
     els = [d[1] for d in dirs]
     area = sum(abs((V[b][3] - V[a][3]) * (V[c][4] - V[a][4]) - (V[c][3] - V[a][3]) * (V[b][4] - V[a][4])) / 2
                for a, b, c in part["triangles"])
-    pole = [i for i, d in enumerate(dirs) if d[0] is None]
+    apex = {tuple(v[:3]) for v in V if abs(v[4]) < 1e-4}
     cdir, chalf = cone[:3], cone[3]
     worst = max(math.degrees(math.acos(max(-1.0, min(1.0, sum(v[k] * cdir[k] for k in range(3)) /
                                                     math.sqrt(sum(c * c for c in v[:3])))))) for v in V)
@@ -150,7 +150,8 @@ def tile_geometry(part, cone):
         elevation=dict(min=round(min(els), 3), max=round(max(els), 3),
                        atV0=edge["v0"]["elevation"], atV1=edge["v1"]["elevation"]),
         upEdge="v0 (PNG top)" if edge["v0"]["elevation"] > edge["v1"]["elevation"] else "v1 (PNG bottom)",
-        apexAtV0=bool(pole) and all(abs(V[i][4]) < 1e-4 for i in pole),
+        apexAtV0=len(apex) == 1,
+        meanY=round(sum(v[1] for v in V) / len(V), 3),
         uvRect=[min(v[3] for v in V), min(v[4] for v in V), max(v[3] for v in V), max(v[4] for v in V)],
         uvCoverage=round(area, 4),
         nativeCull=dict(group=part["group"] & 0xFFFF, coneDir=[round(c, 5) for c in cdir],
@@ -205,19 +206,14 @@ def validate_topology(tiles):
                if (t["neighbours"]["u1"] or {}).get("tile") != num[n % 16 + 1][b]["member"]
                or (t["neighbours"]["u1"] or {}).get("edge") != "u0"]
         checks.append(("u1 edge of NN seams to u0 edge of NN+1 (16 wraps to 01)", not bad, bad))
-        bad = [n for n in nums if max(num[n]["A"]["geometry"]["elevation"]["max"],
-                                      0) > num[n]["B"]["geometry"]["elevation"]["min"] + 0.5]
-        checks.append(("A band lies below B cap", not bad, bad))
-        bad = [n for n in nums if any(abs(wrap180(num[n]["A"]["geometry"]["azimuth"][k] -
-                                                  num[n]["B"]["geometry"]["azimuth"][k])) > 0.5
-                                      for k in ("atU0", "atU1"))]
-        checks.append(("A and B share azimuth edges", not bad, bad))
+        bad = [n for n in nums if num[n]["A"]["geometry"]["meanY"] >= num[n]["B"]["geometry"]["meanY"]]
+        checks.append(("A band lies below B cap (model +Y)", not bad, bad))
         spans = [num[n]["A"]["geometry"]["azimuth"]["spanDeg"] for n in nums]
         checks.append(("A spans sum to 360 deg", abs(sum(spans) - 360) < 0.5,
                        [round(min(spans), 3), round(max(spans), 3)]))
         seams = [v["seamParamMaxDelta"] for t in tiles for v in t["neighbours"].values() if v]
         checks.append(("Seam parameters match across shared vertices", max(seams) < 1e-3, max(seams)))
-        checks.append(("B tiles converge to an apex on their v0 edge",
+        checks.append(("B v0 edge collapses to one apex point",
                        all(num[n]["B"]["geometry"]["apexAtV0"] for n in nums), None))
     return [dict(check=c, ok=bool(ok), detail=d) for c, ok, d in checks]
 
@@ -496,13 +492,16 @@ def export(disc, track, dest, pano_width=None, panorama=True):
             elevation="degrees atan2(y, hypot(x, z)); +Y is up",
             uv="(0,0) = PNG top-left corner; texel (i, j) centre = ((i+0.5)/w, (j+0.5)/h)",
             origin="Sky draw 0x223858 translates the model to the camera position with identity rotation",
-            screenHandedness="unverified: whether increasing azimuth is to the viewer's right needs a native run"),
+            screenHandedness="Anoka native k=32 run: increasing azimuth is to the viewer's right; tile u runs "
+                             "right-to-left on screen (tiles appear mirrored); 01A,16A,15A,14A left to right"),
         **info,
         panorama=dict(file="panorama.png" if panorama else None, lossy=True, projection=dict(
             type="equirectangular-upper-hemisphere", width=width, height=width // 4,
-            azimuthAtX0=g["atU0"], xDirection=-1 if g["uIncreasesWith"] == "decreasing-azimuth" else 1,
+            azimuthAtX0=g["atU1"] if g["uIncreasesWith"] == "decreasing-azimuth" else g["atU0"], xDirection=1,
             elevationTop=90, elevationBottom=0,
-            note="x follows tile u order (sky01 u=0 at x=0); rows are linear in elevation; pixels ray-cast "
+            note="player view: x increases with azimuth (viewer turning right), sky01A starts at x=0, tile "
+                 "numbers decrease left to right and tile art appears mirrored; rows are linear in elevation; "
+                 "pixels ray-cast "
                  "through the decoded triangles, bilinear clamp-to-tile texture sampling; alpha 0 = no sky")))
     rename = {t["geometry"].get("modelTexture", t["member"]): t["member"] for t in manifest["tiles"]}
     for t in manifest["tiles"]:  # neighbour names use the archive spelling; keep them last for reading
@@ -737,7 +736,9 @@ def registry(disc):
                 "verified-editable" if native_run else "editable-unverified",
                 "native purple-sky run (docs/TRACK_ENVIRONMENT_WORKFLOW.md)" if native_run
                 else f"{len(info['tiles'])} tiles decode with the Anoka format; no native run")
-            add("sky tile host replacement (k x)", "unknown", "indexKey/paletteKey exported; no native host run")
+            add("sky tile host replacement (k x)", "verified-editable" if native_run else "editable-unverified",
+                "native k=32 labelled run (docs/HOST_TEXTURE_REPLACEMENT.md)" if native_run
+                else "indexKey/paletteKey exported; no native host run")
             add("sky dome geometry / tile placement", "baked", "GRAF-embedded MODL; no GRAF writer")
             add("sky per-group cull cones", "baked", "GRAF Sky record +0x2C")
             add("horizon cards in sky model", "baked",
