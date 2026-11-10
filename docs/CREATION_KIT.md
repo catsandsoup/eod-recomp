@@ -1,5 +1,7 @@
 # Creation Kit development boundary
 
+Current branches, checkouts, releases and Claude entry point: [Repository map](REPOSITORY_MAP.md). The sections below record the original isolation design; later runtime and release packaging changes are described in TRACK_ENVIRONMENT_WORKFLOW.md and CREATION_KIT_RELEASE.md.
+
 Player success: the accepted EOD Modding Suite and game continue to work while development builds use their own app identity, preferences, project and output folders. No UI redesign or engine modernization is part of this separation.
 
 ## Products in this repository
