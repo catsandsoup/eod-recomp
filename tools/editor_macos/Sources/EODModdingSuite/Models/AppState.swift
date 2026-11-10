@@ -212,6 +212,7 @@ final class StudioState: ObservableObject {
     func request(_ action: String) -> [String: Any] {
         var input: [String: Any] = ["action": action, "disc": disc, "project": project, "archive": archive, "asset": asset]
         if let texture = pendingTextures[asset] { input["textureEdit"] = texture.dictionary }
+        input["textureEdits"] = pendingTextures.mapValues(\.dictionary)
         return input
     }
     func remember() {

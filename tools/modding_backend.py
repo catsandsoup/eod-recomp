@@ -92,7 +92,7 @@ def cached_directory(path, modified, size):
     return directory(Path(path))
 
 
-def vehicle_paint(disc, archive):
+def vehicle_paint(disc, archive, include_embedded=False):
     if archive.suffix.lower() != ".car":
         return None
     stem = archive.stem.upper()
@@ -101,7 +101,7 @@ def vehicle_paint(disc, archive):
         return None
     local_names = {e["name"].lower() for e in directory(archive)}
     aliases = BODY_TEXTURE_ALIASES[chassis.lower()]
-    if all(n.lower() in local_names or (Path(n).stem + ".tm0").lower() in local_names for n in aliases):
+    if not include_embedded and all(n.lower() in local_names or (Path(n).stem + ".tm0").lower() in local_names for n in aliases):
         return None
     common, paints = disc / "DATA/RES/COMMON.RES", disc / "DATA/RES/CT.RES"
     if not common.is_file() or not paints.is_file():
@@ -132,10 +132,37 @@ def vehicle_paint(disc, archive):
     return None
 
 
-def resolve_material(disc, archive, name, paint=None):
+def edited_material(disc, archive, name, request):
+    if not request:
+        return None
+    relative = archive.relative_to(disc).as_posix()
+    entries = directory(archive)
+    # An edited high-detail payload also supplies a model's .tex material alias.
+    for candidate in (Path(name).stem + ".tm0", name):
+        entry = next((e for e in entries if e["name"].lower() == candidate.lower()), None)
+        if entry is None:
+            continue
+        selected = dict(request, archive=relative, asset=entry["name"])
+        pending = request.get("textureEdits", {}) if relative == request["archive"] else {}
+        edit = pending.get(entry["name"]) or saved_edits(selected, disc, sha(archive.read_bytes()))
+        if edit:
+            return texture_edit_bytes(edit, payload(archive, entry["name"], entries)[0])
+    return None
+
+
+def resolve_material(disc, archive, name, paint=None, request=None):
     if name.lower() in ("", "-", ".tex"):
         return None
+    edited = edited_material(disc, archive, name, request)
+    if edited is not None:
+        return edited
     paint = paint if paint is not None else vehicle_paint(disc, archive)
+    if request and paint and name.lower() in {n.lower() for n in BODY_TEXTURE_ALIASES.get(paint["chassis"].lower(), ())}:
+        paint_name = paint["asset"]
+        if paint["chassis"] == "Bus" and name.lower() == "bus2.tex" and paint["number"] == "790":
+            paint_name = "79a.tm0"
+        edited = edited_material(disc, paint["archive"], paint_name, request)
+        return edited if edited is not None else payload(paint["archive"], paint_name)[0]
     # Resource namespaces are mounted with the model's own archive first, then
     # the game's resident resources. Do not substitute another venue's same name.
     shared = ("HOBBYSET.RES", "RACE.RES", "PART.RES", "COMMON.RES", "GENESIS.RES")
@@ -148,7 +175,8 @@ def resolve_material(disc, archive, name, paint=None):
         match = next((e for candidate_name in (name, Path(name).stem + ".tm0")
                       for e in entries if e["name"].lower() == candidate_name.lower()), None)
         if match:
-            return payload(candidate, match["name"], entries)[0]
+            edited = edited_material(disc, candidate, name, request)
+            return edited if edited is not None else payload(candidate, match["name"], entries)[0]
     if paint and name.lower() in {n.lower() for n in BODY_TEXTURE_ALIASES.get(paint["chassis"].lower(), ())}:
         return payload(paint["archive"], paint["asset"])[0]
     return None
@@ -305,7 +333,7 @@ def inspect(request, disc):
         result.update(kind="texture", image=image, metadata=meta)
     elif entry["type"] == "MODL":
         mesh = vif_mesh.parse_modl(data)
-        paint = vehicle_paint(disc, path)
+        paint = vehicle_paint(disc, path, include_embedded=True)
         parts = []
         for part in mesh["parts"]:
             vertices, triangles = [], []
@@ -317,7 +345,7 @@ def inspect(request, disc):
             image = None
             texture_error = None
             try:
-                tex = resolve_material(disc, path, part["texture"], paint=paint)
+                tex = resolve_material(disc, path, part["texture"], paint=paint, request=request)
                 if tex is not None:
                     image, _ = texture(tex, cache)
                 elif part["texture"].lower() not in ("", "-", ".tex"):
@@ -354,7 +382,7 @@ def texture(data, cache):
     return str(path), meta
 
 
-def save(request, disc):
+def save_single_archive(request, disc):
     project_file = project_path(request, disc)
     source = archive_path(disc, request["archive"])
     original = source.read_bytes()
@@ -449,6 +477,60 @@ def save(request, disc):
         raise
     return dict(project=str(project_file), overlay=str(storage_path(project_file, "overlay")),
                 archivePath=str(output), sha256=sha(built), bytes=len(built), sourceCrcWarnings=warnings)
+
+
+def save(request, disc):
+    """Save a Bus body template and its verified paint-zero runtime resources.
+
+    Native Bus logs bind bus1/2.tex to 790/79a.tex for paint=0. Both low and
+    streamed mip-zero resources must be rebuilt; editing the CAR alone is inert.
+    Other vehicle mappings are not inferred from filenames.
+    """
+    if request["archive"].upper() != "DATA/CAR/BUS.CAR":
+        return save_single_archive(request, disc)
+    project_file = project_path(request, disc)
+    project = load_project(project_file) if project_file.exists() else {"archives": {}}
+    assets = dict(project["archives"].get(request["archive"], {}).get("assets", {}))
+    assets.update(request.get("textureEdits", {}))
+    sources = {Path(name).stem.lower(): name for name in sorted(assets, key=lambda n: n.lower().endswith(".tm0"))
+               if isinstance(assets[name], dict) and Path(name).stem.lower() in ("bus1", "bus2")}
+    if not sources:
+        return save_single_archive(request, disc)
+    paint = vehicle_paint(disc, archive_path(disc, request["archive"]), include_embedded=True)
+    if not paint or paint["number"] != "790":
+        raise ValueError("Bus paint-zero binding differs from the verified 790/79a native layout")
+    from texture_edit import import_png
+    texture_edits = {}
+    with tempfile.TemporaryDirectory(prefix="eod-bus-paint-") as folder:
+        png = Path(folder) / "paint.png"
+        for body, source_name in sources.items():
+            original, _ = payload(archive_path(disc, request["archive"]), source_name)
+            data = texture_edit_bytes(assets[source_name], original)
+            width, height, pixels, _ = decode_preview(data)
+            number = "790" if body == "bus1" else "79a"
+            for suffix in (".tex", ".tm0"):
+                target_name = number + suffix
+                target, _ = payload(paint["archive"], target_name)
+                tw, th, _, _ = decode_preview(target)
+                resized = b"".join(pixels[((y*height//th)*width+x*width//tw)*4:((y*height//th)*width+x*width//tw)*4+4]
+                                   for y in range(th) for x in range(tw))
+                write_png(str(png), tw, th, resized)
+                texture_edits[target_name] = texture_record(import_png(target, png))
+    # Both archives and the project are a single recoverable publication.
+    paths = [project_file, overlay_file(project_file, request["archive"]), overlay_file(project_file, "DATA/RES/CT.RES")]
+    previous = {p: p.read_bytes() if p.exists() else None for p in paths}
+    try:
+        paint_request = dict(request, archive="DATA/RES/CT.RES", asset=next(iter(texture_edits)), textureEdits=texture_edits)
+        paint_request.pop("edits", None)
+        save_single_archive(paint_request, disc)
+        return save_single_archive(request, disc)
+    except BaseException:
+        for path, data in previous.items():
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, data)
+        raise
 
 
 def validate(request, disc):

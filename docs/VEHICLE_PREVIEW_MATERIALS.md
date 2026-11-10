@@ -1,5 +1,7 @@
 # Vehicle preview material binding — 10 November 2026
 
+Current follow-up: see `BUS_STICKER_WORKFLOW.md`. Native Bus race evidence showed its embedded templates are replaced by CT.RES paint resources; model inspection now applies saved/pending edits and native paint context. The literal-precedence statement below describes the earlier resolver checkpoint.
+
 ## Player success
 
 The Ambulance Low1 model in the development Kit displays its native painted

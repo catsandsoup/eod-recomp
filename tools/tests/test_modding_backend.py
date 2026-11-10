@@ -224,6 +224,64 @@ class ModdingBackendTest(unittest.TestCase):
                          "An embedded body texture must take precedence over the default paint")
         self.assertIsNone(self.backend.resolve_material(self.disc,self.archive,'amby.tex'), 'Another chassis paint must never be substituted')
 
+    def test_model_material_reads_pending_and_saved_texture_edits(self):
+        self.disc = self.disc.resolve(); self.archive = self.archive.resolve(); self.project = self.project.resolve()
+        from tex import compile_tex
+        stage=self.root/"stage"
+        original=compile_tex(16,16,bytes((20,40,60,255))*256)
+        edited=compile_tex(16,16,bytes((200,30,100,255))*256)
+        (stage/"Body.tm0").write_bytes(original)
+        manifest=json.loads((stage/"manifest.json").read_text())
+        manifest["entries"].append(dict(name="Body.tm0",fourcc="TEX ",version=10,is_extractable=True))
+        (stage/"manifest.json").write_text(json.dumps(manifest))
+        with contextlib.redirect_stdout(io.StringIO()):pack_archive(str(stage),str(self.archive))
+        request=dict(archive="DATA/CAR/ALGAR.CAR",project=str(self.project),asset="Body.tm0")
+        edits={"Body.tm0":self.backend.texture_record(edited)}
+        self.assertEqual(self.backend.resolve_material(self.disc,self.archive,"Body.tex",
+            request=dict(request,textureEdits=edits)),edited)
+        self.backend.save(dict(request,textureEdits=edits),self.disc)
+        self.assertEqual(self.backend.resolve_material(self.disc,self.archive,"Body.tex",request=request),edited)
+
+    def test_bus_body_save_builds_both_native_runtime_paint_levels(self):
+        self.disc = self.disc.resolve(); self.project = self.project.resolve()
+        from tex import compile_tex
+        self.archive=self.disc/"DATA/CAR/BUS.CAR"
+        stage=self.root/"stage"
+        original=compile_tex(32,32,bytes((20,40,60,255))*1024)
+        edited=compile_tex(32,32,bytes((200,30,100,255))*1024)
+        (stage/"Bus1.tm0").write_bytes(original)
+        manifest=json.loads((stage/"manifest.json").read_text())
+        manifest["entries"].append(dict(name="Bus1.tm0",fourcc="TEX ",version=10,is_extractable=True))
+        (stage/"manifest.json").write_text(json.dumps(manifest))
+        res=self.disc/"DATA/RES";res.mkdir()
+        common=self.root/"bus-common";common.mkdir()
+        table=dict(tool_vtable=0,unk1=0,unk2=0,sections=[dict(name="Driver",parent="",sec_vtable=0,tool_ptr=0,pairs=[("chassis","Bus"),("number","790"),("name","Wayne")])])
+        (common/"dirt.val").write_bytes(compile_binary_valt(table))
+        (common/"manifest.json").write_text(json.dumps(dict(version=6,entries=[dict(name="dirt.val",fourcc="VALT",version=11,is_extractable=False)])))
+        paints=self.root/"bus-paints";paints.mkdir()
+        (paints/"790.tex").write_bytes(compile_tex(16,16,bytes((20,40,60,255))*256))
+        (paints/"790.tm0").write_bytes(original)
+        (paints/"manifest.json").write_text(json.dumps(dict(version=6,entries=[dict(name=n,fourcc="TEX ",version=10,is_extractable=True) for n in ["790.tex","790.tm0"]])))
+        with contextlib.redirect_stdout(io.StringIO()):
+            pack_archive(str(stage),str(self.archive))
+            pack_archive(str(common),str(res/"COMMON.RES"))
+            pack_archive(str(paints),str(res/"CT.RES"))
+        request=dict(archive="DATA/CAR/BUS.CAR",asset="Bus1.tm0",project=str(self.project))
+        self.backend.save(dict(request,textureEdits={"Bus1.tm0":self.backend.texture_record(edited)}),self.disc)
+        self.backend.validate(request,self.disc)
+        built=self.backend.overlay_file(self.project,"DATA/RES/CT.RES")
+        self.assertTrue(built.exists(),"The game reads CT.RES, not the edited CAR template")
+        for name in ["790.tex","790.tm0"]:
+            raw,_=self.backend.payload(built,name)
+            self.assertEqual(self.backend.decode_preview(raw)[2],bytes((200,30,100,255))*(256 if name.endswith(".tex") else 1024))
+        self.assertEqual(self.backend.load_project(self.project)["selectedArchive"],request["archive"])
+        paths=[self.project,built,self.backend.overlay_file(self.project,request["archive"])]
+        previous={p:p.read_bytes() for p in paths}
+        bad=dict(request,asset="physics.val",textureEdits={"Bus1.tm0":self.backend.texture_record(original)},
+                 edits=[dict(section="Chassis",key="missing_key",value="1")])
+        with self.assertRaises(ValueError):self.backend.save(bad,self.disc)
+        self.assertEqual({p:p.read_bytes() for p in paths},previous,"Failed linked save must roll back both archives and project")
+
     def test_projects_in_one_folder_never_overwrite_each_others_overlay(self):
         first = self.save("4200")
         original = Path(first["archivePath"]).read_bytes()
