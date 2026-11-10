@@ -113,10 +113,13 @@ void fill_dealer(uint32_t out) {
             ee_r32(kShopSlots + 16));
 }
 
+static bool s_buyscreen_active = false;
+static int s_queued_page_delta = 0;
+
 void career_show_page_banner() {
     char text[96];
     if (s_pages > 1)
-        std::snprintf(text, sizeof text, "DEALER LOT: BATCH %d OF %d", s_page + 1, s_pages);
+        std::snprintf(text, sizeof text, "DEALER: PAGE %d OF %d", s_page + 1, s_pages);
     else
         std::snprintf(text, sizeof text, "DEALER LOT: STOCK UNLOCKED");
     platform_show_hud_banner(text, 3000);
@@ -139,12 +142,22 @@ extern "C" void f_002E35F0(void) {
 // The dealer's per-frame selection callback runs only while its car list is on screen.
 extern "C" void f_003702F0(void) {
     s_dealer_frames.store(0);
+    if (s_queued_page_delta != 0 && s_pages > 1) {
+        s_page = ((s_page + s_queued_page_delta) % s_pages + s_pages) % s_pages;
+        s_queued_page_delta = 0;
+        s_variant++;
+        fill_dealer(0);
+        s_banner_due.store(true);
+        career_show_page_banner();
+    }
     f_003702F0_orig();
 }
 
 // dealer Buy screen: pass-through to native MenuRun loop without stack tampering
 extern "C" void f_0036E9C0(void) {
+    s_buyscreen_active = true;
     f_0036E9C0_orig();
+    s_buyscreen_active = false;
 }
 
 // home: get_buy_slot_for_car(home, car) - maps car index (5..9 on page 1, 10..14 on page 2)
@@ -379,7 +392,13 @@ static void crash_probe() {
 }
 
 void career_vblank(uint16_t pressed) {
-    (void)pressed;
+    if (s_buyscreen_active || s_dealer_frames.load() < 10) {
+        if (pressed & (PAD_R2 | PAD_R1 | PAD_RIGHT)) {
+            s_queued_page_delta = 1;
+        } else if (pressed & (PAD_L2 | PAD_L1 | PAD_LEFT)) {
+            s_queued_page_delta = -1;
+        }
+    }
     // the idle state: the Career's free-roam world (event word 0x8000226; a race or Battle has another value)
     const uint32_t event = ee_r32(kEventWord);
     const bool idle = event == kFreeRoamEvent;

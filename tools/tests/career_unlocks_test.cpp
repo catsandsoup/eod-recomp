@@ -29,10 +29,13 @@ std::string g_game_root;
 static std::string s_banner;
 void platform_show_hud_banner(const char *text, int) { s_banner = text; }
 bool platform_find_file(const char *, const char *, char *, size_t) { return false; }
+void platform_get_pad(int, HostPadState *) {}
 
 // the native functions the wrappers sit on
 static int s_orig_calls[8];
 static int32_t s_orig_result;
+extern "C" void f_001C31A0_orig() {}
+extern "C" void f_001D2DC8_orig() {}
 extern "C" void f_002E5200_orig() { s_orig_calls[0]++; g_ee.r[2].sd[0] = 0; }
 extern "C" void f_002E6C78_orig() { s_orig_calls[1]++; g_ee.r[2].sd[0] = s_orig_result; }
 extern "C" void f_002E0F10_orig() { s_orig_calls[2]++; g_ee.r[2].sd[0] = MEM_LW(MEM_LW(0x3D9394)); }

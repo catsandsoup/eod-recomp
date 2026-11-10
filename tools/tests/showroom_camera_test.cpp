@@ -39,6 +39,11 @@ bool platform_find_file(const char *, const char *, char *, size_t) { return fal
 // Native function orig stubs
 extern "C" void f_001C31A0_orig(void) {}
 extern "C" void f_001D2DC8_orig(void) {}
+extern "C" void f_002DED18_orig(void) {}
+extern "C" void f_002DFDF8_orig(void) {}
+extern "C" void f_002E1380_orig(void) {}
+extern "C" void f_002E1BB0_orig(void) {}
+extern "C" void f_002E1BC0_orig(void) {}
 
 static HostPadState s_mock_pad{};
 void platform_get_pad(int, HostPadState *out) {
@@ -322,8 +327,8 @@ static void test_garage_lot_population() {
     const uint32_t kCDBupgrAddr = 0x00300000;
     ee_w32(0x003D9398, kCDBupgrAddr);
 
-    auto* cdb = reinterpret_cast<CDBupgr*>(ee_ptr(kCDBupgrAddr));
-    std::memset(cdb, 0, sizeof(CDBupgr));
+    auto* cdb = reinterpret_cast<eod::CDBupgr*>(ee_ptr(kCDBupgrAddr));
+    std::memset(cdb, 0, sizeof(eod::CDBupgr));
     cdb->version = 3;
     cdb->car_count = 3; // 3 cars owned in garage
 
