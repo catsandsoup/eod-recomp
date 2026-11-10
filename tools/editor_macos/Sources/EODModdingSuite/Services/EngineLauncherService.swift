@@ -8,7 +8,7 @@ public final class EngineLauncherService {
 
     public func findGameBinary() -> String? {
         let candidates = [
-            "/Users/USER/Documents/GitHub/eod-recomp/build/eod",
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/GitHub/eod-recomp/build/eod").path,
             "build/eod",
             "../build/eod"
         ]
@@ -22,7 +22,7 @@ public final class EngineLauncherService {
 
     public func findDiscDataDir() -> String? {
         let candidates = [
-            "/Users/USER/Library/Application Support/TDEODRecomp/disc",
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/TDEODRecomp/disc").path,
             "disc"
         ]
         for c in candidates {

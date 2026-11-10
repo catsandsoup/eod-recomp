@@ -17,7 +17,7 @@ public final class AppState: ObservableObject {
     @Published public var memoryUsage: String = "3.2 GB"
     @Published public var buildStatus: String = "Build Ready"
     @Published public var projectName: String = "MyEODMod"
-    @Published public var projectPath: String = "/Users/USER/Documents/GitHub/eod-recomp/mods/MyEODMod"
+    @Published public var projectPath: String = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/GitHub/eod-recomp/mods/MyEODMod").path
     
     // Core Data
     @Published public var vehicle: VehicleData = VehicleData()

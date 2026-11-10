@@ -120,7 +120,7 @@ Local evidence, deliberately outside Git because it contains owner-derived data:
   CTest `host_file` passed in 5.32 seconds before the full-game check.
 
 The workspace here is
-`/Users/USER/Documents/Codex/2026-11-08/conversation-log-the-teamwork-system-has`.
+`$HOME/Documents/Codex/2026-11-08/conversation-log-the-teamwork-system-has`.
 These local paths are reproduction evidence on the owner's machine; they are not
 public download links.
 
