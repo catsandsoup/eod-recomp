@@ -291,10 +291,10 @@ def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True,
                                               "_body" if part["group"] & 0x10000 else "")
             obj.append(f"# assetId={assetid} slot={part['slot']} damageGroup={part['group'] & 0xFFFF} "
                        f"bodyPanel={bool(part['group'] & 0x10000)} groupRaw={part['group']:#x} texture={part['texture']}")
-            obj += [f"o {name}", f"usemtl {mat['name']}"]
-            obj += ["v %.7f %.7f %.7f" % v["p"] for v in part["verts"]]
-            obj += ["vt %.7f %.7f" % (v["uv"][0], 1.0 - v["uv"][1]) for v in part["verts"]]
-            obj += ["vn %.6f %.6f %.6f" % v["n"] for v in part["verts"]]
+            obj.extend([f"o {name}", f"usemtl {mat['name']}"])
+            obj.extend(["v %.7f %.7f %.7f" % v["p"] for v in part["verts"]])
+            obj.extend(["vt %.7f %.7f" % (v["uv"][0], 1.0 - v["uv"][1]) for v in part["verts"]])
+            obj.extend(["vn %.6f %.6f %.6f" % v["n"] for v in part["verts"]])
             for a, b, c in part["tris"]:
                 a, b, c = a + vbase, b + vbase, c + vbase
                 obj.append(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")
@@ -306,7 +306,7 @@ def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True,
             n_v += len(part["verts"])
             n_tri += len(part["tris"])
             vbase += len(part["verts"])
-            bbox_pts += [v["p"] for v in part["verts"]]
+            bbox_pts.extend(v["p"] for v in part["verts"])
             if keep_mesh:
                 mesh_parts.append(dict(slot=part["slot"], texture=part["texture"], group=part["group"], scope=scope,
                                        verts=part["verts"], tris=part["tris"], model=label, kind=kind))
@@ -378,12 +378,14 @@ for m in json.load(open(os.path.join(here, "vehicle.json")))["markers"]:
 
 
 def render_preview(info, png, yaw=35.0, pitch=18.0, width=720, height=432, lod_label=None):
-    """3/4 flat-textured render of the first body LOD with the Kit-resolved textures."""
+    """3/4 flat-textured render of one body LOD (default Low1, else the first) with Kit-resolved textures."""
     mesh = info["_mesh"]
-    label = lod_label or next(p["model"] for p in mesh["parts"])
-    parts = [dict(p, group=p["group"]) for p in mesh["parts"] if p["model"] == label]
-    textures = {k[:-0 or None] if False else k: v for k, v in mesh["textures"].items()}
-    vif_mesh.render(dict(parts=parts, bbox=mesh["bbox"]), str(png), {Path(k).stem.lower(): v for k, v in textures.items()},
+    labels = list(dict.fromkeys(p["model"] for p in mesh["parts"]))
+    label = lod_label or next((l for l in labels if l.lower() == "low1"), labels[0])
+    parts = [p for p in mesh["parts"] if p["model"] == label]
+    pts = [v["p"] for p in parts for v in p["verts"]]
+    bbox = dict(min=tuple(min(p[k] for p in pts) for k in range(3)), max=tuple(max(p[k] for p in pts) for k in range(3)))
+    vif_mesh.render(dict(parts=parts, bbox=bbox), str(png), {k.lower(): v for k, v in mesh["textures"].items()},
                     width=width, height=height, yaw_deg=yaw, pitch_deg=pitch)
 
 
@@ -396,7 +398,7 @@ def export_all(disc, dest, **options):
         try:
             info = export_car(disc, car.name, dest, **options)
             cars.append(dict(car=info["car"], archive=info["archive"], archiveSha256=info["archiveSha256"], **info["totals"],
-                             paint=info["paint"], unresolved=info["unresolvedMaterials"], missingLods=info["missingLods"]))
+                             paint=info["paint"], unresolvedMaterials=info["unresolvedMaterials"], missingLods=info["missingLods"]))
         except Exception as error:
             failures.append(dict(car=car.name, error=f"{type(error).__name__}: {error}", trace=traceback.format_exc(limit=3)))
     total = {k: sum(c[k] for c in cars) for k in ("models", "parts", "vertices", "triangles", "materials", "unresolved")}
