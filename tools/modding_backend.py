@@ -24,6 +24,7 @@ from valt import compile_binary_valt, parse_binary_valt
 from tex import write_png
 from texture_preview import decode_preview
 import vif_mesh
+from vehicle_materials import BODY_TEXTURE_ALIASES
 
 # Units for the curated vehicle inspector. Native tables retain their own data.
 FIELDS = {
@@ -91,12 +92,53 @@ def cached_directory(path, modified, size):
     return directory(Path(path))
 
 
-def resolve_material(disc, archive, name):
+def vehicle_paint(disc, archive):
+    if archive.suffix.lower() != ".car":
+        return None
+    stem = archive.stem.upper()
+    chassis = next((name for name in CAR_NAMES if (name.upper() if len(name) <= 8 else name[:6].upper()+"_1") == stem), None)
+    if not chassis or chassis.lower() not in BODY_TEXTURE_ALIASES:
+        return None
+    local_names = {e["name"].lower() for e in directory(archive)}
+    aliases = BODY_TEXTURE_ALIASES[chassis.lower()]
+    if all(n.lower() in local_names or (Path(n).stem + ".tm0").lower() in local_names for n in aliases):
+        return None
+    common, paints = disc / "DATA/RES/COMMON.RES", disc / "DATA/RES/CT.RES"
+    if not common.is_file() or not paints.is_file():
+        return None
+    # Native numbered livery contract: Driver.chassis + Driver.number, CT.RES.
+    # Use a deterministic real driver, and expose this default in the preview.
+    stat = common.stat()
+    entries = cached_directory(str(common), stat.st_mtime_ns, stat.st_size)
+    match = next((e for e in entries if e["name"].lower() == "dirt.val"), None)
+    if match is None:
+        return None
+    raw, _ = payload(common, match["name"], entries)
+    table = parse_binary_valt(raw)
+    paint_stat = paints.stat()
+    paint_entries = cached_directory(str(paints), paint_stat.st_mtime_ns, paint_stat.st_size)
+    for section in table["sections"]:
+        values = dict(section["pairs"])
+        if section["name"].lower() != "driver" or values.get("chassis", "").lower() != chassis.lower():
+            continue
+        number = values.get("number", "")
+        if not re.fullmatch(r"[0-9]+", number):
+            continue
+        resource = next((e for suffix in (".tm0", ".tex") for e in paint_entries
+                         if e["name"].lower() == (number+suffix).lower()), None)
+        if resource:
+            return dict(chassis=chassis, number=number, driver=values.get("name", ""),
+                        asset=resource["name"], archive=paints)
+    return None
+
+
+def resolve_material(disc, archive, name, paint=None):
     if name.lower() in ("", "-", ".tex"):
         return None
+    paint = paint if paint is not None else vehicle_paint(disc, archive)
     # Resource namespaces are mounted with the model's own archive first, then
     # the game's resident resources. Do not substitute another venue's same name.
-    shared = ("HOBBYSET.RES", "RACE.RES", "COMMON.RES", "GENESIS.RES")
+    shared = ("HOBBYSET.RES", "RACE.RES", "PART.RES", "COMMON.RES", "GENESIS.RES")
     candidates = [archive] + [disc / "DATA/RES" / filename for filename in shared]
     for candidate in candidates:
         if not candidate.is_file():
@@ -107,6 +149,8 @@ def resolve_material(disc, archive, name):
                       for e in entries if e["name"].lower() == candidate_name.lower()), None)
         if match:
             return payload(candidate, match["name"], entries)[0]
+    if paint and name.lower() in {n.lower() for n in BODY_TEXTURE_ALIASES.get(paint["chassis"].lower(), ())}:
+        return payload(paint["archive"], paint["asset"])[0]
     return None
 
 
@@ -261,6 +305,7 @@ def inspect(request, disc):
         result.update(kind="texture", image=image, metadata=meta)
     elif entry["type"] == "MODL":
         mesh = vif_mesh.parse_modl(data)
+        paint = vehicle_paint(disc, path)
         parts = []
         for part in mesh["parts"]:
             vertices, triangles = [], []
@@ -272,7 +317,7 @@ def inspect(request, disc):
             image = None
             texture_error = None
             try:
-                tex = resolve_material(disc, path, part["texture"])
+                tex = resolve_material(disc, path, part["texture"], paint=paint)
                 if tex is not None:
                     image, _ = texture(tex, cache)
                 elif part["texture"].lower() not in ("", "-", ".tex"):
@@ -286,7 +331,8 @@ def inspect(request, disc):
                     texture=image, textureError=texture_error))
         if not parts:
             raise ValueError("No supported VIF triangle batches in this model")
-        result.update(kind="model", parts=parts, markers=mesh["markers"])
+        result.update(kind="model", parts=parts, markers=mesh["markers"],
+                      paintDescription=(f"Preview livery {paint['number']} · {paint['driver']} · CT.RES/{paint['asset']}" if paint else None))
     else:
         lines = []
         for offset in range(0, min(len(data), 8192), 16):

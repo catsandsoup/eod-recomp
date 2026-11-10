@@ -49,6 +49,7 @@ struct AssetDetail: Decodable {
     let metadata: [String: Int]?
     let message: String?
     let hex: String?
+    let paintDescription: String?
 }
 struct EnvironmentRecord: Decodable { let track: String; let textures: [String]; let skyTextures: [String]; let worldGeometryEditable: Bool }
 struct TextureChange: Decodable {

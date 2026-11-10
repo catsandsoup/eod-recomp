@@ -118,6 +118,9 @@ struct MainView: View {
                 RetailMeshView(parts: parts, identity: detail.sha256, wireframe: wireframe).frame(minHeight: 300)
                 Text("\(parts.count) recovered mesh parts · \(parts.reduce(0) { $0 + $1.positions.count }.formatted()) vertices · \(parts.reduce(0) { $0 + $1.triangles.count }.formatted()) triangles")
                     .font(.caption).foregroundStyle(.secondary).padding(12)
+                if let paint = detail.paintDescription {
+                    Text(paint).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12)
+                }
                 let issues = Array(Set(parts.compactMap(\.textureError))).sorted()
                 if !issues.isEmpty {
                     Text(issues.joined(separator: "\n") + "\nUnavailable materials are shown in neutral gray.")

@@ -181,6 +181,49 @@ class ModdingBackendTest(unittest.TestCase):
             pack_archive(str(stage), str(self.archive))
         self.assertEqual(self.backend.resolve_material(self.disc, self.archive, "Bus1.tex"), texture)
 
+    def test_material_resolves_native_resident_part_archive(self):
+        from tex import compile_tex
+        stage = self.root / "part-stage"
+        stage.mkdir()
+        texture = compile_tex(16,16,bytes((50,70,90,255))*256)
+        (stage/"Brake.tex").write_bytes(texture)
+        (stage/"manifest.json").write_text(json.dumps(dict(version=6,entries=[
+            dict(name="Brake.tex",fourcc="TEX ",version=10,is_extractable=True)])))
+        res = self.disc/"DATA/RES"
+        res.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()):
+            pack_archive(str(stage),str(res/"PART.RES"))
+        self.assertEqual(self.backend.resolve_material(self.disc,self.archive,"Brake.tex"),texture)
+
+    def test_body_material_resolves_numbered_livery_for_its_own_chassis(self):
+        from tex import compile_tex
+        common_stage = self.root / "common-stage"; common_stage.mkdir()
+        table = dict(tool_vtable=0,unk1=0,unk2=0,sections=[
+            dict(name="Driver",parent="",sec_vtable=0,tool_ptr=0,pairs=[("chassis","Ambulance"),("number","601"),("name","Ambulance driver")]),
+            dict(name="Driver",parent="",sec_vtable=0,tool_ptr=0,pairs=[("chassis","Algar"),("number","199"),("name","Algar driver")])])
+        (common_stage/'dirt.val').write_bytes(compile_binary_valt(table))
+        (common_stage/'manifest.json').write_text(json.dumps(dict(version=6,entries=[dict(name='dirt.val',fourcc='VALT',version=11,is_extractable=False)])))
+        res = self.disc/'DATA/RES';res.mkdir()
+        paints = self.root/'paints';paints.mkdir()
+        expected=compile_tex(16,16,bytes((80,120,200,255))*256)
+        other=compile_tex(16,16,bytes((200,40,20,255))*256)
+        (paints/'199.tm0').write_bytes(expected);(paints/'601.tm0').write_bytes(other)
+        (paints/'manifest.json').write_text(json.dumps(dict(version=6,entries=[dict(name=name,fourcc='TEX ',version=10,is_extractable=True) for name in ['199.tm0','601.tm0']])))
+        with contextlib.redirect_stdout(io.StringIO()):
+            pack_archive(str(common_stage),str(res/'COMMON.RES'))
+            pack_archive(str(paints),str(res/'CT.RES'))
+        self.assertEqual(self.backend.resolve_material(self.disc,self.archive,'Algar.tex'),expected)
+        stage = self.root / "stage"
+        (stage / "Algar.tex").write_bytes(other)
+        manifest = json.loads((stage / "manifest.json").read_text())
+        manifest["entries"].append(dict(name="Algar.tex",fourcc="TEX ",version=10,is_extractable=True))
+        (stage / "manifest.json").write_text(json.dumps(manifest))
+        with contextlib.redirect_stdout(io.StringIO()):
+            pack_archive(str(stage),str(self.archive))
+        self.assertEqual(self.backend.resolve_material(self.disc,self.archive,'Algar.tex'),other,
+                         "An embedded body texture must take precedence over the default paint")
+        self.assertIsNone(self.backend.resolve_material(self.disc,self.archive,'amby.tex'), 'Another chassis paint must never be substituted')
+
     def test_projects_in_one_folder_never_overwrite_each_others_overlay(self):
         first = self.save("4200")
         original = Path(first["archivePath"]).read_bytes()
