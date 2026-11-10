@@ -147,7 +147,7 @@ class ModdingBackendTest(unittest.TestCase):
         self.assertEqual(plan["environment"]["EOD_MUTE"], "1")
         self.assertNotIn(str(self.disc / "memcard"), plan["environment"]["EOD_MEMCARD"])
         self.assertIn("--headless", plan["arguments"])
-        self.assertNotIn("EOD_EDITOR_TEST", plan["environment"])
+        self.assertEqual(plan["environment"]["EOD_EDITOR_TEST"], "1")
 
     def test_project_edit_cannot_claim_an_old_overlay_contains_new_values(self):
         self.save()

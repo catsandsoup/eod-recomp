@@ -66,7 +66,7 @@ def main():
     backend = resources / 'Backend'
     backend.mkdir(parents=True)
     shutil.copy2(Path(binary_dir) / 'EODModdingSuite', executable / 'EODModdingSuite')
-    for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'vif_mesh.py'):
+    for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'texture_edit.py', 'vif_mesh.py'):
         shutil.copy2(ROOT / 'tools' / name, backend / name)
     (resources / 'studio-runtime.json').write_text(json.dumps(config))
     with (stage / 'Contents/Info.plist').open('wb') as handle:

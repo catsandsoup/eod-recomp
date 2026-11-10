@@ -7,6 +7,7 @@ engine manifests, arbitrary geometry compilation, or simulated game results.
 import contextlib
 import hashlib
 import io
+import base64
 import json
 import math
 import os
@@ -33,6 +34,8 @@ FIELDS = {
     ("EngineNormal", "torque_max"): "lb-ft",
     ("EngineNormal", "redline"): "rpm",
 }
+TRACK_NAMES = ("Afton Anoka Baxter Bemidji Dennison Dundas Eagan Gilroy Hastings HomeBase Kenyon Mankato Springfield Welch").split()
+
 CAR_NAMES = ("Algar Blitz Bulldog Carrere Desio Digit Hurricane Moth Palo Top Arrow "
              "Cannon Empire Guerilla Hunter Limo Ocelot Prince Coyote Durand Fillmore "
              "Gladiator Mongoose Orbital Outlaw Rocket Venom Ambulance Bus Clown "
@@ -107,7 +110,7 @@ def resolve_material(disc, archive, name):
     return None
 
 
-def payload(path, name, entries=None):
+def payload(path, name, entries=None, verify_crc=True):
     matches = [e for e in (entries or directory(path)) if e["name"] == name]
     if len(matches) != 1:
         raise ValueError("Asset not found: " + name)
@@ -115,7 +118,7 @@ def payload(path, name, entries=None):
     with path.open("rb") as handle:
         handle.seek(entry["offset"])
         data = handle.read(entry["size"])
-    if eod_crc(data) != entry["crc"]:
+    if verify_crc and eod_crc(data) != entry["crc"]:
         raise ValueError("Asset CRC mismatch: " + name)
     return data, entry
 
@@ -251,6 +254,9 @@ def inspect(request, disc):
                  unit=FIELDS.get((s["name"], k), "")) for pi, (k, v) in enumerate(s["pairs"])])
             for si, s in enumerate(table["sections"])])
     elif entry["type"] == "TEX":
+        edit = request.get("textureEdit") or saved_edits(request, disc, sha(path.read_bytes()))
+        if edit:
+            data = texture_edit_bytes(edit, data)
         image, meta = texture(data, cache)
         result.update(kind="texture", image=image, metadata=meta)
     elif entry["type"] == "MODL":
@@ -310,39 +316,67 @@ def save(request, disc):
     saved_edits(request, disc, source_sha)  # Detect a stale source/project installation.
     project = load_project(project_file) if project_file.exists() else dict(version=1, disc=str(disc), archives={})
     record = project["archives"].setdefault(request["archive"], dict(sourceSha256=source_sha, assets={}))
-    record["assets"][request["asset"]] = request["edits"]
-    # All assets in the source archive must pass CRC checks before any output.
+    if "edits" in request:
+        record["assets"][request["asset"]] = request["edits"]
+    record["assets"].update(request.get("textureEdits", {}))
+    if not record["assets"]:
+        raise ValueError("No edits to build")
+    # Keep opaque source payloads exact, including pre-existing retail CRC
+    # discrepancies. Edited members must still pass their original CRC check.
     entries = directory(source)
-    originals = {e["name"]: payload(source, e["name"], entries)[0] for e in entries}
+    originals = {e["name"]: payload(source, e["name"], entries, verify_crc=False)[0] for e in entries}
+    warnings = [e["name"] for e in entries if eod_crc(originals[e["name"]]) != e["crc"]]
+    changes = {}
+    for asset, edits in record["assets"].items():
+        if asset not in originals:
+            raise ValueError("Edited asset is not in the source archive")
+        data, entry = payload(source, asset, entries)
+        if entry["type"] == "TEX":
+            encoded = texture_edit_bytes(edits, data)
+        elif entry["type"] == "VALT" and isinstance(edits, list):
+            edited = apply_edits(parse_binary_valt(data), edits)
+            encoded = compile_binary_valt(edited)
+            if table_fields(parse_binary_valt(encoded)) != table_fields(edited):
+                raise ValueError("Native table roundtrip failed")
+        else:
+            raise ValueError("Unsupported saved project edit")
+        changes[asset] = encoded
     output = overlay_file(project_file, request["archive"])
     with tempfile.TemporaryDirectory(prefix="eod-build-") as temp:
         stage, packed = Path(temp) / "stage", Path(temp) / "packed.car"
-        with contextlib.redirect_stdout(io.StringIO()):
-            unpack_archive(str(source), str(stage))
-            for asset, edits in record["assets"].items():
-                if asset not in originals or next(e for e in entries if e["name"] == asset)["type"] != "VALT":
-                    raise ValueError("Unsupported saved project edit")
-                edited = apply_edits(parse_binary_valt(originals[asset]), edits)
-                encoded = compile_binary_valt(edited)
-                # Verify semantic roundtrip before native packaging.
-                if parse_binary_valt(encoded)["sections"] != edited["sections"]:
-                    # The compiler may normalize opaque metadata; fields must survive.
-                    actual = parse_binary_valt(encoded)
-                    if [(s["name"], list(map(tuple, s["pairs"]))) for s in actual["sections"]] != [
-                            (s["name"], list(map(tuple, s["pairs"]))) for s in edited["sections"]]:
-                        raise ValueError("Native table roundtrip failed")
-                (stage / asset).write_bytes(encoded)
-            pack_archive(str(stage), str(packed))
+        if all(len(data) == len(originals[name]) for name, data in changes.items()):
+            # Native texture edits retain size. Patch only their bytes and CRC,
+            # preserving every original world/layout/sector/directory byte else.
+            edited_archive = bytearray(original)
+            directory_offset = struct.unpack_from("<I", original, 20)[0]
+            for index, entry in enumerate(entries):
+                if entry["name"] in changes:
+                    data = changes[entry["name"]]
+                    edited_archive[entry["offset"]:entry["offset"]+len(data)] = data
+                    struct.pack_into("<I", edited_archive, directory_offset+index*68+48, eod_crc(data))
+            packed.write_bytes(edited_archive)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                unpack_archive(str(source), str(stage))
+                for asset, data in changes.items():
+                    (stage / asset).write_bytes(data)
+                pack_archive(str(stage), str(packed))
         built_entries = directory(packed)
         if {e["name"] for e in built_entries} != set(originals):
             raise ValueError("Built archive member inventory changed")
         for entry in built_entries:
-            built, _ = payload(packed, entry["name"], built_entries)
-            if entry["name"] not in record["assets"] and built != originals[entry["name"]]:
+            data, _ = payload(packed, entry["name"], built_entries, verify_crc=entry["name"] in changes)
+            if entry["name"] not in changes and data != originals[entry["name"]]:
                 raise ValueError("Unedited archive payload changed: " + entry["name"])
         built = packed.read_bytes()
+    record["sourceCrcWarnings"] = warnings
     record["outputSha256"] = sha(built)
-    project.update(selectedArchive=request["archive"], selectedAsset=request["asset"])
+    selected = request["asset"]
+    if request.get("textureEdits") and selected not in record["assets"]:
+        selected = next(iter(request["textureEdits"]))
+    project.update(selectedArchive=request["archive"], selectedAsset=selected)
+    if source.suffix.lower() == ".trk":
+        project["testTrackArchive"] = request["archive"]
     if source.suffix.lower() == ".car":
         project["testCarArchive"] = request["archive"]
     # Migrate older builds' shared output folders by verified content, retaining
@@ -368,7 +402,7 @@ def save(request, disc):
             atomic_write(output, previous)
         raise
     return dict(project=str(project_file), overlay=str(storage_path(project_file, "overlay")),
-                archivePath=str(output), sha256=sha(built), bytes=len(built))
+                archivePath=str(output), sha256=sha(built), bytes=len(built), sourceCrcWarnings=warnings)
 
 
 def validate(request, disc):
@@ -387,10 +421,15 @@ def validate(request, disc):
         for asset, edits in record["assets"].items():
             source_data, _ = payload(original, asset)
             built_data, _ = payload(output, asset)
-            expected = apply_edits(parse_binary_valt(source_data), edits)
-            actual = parse_binary_valt(built_data)
-            if table_fields(expected) != table_fields(actual):
-                raise ValueError("Project edits do not match the built archive; save again")
+            if isinstance(edits, dict):
+                expected = texture_edit_bytes(edits, source_data)
+                if built_data != expected:
+                    raise ValueError("Saved texture differs from its built archive")
+            else:
+                expected = apply_edits(parse_binary_valt(source_data), edits)
+                actual = parse_binary_valt(built_data)
+                if table_fields(expected) != table_fields(actual):
+                    raise ValueError("Project edits do not match the built archive; save again")
     overlay = storage_path(path, "overlay")
     extras = {f.relative_to(overlay).as_posix() for f in overlay.rglob("*") if f.is_file()} - set(project["archives"])
     if extras:
@@ -411,6 +450,8 @@ def launch_plan(request, disc):
     car = next((name for name in CAR_NAMES if native_name(name) == stem), None)
     if not car:
         car = "Algar"
+    track_archive = project.get("testTrackArchive", "DATA/TRACKS/ANOKA.TRK")
+    track = track_name(track_archive)
     run_dir = storage_path(project_file, "runs")
     for existing in storage_path(project_file, "").rglob("*"):
         if existing.is_symlink():
@@ -418,10 +459,12 @@ def launch_plan(request, disc):
     run_dir.mkdir(parents=True, exist_ok=True)
     config = storage_path(project_file, "runs/test.ini")
     atomic_write(config, b"[Video]\nRenderer=vulkan\nRenderScale=1\nAspectRatio=4:3\nFrameSkip=0\nVSync=1\n")
+    storage_path(project_file, "runs/first-race.png").unlink(missing_ok=True)
     args = ["--data", str(disc), "--config", str(config)]
     environment = dict(EOD_MOD_DIR=checked["overlay"], EOD_MEMCARD=str(storage_path(project_file, "runs/memcard")),
-        EOD_DIRECT_START=f"mode=action;track=Anoka;event=No-Rules Race;car={car};paint=0;humans=1",
-        EOD_SKIP_MOVIES="1")
+        EOD_DIRECT_START=f"mode=action;track={track};event=No-Rules Race;car={car};paint=0;humans=1",
+        EOD_SKIP_MOVIES="1", EOD_EDITOR_TEST="1",
+        EOD_EDITOR_PREVIEW=str(storage_path(project_file, "runs/first-race.png")))
     if request.get("headless"):
         args += ["--headless"]
         environment.update(EOD_HEADLESS="1", EOD_MUTE="1")
@@ -431,7 +474,85 @@ def launch_plan(request, disc):
             raise ValueError("Test duration must be 1–36000 frames")
         args += ["--frames", str(frames)]
     return dict(executable=str(executable), arguments=args, environment=environment,
-                logPath=str(storage_path(project_file, "runs/game.log")), car=car)
+                logPath=str(storage_path(project_file, "runs/game.log")), car=car, track=track)
+
+
+def track_name(archive):
+    stem = Path(archive).stem.upper()
+    name = next((name for name in TRACK_NAMES if (name.upper() if len(name) <= 8 else name[:6].upper() + "_1") == stem), None)
+    if name is None:
+        raise ValueError("No verified native race target for this track archive: " + stem)
+    return name
+
+
+def texture_edit_bytes(edit, original):
+    if not isinstance(edit, dict) or edit.get("kind") != "texture":
+        raise ValueError("Unsupported texture edit record")
+    try:
+        data = base64.b64decode(edit["data"], validate=True)
+    except (ValueError, KeyError) as error:
+        raise ValueError("Invalid saved native texture") from error
+    if sha(data) != edit.get("sha256") or len(data) != len(original) or data[:128] != original[:128]:
+        raise ValueError("Saved texture layout or hash does not match the native source")
+    decode_preview(data)
+    return data
+
+
+def texture_record(data):
+    return dict(kind="texture", data=base64.b64encode(data).decode("ascii"), sha256=sha(data))
+
+
+def environment(request, disc):
+    archive = archive_path(disc, request["archive"])
+    if archive.suffix.lower() != ".trk":
+        raise ValueError("Select an existing track archive")
+    entries = directory(archive)
+    return dict(track=track_name(request["archive"]),
+                textures=[e["name"] for e in entries if e["type"] == "TEX"],
+                skyTextures=[e["name"] for e in entries if re.fullmatch(r"sky[0-9]{2}[AB]\.tex", e["name"], re.IGNORECASE)],
+                worldGeometryEditable=False)
+
+
+def prepare_texture(request, disc):
+    from texture_edit import import_png, tint_texture
+    source = archive_path(disc, request["archive"])
+    entries = directory(source)
+    names = environment(request, disc)["skyTextures"] if request.get("allSky") else [request["asset"]]
+    if not names:
+        raise ValueError("This track has no recognized sky texture tiles")
+    edits = {}
+    cache = storage_path(project_path(request, disc), ".cache")
+    for name in names:
+        original, entry = payload(source, name, entries)
+        if entry["type"] != "TEX":
+            raise ValueError("Select a native texture")
+        existing = request.get("textureEdits", {}).get(name)
+        if not existing:
+            selected = dict(request, asset=name)
+            existing = saved_edits(selected, disc, sha(source.read_bytes()))
+        data = texture_edit_bytes(existing, original) if existing else original
+        if "png" in request:
+            data = import_png(data, Path(request["png"]).expanduser().resolve())
+        else:
+            data = tint_texture(data, tuple(request["tint"]))
+        edits[name] = texture_record(data)
+    preview_asset = request["asset"] if request["asset"] in edits else names[0]
+    image, meta = texture(texture_edit_bytes(edits[preview_asset], payload(source, preview_asset, entries)[0]), cache)
+    return dict(edits=edits, image=image, previewAsset=preview_asset, count=len(edits))
+
+
+def export_texture(request, disc):
+    from texture_edit import export_png
+    destination = Path(request["destination"]).expanduser().resolve()
+    if inside(destination, disc):
+        raise ValueError("Export must not overwrite the installed disc")
+    data, _ = payload(archive_path(disc, request["archive"]), request["asset"])
+    edit = request.get("textureEdit") or saved_edits(request, disc)
+    if edit:
+        data = texture_edit_bytes(edit, data)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    export_png(data, destination)
+    return dict(path=str(destination), bytes=destination.stat().st_size, sha256=sha(destination.read_bytes()))
 
 
 def dispatch(request):
@@ -455,6 +576,12 @@ def dispatch(request):
                 except (OSError, ValueError, struct.error) as error:
                     errors.append(relative + ": " + str(error))
         return dict(archives=archives, assetCount=sum(a["count"] for a in archives), errors=errors)
+    if action == "environment":
+        return environment(request, disc)
+    if action == "prepare_texture":
+        return prepare_texture(request, disc)
+    if action == "export_texture":
+        return export_texture(request, disc)
     if action == "entries":
         path = archive_path(disc, request["archive"])
         return dict(entries=directory(path))

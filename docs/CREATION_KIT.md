@@ -25,7 +25,7 @@ The packager does not build/copy the game, install an app, open it, or modify us
 Development bundle and preference suite: `org.eod-recomp.creationkit.development`.
 Default project: `mods/CreationKitDevelopment/project.eodproject` within the Kit checkout. A game executable must be provided explicitly when packaging. An unbundled development process has no automatic game executable; use the existing chooser. Original extracted assets are read as sources; compiled overlays, caches, test configuration and isolated test memory cards live beside the chosen project. A user can explicitly open another project, so use a copy when testing someone else's work.
 
-The Kit's launch plan uses existing overlay/direct-start contracts. It does not enable the unaccepted `EOD_EDITOR_TEST` runtime experiment. Skipping videos is not skipping resource loading. Native code changes, faster loading and new geometry/event compilers require separate review and acceptance.
+The Kit's launch plan uses existing overlay/direct-start contracts. The track-environment development launcher now opts into `EOD_EDITOR_TEST` on its separate runtime; the accepted game is unchanged. See TRACK_ENVIRONMENT_WORKFLOW.md for native image evidence and desktop acceptance limits. Skipping videos is not skipping resource loading. Native code changes, faster loading and new geometry/event compilers require separate review and acceptance.
 
 Normal fresh game configuration defaults `EOD_BUILD_EDITOR=OFF`; existing cached CMake values persist until explicitly changed. To work on the legacy editor independently:
 

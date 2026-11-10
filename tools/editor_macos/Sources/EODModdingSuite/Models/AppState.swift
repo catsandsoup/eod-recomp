@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 struct ArchiveRecord: Decodable, Identifiable {
     var id: String { path }
@@ -49,10 +50,18 @@ struct AssetDetail: Decodable {
     let message: String?
     let hex: String?
 }
+struct EnvironmentRecord: Decodable { let track: String; let textures: [String]; let skyTextures: [String]; let worldGeometryEditable: Bool }
+struct TextureChange: Decodable {
+    let kind: String
+    let data: String
+    let sha256: String
+    var dictionary: [String: String] { ["kind": kind, "data": data, "sha256": sha256] }
+}
+struct TexturePreparation: Decodable { let edits: [String: TextureChange]; let image: String; let previewAsset: String; let count: Int }
 struct ExportedAsset: Decodable { let path: String; let bytes: Int; let sha256: String }
 struct Catalog: Decodable { let archives: [ArchiveRecord]; let assetCount: Int; let errors: [String] }
 struct EntryList: Decodable { let entries: [AssetRecord] }
-struct LoadedProject: Decodable { let disc: String; let selectedArchive: String; let selectedAsset: String; let testCarArchive: String? }
+struct LoadedProject: Decodable { let disc: String; let selectedArchive: String; let selectedAsset: String; let testCarArchive: String?; let testTrackArchive: String? }
 struct SavedProject: Decodable { let project: String; let overlay: String; let archivePath: String; let sha256: String; let bytes: Int }
 struct LaunchPlan: Decodable {
     let executable: String
@@ -60,6 +69,7 @@ struct LaunchPlan: Decodable {
     let environment: [String: String]
     let logPath: String
     let car: String
+    let track: String
 }
 struct Envelope<T: Decodable>: Decodable { let ok: Bool; let result: T?; let error: String? }
 
@@ -133,6 +143,13 @@ final class StudioState: ObservableObject {
     @Published var archive: String = ""
     @Published var asset: String = ""
     @Published var detail: AssetDetail?
+    @Published var environmentDetail: EnvironmentRecord?
+    @Published var pendingTextures: [String: TextureChange] = [:]
+    @Published var tintRed = "1.0"
+    @Published var tintGreen = "1.0"
+    @Published var tintBlue = "1.0"
+    @Published var nativePreview: String?
+    @Published var savedTestTrack: String?
     @Published var physicsDetail: AssetDetail?
     @Published var editingAsset = ""
     private var editingDetail: AssetDetail?
@@ -164,18 +181,21 @@ final class StudioState: ObservableObject {
         project = prefs.string(forKey: "retailStudio.project") ?? root.appendingPathComponent("mods/CreationKitDevelopment/project.eodproject").path
         if let data = try? Data(contentsOf: URL(fileURLWithPath: project)),
            let saved = try? JSONDecoder().decode(LoadedProject.self, from: data) {
+            savedTestTrack = saved.testTrackArchive
             savedTestArchive = saved.testCarArchive ?? (saved.selectedArchive.lowercased().hasSuffix(".car") ? saved.selectedArchive : "DATA/CAR/ALGAR.CAR")
         }
     }
-    var dirty: Bool { values != savedValues }
+    var dirty: Bool { values != savedValues || !pendingTextures.isEmpty }
     var canUndo: Bool { !undoStack.isEmpty && !busy && !gameRunning }
     var canRedo: Bool { !redoStack.isEmpty && !busy && !gameRunning }
-    var canSave: Bool { !busy && !gameRunning && !editingAsset.isEmpty && !values.isEmpty }
+    var canSave: Bool { !busy && !gameRunning && ((!editingAsset.isEmpty && !values.isEmpty) || !pendingTextures.isEmpty) }
     var canTest: Bool { !busy && !gameRunning && !dirty && savedTestArchive != nil && FileManager.default.fileExists(atPath: project) }
     var filteredAssets: [AssetRecord] { assets.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.type.localizedCaseInsensitiveContains(search) } }
 
     func request(_ action: String) -> [String: Any] {
-        ["action": action, "disc": disc, "project": project, "archive": archive, "asset": asset]
+        var input: [String: Any] = ["action": action, "disc": disc, "project": project, "archive": archive, "asset": asset]
+        if let texture = pendingTextures[asset] { input["textureEdit"] = texture.dictionary }
+        return input
     }
     func remember() {
         preferences.set(disc, forKey: "retailStudio.disc")
@@ -185,7 +205,7 @@ final class StudioState: ObservableObject {
     func permitDiscard() -> Bool {
         guard dirty else { return true }
         let dialog = NSAlert()
-        dialog.messageText = "Discard unsaved physics edits?"
+        dialog.messageText = "Discard unsaved asset edits?"
         dialog.addButton(withTitle: "Cancel")
         dialog.addButton(withTitle: "Discard")
         return dialog.runModal() == .alertSecondButtonReturn
@@ -205,14 +225,19 @@ final class StudioState: ObservableObject {
     func selectArchive(_ value: String) {
         guard !busy, !gameRunning, value != archive, permitDiscard() else { return }
         archive = value; asset = ""; detail = nil; physicsDetail = nil; editingAsset = ""; values = [:]; savedValues = [:]
-        undoStack = []; redoStack = []; assets = []
+        undoStack = []; redoStack = []; assets = []; pendingTextures = [:]; environmentDetail = nil; nativePreview = nil
         busy = true; error = nil
         Task {
             defer { busy = false }
             do {
                 assets = try await Backend.call(request("entries"), as: EntryList.self).entries
                 try await loadPhysics()
+                if archive.lowercased().hasSuffix(".trk") {
+                    environmentDetail = try await Backend.call(request("environment"), as: EnvironmentRecord.self)
+                    asset = environmentDetail?.skyTextures.first ?? assets.first?.name ?? ""
+                } else {
                 asset = assets.first(where: { $0.name.lowercased() == "low1.mod" })?.name ?? assets.first?.name ?? ""
+                }
                 if !asset.isEmpty { await inspectSelection() }
             }
             catch { self.error = error.localizedDescription }
@@ -270,12 +295,16 @@ final class StudioState: ObservableObject {
     func save() {
         guard canSave else { return }
         var input = request("save")
-        input["asset"] = editingAsset
-        input["edits"] = (editingDetail?.sections ?? []).flatMap { section -> [[String: Any]] in
-            section.fields.filter(\.editable).compactMap { field in
-                guard let value = values[field.id] else { return nil }
-                return ["section": section.name, "key": field.key, "sectionIndex": field.sectionIndex,
-                        "pairIndex": field.pairIndex, "value": value]
+        let savingTable = !editingAsset.isEmpty && (values != savedValues || pendingTextures.isEmpty)
+        input["asset"] = savingTable ? editingAsset : asset
+        input["textureEdits"] = pendingTextures.mapValues(\.dictionary)
+        if savingTable {
+            input["edits"] = (editingDetail?.sections ?? []).flatMap { section -> [[String: Any]] in
+                section.fields.filter(\.editable).compactMap { field in
+                    guard let value = values[field.id] else { return nil }
+                    return ["section": section.name, "key": field.key, "sectionIndex": field.sectionIndex,
+                            "pairIndex": field.pairIndex, "value": value]
+                }
             }
         }
         busy = true; error = nil
@@ -283,13 +312,64 @@ final class StudioState: ObservableObject {
             defer { busy = false }
             do {
                 let result = try await Backend.call(input, as: SavedProject.self)
-                savedValues = values
+                savedValues = values; pendingTextures = [:]; tintRed = "1.0"; tintGreen = "1.0"; tintBlue = "1.0"
+                if archive.lowercased().hasSuffix(".trk") { savedTestTrack = archive }
                 if archive.lowercased().hasSuffix(".car") { savedTestArchive = archive }
                 if savedTestArchive == nil { savedTestArchive = "DATA/CAR/ALGAR.CAR" }
                 remember()
                 status = "Saved \(URL(fileURLWithPath: result.archivePath).lastPathComponent) · \(result.bytes.formatted()) bytes · SHA256 \(result.sha256.prefix(12))"
             } catch { self.error = error.localizedDescription }
         }
+    }
+    func prepareTexture(allSky: Bool = false, png: URL? = nil) {
+        guard !busy, !gameRunning else { return }
+        var input = request("prepare_texture")
+        input["textureEdits"] = pendingTextures.mapValues(\.dictionary)
+        input["allSky"] = allSky
+        if let png { input["png"] = png.path }
+        else {
+            guard let red = Double(tintRed), let green = Double(tintGreen), let blue = Double(tintBlue),
+                  [red, green, blue].allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                error = "RGB multipliers must be finite nonnegative numbers"; return
+            }
+            input["tint"] = [red, green, blue]
+        }
+        busy = true; error = nil
+        Task {
+            defer { busy = false }
+            do {
+                let result = try await Backend.call(input, as: TexturePreparation.self)
+                pendingTextures.merge(result.edits) { _, new in new }
+                asset = result.previewAsset
+                await inspectSelection()
+                status = "\(result.count) texture edits pending · Save & Build to test"
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+    func replaceTexture() {
+        guard !busy, !gameRunning else { return }
+        let panel = NSOpenPanel(); panel.allowedContentTypes = [.png]
+        panel.message = "Choose a same-size RGBA PNG; native palette limits apply"
+        if panel.runModal() == .OK, let url = panel.url { prepareTexture(png: url) }
+    }
+    func exportTexture() {
+        guard !busy, detail?.kind == "texture" else { return }
+        let panel = NSSavePanel(); panel.nameFieldStringValue = asset + ".png"; panel.allowedContentTypes = [.png]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        var input = request("export_texture"); input["destination"] = url.path
+        busy = true; error = nil
+        Task {
+            defer { busy = false }
+            do {
+                let result = try await Backend.call(input, as: ExportedAsset.self)
+                status = "Exported PNG · \(result.path)"
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+    func discardTextureEdits() {
+        guard !busy, !gameRunning else { return }
+        pendingTextures = [:]
+        Task { await inspectSelection() }
     }
     func exportNativeAsset() {
         guard !busy, !asset.isEmpty else { return }
@@ -311,6 +391,7 @@ final class StudioState: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
         panel.message = "Choose the extracted game folder containing DATA and SLUS_209.10"
         if panel.runModal() == .OK, let url = panel.url {
+            pendingTextures = [:]; environmentDetail = nil; nativePreview = nil; savedTestTrack = nil; savedTestArchive = nil
             disc = url.path; archive = ""; asset = ""; detail = nil; physicsDetail = nil; editingAsset = ""; assets = []; values = [:]; savedValues = [:]
             Task { await refresh() }
         }
@@ -325,6 +406,7 @@ final class StudioState: ObservableObject {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "project.eodproject"
         panel.canCreateDirectories = true; panel.message = "Choose a separate folder for this mod project and its overlay"
         if panel.runModal() == .OK, let url = panel.url {
+            pendingTextures = [:]; environmentDetail = nil; nativePreview = nil; savedTestTrack = nil
             project = url.path; values = [:]; savedValues = [:]; undoStack = []; redoStack = []
             archive = ""; asset = ""; detail = nil; physicsDetail = nil; editingAsset = ""; assets = []
             savedTestArchive = nil
@@ -348,9 +430,16 @@ final class StudioState: ObservableObject {
             let entries = try await Backend.call(input, as: EntryList.self)
             input["action"] = "inspect"
             let selected = try await Backend.call(input, as: AssetDetail.self)
+            var loadedEnvironment: EnvironmentRecord?
+            if loaded.selectedArchive.lowercased().hasSuffix(".trk") {
+                input["action"] = "environment"
+                loadedEnvironment = try await Backend.call(input, as: EnvironmentRecord.self)
+            }
             disc = loaded.disc; project = path; archive = loaded.selectedArchive; asset = loaded.selectedAsset
             archives = catalog.archives; assetCount = catalog.assetCount; assets = entries.entries
-            detail = selected; physicsDetail = nil; editingAsset = ""
+            detail = selected; physicsDetail = nil; editingAsset = ""; pendingTextures = [:]; environmentDetail = nil; nativePreview = nil
+            environmentDetail = loadedEnvironment
+            savedTestTrack = loaded.testTrackArchive
             editingDetail = nil
             values = [:]; savedValues = [:]; undoStack = []; redoStack = []
             if selected.kind == "table" {
@@ -388,7 +477,15 @@ final class StudioState: ObservableObject {
                 sessionStopped = false
                 try task.run()
                 process = task; gameRunning = true; logPath = plan.logPath
-                status = "Game process started · requested \(plan.car) / Anoka"
+                status = "Game process started · requested \(plan.car) / \(plan.track)"
+                nativePreview = nil
+                let preview = url.deletingLastPathComponent().appendingPathComponent("first-race.png").path
+                Task { [weak owner = self] in
+                    while owner?.gameRunning == true {
+                        if NSImage(contentsOfFile: preview) != nil { owner?.nativePreview = preview; break }
+                        try? await Task.sleep(for: .seconds(1))
+                    }
+                }
                 Task.detached { [weak owner = self] in
                     task.waitUntilExit(); try? log.close()
                     let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""

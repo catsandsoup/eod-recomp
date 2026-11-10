@@ -25,7 +25,7 @@ struct MainView: View {
                 if state.gameRunning {
                     Button("Stop Test") { state.stopGame() }
                 } else {
-                    Button("Test \(state.savedTestArchive.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "Saved Mod")") { state.testGame() }.disabled(!state.canTest)
+                    Button("Run Mod in Game") { state.testGame() }.disabled(!state.canTest)
                 }
             }
             .padding(12).disabled(state.busy)
@@ -125,9 +125,16 @@ struct MainView: View {
                 }
             }
         } else if detail.kind == "texture", let path = detail.image, let image = NSImage(contentsOfFile: path) {
+            VStack(spacing: 0) {
+                HStack {
+                    Button("Export PNG…") { state.exportTexture() }
+                    Button("Replace PNG…") { state.replaceTexture() }.disabled(state.gameRunning || ![4, 8].contains(detail.metadata?["bits_per_pixel"] ?? 0))
+                    Spacer()
+                }.padding(10)
             ScrollView {
                 Image(nsImage: image).resizable().interpolation(.none).scaledToFit().padding(20)
                 if let meta = detail.metadata { Text("\(meta["width"] ?? 0) × \(meta["height"] ?? 0) · \(meta["levels"] ?? 0) mip levels").foregroundStyle(.secondary) }
+            }
             }
         } else if let sections = detail.sections {
             ScrollView {
@@ -170,7 +177,32 @@ struct MainView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let physics = state.physicsDetail, state.editingAsset.lowercased() == "physics.val" {
+                    if let environment = state.environmentDetail {
+                        Text(environment.track).font(.title3.weight(.semibold))
+                        Text("Track Environment").font(.caption).foregroundStyle(.secondary)
+                        Text("\(environment.skyTextures.count) sky tiles · \(environment.textures.count) textures").font(.caption)
+                        Button("Show Sky Textures") { state.search = "sky" }
+                        Divider()
+                        Text("Sky palette RGB multipliers").font(.caption.weight(.semibold))
+                        HStack {
+                            TextField("Red", text: $state.tintRed)
+                            TextField("Green", text: $state.tintGreen)
+                            TextField("Blue", text: $state.tintBlue)
+                        }.textFieldStyle(.roundedBorder)
+                        Button("Preview Whole Sky Tint") { state.prepareTexture(allSky: true) }
+                            .disabled(environment.skyTextures.isEmpty)
+                        if !state.pendingTextures.isEmpty {
+                            Text("\(state.pendingTextures.count) textures changed").font(.caption)
+                            Button("Discard Texture Edits") { state.discardTextureEdits() }.disabled(state.busy || state.gameRunning)
+                        }
+                        Text("PNG replacement keeps the native size and indexed palette; HDR lighting is not supported.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let path = state.nativePreview, let image = NSImage(contentsOfFile: path) {
+                            Divider()
+                            Text("Native race capture").font(.caption.weight(.semibold))
+                            Image(nsImage: image).resizable().scaledToFit()
+                        }
+                    } else if let physics = state.physicsDetail, state.editingAsset.lowercased() == "physics.val" {
                         Text(URL(fileURLWithPath: state.archive).deletingPathExtension().lastPathComponent).font(.title3.weight(.semibold))
                         Text("Vehicle Physics").font(.caption).foregroundStyle(.secondary)
                         ForEach((physics.sections ?? []).indices, id: \.self) { index in
