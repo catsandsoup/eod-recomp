@@ -769,12 +769,16 @@ def _png(path, w, h, rgb):
                            + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
 
-def render_topdown(track, path, size=1400, terrain=None, heights=None):
+def render_topdown(track, path, size=1400, terrain=None, heights=None, bounds=None):
+    """Top-down PNG; bounds = (x0, z0, x1, z1) in metres crops the view."""
     tris = track["scol"]["tris"]
     xs = [v[0] for t in tris for v in t["verts"]] + [r["centre"][0] for r in track["sobl"]["records"]]
     zs = [v[2] for t in tris for v in t["verts"]] + [r["centre"][2] for r in track["sobl"]["records"]]
     ys = [v[1] for t in tris for v in t["verts"]] or [0.0]
-    x0, x1, z0, z1 = min(xs) - 5, max(xs) + 5, min(zs) - 5, max(zs) + 5
+    if bounds:
+        x0, z0, x1, z1 = bounds
+    else:
+        x0, x1, z0, z1 = min(xs) - 5, max(xs) + 5, min(zs) - 5, max(zs) + 5
     scale = (size - 1) / max(x1 - x0, z1 - z0)
     w, h = int((x1 - x0) * scale) + 1, int((z1 - z0) * scale) + 1
     img = bytearray(b"\x14\x14\x18" * (w * h))
@@ -870,6 +874,11 @@ def main(argv=None):
     p.add_argument("track")
     p.add_argument("out")
     p.add_argument("--no-render", action="store_true")
+    p = sub.add_parser("render", help="Top-down PNG of collision and boundaries")
+    p.add_argument("track")
+    p.add_argument("out")
+    p.add_argument("--bounds", help="x0,z0,x1,z1 in metres")
+    p.add_argument("--size", type=int, default=1400)
     p = sub.add_parser("list-limits", help="Print the data-driven limits of a track")
     p.add_argument("track")
     p.add_argument("--json", action="store_true")
@@ -891,6 +900,13 @@ def main(argv=None):
     if args.cmd == "export":
         manifest = export_track(load_track(archive, args.disc), args.out, render=not args.no_render)
         print(json.dumps(manifest["counts"]))
+        return 0
+    if args.cmd == "render":
+        bounds = [float(v) for v in args.bounds.split(",")] if args.bounds else None
+        if bounds is not None and (len(bounds) != 4 or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]):
+            raise SystemExit("--bounds needs x0,z0,x1,z1 with x0<x1 and z0<z1")
+        info = render_topdown(load_track(archive, args.disc), args.out, size=args.size, bounds=bounds)
+        print(json.dumps(info))
         return 0
     if args.cmd == "list-limits":
         rep = limits_report(load_track(archive, args.disc))
