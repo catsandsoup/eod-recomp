@@ -59,15 +59,15 @@ unfinished. One keyboard is currently assigned to one player.
 
 ## Workspace and safety preferences
 
-- Main `/Users/USER/Documents/GitHub/eod-recomp`, branch `macos`, personal fork
+- Main `$HOME/Documents/GitHub/eod-recomp`, branch `macos`, personal fork
   `catsandsoup/eod-recomp`; upstream `pareidolico/eod-recomp`.
 - Existing component worktrees: `../eod-recomp-vk` (`vulkan-gs`),
   `../eod-recomp-app` (`mac-app`), `../eod-recomp-pad` (`rockcandy-pad`).
-- Old Xbox repo `/Users/USER/Documents/GitHub/TDEOD RECOMP` stays parked.
+- Old Xbox repo `$HOME/Documents/GitHub/TDEOD RECOMP` stays parked.
 - Automated game tests MUST be headless and muted: `EOD_HEADLESS=1 EOD_MUTE=1`
   plus `--headless`. User-authorized interactive play is separate. Avoid
   competing GPU tests or builds during performance measurements.
-- Owner's disc: `/Users/USER/Library/Application Support/TDEODRecomp/disc`.
+- Owner's disc: `$HOME/Library/Application Support/TDEODRecomp/disc`.
   The supported SLUS_209.10 is 3,368,996 bytes, CRC32 75BB93EE.
 - Personal config: Application Support/TDEODRecomp/eod.ini. Current personal
   trial uses Vulkan, render scale 6, 16:10, VSync, FrameSkip, Racing keyboard P1.
@@ -157,7 +157,7 @@ normal game ghosting; do not classify from appearance alone.
   eod-alpha-overlap/font-after.png. Pre-font binary eod-old in baseline folder.
 - 4:3 reference /private/tmp/eod-mp-4x3-reference-20261016/frame_04500.png.
 - Diagnostic analysis script and JSON/CSV: old chat work directory
-  `/Users/USER/Documents/Codex/2026-10-16/h/work/`.
+  `$HOME/Documents/Codex/2026-10-16/h/work/`.
 - Real user-facing screenshots in old chat outputs/: font-before.png,
   font-after.png, widescreen-camera-comparison.png. Copy needed deliverables
   into the fresh chat's outputs before linking there. No fabricated game images.

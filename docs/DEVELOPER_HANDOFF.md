@@ -414,7 +414,7 @@ The specific EOD addresses come from its analyzed function boundaries, so an
 upstream game-specific hook cannot substitute for them.
 
 **Result.** Full ninja -j4 build in
-/Users/USER/Documents/Codex/2026-11-06/read/work/nascar-wheels/build linked eod
+$HOME/Documents/Codex/2026-11-06/read/work/nascar-wheels/build linked eod
 successfully. EOD_HEADLESS=1 EOD_MUTE=1 ctest -j4 -E AssetTools
 --output-on-failure passed 78/78 (7.73 seconds). SymbolsDB also passed directly.
 A separate headless, muted 600-frame startup using installed disc data and

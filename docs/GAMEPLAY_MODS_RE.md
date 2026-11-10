@@ -46,7 +46,7 @@ This section provides an immediate, evidence-backed reference for human modders 
 
 ### 0.2 In-Game Mod Menu (`F1` / `L3 + R3` Controller Overlay)
 
-The recompiled engine embeds a full graphical settings and modding menu built with Dear ImGui in [`runtime/ui/overlay.cpp`](file:///Users/USER/Documents/GitHub/eod-recomp/runtime/ui/overlay.cpp).
+The recompiled engine embeds a full graphical settings and modding menu built with Dear ImGui in [`runtime/ui/overlay.cpp`](file://$HOME/Documents/GitHub/eod-recomp/runtime/ui/overlay.cpp).
 
 * **How to Open / Close**:
   * **Keyboard**: Press `F1` (or `Cmd + ,` on macOS).

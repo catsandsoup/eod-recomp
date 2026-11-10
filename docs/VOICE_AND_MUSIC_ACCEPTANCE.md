@@ -18,7 +18,7 @@ acceptance gaps; software test counts do not close them.
 ## Verified software and physical evidence
 
 Evidence files are local, work-only, and not shipped. Their root is
-`/Users/USER/Documents/Codex/2026-11-08/conversation-log-the-teamwork-system-has/work/`.
+`$HOME/Documents/Codex/2026-11-08/conversation-log-the-teamwork-system-has/work/`.
 No microphone recordings were uploaded.
 
 | Scenario | Evidence and observed result |

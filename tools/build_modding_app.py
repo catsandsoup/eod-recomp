@@ -62,8 +62,10 @@ def main():
     args = parser.parse_args()
     layout = build_layout(ROOT)
     config = runtime_config(ROOT, args.game_executable, args.project)
-    command = ['swift', 'build', '--package-path', str(PACKAGE),
-               '--scratch-path', str(layout['scratch']), '-c', 'release']
+    command = ['swift', 'build', '--build-system', 'native', '--package-path', str(PACKAGE),
+               '--scratch-path', str(layout['scratch']), '-c', 'release',
+               '-Xswiftc', '-file-prefix-map', '-Xswiftc', str(Path.home()) + '=/build',
+               '-Xswiftc', '-debug-prefix-map', '-Xswiftc', str(Path.home()) + '=/build']
     subprocess.run(command, check=True)
     binary_dir = subprocess.check_output(command + ['--show-bin-path'], text=True).strip()
     stage = layout['stage']
@@ -75,6 +77,7 @@ def main():
     backend = resources / 'Backend'
     backend.mkdir(parents=True)
     shutil.copy2(Path(binary_dir) / 'EODModdingSuite', executable / 'EODModdingSuite')
+    subprocess.run(['xcrun', 'strip', '-S', str(executable / 'EODModdingSuite')], check=True)
     for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'texture_edit.py', 'vehicle_materials.py', 'vif_mesh.py'):
         shutil.copy2(ROOT / 'tools' / name, backend / name)
     (resources / 'studio-runtime.json').write_text(json.dumps(config))

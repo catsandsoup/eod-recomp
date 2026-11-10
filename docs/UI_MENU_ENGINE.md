@@ -155,9 +155,9 @@ The modern `TurboNavigator` engine eliminates sluggish PS2 pad read delays:
 ## 4. Decompiled Models & HLE Integration Architecture
 
 The implementation is packaged into clean, standalone C++ modules ready for direct linking:
-- **Header:** [`src/ui_menu_engine.h`](file:///C:/Users/USER/Documents/GitHub/eod-recomp/src/ui_menu_engine.h)
-- **Source:** [`src/ui_menu_engine.cpp`](file:///C:/Users/USER/Documents/GitHub/eod-recomp/src/ui_menu_engine.cpp)
-- **Unit Test:** [`tests/ui_menu_engine_test.cpp`](file:///C:/Users/USER/Documents/GitHub/eod-recomp/tests/ui_menu_engine_test.cpp)
+- **Header:** [`src/ui_menu_engine.h`](file:///C:$HOME/Documents/GitHub/eod-recomp/src/ui_menu_engine.h)
+- **Source:** [`src/ui_menu_engine.cpp`](file:///C:$HOME/Documents/GitHub/eod-recomp/src/ui_menu_engine.cpp)
+- **Unit Test:** [`tests/ui_menu_engine_test.cpp`](file:///C:$HOME/Documents/GitHub/eod-recomp/tests/ui_menu_engine_test.cpp)
 
 ### 4.1 Verification & Test Evidence
 All unit tests compile and run cleanly with CTest:

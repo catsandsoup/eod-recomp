@@ -57,3 +57,13 @@ Every code change, fix, and feature MUST be verified against the real game:
 3. Launch the actual game process with real retail disc assets (DATA/, SLUS_209.10, eod.ini).
 4. Verify the player experience end-to-end (game boot, menu navigation, 3D world state, memory allocator integrity, scene transitions, and clean exit without panics).
 5. Reports without real in-game execution evidence are strictly forbidden.
+
+## Public communications and privacy
+
+Public README/release copy is written for players. Use the dedicated
+`dist/creation-kit-preview.md` for Kit release notes. Never publish private
+handoffs, personal names, local filesystem paths, task transcripts, machine
+inventories or internal acceptance logs as release notes. Keep private working
+notes outside Git. Technical documentation may explain reproducible formats
+and builds using generic paths. Audit release archives for private build paths
+and configuration before upload; source-path prefix mapping is required.

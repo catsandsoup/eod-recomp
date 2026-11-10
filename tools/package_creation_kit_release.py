@@ -49,6 +49,11 @@ def main():
     for path in app.rglob('*'):
         if path.name in ('DATA', 'Mods', 'SLUS_209.10') or path.suffix in ('.eodproject', '.CAR', '.TRK', '.RES'):
             raise ValueError('Unexpected game/project data: '+str(path))
+    # Fail before publishing if any bundled file embeds this builder's home path.
+    private_prefix = str(Path.home()).encode()
+    for path in app.rglob('*'):
+        if path.is_file() and private_prefix in path.read_bytes():
+            raise ValueError('Bundle contains a private build path: '+str(path.relative_to(app)))
     subprocess.run(['xattr', '-cr', str(app)], check=True)
     subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)

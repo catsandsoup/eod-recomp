@@ -90,9 +90,14 @@ enum RuntimePaths {
             }
             if let root = config["repository"] { return URL(fileURLWithPath: root) }
         }
+        #if DEBUG
         var source = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { source.deleteLastPathComponent() }
         return source
+        #else
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/EODCreationKit")
+        #endif
     }
     static var gameExecutable: String {
         guard let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),

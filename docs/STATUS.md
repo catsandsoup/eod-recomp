@@ -8,7 +8,7 @@ branch `macos`. The old Xbox project (`TDEOD RECOMP`, branch `bringup`,
 override the later PS2 and Vulkan/MoltenVK decisions.
 
 Claude history was recovered from
-`~/.claude/projects/-Users-maintainer-Documents-GitHub-TDEOD-RECOMP/`:
+`~/.claude/projects/-Users-the maintainer-Documents-GitHub-TDEOD-RECOMP/`:
 
 | Chat | Session file |
 | --- | --- |
