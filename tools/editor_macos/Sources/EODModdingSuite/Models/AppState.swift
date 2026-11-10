@@ -62,7 +62,49 @@ struct TexturePreparation: Decodable { let edits: [String: TextureChange]; let i
 struct ExportedAsset: Decodable { let path: String; let bytes: Int; let sha256: String }
 struct Catalog: Decodable { let archives: [ArchiveRecord]; let assetCount: Int; let errors: [String] }
 struct EntryList: Decodable { let entries: [AssetRecord] }
-struct LoadedProject: Decodable { let disc: String; let selectedArchive: String; let selectedAsset: String; let testCarArchive: String?; let testTrackArchive: String? }
+struct HostRecord: Decodable, Equatable { let image: String; let sha256: String; let k: Int; let width: Int; let height: Int }
+struct LoadedProject: Decodable {
+    let disc: String
+    let selectedArchive: String?
+    let selectedAsset: String?
+    let testCarArchive: String?
+    let testTrackArchive: String?
+    let hostTextures: [String: HostRecord]?
+}
+struct ExportFailure: Decodable { let assetId: String; let error: String? }
+struct ExportStatus: Decodable {
+    let state: String
+    let done: Int
+    let total: Int
+    let assetId: String?
+    let resumable: Bool
+    let exported: Int?
+    let failed: Int?
+    let unsupported: Int?
+    let failures: [ExportFailure]?
+    let error: String?
+}
+struct ReplacementSize: Decodable, Equatable { let width: Int; let height: Int }
+struct ReplacementCheck: Decodable {
+    let mode: String?
+    let scale: Int?
+    let png: ReplacementSize
+    let original: ReplacementSize
+    let reasons: [String: String]
+}
+struct HostImport: Decodable { let assetId: String; let image: String; let sha256: String; let k: Int; let width: Int; let height: Int }
+struct PackageResult: Decodable { let path: String; let id: String; let version: String; let native: Int; let host: Int }
+struct ProfilePackage: Decodable, Identifiable { let id: String; let version: String; let enabled: Bool; let native: Int?; let host: Int?; let error: String? }
+struct ProfileConflict: Decodable { let key: String; let packages: [String]; let accepted: Bool }
+struct ProfileActive: Decodable { let composed: Bool }
+struct ProfileStatus: Decodable {
+    let packages: [ProfilePackage]
+    let conflicts: [ProfileConflict]
+    let blocked: [String]
+    let active: ProfileActive
+}
+struct RemovedHost: Decodable { let assetId: String }
+struct Replacement { let png: String; let check: ReplacementCheck }
 struct SavedProject: Decodable { let project: String; let overlay: String; let archivePath: String; let sha256: String; let bytes: Int }
 struct LaunchPlan: Decodable {
     let executable: String
@@ -71,6 +113,7 @@ struct LaunchPlan: Decodable {
     let logPath: String
     let car: String
     let track: String
+    let carNote: String?
 }
 struct Envelope<T: Decodable>: Decodable { let ok: Bool; let result: T?; let error: String? }
 
@@ -185,6 +228,16 @@ final class StudioState: ObservableObject {
     @Published var gameLog = ""
     @Published var logPath: String?
     @Published var savedTestArchive: String?
+    @Published var exportStatus: ExportStatus?
+    @Published var exportDestination: String?
+    @Published var replacement: Replacement?
+    @Published var hostTextures: [String: HostRecord] = [:]
+    @Published var profile: ProfileStatus?
+    @Published var builtPackage: PackageResult?
+    var profileRoot: String?
+    var jobsRoot: String?
+    private var operations = 0
+    private var usingProfile = false
     private var savedValues: [String: String] = [:]
     private var undoStack: [(String, String, String)] = []
     private var redoStack: [(String, String, String)] = []
@@ -204,20 +257,29 @@ final class StudioState: ObservableObject {
         if let data = try? Data(contentsOf: URL(fileURLWithPath: project)),
            let saved = try? JSONDecoder().decode(LoadedProject.self, from: data) {
             savedTestTrack = saved.testTrackArchive
-            savedTestArchive = saved.testCarArchive ?? (saved.selectedArchive.lowercased().hasSuffix(".car") ? saved.selectedArchive : "DATA/CAR/ALGAR.CAR")
+            savedTestArchive = saved.testCarArchive ?? (saved.selectedArchive?.lowercased().hasSuffix(".car") == true ? saved.selectedArchive : (saved.selectedArchive == nil ? nil : "DATA/CAR/ALGAR.CAR"))
+            hostTextures = saved.hostTextures ?? [:]
         }
     }
     var dirty: Bool { values != savedValues || !pendingTextures.isEmpty }
     var canUndo: Bool { !undoStack.isEmpty && !busy && !gameRunning }
     var canRedo: Bool { !redoStack.isEmpty && !busy && !gameRunning }
     var canSave: Bool { !busy && !gameRunning && ((!editingAsset.isEmpty && !values.isEmpty) || !pendingTextures.isEmpty) }
-    var canTest: Bool { !busy && !gameRunning && !dirty && savedTestArchive != nil && FileManager.default.fileExists(atPath: project) }
+    var profileActive: Bool { profile?.packages.contains(where: \.enabled) == true && profile?.active.composed == true }
+    var exportRunning: Bool { exportStatus?.state == "running" }
+    var canTest: Bool { !busy && !gameRunning && !dirty && (savedTestArchive != nil || profileActive) && FileManager.default.fileExists(atPath: project) }
+    func begin() { operations += 1; busy = true }
+    func end() { operations = max(0, operations - 1); busy = operations > 0 }
+    var currentAssetID: String { archive.isEmpty || asset.isEmpty ? "" : archive + "#" + asset }
+    var currentHost: HostRecord? { hostTextures.first { $0.key.caseInsensitiveCompare(currentAssetID) == .orderedSame }?.value }
     var filteredAssets: [AssetRecord] { assets.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.type.localizedCaseInsensitiveContains(search) } }
 
     func request(_ action: String) -> [String: Any] {
         var input: [String: Any] = ["action": action, "disc": disc, "project": project, "archive": archive, "asset": asset]
         if let texture = pendingTextures[asset] { input["textureEdit"] = texture.dictionary }
         input["textureEdits"] = pendingTextures.mapValues(\.dictionary)
+        if let profileRoot { input["profileRoot"] = profileRoot }
+        if let jobsRoot { input["jobsRoot"] = jobsRoot }
         return input
     }
     func remember() {
@@ -242,7 +304,7 @@ final class StudioState: ObservableObject {
                 await refresh()
                 error = openingError
             }
-        } else { await refresh() }
+        } else { await refresh(); await refreshProfile() }
     }
     func refresh() async {
         guard !busy else { return }
@@ -383,8 +445,137 @@ final class StudioState: ObservableObject {
     func replaceTexture() {
         guard !busy, !gameRunning else { return }
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.png]
-        panel.message = "Choose a same-size RGBA PNG; native palette limits apply"
-        if panel.runModal() == .OK, let url = panel.url { prepareTexture(png: url) }
+        if panel.runModal() == .OK, let url = panel.url { Task { await checkReplacement(url) } }
+    }
+    func checkReplacement(_ url: URL) async {
+        guard !busy, !gameRunning else { return }
+        var input = request("reimport_check"); input["png"] = url.path
+        begin(); error = nil
+        defer { end() }
+        do {
+            let check = try await Backend.call(input, as: ReplacementCheck.self)
+            if check.mode == nil {
+                replacement = nil
+                error = check.reasons.keys.sorted().map { "\($0): \(check.reasons[$0]!)" }.joined(separator: "\n")
+            } else { replacement = Replacement(png: url.path, check: check) }
+        } catch { replacement = nil; self.error = error.localizedDescription }
+    }
+    func cancelReplacement() { replacement = nil }
+    func applyReplacement() async {
+        guard !busy, !gameRunning, let plan = replacement else { return }
+        if plan.check.mode == "native" {
+            replacement = nil
+            prepareTexture(png: URL(fileURLWithPath: plan.png))
+            return
+        }
+        var input = request("import_host"); input["png"] = plan.png
+        begin(); error = nil
+        defer { end() }
+        do {
+            let result = try await Backend.call(input, as: HostImport.self)
+            hostTextures[result.assetId] = HostRecord(image: result.image, sha256: result.sha256, k: result.k, width: result.width, height: result.height)
+            replacement = nil
+            status = "High-resolution replacement recorded · \(result.width) × \(result.height)"
+            builtPackage = nil
+        } catch { self.error = error.localizedDescription }
+    }
+    func removeHostReplacement() async {
+        guard !busy, !gameRunning, currentHost != nil else { return }
+        begin(); error = nil
+        defer { end() }
+        do {
+            _ = try await Backend.call(request("remove_host"), as: RemovedHost.self)
+            hostTextures = hostTextures.filter { $0.key.caseInsensitiveCompare(currentAssetID) != .orderedSame }
+            builtPackage = nil
+        } catch { self.error = error.localizedDescription }
+    }
+
+    // MARK: Export all textures
+    func exportAllTextures() {
+        guard !busy, !gameRunning else { return }
+        let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        if panel.runModal() == .OK, let url = panel.url { Task { await startExport(to: url.path) } }
+    }
+    func startExport(to destination: String) async {
+        guard !busy, !gameRunning else { return }
+        begin(); error = nil
+        defer { end() }
+        do {
+            var input = request("export_batch_status"); input["destination"] = destination
+            let before = try await Backend.call(input, as: ExportStatus.self)
+            input["action"] = "export_batch_start"; input["resume"] = before.resumable
+            struct Started: Decodable { let jobId: String }
+            _ = try await Backend.call(input, as: Started.self)
+            exportDestination = destination
+            exportStatus = ExportStatus(state: "running", done: before.resumable ? before.done : 0, total: before.total, assetId: nil,
+                                        resumable: true, exported: nil, failed: nil, unsupported: nil, failures: nil, error: nil)
+            input["action"] = "export_batch_status"; input.removeValue(forKey: "resume")
+            while true {
+                try await Task.sleep(for: .milliseconds(400))
+                let current = try await Backend.call(input, as: ExportStatus.self)
+                exportStatus = current
+                status = "Exporting textures · \(current.done.formatted()) of \(current.total.formatted())"
+                if current.state != "running" { break }
+            }
+            finishExport()
+        } catch { self.error = error.localizedDescription }
+    }
+    func finishExport() {
+        guard let result = exportStatus else { return }
+        let count = result.exported ?? 0
+        switch result.state {
+        case "complete":
+            status = "Exported \(count.formatted()) textures" + ((result.failed ?? 0) + (result.unsupported ?? 0) > 0
+                ? " · \((result.failed ?? 0) + (result.unsupported ?? 0)) not exported" : "")
+        case "cancelled": status = "Export cancelled · \(result.done.formatted()) of \(result.total.formatted()) finished"
+        default: error = result.error ?? "Export failed"
+        }
+        let failures = result.failures ?? []
+        if !failures.isEmpty {
+            error = failures.prefix(5).map { "\($0.assetId): \($0.error ?? "failed")" }.joined(separator: "\n")
+                + (failures.count > 5 ? "\n+ \(failures.count - 5) more in export-manifest.json" : "")
+        }
+    }
+    func cancelExport() async {
+        guard exportRunning, let destination = exportDestination else { return }
+        var input = request("export_batch_cancel"); input["destination"] = destination
+        do { _ = try await Backend.call(input, as: ExportStatus.self) } catch { self.error = error.localizedDescription }
+    }
+
+    // MARK: Mods
+    func refreshProfile() async {
+        do { profile = try await Backend.call(request("profile_status"), as: ProfileStatus.self) }
+        catch { profile = nil }
+    }
+    var hasModContent: Bool { !hostTextures.isEmpty || savedTestArchive != nil && FileManager.default.fileExists(atPath: project) }
+    func buildPackage() async {
+        guard !busy, !gameRunning, !dirty else { return }
+        begin(); error = nil
+        defer { end() }
+        do {
+            let result = try await Backend.call(request("package_project"), as: PackageResult.self)
+            builtPackage = result
+            status = "Built \(result.id) \(result.version) · \(result.native) native · \(result.host) high-resolution"
+        } catch { self.error = error.localizedDescription }
+    }
+    func profileOperation(_ action: String, id: String? = nil, package: String? = nil) async {
+        guard !busy, !gameRunning else { return }
+        var input = request(action)
+        if let id { input["id"] = id }
+        if let package { input["package"] = package }
+        begin(); error = nil
+        defer { end() }
+        do {
+            struct Done: Decodable { let profile: String }
+            _ = try await Backend.call(input, as: Done.self)
+            status = "Profile updated"
+        } catch { self.error = error.localizedDescription }
+        await refreshProfile()
+    }
+    func installPackage() async {
+        guard let built = builtPackage else { return }
+        await profileOperation("profile_install", package: built.path)
     }
     func exportTexture() {
         guard !busy, detail?.kind == "texture" else { return }
@@ -441,6 +632,7 @@ final class StudioState: ObservableObject {
         panel.canCreateDirectories = true; panel.message = "Choose a separate folder for this mod project and its overlay"
         if panel.runModal() == .OK, let url = panel.url {
             pendingTextures = [:]; environmentDetail = nil; nativePreview = nil; savedTestTrack = nil
+            hostTextures = [:]; replacement = nil; builtPackage = nil
             project = url.path; values = [:]; savedValues = [:]; undoStack = []; redoStack = []
             archive = ""; asset = ""; detail = nil; physicsDetail = nil; editingAsset = ""; assets = []
             savedTestArchive = nil
@@ -457,26 +649,34 @@ final class StudioState: ObservableObject {
         busy = true; error = nil
         do {
             let loaded = try await Backend.call(["action": "load", "project": path], as: LoadedProject.self)
+            let selectedArchive = loaded.selectedArchive ?? "", selectedAsset = loaded.selectedAsset ?? ""
             var input: [String: Any] = ["action": "catalog", "disc": loaded.disc, "project": path,
-                "archive": loaded.selectedArchive, "asset": loaded.selectedAsset]
+                "archive": selectedArchive, "asset": selectedAsset]
             let catalog = try await Backend.call(input, as: Catalog.self)
-            input["action"] = "entries"
-            let entries = try await Backend.call(input, as: EntryList.self)
-            input["action"] = "inspect"
-            let selected = try await Backend.call(input, as: AssetDetail.self)
+            var entries = EntryList(entries: [])
+            var selected: AssetDetail?
+            if !selectedArchive.isEmpty {
+                input["action"] = "entries"
+                entries = try await Backend.call(input, as: EntryList.self)
+                if !selectedAsset.isEmpty {
+                    input["action"] = "inspect"
+                    selected = try await Backend.call(input, as: AssetDetail.self)
+                }
+            }
             var loadedEnvironment: EnvironmentRecord?
-            if loaded.selectedArchive.lowercased().hasSuffix(".trk") {
+            if selectedArchive.lowercased().hasSuffix(".trk") {
                 input["action"] = "environment"
                 loadedEnvironment = try await Backend.call(input, as: EnvironmentRecord.self)
             }
-            disc = loaded.disc; project = path; archive = loaded.selectedArchive; asset = loaded.selectedAsset
+            disc = loaded.disc; project = path; archive = selectedArchive; asset = selectedAsset
+            hostTextures = loaded.hostTextures ?? [:]; replacement = nil; builtPackage = nil
             archives = catalog.archives; assetCount = catalog.assetCount; assets = entries.entries
             detail = selected; physicsDetail = nil; editingAsset = ""; pendingTextures = [:]; environmentDetail = nil; nativePreview = nil
             environmentDetail = loadedEnvironment
             savedTestTrack = loaded.testTrackArchive
             editingDetail = nil
             values = [:]; savedValues = [:]; undoStack = []; redoStack = []
-            if selected.kind == "table" {
+            if let selected, selected.kind == "table" {
                 editingAsset = selected.name
                 editingDetail = selected
                 if selected.name.lowercased() == "physics.val" { physicsDetail = selected }
@@ -485,14 +685,18 @@ final class StudioState: ObservableObject {
                 }, uniquingKeysWith: { first, _ in first })
                 savedValues = values
             }
-            savedTestArchive = loaded.testCarArchive ?? (loaded.selectedArchive.lowercased().hasSuffix(".car") ? loaded.selectedArchive : "DATA/CAR/ALGAR.CAR"); remember()
+            savedTestArchive = loaded.testCarArchive ?? (selectedArchive.lowercased().hasSuffix(".car") ? selectedArchive : (selectedArchive.isEmpty ? nil : "DATA/CAR/ALGAR.CAR")); remember()
             status = "Opened \(URL(fileURLWithPath: path).lastPathComponent)"
+            busy = false
+            await refreshProfile()
+            return
         } catch { self.error = error.localizedDescription }
         busy = false
     }
     func testGame() {
         guard canTest else { return }
-        var input = request("launch_plan"); input["executable"] = executable
+        usingProfile = profileActive
+        var input = request(usingProfile ? "launch_profile" : "launch_plan"); input["executable"] = executable
         busy = true; error = nil
         Task {
             defer { busy = false }
@@ -511,7 +715,8 @@ final class StudioState: ObservableObject {
                 sessionStopped = false
                 try task.run()
                 process = task; gameRunning = true; logPath = plan.logPath
-                status = "Game process started · requested \(plan.car) / \(plan.track)"
+                status = "Game process started · requested \(plan.car) / \(plan.track)" + (usingProfile ? " · dev profile" : "")
+                    + (plan.carNote.map { " · \($0)" } ?? "")
                 nativePreview = nil
                 let preview = url.deletingLastPathComponent().appendingPathComponent("first-race.png").path
                 Task { [weak owner = self] in

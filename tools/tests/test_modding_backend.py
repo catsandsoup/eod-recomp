@@ -307,5 +307,151 @@ class ModdingBackendTest(unittest.TestCase):
             self.request("launch_plan", executable=str(exe))
 
 
+class TexturePipelineTest(unittest.TestCase):
+    def setUp(self):
+        from test_mod_package import make_disc, make_png, ANOKA
+        spec = importlib.util.spec_from_file_location("modding_backend", TOOLS / "modding_backend.py")
+        self.backend = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.backend)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.disc = make_disc(self.root)
+        self.make_png, self.anoka = make_png, ANOKA
+        self.project = self.root / "mod one/project.eodproject"
+        self.profiles = self.root / "profiles"
+        self.jobs = self.root / "jobs"
+        self.exe = self.root / "game"
+        self.exe.write_text("#!/bin/sh\nexit 0\n")
+        self.exe.chmod(0o755)
+
+    def call(self, action, **kwargs):
+        request = dict(action=action, disc=str(self.disc), project=str(self.project), archive=self.anoka,
+                       asset="ground.tex", profileRoot=str(self.profiles), jobsRoot=str(self.jobs))
+        request.update(kwargs)
+        return self.backend.dispatch(request)
+
+    def png(self, name, size):
+        return str(self.make_png(self.root / name, size, size))
+
+    def test_reimport_check_distinguishes_native_and_host(self):
+        native = self.call("reimport_check", png=self.png("same.png", 16))
+        self.assertEqual(native["mode"], "native")
+        host = self.call("reimport_check", png=self.png("big.png", 64))
+        self.assertEqual((host["mode"], host["scale"], host["result"]["width"]), ("host", 4, 64))
+        odd = self.call("reimport_check", png=self.png("odd.png", 48))
+        self.assertIsNone(odd["mode"])
+        self.assertIn("host-replacement", odd["reasons"])
+
+    def test_import_host_is_optional_project_key_and_removable(self):
+        result = self.call("import_host", png=self.png("big.png", 32))
+        self.assertEqual(result["k"], 2)
+        project = json.loads(self.project.read_text())
+        self.assertEqual(project["version"], 1)
+        record = project["hostTextures"][self.anoka + "#ground.tex"]
+        stored = self.project.parent / (self.project.name + ".assets") / record["image"]
+        self.assertEqual(hashlib.sha256(stored.read_bytes()).hexdigest(), record["sha256"])
+        self.assertEqual(self.backend.dispatch(dict(action="load", project=str(self.project)))["version"], 1)
+        with self.assertRaises(ValueError):
+            self.call("import_host", png=self.png("bad.png", 24))
+        self.call("remove_host")
+        self.assertEqual(json.loads(self.project.read_text())["hostTextures"], {})
+        self.assertFalse(stored.exists())
+
+    def test_package_install_enable_disable_uninstall_and_launch_profile(self):
+        self.call("import_host", png=self.png("big.png", 32))
+        package = self.call("package_project")
+        self.assertEqual((package["host"], package["version"]), (1, "1.0.1"))
+        self.assertEqual(self.call("package_project")["version"], "1.0.2")
+        installed = self.call("profile_install", package=package["path"])
+        self.assertEqual(installed["enabled"], [package["id"]])
+        status = self.call("profile_status")
+        self.assertTrue(status["active"]["hostTextures"])
+        self.assertEqual(status["profile"], "dev")
+        plan = self.call("launch_profile", executable=str(self.exe))
+        self.assertEqual(plan["environment"]["EOD_MOD_DIR"], str((self.profiles / "dev/active").resolve()))
+        self.assertIn("EOD_MEMCARD", plan["environment"])
+        self.assertIn("EOD_DIRECT_START", plan["environment"])
+        self.assertIn("Algar", plan["carNote"])
+        self.call("profile_disable", id=package["id"])
+        self.assertEqual(self.call("profile_status")["packages"][0]["enabled"], False)
+        self.call("profile_enable", id=package["id"])
+        self.call("profile_uninstall", id=package["id"])
+        self.assertEqual(self.call("profile_status")["packages"], [])
+        with self.assertRaises(ValueError):
+            self.call("launch_profile", executable=str(self.exe))
+
+    def test_package_from_saved_native_edit_and_host_together(self):
+        edit = self.call("prepare_texture", tint=[2, 1, 1])
+        self.call("save", textureEdits=edit["edits"])
+        self.call("import_host", asset="sky.tex", png=self.png("sky.png", 32))
+        package = self.call("package_project")
+        self.assertEqual((package["native"], package["host"]), (1, 1))
+        with self.assertRaises(ValueError):
+            self.call("package_project", out=package["path"])
+
+    def test_package_with_nothing_is_refused_and_leaves_no_folder(self):
+        self.call("import_host", png=self.png("big.png", 32))
+        self.call("remove_host")
+        with self.assertRaises(ValueError):
+            self.call("package_project")
+
+    def test_launch_never_substitutes_an_unmapped_car(self):
+        edit = self.call("prepare_texture", tint=[2, 1, 1])
+        self.call("save", textureEdits=edit["edits"])
+        plan = self.call("launch_plan", executable=str(self.exe))
+        self.assertEqual(plan["car"], "Algar")
+        self.assertTrue(plan["carNote"])
+        data = json.loads(self.project.read_text())
+        data["testCarArchive"] = "DATA/CAR/TRAILER3.CAR"
+        self.project.write_text(json.dumps(data))
+        with self.assertRaises(ValueError) as caught:
+            self.call("launch_plan", executable=str(self.exe))
+        self.assertIn("TRAILER3.CAR", str(caught.exception))
+        data["testCarArchive"] = "DATA/CAR/BUS.CAR"
+        self.project.write_text(json.dumps(data))
+        mapped = self.call("launch_plan", executable=str(self.exe))
+        self.assertEqual((mapped["car"], mapped["carNote"]), ("Bus", None))
+
+    def wait(self, dest, states):
+        import time
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            status = self.call("export_batch_status", destination=str(dest))
+            if status["state"] in states:
+                return status
+            time.sleep(0.1)
+        self.fail("export did not finish")
+
+    def test_export_batch_runs_reports_resumes_and_refuses_disc_destination(self):
+        dest = self.root / "out"
+        self.assertEqual(self.call("export_batch_status", destination=str(dest))["state"], "idle")
+        with self.assertRaises(ValueError):
+            self.call("export_batch_start", destination=str(self.disc / "DATA/out"))
+        started = self.call("export_batch_start", destination=str(dest), jobs=1)
+        self.assertEqual(started["destination"], str(dest.resolve()))
+        done = self.wait(dest, ("complete", "cancelled", "failed"))
+        self.assertEqual(done["state"], "complete", done)
+        self.assertEqual((done["exported"], done["failed"]), (3, 0))
+        self.assertEqual(done["done"], done["total"])
+        self.assertTrue(done["resumable"])
+        self.assertTrue((dest / "textures").is_dir())
+        with self.assertRaises(ValueError):
+            self.call("export_batch_start", destination=str(dest))
+        self.call("export_batch_start", destination=str(dest), resume=True, jobs=1)
+        again = self.wait(dest, ("complete", "cancelled", "failed"))
+        self.assertEqual((again["state"], again["exported"]), ("complete", 3))
+
+    def test_export_batch_cancel_stops_the_child_and_stays_resumable(self):
+        dest = self.root / "cancelled"
+        self.call("export_batch_start", destination=str(dest), jobs=1)
+        self.call("export_batch_cancel", destination=str(dest))
+        final = self.wait(dest, ("complete", "cancelled", "failed"))
+        self.assertIn(final["state"], ("cancelled", "complete"))
+        if final["state"] == "cancelled":
+            self.call("export_batch_start", destination=str(dest), resume=True, jobs=1)
+            self.assertEqual(self.wait(dest, ("complete", "failed"))["state"], "complete")
+
+
 if __name__ == "__main__":
     unittest.main()

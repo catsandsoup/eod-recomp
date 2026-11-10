@@ -51,7 +51,7 @@ def bundle_info():
                 CFBundleIdentifier='org.eod-recomp.creationkit.development',
                 CFBundleExecutable='EODModdingSuite', CFBundlePackageType='APPL',
                 CFBundleIconFile='AppIcon',
-                CFBundleShortVersionString='0.3.2', CFBundleVersion='5',
+                CFBundleShortVersionString='0.4.0', CFBundleVersion='6',
                 LSMinimumSystemVersion='14.0', NSHighResolutionCapable=True)
 
 
@@ -78,7 +78,8 @@ def main():
     backend.mkdir(parents=True)
     shutil.copy2(Path(binary_dir) / 'EODModdingSuite', executable / 'EODModdingSuite')
     subprocess.run(['xcrun', 'strip', '-S', str(executable / 'EODModdingSuite')], check=True)
-    for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'texture_edit.py', 'vehicle_materials.py', 'vif_mesh.py'):
+    for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'texture_edit.py', 'vehicle_materials.py', 'vif_mesh.py',
+                 'texture_export.py', 'asset_registry.py', 'texture_identity.py', 'mod_package.py', 'mod_install.py'):
         shutil.copy2(ROOT / 'tools' / name, backend / name)
     (resources / 'studio-runtime.json').write_text(json.dumps(config))
     # Reuse the repository's existing artwork and standard macOS icon tooling.

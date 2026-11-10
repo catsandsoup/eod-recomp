@@ -35,6 +35,8 @@ FIELDS = {
     ("EngineNormal", "torque_max"): "lb-ft",
     ("EngineNormal", "redline"): "rpm",
 }
+DEV_PROFILE = "dev"
+JOBS_ROOT = Path("~/Library/Application Support/EODCreationKit/jobs")
 TRACK_NAMES = ("Afton Anoka Baxter Bemidji Dennison Dundas Eagan Gilroy Hastings HomeBase Kenyon Mankato Springfield Welch").split()
 
 CAR_NAMES = ("Algar Blitz Bulldog Carrere Desio Digit Hurricane Moth Palo Top Arrow "
@@ -567,17 +569,38 @@ def validate(request, disc):
 
 def launch_plan(request, disc):
     checked = validate(request, disc)
+    return build_launch_plan(request, disc, checked["overlay"])
+
+
+def launch_profile(request, disc):
+    """Same isolated session as launch_plan, but EOD_MOD_DIR is the dev profile's composed overlay."""
+    import mod_install
+    name, root = request.get("profile") or DEV_PROFILE, request.get("profileRoot")
+    if not any(p["enabled"] for p in mod_install.status(name, root)["packages"]):
+        raise ValueError("No enabled package in the development profile")
+    env = mod_install.launch_env(name, root)
+    plan = build_launch_plan(request, disc, env["EOD_MOD_DIR"])
+    plan["profile"] = request.get("profile") or DEV_PROFILE
+    return plan
+
+
+def build_launch_plan(request, disc, mod_dir):
     project_file = project_path(request, disc)
     project = load_project(project_file)
     executable = Path(request["executable"]).expanduser().resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise ValueError("Choose an executable game build")
-    stem = Path(project.get("testCarArchive", project["selectedArchive"])).stem.upper()
-    def native_name(name):
-        return (name if len(name) <= 8 else name[:6] + "_1").upper()
-    car = next((name for name in CAR_NAMES if native_name(name) == stem), None)
-    if not car:
+    car_archive = project.get("testCarArchive") or project.get("selectedArchive") or ""
+    car_note = None
+    if car_archive.lower().endswith(".car"):
+        stem = Path(car_archive).stem.upper()
+        car = next((name for name in CAR_NAMES if (name if len(name) <= 8 else name[:6] + "_1").upper() == stem), None)
+        if not car:
+            raise ValueError(f"No verified native race car for {Path(car_archive).name}; "
+                             "choose a mapped vehicle to test, or save the project from a track")
+    else:
         car = "Algar"
+        car_note = "No vehicle in this project; the test drives Algar"
     track_archive = project.get("testTrackArchive", "DATA/TRACKS/ANOKA.TRK")
     track = track_name(track_archive)
     run_dir = storage_path(project_file, "runs")
@@ -589,7 +612,7 @@ def launch_plan(request, disc):
     atomic_write(config, b"[Video]\nRenderer=vulkan\nRenderScale=1\nAspectRatio=4:3\nFrameSkip=0\nVSync=1\n")
     storage_path(project_file, "runs/first-race.png").unlink(missing_ok=True)
     args = ["--data", str(disc), "--config", str(config)]
-    environment = dict(EOD_MOD_DIR=checked["overlay"], EOD_MEMCARD=str(storage_path(project_file, "runs/memcard")),
+    environment = dict(EOD_MOD_DIR=mod_dir, EOD_MEMCARD=str(storage_path(project_file, "runs/memcard")),
         EOD_DIRECT_START=f"mode=action;track={track};event=No-Rules Race;car={car};paint=0;humans=1",
         EOD_SKIP_MOVIES="1", EOD_EDITOR_TEST="1",
         EOD_EDITOR_PREVIEW=str(storage_path(project_file, "runs/first-race.png")))
@@ -602,7 +625,7 @@ def launch_plan(request, disc):
             raise ValueError("Test duration must be 1–36000 frames")
         args += ["--frames", str(frames)]
     return dict(executable=str(executable), arguments=args, environment=environment,
-                logPath=str(storage_path(project_file, "runs/game.log")), car=car, track=track)
+                logPath=str(storage_path(project_file, "runs/game.log")), car=car, track=track, carNote=car_note)
 
 
 def track_name(archive):
@@ -683,6 +706,307 @@ def export_texture(request, disc):
     return dict(path=str(destination), bytes=destination.stat().st_size, sha256=sha(destination.read_bytes()))
 
 
+# ---------------------------------------------------------------- texture pipeline
+
+def _dest_checked(disc, destination):
+    import texture_export
+    try:
+        return texture_export.check_dest(disc, destination)
+    except texture_export.ExportError as error:
+        raise ValueError(str(error)) from None
+
+
+def _job_paths(request, dest):
+    root = Path(request.get("jobsRoot") or JOBS_ROOT).expanduser().resolve()
+    job = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
+    return job, root / (job + ".json"), root / (job + ".progress"), root / (job + ".summary")
+
+
+def _alive(pid):
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return False
+    except ChildProcessError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _last_events(path):
+    events, error = {}, None
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 65536))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+        with path.open("rb") as handle:
+            first = handle.readline().decode("utf-8", "replace")
+        lines.insert(0, first)
+    except OSError:
+        return events, error
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        if "error" in item:
+            error = str(item["error"])
+        if "event" in item:
+            events[item["event"]] = item
+    return events, error
+
+
+def export_batch_start(request, disc):
+    dest = _dest_checked(disc, request["destination"])
+    job, record_path, progress_path, summary_path = _job_paths(request, dest)
+    current = export_batch_status(request, disc)
+    if current["state"] == "running":
+        raise ValueError("An export to this folder is already running")
+    resume = bool(request.get("resume"))
+    if (dest / "export-manifest.json").exists() and not resume:
+        raise ValueError("This folder already holds an export; resume it or choose another folder")
+    command = [sys.executable, str(Path(__file__).resolve().parent / "texture_export.py"),
+               "--disc", str(disc), "--dest", str(dest)]
+    for glob in request.get("select") or []:
+        command += ["--select", glob]
+    for archive in request.get("archives") or []:
+        command += ["--archive", archive]
+    if request.get("role"):
+        command += ["--role", request["role"]]
+    if request.get("jobs"):
+        command += ["--jobs", str(int(request["jobs"]))]
+    if resume:
+        command.append("--resume")
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.unlink(missing_ok=True)
+    import subprocess
+    with progress_path.open("wb") as err, summary_path.open("wb") as out:
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True,
+                                 cwd=str(record_path.parent))
+    child.returncode = 0  # detached on purpose; liveness is tracked by pid, not by this handle
+    atomic_write(record_path, json.dumps(dict(jobId=job, pid=child.pid, destination=str(dest), disc=str(disc),
+                                              resume=resume, cancelRequested=False)).encode())
+    return dict(jobId=job, pid=child.pid, destination=str(dest), resumed=resume)
+
+
+def export_batch_status(request, disc):
+    dest = _dest_checked(disc, request["destination"])
+    job, record_path, progress_path, summary_path = _job_paths(request, dest)
+    manifest = dest / "export-manifest.json"
+    result = dict(jobId=job, destination=str(dest), state="idle", done=0, total=0, assetId=None,
+                  resumable=manifest.is_file(), manifest=str(manifest) if manifest.is_file() else None)
+    if manifest.is_file():
+        try:
+            run = json.loads(manifest.read_text()).get("run", {})
+            result.update(done=run.get("done", 0), total=run.get("total", 0), previousRun=run.get("status"))
+        except (OSError, ValueError):
+            pass
+    try:
+        record = json.loads(record_path.read_text())
+    except (OSError, ValueError):
+        return result
+    events, error = _last_events(progress_path)
+    if "start" in events:
+        result["total"] = events["start"].get("total", 0)
+    if "progress" in events:
+        result.update(done=events["progress"].get("done", 0), assetId=events["progress"].get("assetId"))
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, ValueError):
+        summary = None
+    if summary:
+        result.update(state=summary.get("status", "complete"), summary={k: v for k, v in summary.items()},
+                      exported=summary.get("exported", 0), failed=summary.get("failed", 0),
+                      unsupported=summary.get("unsupported", 0), failures=summary.get("failures", []),
+                      done=result["total"] or result["done"] if summary.get("status") == "complete" else result["done"])
+        result["resumable"] = True
+    elif _alive(record["pid"]):
+        result["state"] = "running"
+        result["cancelRequested"] = record.get("cancelRequested", False)
+    else:
+        result.update(state="cancelled" if record.get("cancelRequested") else "failed",
+                      error=error or "Export stopped before finishing; resume it to continue")
+    return result
+
+
+def export_batch_cancel(request, disc):
+    dest = _dest_checked(disc, request["destination"])
+    job, record_path, _, _ = _job_paths(request, dest)
+    try:
+        record = json.loads(record_path.read_text())
+    except (OSError, ValueError):
+        raise ValueError("No export is running for this folder") from None
+    if not _alive(record["pid"]):
+        return export_batch_status(request, disc)
+    record["cancelRequested"] = True
+    atomic_write(record_path, json.dumps(record).encode())
+    os.kill(record["pid"], 15)
+    return dict(export_batch_status(request, disc), cancelRequested=True)
+
+
+def _retail_texture_record(disc, archive, asset):
+    from mod_package import retail_member
+    from asset_registry import analyze_tex
+    data, entry, _, spelled = retail_member(disc, archive, asset)
+    if entry["type"] != "TEX":
+        raise ValueError(f"{spelled}#{entry['name']} is not a texture")
+    info, _ = analyze_tex(data)
+    if info.get("status") != "ok":
+        raise ValueError(info.get("error", "Texture cannot be decoded"))
+    return dict(assetId=f"{spelled}#{entry['name']}", status="exported", width=info["width"], height=info["height"],
+                reimport=info.get("reimport", []))
+
+
+def reimport_check(request, disc):
+    import texture_export
+    png = Path(request["png"]).expanduser().resolve()
+    if request.get("manifest"):
+        manifest = json.loads(Path(request["manifest"]).expanduser().read_text())
+        asset_id = request["archive"] + "#" + request["asset"]
+    else:
+        record = _retail_texture_record(disc, request["archive"], request["asset"])
+        manifest, asset_id = dict(assets=[record]), record["assetId"]
+    result = texture_export.classify_reimport(manifest, asset_id, png)
+    k = result["scale"]
+    result["mode"] = ("native" if result["nativeSameSize"] else "host" if result["hostReplacement"] else None)
+    if result["mode"] == "host":
+        result["result"] = dict(width=result["png"]["width"], height=result["png"]["height"], scale=k)
+    return result
+
+
+def _host_map(project):
+    hosts = project.get("hostTextures")
+    return hosts if isinstance(hosts, dict) else {}
+
+
+def import_host(request, disc):
+    import mod_package as mp
+    from tex import read_png
+    project_file = project_path(request, disc)
+    data, entry, _, spelled = mp.retail_member(disc, request["archive"], request["asset"])
+    asset_id = f"{spelled}#{entry['name']}"
+    if entry["type"] != "TEX":
+        raise ValueError(f"{asset_id} is not a texture")
+    ident = mp.host_identity(data, asset_id)
+    png = Path(request["png"]).expanduser().resolve()
+    width, height = mp.png_size(png)
+    k = mp.replacement_scale(width, height, ident["width"], ident["height"])
+    try:
+        if tuple(read_png(str(png))[:2]) != (width, height):
+            raise ValueError("Replacement PNG header and pixel data disagree")
+    except (OSError, struct.error) as error:
+        raise ValueError(f"Cannot read replacement PNG: {error}") from None
+    image = png.read_bytes()
+    project = load_project(project_file) if project_file.exists() else dict(version=1, disc=str(disc), archives={})
+    if Path(project["disc"]).resolve() != disc:
+        raise ValueError("Project belongs to a different game installation")
+    relative = f"host/{spelled}/{entry['name']}.png"
+    target = storage_path(project_file, relative)
+    hosts = dict(_host_map(project))
+    hosts[asset_id] = dict(image=relative, sha256=sha(image), k=k, width=width, height=height)
+    project["hostTextures"] = hosts
+    previous = target.read_bytes() if target.exists() else None
+    atomic_write(target, image)
+    try:
+        atomic_write(project_file, (json.dumps(project, indent=2) + "\n").encode())
+    except BaseException:
+        target.unlink(missing_ok=True) if previous is None else atomic_write(target, previous)
+        raise
+    return dict(assetId=asset_id, **hosts[asset_id])
+
+
+def remove_host(request, disc):
+    project_file = project_path(request, disc)
+    project = load_project(project_file)
+    hosts = dict(_host_map(project))
+    key = next((k for k in hosts if k.lower() == (request["archive"] + "#" + request["asset"]).lower()), None)
+    if key is None:
+        raise ValueError("No high-resolution replacement is recorded for this texture")
+    record = hosts.pop(key)
+    project["hostTextures"] = hosts
+    atomic_write(project_file, (json.dumps(project, indent=2) + "\n").encode())
+    storage_path(project_file, record["image"]).unlink(missing_ok=True)
+    return dict(assetId=key, remaining=len(hosts))
+
+
+def _next_version(folder):
+    best = 0
+    if folder.is_dir():
+        for child in folder.iterdir():
+            found = re.fullmatch(r"[a-z0-9._-]+-1\.0\.([0-9]+)", child.name)
+            if found:
+                best = max(best, int(found.group(1)))
+    return f"1.0.{best + 1}"
+
+
+def package_project(request, disc):
+    import mod_package as mp
+    import shutil
+    project_file = project_path(request, disc)
+    project = load_project(project_file)
+    hosts = _host_map(project)
+    if not project["archives"] and not hosts:
+        raise ValueError("Nothing to package; save a texture or vehicle edit first")
+    slug = re.sub(r"[^a-z0-9._-]+", "-", project_file.parent.name.lower()).strip("-._") or "mod"
+    package_id = request.get("id") or slug[:64]
+    packages = storage_path(project_file, "packages")
+    version = request.get("version") or _next_version(packages)
+    out = Path(request["out"]).expanduser().resolve() if request.get("out") else packages / f"{package_id}-{version}"
+    name = request.get("name") or project_file.parent.name
+    for key, record in hosts.items():
+        image = storage_path(project_file, record["image"])
+        if not image.is_file() or sha(image.read_bytes()) != record["sha256"]:
+            raise ValueError("Saved replacement image is missing or modified: " + key)
+    created = not out.exists()
+    try:
+        if project["archives"]:
+            info = mp.from_project(project_file, disc, package_id, version, out, name)
+        else:
+            info = mp.init(out, disc, package_id, version, name)
+        for key, record in sorted(hosts.items()):
+            info = mp.add_host(out, disc, key, storage_path(project_file, record["image"]))
+    except BaseException:
+        if created:
+            shutil.rmtree(out, ignore_errors=True)
+        raise
+    return dict(path=str(out), id=package_id, version=version, native=info["native"],
+                host=len(hosts), info=info)
+
+
+def _profile_args(request):
+    return request.get("profile") or DEV_PROFILE, request.get("profileRoot")
+
+
+def profile_status(request, disc):
+    import mod_install
+    name, root = _profile_args(request)
+    return mod_install.status(name, root)
+
+
+def profile_install(request, disc):
+    import mod_install
+    name, root = _profile_args(request)
+    return mod_install.install(request["package"], str(disc), name, root, enable=request.get("enable", True))
+
+
+def profile_change(request, disc, action):
+    import mod_install
+    name, root = _profile_args(request)
+    return getattr(mod_install, action)(request["id"], name, root, str(disc))
+
+
+def profile_accept_conflict(request, disc):
+    import mod_install
+    name, root = _profile_args(request)
+    return mod_install.accept_conflict(request["key"], request["winner"], name, root, str(disc))
+
+
 def dispatch(request):
     action = request["action"]
     if action == "load":
@@ -728,6 +1052,15 @@ def dispatch(request):
         return validate(request, disc)
     if action == "launch_plan":
         return launch_plan(request, disc)
+    if action == "launch_profile":
+        return launch_profile(request, disc)
+    if action in ("export_batch_start", "export_batch_status", "export_batch_cancel"):
+        return globals()[action](request, disc)
+    if action in ("reimport_check", "import_host", "remove_host", "package_project", "profile_status",
+                  "profile_install", "profile_accept_conflict"):
+        return globals()[action](request, disc)
+    if action in ("profile_enable", "profile_disable", "profile_uninstall"):
+        return profile_change(request, disc, action[len("profile_"):])
     raise ValueError("Unknown action: " + action)
 
 

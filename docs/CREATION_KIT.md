@@ -36,6 +36,24 @@ cmake -S tools/editor -B build/legacy-editor
 cmake --build build/legacy-editor
 ```
 
+## Texture and mod pipeline in the app
+
+Backend actions (JSON, `tools/modding_backend.py`): `export_batch_start|status|cancel`
+(child `texture_export.py`, progress and summary under `~/Library/Application Support/EODCreationKit/jobs`,
+resumable, destination outside the disc), `reimport_check` (native same-size vs host k×),
+`import_host` / `remove_host` (optional `hostTextures` map in `project.eodproject`, images copied to
+`project.eodproject.assets/host/`), `package_project` (native diff via `from-project`, plus `add-host` per host
+texture; version auto-increments), `profile_status|install|enable|disable|uninstall|accept_conflict`
+(profile `dev`, default root `~/Library/Application Support/EODCreationKit/profiles`) and `launch_profile`
+(`EOD_MOD_DIR=<profile>/active`, same isolated memcard and direct start as `launch_plan`).
+`launch_plan`/`launch_profile` return `carNote` when a project without a vehicle defaults to Algar and refuse
+a selected `.CAR` that has no verified native race mapping.
+
+App flow: Export All Textures… (folder picker, progress, Cancel Export; choosing a folder that already holds an
+export resumes it) · texture, Replace with Image… (shows Native or High-resolution consequence and resulting size, Apply) ·
+Mods tab: Build Package, Install, Enable/Disable/Uninstall · Run Mod in Game uses the dev profile while a package
+is enabled.
+
 ## Development and promotion
 
 Keep one repository with `main` as published source, a Kit branch/worktree, and a separate branch/worktree for game runtime experiments. Never deploy a development bundle over the accepted Modding Suite. Never merge unrelated runtime experiments to make an editor change look complete. Preserve known working app/game/project snapshots before promotion; they contain retail-derived output and belong in ignored local storage, not commits.

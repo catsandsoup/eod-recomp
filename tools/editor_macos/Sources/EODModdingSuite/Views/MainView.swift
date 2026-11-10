@@ -21,6 +21,7 @@ struct MainView: View {
                 Spacer()
                 Button("Open Project…") { state.openProject() }
                 Button("Game Folder…") { state.chooseDisc() }
+                Button("Export All Textures…") { state.exportAllTextures() }
                 Button("Save & Build") { state.save() }.disabled(!state.canSave)
                 if state.gameRunning {
                     Button("Stop Test") { state.stopGame() }
@@ -31,14 +32,19 @@ struct MainView: View {
             .padding(12).disabled(state.busy)
             Divider()
             HStack(spacing: 6) {
-                Label("Asset Workspace", systemImage: "square.stack.3d.up.fill")
-                    .font(.system(size: 12, weight: .medium)).padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Color.blue.opacity(0.22), in: RoundedRectangle(cornerRadius: 5))
+                ForEach(["Assets", "Mods"], id: \.self) { tab in
+                    Button { state.studio = tab } label: {
+                        Label(tab == "Assets" ? "Asset Workspace" : "Mods", systemImage: tab == "Assets" ? "square.stack.3d.up.fill" : "shippingbox.fill")
+                            .font(.system(size: 12, weight: .medium)).padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(Color.blue.opacity(state.studio == tab ? 0.22 : 0), in: RoundedRectangle(cornerRadius: 5))
+                    }.buttonStyle(.plain)
+                }
                 Spacer()
                 Text(state.archive.isEmpty ? "Select a source archive" : state.archive).font(.caption.monospaced()).foregroundStyle(.secondary)
                 if state.detail?.kind == "model" { Toggle("Wireframe", isOn: $wireframe).toggleStyle(.checkbox).font(.caption) }
             }.padding(.horizontal, 12).padding(.vertical, 7).background(Color.black.opacity(0.15))
             Divider()
+            if state.studio == "Mods" { ModsView(state: state) } else {
             HSplitView {
                 VStack(alignment: .leading, spacing: 0) {
                     Label("Game Sources", systemImage: "externaldrive.fill").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(12)
@@ -90,6 +96,7 @@ struct MainView: View {
                 }.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
                 inspector.frame(minWidth: 250, idealWidth: 280, maxWidth: 340)
             }
+            }
             if let error = state.error {
                 Divider()
                 HStack(alignment: .top) {
@@ -101,7 +108,10 @@ struct MainView: View {
             }
             Divider()
             HStack {
-                if state.busy { ProgressView().controlSize(.small) }
+                if state.exportRunning, let export = state.exportStatus {
+                    ProgressView(value: Double(export.done), total: Double(max(export.total, 1))).frame(width: 220)
+                    Button("Cancel Export") { Task { await state.cancelExport() } }.font(.caption)
+                } else if state.busy { ProgressView().controlSize(.small) }
                 Text(state.status).lineLimit(1).font(.caption).textSelection(.enabled)
                 Spacer()
                 if let path = state.logPath {
@@ -131,9 +141,30 @@ struct MainView: View {
             VStack(spacing: 0) {
                 HStack {
                     Button("Export PNG…") { state.exportTexture() }
-                    Button("Replace PNG…") { state.replaceTexture() }.disabled(state.gameRunning || ![4, 8].contains(detail.metadata?["bits_per_pixel"] ?? 0))
+                    Button("Replace with Image…") { state.replaceTexture() }.disabled(state.gameRunning || ![4, 8].contains(detail.metadata?["bits_per_pixel"] ?? 0))
                     Spacer()
-                }.padding(10)
+                }.padding(10).disabled(state.busy)
+                if let plan = state.replacement {
+                    let check = plan.check
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(check.mode == "native" ? "Native (same size, palette quantised)"
+                                 : "High-resolution (\(check.scale ?? 0)×, runtime replacement)").font(.callout.weight(.semibold))
+                            Text(check.mode == "native" ? "\(check.original.width) × \(check.original.height)"
+                                 : "\(check.original.width) × \(check.original.height) → \(check.png.width) × \(check.png.height)")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Cancel") { state.cancelReplacement() }
+                        Button("Apply") { Task { await state.applyReplacement() } }.keyboardShortcut(.defaultAction)
+                    }.padding(10).background(Color.blue.opacity(0.1)).disabled(state.busy)
+                } else if let host = state.currentHost {
+                    HStack {
+                        Text("High-resolution replacement · \(host.k)× · \(host.width) × \(host.height)").font(.caption)
+                        Spacer()
+                        Button("Remove") { Task { await state.removeHostReplacement() } }.font(.caption).disabled(state.busy)
+                    }.padding(.horizontal, 10).padding(.bottom, 8)
+                }
             ScrollView {
                 Image(nsImage: image).resizable().interpolation(.none).scaledToFit().padding(20)
                 if let meta = detail.metadata { Text("\(meta["width"] ?? 0) × \(meta["height"] ?? 0) · \(meta["levels"] ?? 0) mip levels").foregroundStyle(.secondary) }
@@ -249,6 +280,49 @@ struct MainView: View {
                 }.padding(14)
             }.disabled(state.busy || state.gameRunning)
         }.background(Color.white.opacity(0.025))
+    }
+}
+
+struct ModsView: View {
+    @ObservedObject var state: StudioState
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Button("Build Package") { Task { await state.buildPackage() } }
+                    .disabled(state.busy || state.gameRunning || state.dirty || !state.hasModContent)
+                Button("Install") { Task { await state.installPackage() } }
+                    .disabled(state.busy || state.gameRunning || state.builtPackage == nil)
+                if let built = state.builtPackage {
+                    Text("\(built.id) \(built.version) · \(built.native) native · \(built.host) high-resolution")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            Divider()
+            let packages = state.profile?.packages ?? []
+            if packages.isEmpty {
+                Text("No packages installed in the dev profile").foregroundStyle(.secondary)
+            }
+            ForEach(packages) { item in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(item.id) \(item.version)").font(.system(.body, design: .monospaced))
+                        Text(item.error ?? "\(item.native ?? 0) native · \(item.host ?? 0) high-resolution")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(item.enabled ? "Disable" : "Enable") {
+                        Task { await state.profileOperation(item.enabled ? "profile_disable" : "profile_enable", id: item.id) }
+                    }
+                    Button("Uninstall") { Task { await state.profileOperation("profile_uninstall", id: item.id) } }
+                }.disabled(state.busy || state.gameRunning)
+            }
+            ForEach(state.profile?.conflicts.filter { !$0.accepted } ?? [], id: \.key) { conflict in
+                Label("\(conflict.key) is edited by \(conflict.packages.joined(separator: ", "))", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.orange)
+            }
+            Spacer()
+        }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
