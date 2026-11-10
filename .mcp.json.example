@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "eod-creation-kit": {
+      "command": "python3",
+      "args": ["-I", "tools/eod_mcp/server.py"],
+      "env": {
+        "EOD_DISC": "${EOD_DISC}",
+        "EOD_KIT_WORKSPACE": "${EOD_KIT_WORKSPACE:-${HOME}/Library/Application Support/EODCreationKit}",
+        "EOD_KIT_ALLOW_RUN": "${EOD_KIT_ALLOW_RUN:-0}",
+        "EOD_GAME_EXECUTABLE": "${EOD_GAME_EXECUTABLE:-}"
+      }
+    }
+  }
+}
