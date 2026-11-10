@@ -67,6 +67,7 @@ VK_PUSH cbuffer Draw CB_REG(b0) {
 #define F_IIP        0x1000
 #define F_TEX_RT24   0x2000   // texture is a render target read as a 24-bit format
 #define F_TEX_RT16   0x4000   // texture is a render target read as a 16-bit format
+#define F_TEX_HOST   0x8000   // host replacement: c_tex_scale texels per GS texel, full mip chain
 #define F_DST16      0x1000000  // 16-bit frame buffer: 5 bits per channel are stored
 #define F_UNIT_ADD   0x2000000  // blend is Cd + Cs (16-bit buffer: Cs counts in steps of 8, rounded down)
 #define F_UNIT_SUB   0x4000000  // blend is Cd - Cs (rounded up)
@@ -114,8 +115,28 @@ int wrap_coord(int c, int size, int mode) {
     return clamp(c, 0, size - 1);                      // CLAMP (region modes approximated)
 }
 
-float4 sample_tex(float2 tc, int lvl, bool linear_filter) {
+float4 sample_tex(float2 tc, int lvl, bool linear_filter, bool host) {
 #ifdef VK
+    if (host) {
+        // A host replacement has more texels than the GS texture. Choose its
+        // level from the screen footprint so the extra detail neither aliases
+        // when minified nor is discarded by the GS level (which counts GS
+        // texels); the GS mag/min filter choice and wrap modes are kept.
+        float2 uv = tc / c_tex_size;
+        float2 dx = ddx(uv), dy = ddy(uv);
+        if (linear_filter)
+            return lvl > 0 ? t_tex.SampleGrad(s_min, uv, dx, dy) : t_tex.SampleGrad(s_mag, uv, dx, dy);
+        uint w0, h0, n0;
+        t_tex.GetDimensions(0, w0, h0, n0);
+        float2 sz = float2(w0, h0);
+        float rho = max(length(dx * sz), length(dy * sz));
+        int hl = clamp((int)floor(log2(max(rho, 1.0)) + 0.5), 0, (int)n0 - 1);
+        uint hw, hh, hn;
+        t_tex.GetDimensions(hl, hw, hh, hn);
+        float2 hp = floor(tc * c_tex_scale / (float)(1 << hl) + 1.0 / 1024.0);
+        int2 hip = int2(wrap_coord((int)hp.x, (int)hw, c_wrap.x), wrap_coord((int)hp.y, (int)hh, c_wrap.y));
+        return t_tex.Load(int3(hip, hl));
+    }
     if (linear_filter && c_tex_scale == 1.0) {
         // The GS quantizes UV at 1/16 texel of the selected mip level. Keep
         // hardware filtering/rounding; continuous float UV causes visible
@@ -173,7 +194,7 @@ PSOut ps_draw(VSOut i) {
             }
         }
         bool lin = lvl > 0 ? (f & F_MIN_LIN) != 0 : (f & F_MAG_LIN) != 0;
-        int4 t = (int4)round(sample_tex(tc, lvl, lin) * 255.0);
+        int4 t = (int4)round(sample_tex(tc, lvl, lin, (f & F_TEX_HOST) != 0) * 255.0);
         if (f & F_TEX_RT16) {  // 16-bit texel: 5 bits per channel, alpha from TEXA
             t.rgb &= 0xF8;
             t.a = t.a >= 0x80 ? (int)c_texa.y : ((c_texa.z != 0 && all(t.rgb == 0)) ? 0 : (int)c_texa.x);

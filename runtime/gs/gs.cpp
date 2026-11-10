@@ -951,7 +951,7 @@ void gs_frame_end(uint64_t frame, int aspect) {
                 LOG(LOG_GS, "  tri kind gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels per vblank", k & 1, (k >> 1) & 1,
                     (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, stats.kind_px[k] / 60);
         if (hw::g_on && g_log_enabled[LOG_GS]) {  // totals over the last 60 vblanks
-            char line[512];
+            char line[1024];
             hw::stats_line(line, sizeof line);
             LOG(LOG_GS, "  %s", line);
         }
@@ -1350,7 +1350,7 @@ int gs_replay(const char *path, int repeat) {
         g_prim_counter = 0;
         if (hw::g_on) {
             hw::finish();
-            char line[512];
+            char line[1024];
             hw::stats_line(line, sizeof line);
             fprintf(stderr, "%s\n", line);
         }
