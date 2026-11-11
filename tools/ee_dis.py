@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Annotated disassembler for SLUS_209.10.
 
-usage: dis.py <hexaddr> [count]       disassemble count instructions
-       dis.py -f <hexaddr>            disassemble the whole function
-       dis.py -x <hexaddr>            list callers of a function
+usage: ee_dis.py <hexaddr> [count]       disassemble count instructions
+       ee_dis.py -f <hexaddr>            disassemble the whole function
+       ee_dis.py -x <hexaddr>            list callers of a function
 
 Annotations: symbol names from config/symbols.txt, string literals and
 data addresses built with lui/addiu pairs.

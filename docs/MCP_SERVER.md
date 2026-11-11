@@ -19,7 +19,7 @@ or from the repo root:
       -- python3 -I tools/eod_mcp/server.py
 
 `${VAR}` and `${VAR:-default}` expansion in `.mcp.json` is a Claude Code feature; the example has no
-machine-specific paths. Use `python3 -I` so a stray `json.py` or `tools/dis.py` cannot shadow the stdlib.
+machine-specific paths. Use `python3 -I` so a stray module in the working directory cannot shadow the stdlib.
 Check with `claude mcp list`.
 
 ## Environment

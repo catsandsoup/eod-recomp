@@ -135,12 +135,12 @@ the recovery.
 Reinspect locally with a local executable and analysis metadata present:
 
 ```sh
-.venv/bin/python tools/dis.py -f 0017DE78
-.venv/bin/python tools/dis.py -f 0017E000
-.venv/bin/python tools/dis.py -f 0017E4D8
-.venv/bin/python tools/dis.py -f 0017E5C8
-.venv/bin/python tools/dis.py -f 0017E718
-.venv/bin/python tools/dis.py -f 0018AA80
+.venv/bin/python tools/ee_dis.py -f 0017DE78
+.venv/bin/python tools/ee_dis.py -f 0017E000
+.venv/bin/python tools/ee_dis.py -f 0017E4D8
+.venv/bin/python tools/ee_dis.py -f 0017E5C8
+.venv/bin/python tools/ee_dis.py -f 0017E718
+.venv/bin/python tools/ee_dis.py -f 0018AA80
 ```
 
 Do not commit the executable, generated functions, RAM dumps, captures or

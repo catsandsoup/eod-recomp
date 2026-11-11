@@ -33,7 +33,7 @@ or Windows implementation is part of this work.
 
 ## The original draw-distance option is not an unbounded multiplier
 
-Disassemble with `.venv/bin/python tools/dis.py -f 00212808`.
+Disassemble with `.venv/bin/python tools/ee_dis.py -f 00212808`.
 
 `00212808` defaults the option to 2, reads `draw_distance`, initializes a float
 factor to zero, and branches only for options 0, 1 and 2:
@@ -67,7 +67,7 @@ verify actual values per view rather than assuming one-player settings carry
 unchanged into split screen.
 
 `00212DB0` and `00212DC0` are identical getters for `00495D58`. The simple
-`tools/dis.py -x` JAL search finds no callers; this is **not** proof that there
+`tools/ee_dis.py -x` JAL search finds no callers; this is **not** proof that there
 are no tail-call/indirect/data references. A write after setup is a candidate
 range experiment only after logging later projection/fog updates and other
 scene limits. Do not patch a getter and assume the whole engine changed.

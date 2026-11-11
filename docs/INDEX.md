@@ -15,7 +15,7 @@ This index maps every reverse-engineered subsystem in *Test Drive: Eve of Destru
 - **`[V]` (Verified)**: Confirmed via retail debug strings, Sony PS2SDK / newlib signatures, or runtime-traced HLE contracts.
 - **`[I]` (Inferred)**: Deduced from call-graph structure, struct layouts, and caller/callee register contracts.
 - **Generator integration (`tools/recomp.py`)**: Emits symbol names, `[V]`/`[I]` tags, and notes in `gen/rec_*.c` function header comments and inline `/* SymbolName */` comments on `jal` call sites.
-- **Disassembler integration (`tools/dis.py`)**: Prints symbol headers (`SymbolName [V]: ; note`) at entry points and resolves function and global operand names inline.
+- **Disassembler integration (`tools/ee_dis.py`)**: Prints symbol headers (`SymbolName [V]: ; note`) at entry points and resolves function and global operand names inline.
 
 ---
 

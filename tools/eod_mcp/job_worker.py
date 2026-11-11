@@ -1,9 +1,9 @@
 """Child process for long jobs: python3 -I job_worker.py <job_dir>.
 
 Reads job.json {kind, params}, appends progress.jsonl lines, writes result.json.
-tools/ is appended to sys.path (never prepended: tools/dis.py shadows stdlib dis).
+tools/ is appended to sys.path so tools/ modules never shadow the stdlib.
 """
-import dis, inspect, json, os, signal, subprocess, sys, threading, time  # noqa: E401  (dis first, see above)
+import dis, inspect, json, os, signal, subprocess, sys, threading, time  # noqa: E401
 from pathlib import Path
 
 TOOLS = str(Path(__file__).resolve().parents[1])

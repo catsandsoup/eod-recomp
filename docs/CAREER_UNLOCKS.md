@@ -19,7 +19,7 @@ Code: `src/hle_career.cpp` (wrappers and the per-frame hook `career_vblank`), th
 `tools/tests/test_career_content.py` (ctest `CareerContent`, `EOD_CAREER_CONTENT=<COMMON.RES or content folder>`
 checks real content).
 
-Addresses are EE addresses in SLUS_209.10 (the `f_xxxxxxxx` of `gen/` and `tools/dis.py`).
+Addresses are EE addresses in SLUS_209.10 (the `f_xxxxxxxx` of `gen/` and `tools/ee_dis.py`).
 
 ## Career state
 

@@ -112,7 +112,7 @@ frame interpolation.
 assumes the existing recompilation tooling and gets cheaper with each repeat.
 
 ### 0.1 PS2 hook points found in this pass
-Addresses are EE addresses in `SLUS_209.10` (view with `tools/dis.py -f <addr>`).
+Addresses are EE addresses in `SLUS_209.10` (view with `tools/ee_dis.py -f <addr>`).
 None of these are in `config/symbols.txt` yet; the names are descriptive guesses
 from strings and code shape. HLE `wrap`/`replace` entries go in `config/hle.txt`.
 

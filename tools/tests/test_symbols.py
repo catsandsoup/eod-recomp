@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test for config/symbols.txt, tools/recomp.py, and tools/dis.py."""
+"""Regression test for config/symbols.txt, tools/recomp.py, and tools/ee_dis.py."""
 import json
 import os
 import re

@@ -2,7 +2,7 @@
 
 Tools: `tools/vehicle_export.py`, `tools/vehicle_import.py` (on `tools/vif_patch.py`, `tools/mod_package.py`).
 Run unit tests from the repository root: `EOD_HEADLESS=1 EOD_MUTE=1 EOD_TEST_RETAIL_MODELS=1 python3 -m unittest tools.tests.test_vehicle_export tools.tests.test_vehicle_import`.
-Never run these from inside `tools/` (`tools/dis.py` shadows the standard library).
+Run from the repository root.
 
 ## Player success
 

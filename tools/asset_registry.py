@@ -131,7 +131,7 @@ def analyze_member(task):
 
 @contextlib.contextmanager
 def _stdlib_first():
-    """tools/dis.py shadows the stdlib `dis`; spawned workers inherit sys.path, so
+    """Spawned workers inherit sys.path; keep tools/ modules from shadowing the stdlib, so
     keep this directory last while a pool lives (it is still importable)."""
     here = str(Path(__file__).resolve().parent)
     saved = list(sys.path)

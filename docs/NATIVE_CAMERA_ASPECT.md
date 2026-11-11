@@ -47,7 +47,7 @@ uses this same scale address. PCSX2's
 [ELF checksum implementation](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/Elfheader.cpp)
 explains the identifier difference.
 
-Local disassembly (`.venv/bin/python tools/dis.py -f ADDRESS`) establishes:
+Local disassembly (`.venv/bin/python tools/ee_dis.py -f ADDRESS`) establishes:
 
 - `0034D328`: native `SetDisplayMode`. Writes mode to `003DD660`; initializes
   `003DD658` and `003DD65C` to 1. Mode 1 sets both to 0.75 and the widescreen

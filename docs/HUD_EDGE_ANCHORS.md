@@ -7,7 +7,7 @@ old 4:3 area. Camera correctness does not establish HUD edge placement.
 
 ## Exact target evidence
 
-Disassembled the supported local SLUS_209.10 (CRC32 75BB93EE) with tools/dis.py,
+Disassembled the supported local SLUS_209.10 (CRC32 75BB93EE) with tools/ee_dis.py,
 and checked the synchronous global-g_ee generated call convention.
 
 - `00127050` updates the racing overlay, with actual POS/LAP/DAMAGE and KPH/MPH
