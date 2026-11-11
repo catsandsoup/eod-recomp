@@ -63,6 +63,20 @@ Every code change, fix, and feature MUST be verified against the real game:
 4. Verify the player experience end-to-end (game boot, menu navigation, 3D world state, memory allocator integrity, scene transitions, and clean exit without panics).
 5. Reports without real in-game execution evidence are strictly forbidden.
 
+## Creation Kit concurrency — hard rule
+
+The Kit's UI never waits on work. The main thread only draws and takes input.
+Every other kind of work runs in its own lane so one never stalls another:
+asset reads/inspection, exports, package build/install, 3D model decoding and
+mesh building, texture/image decoding, index builds, and game runs. Long work
+is a backend job (queued, progress, cancel) shown in the Jobs panel; the rest
+of the app stays usable while it runs. No app-wide "busy" lock: only the
+specific asset or project being written is locked, and only against writes.
+Decode large responses, meshes and images off the main thread. The backend
+service serves reads concurrently and runs exports, builds and mesh work in
+separate worker processes. Verify with a long export or build running while
+browsing, inspecting and previewing models stays responsive.
+
 ## Public communications and privacy
 
 Public README/release copy is written for players. Use the dedicated
