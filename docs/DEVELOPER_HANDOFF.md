@@ -116,9 +116,9 @@ texture-validity change is not yet retail-benchmarked. Do not describe these as
 flawless, full-speed 4K or an established transfer speedup. Windows/D3D11 was not
 run during this Mac session. Achievements are not implemented by this work.
 
-Owner order: 1:1 native 1x/4:3, original timing, stable full speed without frame
-skipping; LOD/draw distance and proper widescreen; higher resolutions sequentially;
-higher FPS; DLSS last. Car LOD expansion is opt-in via EOD_CAR_LOD_MULTIPLIER;
+Owner order (revised 11 Nov 2026): test at maximum quality (4K/5K Retina,
+widescreen, 60 fps or higher, enhanced LOD) with original timing and full speed
+without frame skipping; native 1x/4:3 is a diagnostic reference only; DLSS last. Car LOD expansion is opt-in via EOD_CAR_LOD_MULTIPLIER;
 leave it unset for the native baseline. EOD_HUD_EDGE_ANCHORS=0 disables wide HUD
 anchor adjustment for same-binary comparison. Leave enhancements off while
 establishing the original baseline.

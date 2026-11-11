@@ -7,15 +7,15 @@ the evidence cannot establish. Carry those criteria into the final handoff.
 ## Success for the current native baseline
 
 “I open the app with my own installed disc, reach a race without terminal setup,
-and play alone or with a local second player. At native 1x PS2 resolution and
-original 4:3, heavy carnage stays at the game's original timing and full speed,
+and play alone or with a local second player. At maximum quality (4K/5K
+Retina, widescreen, 60 fps or higher), heavy carnage stays at the game's original timing and full speed,
 without frame skipping. Steering and braking respond promptly; physics, damage,
 camera, world and HUD behave faithfully.”
 
 | Player acceptance | Required evidence and limits |
 | --- | --- |
 | Open the installed app and return to play | First-launch/import and returning-launch journeys on the current packaged app; build success does not prove native dialogs or startup experience. |
-| Heavy races remain at original speed | Reproducible solo and local multiplayer runs at 1x/4:3, FrameSkip=0, enhancements off; record game timing, frame cadence, drawn frames and stalls. Verify the original game's cadence for the tested mode against a reference; do not assume every PS2 mode draws at 60 FPS. |
+| Heavy races remain at original speed | Reproducible solo and local multiplayer runs at maximum quality (highest RenderScale, widescreen, enhancements on), FrameSkip=0; native 1x/4:3 only as a diagnostic reference; record game timing, frame cadence, drawn frames and stalls. Verify the original game's cadence for the tested mode against a reference; do not assume every PS2 mode draws at 60 FPS. |
 | Controls feel immediate and simulation stays faithful | Hands-on keyboard/pad driving compared with the original reference, including heavy carnage, physics and damage. Headless input tests do not establish visible latency or driving feel. |
 | Rendering and presentation match the original | Reference comparisons of representative world/HUD scenes, including split screen and known thin black lines; a byte-exact optimization comparison proves only equivalence for its tested input. |
 

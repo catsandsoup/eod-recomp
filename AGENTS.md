@@ -28,12 +28,17 @@ EOD_MUTE=1`, plus `--headless` for game runs). Coordinate GPU measurements:
 never run competing game/replay/build workloads during performance comparisons.
 Never commit disc data, generated game code, captures or binaries.
 
-Latest owner priority: establish accurate 1:1 native 1x PS2-resolution rendering,
-original 4:3 presentation, original timing, stability and full speed without frame
-skipping first. Then improve LOD/draw distance and proper widescreen HUD/camera;
-then validate higher resolutions sequentially (2x, 4x, 6x); higher FPS follows.
+Latest owner priority: test and demonstrate the remaster at maximum quality — the
+highest render scale the display supports (4K/5K Retina), widescreen, 60 fps and
+higher frame rates where the build supports them, enhanced LOD/draw distance on —
+with original game timing, stability and full speed without frame skipping. Native
+1x/4:3 is a diagnostic reference for faithfulness bugs, not the test condition.
 DLSS is explicitly last. Preserve faithful simulation/physics and verify solo/local
-multiplayer with real rendering outputs. Other mods remain deferred. Read
+multiplayer with real rendering outputs. Other mods remain deferred.
+
+Install each verified build over the installed game and Creation Kit apps without
+asking, keeping a backup of the previous copy. Publishing a public release still
+needs the owner's approval. Read
 `docs/DEVELOPER_HANDOFF.md` for the published branches and current acceptance gaps.
 
 ## Product language — hard rule
