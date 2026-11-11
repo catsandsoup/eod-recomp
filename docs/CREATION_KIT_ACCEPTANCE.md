@@ -20,9 +20,10 @@ development runtime. Desktop (visible window) presentation is not covered.
 | Placement write-back | component-tested | Byte-exact translate/rigid edits; moved visual geometry does not move collision; not yet raced |
 | Collision / wall height | component-tested | Wall slabs ~16 m tall behind 1–2 m visible walls; shrink-only edit byte-verified; airborne pass-over not yet produced |
 | MCP server | component-tested | 41 tools, 15 tests, stdio smoke against retail disc; game-run tool not exercised |
-| Kit app 0.4.0 | component-tested | 26 backend + 3 Swift handler tests; window captured on the desktop (asset workspace, inspector); export/replace/package/run flows not yet clicked through |
+| Kit app 0.4.1 | component-tested | Installed; window captured on the desktop opening the owner's project; labelled format inspector (no hex primary view) compiled and verified through the backend, not yet clicked on screen; Run in Game now uses the bundled current runtime |
 | Game app build | native-verified | Stale `gen/` regenerates from an input fingerprint; `EOD_BUNDLE_MODS` bundles a manifest-verified integrated root; clean build races Phantom and the #24 Cup car headless |
 | Game window startup | desktop-verified (one run) | Windowed, muted launch of a clean build: window at 1.0 s, black to ~2 s, splash at 2.2 s, Anoka race (direct start) by 8.3 s at 100 % speed / 60 fps; integrated root activated by the app itself |
+| Game at maximum quality | desktop-verified (one run) | Installed build, windowed Retina 3024 px, RenderScale 6, Detail maximum, 16:9, FrameSkip 0, VSync: Anoka race holds 100 % speed / 60 fps after load. Defect: at 16:9 the race HUD panels are clipped at the left and right screen edges |
 
 ## Not achieved / next decisive tests
 
