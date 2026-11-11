@@ -24,6 +24,7 @@ from valt import compile_binary_valt, parse_binary_valt
 from tex import write_png
 from texture_preview import decode_preview
 import vif_mesh
+import formats
 from vehicle_materials import BODY_TEXTURE_ALIASES
 
 # Units for the curated vehicle inspector. Native tables retain their own data.
@@ -45,6 +46,14 @@ CAR_NAMES = ("Algar Blitz Bulldog Carrere Desio Digit Hurricane Moth Palo Top Ar
              "Copcar Hearse Postal Taxi Tow").split()
 
 
+class PlainError(ValueError):
+    """A sentence for the modder; `detail` keeps the technical cause for logs and MCP."""
+
+    def __init__(self, message, detail=None):
+        super().__init__(message)
+        self.detail = detail
+
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -57,7 +66,7 @@ def archive_path(disc, relative):
     rel = Path(relative)
     path = (disc / rel).resolve()
     if rel.is_absolute() or ".." in rel.parts or not inside(path, disc / "DATA"):
-        raise ValueError("Archive must be inside the selected disc's DATA directory")
+        raise ValueError("That archive is outside the game folder's DATA folder, so it can't be opened. Choose an archive from the game sources list.")
     return path
 
 
@@ -66,12 +75,12 @@ def directory(path):
     with path.open("rb") as handle:
         hdr = handle.read(40)
         if len(hdr) != 40 or hdr[:4] != b"0TSR" or struct.unpack_from("<I", hdr, 8)[0] != 6:
-            raise ValueError("Only native EOD 0TSR v6 archives are supported")
+            raise PlainError("This file isn't a game archive the Creation Kit can read. Choose a .CAR, .RES or .TRK file from the game folder.", "0TSR version 6 header expected")
         if eod_crc(hdr[:36]) != struct.unpack_from("<I", hdr, 36)[0]:
-            raise ValueError("Archive header CRC mismatch")
+            raise PlainError("This archive's header is damaged, so it was not opened. Re-extract the game folder from your disc and try again.", "archive header checksum mismatch")
         offset, count = struct.unpack_from("<II", hdr, 20)
         if offset < 40 or count > 100000 or offset + count * 68 > size:
-            raise ValueError("Truncated archive directory")
+            raise PlainError("This archive is incomplete, so it was not opened. Re-extract the game folder from your disc and try again.", "archive directory runs past end of file")
         handle.seek(offset)
         raw = handle.read(count * 68)
     entries, names = [], set()
@@ -80,10 +89,10 @@ def directory(path):
         name = entry[:32].split(b"\0")[0].decode("latin1")
         length, position, crc = struct.unpack_from("<III", entry, 40)
         if not name or name in (".", "..", "manifest.json") or "/" in name or "\\" in name or name.lower() in names:
-            raise ValueError("Unsafe or duplicate archive member")
+            raise PlainError("This archive lists the same file twice or uses an unsafe file name, so it was not opened. Re-extract the game folder from your disc.", "duplicate or unsafe member name: " + name)
         names.add(name.lower())
         if position + offset + length > size:
-            raise ValueError("Truncated archive member: " + name)
+            raise PlainError(f"{name} extends past the end of its archive, so it can't be read. Re-extract the game folder from your disc.", "member runs past end of file")
         entries.append(dict(name=name, type=entry[32:36][::-1].decode("latin1").strip(),
                             size=length, offset=offset + position, crc=crc))
     return entries
@@ -115,7 +124,7 @@ def vehicle_paint(disc, archive, include_embedded=False):
     match = next((e for e in entries if e["name"].lower() == "dirt.val"), None)
     if match is None:
         return None
-    raw, _ = payload(common, match["name"], entries)
+    raw, _ = payload(common, match["name"], entries, verify_crc=False)
     table = parse_binary_valt(raw)
     paint_stat = paints.stat()
     paint_entries = cached_directory(str(paints), paint_stat.st_mtime_ns, paint_stat.st_size)
@@ -148,7 +157,7 @@ def edited_material(disc, archive, name, request):
         pending = request.get("textureEdits", {}) if relative == request["archive"] else {}
         edit = pending.get(entry["name"]) or saved_edits(selected, disc, sha(archive.read_bytes()))
         if edit:
-            return texture_edit_bytes(edit, payload(archive, entry["name"], entries)[0])
+            return texture_edit_bytes(edit, payload(archive, entry["name"], entries, verify_crc=False)[0])
     return None
 
 
@@ -164,7 +173,7 @@ def resolve_material(disc, archive, name, paint=None, request=None):
         if paint["chassis"] == "Bus" and name.lower() == "bus2.tex" and paint["number"] == "790":
             paint_name = "79a.tm0"
         edited = edited_material(disc, paint["archive"], paint_name, request)
-        return edited if edited is not None else payload(paint["archive"], paint_name)[0]
+        return edited if edited is not None else payload(paint["archive"], paint_name, verify_crc=False)[0]
     # Resource namespaces are mounted with the model's own archive first, then
     # the game's resident resources. Do not substitute another venue's same name.
     shared = ("HOBBYSET.RES", "RACE.RES", "PART.RES", "COMMON.RES", "GENESIS.RES")
@@ -178,36 +187,38 @@ def resolve_material(disc, archive, name, paint=None, request=None):
                       for e in entries if e["name"].lower() == candidate_name.lower()), None)
         if match:
             edited = edited_material(disc, candidate, name, request)
-            return edited if edited is not None else payload(candidate, match["name"], entries)[0]
+            return edited if edited is not None else payload(candidate, match["name"], entries, verify_crc=False)[0]
     if paint and name.lower() in {n.lower() for n in BODY_TEXTURE_ALIASES.get(paint["chassis"].lower(), ())}:
-        return payload(paint["archive"], paint["asset"])[0]
+        return payload(paint["archive"], paint["asset"], verify_crc=False)[0]
     return None
 
 
 def payload(path, name, entries=None, verify_crc=True):
     matches = [e for e in (entries or directory(path)) if e["name"] == name]
     if len(matches) != 1:
-        raise ValueError("Asset not found: " + name)
+        raise ValueError(f"{name} is not in this archive. Refresh the list and choose again.")
     entry = matches[0]
     with path.open("rb") as handle:
         handle.seek(entry["offset"])
         data = handle.read(entry["size"])
-    if verify_crc and eod_crc(data) != entry["crc"]:
-        raise ValueError("Asset CRC mismatch: " + name)
+    entry = dict(entry, crcOk=eod_crc(data) == entry["crc"])
+    if verify_crc and not entry["crcOk"]:
+        raise PlainError(f"{name} does not match its stored checksum, so it was not used. "
+                         "Re-extract the game folder from your disc and try again.", "member checksum mismatch")
     return data, entry
 
 
 def project_path(request, disc):
     path = Path(request["project"]).expanduser().resolve()
     if inside(path, disc) or inside(disc, path.parent):
-        raise ValueError("Choose a project folder separate from the original disc")
+        raise ValueError("The project folder can't be inside the game folder. Choose a different folder so the original files stay untouched.")
     return path
 
 
 def load_project(path):
     data = json.loads(path.read_text())
     if data.get("version") != 1 or not isinstance(data.get("archives"), dict):
-        raise ValueError("Not an EOD retail mod project (version 1)")
+        raise ValueError("This isn't a Creation Kit project file. Open a project saved here, or start a new one.")
     return data
 
 
@@ -229,7 +240,7 @@ def storage_path(project_file, relative):
     root = project_file.parent / (project_file.name + ".assets")
     output = root / relative
     if root.resolve() != root or output.resolve() != output or not inside(output, root):
-        raise ValueError("Project output path escapes its storage or uses a symbolic link")
+        raise ValueError("The project's storage contains a shortcut (symbolic link), which isn't allowed. Remove it or choose another project folder.")
     return output
 
 
@@ -245,36 +256,39 @@ def apply_edits(table, edits):
         if "sectionIndex" in edit and "pairIndex" in edit:
             si, pi = edit["sectionIndex"], edit["pairIndex"]
             if type(si) is not int or type(pi) is not int or not 0 <= si < len(table["sections"]) or not 0 <= pi < len(table["sections"][si]["pairs"]):
-                raise ValueError("Native table row index is out of range")
+                raise ValueError("A field in this table no longer exists. Reopen the asset and repeat the edit.")
             s, i = table["sections"][si], pi
             if s["name"] != section or s["pairs"][i][0] != key:
-                raise ValueError("Native table row changed since it was opened")
+                raise ValueError("This table changed after it was opened. Reopen the asset and repeat the edit.")
         else:
             matches = [(s, i) for s in table["sections"] if s["name"] == section
                        for i, pair in enumerate(s["pairs"]) if pair[0] == key]
             if len(matches) != 1:
-                raise ValueError("Missing or ambiguous native field: " + section + "/" + key)
+                raise ValueError(f"The field {section} / {key} could not be found, or appears more than once. Reopen the asset and choose it again.")
             s, i = matches[0]
             si, pi = next(index for index, candidate in enumerate(table["sections"]) if candidate is s), i
         row = (si, pi)
         if row in seen:
-            raise ValueError("Duplicate native field: " + section + "/" + key)
+            raise ValueError(f"{section} / {key} was edited twice in one save. Keep a single value and save again.")
         seen.add(row)
         if "\0" in value:
-            raise ValueError("Native table strings cannot contain a NUL byte")
-        value.encode("latin1")
+            raise ValueError("Text values can't contain a null character. Remove it and try again.")
+        try:
+            value.encode("latin1")
+        except UnicodeEncodeError:
+            raise ValueError("Text values can only use standard Western characters. Replace the others and try again.") from None
         if identity in FIELDS:
             if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value):
-                raise ValueError("Enter a decimal number for " + section + "/" + key)
+                raise ValueError(f"{key} needs a number, such as 2800 or 0.9.")
             number = float(value)
             try:
                 stored = struct.unpack("<f", struct.pack("<f", number))[0]
             except (OverflowError, struct.error):
-                raise ValueError("Value cannot be represented by the game's 32-bit float") from None
+                raise ValueError("That number is too large or too small for the game to store. Enter a smaller value.") from None
             if not math.isfinite(stored) or (number != 0 and stored == 0):
-                raise ValueError("Value cannot be represented by the game's 32-bit float")
+                raise ValueError("That number is too large or too small for the game to store. Enter a smaller value.")
             if identity == ("Chassis", "mass") and stored <= 0:
-                raise ValueError("Mass must be positive; the game divides by this value")
+                raise ValueError("Mass must be above zero; the game can't simulate a car with no weight. Enter a positive value.")
             value = format(stored, ".9g")
         s["pairs"][i] = (key, value)
     return table
@@ -296,28 +310,79 @@ def table_fields(table):
     return result
 
 
+@lru_cache(maxsize=64)
+def _archive_sha(path, modified, size):
+    return sha(Path(path).read_bytes())
+
+
+def archive_sha(path):
+    stat = path.stat()
+    return _archive_sha(str(path), stat.st_mtime_ns, stat.st_size)
+
+
 def saved_edits(request, disc, source_sha=None):
     path = project_path(request, disc)
     if not path.exists():
         return []
     project = load_project(path)
     if Path(project["disc"]).resolve() != disc:
-        raise ValueError("Project belongs to a different game installation")
+        raise ValueError("This project was made for a different game folder. Open it with its original game folder, or start a new project.")
     record = project["archives"].get(request["archive"], {})
     if source_sha and record and record["sourceSha256"] != source_sha:
-        raise ValueError("Retail archive changed since this project was saved")
+        raise ValueError("The game file this project edits has changed since the project was saved. Re-extract the original game folder, or start a new project.")
     return record.get("assets", {}).get(request["asset"], [])
+
+
+CRC_WARNING = "This file's checksum differs on the original disc. It opens normally, and saved edits are verified."
+FORMAT_EDIT = "format"
+
+
+def hex_dump(data, limit=8192):
+    lines = []
+    for offset in range(0, min(len(data), limit), 16):
+        chunk = data[offset:offset + 16]
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{offset:08X}  {chunk.hex(' ').upper():47s}  {text}")
+    return "\n".join(lines)
+
+
+def format_result(request, disc, path, entry, data, result, warnings):
+    """Labelled view for any member without a dedicated preview (SETU, ILIN, LAYT, ...)."""
+    original = data
+    saved = saved_edits(request, disc, archive_sha(path))
+    pending = request.get("formatEdits")
+    edits = pending if isinstance(pending, dict) else (saved["edits"] if isinstance(saved, dict) and saved.get("kind") == FORMAT_EDIT else None)
+    if edits:
+        data = formats.apply_edits(entry["type"], data, edits)
+    context = dict(archive=request["archive"], member=entry["name"], disc=str(disc))
+    view = formats.describe(entry["type"], data, context)
+    view["warnings"] = list(warnings) + list(view.get("warnings", []))
+    changed = bool(edits) and data != original
+    result.update(kind="format", format=view, hex=hex_dump(data), edited=changed,
+                  size=len(data), sha256=sha(data), warnings=view["warnings"])
+    return result
 
 
 def inspect(request, disc):
     path = archive_path(disc, request["archive"])
-    data, entry = payload(path, request["asset"])
+    data, entry = payload(path, request["asset"], verify_crc=False)
     result = dict(name=entry["name"], type=entry["type"], size=len(data), sha256=sha(data))
+    warnings = [] if entry["crcOk"] else [CRC_WARNING]
+    result["warnings"] = warnings
     cache = storage_path(project_path(request, disc), ".cache")
+    DECODE_ERRORS = (ValueError, IndexError, KeyError, struct.error, ArithmeticError)
+
+    def unreadable(kind):
+        return format_result(request, disc, path, entry, data, result, warnings + [
+            f"This {kind} couldn't be previewed, so its contents are listed below. It saves unchanged."])
+
     if entry["type"] == "VALT":
-        table = parse_binary_valt(data)
+        try:
+            table = parse_binary_valt(data)
+        except DECODE_ERRORS:
+            return unreadable("table")
         original = [[v for _, v in s["pairs"]] for s in table["sections"]]
-        edits = saved_edits(request, disc, sha(path.read_bytes()))
+        edits = saved_edits(request, disc, archive_sha(path))
         if edits:
             apply_edits(table, edits)
         editable = not table.get("is_v6", False)
@@ -328,22 +393,32 @@ def inspect(request, disc):
                  unit=FIELDS.get((s["name"], k), "")) for pi, (k, v) in enumerate(s["pairs"])])
             for si, s in enumerate(table["sections"])])
     elif entry["type"] == "TEX":
-        edit = request.get("textureEdit") or saved_edits(request, disc, sha(path.read_bytes()))
+        edit = request.get("textureEdit") or saved_edits(request, disc, archive_sha(path))
         if edit:
             data = texture_edit_bytes(edit, data)
-        image, meta = texture(data, cache)
+        try:
+            image, meta = texture(data, cache)
+        except DECODE_ERRORS:
+            return unreadable("texture")
         result.update(kind="texture", image=image, metadata=meta)
     elif entry["type"] == "MODL":
-        mesh = vif_mesh.parse_modl(data)
+        try:
+            mesh = vif_mesh.parse_modl(data)
+        except DECODE_ERRORS:
+            return unreadable("model")
         paint = vehicle_paint(disc, path, include_embedded=True)
         parts = []
         for part in mesh["parts"]:
             vertices, triangles = [], []
-            for batch in vif_mesh.decode_part(data, part):
-                base = len(vertices)
-                faces = vif_mesh.triangulate_batch(batch)
-                triangles.extend([a + base, b + base, c + base] for a, b, c in faces)
-                vertices.extend(batch["verts"])
+            try:
+                batches = list(vif_mesh.decode_part(data, part))
+                for batch in batches:
+                    base = len(vertices)
+                    faces = vif_mesh.triangulate_batch(batch)
+                    triangles.extend([a + base, b + base, c + base] for a, b, c in faces)
+                    vertices.extend(batch["verts"])
+            except DECODE_ERRORS:
+                vertices, triangles = [], []
             image = None
             texture_error = None
             try:
@@ -351,25 +426,21 @@ def inspect(request, disc):
                 if tex is not None:
                     image, _ = texture(tex, cache)
                 elif part["texture"].lower() not in ("", "-", ".tex"):
-                    texture_error = "Material texture not found in model or resident archives: " + part["texture"]
+                    texture_error = f"Texture {part['texture']} was not found in this model's archive or the game's shared archives."
             except (ValueError, IndexError, struct.error) as error:
-                texture_error = str(error)
+                texture_error = f"Texture {part['texture']} could not be read."
             if vertices and triangles:
                 parts.append(dict(name=f"slot {part['slot']} · group {part['group'] & 0xffff}",
                     positions=[v["p"] for v in vertices], normals=[v["n"] for v in vertices],
                     uvs=[v["uv"] for v in vertices], triangles=triangles,
                     texture=image, textureError=texture_error))
         if not parts:
-            raise ValueError("No supported VIF triangle batches in this model")
+            return format_result(request, disc, path, entry, data, result, warnings + [
+                "This model's geometry can't be previewed yet. Its contents are listed below and it saves unchanged."])
         result.update(kind="model", parts=parts, markers=mesh["markers"],
                       paintDescription=(f"Preview livery {paint['number']} · {paint['driver']} · CT.RES/{paint['asset']}" if paint else None))
     else:
-        lines = []
-        for offset in range(0, min(len(data), 8192), 16):
-            chunk = data[offset:offset + 16]
-            text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-            lines.append(f"{offset:08X}  {chunk.hex(' ').upper():47s}  {text}")
-        result.update(kind="binary", message="Raw native asset · " + entry["type"], hex="\n".join(lines))
+        return format_result(request, disc, path, entry, data, result, warnings)
     return result
 
 
@@ -378,7 +449,7 @@ def texture(data, cache):
     cache.mkdir(parents=True, exist_ok=True)
     path = cache / (sha(data + b"studio-preview-v2" + rgba) + ".png")
     if path.resolve() != path:
-        raise ValueError("Texture cache file uses a symbolic link")
+        raise ValueError("The preview cache contains a shortcut (symbolic link) and was not used. Delete the project's .cache folder and try again.")
     if not path.exists():
         write_png(str(path), w, h, rgba)
     return str(path), meta
@@ -394,9 +465,13 @@ def save_single_archive(request, disc):
     record = project["archives"].setdefault(request["archive"], dict(sourceSha256=source_sha, assets={}))
     if "edits" in request:
         record["assets"][request["asset"]] = request["edits"]
+    if request.get("formatEdits"):
+        if not isinstance(request["formatEdits"], dict):
+            raise ValueError("The changes could not be read. Reopen the asset and try again.")
+        record["assets"][request["asset"]] = dict(kind=FORMAT_EDIT, edits=request["formatEdits"])
     record["assets"].update(request.get("textureEdits", {}))
     if not record["assets"]:
-        raise ValueError("No edits to build")
+        raise ValueError("There are no changes to save. Edit a value or texture first.")
     # Keep opaque source payloads exact, including pre-existing retail CRC
     # discrepancies. Edited members must still pass their original CRC check.
     entries = directory(source)
@@ -405,17 +480,19 @@ def save_single_archive(request, disc):
     changes = {}
     for asset, edits in record["assets"].items():
         if asset not in originals:
-            raise ValueError("Edited asset is not in the source archive")
-        data, entry = payload(source, asset, entries)
+            raise ValueError("A saved change refers to a file the archive no longer contains. Discard that change and try again.")
+        data, entry = payload(source, asset, entries, verify_crc=False)
         if entry["type"] == "TEX":
             encoded = texture_edit_bytes(edits, data)
+        elif isinstance(edits, dict) and edits.get("kind") == FORMAT_EDIT:
+            encoded = formats.apply_edits(entry["type"], data, edits["edits"])
         elif entry["type"] == "VALT" and isinstance(edits, list):
             edited = apply_edits(parse_binary_valt(data), edits)
             encoded = compile_binary_valt(edited)
             if table_fields(parse_binary_valt(encoded)) != table_fields(edited):
-                raise ValueError("Native table roundtrip failed")
+                raise PlainError("The edited table could not be written back without altering other values, so nothing was saved. Try a smaller edit.", "table round-trip comparison failed")
         else:
-            raise ValueError("Unsupported saved project edit")
+            raise ValueError("This project holds a kind of change this version can't build. Update the Creation Kit, or discard that change.")
         changes[asset] = encoded
     output = overlay_file(project_file, request["archive"])
     with tempfile.TemporaryDirectory(prefix="eod-build-") as temp:
@@ -439,11 +516,11 @@ def save_single_archive(request, disc):
                 pack_archive(str(stage), str(packed))
         built_entries = directory(packed)
         if {e["name"] for e in built_entries} != set(originals):
-            raise ValueError("Built archive member inventory changed")
+            raise ValueError("The rebuilt archive doesn't have the same files as the original, so it was discarded. Nothing was saved; try again.")
         for entry in built_entries:
             data, _ = payload(packed, entry["name"], built_entries, verify_crc=entry["name"] in changes)
             if entry["name"] not in changes and data != originals[entry["name"]]:
-                raise ValueError("Unedited archive payload changed: " + entry["name"])
+                raise ValueError(f"{entry['name']} would have changed without being edited, so the rebuilt archive was discarded. Nothing was saved.")
         built = packed.read_bytes()
     record["sourceCrcWarnings"] = warnings
     record["outputSha256"] = sha(built)
@@ -465,7 +542,7 @@ def save_single_archive(request, disc):
             continue
         legacy = (project_file.parent / "overlay" / relative).resolve()
         if not inside(legacy, project_file.parent / "overlay") or not legacy.is_file() or sha(legacy.read_bytes()) != other["outputSha256"]:
-            raise ValueError("Saved archive missing; rebuild this asset first: " + relative)
+            raise ValueError(f"A previously built archive ({relative}) is missing. Open that asset and choose Save & Build again.")
         atomic_write(destination, legacy.read_bytes())
     previous = output.read_bytes() if output.exists() else None
     atomic_write(output, built)
@@ -479,6 +556,23 @@ def save_single_archive(request, disc):
         raise
     return dict(project=str(project_file), overlay=str(storage_path(project_file, "overlay")),
                 archivePath=str(output), sha256=sha(built), bytes=len(built), sourceCrcWarnings=warnings)
+
+
+def save_format(request, disc):
+    """Persist labelled-field edits ({field id: value}) for one member and rebuild its archive.
+
+    Edits are stored in the project beside VALT and texture edits; the rebuilt
+    member gets a fresh directory CRC, every other member stays byte-identical.
+    """
+    edits = request.get("formatEdits")
+    if not isinstance(edits, dict) or not edits:
+        raise ValueError("There are no changes to save. Edit a value first.")
+    source = archive_path(disc, request["archive"])
+    data, entry = payload(source, request["asset"], verify_crc=False)
+    formats.apply_edits(entry["type"], data, edits)  # reject out-of-range values before anything is written
+    result = save_single_archive(request, disc)
+    result["edited"] = request["asset"]
+    return result
 
 
 def save(request, disc):
@@ -500,19 +594,19 @@ def save(request, disc):
         return save_single_archive(request, disc)
     paint = vehicle_paint(disc, archive_path(disc, request["archive"]), include_embedded=True)
     if not paint or paint["number"] != "790":
-        raise ValueError("Bus paint-zero binding differs from the verified 790/79a native layout")
+        raise ValueError("Bus paint changes can only be built when the bus uses its standard paint set. This copy differs, so nothing was saved.")
     from texture_edit import import_png
     texture_edits = {}
     with tempfile.TemporaryDirectory(prefix="eod-bus-paint-") as folder:
         png = Path(folder) / "paint.png"
         for body, source_name in sources.items():
-            original, _ = payload(archive_path(disc, request["archive"]), source_name)
+            original, _ = payload(archive_path(disc, request["archive"]), source_name, verify_crc=False)
             data = texture_edit_bytes(assets[source_name], original)
             width, height, pixels, _ = decode_preview(data)
             number = "790" if body == "bus1" else "79a"
             for suffix in (".tex", ".tm0"):
                 target_name = number + suffix
-                target, _ = payload(paint["archive"], target_name)
+                target, _ = payload(paint["archive"], target_name, verify_crc=False)
                 tw, th, _, _ = decode_preview(target)
                 resized = b"".join(pixels[((y*height//th)*width+x*width//tw)*4:((y*height//th)*width+x*width//tw)*4+4]
                                    for y in range(th) for x in range(tw))
@@ -539,31 +633,35 @@ def validate(request, disc):
     path = project_path(request, disc)
     project = load_project(path)
     if Path(project["disc"]).resolve() != disc or not project["archives"]:
-        raise ValueError("Project has no built assets for this game installation")
+        raise ValueError("This project has no saved changes for this game folder. Choose Save & Build on an edit first.")
     for relative, record in project["archives"].items():
         original = archive_path(disc, relative)
         output = overlay_file(path, relative)
         if sha(original.read_bytes()) != record["sourceSha256"]:
-            raise ValueError("Retail archive changed: " + relative)
+            raise ValueError(f"{relative} has changed since this project was built. Choose Save & Build again.")
         if not output.exists() or sha(output.read_bytes()) != record["outputSha256"]:
-            raise ValueError("Built archive missing or modified; save the project again: " + relative)
+            raise ValueError(f"The built copy of {relative} is missing or was modified. Choose Save & Build again.")
         directory(output)
         for asset, edits in record["assets"].items():
-            source_data, _ = payload(original, asset)
+            source_data, _ = payload(original, asset, verify_crc=False)
             built_data, _ = payload(output, asset)
-            if isinstance(edits, dict):
+            if isinstance(edits, dict) and edits.get("kind") == FORMAT_EDIT:
+                _, entry = payload(original, asset, verify_crc=False)
+                if built_data != formats.apply_edits(entry["type"], source_data, edits["edits"]):
+                    raise ValueError("Saved changes don't match the built archive. Choose Save & Build again.")
+            elif isinstance(edits, dict):
                 expected = texture_edit_bytes(edits, source_data)
                 if built_data != expected:
-                    raise ValueError("Saved texture differs from its built archive")
+                    raise ValueError("A saved texture doesn't match the built archive. Choose Save & Build again.")
             else:
                 expected = apply_edits(parse_binary_valt(source_data), edits)
                 actual = parse_binary_valt(built_data)
                 if table_fields(expected) != table_fields(actual):
-                    raise ValueError("Project edits do not match the built archive; save again")
+                    raise ValueError("Saved changes don't match the built archive. Choose Save & Build again.")
     overlay = storage_path(path, "overlay")
     extras = {f.relative_to(overlay).as_posix() for f in overlay.rglob("*") if f.is_file()} - set(project["archives"])
     if extras:
-        raise ValueError("Overlay contains untracked files: " + ", ".join(sorted(extras)))
+        raise ValueError("The mod output holds files this project didn't build (" + ", ".join(sorted(extras)) + "). Remove them from the project's overlay folder or rebuild.")
     return dict(overlay=str(overlay), archives=len(project["archives"]))
 
 
@@ -577,7 +675,7 @@ def launch_profile(request, disc):
     import mod_install
     name, root = request.get("profile") or DEV_PROFILE, request.get("profileRoot")
     if not any(p["enabled"] for p in mod_install.status(name, root)["packages"]):
-        raise ValueError("No enabled package in the development profile")
+        raise ValueError("No mod is enabled in the test profile. Install and enable a package in Mods first.")
     env = mod_install.launch_env(name, root)
     plan = build_launch_plan(request, disc, env["EOD_MOD_DIR"])
     plan["profile"] = request.get("profile") or DEV_PROFILE
@@ -589,15 +687,15 @@ def build_launch_plan(request, disc, mod_dir):
     project = load_project(project_file)
     executable = Path(request["executable"]).expanduser().resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise ValueError("Choose an executable game build")
+        raise ValueError("The game application could not be found. Choose the game build to test with.")
     car_archive = project.get("testCarArchive") or project.get("selectedArchive") or ""
     car_note = None
     if car_archive.lower().endswith(".car"):
         stem = Path(car_archive).stem.upper()
         car = next((name for name in CAR_NAMES if (name if len(name) <= 8 else name[:6] + "_1").upper() == stem), None)
         if not car:
-            raise ValueError(f"No verified native race car for {Path(car_archive).name}; "
-                             "choose a mapped vehicle to test, or save the project from a track")
+            raise ValueError(f"{Path(car_archive).name} can't be driven in a test race yet. "
+                             "Choose another vehicle, or save the project from a track.")
     else:
         car = "Algar"
         car_note = "No vehicle in this project; the test drives Algar"
@@ -606,7 +704,7 @@ def build_launch_plan(request, disc, mod_dir):
     run_dir = storage_path(project_file, "runs")
     for existing in storage_path(project_file, "").rglob("*"):
         if existing.is_symlink():
-            raise ValueError("Project storage contains a symbolic link: " + existing.name)
+            raise ValueError(f"The project's storage contains a shortcut (symbolic link) named {existing.name}. Remove it and try again.")
     run_dir.mkdir(parents=True, exist_ok=True)
     config = storage_path(project_file, "runs/test.ini")
     atomic_write(config, b"[Video]\nRenderer=vulkan\nRenderScale=1\nAspectRatio=4:3\nFrameSkip=0\nVSync=1\n")
@@ -622,7 +720,7 @@ def build_launch_plan(request, disc, mod_dir):
     if request.get("frames"):
         frames = int(request["frames"])
         if not 1 <= frames <= 36000:
-            raise ValueError("Test duration must be 1–36000 frames")
+            raise ValueError("Test length must be between 1 and 36,000 frames.")
         args += ["--frames", str(frames)]
     return dict(executable=str(executable), arguments=args, environment=environment,
                 logPath=str(storage_path(project_file, "runs/game.log")), car=car, track=track, carNote=car_note)
@@ -632,19 +730,19 @@ def track_name(archive):
     stem = Path(archive).stem.upper()
     name = next((name for name in TRACK_NAMES if (name.upper() if len(name) <= 8 else name[:6].upper() + "_1") == stem), None)
     if name is None:
-        raise ValueError("No verified native race target for this track archive: " + stem)
+        raise ValueError(f"{stem} can't be raced in a test yet. Choose another track.")
     return name
 
 
 def texture_edit_bytes(edit, original):
     if not isinstance(edit, dict) or edit.get("kind") != "texture":
-        raise ValueError("Unsupported texture edit record")
+        raise ValueError("A saved texture change isn't in a form this version can read. Discard it and edit the texture again.")
     try:
         data = base64.b64decode(edit["data"], validate=True)
     except (ValueError, KeyError) as error:
-        raise ValueError("Invalid saved native texture") from error
+        raise ValueError("A saved texture change is damaged. Discard it and edit the texture again.") from error
     if sha(data) != edit.get("sha256") or len(data) != len(original) or data[:128] != original[:128]:
-        raise ValueError("Saved texture layout or hash does not match the native source")
+        raise ValueError("A saved texture change no longer matches the game's texture. Discard it and edit the texture again.")
     decode_preview(data)
     return data
 
@@ -656,7 +754,7 @@ def texture_record(data):
 def environment(request, disc):
     archive = archive_path(disc, request["archive"])
     if archive.suffix.lower() != ".trk":
-        raise ValueError("Select an existing track archive")
+        raise ValueError("Choose a track archive (.TRK).")
     entries = directory(archive)
     return dict(track=track_name(request["archive"]),
                 textures=[e["name"] for e in entries if e["type"] == "TEX"],
@@ -670,13 +768,13 @@ def prepare_texture(request, disc):
     entries = directory(source)
     names = environment(request, disc)["skyTextures"] if request.get("allSky") else [request["asset"]]
     if not names:
-        raise ValueError("This track has no recognized sky texture tiles")
+        raise ValueError("This track has no sky textures to tint.")
     edits = {}
     cache = storage_path(project_path(request, disc), ".cache")
     for name in names:
-        original, entry = payload(source, name, entries)
+        original, entry = payload(source, name, entries, verify_crc=False)
         if entry["type"] != "TEX":
-            raise ValueError("Select a native texture")
+            raise ValueError("That file isn't a texture. Choose a texture from the list.")
         existing = request.get("textureEdits", {}).get(name)
         if not existing:
             selected = dict(request, asset=name)
@@ -688,7 +786,7 @@ def prepare_texture(request, disc):
             data = tint_texture(data, tuple(request["tint"]))
         edits[name] = texture_record(data)
     preview_asset = request["asset"] if request["asset"] in edits else names[0]
-    image, meta = texture(texture_edit_bytes(edits[preview_asset], payload(source, preview_asset, entries)[0]), cache)
+    image, meta = texture(texture_edit_bytes(edits[preview_asset], payload(source, preview_asset, entries, verify_crc=False)[0]), cache)
     return dict(edits=edits, image=image, previewAsset=preview_asset, count=len(edits))
 
 
@@ -696,8 +794,8 @@ def export_texture(request, disc):
     from texture_edit import export_png
     destination = Path(request["destination"]).expanduser().resolve()
     if inside(destination, disc):
-        raise ValueError("Export must not overwrite the installed disc")
-    data, _ = payload(archive_path(disc, request["archive"]), request["asset"])
+        raise ValueError("Choose a destination outside the game folder so the original files stay untouched.")
+    data, _ = payload(archive_path(disc, request["archive"]), request["asset"], verify_crc=False)
     edit = request.get("textureEdit") or saved_edits(request, disc)
     if edit:
         data = texture_edit_bytes(edit, data)
@@ -767,10 +865,10 @@ def export_batch_start(request, disc):
     job, record_path, progress_path, summary_path = _job_paths(request, dest)
     current = export_batch_status(request, disc)
     if current["state"] == "running":
-        raise ValueError("An export to this folder is already running")
+        raise ValueError("An export to this folder is still running. Wait for it to finish, or choose another folder.")
     resume = bool(request.get("resume"))
     if (dest / "export-manifest.json").exists() and not resume:
-        raise ValueError("This folder already holds an export; resume it or choose another folder")
+        raise ValueError("This folder already contains an export. Resume it, or choose another folder.")
     command = [sys.executable, str(Path(__file__).resolve().parent / "texture_export.py"),
                "--disc", str(disc), "--dest", str(dest)]
     for glob in request.get("select") or []:
@@ -831,7 +929,7 @@ def export_batch_status(request, disc):
         result["cancelRequested"] = record.get("cancelRequested", False)
     else:
         result.update(state="cancelled" if record.get("cancelRequested") else "failed",
-                      error=error or "Export stopped before finishing; resume it to continue")
+                      error=error or "The export stopped before it finished. Resume it to continue.")
     return result
 
 
@@ -841,7 +939,7 @@ def export_batch_cancel(request, disc):
     try:
         record = json.loads(record_path.read_text())
     except (OSError, ValueError):
-        raise ValueError("No export is running for this folder") from None
+        raise ValueError("No export is running for this folder, so there is nothing to cancel.") from None
     if not _alive(record["pid"]):
         return export_batch_status(request, disc)
     record["cancelRequested"] = True
@@ -855,10 +953,10 @@ def _retail_texture_record(disc, archive, asset):
     from asset_registry import analyze_tex
     data, entry, _, spelled = retail_member(disc, archive, asset)
     if entry["type"] != "TEX":
-        raise ValueError(f"{spelled}#{entry['name']} is not a texture")
+        raise ValueError(f"{entry['name']} isn't a texture, so it can't be exported or replaced. Choose a texture.")
     info, _ = analyze_tex(data)
     if info.get("status") != "ok":
-        raise ValueError(info.get("error", "Texture cannot be decoded"))
+        raise PlainError("This texture can't be read, so it can't be exported. The game file is unchanged.", str(info.get("error", "texture decode failed")))
     return dict(assetId=f"{spelled}#{entry['name']}", status="exported", width=info["width"], height=info["height"],
                 reimport=info.get("reimport", []))
 
@@ -892,20 +990,20 @@ def import_host(request, disc):
     data, entry, _, spelled = mp.retail_member(disc, request["archive"], request["asset"])
     asset_id = f"{spelled}#{entry['name']}"
     if entry["type"] != "TEX":
-        raise ValueError(f"{asset_id} is not a texture")
+        raise ValueError(f"{entry['name']} isn't a texture, so it can't be exported or replaced. Choose a texture.")
     ident = mp.host_identity(data, asset_id)
     png = Path(request["png"]).expanduser().resolve()
     width, height = mp.png_size(png)
     k = mp.replacement_scale(width, height, ident["width"], ident["height"])
     try:
         if tuple(read_png(str(png))[:2]) != (width, height):
-            raise ValueError("Replacement PNG header and pixel data disagree")
+            raise ValueError("That PNG file is damaged. Export it again from your image editor and retry.")
     except (OSError, struct.error) as error:
-        raise ValueError(f"Cannot read replacement PNG: {error}") from None
+        raise PlainError("That image couldn't be read. Choose a PNG file.", str(error)) from None
     image = png.read_bytes()
     project = load_project(project_file) if project_file.exists() else dict(version=1, disc=str(disc), archives={})
     if Path(project["disc"]).resolve() != disc:
-        raise ValueError("Project belongs to a different game installation")
+        raise ValueError("This project was made for a different game folder. Open it with its original game folder, or start a new project.")
     relative = f"host/{spelled}/{entry['name']}.png"
     target = storage_path(project_file, relative)
     hosts = dict(_host_map(project))
@@ -927,7 +1025,7 @@ def remove_host(request, disc):
     hosts = dict(_host_map(project))
     key = next((k for k in hosts if k.lower() == (request["archive"] + "#" + request["asset"]).lower()), None)
     if key is None:
-        raise ValueError("No high-resolution replacement is recorded for this texture")
+        raise ValueError("This texture has no high-resolution replacement to remove.")
     record = hosts.pop(key)
     project["hostTextures"] = hosts
     atomic_write(project_file, (json.dumps(project, indent=2) + "\n").encode())
@@ -952,7 +1050,7 @@ def package_project(request, disc):
     project = load_project(project_file)
     hosts = _host_map(project)
     if not project["archives"] and not hosts:
-        raise ValueError("Nothing to package; save a texture or vehicle edit first")
+        raise ValueError("There is nothing to package yet. Choose Save & Build on an edit first.")
     slug = re.sub(r"[^a-z0-9._-]+", "-", project_file.parent.name.lower()).strip("-._") or "mod"
     package_id = request.get("id") or slug[:64]
     packages = storage_path(project_file, "packages")
@@ -962,7 +1060,7 @@ def package_project(request, disc):
     for key, record in hosts.items():
         image = storage_path(project_file, record["image"])
         if not image.is_file() or sha(image.read_bytes()) != record["sha256"]:
-            raise ValueError("Saved replacement image is missing or modified: " + key)
+            raise ValueError(f"The saved replacement image for {key} is missing or was changed. Replace the texture again.")
     created = not out.exists()
     try:
         if project["archives"]:
@@ -1016,7 +1114,7 @@ def dispatch(request):
         return project
     disc = Path(request["disc"]).expanduser().resolve()
     if not (disc / "DATA").is_dir():
-        raise ValueError("Select the extracted game folder containing DATA and SLUS_209.10")
+        raise ValueError("That folder isn't the extracted game. Choose the folder that contains DATA and SLUS_209.10.")
     if action == "catalog":
         archives, errors = [], []
         for path in sorted((disc / "DATA").rglob("*")):
@@ -1042,12 +1140,14 @@ def dispatch(request):
     if action == "export_native":
         destination = Path(request["destination"]).expanduser().resolve()
         if inside(destination, disc):
-            raise ValueError("Export must not overwrite the installed disc")
-        data, _ = payload(archive_path(disc, request["archive"]), request["asset"])
+            raise ValueError("Choose a destination outside the game folder so the original files stay untouched.")
+        data, _ = payload(archive_path(disc, request["archive"]), request["asset"], verify_crc=False)
         atomic_write(destination, data)
         return dict(path=str(destination), bytes=len(data), sha256=sha(data))
     if action == "save":
         return save(request, disc)
+    if action == "save_format":
+        return save_format(request, disc)
     if action == "validate":
         return validate(request, disc)
     if action == "launch_plan":
@@ -1061,7 +1161,7 @@ def dispatch(request):
         return globals()[action](request, disc)
     if action in ("profile_enable", "profile_disable", "profile_uninstall"):
         return profile_change(request, disc, action[len("profile_"):])
-    raise ValueError("Unknown action: " + action)
+    raise PlainError("The Creation Kit asked its helper for something it doesn't support. Update the app.", "unknown action: " + str(action))
 
 
 def main():
@@ -1070,7 +1170,18 @@ def main():
         result = dispatch(request)
         print(json.dumps(dict(ok=True, result=result), allow_nan=False))
     except Exception as error:
-        print(json.dumps(dict(ok=False, error=str(error))))
+        if isinstance(error, json.JSONDecodeError):
+            message = "The Creation Kit sent a request its helper couldn't read. Restart the app and try again."
+            detail = str(error)
+        elif isinstance(error, ValueError):
+            message, detail = str(error), getattr(error, "detail", None)
+        elif isinstance(error, OSError):
+            message = "A file couldn't be read or written. Check that the folder is available and has free space, then try again."
+            detail = f"{type(error).__name__}: {error}"
+        else:
+            message = "The Creation Kit couldn't finish this action. Nothing was changed. Try again, or reopen the project."
+            detail = f"{type(error).__name__}: {error}"
+        print(json.dumps(dict(ok=False, error=message, detail=detail)))
         return 1
     return 0
 

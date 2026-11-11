@@ -81,6 +81,9 @@ def main():
     for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'texture_edit.py', 'vehicle_materials.py', 'vif_mesh.py',
                  'texture_export.py', 'asset_registry.py', 'texture_identity.py', 'mod_package.py', 'mod_install.py'):
         shutil.copy2(ROOT / 'tools' / name, backend / name)
+    # Labelled format views (docs/FORMAT_VIEW_CONTRACT.md); decoders are self-contained.
+    shutil.copytree(ROOT / 'tools' / 'formats', backend / 'formats',
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     (resources / 'studio-runtime.json').write_text(json.dumps(config))
     # Reuse the repository's existing artwork and standard macOS icon tooling.
     icon = ROOT / 'tools/macos/assets/AppIcon.png'

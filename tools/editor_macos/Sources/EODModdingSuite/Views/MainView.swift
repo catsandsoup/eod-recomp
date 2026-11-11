@@ -15,7 +15,7 @@ struct MainView: View {
                 Divider().frame(height: 28).padding(.horizontal, 8)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(URL(fileURLWithPath: state.project).deletingLastPathComponent().lastPathComponent).font(.headline)
-                    Text(state.editingAsset.isEmpty ? "Retail asset project" : "\(state.editingAsset)\(state.dirty ? " · Unsaved" : "")")
+                    Text(state.editingAsset.isEmpty ? "Project" : "\(state.editingAsset)\(state.dirty ? " · Unsaved" : "")")
                         .font(.caption).foregroundStyle(state.dirty ? .orange : .secondary)
                 }
                 Spacer()
@@ -40,7 +40,7 @@ struct MainView: View {
                     }.buttonStyle(.plain)
                 }
                 Spacer()
-                Text(state.archive.isEmpty ? "Select a source archive" : state.archive).font(.caption.monospaced()).foregroundStyle(.secondary)
+                Text(state.archive.isEmpty ? "No archive selected" : state.archive).font(.caption.monospaced()).foregroundStyle(.secondary)
                 if state.detail?.kind == "model" { Toggle("Wireframe", isOn: $wireframe).toggleStyle(.checkbox).font(.caption) }
             }.padding(.horizontal, 12).padding(.vertical, 7).background(Color.black.opacity(0.15))
             Divider()
@@ -77,7 +77,7 @@ struct MainView: View {
                             Text(detail.name).font(.title2.weight(.semibold))
                             Text(detail.type).font(.caption.monospaced()).foregroundStyle(.secondary)
                             Spacer()
-                            Button("Export Native…") { state.exportNativeAsset() }.font(.caption).disabled(state.busy)
+                            Button("Export File…") { state.exportNativeAsset() }.font(.caption).disabled(state.busy)
                         }.padding(16)
                         Divider()
                         assetContent(detail)
@@ -89,7 +89,6 @@ struct MainView: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text(state.asset.isEmpty ? "Game Asset Workspace" : state.asset).font(.title2)
                             Text("\(state.archives.count) archives · \(state.assetCount.formatted()) assets").foregroundStyle(.secondary)
-                            if state.error == nil { Text("Choose a vehicle, texture or model from the game sources.").foregroundStyle(.secondary) }
                         }.padding(24)
                         Spacer()
                     }
@@ -126,14 +125,14 @@ struct MainView: View {
         if detail.kind == "model", let parts = detail.parts {
             VStack(alignment: .leading, spacing: 0) {
                 RetailMeshView(parts: parts, identity: detail.sha256, wireframe: wireframe).frame(minHeight: 300)
-                Text("\(parts.count) recovered mesh parts · \(parts.reduce(0) { $0 + $1.positions.count }.formatted()) vertices · \(parts.reduce(0) { $0 + $1.triangles.count }.formatted()) triangles")
+                Text("\(parts.count) parts · \(parts.reduce(0) { $0 + $1.positions.count }.formatted()) vertices · \(parts.reduce(0) { $0 + $1.triangles.count }.formatted()) triangles")
                     .font(.caption).foregroundStyle(.secondary).padding(12)
                 if let paint = detail.paintDescription {
                     Text(paint).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12)
                 }
                 let issues = Array(Set(parts.compactMap(\.textureError))).sorted()
                 if !issues.isEmpty {
-                    Text(issues.joined(separator: "\n") + "\nUnavailable materials are shown in neutral gray.")
+                    Text(issues.joined(separator: "\n") + "\nMissing textures appear gray.")
                         .font(.caption).foregroundStyle(.secondary).padding([.horizontal, .bottom], 12)
                 }
             }
@@ -148,8 +147,8 @@ struct MainView: View {
                     let check = plan.check
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(check.mode == "native" ? "Native (same size, palette quantised)"
-                                 : "High-resolution (\(check.scale ?? 0)×, runtime replacement)").font(.callout.weight(.semibold))
+                            Text(check.mode == "native" ? "Same size, palette reduced"
+                                 : "High-resolution, \(check.scale ?? 0)× larger").font(.callout.weight(.semibold))
                             Text(check.mode == "native" ? "\(check.original.width) × \(check.original.height)"
                                  : "\(check.original.width) × \(check.original.height) → \(check.png.width) × \(check.png.height)")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -170,12 +169,14 @@ struct MainView: View {
                 if let meta = detail.metadata { Text("\(meta["width"] ?? 0) × \(meta["height"] ?? 0) · \(meta["levels"] ?? 0) mip levels").foregroundStyle(.secondary) }
             }
             }
+        } else if detail.kind == "format" {
+            FormatInspectorView(state: state, detail: detail)
         } else if let sections = detail.sections {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     ForEach(sections.indices, id: \.self) { index in
                         let section = sections[index]
-                        DisclosureGroup("\(section.name) · \(section.fields.count) native fields") {
+                        DisclosureGroup("\(section.name) · \(section.fields.count) values") {
                             VStack(spacing: 6) {
                                 ForEach(section.fields.indices, id: \.self) { i in
                                     let field = section.fields[i]
@@ -195,12 +196,7 @@ struct MainView: View {
                 }.padding(18)
             }.disabled(state.busy || state.gameRunning)
         } else {
-            ScrollView([.vertical, .horizontal]) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(detail.message ?? "Native asset").foregroundStyle(.secondary)
-                    Text(detail.hex ?? "").font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                }.padding(20)
-            }
+            Text("This file can't be shown.").foregroundStyle(.secondary).padding(20)
         }
     }
 
@@ -217,7 +213,7 @@ struct MainView: View {
                         Text("\(environment.skyTextures.count) sky tiles · \(environment.textures.count) textures").font(.caption)
                         Button("Show Sky Textures") { state.search = "sky" }
                         Divider()
-                        Text("Sky palette RGB multipliers").font(.caption.weight(.semibold))
+                        Text("Sky tint (red, green, blue multipliers)").font(.caption.weight(.semibold))
                         HStack {
                             TextField("Red", text: $state.tintRed)
                             TextField("Green", text: $state.tintGreen)
@@ -229,11 +225,11 @@ struct MainView: View {
                             Text("\(state.pendingTextures.count) textures changed").font(.caption)
                             Button("Discard Texture Edits") { state.discardTextureEdits() }.disabled(state.busy || state.gameRunning)
                         }
-                        Text("PNG replacement keeps the native size and indexed palette; HDR lighting is not supported.")
+                        Text("Replacements keep each texture's original size and color count.")
                             .font(.caption).foregroundStyle(.secondary)
                         if let path = state.nativePreview, let image = NSImage(contentsOfFile: path) {
                             Divider()
-                            Text("Native race capture").font(.caption.weight(.semibold))
+                            Text("Test race capture").font(.caption.weight(.semibold))
                             Image(nsImage: image).resizable().scaledToFit()
                         }
                     } else if let physics = state.physicsDetail, state.editingAsset.lowercased() == "physics.val" {
@@ -252,7 +248,7 @@ struct MainView: View {
                                         HStack { Text(field.key).font(.caption.monospaced()); Spacer(); Text(field.unit).font(.caption).foregroundStyle(.secondary) }
                                         TextField(field.key, text: Binding(get: { state.values[key] ?? field.value }, set: { state.edit(key, $0) }))
                                             .textFieldStyle(.roundedBorder).accessibilityIdentifier(key)
-                                        Text("Retail \(field.original)").font(.system(size: 10)).foregroundStyle(.secondary)
+                                        Text("Original \(field.original)").font(.system(size: 10)).foregroundStyle(.secondary)
                                     }
                                 }
                             }
@@ -262,7 +258,7 @@ struct MainView: View {
                             Button("Redo") { state.redo() }.disabled(!state.canRedo)
                         }.padding(.top, 6)
                         Divider()
-                        Text("Save & Build writes a separate native overlay. Test sessions use a separate memory card.")
+                        Text("Saving builds a separate copy; the game files are never changed. Test runs use their own save data.")
                             .font(.caption).foregroundStyle(.secondary)
                     } else if let detail = state.detail {
                         Text(detail.name).font(.headline)
@@ -273,7 +269,7 @@ struct MainView: View {
                         }
                         if let parts = detail.parts {
                             Divider()
-                            Text("Recovered mesh hierarchy").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            Text("Parts").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                             ForEach(parts.indices, id: \.self) { index in Label(parts[index].name, systemImage: "cube").font(.caption) }
                         }
                     } else { Text("No asset selected").foregroundStyle(.secondary).font(.caption) }
@@ -293,7 +289,7 @@ struct ModsView: View {
                 Button("Install") { Task { await state.installPackage() } }
                     .disabled(state.busy || state.gameRunning || state.builtPackage == nil)
                 if let built = state.builtPackage {
-                    Text("\(built.id) \(built.version) · \(built.native) native · \(built.host) high-resolution")
+                    Text("\(built.id) \(built.version) · \(built.native) changed files · \(built.host) high-resolution textures")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -301,13 +297,13 @@ struct ModsView: View {
             Divider()
             let packages = state.profile?.packages ?? []
             if packages.isEmpty {
-                Text("No packages installed in the dev profile").foregroundStyle(.secondary)
+                Text("No mods installed").foregroundStyle(.secondary)
             }
             ForEach(packages) { item in
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("\(item.id) \(item.version)").font(.system(.body, design: .monospaced))
-                        Text(item.error ?? "\(item.native ?? 0) native · \(item.host ?? 0) high-resolution")
+                        Text(item.error ?? "\(item.native ?? 0) changed files · \(item.host ?? 0) high-resolution textures")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -318,7 +314,7 @@ struct ModsView: View {
                 }.disabled(state.busy || state.gameRunning)
             }
             ForEach(state.profile?.conflicts.filter { !$0.accepted } ?? [], id: \.key) { conflict in
-                Label("\(conflict.key) is edited by \(conflict.packages.joined(separator: ", "))", systemImage: "exclamationmark.triangle.fill")
+                Label("\(conflict.key) is changed by \(conflict.packages.joined(separator: ", "))", systemImage: "exclamationmark.triangle.fill")
                     .font(.callout).foregroundStyle(.orange)
             }
             Spacer()
