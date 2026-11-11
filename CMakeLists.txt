@@ -24,11 +24,31 @@ set(GEN_DIR ${CMAKE_SOURCE_DIR}/gen)
 # ---------------------------------------------------------------- generation
 # gen/ holds the C translation of SLUS_209.10.  Regenerate it with
 #   python3 tools/analyze.py && python3 tools/recomp.py
+# The stamp gen/.inputs.sha256 (written by tools/recomp.py) fingerprints the
+# ELF, config/ overrides and generator scripts; any change regenerates gen/.
+set(EOD_GEN_STALE FALSE)
 if(NOT EXISTS ${GEN_DIR}/table.c)
-  if(NOT Python3_FOUND)
-    message(FATAL_ERROR "gen/ is missing and Python 3 was not found to generate it")
+  set(EOD_GEN_STALE TRUE)
+elseif(Python3_FOUND)
+  execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/gen_inputs.py --check ${GEN_DIR}
+                  RESULT_VARIABLE r0 OUTPUT_QUIET ERROR_QUIET)
+  if(r0)
+    set(EOD_GEN_STALE TRUE)
   endif()
-  message(STATUS "Generating recompiled sources...")
+endif()
+if(Python3_FOUND)
+  execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/gen_inputs.py --list
+                  OUTPUT_VARIABLE EOD_GEN_INPUTS OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REPLACE "\n" ";" EOD_GEN_INPUTS "${EOD_GEN_INPUTS}")
+  foreach(f ${EOD_GEN_INPUTS})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${f}")
+  endforeach()
+endif()
+if(EOD_GEN_STALE)
+  if(NOT Python3_FOUND)
+    message(FATAL_ERROR "gen/ is missing or out of date and Python 3 was not found. Run: python3 tools/analyze.py && python3 tools/recomp.py")
+  endif()
+  message(STATUS "Generating recompiled sources (gen/ missing or inputs changed)...")
   execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/analyze.py
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} RESULT_VARIABLE r1)
   execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/recomp.py
@@ -495,8 +515,18 @@ if(APPLE)
   if(EOD_MAC_APP)
     set(EOD_APP_OUTPUT "$ENV{HOME}/Library/Application Support/TDEODRecomp/local-build"
       CACHE PATH "Local app output directory (use a non-cloud-synced directory for codesign)")
+    # Optional owner-only package: a directory containing integrated/ (output of
+    # tools/build_integrated_profile.py). Empty keeps the bundle free of disc data.
+    set(EOD_BUNDLE_MODS "" CACHE PATH "Directory containing integrated/ to bundle as Resources/Mods (empty = none)")
+    if(EOD_BUNDLE_MODS)
+      set(EOD_APP_ENV ${CMAKE_COMMAND} -E env "EOD_BUNDLE_MODS=${EOD_BUNDLE_MODS}")
+    elseif(NOT CMAKE_VERSION VERSION_LESS 3.25)
+      set(EOD_APP_ENV ${CMAKE_COMMAND} -E env --unset=EOD_BUNDLE_MODS)
+    else()
+      set(EOD_APP_ENV ${CMAKE_COMMAND} -E env)
+    endif()
     add_custom_target(eod_app ALL
-      COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/macos/bundle.py"
+      COMMAND ${EOD_APP_ENV} ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/macos/bundle.py"
         "${EOD_APP_OUTPUT}/Eve of Destruction.app" "$<TARGET_FILE:eod>"
       DEPENDS eod VERBATIM)
   endif()

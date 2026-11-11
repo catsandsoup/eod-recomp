@@ -36,6 +36,26 @@ if mod_source := os.environ.get('EOD_BUNDLE_MODS'):
     for name in required:
         if not (source/'DATA'/name).is_file() or (source/'DATA'/name).stat().st_size==0:
             raise RuntimeError(f'Missing integrated resource: {source/"DATA"/name}')
+    def parse_manifest(root):
+        entries={}
+        for line in (root/'INTEGRATED.MANIFEST').read_text().splitlines():
+            if not line.strip(): continue
+            digest,size,rel=line.split(' ',2)
+            entries[rel]=(digest,int(size))
+        return entries
+    def verify_manifest(root,label):
+        entries=parse_manifest(root)
+        if not entries: raise RuntimeError(f'{label}: INTEGRATED.MANIFEST lists no files')
+        for rel,(digest,size) in entries.items():
+            f=root/rel
+            if not f.is_file(): raise RuntimeError(f'{label}: manifest file missing: {rel}')
+            data=f.read_bytes()
+            if len(data)!=size or hashlib.sha256(data).hexdigest()!=digest:
+                raise RuntimeError(f'{label}: manifest mismatch for {rel}')
+        return entries
+    manifest_status='generated'
+    if (source/'INTEGRATED.MANIFEST').is_file():
+        verify_manifest(source,'source integrated profile'); manifest_status='source manifest verified'
     target=bundled_mods/'integrated'
     shutil.copytree(source,target)
     lines=[]
@@ -43,6 +63,8 @@ if mod_source := os.environ.get('EOD_BUNDLE_MODS'):
     for path in sorted(p for d in ('DATA','battle-alternates') if (target/d).is_dir() for p in (target/d).rglob('*') if p.is_file()):
         lines.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()} {path.stat().st_size} {path.relative_to(target).as_posix()}')
     (target/'INTEGRATED.MANIFEST').write_text('\n'.join(lines)+'\n')
+    entries=verify_manifest(target,'bundled integrated profile')
+    print(f'integrated mods: {len(entries)} files, manifest {manifest_status}, bundle verified')
 vulkan_resources=resources/'vulkan'
 if vulkan_resources.exists(): shutil.rmtree(vulkan_resources)
 # MoltenVK is dlopened by the Vulkan loader: it does not appear in its linked

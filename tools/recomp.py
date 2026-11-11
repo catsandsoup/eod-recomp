@@ -1004,6 +1004,9 @@ def main():
             "const uint32_t ee_elf_size = %d;" % len(elf.data), ""]
     write_if_changed(os.path.join(args.out, "table.c"), "\n".join(tab))
     print("wrote %d files, %d functions, %d errors" % (len(files), len(funcs), errors))
+    if not only and not errors and os.path.abspath(args.out) == os.path.join(ROOT, "gen"):
+        import gen_inputs
+        gen_inputs.write_stamp(args.out)
     return 1 if errors else 0
 
 
