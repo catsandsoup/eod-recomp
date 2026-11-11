@@ -142,11 +142,37 @@ def locate(disc, archive, name, digest, paint):
     return None
 
 
+# See world_export.alpha_treatment: palette alpha is mostly a blend weight, so only textures with
+# >=1% alpha==0 texels (retail BUS: only wheel_bustire, 20.7%) are exported as cutouts.
+CUTOUT_ZERO_FRACTION = 0.01
+ALPHA_MODES = ("cutout", "blend", "opaque")
+
+
+def alpha_treatment(alphas, mode):
+    zero = alphas.count(0) / max(1, len(alphas))
+    if mode == "blend":
+        return ("blend" if min(alphas) < 255 else "opaque"), zero
+    if mode == "cutout" and zero >= CUTOUT_ZERO_FRACTION:
+        return "cutout", zero
+    return "opaque", zero
+
+
+def apply_alpha(rgba, kind):
+    if kind == "blend":
+        return bytes(rgba)
+    out = bytearray(rgba)
+    if kind == "opaque":
+        out[3::4] = b"\xff" * (len(out) // 4)
+    else:
+        out[3::4] = bytes(0 if a == 0 else 255 for a in out[3::4])
+    return bytes(out)
+
+
 class Materials:
     """Resolve once per (scope, texture name); write PNGs; render MTL."""
 
-    def __init__(self, disc, out_dir, paint):
-        self.disc, self.dir, self.paint = disc, Path(out_dir), paint
+    def __init__(self, disc, out_dir, paint, alpha="cutout"):
+        self.disc, self.dir, self.paint, self.alpha = disc, Path(out_dir), paint, alpha
         self.items, self.pngs = {}, {}
 
     def get(self, scope, archive, name):
@@ -170,10 +196,12 @@ class Materials:
                     w, h, rgba, meta = decode_preview(data)
                     png = self.dir / "textures" / (mat["name"] + ".png")
                     png.parent.mkdir(parents=True, exist_ok=True)
-                    write_png(str(png), w, h, rgba)
+                    kind, zero = alpha_treatment(rgba[3::4], self.alpha)
+                    write_png(str(png), w, h, apply_alpha(rgba, kind))
                     mat.update(status="resolved", source=locate(self.disc, archive, name, sha(data), self.paint if scope == "car" else None),
                                sourceSha256=sha(data), png=f"textures/{mat['name']}.png", pngSha256=file_sha_nocache(png),
-                               width=w, height=h, levels=meta["levels"])
+                               width=w, height=h, levels=meta["levels"],
+                               zeroAlphaFraction=round(zero, 4), alphaKind=kind)
                     self.pngs[mat["name"].lower()] = (w, h, rgba)
                 except Exception as error:
                     mat.update(status="unresolved", reason=f"decode failed: {error}")
@@ -185,7 +213,10 @@ class Materials:
         for mat in sorted(self.items.values(), key=lambda m: m["name"]):
             lines += [f"newmtl {mat['name']}", "Kd 1.0 1.0 1.0"]
             if mat["status"] == "resolved":
-                lines += [f"map_Kd {mat['png']}", f"# source {mat['source']}"]
+                lines.append(f"map_Kd {mat['png']}")
+                if mat["alphaKind"] in ("cutout", "blend"):
+                    lines.append(f"map_d {mat['png']}")
+                lines.append(f"# source {mat['source']}")
             elif mat["status"] == "unresolved":
                 lines += ["Kd 1.0 0.0 1.0", f"# UNRESOLVED {mat['texture']}: {mat['reason']} (not substituted)"]
             else:
@@ -233,7 +264,8 @@ def wheel_specs(disc, physics, lods, want_all):
     return out, notes
 
 
-def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True, keep_mesh=False):
+def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True, keep_mesh=False,
+               alpha="cutout", double_sided=False):
     """Export one car. Returns the vehicle.json dict (plus '_mesh' when keep_mesh)."""
     disc = disc_root(disc)
     car_path = find_car(disc, car)
@@ -264,7 +296,7 @@ def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True,
     physics = valt_dump(raw["physics.val"]) if "physics.val" in raw else []
     lodval = valt_dump(raw["lod.val"]) if "lod.val" in raw else []
     painted = pick_paint(disc, car_path, paint)
-    materials = Materials(disc, out, painted)
+    materials = Materials(disc, out, painted, alpha)
     lod_dist = {}
     for sec in lodval:
         if sec["section"] == "low":
@@ -274,11 +306,11 @@ def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True,
     obj = [f"# {archive_id}  exported by vehicle_export.py (schema {SCHEMA})",
            "# +Y up, +Z forward, metres. Vertex order inside each object is the native VIF order: do not add/remove/reorder vertices.",
            f"mtllib {stem}.mtl"]
-    parts, vbase, mesh_parts, bbox_pts = [], 1, [], []
+    parts, vbase, nbase, mesh_parts, bbox_pts = [], 1, 1, [], []
     models = []
 
     def emit(label, kind, data, scope, mat_archive, assetid, extra):
-        nonlocal vbase
+        nonlocal vbase, nbase
         model = decode_model(data)
         info = dict(label=label, kind=kind, assetId=assetid, size=len(data), sha256=sha(data), markers=model["markers"],
                     bbox=model["bbox"], radius=model["radius"], **extra)
@@ -295,9 +327,17 @@ def export_car(disc, car, dest, lod="1", paint=None, blender=False, wheels=True,
             obj.extend(["v %.7f %.7f %.7f" % v["p"] for v in part["verts"]])
             obj.extend(["vt %.7f %.7f" % (v["uv"][0], 1.0 - v["uv"][1]) for v in part["verts"]])
             obj.extend(["vn %.6f %.6f %.6f" % v["n"] for v in part["verts"]])
+            nv = len(part["verts"])
+            if double_sided:  # back faces reuse the vertices with flipped normals appended after the native ones
+                obj.extend(["vn %.6f %.6f %.6f" % tuple(-x for x in v["n"]) for v in part["verts"]])
             for a, b, c in part["tris"]:
-                a, b, c = a + vbase, b + vbase, c + vbase
-                obj.append(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")
+                va, vb, vc = a + vbase, b + vbase, c + vbase
+                na, nb, nc = a + nbase, b + nbase, c + nbase
+                obj.append(f"f {va}/{va}/{na} {vb}/{vb}/{nb} {vc}/{vc}/{nc}")
+                if double_sided:
+                    na, nb, nc = na + nv, nb + nv, nc + nv
+                    obj.append(f"f {va}/{va}/{na} {vc}/{vc}/{nc} {vb}/{vb}/{nb}")
+            nbase += nv * (2 if double_sided else 1)
             parts.append(dict(object=name, assetId=assetid, model=label, kind=kind, slot=part["slot"],
                               damageGroup=part["group"] & 0xFFFF, bodyPanel=bool(part["group"] & 0x10000),
                               groupRaw=part["group"], texture=part["texture"], material=mat["name"],
@@ -419,11 +459,17 @@ def main(argv=None):
     ap.add_argument("--paint", help="CT.RES racing number for the livery (default: first retail driver of the chassis)")
     ap.add_argument("--blender", action="store_true", help="also write import_blender.py")
     ap.add_argument("--no-wheels", action="store_true")
+    ap.add_argument("--alpha", choices=ALPHA_MODES, default="cutout",
+                    help="cutout (default): map_d + binary-alpha PNG only for textures with >=1%% alpha==0 texels, "
+                         "all others opaque; blend: map_d for any palette alpha<255; opaque: never")
+    ap.add_argument("--double-sided", action="store_true",
+                    help="emit every triangle twice with reversed winding and flipped normals (for back-face-culling "
+                         "viewers such as SceneKit); doubles f lines and vn lines; view-only, do not feed to vehicle_import")
     ap.add_argument("--preview", help="write a 3/4 software-render PNG (single car)")
     a = ap.parse_args(argv)
     if bool(a.car) == bool(a.all):
         ap.error("give exactly one of --car or --all")
-    opts = dict(lod=a.lod, paint=a.paint, blender=a.blender, wheels=not a.no_wheels)
+    opts = dict(lod=a.lod, paint=a.paint, blender=a.blender, wheels=not a.no_wheels, alpha=a.alpha, double_sided=a.double_sided)
     try:
         if a.all:
             if a.paint:

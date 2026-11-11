@@ -106,6 +106,23 @@ class SyntheticTests(unittest.TestCase):
         self.assertEqual(we.apply(M, (0, 0, 1)), (4.0, 6.0, 7.0))
 
 
+class AlphaTests(unittest.TestCase):
+    def test_alpha_treatment(self):
+        weight = bytes([42] * 100)                          # road-like: palette weight, no zero texels
+        cut = bytes([0] * 5 + [255] * 95)                   # 5% zero
+        self.assertEqual(we.alpha_treatment(weight, "cutout"), ("opaque", 0.0))
+        self.assertEqual(we.alpha_treatment(cut, "cutout")[0], "cutout")
+        self.assertEqual(we.alpha_treatment(weight, "blend")[0], "blend")
+        self.assertEqual(we.alpha_treatment(bytes([255] * 4), "blend")[0], "opaque")
+        self.assertEqual(we.alpha_treatment(cut, "opaque")[0], "opaque")
+
+    def test_apply_alpha(self):
+        rgba = bytes([1, 2, 3, 0, 4, 5, 6, 77])
+        self.assertEqual(we.apply_alpha(rgba, "blend"), rgba)
+        self.assertEqual(we.apply_alpha(rgba, "opaque"), bytes([1, 2, 3, 255, 4, 5, 6, 255]))
+        self.assertEqual(we.apply_alpha(rgba, "cutout"), bytes([1, 2, 3, 0, 4, 5, 6, 255]))
+
+
 @unittest.skipUnless(RETAIL, "set EOD_TEST_RETAIL_MODELS=1 with a retail disc")
 class RetailTests(unittest.TestCase):
     def test_all_tracks_parse_with_exact_counts(self):
@@ -125,9 +142,12 @@ class RetailTests(unittest.TestCase):
     def export(self, track, dest, *extra):
         ns = argparse.Namespace(disc=str(DISC), track=track, dest=str(dest), lod=0, props_only=False,
                                 terrain_only=False, blender=False, rh=False, include_sky=False,
-                                include_unspawned=False, preview=False)
+                                include_unspawned=False, preview=False, alpha="cutout", double_sided=False)
         for k in extra:
-            setattr(ns, k, True)
+            if "=" in k:
+                setattr(ns, *k.split("=", 1))
+            else:
+                setattr(ns, k, True)
         return we.export(ns)
 
     def test_obj_well_formed_and_materials_exist(self):
@@ -156,6 +176,33 @@ class RetailTests(unittest.TestCase):
                 self.assertTrue((dest / png).is_file(), png)
             self.assertEqual(doc["stats"]["unresolvedMaterials"], [])
             self.assertEqual(sum(1 for line in obj if line.startswith("o ")), doc["stats"]["objects"])
+
+    def test_alpha_modes_and_double_sided(self):
+        def mtl_maps(d):
+            txt = (d / "dennison_world.mtl").read_text()
+            return {b.split("\n")[0] for b in txt.split("newmtl ")[1:] if "\nmap_d " in b}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cut = self.export("DATA/TRACKS/DENNISON.TRK", tmp / "c")
+            blend = self.export("DATA/TRACKS/DENNISON.TRK", tmp / "b", "alpha=blend")
+            opq = self.export("DATA/TRACKS/DENNISON.TRK", tmp / "o", "alpha=opaque")
+            two = self.export("DATA/TRACKS/DENNISON.TRK", tmp / "d", "double_sided")
+            cm, bm = mtl_maps(tmp / "c"), mtl_maps(tmp / "b")
+            self.assertEqual(mtl_maps(tmp / "o"), set())
+            self.assertLess(len(cm), len(bm))
+            self.assertLessEqual(cm, bm)
+            for road in ("rd-1", "rd-4", "rd-5", "rd-6", "fig-8"):
+                self.assertIn(road, bm)
+                self.assertNotIn(road, cm)
+            for tree in ("p1", "trim", "fig-84"):
+                self.assertIn(tree, cm)
+            for t in cut["textures"].values():
+                if t["status"] == "exported":
+                    self.assertEqual(t["alphaKind"] == "cutout", t["zeroAlphaFraction"] >= we.CUTOUT_ZERO_FRACTION)
+            nf = lambda d: sum(1 for l in (d / "dennison_world.obj").read_text().splitlines() if l.startswith("f "))
+            self.assertEqual(nf(tmp / "d"), 2 * nf(tmp / "c"))
+            self.assertEqual(two["options"]["doubleSided"], True)
+            self.assertEqual(cut["options"]["alpha"], "cutout")
 
     def test_noop_placement_is_byte_identical(self):
         with tempfile.TemporaryDirectory() as tmp:

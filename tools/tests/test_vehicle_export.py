@@ -17,6 +17,15 @@ UNRESOLVED = {"GLADIA_1": ["RollBar.tex"], "HURRIC_1": ["RollBar.tex"],
               **{f"TRAILER{s}": ["HWindows.tex", "Hobby.tex"] for s in ("", "2", "3", "4", "5")}}
 
 
+class AlphaUnit(unittest.TestCase):
+    def test_treatment(self):
+        self.assertEqual(ve.alpha_treatment(bytes([60] * 50), "cutout"), ("opaque", 0.0))
+        self.assertEqual(ve.alpha_treatment(bytes([0] * 10 + [255] * 90), "cutout")[0], "cutout")
+        self.assertEqual(ve.alpha_treatment(bytes([60] * 50), "blend")[0], "blend")
+        self.assertEqual(ve.alpha_treatment(bytes([0] * 10), "opaque")[0], "opaque")
+        self.assertEqual(ve.apply_alpha(bytes([9, 9, 9, 0, 1, 1, 1, 60]), "cutout"), bytes([9, 9, 9, 0, 1, 1, 1, 255]))
+
+
 class Parsing(unittest.TestCase):
     def test_lod_spec(self):
         self.assertEqual(ve.parse_lods("1"), ({1}, False))
@@ -90,6 +99,30 @@ class Retail(unittest.TestCase):
                     self.assertIn(m["status"], ("resolved", "no-texture-field"))
             self.assertTrue(info["members"] and all(x["crcOk"] for x in info["members"]))
             self.assertTrue(info["physics"] and info["wheels"]["placement"] == "origin")
+
+    def test_bus_alpha_and_double_sided(self):
+        with tempfile.TemporaryDirectory() as t:
+            ve.export_car(DISC, "DATA/CAR/BUS.CAR", t)
+            ve.export_car(DISC, "DATA/CAR/BUS.CAR", Path(t) / "blend", alpha="blend")
+            ve.export_car(DISC, "DATA/CAR/BUS.CAR", Path(t) / "two", double_sided=True)
+            mtl = (Path(t) / "BUS/BUS.mtl").read_text()
+            self.assertEqual(re.findall(r"^map_d (.+)$", mtl, re.M), ["textures/wheel_bustire.png"])
+            self.assertEqual(re.findall(r"^map_d (.+)$", (Path(t) / "blend/BUS/BUS.mtl").read_text(), re.M),
+                             ["textures/wheel_bustire.png"])
+            body = (Path(t) / "BUS/textures/Bus1.png").read_bytes()
+            self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
+            one = (Path(t) / "BUS/BUS.obj").read_text().splitlines()
+            two = (Path(t) / "two/BUS/BUS.obj").read_text().splitlines()
+            cnt = lambda ls, k: sum(1 for l in ls if l.startswith(k + " "))
+            self.assertEqual(cnt(two, "f"), 2 * cnt(one, "f"))
+            self.assertEqual(cnt(two, "vn"), 2 * cnt(one, "vn"))
+            self.assertEqual(cnt(two, "v"), cnt(one, "v"))
+            nv, nvn = cnt(two, "v"), cnt(two, "vn")
+            for l in two:
+                if l.startswith("f "):
+                    for c in l.split()[1:]:
+                        a = [int(x) for x in c.split("/")]
+                        self.assertTrue(a[0] <= nv and a[2] <= nvn)
 
     def test_bus_livery_as_kit(self):
         info = json.loads((self.dest / "BUS/vehicle.json").read_text())

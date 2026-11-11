@@ -13,11 +13,16 @@ Native playtest of an import is not established by this document.
 ## Export
 
 ```sh
-python3 tools/vehicle_export.py --disc "$DISC" --car DATA/CAR/BUS.CAR --dest out [--lod 1|1,2|all|shadow] [--paint 790] [--blender] [--preview p.png]
+python3 tools/vehicle_export.py --disc "$DISC" --car DATA/CAR/BUS.CAR --dest out [--lod 1|1,2|all|shadow] [--paint 790] [--blender] [--alpha cutout|blend|opaque] [--double-sided] [--preview p.png]
 python3 tools/vehicle_export.py --disc "$DISC" --all --dest out --lod all
 ```
 
 Per car `out/<STEM>/`: `<STEM>.obj`, `.mtl`, `textures/*.png`, `vehicle.json` (`--blender` adds `import_blender.py`).
+- Transparency: `--alpha cutout` (default) writes `map_d` and a 0/255-alpha PNG only for textures with >= 1 % alpha==0 texels
+  (BUS: only `wheel_bustire`, 20.7 %); all other PNGs are written opaque since palette alpha is a blend weight, not
+  transparency. `blend` = `map_d` for any alpha < 255 with raw alpha; `opaque` = never. `--double-sided` emits each triangle
+  twice (reversed winding, appended flipped `vn` entries): ~2x `f`/`vn` lines, for back-face-culling viewers only; BUS already
+  renders solid in SceneKit without it. A double-sided OBJ is view-only and must not go to `vehicle_import.py`.
 - Objects are `<model>__slotNN_g<damageGroup>_<texture>[_body]` (model = `Low1`, `shadow1`, `Wheel_mid1`).
   Each is preceded by a comment with assetId (`DATA/CAR/BUS.CAR#Low1.mod`), slot, damage group, body-panel bit, raw group.
   The low 16 group bits are the native damage/visibility group; bit 16 marks paintable body panels. Overlapping groups are

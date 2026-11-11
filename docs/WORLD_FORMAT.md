@@ -281,7 +281,8 @@ under the left-handed reading it is correct. Placement matrices are rigid
 ```
 python3 -I tools/world_export.py export --disc DISC --track DATA/TRACKS/ANOKA.TRK --dest DIR \
     [--lod N] [--props-only|--terrain-only] [--blender|--rh] [--event c_jump_race] \
-    [--include-sky] [--include-unspawned] [--preview PNG|--no-preview]
+    [--include-sky] [--include-unspawned] [--alpha cutout|blend|opaque] [--double-sided] \
+    [--preview PNG|--no-preview]
 ```
 
 Writes `<track>_world.obj/.mtl`, `textures/*.png` (mip 0 via
@@ -291,10 +292,24 @@ HOBBYSET/RACE/PART/COMMON/GENESIS .RES, `name` before `<stem>.tm0`, as in
 `preview_topdown.png` (central 96 % of objects), `_full.png`, and with
 `--event` `_event.png`. One `o`/`g` per instance named
 `<member>@<modelOffset>_i<index>` (event props `<va0>_<dyno>_e<index>`).
-`map_d` is written when a palette alpha is below 255; note that many opaque
-terrain textures carry palette alpha < 255 (e.g. `an-grs02` 67–190), which
-the native renderer may not treat as transparency (texture `flags` are in the
-MTL comment and placements.json).
+Transparency (`--alpha`, default `cutout`): palette alpha on these textures is mostly
+a blend/detail weight the game applies only under particular GS state (road textures
+`rd-1/4/5/6` and `fig-8` have alpha 42-179 on every texel, no zero texels, and draw
+opaque). Only textures with at least 1 % alpha==0 texels get `map_d`; their PNG alpha is
+binarised to 0/255 so SceneKit/Blender alpha tests agree, and every other texture's PNG
+is written fully opaque. On retail Dennison the 43 cutout textures have 6.2-97 % zero
+texels and all 98 others have exactly 0 %, so the 1 % cut is not sensitive (trees,
+fences, rails, shadow blobs qualify; roads, terrain, `fnce`, `5-cab` do not).
+`blend` keeps the old behaviour (raw palette alpha PNGs, `map_d` whenever alpha < 255,
+which renders roads/terrain see-through in SceneKit); `opaque` never writes `map_d`.
+`placements.json` records `zeroAlphaFraction` and `alphaKind` per texture.
+`--double-sided` writes every triangle twice (second copy reversed winding), about
++29 % OBJ size on Dennison (6.3 -> 8.1 MB; `f` lines double). PS2 draws most world
+geometry without back-face culling and strip winding is not consistent, so
+culling viewers (SceneKit, Xcode scene editor, Quick Look, Unreal default) show holes
+without it; Blender does not cull and does not need it. Do not feed a double-sided OBJ
+to any import path. Winding was not made consistent: it cannot be verified from the
+strip data alone (no per-triangle normals in world batches).
 `--lod N` keeps child `min(N, count-1)` of every multi-child group.
 `--terrain-only` = static + Optional Terrain; `--props-only` = everything
 else except sky.

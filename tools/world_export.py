@@ -451,7 +451,38 @@ def event_props(track, event):
 
 # --------------------------------------------------------------------------- export
 
-def export_textures(track, names, dest):
+# Palette alpha on PS2/EOD textures is mostly a blend/detail weight the game applies only
+# under specific GS state (roads rd-1/rd-4/rd-5/rd-6 and fig-8 carry alpha 42-179 on every
+# texel yet draw opaque). Only real cutouts (a meaningful share of alpha==0 texels) should
+# become transparent in a viewer. Retail Dennison: cutout textures have 6.2%..97% zero-alpha
+# texels, every other texture has exactly 0%, so any threshold in (0, 6%) separates them; 1%.
+CUTOUT_ZERO_FRACTION = 0.01
+ALPHA_MODES = ("cutout", "blend", "opaque")
+
+
+def alpha_treatment(alphas, mode):
+    """-> (kind, zero_fraction); kind is 'cutout' | 'blend' | 'opaque' for the written PNG/MTL."""
+    zero = alphas.count(0) / max(1, len(alphas))
+    if mode == "blend":
+        return ("blend" if min(alphas) < 255 else "opaque"), zero
+    if mode == "cutout" and zero >= CUTOUT_ZERO_FRACTION:
+        return "cutout", zero
+    return "opaque", zero
+
+
+def apply_alpha(rgba, kind):
+    """RGBA bytes for the PNG: blend keeps palette alpha, cutout binarises to 0/255, opaque forces 255."""
+    if kind == "blend":
+        return bytes(rgba)
+    out = bytearray(rgba)
+    if kind == "opaque":
+        out[3::4] = b"\xff" * (len(out) // 4)
+    else:
+        out[3::4] = bytes(0 if a == 0 else 255 for a in out[3::4])
+    return bytes(out)
+
+
+def export_textures(track, names, dest, alpha="cutout"):
     cache, out = {}, {}
     tdir = dest / "textures"
     tdir.mkdir(parents=True, exist_ok=True)
@@ -471,13 +502,15 @@ def export_textures(track, names, dest):
                 alphas = rgba[3::4]
                 amin = min(alphas)
                 fn = re.sub(r"[^A-Za-z0-9_.-]", "_", asset.split("#", 1)[1]) + ".png"
-                write_png(str(tdir / fn), w, h, bytes(rgba))
+                kind, zero = alpha_treatment(alphas, alpha)
+                write_png(str(tdir / fn), w, h, apply_alpha(rgba, kind))
                 n = w * h
                 tot = sum(alphas) or 1
                 avg = tuple(sum(rgba[c + 4 * i] * alphas[i] for i in range(0, n, 7)) /
                             max(1, sum(alphas[i] for i in range(0, n, 7))) for c in range(3)) if tot else (128, 128, 128)
                 rec.update(status="exported", png="textures/" + fn, width=w, height=h,
-                           alphaMin=amin, format=meta["format"], flags=meta["flags"],
+                           alphaMin=amin, zeroAlphaFraction=round(zero, 4),
+                           alphaKind=kind, format=meta["format"], flags=meta["flags"],
                            averageRgb=[round(x) for x in avg])
         out[name] = rec
     return out
@@ -493,7 +526,7 @@ AXES = {
 }
 
 
-def write_obj(instances, textures, dest, stem, axes="native"):
+def write_obj(instances, textures, dest, stem, axes="native", double_sided=False):
     obj, mtl = dest / (stem + ".obj"), dest / (stem + ".mtl")
     mats = {}
     conv, mirror = AXES[axes]
@@ -518,9 +551,11 @@ def write_obj(instances, textures, dest, stem, axes="native"):
                     b, c = c, b
                 ia, ib, ic = a + vbase, b + vbase, c + vbase
                 lines.append("f %d/%d %d/%d %d/%d" % (ia, ia, ib, ib, ic, ic))
+                if double_sided:  # same vertices, reversed winding: visible to back-face-culling viewers
+                    lines.append("f %d/%d %d/%d %d/%d" % (ia, ia, ic, ic, ib, ib))
             vbase += len(part["verts"])
     obj.write_text("\n".join(lines) + "\n")
-    ml = ["# world_export.py materials; map_d = same PNG when palette alpha < 255"]
+    ml = ["# world_export.py materials; map_d only for cutout textures (see --alpha)"]
     unresolved = []
     for mat, tex in sorted(mats.items()):
         ml += ["", "newmtl %s" % mat, "Kd 1 1 1", "Ka 0 0 0", "Ks 0 0 0", "illum 1"]
@@ -531,7 +566,7 @@ def write_obj(instances, textures, dest, stem, axes="native"):
             continue
         if t and t["status"] == "exported":
             ml.append("map_Kd %s" % t["png"])
-            if t["alphaMin"] < 255:
+            if t.get("alphaKind") in ("cutout", "blend"):
                 ml.append("map_d %s" % t["png"])
             ml.append("# source %s flags 0x%x alphaMin %d" % (t["assetId"], t["flags"], t["alphaMin"]))
         else:
@@ -652,10 +687,10 @@ def export(args):
     graf, instances = build_scene(track, lod=args.lod, mode=mode, include_sky=args.include_sky,
                                   include_unspawned=args.include_unspawned, event=getattr(args, "event", None))
     names = set(p["texture"] for i in instances if i["selected"] for p in i["_geom"])
-    textures = export_textures(track, names, dest)
+    textures = export_textures(track, names, dest, alpha=args.alpha)
     stem = Path(args.track).stem.lower() + "_world"
     axes = "blender" if args.blender else "rh-yup" if args.rh else "native"
-    obj, mtl, unresolved = write_obj(instances, textures, dest, stem, axes=axes)
+    obj, mtl, unresolved = write_obj(instances, textures, dest, stem, axes=axes, double_sided=args.double_sided)
     sel = [i for i in instances if i["selected"]]
     stats = dict(instances=len(instances), selected=len(sel),
                  selectedWithGeometry=sum(1 for i in sel if i["_geom"]),
@@ -695,7 +730,8 @@ def export(args):
                                                 "blender": "(x,z,y), winding reversed"},
                                 placementsSpace="native"),
                options=dict(lod=args.lod, mode=mode, event=getattr(args, "event", None), includeSky=args.include_sky,
-                            includeUnspawned=args.include_unspawned),
+                            includeUnspawned=args.include_unspawned, alpha=args.alpha,
+                            doubleSided=args.double_sided),
                stats=stats, preview=preview, textures=textures,
                instances=[{k: v for k, v in i.items() if k != "_geom"} for i in instances])
     (dest / "placements.json").write_text(json.dumps(doc, indent=1) + "\n")
@@ -962,6 +998,12 @@ def main(argv=None):
         p.add_argument("--blender", action="store_true",
                        help="write OBJ for Blender (right-handed Z-up): (x,z,y), winding reversed")
         p.add_argument("--rh", action="store_true", help="write OBJ right-handed Y-up: (x,y,-z), winding reversed")
+        p.add_argument("--alpha", choices=ALPHA_MODES, default="cutout",
+                       help="cutout (default): map_d + binary-alpha PNG only for textures with >=1%% alpha==0 texels, "
+                            "all others opaque; blend: map_d for any palette alpha<255 (old behaviour); opaque: never")
+        p.add_argument("--double-sided", action="store_true",
+                       help="emit every triangle twice with reversed winding so back-face-culling viewers "
+                            "(SceneKit/Xcode/Quick Look) show it; doubles the f lines")
         p.add_argument("--include-sky", action="store_true")
         p.add_argument("--event", help="also place one event table's props, e.g. c_jump_race")
         p.add_argument("--include-unspawned", action="store_true",
