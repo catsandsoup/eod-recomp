@@ -51,7 +51,7 @@ def bundle_info():
                 CFBundleIdentifier='org.eod-recomp.creationkit.development',
                 CFBundleExecutable='EODModdingSuite', CFBundlePackageType='APPL',
                 CFBundleIconFile='AppIcon',
-                CFBundleShortVersionString='0.4.0', CFBundleVersion='6',
+                CFBundleShortVersionString='0.4.1', CFBundleVersion='7',
                 LSMinimumSystemVersion='14.0', NSHighResolutionCapable=True)
 
 
