@@ -235,3 +235,20 @@ and actual CPU visibility consumer are established. Outstanding work is live
 residency/allocator verification, track traversal/range limits, texture
 promotion, complete per-view/VU edge testing and measured performance. Literal
 zero pop-in remains unproven.
+
+## Observed in play (11 Nov 2026): pop-in unchanged at maximum LOD
+
+With the car LOD multiplier and maximum detail settings, scenery and objects
+still appear at the native PS2 view distance. The car LOD hook only keeps
+higher car models longer; it does not change what the track submits. Pop-in is
+governed by the remaining layers listed above: the CPU sphere-versus-view test
+(`0034E308`, near/far at `004CD370`/`004CD374`) gating submission at
+`0034C0EC`/`0034CCD4`, the track scene traversal and its range limits,
+projection/fog distance, and VU clipping.
+
+Remaster target, from the player's point of view: no visible pop-in of track
+scenery, props or cars within the visible horizon at 4:3 and widescreen, with
+fog/sky still matching the original look, and simulation, AI and timing
+unchanged. Evidence: matched frame sequences (native vs remastered setting)
+along a lap of a long-sightline track, with submission counts, frame time and
+memory; native setting must stay pixel-identical to the baseline.
