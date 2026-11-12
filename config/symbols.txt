@@ -51,7 +51,7 @@
 0017DE78 WeaponRegistryQuery [V]  # Looks up registered weapon interface for (owner_idx, slot) -> docs/BATTLE_RECOVERY.md
 0017DFA8 ChickenWeaponAlloc [V]  # Allocates 0x228-byte Ball/chicken projectile object -> docs/BATTLE_RECOVERY.md
 0017E000 ChickenWeaponTrigger [V]  # Fires chicken projectile from car muzzle pose (straight Battle, mortar, or rain) -> docs/BATTLE_RECOVERY.md
-0017E4D8 ChickenWeaponStartCooldown [V]  # Starts 3.0s reload cooldown timer at body+0x1E0/0x1E4 -> docs/BATTLE_RECOVERY.md
+0017E4D8 ChickenWeaponStartCooldown [V]  # Starts reload cooldown at body+0x1E0/0x1E4 (3.0s native, only while the weapon cheat is on); wrapped: always initialised, ChickenReload -> docs/BATTLE_RECOVERY.md
 0017E5C8 ChickenWeaponUpdate [V]  # Advances projectile flight, reload state machine, and collision checks -> docs/BATTLE_RECOVERY.md
 0017E718 ChickenWeaponDetonate [V]  # Triggers explosion SFX, particle burst, and radial shockwave at impact point -> docs/BATTLE_RECOVERY.md
 0017EA10 ChickenWeaponInit [V]  # Initializes projectile scene nodes, SFX handles, and weapon registry entry -> docs/BATTLE_RECOVERY.md
@@ -90,6 +90,7 @@
 00212B58 CameraBuildViewportProjection [V]  # Configures per-viewport near/far plane and fog range; wrapped for 2P/Horizon draw distance -> docs/LOD_CULLING_INVESTIGATION.md
 00212DB0 DrawDistanceGetFar [V]  # Returns g_DrawDistanceFar (0x00495D58) -> docs/LOD_CULLING_INVESTIGATION.md
 00212DF0 ConfigGetHighDetailCar [V]  # Returns high_detail_car flag -> docs/LOD_CULLING_INVESTIGATION.md
+00214678 GrafTrackLoad [V]  # Loads track.grf and relocates its mlists; wrapped: DrawDistance scales each LOD group's final cutoff -> docs/LOD_CULLING_INVESTIGATION.md
 00217DF0 VisualCarInit [V]  # Initializes visual car struct (+0x74 handles, +0xF8 LOD records, +0x21C/+0x220/+0x224 pointers) -> docs/LOD_RUNTIME.md
 002189C8 VisualCarSubmitModel [V]  # Selects active LOD handle from +0x21C[+0x54C] and submits to renderer -> docs/LOD_CULLING_INVESTIGATION.md
 00218C38 VisualCarSubmitWheelsAndParts [V]  # Submits car wheels, windows, and detachable parts for selected LOD -> docs/LOD_CULLING_INVESTIGATION.md
@@ -149,6 +150,7 @@
 003543D0 TextureMip0PoolInit [V]  # Allocates ring buffer for on-demand .tm0 high-res mip0 textures (0x004A9830) -> docs/TEXTURE_FORMAT_NOTES.md
 003545B8 TextureLoadHiResTm0 [V]  # Streams .tm0 high-res mip0 companion for a .tex texture -> docs/LOD_CULLING_INVESTIGATION.md
 00354838 TextureMip0PoolResize [V]  # Resizes on-demand .tm0 ring buffer allocation -> docs/TEXTURE_FORMAT_NOTES.md
+003582B8 MlistVisibilityCalc [V]  # Per-frame mlist sphere/group/model visibility into the scratchpad; wrapped for EOD_CULL_TRACE counts -> docs/LOD_CULLING_INVESTIGATION.md
 0035C460 FrameWaitVblank [V]  # Idle busy-wait loop for vblank counter increment -> docs/INDEX.md
 0035C528 FrameWaitDrawDone [V]  # Idle busy-wait loop for GS draw-done state (1 or 7) -> docs/INDEX.md
 003653F8 GsFogWriteTables [V]  # Computes and uploads GS FOG / fog-table values for current pass -> docs/LOD_CULLING_INVESTIGATION.md

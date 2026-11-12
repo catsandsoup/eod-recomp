@@ -13,6 +13,7 @@
 //   0x68 nrOfModes 0x69 modeCurOffs 0x6A nrOfActuators 0x6B numActComb
 //   0x6D mode 0x6E lock 0x6F actLevel 0x70 state 0x71 reqState
 //   0x72 currentTask 0x73 runTask
+#include "chord_guard.h"
 #include <cstring>
 
 #include "../core/log.h"
@@ -82,7 +83,8 @@ void write_pad_data(int port, int slot) {
     if (slot != 0) hs.connected = false;  // no multitap
     uint8_t d[128] = {};
     uint8_t mode = !p.analog ? 0x41 : p.pressure ? 0x79 : 0x73;
-    uint16_t b_clean = hs.buttons;
+    static chord_guard::Guard chord[2];   // Start+Select opens the in-game menu: the game never sees that chord
+    uint16_t b_clean = hs.connected && port >= 0 && port < 2 ? chord[port].filter(hs.buttons) : hs.buttons;
     if (port == 0) b_clean &= ~game_patches_suppressed_buttons();
     uint16_t btn = (uint16_t)~b_clean;  // active low
     d[0] = 0x00;

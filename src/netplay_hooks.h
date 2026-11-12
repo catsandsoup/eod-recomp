@@ -13,6 +13,22 @@ inline bool rule(RaceRule flag, bool offline) {
 inline float race_scale(float personal, float shared) {
     return race_rules && race_rules() >= 0 ? shared : personal;
 }
+// Cheat tuning (turbo strength, chicken blast force and size as multipliers, chicken reload in seconds).
+// During an online event every player uses the lobby's values, carried in quarter units so all machines
+// compute with the same float; otherwise the player's own settings apply.
+enum Tune { TurboStrength, ChickenForce, ChickenSize, ChickenReload, TuneCount };
+struct TuneRange { uint8_t lo, hi, standard; };
+inline constexpr TuneRange tune_ranges[TuneCount] = {{4, 16, 7}, {1, 32, 4}, {1, 16, 4}, {1, 40, 12}};
+inline const uint8_t *(*race_tuning)() = nullptr;   // TuneCount quarter-unit values, or null when no online event runs
+inline uint8_t tune_quarters(Tune t, float value) {
+    const float q = value * 4.0f + 0.5f;
+    const int v = q != q ? tune_ranges[t].standard : q < 0 ? 0 : q > 255 ? 255 : (int)q;
+    return (uint8_t)(v < tune_ranges[t].lo ? tune_ranges[t].lo : v > tune_ranges[t].hi ? tune_ranges[t].hi : v);
+}
+inline float tuned(Tune t, float personal) {
+    const uint8_t *shared = race_tuning ? race_tuning() : nullptr;
+    return shared ? shared[t] * 0.25f : personal;
+}
 // Normalize the native cheat word online after applying the shared lobby rules.
 // Offline combo remnants (rain, vengeance/hardcore, master) cannot survive room
 // entry. Battle's native weapon remains available without the optional mod.

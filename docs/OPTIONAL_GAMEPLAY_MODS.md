@@ -293,3 +293,41 @@ needs coordinated participant/rank storage, construction/allocation and every
 native access (including finish and HUD) audited and adapted, followed by
 complete scoring/respawn/match tests. Neither ordinary 14-car racing nor changing
 one Battle catalog field establishes this. The generator retains maxcars=4.
+
+## Live cheat switches and tuning (12 Nov 2026)
+
+Player success: switching Chicken Fight, Turbo Boost, Invincible Humans, Per-car Durability or Manual
+Recovery in the in-game menu during a race takes effect when the menu closes, every time; Chicken Fight
+fires on the first L2 press afterwards. Turbo strength, chicken reload time, blast force and blast size
+are settings (SETTINGS tab; `TurboScale`, `ChickenReload`, `ChickenForceScale`, `ChickenRadiusScale` in
+`[Cheats]`) and work in Action, Career and Battle. Online, the host sets them in the lobby (they start
+from the host's own values) and every player races with the lobby's values; they are carried in quarter
+units in the lobby and start messages (wire protocol 6) so every machine computes with the same float.
+Hosting or sitting in a lobby that is still waiting leaves the player's own cheats, Career included, in force:
+the lobby's rules apply from the start of an online event until it ends.
+
+Root cause of "chickens do not always enable": `ChickenWeaponStartCooldown` (`0x0017E4D8`) writes the
+launcher's reload state (`body+0x1E0`) and deadline (`body+0x1E4`) only while the weapon cheat is on. A
+launcher built with the cheat off kept uninitialised heap bytes (`0xE3E3E3E3`) there and the trigger
+(`0x0017E000`, acts on states 1 and 2 only) could never fire for the rest of the event. The wrapper makes
+the same two writes when the cheat is off; nothing reads them until it is switched on. The reload time is
+the deadline it writes (3 s natively; the native write is kept when the setting is 3).
+
+Start+Select (the menu chord) no longer reaches the game: `runtime/iop/chord_guard.h` holds a lone Start or
+Select back for five frames and hides both when the other joins, so opening the menu no longer opens the
+game's own pause menu under it or recovers the car.
+
+Evidence (real game, 3840x2160, RenderScale 6, `EOD_CHEAT_TRACE=1`): Chicken Fight off at race load, switched
+on in the menu mid-race: before the fix the trigger ran with state `0xE3E3E3E3` and never fired; after it the
+launcher armed two frames later and every L2 tap after reload fired. Reload 0.5 s: 31 shots from 31 taps
+40 frames apart (3 s: one shot per 200 frames). Two-machine online race (host + guest processes): both logged
+`rules=3 tuning=8,5,5,2` and the host fired on every tap.
+
+Open defect (found by this test, not yet fixed): in that automated two-machine race the guest's own car never
+ran `HumanDriver::DriveUpdate` (`0x0018F2A8`): no launcher lookup was logged on the guest and its car reported
+gas 1.0 with no pad input. Reproduce with a host and guest started with `EOD_NETPLAY_AUTO`, a full AI field
+("No-Rules Race") and `EOD_CHEAT_TRACE=1`; the host logs `human=... launcher=...`, the guest logs none. Next
+decisive test: drive the guest by pad script and compare its car's motion with and without input.
+
+Developer tools: `EOD_CHEAT_TRACE=1` (cheat word, rules in effect, launcher lookup, trigger state, shots),
+`EOD_MENU_SCRIPT="FRAME:ROW[:left|right],..."` (press a menu row by id).

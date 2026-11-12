@@ -316,11 +316,11 @@ extern "C" void f_0017DA58(void) {
                 ee_rf(position + 4), ee_rf(position + 8),
                 g_ee.fpr[12].f, g_ee.fpr[13].f);
     }
-    if (netplay_hooks::race_scale(g_config.chicken_radius_scale, 1.0f) > 0.0f && netplay_hooks::race_scale(g_config.chicken_radius_scale, 1.0f) != 1.0f) {
-        g_ee.fpr[12].f *= netplay_hooks::race_scale(g_config.chicken_radius_scale, 1.0f);
+    if (netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale) > 0.0f && netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale) != 1.0f) {
+        g_ee.fpr[12].f *= netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale);
     }
-    if (netplay_hooks::race_scale(g_config.chicken_force_scale, 1.0f) > 0.0f && netplay_hooks::race_scale(g_config.chicken_force_scale, 1.0f) != 1.0f) {
-        g_ee.fpr[13].f *= netplay_hooks::race_scale(g_config.chicken_force_scale, 1.0f);
+    if (netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale) > 0.0f && netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale) != 1.0f) {
+        g_ee.fpr[13].f *= netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale);
     }
     f_0017DA58_orig();
 }
@@ -333,6 +333,23 @@ extern "C" void f_0018F2A8(void) {
     const bool valid = controller && !(controller & 3) && controller <= EE_RAM_SIZE - 0x44;
     const uint32_t car = valid ? ee_r32(controller + 0x38) : 0;
     const uint32_t driver = valid ? ee_r32(controller + 0x3C) : 0;
+    {   // Opt-in evidence (EOD_CHEAT_TRACE): which launcher this human would fire, when that changes.
+        static const bool trace = getenv("EOD_CHEAT_TRACE") != nullptr;
+        if (trace && valid) {
+            const uint32_t owner = ee_r32(controller + 0x40), count = ee_r32(0x003CE4B8);
+            uint32_t found = 0;
+            for (uint32_t i = 0; i < count && i < 16; ++i)
+                if (ee_r32(0x003CE3F8 + i * 12) == owner && ee_r32(0x003CE3F8 + i * 12 + 4) == 0) { found = ee_r32(0x003CE3F8 + i * 12 + 8); break; }
+            static uint32_t last_key = ~0u;
+            const uint32_t key = controller ^ (owner << 24) ^ (count << 16) ^ found;
+            if (key != last_key) {
+                last_key = key;
+                LOG(LOG_CORE, "[CHEAT] vblank=%u human=%08x car=%08x weapon owner=%u registry=%u launcher=%08x", ee_r32(0x003E579C), controller, car, owner, count, found);
+                for (uint32_t i = 0; i < count && i < 16; ++i)
+                    LOG(LOG_CORE, "[CHEAT]   registry %u: owner=%u slot=%u iface=%08x", i, ee_r32(0x003CE3F8 + i * 12), ee_r32(0x003CE3F8 + i * 12 + 4), ee_r32(0x003CE3F8 + i * 12 + 8));
+            }
+        }
+    }
     f_0018F2A8_orig();
     if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
         driver && !(driver & 3) && driver <= EE_RAM_SIZE - 4) {
@@ -350,7 +367,7 @@ extern "C" void f_0018F2A8(void) {
         const uint32_t cheats = ee_r32(0x003C4190);
         if (l2_pressed) {
             // Turbo boost while L2 is held:
-            if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && (cheats & 0x3) == 0x3 && netplay_hooks::race_scale(g_config.turbo_scale, 1.75f) > 1.0f) {
+            if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && (cheats & 0x3) == 0x3 && netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale) > 1.0f) {
                 float fwd_x = ee_rf(car + 0x7C);
                 float fwd_y = ee_rf(car + 0x80);
                 float fwd_z = ee_rf(car + 0x84);
@@ -360,10 +377,10 @@ extern "C" void f_0018F2A8(void) {
                 float vel_z = ee_rf(car + 0x10C);
 
                 float forward_speed = vel_x * fwd_x + vel_y * fwd_y + vel_z * fwd_z;
-                float speed_cap = 44.444447f * netplay_hooks::race_scale(g_config.turbo_scale, 1.75f);
+                float speed_cap = 44.444447f * netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale);
 
                 if (forward_speed < speed_cap) {
-                    float extra_accel = (netplay_hooks::race_scale(g_config.turbo_scale, 1.75f) - 1.0f) * 20.0f;
+                    float extra_accel = (netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale) - 1.0f) * 20.0f;
                     float dt = 1.0f / 60.0f;
                     ee_wf(car + 0x104, vel_x + fwd_x * extra_accel * dt);
                     ee_wf(car + 0x108, vel_y + fwd_y * extra_accel * dt);
@@ -405,6 +422,64 @@ static void trace_battle() {
             ee_rf(body+0x104), ee_rf(body+0x108), ee_rf(body+0x10C),
             ee_r32(body+0x210), ee_r32(body+0x214));
     }
+}
+
+// Opt-in evidence only (EOD_CHEAT_TRACE): the cheat word and each weapon's reload/flight state, on change.
+static void trace_cheats(uint32_t cheats) {
+    static const bool enabled = getenv("EOD_CHEAT_TRACE") != nullptr;
+    if (!enabled) return;
+    static uint32_t last_cheats = ~0u;
+    const uint32_t vblank = ee_r32(0x003E579C);
+    if (cheats != last_cheats) { LOG(LOG_CORE, "[CHEAT] vblank=%u cheats=%08x", vblank, cheats); last_cheats = cheats; }
+    using namespace netplay_hooks;
+    const int rules = (rule(Turbo, g_config.cheat_turbo) ? 1 : 0) | (rule(Chickens, g_config.cheat_chickens) ? 2 : 0) |
+                      (rule(Invincible, g_config.cheat_invincible) ? 4 : 0) | (rule(Durability, g_config.car_durability) ? 8 : 0) |
+                      (rule(ManualRecovery, g_config.manual_recovery) ? 16 : 0);
+    static int last_rules = -1;
+    if (rules != last_rules) {
+        LOG(LOG_CORE, "[CHEAT] vblank=%u in effect: turbo=%d chickens=%d invincible=%d durability=%d manual_recovery=%d", vblank,
+            rules & 1, (rules >> 1) & 1, (rules >> 2) & 1, (rules >> 3) & 1, (rules >> 4) & 1);
+        last_rules = rules;
+    }
+}
+
+// Chicken trigger (weapon interface, car, &trigger held). Diagnostic only: with EOD_CHEAT_TRACE each shot
+// (armed state 2 with the trigger held) and each state the trigger is called in are logged.
+extern "C" void f_0017E000_orig(void);
+extern "C" void f_0017E000(void) {
+    static const bool enabled = getenv("EOD_CHEAT_TRACE") != nullptr;
+    if (enabled) {
+        const uint32_t iface = g_ee.r[4].uw[0], held_at = g_ee.r[6].uw[0];
+        const uint32_t state = ee_r32(iface - 0x1DC + 0x1E0), held = ee_r32(held_at);
+        static uint32_t last_state = ~0u, last_held = ~0u;
+        if (state != last_state || held != last_held) {
+            LOG(LOG_CORE, "[CHEAT] vblank=%u trigger weapon=%08x car=%08x state=%u held=%u%s", ee_r32(0x003E579C), iface,
+                g_ee.r[5].uw[0], state, held, state == 2 && held ? " SHOT" : "");
+            last_state = state; last_held = held;
+        }
+    }
+    f_0017E000_orig();
+}
+
+// Chicken reload start (weapon body in a0). Native writes the reload state (+0x1E0 = 0) and deadline
+// (+0x1E4 = race time + 3 s) only while the weapon cheat is on; a weapon built with it off keeps
+// uninitialised heap bytes there, and the trigger (which acts on states 1 and 2 only) can then never
+// fire for the rest of the event. The same two writes are made when the cheat is off, so the launcher
+// is reloaded and ready whenever Chicken Fight is switched on. Nothing reads them while it is off.
+// The reload time itself is a setting (ChickenReload).
+extern "C" void f_0017E4D8_orig(void);
+extern "C" void f_0017E4D8(void) {
+    const uint32_t body = g_ee.r[4].uw[0];
+    f_0017E4D8_orig();
+    if (!body || (body & 3) || body > EE_RAM_SIZE - 0x1E8) return;
+    // Reload time: 3 s natively; the player's setting, or the lobby's during an online event.
+    const float reload = netplay_hooks::tuned(netplay_hooks::ChickenReload, g_config.chicken_reload);
+    const uint32_t cheats = ee_r32(0x003C4190);
+    if ((cheats & 0x9) == 0x9 && reload == 3.0f) return;   // native already wrote exactly this
+    ee_w32(body + 0x1E0, 0);
+    float deadline = fadd_ps2(ee_rf(0x003CDACC), reload > 0.0f ? reload : 3.0f);
+    uint32_t bits; memcpy(&bits, &deadline, 4);
+    ee_w32(body + 0x1E4, bits);
 }
 
 static uint16_t s_suppressed_pad0_buttons = 0;
@@ -457,7 +532,9 @@ void game_patches_vblank() {
     career_vblank(pressed);
 
     bool l1_r1_held = (b & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1);
-    const bool online_guest = netplay_hooks::active && netplay_hooks::active(); // Both roles use lobby rules.
+    // An online event in progress (loading, racing, results): both roles use the lobby's rules. Hosting or
+    // sitting in a lobby that is still waiting changes nothing: Career and its cheats carry on as offline.
+    const bool online_guest = netplay_hooks::event_active && netplay_hooks::event_active();
     platform_set_mod_overlay(l1_r1_held && !online_guest);
 
     // Track button suppression to protect driving and pause menus
@@ -587,6 +664,7 @@ void game_patches_vblank() {
     // native weapon independently of the optional Chicken Fight rule.
     if (online_guest) cheats = netplay_hooks::online_cheats(cheats, battle, turbo, chickens);
     ee_w32(0x003C4190, cheats);
+    trace_cheats(cheats);
 
     int aspect;
     if (g_config.aspect == "stretch")

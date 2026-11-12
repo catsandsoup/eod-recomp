@@ -137,9 +137,9 @@ int main() {
     CHECK((uint16_t)(d[2] | d[3] << 8) == 0xFFFF);
     // An input delivered while the renderer blocks belongs to this vblank,
     // not the next one. Check the real published DMA packet.
-    CHECK(vblank_finish_and_poll_input([&]() { pending_input=true; pending_buttons=PAD_START; }));
+    CHECK(vblank_finish_and_poll_input([&]() { pending_input=true; pending_buttons=PAD_TRIANGLE; }));
     d = latest();
-    CHECK((uint16_t)(d[2] | d[3] << 8) == (uint16_t)~PAD_START);
+    CHECK((uint16_t)(d[2] | d[3] << 8) == (uint16_t)~PAD_TRIANGLE);   // (Start and Select alone are held back a few frames: chord_guard.h)
     uint8_t before_quit[256]; memcpy(before_quit, ram + 1024, sizeof before_quit);
     quit_input = true;
     CHECK(!vblank_poll_input());

@@ -153,6 +153,7 @@ struct Session::Impl {
     // host side
     std::map<uint8_t, Peer> peers;
     uint8_t rules = 0;
+    uint8_t tuning[netplay_hooks::TuneCount] = {7, 4, 4, 12};   // lobby cheat tuning in quarter units (netplay_hooks::Tune)
     unsigned max_players = kMaxPlayers;
     uint64_t next_peer_identity = 0;
     int ai_count = 0;
@@ -547,6 +548,10 @@ struct Session::Impl {
         {"rule_damage","INVINCIBILITY",netplay_hooks::Invincible}, {"rule_durability","CAR DURABILITY",netplay_hooks::Durability},
         {"rule_recovery","MANUAL RECOVERY",netplay_hooks::ManualRecovery}
     };
+    static constexpr struct TuneOption { const char *id, *label, *unit; netplay_hooks::Tune tune; } tune_options[] = {
+        {"tune_turbo","TURBO STRENGTH","X",netplay_hooks::TurboStrength}, {"tune_reload","CHICKEN RELOAD"," S",netplay_hooks::ChickenReload},
+        {"tune_force","CHICKEN BLAST FORCE","X",netplay_hooks::ChickenForce}, {"tune_size","CHICKEN BLAST SIZE","X",netplay_hooks::ChickenSize}
+    };
     void cycle(const std::string &what, int dir) {
         if (what == "players" && role == Role::Host) {
             max_players = std::clamp<int>((int)max_players + (dir >= 0 ? 1 : -1),1+alive_count(),kMaxPlayers);
@@ -554,6 +559,11 @@ struct Session::Impl {
         }
         for (const auto &opt : rule_options) if (what == opt.id) {
             if (role == Role::Host) rules ^= opt.bit;
+            return;
+        }
+        for (const auto &opt : tune_options) if (what == opt.id) {
+            const auto range = netplay_hooks::tune_ranges[opt.tune];
+            if (role == Role::Host) tuning[opt.tune] = (uint8_t)std::clamp<int>(tuning[opt.tune] + (dir >= 0 ? 1 : -1), range.lo, range.hi);
             return;
         }
         if (!session_catalog::ready()) return;
@@ -584,6 +594,7 @@ struct Session::Impl {
         w.u8((uint32_t)v.size());
         for (auto &p : v) { w.u8(p.id); w.str(p.name, 16); w.u8(p.ready); w.str(p.vname, 24); w.u16(p.ping); }
         w.str(track_name, 40); w.u8(rules); w.u8(max_players);
+        for (uint8_t q : tuning) w.u8(q);
     }
     bool all_peers(bool (*pred)(const Peer &)) const { for (auto &kv : peers) if (kv.second.alive && !pred(kv.second)) return false; return true; }
     int alive_count() const { int n = 0; for (auto &kv : peers) n += kv.second.alive; return n; }
@@ -665,6 +676,10 @@ game_frontend::Snapshot Session::snapshot() const {
         for (const auto &opt : Impl::rule_options)
             s.options.push_back({opt.id,opt.label,(d.rules & opt.bit) ? "ON" : "OFF",s.is_host,
                                  "Applies to all players. Locked during the race."});
+        for (const auto &opt : Impl::tune_options) {
+            char value[24]; std::snprintf(value, sizeof value, "%.2f%s", d.tuning[opt.tune] * 0.25, opt.unit);
+            s.options.push_back({opt.id, opt.label, value, s.is_host, "Applies to all players. Locked during the race."});
+        }
     }
     if (s.phase != S::Phase::Lobby) for (auto &o : s.options) o.editable = false;
     uint64_t t = now_us();
@@ -700,6 +715,13 @@ void Session::submit(game_frontend::Command c) {
         d.content_id = content.value;
         std::fprintf(stderr,"[netplay] content %s\n",d.content_id.c_str());
         d.rules = 0;
+        {   // a new lobby starts from the host's own tuning
+            using namespace netplay_hooks;
+            d.tuning[TurboStrength] = tune_quarters(TurboStrength, g_config.turbo_scale);
+            d.tuning[ChickenForce] = tune_quarters(ChickenForce, g_config.chicken_force_scale);
+            d.tuning[ChickenSize] = tune_quarters(ChickenSize, g_config.chicken_radius_scale);
+            d.tuning[ChickenReload] = tune_quarters(ChickenReload, g_config.chicken_reload);
+        }
         d.event_id = 0;
         d.pending_start = false;
         d.abort_requested = false;
@@ -1114,13 +1136,17 @@ void Session::poll() {
                 uint32_t n = r.u8(); std::vector<LobbyPlayer> v;
                 for (uint32_t i = 0; i < n && r.ok; ++i) { LobbyPlayer p; p.id = (uint8_t)r.u8(); p.name = r.str(); p.ready = r.u8(); p.vname = r.str(); p.ping = (uint16_t)r.u16(); v.push_back(p); }
                 std::string lt = r.str(); const uint8_t rules = r.u8(); const uint8_t capacity = r.u8();
+                uint8_t tune[netplay_hooks::TuneCount]; for (uint8_t &q : tune) q = (uint8_t)r.u8();
+                if (r.ok && !in_event_ && !d.pending_start) for (int i = 0; i < netplay_hooks::TuneCount; ++i) d.tuning[i] = std::clamp(tune[i], netplay_hooks::tune_ranges[i].lo, netplay_hooks::tune_ranges[i].hi);
                 if (r.ok) { d.max_players = std::clamp<unsigned>(capacity,1,kMaxPlayers); d.lobby_players = v; d.lobby_event = le; d.lobby_track = lt; if (!in_event_ && !d.pending_start) d.rules = rules; }
                 (void)ev;
                 if (r.ok && !d.remembered && !v.empty() && d.join_secret.size() == 32) { d.remembered = true; d.remember(v[0].name, d.join_secret); }
             } else if (kind == K_START) {
                 uint32_t id = r.u32(); std::string ev = r.str(); uint32_t seed = r.u32(); std::string tr = r.str(); uint8_t rules = r.u8();
+                uint8_t tune[netplay_hooks::TuneCount]; for (uint8_t &q : tune) q = (uint8_t)r.u8();
                 if (r.ok && id > d.event_id) {
                     d.ensure_defaults();
+                    for (int i = 0; i < netplay_hooks::TuneCount; ++i) d.tuning[i] = std::clamp(tune[i], netplay_hooks::tune_ranges[i].lo, netplay_hooks::tune_ranges[i].hi);
                     d.rules = rules; d.event_id = id; d.event_name = ev; d.pending_start = true; d.start_info = {ev, tr, id, seed, d.my_vehicle, false};
                     d.have_track = false; d.have_roster = false; d.go = false; d.grid_event = d.applied_grid_event = 0; d.initial_grid.clear(); d.grid_acks.clear(); d.car_done = false; d.loaded_sent = false; d.my_phase = P_LOBBY;
                     if (overlay_menu_open()) overlay_toggle();
@@ -1222,7 +1248,7 @@ void Session::poll() {
             for (auto &kv : d.peers) {
                 Peer &p = kv.second; if (!p.alive) continue;
                 if (!p.got_start || p.seen_event != d.event_id) {
-                    Writer w; w.u32(d.event_id); w.str(d.event_name, 40); w.u32(d.start_info.seed); w.str(d.start_info.track, 40); w.u8(d.rules); d.send_to(p.addr, K_START, 0, w);
+                    Writer w; w.u32(d.event_id); w.str(d.event_name, 40); w.u32(d.start_info.seed); w.str(d.start_info.track, 40); w.u8(d.rules); for (uint8_t q : d.tuning) w.u8(q); d.send_to(p.addr, K_START, 0, w);
                 }
                 if (d.have_track && !p.got_track) { Writer w; w.u32(d.event_id); w.str(d.track, 40); d.send_to(p.addr, K_TRACK, 0, w); }
                 if (d.have_roster && !p.got_roster) {
@@ -1355,7 +1381,8 @@ bool Session::take_start(StartInfo &out) {
     in_event_ = true;
     d.my_phase = P_STARTED; d.tick = 0; d.bound = false; d.my_slot = -1; d.remote.clear(); d.puppet_cars.clear(); d.roster.clear(); d.have_roster = false;
     d.have_track = d.role == Impl::Role::Host ? false : false; d.strip.clear();
-    std::fprintf(stderr, "[netplay] event %u '%s' starting (%s)\n", out.event_id, out.event.c_str(), out.host ? "host" : "guest");
+    std::fprintf(stderr, "[netplay] event %u '%s' starting (%s) rules=%u tuning=%u,%u,%u,%u\n", out.event_id, out.event.c_str(), out.host ? "host" : "guest",
+                 d.rules, d.tuning[0], d.tuning[1], d.tuning[2], d.tuning[3]);
     return true;
 }
 void Session::car_chosen(uint32_t vehicle, const std::string &) {
@@ -1375,7 +1402,9 @@ bool Session::wait_track(std::string &track) {
     return true;
 }
 std::string Session::strip() const { return d_->strip; }
-int Session::online_rules() const { return active() ? d_->rules : -1; }
+// The lobby's rules apply to the online event only; a lobby that is still waiting leaves the player's own settings in force.
+int Session::online_rules() const { return in_event_ ? d_->rules : -1; }
+const uint8_t *Session::online_tuning() const { return in_event_ ? d_->tuning : nullptr; }
 bool Session::active() const { return in_event_ || d_->role != Impl::Role::None; }
 bool Session::is_host() const { return d_->role == Impl::Role::Host; }
 uint32_t Session::remote_humans() const { return in_event_ ? (uint32_t)(d_->role == Impl::Role::Host ? d_->alive_count() : (d_->lobby_players.size() > 1 ? d_->lobby_players.size() - 1 : 0)) : 0; }
@@ -1711,6 +1740,7 @@ namespace {
 const bool g_registered = [] {
     namespace H = netplay_hooks;
     H::race_rules = [] { return session().online_rules(); };
+    H::race_tuning = [] { return session().online_tuning(); };
     H::menu_enter = [] { session().menu_enter(); };
     H::menu_leave = [] { session().menu_leave(); };
     H::take_start = [](H::StartInfo &i) { return session().take_start(i); };

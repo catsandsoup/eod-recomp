@@ -111,6 +111,11 @@ bool config_load(const std::string &path, Config &c) {
 #endif
             else if (ieq(k, "Detail") && (ieq(v,"original") || ieq(v,"high") || ieq(v,"maximum")))
                 c.detail = ieq(v,"maximum") ? "maximum" : ieq(v,"high") ? "high" : "original";
+            else if (ieq(k, "DrawDistance")) {
+                char *end = nullptr;
+                const float d = strtof(v.c_str(), &end);
+                if (end != v.c_str() && !*end && d >= 1 && d <= 8) c.draw_distance = d;
+            }
             else if (ieq(k, "Adapter")) c.adapter = num(0, 15);
             else if (ieq(k, "Fullscreen")) c.fullscreen = to_bool(v);
             else if (ieq(k, "Width")) c.width = num(320, 16384);
@@ -161,6 +166,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "TurboScale")) c.turbo_scale = (float)atof(v.c_str());
             else if (ieq(k, "ChickenForceScale")) c.chicken_force_scale = (float)atof(v.c_str());
             else if (ieq(k, "ChickenRadiusScale")) c.chicken_radius_scale = (float)atof(v.c_str());
+            else if (ieq(k, "ChickenReload")) { const float r = (float)atof(v.c_str()); if (r >= 0.25f && r <= 10.0f) c.chicken_reload = r; }
             else if (ieq(k, "BattleBots")) c.battle_bots = to_bool(v);
             else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
             else if (ieq(k, "Invincible") || ieq(k, "GodMode")) c.cheat_invincible = to_bool(v);
@@ -227,6 +233,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "; Test Drive: Eve of Destruction - PC port settings (written by eodsetup and the in-game menu)\n\n");
     fprintf(f, "[Video]\n");
     fprintf(f, "Detail=%s\n", c.detail.c_str());
+    if (c.draw_distance != 1.0f) fprintf(f, "DrawDistance=%g\n", double(c.draw_distance));
 #ifdef _WIN32
     fprintf(f, "Renderer=%s        ; d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
 #else
@@ -281,6 +288,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "TurboScale=%.2f       ; multiplier for turbo thrust and top speed cap (default 1.0)\n", c.turbo_scale);
     fprintf(f, "ChickenForceScale=%.2f; multiplier for chicken explosion blast impulse (default 1.0)\n", c.chicken_force_scale);
     fprintf(f, "ChickenRadiusScale=%.2f; multiplier for chicken explosion blast radius (default 1.0)\n", c.chicken_radius_scale);
+    fprintf(f, "ChickenReload=%.2f    ; seconds between chicken shots (default 3.0)\n", c.chicken_reload);
     fprintf(f, "BattleBots=%d         ; 1: fill Battle to four participants; restart event to apply\n", c.battle_bots ? 1 : 0);
     fprintf(f, "SinglePlayerBattle=%d ; 1: inject Battle Mode into single player action menus with AI\n", c.sp_battle_mode ? 1 : 0);
     fprintf(f, "CareerMoney=%d        ; 1: Career money never drops below $10,000 (winnings still add)\n", c.career_money ? 1 : 0);

@@ -44,6 +44,7 @@ public:
     void event_ended();                           // GameDoSingle returned
     bool event_active() const { return in_event_; }
     int online_rules() const;
+    const uint8_t *online_tuning() const;   // lobby cheat tuning during an online event, else null
     bool active() const;                          // true whenever hosting, connecting, in lobby, or racing
     bool is_host() const;
     uint32_t remote_humans() const;               // extra cars the roster needs (Battle size)

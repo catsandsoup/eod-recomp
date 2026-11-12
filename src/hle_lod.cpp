@@ -13,6 +13,8 @@ extern "C" void f_0021C6E0_orig();
 extern "C" void f_00218E68_orig();
 extern "C" void f_0034E308_orig();
 extern "C" void f_00212B58_orig();
+float eod_draw_distance();
+void eod_draw_distance_native_fog(float source);
 namespace {
 bool trace() { static const bool enabled = std::getenv("EOD_LOD_TRACE") != nullptr; return enabled; }
 bool ram(uint32_t a, uint32_t size) { return a && !(a & 3) && a < EE_RAM_SIZE && size <= EE_RAM_SIZE-a; }
@@ -130,12 +132,19 @@ extern "C" void f_0034E308() {
 // Native camera builder divides the configured distance by the view count and
 // derives BOTH projection and fog from that quotient. Scope the source distance
 // here rather than altering the global view count or projection alone.
+// DrawDistance (hle_draw_distance.cpp) then scales the far plane for both the
+// CPU and VU0 visibility tests and restores the native fog range afterwards.
 extern "C" void f_00212B58() {
     const uint32_t original=ee_r32(0x495d58);
     const float distance=loadf(0x495d58);
     const bool extend=maximum() && ee_r32(0x3d1a74)==2 &&
         std::isfinite(distance) && distance>0 && distance<=1150;
-    if (extend) storef(0x495d58,distance*2);
+    const float source=extend ? distance*2 : distance;
+    const float far=eod_draw_distance();
+    const bool farther=far>1 && std::isfinite(source) && source>0 && source<=1150*2;
+    const bool fog=farther && ee_r32(0x3d1b0c)==0; // the other branch sets no fog
+    if (extend || farther) storef(0x495d58,farther ? source*far : source);
     f_00212B58_orig();
-    if (extend) ee_w32(0x495d58,original);
+    if (extend || farther) ee_w32(0x495d58,original);
+    if (fog) eod_draw_distance_native_fog(source);
 }

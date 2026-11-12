@@ -47,6 +47,15 @@ static int native_collision_damage_calls = 0;
 extern "C" void f_0018AD20_orig() { ++native_damage_calls; }
 extern "C" void f_0018CA98_orig() { ++native_collision_damage_calls; }
 extern "C" void f_0017DA58_orig() {}
+extern "C" void f_0017E000_orig() {}
+extern "C" void f_0017E4D8();
+// Native reload start: writes state and a 3 s deadline only while the weapon cheat is on.
+extern "C" void f_0017E4D8_orig() {
+    const uint32_t body = g_ee.r[4].uw[0];
+    if ((MEM_LW(0x003C4190) & 0x9) != 0x9) return;
+    float t; uint32_t bits = MEM_LW(0x003CDACC); std::memcpy(&t, &bits, 4); t += 3.0f; std::memcpy(&bits, &t, 4);
+    MEM_SW(body + 0x1E0, 0); MEM_SW(body + 0x1E4, bits);
+}
 static int native_driver_calls = 0;
 extern "C" void f_0018F2A8();
 extern "C" void f_0018F2A8_orig() { ++native_driver_calls; }
@@ -420,6 +429,27 @@ int main() {
           "Environment enables invincibility on first launch without an ini");
     unsetenv("EOD_INVINCIBLE");
     std::remove(test_ini);
+
+    {   // A launcher built while Chicken Fight is off is still initialised, so it can be switched on mid-race;
+        // the reload time is the player's setting (3 s = the native value, written by the native code itself).
+        g_config = Config{};
+        const uint32_t body = 0x20000;
+        auto deadline = [&] { float f; uint32_t bits = MEM_LW(body + 0x1E4); std::memcpy(&f, &bits, 4); return f; };
+        float now = 100.0f; uint32_t bits; std::memcpy(&bits, &now, 4); MEM_SW(0x003CDACC, bits);
+        MEM_SW(0x003C4190, 0x1);                                    // cheat off at construction
+        MEM_SW(body + 0x1E0, 0xE3E3E3E3); MEM_SW(body + 0x1E4, 0xE3E3E3E3);
+        g_ee.r[4].ud[0] = body; f_0017E4D8();
+        check(MEM_LW(body + 0x1E0) == 0 && deadline() == 103.0f, "launcher initialised with the weapon cheat off");
+        MEM_SW(0x003C4190, 0x9);
+        g_config.chicken_reload = 0.5f;
+        g_ee.r[4].ud[0] = body; f_0017E4D8();
+        check(MEM_LW(body + 0x1E0) == 0 && deadline() == 100.5f, "reload time follows the ChickenReload setting");
+        g_config.chicken_reload = 3.0f;
+        MEM_SW(body + 0x1E4, 0);
+        g_ee.r[4].ud[0] = body; f_0017E4D8();
+        check(deadline() == 103.0f, "native 3 s reload is the native write");
+        MEM_SW(0x003C4190, 0);
+    }
 
     std::puts("PASS: Live cheats, controller combo triggers, and Battle mode verification succeeded.");
     return 0;

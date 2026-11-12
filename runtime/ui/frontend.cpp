@@ -347,7 +347,16 @@ void Menu::rows_settings(std::vector<Row> &r) {
     r.push_back(host_rule(toggle("durability", "PER-CAR DURABILITY", cfg_.car_durability, "LIVE",
                        "Each car's own damage scale from its files (the game's menus already rate cars by it).")));
     r.push_back(host_rule(toggle("turbo", "TURBO BOOST (L2)", cfg_.cheat_turbo, "LIVE", "Optional cheat: L2 boosts.")));
+    auto amount = [](float v, const char *unit) { char t[24]; snprintf(t, sizeof t, "%.2f%s", v, unit); return std::string(t); };
+    r.push_back(host_rule(choice("turbo_scale", "TURBO STRENGTH", amount(cfg_.turbo_scale, "X"), "LIVE",
+                       "Push and top speed while boosting.")));
     r.push_back(host_rule(toggle("chickens", "CHICKEN FIGHT (L2)", cfg_.cheat_chickens, "LIVE", "Optional cheat: L2 fires chickens.")));
+    r.push_back(host_rule(choice("chicken_reload", "CHICKEN RELOAD", amount(cfg_.chicken_reload, " S"), "LIVE",
+                       "Seconds between shots. The original is 3.")));
+    r.push_back(host_rule(choice("chicken_force", "CHICKEN BLAST FORCE", amount(cfg_.chicken_force_scale, "X"), "LIVE",
+                       "How hard a blast throws cars.")));
+    r.push_back(host_rule(choice("chicken_size", "CHICKEN BLAST SIZE", amount(cfg_.chicken_radius_scale, "X"), "LIVE",
+                       "How far a blast reaches.")));
     r.push_back(host_rule(toggle("invincible", "INVINCIBLE HUMANS", cfg_.cheat_invincible, "LIVE",
                        "Optional cheat: human players take no damage; AI stay vulnerable.")));
 }
@@ -714,6 +723,8 @@ void Menu::reset_tab(Tab t) {
         cfg_.career_cheats = d.career_cheats; cfg_.battle_bots = d.battle_bots; cfg_.sp_battle_mode = d.sp_battle_mode;
         cfg_.manual_recovery = d.manual_recovery; cfg_.car_durability = d.car_durability; cfg_.cheat_turbo = d.cheat_turbo;
         cfg_.cheat_chickens = d.cheat_chickens; cfg_.cheat_invincible = d.cheat_invincible;
+        cfg_.turbo_scale = d.turbo_scale; cfg_.chicken_reload = d.chicken_reload;
+        cfg_.chicken_force_scale = d.chicken_force_scale; cfg_.chicken_radius_scale = d.chicken_radius_scale;
         break;
     case Tab::Inputs:
         for (int i = 0; i < KEY_COUNT; i++) cfg_.keys[i] = d.keys[i];
@@ -752,6 +763,8 @@ void Menu::move_selection(int dy) {
 void Menu::change(const Row &row, int dir, Effects &fx) {
     const std::string &id = row.id;
     auto step = [&](int &v, int lo, int hi, int by) { v = std::clamp(v + dir * by, lo, hi); };
+    // cheat tuning moves in quarter steps, the same units a lobby shares
+    auto stepq = [&](float &v, float lo, float hi) { v = std::clamp(std::round(v * 4.0f + (dir >= 0 ? 1 : -1)) / 4.0f, lo, hi); };
     auto cycle = [&](const char *const *list, int n, std::string &v) { v = list[(index_of(list, n, v) + dir + n) % n]; };
     if (id == "scale") {
 #ifdef _WIN32
@@ -783,6 +796,10 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "durability") cfg_.car_durability = !cfg_.car_durability;
     else if (id == "turbo") cfg_.cheat_turbo = !cfg_.cheat_turbo;
     else if (id == "chickens") cfg_.cheat_chickens = !cfg_.cheat_chickens;
+    else if (id == "turbo_scale") stepq(cfg_.turbo_scale, 1.0f, 4.0f);
+    else if (id == "chicken_reload") stepq(cfg_.chicken_reload, 0.25f, 10.0f);
+    else if (id == "chicken_force") stepq(cfg_.chicken_force_scale, 0.25f, 8.0f);
+    else if (id == "chicken_size") stepq(cfg_.chicken_radius_scale, 0.25f, 4.0f);
     else if (id == "invincible") cfg_.cheat_invincible = !cfg_.cheat_invincible;
     else if (id == "vibration") cfg_.vibration = !cfg_.vibration;
     else if (id == "cu_money") cfg_.career_money = !cfg_.career_money;

@@ -162,7 +162,7 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
         float aim_error=std::fabs(ax*rx+az*rz);
         float elevation=rf(target+0x8C)-rf(car+0x8C);
         // Native state 1 needs a released input first; do not edit reload state.
-        float radius=netplay_hooks::race_scale(g_config.chicken_radius_scale,1.0f);
+        float radius=netplay_hooks::tuned(netplay_hooks::ChickenSize,g_config.chicken_radius_scale);
         if(!std::isfinite(radius) || radius<=0) radius=1;
         float safe_range=7.5f*radius+3.0f+speed*.15f;
         bool fire=ee_r32(iface+4)==2 && !reversing && range>safe_range && range<85 &&

@@ -53,7 +53,7 @@ evidence patch is outside the repo (`online-build/abandoned-determinism-experime
 5. Race: event-scoped SNAP at 30 Hz. Guests send their own car to the host; the host sends every other car (its own,
    the AI cars, other guests' cars) to each guest. 62 bytes per car. Guests never apply SNAP to their
    own roster owner. Older/duplicate ticks and invalid/nonfinite states are discarded. A previous
-   event's datagram cannot populate a rematch timeline. Wire protocol 5 includes the rules extension.
+   event's datagram cannot populate a rematch timeline. Wire protocol 5 added the rules extension; protocol 6 adds the lobby's cheat tuning (turbo strength, chicken reload, blast force and size, in quarter units) to the lobby and start messages.
 6. End: when GameDoSingle returns to the main menu the lobby reopens (ONLINE tab).
 
 ## Smoothing (no ghosting)

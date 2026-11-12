@@ -15,6 +15,8 @@
 0021C6E0 wrap     # bounded single-car selection trace
 00218E68 wrap     # bounded batch selection/submission trace
 0034E308 wrap     # bounded actual CPU sphere visibility trace
+00214678 wrap     # GRAF load: optional DrawDistance scales each mlist LOD group final cutoff
+003582B8 wrap     # mlist calc: EOD_CULL_TRACE per-test rejection counts (diagnostic)
 
 # Semantic native HUD rows: opt-in edge anchors (EOD_HUD_EDGE_ANCHORS=1), centred UI and world untouched.
 00119888 wrap     # left position/lap/damage rows in each supported race viewport
@@ -40,6 +42,8 @@
 
 001B8370 wrap     # optional manual-only human countdown recovery
 0017DA58 wrap     # scale chicken explosion blast radius and impulse force
+0017E000 wrap     # chicken trigger: EOD_CHEAT_TRACE logs each shot (diagnostic)
+0017E4D8 wrap     # chicken reload start: always initialised, so Chicken Fight can be switched on mid-race
 0018F2A8 wrap     # optional turbo boost scaling (speed cap and acceleration)
 001244A8 wrap     # optional single player battle mode injection into action eves
 

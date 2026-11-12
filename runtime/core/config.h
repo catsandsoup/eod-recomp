@@ -16,6 +16,7 @@ enum PadKey {
 struct Config {
     // [Video]
     std::string detail = "original"; // optional car/detail preset; restart to apply
+    float draw_distance = 1.0f;      // track draw distance multiplier 1..8 (1 = original); restart to apply
 #if defined(__APPLE__) && defined(EOD_VULKAN)
     std::string renderer = "vulkan";  // vulkan | software (macOS)
 #elif defined(__APPLE__)
@@ -74,6 +75,7 @@ struct Config {
     float turbo_scale = 1.75f;         // multiplier for turbo push force and top speed
     float chicken_force_scale = 1.0f;  // multiplier for chicken explosion blast force
     float chicken_radius_scale = 1.0f; // multiplier for chicken explosion blast radius
+    float chicken_reload = 3.0f;       // seconds between chicken shots (3 = original)
     bool battle_bots = true;          // fill Battle to four cars with AI; restart event to apply
     bool sp_battle_mode = true;        // inject Battle Mode into single player action menus with AI
     // Career unlocks (docs/CAREER_UNLOCKS.md); all on out of the box, each live in the MODS tab

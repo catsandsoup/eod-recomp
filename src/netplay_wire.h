@@ -8,7 +8,7 @@
 #include <vector>
 #include "netplay_car.h"
 namespace netplay {
-constexpr uint16_t kMagic = 0x7D3E, kProtocol = 5;
+constexpr uint16_t kMagic = 0x7D3E, kProtocol = 6;
 constexpr int kMaxPlayers = 16;
 enum Kind : uint8_t {
     K_JOIN = 1, K_WELCOME, K_REFUSE, K_HEARTBEAT, K_LOBBY, K_START, K_TRACK, K_ROSTER, K_GO, K_END, K_LEAVE,

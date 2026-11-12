@@ -31,6 +31,9 @@ extern "C" void f_00218E68_orig() { native(); }
 extern "C" void f_0034E308_orig() { native(); }
 extern "C" void f_00212B58_orig() { uint32_t u=MEM_LW(0x495d58); std::memcpy(&distance_seen,&u,4); native(); }
 extern "C" void f_00212B58();
+uint8_t g_scratchpad[0x4000];                     // hle_draw_distance.cpp (DrawDistance off here)
+extern "C" void f_00214678_orig() { native(); }
+extern "C" void f_003582B8_orig() { native(); }
 extern "C" void f_0021ABF8();
 extern "C" void f_0021C6E0();
 extern "C" void f_00218E68();
