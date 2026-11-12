@@ -63,6 +63,32 @@ Every code change, fix, and feature MUST be verified against the real game:
 4. Verify the player experience end-to-end (game boot, menu navigation, 3D world state, memory allocator integrity, scene transitions, and clean exit without panics).
 5. Reports without real in-game execution evidence are strictly forbidden.
 
+## Modern hardware, not PS2 limits — hard rule
+
+Accepting a PS2 hardware limit that no longer applies is a failed result, not
+a known limit. The target machine has 8 GB+ of RAM, a modern multi-core CPU and
+GPU, Apple Silicon unified memory and NVMe storage; the remaster must use them.
+This covers guest memory (32 MB EE RAM, 4 MB GS VRAM, allocator heaps, resource
+and instance pools), texture size (4K and 8K replacements), model polygon and
+packet budgets (higher-poly cars from other games), car counts, draw distance and
+streaming. When a limit is found, the deliverable is the expansion: grow guest
+memory or heaps where the game's code allows, or move the data to host-side
+storage the renderer reads directly, and stream from NVMe without hitches.
+Expansion is adaptive: memory, pools and caches grow on demand to fit what the
+loaded content actually needs (bigger textures, more cars, longer draw
+distance), and release it when no longer used. Do not reserve gigabytes up
+front or replace one fixed cap with a bigger fixed cap; 8 GB is the machine
+it must fit comfortably within, not a budget to fill.
+Keep the Original setting faithful and pixel-identical, keep simulation, timing
+and netplay determinism unchanged, and measure memory, frame time and load time
+before and after. A limit may stay only with evidence that expanding it would
+break faithful behaviour; record it in the focused document with that evidence.
+
+No deferral: never commit, publish, install or report as done any work that
+keeps a PS2-level limit and labels it "next step", "follow-up", "out of scope"
+or "for later". A task that runs into a PS2 limit overcomes it, for the long
+term, inside that same task, before the work is considered finished.
+
 ## Creation Kit concurrency — hard rule
 
 The Kit's UI never waits on work. The main thread only draws and takes input.
