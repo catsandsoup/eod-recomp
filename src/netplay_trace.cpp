@@ -190,3 +190,25 @@ extern "C" void f_0012F470_orig(void);
 extern "C" void f_0012F470(void) {const uint32_t s=R[4].uw[0],c=R[31].uw[0];f_0012F470_orig();trace_rng0("range",s,c);}
 extern "C" void f_0012F4F0_orig(void);
 extern "C" void f_0012F4F0(void) {const uint32_t s=R[4].uw[0],c=R[31].uw[0];f_0012F4F0_orig();trace_rng0("bound",s,c);}
+
+// Driver wrapper (car+0x1C1C): a0 = wrapper, a1 = the driver that takes over (wrapper+8 or wrapper+12).
+// Diagnostic: with EOD_NETPLAY_DEBUG each switch is logged with its caller.
+extern "C" void f_00190A38_orig(void);
+extern "C" void f_00190A38(void) {
+ static const bool debug=std::getenv("EOD_NETPLAY_DEBUG")!=nullptr;
+ if(debug){
+  const uint32_t wrapper=R[4].uw[0],driver=R[5].uw[0],state=R[17].uw[0],master=ee_r32(0x3cf194);
+  const bool frame_choice=R[31].uw[0]==0x18e924;
+  const uint32_t phase=frame_choice && state && !(state&3) && state<EE_RAM_SIZE-84?ee_r32(state+80):~0u;
+  static uint32_t last[6]={~0u,~0u,~0u,~0u,~0u,~0u};
+  const uint32_t now[6]={driver,R[31].uw[0],phase,ee_r32(0x3cf198),ee_r32(0x3ce560),ee_r32(0x3ce55c)};
+  if(std::memcmp(last,now,sizeof now)){
+   std::memcpy(last,now,sizeof now);
+   std::fprintf(stderr,"[netplay] race state=%08x vtbl=%08x\n",state,state&&!(state&3)&&state<EE_RAM_SIZE-4?ee_r32(state):0);
+   std::fprintf(stderr,"[netplay] driver switch car=%08x to=%s ra=%08x step=%u phase=%d master=%08x vtbl=%08x started=%u force_human=%u force_auto=%u w40=%u w44=%u w48=%u participant=%08x\n",
+                ee_r32(wrapper+32),driver==ee_r32(wrapper+12)?"player":driver==ee_r32(wrapper+8)?"autopilot":"none",R[31].uw[0],ee_r32(0x3cda8c),(int)phase,
+                master,master&&!(master&3)&&master<EE_RAM_SIZE-4?ee_r32(master):0,now[3],now[4],now[5],ee_r32(wrapper+40),ee_r32(wrapper+44),ee_r32(wrapper+48),ee_r32(wrapper+28));
+  }
+ }
+ f_00190A38_orig();
+}

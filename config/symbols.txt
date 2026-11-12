@@ -64,6 +64,7 @@
 0018CFE8 CarUpdateDetachablePanels [V]  # Checks bone displacement thresholds against 8 detachable panel rows -> docs/NASCAR_A2_RECOVERY.md
 0018DBF8 CarInitDetachablePanelTable [V]  # Populates 8 detachable panel entries (doors, hood, decklid, bumpers, fenders) -> docs/NASCAR_A2_RECOVERY.md
 0018F2A8 HumanDriverUpdate [V]  # Reads pad input, updates steering/ pedals, triggers weapons and Turbo Boost -> docs/GAMEPLAY_MODS_RE.md
+00190A38 DriverWrapperSetActive [V]  # Driver wrapper (car+0x1C1C): makes a1 (wrapper+8 or +12) the active driver; wrapped for EOD_NETPLAY_DEBUG -> docs/NETPLAY_STATE_SYNC.md
 00191548 ReplayRecordHumanTick [V]  # Encodes/decodes 6-byte per-tick human control record -> docs/INDEX.md
 001A2D20 AICarUpdate [V]  # Per-frame AI vehicle controller update; wrapped to drive Battle bots -> docs/BATTLE_RECOVERY.md
 001B2868 DetachedWheelPoolReset [V]  # Clears 16-entry detached wheel phob ring buffer at 0x00484E68 -> docs/INDEX.md

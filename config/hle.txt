@@ -75,6 +75,7 @@
 00191548 wrap     # native six-byte per-tick human replay record diagnostics
 00176918 wrap     # opt-in netplay agreed native race RNG seeds
 00176698 wrap     # opt-in agreed native race-start phase and RNG epoch
+00190A38 wrap     # driver wrapper: set the active driver (pace-lap autopilot / player); EOD_NETPLAY_DEBUG logs each switch
 0012F3C8 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F470 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F4F0 wrap     # bounded opt-in RNG0 callsite diagnosis
