@@ -1,7 +1,7 @@
 import Foundation
 
 /// Any JSON scalar a format field can hold.
-enum FormatValue: Decodable, Equatable {
+enum FormatValue: Decodable, Equatable, Sendable {
     case number(Double)
     case text(String)
     case flag(Bool)
@@ -58,6 +58,8 @@ struct FormatField: Decodable, Identifiable {
     let confidence: String?
     let explanation: String?
     let evidence: String?
+    /// File-layout detail; shown only with "Show file internals".
+    let expert: Bool?
 }
 
 struct FormatBlock: Decodable, Identifiable {
@@ -73,10 +75,74 @@ struct FormatBlock: Decodable, Identifiable {
 struct FormatPreview: Decodable {
     let kind: String
     let png: String?
+    let width: Int?
+    let height: Int?
     let points: [[Double]]?
+    /// Path previews: the node number of each point, so the table and the drawing agree.
+    let nodes: [Int]?
     let closed: Bool?
-    let columns: [String]?
+    let unit: String?
+    /// Path previews: caption for the first point ("Start/finish").
+    let start: String?
+    /// Path previews: draw direction arrows along the line.
+    let direction: Bool?
+    let columns: [FormatColumn]?
     let rows: [[FormatValue]]?
+}
+
+/// A column of a `table`. Older views list plain strings; newer ones describe each column.
+struct FormatColumn: Decodable, Identifiable, Hashable {
+    let key: String
+    let label: String
+    let unit: String?
+    let type: String?
+    /// Edit id template, e.g. "node.{id}.x" (`{id}` is the row's first cell). Absent = read-only.
+    let edit: String?
+    let min: Double?
+    let max: Double?
+    /// Text columns: how a line break is shown and typed (e.g. "\\n").
+    let newline: String?
+    var id: String { key }
+
+    init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer(), let text = try? single.decode(String.self) {
+            key = text; label = text; unit = nil; type = nil; edit = nil; min = nil; max = nil; newline = nil
+            return
+        }
+        let box = try decoder.container(keyedBy: Keys.self)
+        key = try box.decode(String.self, forKey: .key)
+        label = try box.decodeIfPresent(String.self, forKey: .label) ?? key
+        unit = try box.decodeIfPresent(String.self, forKey: .unit)
+        type = try box.decodeIfPresent(String.self, forKey: .type)
+        edit = try box.decodeIfPresent(String.self, forKey: .edit)
+        min = try box.decodeIfPresent(Double.self, forKey: .min)
+        max = try box.decodeIfPresent(Double.self, forKey: .max)
+        newline = try box.decodeIfPresent(String.self, forKey: .newline)
+    }
+    private enum Keys: String, CodingKey { case key, label, unit, type, edit, min, max, newline }
+}
+
+/// A large set of rows shown as a scrolling table instead of one field per value.
+struct FormatTable: Decodable {
+    let name: String?
+    /// "path" (racing line nodes), "strings" (game text), or absent.
+    let role: String?
+    let searchable: Bool?
+    let columns: [FormatColumn]
+    let rows: [[FormatValue]]
+}
+
+struct FormatHow: Decodable, Identifiable {
+    let text: String
+    let confidence: String?
+    var id: String { text }
+}
+
+/// A suggested next step, e.g. "Change handling in this car's physics settings".
+struct FormatAction: Decodable {
+    let label: String
+    let archive: String?
+    let asset: String?
 }
 
 struct FormatView: Decodable {
@@ -90,12 +156,10 @@ struct FormatView: Decodable {
     let blocks: [FormatBlock]
     let preview: FormatPreview?
     let warnings: [String]
-}
-
-/// Inspect response for `kind == "format"`.
-struct FormatDetail: Decodable {
-    let kind: String
-    let format: FormatView?
-    let hex: String?
-    let edited: Bool?
+    let table: FormatTable?
+    let howWeKnow: [FormatHow]?
+    let notes: [String]?
+    /// "unused" (the game never reads this file) or "empty".
+    let status: String?
+    let action: FormatAction?
 }

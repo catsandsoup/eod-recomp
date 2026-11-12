@@ -95,22 +95,74 @@ def _finite(value):
 
 def _field(fid, group, label, ftype, value, offset, size, confidence, explanation,
            evidence="", unit="", editable=False, **extra):
+    # `expert` fields (layout internals) are hidden in the app until "Show file internals" is on.
     field = dict(id=fid, group=group, label=label, type=ftype, unit=unit, value=value,
                  offset=offset, size=size, editable=editable, confidence=confidence,
-                 explanation=explanation, evidence=evidence)
+                 explanation=explanation, evidence=evidence, expert=not editable)
     field.update(extra)
     return field
 
 
+_LAYOUTS = (("bw_oval", "oval", True), ("bw_fig8", "fig8", True), ("oval", "oval", False),
+            ("fig8", "fig8", False), ("track", "track", False), ("bw", "track", True))
+_LAYOUT_NAMES = {"oval": "Oval", "fig8": "Figure-8", "track": "Full course"}
+
+
+def line_name(member):
+    """Player-facing identity of a line file from its name: prefix + optional `bw` + layout.
+
+    The prefix is the event's line basename and the layout/direction suffix is the one the game's
+    file-name builder appends (f_0013D9A8). `bw` is confirmed as "driven the other way round" by the
+    data: in every checked track the `bw` file visits the same course with its points in reverse
+    order and opposite direction vectors.
+    """
+    base = str(member or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    stem, _, ext = base.rpartition(".")
+    if not stem:
+        stem, ext = base, ""
+    prefix, layout, backwards = stem, None, False
+    for suffix, name, back in _LAYOUTS:
+        if stem.endswith(suffix):
+            prefix, layout, backwards = stem[:-len(suffix)], name, back
+            break
+    if prefix == "":
+        who = "Base layout"
+    elif prefix in ("rr", "roadrace"):
+        who = "Road Race"
+    elif prefix.startswith("opt"):
+        who = "HomeBase option " + (prefix[3:].strip("_").upper() or "?")
+    else:
+        who = prefix
+    return dict(prefix=prefix, who=who, layout=layout, layout_name=_LAYOUT_NAMES.get(layout, ""),
+                backwards=backwards, ext=ext)
+
+
+def _title(name):
+    ghost = name["ext"] == "ili"
+    if ghost:
+        return f"{name['who']} ghost line"
+    layout = name["layout_name"]
+    if name["prefix"]:
+        parts = [f"{name['who']} racing line"] + ([layout] if layout else [])
+    else:
+        parts = [f"{layout} racing line" if layout else "Racing line"]
+    if name["backwards"]:
+        parts.append("reverse direction")
+    return " \u00b7 ".join(parts)
+
+
 def _empty(data, context):
-    member = str(context.get("member") or "")
+    name = line_name(context.get("member"))
+    ghost = name["ext"] == "ili"
+    what = "ghost line" if ghost else "racing line"
     return dict(
-        schema="eod.ilin/1", fourcc="ILIN", title="Empty line file", confidence="high", editable=False,
-        summary=("This file has no data on the retail disc. The game's directory still lists it, so a "
-                 "track that asks for this line gets nothing from it" + (f" ({member})." if member else ".")),
-        fields=[], blocks=[], preview=None,
-        warnings=["There is nothing to edit here. To give the track this line, add a mod that supplies "
-                  "a full line file under the same name."])
+        schema="eod.ilin/1", fourcc="ILIN", title=_title(name) + " (empty)", confidence="high", editable=False,
+        summary=(f"This {what} file is empty on the original disc, so there is nothing to see or edit. "
+                 "Changing it has no effect on the game."),
+        fields=[], blocks=[], preview=None, status="empty",
+        howWeKnow=[dict(text="The file is 0 bytes in the game's archive. Its directory entry still carries a "
+                             "checksum from a longer original that is not on the disc.", confidence="verified")],
+        warnings=[])
 
 
 def decode(data, context):
@@ -124,6 +176,7 @@ def decode(data, context):
     loop, closed = main_loop(data)
     lap = _f32(data, 12)
 
+    compact = bool(context.get("compact"))
     fields, blocks = [], []
 
     # ---- header (48 bytes) ----
@@ -182,9 +235,9 @@ def decode(data, context):
         grp = f"Node {i}"
         nxt = _u32(data, o + 20)
         nxt_index = _node_index(layout, nxt)
-        role = ("main line" if i < primary else "side line")
+        role = ("Main" if i < primary else "Side")
         x, z = _f32(data, o), _f32(data, o + 4)
-        fields += [
+        node_fields = [
             _field(f"node.{i}.x", grp, "X position", "f32", x, o, 4, "high",
                    "East-west position in metres in the game's world axes (image right on a top-down map). "
                    "Moving it shifts the line, but the stored direction and segment length are not recalculated.",
@@ -238,7 +291,10 @@ def decode(data, context):
                    "medium", "0 for almost every node; one node per line points at the list of side lines.",
                    "src/battle_navigation.cpp notes secondary lists at +0x38"),
         ]
-        table_rows.append([i, role, round(x, 4), round(z, 4)])
+        if not compact:
+            fields += node_fields
+        table_rows.append([i, role, round(x, 3), round(z, 3), round(_finite(_f32(data, o + 24)) or 0.0, 2),
+                           round(_finite(_f32(data, o + 28)) or 0.0, 1)])
 
     # ---- tail ----
     tail_start = layout["node_end"]
@@ -280,35 +336,62 @@ def decode(data, context):
                    "points at a node boundary in every retail line that has side lines"),
         ]
 
+    name = line_name(member)
+    side = count - primary
+    how = [
+        dict(text="The AI driver setup (f_00137A68) loads this file and stops with \"ai: Can't load centerline\" if it is missing.",
+             confidence="high"),
+        dict(text="The file name is the event's line prefix plus the layout and direction, built by f_0013D9A8 "
+                  "(0 fig8, 1 oval, 2 track, 0x200+ the same three with `bw`).", confidence="high"),
+        dict(text="`bw` means the line is driven the other way round: in every file pair checked, the bw file visits "
+                  "the same points in reverse order with opposite direction vectors.", confidence="high"),
+        dict(text="The same line feeds the road-smoke and tyre-wear effects (f_002EC2BC, f_002ECFEC: "
+                  "\"couldn't create ideal line / wear line\").", confidence="medium"),
+        dict(text="Point positions are read as X and Z in metres (native 0x0013AF20, src/battle_navigation.cpp). "
+                  "No height is stored.", confidence="high"),
+        dict(text="Not traced: whether lap counting or wrong-way detection reads this file.", confidence="low"),
+    ]
     if ghost:
         entry = member.endswith("_e.ili")
         title = "Ghost entry line" if entry else "Ghost lap line"
-        kind_summary = (
-            ("A short line named as the track's entry line (the ghost loader logs 'ghost: got entry line'), "
-             if entry else "The path of a recorded ghost run, ") +
-            "stored with its lap time and the ghost's car data. The ghost loader reads these from the ghost "
-            "car archive by track and layout name (f_001174D0: 'ghost: Loading trackline'). ")
-    elif member.endswith(".ild") or not member:
-        title, kind_summary = "Racing line (AI driving path)", (
-            "The path the computer-driven cars follow. The AI driver setup (f_00137A68) loads the line for the "
-            "event's layout and stops with 'ai: Can't load centerline' if it is missing; the file name is "
-            "prefix + layout (oval, fig8, track, bw_oval, bw_fig8, bw) chosen by f_0013D9A8. The same line also "
-            "feeds the road smoke and tyre-wear effects (f_002EC280, f_002ECFEC: 'couldn't create ideal line / wear line'). ")
+        summary = (("The route a ghost car takes into the track, " if entry else "The route of a recorded ghost lap, ") +
+                   f"stored with its lap time ({_f32(data, len(data) - 16):.2f} s) and the ghost car's details. "
+                   "The game reads it from the ghost car archive when it shows a ghost.")
+        how = [dict(text="The ghost loader (f_001174D0) reads \"ghost: Loading trackline\" from the ghost car "
+                         "archive by track and layout name.", confidence="medium")]
+        notes = ["Moving points changes the ghost's route. The recorded lap time and car data stay as they are."]
     else:
-        title, kind_summary = "Racing line", ""
-    summary = (kind_summary +
-               f"Main line: {primary} nodes, {lap:.1f} m, {'closed loop' if closed else 'open'}; "
-               f"{count - primary} further nodes belong to side lines. "
-               "Positions are flat X/Z in metres. Direction, segment length and distance values are stored, not "
-               "derived, so moving a node alone does not update them. "
-               "Not traced: whether lap counting or wrong-way detection reads this file. "
-               "Adding or removing nodes is not supported.")
-    return dict(
-        schema="eod.ilin/1", fourcc="ILIN", title=title, summary=summary, confidence="medium", editable=True,
-        fields=fields, blocks=blocks,
-        preview=dict(kind="path", points=points(data), closed=closed),
-        table=dict(name="Nodes", columns=["index", "line", "x (m)", "z (m)"], rows=table_rows),
+        title = _title(name) if member else "Racing line (AI driving path)"
+        direction = (" It is the same course as the matching forward line, driven in the opposite direction."
+                     if name["backwards"] else "")
+        summary = (f"The route computer-driven cars follow, {lap:.0f} m per lap"
+                   + (", as a closed loop" if closed else "") + "." + direction +
+                   (f" {side} extra points form side routes such as pit road or shortcuts." if side else "") +
+                   " The road smoke and tyre-wear effects use it too.")
+        notes = ["Each track has one line per layout and per direction, so the files in a track look alike: "
+                 "the reverse-direction file visits the same course with its points in the opposite order.",
+                 "Moving a point changes where the AI drives. Lap length and the stored direction at each point "
+                 "are not recalculated, so keep moves small."]
+    columns = [
+        dict(key="index", label="#"),
+        dict(key="route", label="Route"),
+        dict(key="x", label="X", unit="m", type="f32", edit="node.{id}.x", min=-_LIMIT, max=_LIMIT),
+        dict(key="z", label="Z", unit="m", type="f32", edit="node.{id}.z", min=-_LIMIT, max=_LIMIT),
+        dict(key="segment", label="To next point", unit="m"),
+        dict(key="distance", label="Distance along line", unit="m"),
+    ]
+    view = dict(
+        schema="eod.ilin/1", fourcc="ILIN", title=title, summary=summary, confidence="high", editable=True,
+        fields=fields, blocks=blocks, howWeKnow=how, notes=notes,
+        preview=dict(kind="path", points=points(data), nodes=loop, closed=closed, unit="m",
+                     start="Start/finish", direction=True),
+        table=dict(name="Path points", columns=columns, rows=table_rows, role="path", searchable=False),
         warnings=[])
+    if compact:
+        # Only the lap length is useful outside the file-internals view.
+        for f in fields:
+            f["expert"] = True
+    return view
 
 
 def encode(data, edits):

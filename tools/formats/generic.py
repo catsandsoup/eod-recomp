@@ -13,8 +13,8 @@ def _is_words(run):
 def decode(data, context):
     fourcc = context.get("fourcc", "????")
     if not data:
-        return dict(schema="eod.generic/1", fourcc=fourcc, title=f"{fourcc} file", confidence="verified",
-                    summary="This file is empty (0 bytes) in the game's archive, so there is nothing to edit.",
+        return dict(schema="eod.generic/1", fourcc=fourcc, title="Empty file", confidence="verified",
+                    summary="This file is empty on the original disc, so there is nothing to see or edit. Changing it has no effect on the game.",
                     fields=[], blocks=[], preview=None, warnings=[], editable=False)
     blocks, cursor = [], 0
     for match in _TEXT.finditer(data):
@@ -30,7 +30,7 @@ def decode(data, context):
         blocks.append(dict(name=f"Unknown block {len(blocks) + 1}", offset=cursor,
                            size=len(data) - cursor, known=False))
     return dict(schema="eod.generic/1", fourcc=fourcc,
-                title=f"{fourcc} file", confidence="low",
-                summary=(f"The layout of {fourcc} files is not decoded yet. Contents are listed "
-                         "as unknown blocks and any text found inside; saving keeps them unchanged."),
+                title="Not yet understood", confidence="low",
+                summary=("The Creation Kit cannot show this kind of file yet. Any readable text inside is listed "
+                         "below, and the file is kept unchanged when you save."),
                 fields=[], blocks=blocks, preview=None, warnings=[], editable=False)

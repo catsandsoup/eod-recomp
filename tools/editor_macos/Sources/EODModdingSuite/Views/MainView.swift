@@ -117,7 +117,7 @@ struct MainView: View {
                 if state.exportRunning, let export = state.exportStatus {
                     ProgressView(value: Double(export.done), total: Double(max(export.total, 1))).frame(width: 220)
                     Button("Cancel Export") { Task { await state.cancelExport() } }.font(.caption)
-                } else if state.busy { ProgressView().controlSize(.small) }
+                } else if state.loading || state.isWriting { ProgressView().controlSize(.small) }
                 Text(state.status).lineLimit(1).font(.caption).textSelection(.enabled)
                 Spacer()
                 if let path = state.logPath {
@@ -143,7 +143,7 @@ struct MainView: View {
                         .font(.caption).foregroundStyle(.secondary).padding([.horizontal, .bottom], 12)
                 }
             }
-        } else if detail.kind == "texture", let path = detail.image, let image = NSImage(contentsOfFile: path) {
+        } else if detail.kind == "texture", let path = detail.image {
             VStack(spacing: 0) {
                 HStack {
                     Button("Export PNG…") { state.exportTexture() }
@@ -172,36 +172,14 @@ struct MainView: View {
                     }.padding(.horizontal, 10).padding(.bottom, 8)
                 }
             ScrollView {
-                Image(nsImage: image).resizable().interpolation(.none).scaledToFit().padding(20)
+                FileImage(path: path).padding(20)
                 if let meta = detail.metadata { Text("\(meta["width"] ?? 0) × \(meta["height"] ?? 0) · \(meta["levels"] ?? 0) mip levels").foregroundStyle(.secondary) }
             }
             }
         } else if detail.kind == "format" {
             FormatInspectorView(state: state, detail: detail)
-        } else if let sections = detail.sections {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    ForEach(sections.indices, id: \.self) { index in
-                        let section = sections[index]
-                        DisclosureGroup("\(section.name) · \(section.fields.count) values") {
-                            VStack(spacing: 6) {
-                                ForEach(section.fields.indices, id: \.self) { i in
-                                    let field = section.fields[i]
-                                    HStack(alignment: .top) {
-                                        Text(field.key).foregroundStyle(.secondary)
-                                        Spacer()
-                                        if field.editable {
-                                            let key = field.id
-                                            TextField(field.key, text: Binding(get: { state.values[key] ?? field.value }, set: { state.edit(key, $0) }))
-                                                .textFieldStyle(.roundedBorder).frame(minWidth: 130, maxWidth: 300)
-                                        } else { Text(field.value).multilineTextAlignment(.trailing) }
-                                    }.font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                                }
-                            }.padding(.top, 6)
-                        }
-                    }
-                }.padding(18)
-            }.disabled(state.busy || state.gameRunning)
+        } else if detail.sections != nil {
+            ValueTableView(state: state, detail: detail)
         } else {
             Text("This file can't be shown.").foregroundStyle(.secondary).padding(20)
         }
@@ -234,10 +212,10 @@ struct MainView: View {
                         }
                         Text("Replacements keep each texture's original size and color count.")
                             .font(.caption).foregroundStyle(.secondary)
-                        if let path = state.nativePreview, let image = NSImage(contentsOfFile: path) {
+                        if let path = state.nativePreview {
                             Divider()
                             Text("Test race capture").font(.caption.weight(.semibold))
-                            Image(nsImage: image).resizable().scaledToFit()
+                            FileImage(path: path, maxPixel: 900, smooth: true)
                         }
                     } else if let physics = state.physicsDetail, state.editingAsset.lowercased() == "physics.val" {
                         Text(URL(fileURLWithPath: state.archive).deletingPathExtension().lastPathComponent).font(.title3.weight(.semibold))
@@ -252,7 +230,7 @@ struct MainView: View {
                                     let field = fields[i]
                                     let key = field.id
                                     VStack(alignment: .leading, spacing: 5) {
-                                        HStack { Text(field.key).font(.caption.monospaced()); Spacer(); Text(field.unit).font(.caption).foregroundStyle(.secondary) }
+                                        HStack { Text(field.label ?? field.key).font(field.label == nil ? .caption.monospaced() : .caption); Spacer(); Text(field.unit).font(.caption).foregroundStyle(.secondary) }
                                         TextField(field.key, text: Binding(get: { state.values[key] ?? field.value }, set: { state.edit(key, $0) }))
                                             .textFieldStyle(.roundedBorder).accessibilityIdentifier(key)
                                         Text("Original \(field.original)").font(.system(size: 10)).foregroundStyle(.secondary)
@@ -329,11 +307,13 @@ struct ModsView: View {
     }
 }
 
+/// Draws a decoded model. The node tree, textures and camera are built on a background task and attached
+/// on the main thread when ready, so opening a large model never freezes the window.
 struct RetailMeshView: NSViewRepresentable {
     let parts: [MeshPart]
     let identity: String
     var wireframe = false
-    final class Coordinator { var identity = "" }
+    final class Coordinator { var identity = ""; var task: Task<Void, Never>? }
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> SCNView {
         let view = SCNView()
@@ -347,6 +327,27 @@ struct RetailMeshView: NSViewRepresentable {
         let version = identity + String(wireframe)
         guard context.coordinator.identity != version else { return }
         context.coordinator.identity = version
+        context.coordinator.task?.cancel()
+        let parts = parts, wireframe = wireframe
+        context.coordinator.task = Task {
+            let built = await Task.detached(priority: .userInitiated) { MeshScene.build(parts: parts, wireframe: wireframe) }.value
+            guard !Task.isCancelled else { return }
+            view.scene = built.scene
+            view.pointOfView = built.camera
+            view.defaultCameraController.target = built.center
+        }
+    }
+}
+
+/// SceneKit objects are safe to create off the main thread until they are shown; the box carries them across.
+struct BuiltScene: @unchecked Sendable {
+    let scene: SCNScene
+    let camera: SCNNode
+    let center: SCNVector3
+}
+
+enum MeshScene {
+    nonisolated static func build(parts: [MeshPart], wireframe: Bool) -> BuiltScene {
         let scene = SCNScene()
         let root = SCNNode()
         for part in parts {
@@ -360,7 +361,11 @@ struct RetailMeshView: NSViewRepresentable {
             let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: positions),
                 SCNGeometrySource(normals: normals), SCNGeometrySource(textureCoordinates: uv)], elements: [element])
             let material = SCNMaterial()
-            material.diffuse.contents = part.texture.flatMap { NSImage(contentsOfFile: $0) } ?? NSColor.lightGray
+            if let path = part.texture, let image = ImageLoader.load(path) {
+                material.diffuse.contents = image.cg
+            } else {
+                material.diffuse.contents = NSColor.lightGray
+            }
             material.isDoubleSided = true
             material.diffuse.wrapS = .repeat
             material.diffuse.wrapT = .repeat
@@ -379,7 +384,6 @@ struct RetailMeshView: NSViewRepresentable {
         camera.position = SCNVector3(center.x + extent * 1.1, center.y + extent * 0.65, center.z + extent * 1.4)
         camera.look(at: center)
         scene.rootNode.addChildNode(camera)
-        view.scene = scene; view.pointOfView = camera
-        view.defaultCameraController.target = center
+        return BuiltScene(scene: scene, camera: camera, center: center)
     }
 }

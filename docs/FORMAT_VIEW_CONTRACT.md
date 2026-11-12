@@ -64,6 +64,28 @@ native run; `high` = traced to the loader or unambiguous data; `medium` =
 consistent data pattern; `low` = guess. Labels for anything below `high` say
 so in `explanation`.
 
+## Size, tables and plain language (inspector contract)
+
+The app never builds one row per stored value for large files.
+
+- `context.compact` (the service default; `expert: true` in the inspect request turns it off): decoders
+  return only the fields a modder edits or reads (header summary values) plus a `table`. Layout internals
+  are not sent; with `expert: true` the full field list, blocks and bytes come back and fields carry
+  `expert: true`. Fields marked `expert` are hidden until "Show file internals".
+- `table`: `{name, role, searchable, columns: [{key, label, unit?, type?, edit?, min?, max?, newline?}], rows}`.
+  `edit` is an edit-id template (`"node.{id}.x"`, `{id}` = first cell of the row); columns without it are
+  read-only. `newline` is the text shown for a line break in editable text. Legacy `columns: ["A", "B"]`
+  (plain strings) still works. `role`: `path` (racing line nodes), `strings` (game text).
+- `preview` `path` adds `nodes` (node number per point), `unit`, `start` (caption for the first point) and
+  `direction` (draw arrows); the app lets the modder drag points and writes the edits through the table's
+  `x`/`z` column edit ids.
+- View-level: `howWeKnow: [{text, confidence}]` (evidence, collapsed in the app), `notes: [str]`,
+  `status: "unused" | "empty"` with an optional `action: {label, archive, asset}` (a button that selects that
+  asset in the same archive).
+- Titles, summaries, labels and notes are player-facing: no function addresses, offsets or FourCCs. Put those
+  in `howWeKnow` or `evidence`. Confidence is shown as "Confirmed in game" (verified), "From the game's
+  code" (high) or "Best guess" (medium, low).
+
 ## Product language
 
 Titles, labels, explanations and warnings follow AGENTS.md: identify,

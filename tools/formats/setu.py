@@ -221,20 +221,23 @@ def decode(data, context):
     rows = []
     for name, part in (("Spring rate", 0), ("Shock bump", 1), ("Shock rebound", 2), ("Camber", 3), ("Tyre pressure (psi)", 4)):
         rows.append([name] + [round(values[8 + 5 * w + part], 4) for w in range(4)])
-    warnings = ["Eve of Destruction does not load setup sheets, so edits here do not change how a car drives. "
-                "They matter to tools that read sheets, such as the NASCAR import, or to a future loader."]
+    warnings = []
     bad = [s["label"] for s in LAYOUT if not math.isfinite(values[s["index"]])]
     if bad:
         warnings.append("Not a number in: " + ", ".join(bad) + ". Enter a value to repair it.")
     sheet = role(member)
-    summary = ("Car setup sheet: 49 settings covering anti-roll bars, springs, shocks, camber and tyre pressure "
-               "for each wheel, steering lock, four gear ratios, final drive and fuel. Most settings are 0-1 "
-               "positions on ranges each car declares in its physics.val. These sheets come from the NASCAR engine "
-               "the game is built on; the retail executable never reads them, and car handling comes from each "
-               "car's physics.val instead. Meanings come from data patterns across all 64 retail sheets.")
-    if sheet:
-        summary = sheet + " " + summary
-    return dict(schema="eod.setu/1", fourcc="SETU", title="Car setup sheet", confidence="medium",
+    car = str((context or {}).get("archive") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    physics = f"{car}'s physics settings (physics.val)" if car.lower().endswith(".car") else "the car's physics settings (physics.val)"
+    summary = ((sheet + " " if sheet else "") +
+               "A car setup sheet, a leftover from the NASCAR game this one is built on: springs, shocks, "
+               "anti-roll bars, camber, tyre pressure, gear ratios and fuel for each wheel. "
+               "Eve of Destruction never reads it, so changing it has no effect in game. "
+               f"To change how this car handles, edit {physics}.")
+    how = [dict(text="No code in the executable loads these files, and car physics (0x00185470) reads handling only from physics.val.", confidence="high"),
+           dict(text="Setting meanings come from data patterns across all 64 retail sheets, not from game code.", confidence="medium")]
+    return dict(schema="eod.setu/1", fourcc="SETU", title="Car setup sheet (not used by the game)", confidence="medium", status="unused",
+                action=dict(label="Change handling in this car's physics settings", archive=str((context or {}).get("archive") or ""), asset="physics.val"),
+                howWeKnow=how,
                 summary=summary, editable=True, fields=fields, blocks=blocks,
                 preview=dict(kind="table", columns=["Setting", "Front left", "Front right", "Rear left", "Rear right"],
                              rows=rows),

@@ -101,43 +101,50 @@ def _explain(text):
 def _summary(member, count):
     if member.lower() == "usenglish_lang.lng":
         return (f"Every piece of English text the game shows: menu labels, option names, dialogs, driver names, "
-                f"upgrade names and descriptions, units, control names. {count} entries. The executable loads this file "
-                "at start-up (LangLoad) and each screen looks its text up by the key shown for each line, ignoring "
-                "capitals. A line that is missing from this file is shown as its key instead. "
-                "A line break in a value is written \\n.")
+                f"upgrade names and descriptions. {count} lines. Each screen asks for its text by name, so you edit "
+                "the text and leave the name alone. If a name is missing here, the screen shows the name itself. "
+                "A line break is written \\n; codes like %d are filled in by the game and must stay.")
     if member.lower() == "english.lng":
-        return (f"A {count}-entry English text table stored in the boot resources. The retail executable does not "
-                "name this file (it only loads the one in the locale resources), so editing it is not expected to "
-                "change anything on screen; the layout is identical to the main text table.")
-    return (f"A text table with {count} entries, each a key and the text shown in game. Screens look their text up by key, "
-            "ignoring capitals; a missing key shows as the key itself.")
+        return (f"A {count}-line English text table stored with the start-up files. The game does not use this copy, "
+                "so editing it changes nothing on screen. Edit usenglish_lang.lng instead.")
+    return (f"A text table with {count} lines, each a name and the text shown in game. "
+            "Screens ask for text by name; if a name is missing the screen shows the name itself.")
+
+
+_HOW = [
+    dict(text="The game loads the whole file at start-up (LangLoad 0x001342A8) and looks each string up by name "
+              "with a case-insensitive search (0x001347D0, 0x00134620).", confidence="verified"),
+    dict(text="Entry order does not matter to the game; it is kept as shipped.", confidence="high"),
+    dict(text="The 68-byte header is build-tool bookkeeping the game never reads, apart from the entry count.", confidence="medium"),
+]
 
 
 def decode(data, context):
     count, pool, entries = _parse(data)
     member = str(context.get("member") or "")
+    compact = bool(context.get("compact"))
     fields, blocks = [], []
 
     name = data[0:8].split(b"\0", 1)[0].decode(ENCODING)
     fields.append(dict(
         id="header.name", group="File header", label="Language name", type="str", unit="", value=name,
-        offset=0, size=8, editable=False, confidence="high",
+        offset=0, size=8, editable=False, confidence="high", expert=True,
         explanation="Label of the language. The game takes its language name from the executable, not from this field.",
         evidence="LangInit 0x00134048 stores the display name 'English (US)' itself; no read of this field in gen/."))
     fields.append(dict(
         id="header.version", group="File header", label="Table version", type="u32", unit="",
-        value=struct.unpack_from("<I", data, 8)[0], offset=8, size=4, editable=False, confidence="medium",
+        value=struct.unpack_from("<I", data, 8)[0], offset=8, size=4, editable=False, confidence="medium", expert=True,
         explanation="Build version of the table, 0x7E4 in both retail files. The game does not check it.",
         evidence="Retail data; LangLoad 0x001342A8 reads only the count and entries."))
     for offset, (label, explanation) in _HEADER_WORDS.items():
         fields.append(dict(
             id=f"header.{offset:02x}", group="File header", label=label, type="u32", unit="",
-            value=struct.unpack_from("<I", data, offset)[0], offset=offset, size=4, editable=False,
+            value=struct.unpack_from("<I", data, offset)[0], offset=offset, size=4, editable=False, expert=True,
             confidence="medium", explanation=explanation,
             evidence="Retail data pattern; LangLoad 0x001342A8 never touches offsets 0x08 to 0x3F."))
     fields.append(dict(
         id="header.count", group="File header", label="Number of entries", type="u32", unit="",
-        value=count, offset=COUNT_OFFSET, size=4, editable=False, confidence="verified",
+        value=count, offset=COUNT_OFFSET, size=4, editable=False, confidence="verified", expert=True,
         explanation="How many key/text pairs follow. Kept in step automatically when the file is saved.",
         evidence="LangLoad 0x001342A8 loops over this count to add the load address to every offset; "
                  "LangGetString 0x001347D0 stops searching at it."))
@@ -147,6 +154,8 @@ def decode(data, context):
 
     for e in entries:
         text = e["text"]
+        if compact:
+            continue
         blocks.append(dict(
             name=f"Key {e['index']}", offset=e["key_at"], size=e["key_end"] - e["key_at"], known=True,
             text=e["key"], explanation="Name a screen uses to look this text up. Changing it would make the text unreachable."))
@@ -159,15 +168,19 @@ def decode(data, context):
     blocks.sort(key=lambda b: b["offset"])
 
     rows = [[e["index"], e["key"], e["text"].replace("\n", "\\n"), " ".join(specifiers(e["text"]))] for e in entries]
+    table = dict(name="Text lines", role="strings", searchable=True, columns=[
+        dict(key="index", label="#"), dict(key="group", label="Screen / group"), dict(key="key", label="Name"),
+        dict(key="text", label="Text", edit="string.{id}", type="str", newline="\\n")],
+        rows=[[e["index"], _group(e["key"]), e["key"], e["text"]] for e in entries])
     warnings = []
     if len(data) > MAX_FILE_BYTES:
         warnings.append("This file is larger than the memory the game reserves after the text buffer is believed "
                         "to allow; the game may crash while loading it.")
     return dict(
         schema="eod.lang/1", fourcc="LANG", title="Game text", confidence="high",
-        summary=_summary(member, count), editable=True, fields=fields, blocks=blocks,
-        preview=dict(kind="table", columns=["ID", "Key", "Text", "Placeholders"], rows=rows),
-        warnings=warnings)
+        summary=_summary(member, count), editable=True, fields=fields, blocks=blocks, howWeKnow=_HOW,
+        preview=None if compact else dict(kind="table", columns=["ID", "Key", "Text", "Placeholders"], rows=rows),
+        table=table, warnings=warnings)
 
 
 def validate_text(old, new, label="text"):

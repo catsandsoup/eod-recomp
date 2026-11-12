@@ -26,8 +26,16 @@ struct AssetField: Decodable {
     let editable: Bool
     let featured: Bool?
     let unit: String
+    // Plain-language details; absent for tables the backend has not labelled yet.
+    let label: String?
+    let group: String?
+    let explanation: String?
+    let confidence: String?
+    let used: Bool?
+    let min: Double?
+    let max: Double?
 }
-struct AssetSection: Decodable { let name: String; let fields: [AssetField] }
+struct AssetSection: Decodable { let name: String; let fields: [AssetField]; let label: String?; let explanation: String? }
 struct MeshPart: Decodable {
     let name: String
     let positions: [[Double]]
@@ -50,6 +58,8 @@ struct AssetDetail: Decodable {
     let message: String?
     let hex: String?
     let paintDescription: String?
+    let title: String?
+    let summary: String?
     let format: FormatView?
     let warnings: [String]?
     let edited: Bool?

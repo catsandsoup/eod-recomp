@@ -54,7 +54,7 @@ class SyntheticTests(unittest.TestCase):
         self.assertIs(formats.decoder_for("SETU"), setu)
         view = formats.describe("SETU", SAMPLE, {"member": "default.gar"})
         self.assertEqual(view["schema"], "eod.setu/1")
-        self.assertEqual(view["title"], "Car setup sheet")
+        self.assertEqual(view["title"], "Car setup sheet (not used by the game)")
         self.assertTrue(covered_exactly(view, setu.SIZE))
         self.assertEqual(len({f["id"] for f in view["fields"]}), len(view["fields"]))
         self.assertTrue(view["summary"].startswith("Default sheet"))

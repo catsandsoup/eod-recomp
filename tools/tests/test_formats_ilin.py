@@ -40,7 +40,7 @@ class SyntheticTests(unittest.TestCase):
         self.assertIs(formats.decoder_for("ILIN"), ilin)
         data = synthetic()
         view = formats.describe("ILIN", data, {"member": "oval.ild"})
-        self.assertEqual(view["title"], "Racing line (AI driving path)")
+        self.assertEqual(view["title"], "Oval racing line")
         self.assertEqual(formats.apply_edits("ILIN", data, {}), data)
         self.assertEqual(view["preview"]["kind"], "path")
         self.assertTrue(view["preview"]["closed"])

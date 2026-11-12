@@ -354,7 +354,7 @@ def format_result(request, disc, path, entry, data, result, warnings):
     edits = pending if isinstance(pending, dict) else (saved["edits"] if isinstance(saved, dict) and saved.get("kind") == FORMAT_EDIT else None)
     if edits:
         data = formats.apply_edits(entry["type"], data, edits)
-    context = dict(archive=request["archive"], member=entry["name"], disc=str(disc))
+    context = dict(archive=request["archive"], member=entry["name"], disc=str(disc), compact=not request.get("expert"))
     view = formats.describe(entry["type"], data, context)
     view["warnings"] = list(warnings) + list(view.get("warnings", []))
     changed = bool(edits) and data != original

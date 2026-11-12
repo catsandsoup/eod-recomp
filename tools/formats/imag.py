@@ -136,11 +136,11 @@ def decode(data, context):
 
     summary = (f"A {width} x {height} picture"
                + (f" with {count} frames" if count > 1 else "")
-               + " the game draws on menus, the in-race HUD and buttons (for example dials, arrows, controller glyphs and "
-                 "backdrops). It is requested by name through the resource loader (ResourceGet type IMAG), then each "
-                 "frame is uploaded as a 256-colour texture. Replace a picture with a PNG of the same size; it is "
-                 "reduced to 256 colours per frame.")
-    view = dict(schema="eod.imag/1", fourcc="IMAG", title="Interface image", confidence="verified",
+               + " the game draws on menus, the in-race HUD and buttons. To change it, replace it with a PNG of the "
+                 "same size; it is reduced to 256 colours per frame.")
+    how = [dict(text="The game requests pictures by name through the resource loader (ResourceGet type IMAG) and "
+                     "uploads each frame as a 256-colour texture.", confidence="verified")]
+    view = dict(schema="eod.imag/1", fourcc="IMAG", title="Interface image", confidence="verified", howWeKnow=how,
                 summary=summary, editable=True, fields=fields, blocks=blocks,
                 preview=dict(kind="image", png=frames[0], width=width, height=height), warnings=[])
     if count > 1:
