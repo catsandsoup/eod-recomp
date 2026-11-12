@@ -32,14 +32,31 @@ CANCEL_GRACE = 5.0
 MAX_RECOVERIES = 5
 # kind -> policy. resumable: may be requeued after a crash. dedupe_succeeded: a duplicate submit
 # of a finished job returns it while its recorded outputs are intact.
+# lane: which worker lane runs it. Lanes have separate slot limits, so a long export never
+# keeps an index build, a package build or a game run waiting (and vice versa).
 KINDS = dict(
-    texture_export=dict(resumable=True, dedupe_succeeded=False),
-    census=dict(resumable=True, dedupe_succeeded=True),
-    index_build=dict(resumable=True, dedupe_succeeded=True),
-    cli=dict(resumable=True, dedupe_succeeded=False),
-    test_run=dict(resumable=False, dedupe_succeeded=False),
-    stub=dict(resumable=True, dedupe_succeeded=False),
+    texture_export=dict(resumable=True, dedupe_succeeded=False, lane="export"),
+    census=dict(resumable=True, dedupe_succeeded=True, lane="index"),
+    index_build=dict(resumable=True, dedupe_succeeded=True, lane="index"),
+    cli=dict(resumable=True, dedupe_succeeded=False, lane="build"),
+    test_run=dict(resumable=False, dedupe_succeeded=False, lane="game"),
+    stub=dict(resumable=True, dedupe_succeeded=False, lane="export"),
 )
+# Slots per lane (EOD_KIT_LANE_<NAME>=n overrides). The game lane is also guarded by the global
+# "game" resource lock; one slot here just keeps a second run queued instead of spawning it.
+# Sized from the core count (Apple Silicon: 8-24 cores). Index builds parallelise internally (jobs=N).
+_CORES = os.cpu_count() or 8
+LANE_SLOTS = dict(export=max(2, _CORES // 4), index=1, build=max(2, _CORES // 4), game=1)
+
+
+def lane_of(kind, params=None):
+    if kind == "stub" and isinstance(params, dict) and params.get("lane") in LANE_SLOTS:
+        return params["lane"]
+    return KINDS.get(kind, {}).get("lane", "export")
+
+
+def lane_slots():
+    return {lane: int(os.environ.get("EOD_KIT_LANE_" + lane.upper(), str(n))) for lane, n in LANE_SLOTS.items()}
 ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "EOD_MCP_JOB_DELAY")
 
 
@@ -90,7 +107,8 @@ class Store:
 
 
 def job_view(row, ws=None, log_lines=20):
-    out = dict(job_id=row["id"], kind=row["kind"], label=row["label"] or "", state=row["state"], source=row["source"],
+    out = dict(job_id=row["id"], kind=row["kind"], lane=lane_of(row["kind"], json.loads(row["params"] or "{}")),
+               label=row["label"] or "", state=row["state"], source=row["source"],
                created=row["created"], started=row["started"], finished=row["finished"], attempts=row["attempts"],
                maxAttempts=row["max_attempts"], recoveries=row["recoveries"], pid=row["pid"],
                progress_count=row["progress_seq"] or 0, done=row["progress_done"], total=row["progress_total"],
@@ -124,7 +142,10 @@ class Jobs:
     def __init__(self, ws, store, max_workers=None, on_change=None):
         self.ws = Path(ws)
         self.store = store
-        self.max_workers = int(max_workers or os.environ.get("EOD_KIT_MAX_WORKERS", "2"))
+        self.slots = lane_slots()
+        if max_workers or os.environ.get("EOD_KIT_MAX_WORKERS"):  # legacy knob: caps every lane
+            cap = int(max_workers or os.environ["EOD_KIT_MAX_WORKERS"])
+            self.slots = {lane: min(n, cap) for lane, n in self.slots.items()}
         self.backoff_base = float(os.environ.get("EOD_KIT_BACKOFF_BASE", "2.0"))
         self.procs = {}       # job_id -> Popen (spawned by this service)
         self.adopted = {}     # job_id -> pid (left running by a previous service)
@@ -237,7 +258,8 @@ class Jobs:
                 args.append(value)
         sql += " ORDER BY created DESC, id DESC LIMIT ?"
         args.append(int(limit))
-        return [dict(job_id=r["id"], kind=r["kind"], state=r["state"], label=r["label"] or "", created=r["created"],
+        return [dict(job_id=r["id"], kind=r["kind"], lane=lane_of(r["kind"], json.loads(r["params"] or "{}")),
+                     state=r["state"], label=r["label"] or "", created=r["created"],
                      source=r["source"], done=r["progress_done"], total=r["progress_total"])
                 for r in self.store.conn().execute(sql, args)]
 
@@ -290,14 +312,18 @@ class Jobs:
     # ------------------------------------------------------------------ dispatch
     def _dispatch(self):
         conn = self.store.conn()
-        running = conn.execute("SELECT count(*) FROM jobs WHERE state='running'").fetchone()[0]
-        if running >= self.max_workers:
-            return
+        running = {lane: 0 for lane in self.slots}
+        for row in conn.execute("SELECT kind, params FROM jobs WHERE state='running'"):
+            lane = lane_of(row["kind"], json.loads(row["params"] or "{}"))
+            running[lane] = running.get(lane, 0) + 1
         now = time.time()
         for row in conn.execute("SELECT * FROM jobs WHERE state='queued' AND (next_run_at IS NULL OR next_run_at<=?) "
                                 "ORDER BY created", (now,)).fetchall():
-            if running >= self.max_workers or self.stopped.is_set():
+            if self.stopped.is_set():
                 return
+            lane = lane_of(row["kind"], json.loads(row["params"] or "{}"))
+            if running.get(lane, 0) >= self.slots.get(lane, 1):
+                continue
             token = secrets.token_hex(8)
             resources = json.loads(row["resources"] or "[]")
             with kdb.tx(conn):
@@ -322,7 +348,7 @@ class Jobs:
                 continue
             conn.execute("UPDATE jobs SET pid=? WHERE id=?", (proc.pid, row["id"]))
             self.procs[row["id"]] = proc
-            running += 1
+            running[lane] = running.get(lane, 0) + 1
             self.on_change(self.get(row["id"]))
 
     def _lock_taken(self, conn, resource, holder):
@@ -546,8 +572,8 @@ def default_resources(kind, params):
         if mod_dir and Path(mod_dir).name == "active":
             out.append("profile:" + str(Path(mod_dir).resolve().parent))
         return out
-    if kind == "cli" and params.get("out"):
-        return ["export:" + str(Path(params["out"]).resolve())]
+    if kind == "cli" and (params.get("dest") or params.get("out")):
+        return ["export:" + str(Path(params.get("dest") or params["out"]).resolve())]
     if kind == "stub":
         return list(params.get("resources") or [])
     return []

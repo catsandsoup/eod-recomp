@@ -9,7 +9,7 @@ from pathlib import Path
 TOOLS = str(Path(__file__).resolve().parents[1])
 sys.path.append(TOOLS)
 
-job_dir = Path(sys.argv[1])
+job_dir = Path(sys.argv[1]) if __name__ == "__main__" else None  # kit_service/worker.py sets its own sinks
 cancel = threading.Event()
 child = {"proc": None}
 
@@ -24,8 +24,9 @@ def on_term(signum, frame):
             pass
 
 
-signal.signal(signal.SIGTERM, on_term)
-signal.signal(signal.SIGINT, on_term)
+def install_signals():
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
 
 
 def progress(done=None, total=None, message="", current=None):
@@ -152,6 +153,7 @@ def test_run(p):
 KINDS = dict(census=census, texture_export=texture_export, cli=cli, test_run=test_run)
 
 if __name__ == "__main__":
+    install_signals()
     job = json.loads((job_dir / "job.json").read_text())
     try:
         res = KINDS[job["kind"]](job["params"])

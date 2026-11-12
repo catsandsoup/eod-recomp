@@ -103,10 +103,10 @@ final class StudioTests: XCTestCase {
         state.prepareTexture(allSky: true); try await settle(state)
         XCTAssertNil(state.error); XCTAssertEqual(state.pendingTextures.count, 2)
         XCTAssertTrue(state.dirty); XCTAssertTrue(state.canSave)
-        state.busy = true
+        state.begin(.write)
         state.discardTextureEdits()
-        XCTAssertEqual(state.pendingTextures.count, 2, "Discard must not race a pending operation")
-        state.busy = false
+        XCTAssertEqual(state.pendingTextures.count, 2, "Discard must not race a pending write")
+        state.end(.write)
         state.save(); try await settle(state)
         XCTAssertNil(state.error); XCTAssertFalse(state.dirty); XCTAssertTrue(state.canTest)
         XCTAssertEqual(state.savedTestTrack, "DATA/TRACKS/ANOKA.TRK")
@@ -225,7 +225,64 @@ final class StudioTests: XCTestCase {
     @MainActor
     private func settle(_ state: StudioState) async throws {
         let deadline = Date().addingTimeInterval(10)
-        while state.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-        XCTAssertFalse(state.busy, "Production operation did not finish")
+        while (state.loading || state.isWriting) && Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertFalse(state.loading || state.isWriting, "Production operation did not finish")
+    }
+
+    /// The owner's concurrency rule: a long export must not block selecting or inspecting assets.
+    @MainActor
+    func testCanInspectWhileExportRunning() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "ConcurrencyTests." + UUID().uuidString
+        let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        let fixture = Process()
+        fixture.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        fixture.arguments = ["-c", """
+        import sys,json,contextlib,io,random
+        from pathlib import Path
+        sys.path.insert(0,sys.argv[1])
+        from tex import compile_tex
+        from rst0 import pack_archive
+        root=Path(sys.argv[2]);stage=root/'stage';stage.mkdir()
+        (root/'disc/DATA/TRACKS').mkdir(parents=True)
+        (root/'disc/SLUS_209.10').write_bytes(b'synthetic executable')
+        rng=random.Random(7)
+        entries=[]
+        for i in range(80):
+            palette=[bytes(rng.randrange(256) for _ in range(3))+b'\\xff' for _ in range(8)]
+            (stage/f't{i:03d}.tex').write_bytes(compile_tex(64,64,b''.join(rng.choice(palette) for _ in range(64*64))))
+            entries.append(dict(name=f't{i:03d}.tex',fourcc='TEX ',version=10,is_extractable=False))
+        (stage/'manifest.json').write_text(json.dumps(dict(version=6,entries=entries)))
+        with contextlib.redirect_stdout(io.StringIO()):pack_archive(str(stage),str(root/'disc/DATA/TRACKS/ANOKA.TRK'))
+        """, RuntimePaths.repository.appendingPathComponent("tools").path, directory.path]
+        try fixture.run(); fixture.waitUntilExit(); XCTAssertEqual(fixture.terminationStatus, 0)
+        let state = StudioState(preferences: prefs)
+        state.disc = directory.appendingPathComponent("disc").path
+        state.project = directory.appendingPathComponent("mod/project.eodproject").path
+        state.profileRoot = directory.appendingPathComponent("profiles").path
+        state.jobsRoot = directory.appendingPathComponent("jobs").path
+        await state.refresh()
+        state.selectArchive("DATA/TRACKS/ANOKA.TRK"); try await settle(state)
+        XCTAssertNil(state.error)
+
+        let exporting = Task { await state.startExport(to: directory.appendingPathComponent("out").path) }
+        let started = Date().addingTimeInterval(10)
+        while !state.exportRunning && Date() < started { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(state.exportRunning, "export did not start")
+        XCTAssertFalse(state.busy, "an export must not raise the app-wide write gate")
+        for name in ["t040.tex", "t041.tex", "t042.tex"] {
+            let clicked = Date()
+            state.selectAsset(name)
+            while state.detail?.name != name && Date().timeIntervalSince(clicked) < 10 { try await Task.sleep(for: .milliseconds(5)) }
+            XCTAssertEqual(state.detail?.name, name, "inspect must complete while the export runs")
+            XCTAssertNil(state.error)
+        }
+        XCTAssertTrue(state.isRunning(.export), "the export finished before the inspects; the check proved nothing")
+        await exporting.value
+        XCTAssertEqual(state.exportStatus?.state, "complete")
+        XCTAssertEqual(state.exportStatus?.exported, 80)
     }
 }

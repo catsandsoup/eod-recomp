@@ -53,6 +53,15 @@ class LRU:
             self.data.clear()
             self.bytes = 0
 
+    def shrink(self, keep):
+        """Evict least-recently-used entries until at most `keep` (0..1) of the current bytes remain."""
+        with self.lock:
+            target = int(self.bytes * keep)
+            while self.data and self.bytes > target:
+                _, (_, freed) = self.data.popitem(last=False)
+                self.bytes -= freed
+                self.evictions += 1
+
     def stats(self):
         with self.lock:
             return dict(entries=len(self.data), bytes=self.bytes, maxEntries=self.max_entries, maxBytes=self.max_bytes,
@@ -60,10 +69,36 @@ class LRU:
 
 
 MB = 1 << 20
-DIRECTORIES = LRU("directories", 512, 64 * MB)
-PAYLOADS = LRU("payloads", 4096, int(os.environ.get("EOD_KIT_PAYLOAD_CACHE_MB", "256")) * MB)
-DECODED = LRU("decoded", 2048, int(os.environ.get("EOD_KIT_DECODE_CACHE_MB", "256")) * MB)
-RESPONSES = LRU("responses", 256, int(os.environ.get("EOD_KIT_RESPONSE_CACHE_MB", "256")) * MB)
+
+
+def _ram_bytes():
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 8 << 30
+
+
+# Caches start empty and grow only with what is actually opened; nothing is reserved. The byte
+# figure is a ceiling relative to the machine (1/16 of RAM for payloads/decoded), not a target:
+# the service also sheds cache under macOS memory pressure and drops it after an idle spell
+# (server.py watchdog). Entry counts sit above the ~7300 retail members so bytes decide.
+# Overridable: EOD_KIT_<NAME>_CACHE_MB / EOD_KIT_<NAME>_CACHE_ENTRIES.
+RAM = _ram_bytes()
+
+
+def _lru(name, entries, fraction, floor_mb):
+    key = "EOD_KIT_" + name.upper() + "_CACHE_"
+    legacy = dict(payloads="EOD_KIT_PAYLOAD_CACHE_MB", decoded="EOD_KIT_DECODE_CACHE_MB",
+                  responses="EOD_KIT_RESPONSE_CACHE_MB").get(name)
+    mb = os.environ.get(key + "MB") or (os.environ.get(legacy) if legacy else None)
+    budget = int(mb) * MB if mb else max(floor_mb * MB, int(RAM * fraction))
+    return LRU(name, int(os.environ.get(key + "ENTRIES", str(entries))), budget)
+
+
+DIRECTORIES = _lru("directories", 4096, 1 / 256, 64)
+PAYLOADS = _lru("payloads", 65536, 1 / 16, 512)
+DECODED = _lru("decoded", 32768, 1 / 16, 512)
+RESPONSES = _lru("responses", 8192, 1 / 32, 256)
 ALL = (DIRECTORIES, PAYLOADS, DECODED, RESPONSES)
 
 
@@ -141,3 +176,12 @@ def stats():
 def clear():
     for c in ALL:
         c.clear()
+
+
+def shrink(keep):
+    for c in ALL:
+        c.shrink(keep)
+
+
+def total_bytes():
+    return sum(c.bytes for c in ALL)

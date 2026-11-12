@@ -6,6 +6,13 @@ struct MainView: View {
     @ObservedObject var state: StudioState
     @State private var wireframe = false
     var body: some View {
+        content
+        #if DEBUG || EOD_KIT_MEASURE
+            .task { await debugOpenAtLaunch() }
+        #endif
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {

@@ -50,6 +50,9 @@ struct AssetDetail: Decodable {
     let message: String?
     let hex: String?
     let paintDescription: String?
+    let format: FormatView?
+    let warnings: [String]?
+    let edited: Bool?
 }
 struct EnvironmentRecord: Decodable { let track: String; let textures: [String]; let skyTextures: [String]; let worldGeometryEditable: Bool }
 struct TextureChange: Decodable {
@@ -115,7 +118,7 @@ struct LaunchPlan: Decodable {
     let track: String
     let carNote: String?
 }
-struct Envelope<T: Decodable>: Decodable { let ok: Bool; let result: T?; let error: String? }
+struct Envelope<T: Decodable>: Decodable { let ok: Bool; let result: T?; let error: String?; let detail: String? }
 
 enum StudioError: LocalizedError {
     case message(String)
@@ -168,9 +171,56 @@ enum RuntimePaths {
     }
 }
 
+/// Actions that only read; safe to repeat through the helper if the service drops mid-request.
+private let readOnlyActions: Set<String> = ["catalog", "entries", "environment", "inspect", "load", "validate",
+                                             "profile_status", "export_batch_status", "reimport_check", "launch_plan"]
+
 @MainActor
 enum Backend {
-    static func call<T: Decodable>(_ request: [String: Any], as: T.Type) async throws -> T {
+    /// Same request and envelope as tools/modding_backend.py, served by the persistent Kit service
+    /// when it can be reached or started; otherwise one helper process per request (logged).
+    static func call<T: Decodable & Sendable>(_ request: [String: Any], as: T.Type) async throws -> T {
+        let client = KitServiceClient.shared
+        if client.shouldTry() {
+            do {
+                let line = try await client.call(method: "backend", params: try JSONSerialization.data(withJSONObject: request))
+                return try await decode(line, as: T.self)
+            } catch let failure as KitServiceClient.Failure {
+                switch failure {
+                case .unavailable(let reason): client.markUnavailable(reason)
+                case .closed:
+                    if Task.isCancelled { throw CancellationError() }
+                    guard readOnlyActions.contains(request["action"] as? String ?? "") else {
+                        throw StudioError.message("The asset service stopped before confirming this change. Check the project, then try again.")
+                    }
+                    client.markUnavailable("connection closed")
+                }
+            }
+        }
+        return try await spawn(request, as: T.self)
+    }
+
+    /// Decodes a service response off the main actor (model and format views can be several MB).
+    nonisolated static func decode<T: Decodable & Sendable>(_ line: Data, as: T.Type) async throws -> T {
+        try await Task.detached(priority: .userInitiated) { () throws -> T in
+            let response = try JSONDecoder().decode(RPCResponse<Envelope<T>>.self, from: line)
+            if let envelope = response.result { return try unwrap(envelope) }
+            throw StudioError.message(response.error?.message ?? "Asset service returned no result")
+        }.value
+    }
+
+    nonisolated static func unwrap<T: Decodable>(_ envelope: Envelope<T>) throws -> T {
+        guard envelope.ok, let result = envelope.result else {
+            if let detail = envelope.detail, !detail.isEmpty {
+                FileHandle.standardError.write(Data("EOD Creation Kit backend: \(detail)\n".utf8))
+            }
+            throw StudioError.message(envelope.error ?? "Asset backend returned no result")
+        }
+        return result
+    }
+
+    /// The original transport: a fresh helper process per request.
+    static func spawn<T: Decodable & Sendable>(_ request: [String: Any], as: T.Type) async throws -> T {
         let input = try JSONSerialization.data(withJSONObject: request)
         let helper = RuntimePaths.helper.path
         let data = try await Task.detached(priority: .userInitiated) {
@@ -187,13 +237,30 @@ enum Backend {
             try stdin.fileHandleForWriting.close()
             let bytes = stdout.fileHandleForReading.readDataToEndOfFile()
             task.waitUntilExit()
-            return bytes
+            return try unwrap(try JSONDecoder().decode(Envelope<T>.self, from: bytes))
         }.value
-        let envelope = try JSONDecoder().decode(Envelope<T>.self, from: data)
-        guard envelope.ok, let result = envelope.result else {
-            throw StudioError.message(envelope.error ?? "Asset backend returned no result")
-        }
-        return result
+        return data
+    }
+
+    /// Claim the single game-test slot shared with MCP runs. Returns false only when another run holds it.
+    static func acquireGame() async throws -> Bool {
+        let client = KitServiceClient.shared
+        guard client.shouldTry() else { return true }
+        do {
+            let params: [String: Any] = ["resource": "game", "pid": Int(ProcessInfo.processInfo.processIdentifier), "owner": "app"]
+            let line = try await client.call(method: "lock.acquire", params: try JSONSerialization.data(withJSONObject: params))
+            let response = try JSONDecoder().decode(RPCResponse<GameLock>.self, from: line)
+            if let error = response.error { throw StudioError.message(error.message) }
+            return true
+        } catch is KitServiceClient.Failure { return true }
+    }
+
+    static func releaseGame() async {
+        let client = KitServiceClient.shared
+        guard client.shouldTry() else { return }
+        let params: [String: Any] = ["resource": "game", "pid": Int(ProcessInfo.processInfo.processIdentifier), "owner": "app"]
+        guard let body = try? JSONSerialization.data(withJSONObject: params) else { return }
+        _ = try? await client.call(method: "lock.release", params: body)
     }
 }
 
@@ -221,7 +288,9 @@ final class StudioState: ObservableObject {
     @Published var values: [String: String] = [:]
     @Published var search = ""
     @Published var assetCount = 0
-    @Published var busy = false
+    /// Operations in flight, by lane. Reads (catalog, entries, inspect, prepare) never wait for
+    /// exports, builds, saves or game runs; only conflicting project/profile writes exclude each other.
+    @Published private(set) var running: [Operation: Int] = [:]
     @Published var status = ""
     @Published var error: String?
     @Published var gameRunning = false
@@ -236,7 +305,8 @@ final class StudioState: ObservableObject {
     @Published var builtPackage: PackageResult?
     var profileRoot: String?
     var jobsRoot: String?
-    private var operations = 0
+    private var archiveTask: Task<Void, Never>?
+    private var inspectTask: Task<Void, Never>?
     private var usingProfile = false
     private var savedValues: [String: String] = [:]
     private var undoStack: [(String, String, String)] = []
@@ -262,14 +332,36 @@ final class StudioState: ObservableObject {
         }
     }
     var dirty: Bool { values != savedValues || !pendingTextures.isEmpty }
-    var canUndo: Bool { !undoStack.isEmpty && !busy && !gameRunning }
-    var canRedo: Bool { !redoStack.isEmpty && !busy && !gameRunning }
-    var canSave: Bool { !busy && !gameRunning && ((!editingAsset.isEmpty && !values.isEmpty) || !pendingTextures.isEmpty) }
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+    var canSave: Bool { !isWriting && !gameRunning && ((!editingAsset.isEmpty && !values.isEmpty) || !pendingTextures.isEmpty) }
     var profileActive: Bool { profile?.packages.contains(where: \.enabled) == true && profile?.active.composed == true }
     var exportRunning: Bool { exportStatus?.state == "running" }
-    var canTest: Bool { !busy && !gameRunning && !dirty && (savedTestArchive != nil || profileActive) && FileManager.default.fileExists(atPath: project) }
-    func begin() { operations += 1; busy = true }
-    func end() { operations = max(0, operations - 1); busy = operations > 0 }
+    var canTest: Bool { !isWriting && !gameRunning && !dirty && (savedTestArchive != nil || profileActive) && FileManager.default.fileExists(atPath: project) }
+
+    enum Operation: Hashable, Sendable {
+        case catalog, load, entries, inspect, prepare, file, export, game
+        /// Writes to the project file or overlay (save, host import/remove).
+        case write
+        case build, profile
+    }
+    func begin(_ operation: Operation = .write) { running[operation, default: 0] += 1 }
+    func end(_ operation: Operation = .write) {
+        guard let count = running[operation] else { return }
+        running[operation] = count > 1 ? count - 1 : nil
+    }
+    func isRunning(_ operation: Operation) -> Bool { running[operation] != nil }
+    /// A project or profile write is in flight; another write would conflict with it.
+    var isWriting: Bool { isRunning(.write) || isRunning(.build) || isRunning(.profile) }
+    /// The selected archive or asset is still loading (for spinners).
+    var loading: Bool { isRunning(.catalog) || isRunning(.load) || isRunning(.entries) || isRunning(.inspect) || isRunning(.prepare) }
+    /// Compatibility for views not yet moved to `isWriting` / `loading`: true only while a conflicting
+    /// write runs, so selecting and inspecting stay enabled during exports, builds and game runs.
+    var busy: Bool { isWriting }
+    private func report(_ failure: Error) {
+        if failure is CancellationError { return }
+        error = failure.localizedDescription
+    }
     var currentAssetID: String { archive.isEmpty || asset.isEmpty ? "" : archive + "#" + asset }
     var currentHost: HostRecord? { hostTextures.first { $0.key.caseInsensitiveCompare(currentAssetID) == .orderedSame }?.value }
     var filteredAssets: [AssetRecord] { assets.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.type.localizedCaseInsensitiveContains(search) } }
@@ -307,9 +399,9 @@ final class StudioState: ObservableObject {
         } else { await refresh(); await refreshProfile() }
     }
     func refresh() async {
-        guard !busy else { return }
-        busy = true; error = nil
-        defer { busy = false }
+        guard !isRunning(.catalog) else { return }
+        begin(.catalog); error = nil
+        defer { end(.catalog) }
         do {
             let result = try await Backend.call(request("catalog"), as: Catalog.self)
             archives = result.archives; assetCount = result.assetCount
@@ -319,38 +411,49 @@ final class StudioState: ObservableObject {
         } catch { self.error = error.localizedDescription }
     }
     func selectArchive(_ value: String) {
-        guard !busy, !gameRunning, value != archive, permitDiscard() else { return }
+        guard value != archive, permitDiscard() else { return }
         archive = value; asset = ""; detail = nil; physicsDetail = nil; editingAsset = ""; values = [:]; savedValues = [:]
         undoStack = []; redoStack = []; assets = []; pendingTextures = [:]; environmentDetail = nil; nativePreview = nil
-        busy = true; error = nil
-        Task {
-            defer { busy = false }
+        error = nil
+        archiveTask?.cancel(); inspectTask?.cancel()
+        begin(.entries)
+        archiveTask = Task {
+            defer { end(.entries) }
             do {
-                assets = try await Backend.call(request("entries"), as: EntryList.self).entries
+                let entries = try await Backend.call(request("entries"), as: EntryList.self).entries
+                guard archive == value, !Task.isCancelled else { return }
+                assets = entries
                 try await loadPhysics()
+                guard archive == value, !Task.isCancelled else { return }
                 if archive.lowercased().hasSuffix(".trk") {
-                    environmentDetail = try await Backend.call(request("environment"), as: EnvironmentRecord.self)
+                    let environment = try await Backend.call(request("environment"), as: EnvironmentRecord.self)
+                    guard archive == value, !Task.isCancelled else { return }
+                    environmentDetail = environment
                     asset = environmentDetail?.skyTextures.first ?? assets.first?.name ?? ""
                 } else {
                 asset = assets.first(where: { $0.name.lowercased() == "low1.mod" })?.name ?? assets.first?.name ?? ""
                 }
                 if !asset.isEmpty { await inspectSelection() }
             }
-            catch { self.error = error.localizedDescription }
+            catch { report(error) }
         }
     }
     func selectAsset(_ value: String) {
-        guard !busy, !gameRunning, value != asset else { return }
+        guard value != asset else { return }
         if assets.first(where: { $0.name == value })?.type == "VALT" && value != editingAsset && !permitDiscard() { return }
-        asset = value; detail = nil; busy = true; status = "\(archive) / \(asset)"
-        Task { await inspectSelection() }
+        asset = value; detail = nil; status = "\(archive) / \(asset)"
+        inspectTask?.cancel()
+        begin(.inspect)  // counted before the task starts so `loading` is true from the click
+        inspectTask = Task { defer { end(.inspect) }; await inspectSelection() }
     }
     func loadPhysics() async throws {
         physicsDetail = nil
         guard archive.lowercased().hasSuffix(".car"),
               let name = assets.first(where: { $0.name.lowercased() == "physics.val" })?.name else { return }
         var input = request("inspect"); input["asset"] = name
+        let owner = archive
         let physics = try await Backend.call(input, as: AssetDetail.self)
+        guard archive == owner else { return }
         physicsDetail = physics
         editingDetail = physics
         editingAsset = name
@@ -360,10 +463,12 @@ final class StudioState: ObservableObject {
         savedValues = values
     }
     func inspectSelection() async {
-        busy = true; error = nil
-        defer { busy = false }
+        begin(.inspect); error = nil
+        defer { end(.inspect) }
+        let target = currentAssetID
         do {
             let result = try await Backend.call(request("inspect"), as: AssetDetail.self)
+            guard currentAssetID == target else { return }  // the selection moved on while this loaded
             detail = result
             if result.kind == "table", editingAsset != asset {
                 editingAsset = asset
@@ -374,10 +479,10 @@ final class StudioState: ObservableObject {
                 savedValues = values; undoStack = []; redoStack = []
             }
             status = "\(archive) / \(asset)"
-        } catch { self.error = error.localizedDescription }
+        } catch { if currentAssetID == target { report(error) } }
     }
     func edit(_ key: String, _ new: String) {
-        guard !busy, !gameRunning, let old = values[key], old != new else { return }
+        guard let old = values[key], old != new else { return }
         undoStack.append((key, old, new)); redoStack = []; values[key] = new
     }
     func undo() {
@@ -403,22 +508,28 @@ final class StudioState: ObservableObject {
                 }
             }
         }
-        busy = true; error = nil
+        let sentValues = values, sentArchive = archive, sentTextures = Set(pendingTextures.keys)
+        begin(.write); error = nil
         Task {
-            defer { busy = false }
+            defer { end(.write) }
             do {
                 let result = try await Backend.call(input, as: SavedProject.self)
-                savedValues = values; pendingTextures = [:]; tintRed = "1.0"; tintGreen = "1.0"; tintBlue = "1.0"
+                // Edits made while the save was in flight stay pending (and keep the project dirty).
+                if archive == sentArchive {
+                    savedValues = sentValues
+                    pendingTextures = pendingTextures.filter { !sentTextures.contains($0.key) }
+                }
+                tintRed = "1.0"; tintGreen = "1.0"; tintBlue = "1.0"
                 if archive.lowercased().hasSuffix(".trk") { savedTestTrack = archive }
                 if archive.lowercased().hasSuffix(".car") { savedTestArchive = archive }
                 if savedTestArchive == nil { savedTestArchive = "DATA/CAR/ALGAR.CAR" }
                 remember()
                 status = "Saved \(URL(fileURLWithPath: result.archivePath).lastPathComponent) · \(result.bytes.formatted()) bytes · SHA256 \(result.sha256.prefix(12))"
-            } catch { self.error = error.localizedDescription }
+            } catch { report(error) }
         }
     }
     func prepareTexture(allSky: Bool = false, png: URL? = nil) {
-        guard !busy, !gameRunning else { return }
+        guard !isRunning(.prepare), !isWriting else { return }
         var input = request("prepare_texture")
         input["textureEdits"] = pendingTextures.mapValues(\.dictionary)
         input["allSky"] = allSky
@@ -430,28 +541,28 @@ final class StudioState: ObservableObject {
             }
             input["tint"] = [red, green, blue]
         }
-        busy = true; error = nil
+        begin(.prepare); error = nil
         Task {
-            defer { busy = false }
+            defer { end(.prepare) }
             do {
                 let result = try await Backend.call(input, as: TexturePreparation.self)
                 pendingTextures.merge(result.edits) { _, new in new }
                 asset = result.previewAsset
                 await inspectSelection()
                 status = "\(result.count) texture edits pending · Save & Build to test"
-            } catch { self.error = error.localizedDescription }
+            } catch { report(error) }
         }
     }
     func replaceTexture() {
-        guard !busy, !gameRunning else { return }
+        guard !isWriting else { return }
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.png]
         if panel.runModal() == .OK, let url = panel.url { Task { await checkReplacement(url) } }
     }
     func checkReplacement(_ url: URL) async {
-        guard !busy, !gameRunning else { return }
+        guard !isRunning(.prepare) else { return }
         var input = request("reimport_check"); input["png"] = url.path
-        begin(); error = nil
-        defer { end() }
+        begin(.prepare); error = nil
+        defer { end(.prepare) }
         do {
             let check = try await Backend.call(input, as: ReplacementCheck.self)
             if check.mode == nil {
@@ -462,7 +573,7 @@ final class StudioState: ObservableObject {
     }
     func cancelReplacement() { replacement = nil }
     func applyReplacement() async {
-        guard !busy, !gameRunning, let plan = replacement else { return }
+        guard !isWriting, !gameRunning, let plan = replacement else { return }
         if plan.check.mode == "native" {
             replacement = nil
             prepareTexture(png: URL(fileURLWithPath: plan.png))
@@ -480,7 +591,7 @@ final class StudioState: ObservableObject {
         } catch { self.error = error.localizedDescription }
     }
     func removeHostReplacement() async {
-        guard !busy, !gameRunning, currentHost != nil else { return }
+        guard !isWriting, !gameRunning, currentHost != nil else { return }
         begin(); error = nil
         defer { end() }
         do {
@@ -492,15 +603,16 @@ final class StudioState: ObservableObject {
 
     // MARK: Export all textures
     func exportAllTextures() {
-        guard !busy, !gameRunning else { return }
+        guard !isRunning(.export), !exportRunning else { return }
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true
         panel.prompt = "Export"
         if panel.runModal() == .OK, let url = panel.url { Task { await startExport(to: url.path) } }
     }
+    /// Runs as a service job in the export lane; selecting, inspecting, saving and testing stay available.
     func startExport(to destination: String) async {
-        guard !busy, !gameRunning else { return }
-        begin(); error = nil
-        defer { end() }
+        guard !isRunning(.export) else { return }
+        begin(.export); error = nil
+        defer { end(.export) }
         do {
             var input = request("export_batch_status"); input["destination"] = destination
             let before = try await Backend.call(input, as: ExportStatus.self)
@@ -519,7 +631,7 @@ final class StudioState: ObservableObject {
                 if current.state != "running" { break }
             }
             finishExport()
-        } catch { self.error = error.localizedDescription }
+        } catch { report(error) }
     }
     func finishExport() {
         guard let result = exportStatus else { return }
@@ -550,9 +662,9 @@ final class StudioState: ObservableObject {
     }
     var hasModContent: Bool { !hostTextures.isEmpty || savedTestArchive != nil && FileManager.default.fileExists(atPath: project) }
     func buildPackage() async {
-        guard !busy, !gameRunning, !dirty else { return }
-        begin(); error = nil
-        defer { end() }
+        guard !isWriting, !gameRunning, !dirty else { return }
+        begin(.build); error = nil
+        defer { end(.build) }
         do {
             let result = try await Backend.call(request("package_project"), as: PackageResult.self)
             builtPackage = result
@@ -560,12 +672,12 @@ final class StudioState: ObservableObject {
         } catch { self.error = error.localizedDescription }
     }
     func profileOperation(_ action: String, id: String? = nil, package: String? = nil) async {
-        guard !busy, !gameRunning else { return }
+        guard !isWriting, !gameRunning else { return }
         var input = request(action)
         if let id { input["id"] = id }
         if let package { input["package"] = package }
-        begin(); error = nil
-        defer { end() }
+        begin(.profile); error = nil
+        defer { end(.profile) }
         do {
             struct Done: Decodable { let profile: String }
             _ = try await Backend.call(input, as: Done.self)
@@ -578,13 +690,13 @@ final class StudioState: ObservableObject {
         await profileOperation("profile_install", package: built.path)
     }
     func exportTexture() {
-        guard !busy, detail?.kind == "texture" else { return }
+        guard detail?.kind == "texture" else { return }
         let panel = NSSavePanel(); panel.nameFieldStringValue = asset + ".png"; panel.allowedContentTypes = [.png]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         var input = request("export_texture"); input["destination"] = url.path
-        busy = true; error = nil
+        begin(.file); error = nil
         Task {
-            defer { busy = false }
+            defer { end(.file) }
             do {
                 let result = try await Backend.call(input, as: ExportedAsset.self)
                 status = "Exported PNG · \(result.path)"
@@ -592,19 +704,19 @@ final class StudioState: ObservableObject {
         }
     }
     func discardTextureEdits() {
-        guard !busy, !gameRunning else { return }
+        guard !isWriting, !isRunning(.prepare) else { return }
         pendingTextures = [:]
         Task { await inspectSelection() }
     }
     func exportNativeAsset() {
-        guard !busy, !asset.isEmpty else { return }
+        guard !asset.isEmpty else { return }
         let panel = NSSavePanel(); panel.nameFieldStringValue = asset
         panel.message = "Export the original native asset bytes"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         var input = request("export_native"); input["destination"] = url.path
-        busy = true; error = nil
+        begin(.file); error = nil
         Task {
-            defer { busy = false }
+            defer { end(.file) }
             do {
                 let exported = try await Backend.call(input, as: ExportedAsset.self)
                 status = "Exported \(exported.bytes.formatted()) bytes · \(exported.path)"
@@ -612,7 +724,7 @@ final class StudioState: ObservableObject {
         }
     }
     func chooseDisc() {
-        guard !busy, !gameRunning, permitDiscard() else { return }
+        guard !isWriting, !gameRunning, permitDiscard() else { return }
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
         panel.message = "Choose the extracted game folder containing DATA and SLUS_209.10"
         if panel.runModal() == .OK, let url = panel.url {
@@ -622,12 +734,12 @@ final class StudioState: ObservableObject {
         }
     }
     func chooseExecutable() {
-        guard !busy, !gameRunning else { return }
+        guard !gameRunning else { return }
         let panel = NSOpenPanel(); panel.message = "Choose the native eod executable"
         if panel.runModal() == .OK, let url = panel.url { executable = url.path; remember() }
     }
     func newProject() {
-        guard !busy, !gameRunning, permitDiscard() else { return }
+        guard !isWriting, !gameRunning, permitDiscard() else { return }
         let panel = NSSavePanel(); panel.nameFieldStringValue = "project.eodproject"
         panel.canCreateDirectories = true; panel.message = "Choose a separate folder for this mod project and its overlay"
         if panel.runModal() == .OK, let url = panel.url {
@@ -640,13 +752,14 @@ final class StudioState: ObservableObject {
         }
     }
     func openProject() {
-        guard !busy, !gameRunning, permitDiscard() else { return }
+        guard !isWriting, !gameRunning, permitDiscard() else { return }
         let panel = NSOpenPanel(); panel.message = "Choose an EOD retail mod project"
         if panel.runModal() == .OK, let url = panel.url { Task { await loadProject(url.path) } }
     }
     func loadProject(_ path: String) async {
-        guard !busy else { return }
-        busy = true; error = nil
+        guard !isWriting, !isRunning(.load) else { return }
+        begin(.load); error = nil
+        archiveTask?.cancel(); inspectTask?.cancel()
         do {
             let loaded = try await Backend.call(["action": "load", "project": path], as: LoadedProject.self)
             let selectedArchive = loaded.selectedArchive ?? "", selectedAsset = loaded.selectedAsset ?? ""
@@ -687,21 +800,22 @@ final class StudioState: ObservableObject {
             }
             savedTestArchive = loaded.testCarArchive ?? (selectedArchive.lowercased().hasSuffix(".car") ? selectedArchive : (selectedArchive.isEmpty ? nil : "DATA/CAR/ALGAR.CAR")); remember()
             status = "Opened \(URL(fileURLWithPath: path).lastPathComponent)"
-            busy = false
+            end(.load)
             await refreshProfile()
             return
-        } catch { self.error = error.localizedDescription }
-        busy = false
+        } catch { report(error) }
+        end(.load)
     }
     func testGame() {
         guard canTest else { return }
         usingProfile = profileActive
         var input = request(usingProfile ? "launch_profile" : "launch_plan"); input["executable"] = executable
-        busy = true; error = nil
+        begin(.game); error = nil
         Task {
-            defer { busy = false }
+            defer { end(.game) }
             do {
                 let plan = try await Backend.call(input, as: LaunchPlan.self)
+                _ = try await Backend.acquireGame()
                 let task = Process(); task.executableURL = URL(fileURLWithPath: plan.executable); task.arguments = plan.arguments
                 var environment = ProcessInfo.processInfo.environment
                 // An editor launched by a headless test shell must still start the user's visible session.
@@ -713,7 +827,7 @@ final class StudioState: ObservableObject {
                 let log = try FileHandle(forWritingTo: url)
                 task.standardOutput = log; task.standardError = log
                 sessionStopped = false
-                try task.run()
+                do { try task.run() } catch { await Backend.releaseGame(); throw error }
                 process = task; gameRunning = true; logPath = plan.logPath
                 status = "Game process started · requested \(plan.car) / \(plan.track)" + (usingProfile ? " · dev profile" : "")
                     + (plan.carNote.map { " · \($0)" } ?? "")
@@ -735,14 +849,15 @@ final class StudioState: ObservableObject {
     }
     func gameEnded(code: Int32, log: String) {
         gameLog = log; gameRunning = false; process = nil
+        Task { await Backend.releaseGame() }
         status = sessionStopped ? "Test session stopped · exit \(code)" : "Game exited with code \(code)"
         if code != 0 && !sessionStopped { error = "Game failed (\(code)). See the session log." }
     }
     func stopGame() { sessionStopped = true; process?.terminate() }
 
     func prepareToQuit() -> Bool {
-        if busy {
-            let dialog = NSAlert(); dialog.messageText = "Wait for the current asset operation to finish."
+        if isWriting {
+            let dialog = NSAlert(); dialog.messageText = "Wait for the current save, build or install to finish."
             dialog.runModal(); return false
         }
         guard permitDiscard() else { return false }

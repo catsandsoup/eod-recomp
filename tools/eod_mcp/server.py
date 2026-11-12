@@ -32,6 +32,7 @@ class Server:
         self.wlock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.cancelled = set()
+        self.progress_counters = {}
         ctx.jobs.on_change = lambda: self.notify("notifications/resources/list_changed")
 
     def send(self, obj):
@@ -75,7 +76,9 @@ class Server:
             raise RpcError(-32602, "Invalid arguments: " + "; ".join(errs[:5]), dict(errors=errs))
         token = (meta or {}).get("progressToken")
         if token is not None:
-            counter = [0]
+            # progress must increase per token across calls (a client may reuse it while polling a job)
+            with self.wlock:
+                counter = self.progress_counters.setdefault(token, [0])
 
             def prog(done, total, message):
                 counter[0] += 1

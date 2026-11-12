@@ -137,9 +137,11 @@ class Ctx:
         self.config = config or Config()
         self.plans = Plans()
         self.audit = Audit(self.config)
-        from .jobs import JobManager
-        self.jobs = JobManager(self.config)
+        from .jobs import make_job_manager
+        self.jobs = make_job_manager(self.config)
         self.jobs.finish_hook = self._job_finished
+        # Kit service client (shared index, job queue and backend caches with the app), or None.
+        self.svc = getattr(self.jobs, "client", None)
         self.modules = probe_modules(hidden)
         self._census = (None, None)
         self._slus = None
@@ -180,6 +182,16 @@ class Ctx:
 
     def mb(self, action, **kw):
         mb = self.mod("modding_backend")
+        if self.svc is not None:
+            from kit_service.common import ServiceUnavailable
+            try:
+                envelope = json.loads(self.svc.raw("backend", dict(action=action, disc=str(self.disc()), **kw)))["result"]
+            except (ServiceUnavailable, KeyError, ValueError):
+                envelope = None
+            if envelope is not None:
+                if envelope.get("ok"):
+                    return envelope["result"]
+                raise ToolError("BACKEND_ERROR", envelope.get("error") or "backend error")
         try:
             return mb.dispatch(dict(action=action, disc=str(self.disc()), **kw))
         except ToolError:
@@ -367,7 +379,13 @@ def census_start(ctx, a):
             pass
     meta = p.with_name("census.meta.json")
     ctx.config.ws_path("cache/census.json", write=True)
-    r = ctx.jobs.start("census", dict(disc=str(ctx.disc()), out=str(p), meta=str(meta), jobs=a.get("jobs", 1)), "census")
+    if ctx.svc is not None:  # index build in the shared Kit service; census.json is exported from the index
+        r = ctx.jobs._call("index.build", dict(disc=str(ctx.disc()), census_out=str(p), meta_out=str(meta),
+                                                jobs=a.get("jobs", 1), full=bool(a.get("refresh")), source="mcp",
+                                                audit=True, label="census"))
+        r = dict(job_id=r["job_id"], kind="census", state=r["state"], duplicate=r.get("duplicate", False))
+    else:
+        r = ctx.jobs.start("census", dict(disc=str(ctx.disc()), out=str(p), meta=str(meta), jobs=a.get("jobs", 1)), "census")
     ctx.audit.write("eod_census_start", a, None, [dict(path="cache/census.json", before=fingerprint(p), after=None)], note="job started")
     return Out(r, "Census started: poll eod_job_status")
 
@@ -384,6 +402,13 @@ def compact(r):
            limit=dict(type="integer", minimum=1, maximum=200), cursor=dict(type="string")))
 def asset_search(ctx, a):
     ctx.disc()
+    if ctx.svc is not None:
+        try:
+            data = ctx.jobs._call("index.search", dict(a, disc=str(ctx.disc()), limit=a.get("limit", 50)))
+            return Out(data, f"{len(data['assets'])} of {data['total']} matches")
+        except ToolError as e:
+            if e.code != "NOT_CONFIGURED" or "paletteKey" in e.message:
+                raise
     c = ctx.census()
     assets = c["assets"]
     pal = None
@@ -422,6 +447,14 @@ def asset_search(ctx, a):
 @tool("eod_asset_get", "R", "Full census record for one asset id (ARCHIVE#MEMBER) plus preview link.",
       dict(asset_id=dict(type="string")), ["asset_id"])
 def asset_get(ctx, a):
+    if ctx.svc is not None:
+        try:
+            r = ctx.jobs._call("index.get", dict(disc=str(ctx.disc()), assetId=a["asset_id"]))
+            r["previewLink"] = f"eod://asset/{r['archive']}/{r['member']}/preview.png"
+            return Out(r, r["assetId"], links=[r["previewLink"]])
+        except ToolError as e:
+            if e.code != "NOT_CONFIGURED":
+                raise
     c = ctx.census()
     r = next((x for x in c["assets"] if x["assetId"].casefold() == a["asset_id"].casefold()), None)
     if not r:

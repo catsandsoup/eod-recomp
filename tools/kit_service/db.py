@@ -35,7 +35,7 @@ MIGRATIONS = [
         PRIMARY KEY(disc, asset_id, tag));
     CREATE TABLE IF NOT EXISTS relations(
         disc TEXT NOT NULL, src TEXT NOT NULL COLLATE NOCASE, rel TEXT NOT NULL, dst TEXT NOT NULL COLLATE NOCASE,
-        PRIMARY KEY(disc, src, rel, dst));
+        PRIMARY KEY(disc, src, rel, dst)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS relations_dst ON relations(disc, dst, rel);
     CREATE TABLE IF NOT EXISTS thumbnails(
         member_sha256 TEXT NOT NULL, size INTEGER NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,

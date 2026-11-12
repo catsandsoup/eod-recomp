@@ -30,7 +30,7 @@ COMPACT_KEYS = ("assetId", "type", "role", "roleConfidence", "width", "height", 
                 "runtimeKeyShared", "size")
 MAX_FIELDS = 4000
 FTS_FIELDS_CHARS = 64 * 1024
-THUMB_SIZES = (64, 128, 256)
+THUMB_SIZES = (64, 128, 256, 512, 1024)
 
 
 # --------------------------------------------------------------------------- hashing
@@ -297,6 +297,10 @@ def build(conn, disc, jobs=1, full=False, progress=None, cancel=None):
                  "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (key, started, time.time(), summary["mode"], status, len(names),
                                                    len(changed), skipped_stat + skipped_hash, len(removed), done[0],
                                                    summary["seconds"]))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # fold the bulk write back into kit.db
+    except Exception:  # noqa: BLE001 - a concurrent reader only delays the checkpoint
+        pass
     emit(dict(event="finish", done=done[0], total=len(tasks), message=status))
     return summary
 
@@ -396,7 +400,7 @@ def search(conn, disc, params):
     sql = (" FROM assets a JOIN files f ON f.disc=a.disc AND f.path=a.archive WHERE " + " AND ".join(where))
     total = conn.execute("SELECT count(*)" + sql, args).fetchone()[0]
     start = int(params.get("cursor") or 0)
-    limit = max(1, min(int(params.get("limit") or 50), 1000))
+    limit = max(1, min(int(params.get("limit") or 50), int(os.environ.get("EOD_KIT_SEARCH_MAX", "20000"))))
     rows = conn.execute("SELECT a.record" + sql + " ORDER BY f.ord, a.member_index LIMIT ? OFFSET ?",
                         args + [limit, start]).fetchall()
     out = dict(assets=[compact(json.loads(r[0])) for r in rows], total=total)
