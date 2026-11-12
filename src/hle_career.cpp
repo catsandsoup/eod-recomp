@@ -31,6 +31,7 @@ void f_002E35F0_orig(void);
 void f_0018AAD0_orig(void);
 void f_001741C0_orig(void);
 void f_003702F0_orig(void);
+void f_00370608_orig(void);
 void f_0036E9C0_orig(void);
 void f_00370DD8_orig(void);
 void f_0016F4E8_orig(void);
@@ -115,11 +116,13 @@ void fill_dealer(uint32_t out) {
 
 static bool s_buyscreen_active = false;
 static int s_queued_page_delta = 0;
+static bool s_page_turned = false;          // the list menu was ended by a page turn, not by a choice
+constexpr uint32_t kMenuDone = 0x004A1AC0, kMenuResult = 0x004A1AC4;   // the running menu's done flag and result (MenuRun)
 
 void career_show_page_banner() {
     char text[96];
     if (s_pages > 1)
-        std::snprintf(text, sizeof text, "DEALER: PAGE %d OF %d", s_page + 1, s_pages);
+        std::snprintf(text, sizeof text, "PAGE %d OF %d   L1 / R1: MORE CARS", s_page + 1, s_pages);
     else
         std::snprintf(text, sizeof text, "DEALER LOT: STOCK UNLOCKED");
     platform_show_hud_banner(text, 3000);
@@ -142,15 +145,32 @@ extern "C" void f_002E35F0(void) {
 // The dealer's per-frame selection callback runs only while its car list is on screen.
 extern "C" void f_003702F0(void) {
     s_dealer_frames.store(0);
-    if (s_queued_page_delta != 0 && s_pages > 1) {
+    if (s_queued_page_delta != 0 && s_pages > 1 && s_buyscreen_active) {
         s_page = ((s_page + s_queued_page_delta) % s_pages + s_pages) % s_pages;
         s_queued_page_delta = 0;
         s_variant++;
         fill_dealer(0);
         s_banner_due.store(true);
         career_show_page_banner();
+        // Show the new page now: end the list menu as if a row had been chosen. The Buy screen then asks
+        // DealerBuySelected (wrapped below), which answers "nothing bought" for a page turn, and the screen's
+        // own loop rebuilds the list from the dealer stock just written.
+        s_page_turned = true;
+        ee_w32(kMenuResult, 0);
+        ee_w32(kMenuDone, 1);
     }
+    s_queued_page_delta = 0;
     f_003702F0_orig();
+}
+
+// DealerBuySelected: the trade / pay flow for the highlighted car. A page turn is not a purchase.
+extern "C" void f_00370608(void) {
+    if (s_page_turned) {
+        s_page_turned = false;
+        g_ee.r[2].ud[0] = 0;
+        return;
+    }
+    f_00370608_orig();
 }
 
 // dealer Buy screen: pass-through to native MenuRun loop without stack tampering
@@ -393,9 +413,10 @@ static void crash_probe() {
 
 void career_vblank(uint16_t pressed) {
     if (s_buyscreen_active || s_dealer_frames.load() < 10) {
-        if (pressed & (PAD_R2 | PAD_R1 | PAD_RIGHT)) {
+        // L1/R1 or L2/R2 (Q/E and 1/3 on the keyboard). Left/Right belong to the game: they switch Buy / Sell / Drive.
+        if (pressed & (PAD_R2 | PAD_R1)) {
             s_queued_page_delta = 1;
-        } else if (pressed & (PAD_L2 | PAD_L1 | PAD_LEFT)) {
+        } else if (pressed & (PAD_L2 | PAD_L1)) {
             s_queued_page_delta = -1;
         }
     }

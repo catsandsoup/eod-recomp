@@ -159,6 +159,7 @@
 003698E8 HomebaseBuildMenu [V]  # Builds Homebase hub / AutoShop / Garage / Challengers UI menu list -> docs/CAREER_UNLOCKS.md
 0036E9C0 DealerBuyScreen [V]  # Dealership Buy screen MenuRun execution loop -> docs/CAREER_UNLOCKS.md
 003702F0 AutoShopUpdateSelection [V]  # Per-frame AutoShop car list update; wrapped to turn dealer pages on L1/R1 -> docs/CAREER_UNLOCKS.md
+00370608 DealerBuySelected [V]  # Buy screen: trade/pay flow for the highlighted car (a1 = row); returns nonzero when a car was bought; wrapped for dealer paging -> docs/CAREER_UNLOCKS.md
 00370DD8 DealerGetSlotForCar [V]  # Maps vehicle to dealer yard slot without panicking -> docs/CAREER_UNLOCKS.md
 00381BB8 ResetEE [V]  # PS2SDK syscall 0x01
 00381BC8 SetGsCrt [V]  # PS2SDK syscall 0x02 (interlace, display mode, frame/field)

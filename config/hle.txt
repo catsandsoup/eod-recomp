@@ -103,6 +103,7 @@
 00114358 wrap     # Finish one online contest after native race cleanup
 0036E9C0 wrap     # dealer Buy screen: pass-through to MenuRun loop
 00370DD8 wrap     # dealer get_slot_for_car: maps vehicle to yard slot without panicking
+00370608 wrap     # dealer: buy the highlighted car (trade screen); a page turn ends the list menu through it without buying
 0016F4E8 wrap     # HomebaseGetSlotForCar: maps car index to homebase lot slot safely
 0016F748 wrap     # HomebaseGetBuySlotForCar: maps car to homebase buy slot 0..4 without asserting
 
