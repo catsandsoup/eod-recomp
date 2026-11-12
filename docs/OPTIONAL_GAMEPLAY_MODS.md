@@ -323,11 +323,15 @@ launcher armed two frames later and every L2 tap after reload fired. Reload 0.5 
 40 frames apart (3 s: one shot per 200 frames). Two-machine online race (host + guest processes): both logged
 `rules=3 tuning=8,5,5,2` and the host fired on every tap.
 
-Open defect (found by this test, not yet fixed): in that automated two-machine race the guest's own car never
-ran `HumanDriver::DriveUpdate` (`0x0018F2A8`): no launcher lookup was logged on the guest and its car reported
-gas 1.0 with no pad input. Reproduce with a host and guest started with `EOD_NETPLAY_AUTO`, a full AI field
-("No-Rules Race") and `EOD_CHEAT_TRACE=1`; the host logs `human=... launcher=...`, the guest logs none. Next
-decisive test: drive the guest by pad script and compare its car's motion with and without input.
+Open defect (found by this test, not yet fixed): in a rolling-start event ("No-Rules Race", full AI field)
+the guest never gets control of its own car. On the host the pace-lap autopilot hands the car to the player
+within 360 steps (steer 0, gas 0 with no pad input, launcher lookup logged). On the guest the same car keeps
+lapping with AI steering and throttle for the whole race and `HumanDriverUpdate` (`0x0018F2A8`) never runs, so
+the guest can neither drive nor fire. The native AI update (`0x001A2D20`) is not what drives it (a guard there
+never triggered). Cause to confirm: the race-start phase is not shared by default (`0x00176698`,
+`EOD_NETPLAY_ALIGN_START` is opt-in), so the guest stays in the pace lap. Reproduce: host and guest processes
+with `EOD_NETPLAY_AUTO`, `EOD_NETPLAY_DEBUG=1`, `EOD_CHEAT_TRACE=1`; compare the `own slot` lines. Next decisive
+tests: the same race with `EOD_NETPLAY_ALIGN_START=1`, and a standing-start event (Demolition Derby).
 
 Developer tools: `EOD_CHEAT_TRACE=1` (cheat word, rules in effect, launcher lookup, trigger state, shots),
 `EOD_MENU_SCRIPT="FRAME:ROW[:left|right],..."` (press a menu row by id).
