@@ -11,6 +11,7 @@
 bool overlay_wndproc(void *, unsigned, uintptr_t, intptr_t) { return false; }
 bool overlay_captures_input() { return false; }
 uint64_t kernel_vblank_count() { return 0; }
+uint64_t kernel_menu_hold_frames() { return 0; }
 #endif
 namespace fs = std::filesystem;
 int main() {

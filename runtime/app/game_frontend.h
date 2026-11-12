@@ -39,6 +39,9 @@ class Network {
 public:
     virtual ~Network()=default;
     virtual Snapshot snapshot()const=0; // Thread-safe copy, no blocking UI/network waits.
+    // The ONLINE tab is on screen this frame (snapshot() alone, e.g. from SETTINGS, starts nothing):
+    // the network side may look for remembered friends who are hosting while it stays on screen.
+    virtual void viewing_online(){}
     virtual void submit(Command command)=0;
 };
 void set_network(std::shared_ptr<Network>network);

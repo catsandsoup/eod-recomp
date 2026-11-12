@@ -24,6 +24,8 @@
 #include "ui_art.h"
 #include "ui_preview.h"
 #include "../../src/netplay_session.h"
+extern uint64_t kernel_vblank_count();
+extern uint64_t kernel_menu_hold_frames();
 
 [[noreturn]] void app_exit(int code);
 uint64_t gs_drawn_frames();
@@ -442,11 +444,12 @@ void pump_paused_audio() {
 void overlay_enable() { g_available = true; }
 bool overlay_menu_open() { return g_open; }
 bool overlay_captures_input() { return g_open || g_release_wait; }
-// Never hold the game when an online session is active (Hosting, Connecting, Lobby, or Racing) or on the ONLINE tab:
-// pausing the EE thread freezes the local simulation and network pump, which desyncs multiplayer.
+// Never hold the game when an online session is active (Hosting, Connecting, Lobby, or Racing): holding the EE
+// thread freezes the local simulation, which desyncs multiplayer. Which tab is on screen never matters, so
+// switching tabs never resumes a held game or its music; the network pump keeps running while the game is
+// held (hold_for_menu draws the menu through overlay_frame, which polls the session).
 bool overlay_paused() {
-    return g_open && g_config.pause_in_menu && !netplay::session().active() &&
-           !(g_menu && (g_menu->error_active() || g_menu->tab() == frontend::Tab::Online));
+    return g_open && g_config.pause_in_menu && !netplay::session().active() && !(g_menu && g_menu->error_active());
 }
 void overlay_toggle() { open_menu(!g_open); }
 bool overlay_in_screenshots() {
@@ -524,8 +527,65 @@ void overlay_show_online() {
     if (!g_open) { open_menu(true); play(frontend::Sound::Select); }
 }
 
+// Developer test hook: EOD_MENU_SCRIPT="FRAME:ROW[:left|right],..." presses a menu row by its id at a presented
+// frame (game vblanks plus frames drawn while the menu holds the game), through the menu's own input path.
+static void menu_script(frontend::Input &in) {
+    struct Step { uint64_t frame; std::string id; int dx; bool done; };
+    static std::vector<Step> steps;
+    static bool parsed = false;
+    if (!parsed) {
+        parsed = true;
+        if (const char *e = getenv("EOD_MENU_SCRIPT")) {
+            std::string all = e;
+            for (size_t pos = 0; pos < all.size();) {
+                size_t end = all.find(',', pos);
+                if (end == std::string::npos) end = all.size();
+                const std::string item = all.substr(pos, end - pos);
+                pos = end + 1;
+                const size_t c1 = item.find(':');
+                if (c1 == std::string::npos) continue;
+                const size_t c2 = item.rfind(':');
+                Step st{strtoull(item.c_str(), nullptr, 10), item.substr(c1 + 1), 0, false};
+                if (c2 != c1) {
+                    const std::string tail = item.substr(c2 + 1);
+                    if (tail == "left" || tail == "right") { st.dx = tail == "left" ? -1 : 1; st.id = item.substr(c1 + 1, c2 - c1 - 1); }
+                }
+                steps.push_back(st);
+            }
+        }
+    }
+    if (steps.empty() || !g_open || !g_menu) return;
+    const uint64_t frame = kernel_vblank_count() + kernel_menu_hold_frames();
+    for (Step &st : steps) {
+        if (st.done || frame < st.frame) continue;
+        st.done = true;
+        bool found = false;
+        for (int t = 0; t < (int)frontend::Tab::Count && !found; t++) {
+            const auto &rows = g_menu->rows_for((frontend::Tab)t);
+            for (size_t i = 0; i < rows.size(); i++) {
+                if (rows[i].id != st.id) continue;
+                g_menu->set_tab((frontend::Tab)t);
+                g_menu->select((int)i);
+                if (st.dx) in.dx = st.dx; else in.accept = true;
+                found = true;
+                break;
+            }
+        }
+        fprintf(stderr, "[menu] script frame=%llu row=%s %s\n", (unsigned long long)frame, st.id.c_str(), found ? "pressed" : "NOT FOUND");
+        return;   // one step per frame
+    }
+}
+
 void overlay_frame() {
+    static const bool menu_trace = getenv("EOD_MENU_TRACE") != nullptr;
+    const uint64_t poll_t0 = menu_trace ? platform_time_us() : 0;
+    struct FrameClock {  // developer trace: a menu frame that holds the game thread (the app's main thread)
+        uint64_t t0; bool on;
+        ~FrameClock() { if (on && platform_time_us() - t0 > 50000) fprintf(stderr, "[menu] STALL: menu frame took %llu ms\n", (unsigned long long)((platform_time_us() - t0) / 1000)); }
+    } frame_clock{poll_t0, menu_trace};
     netplay::session().poll();   // network pump: every vblank, also with the menu closed or headless
+    if (menu_trace && platform_time_us() - poll_t0 > 50000)
+        fprintf(stderr, "[menu] STALL: network pump held the game thread %llu ms\n", (unsigned long long)((platform_time_us() - poll_t0) / 1000));
     if (!g_available) return;
     if (!g_context) {
         // the chord before the first use (no context yet: nothing else to do)
@@ -549,11 +609,21 @@ void overlay_frame() {
     }
     bool toggled = false;
     frontend::Input in = gather_input(toggled);
+    menu_script(in);
     if (toggled && !g_menu->error_active()) {
         open_menu(!g_open);
         play(g_open ? frontend::Sound::Select : frontend::Sound::Back);
     } else if (g_open && g_import_state != 1) {
         apply(g_menu->update(in));
+    }
+    if (menu_trace) {  // developer trace: menu tab and whether the game is held, per change
+        static int last = -1;
+        const int now = g_open ? (int)g_menu->tab() * 2 + (overlay_paused() ? 1 : 0) : -1;
+        if (now != last) {
+            last = now;
+            fprintf(stderr, "[menu] open=%d tab=%d paused=%d vblank=%llu\n", (int)g_open, g_open ? (int)g_menu->tab() : -1,
+                    (int)overlay_paused(), (unsigned long long)kernel_vblank_count());
+        }
     }
     if (g_release_wait) {
         bool any = false;

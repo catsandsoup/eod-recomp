@@ -46,6 +46,15 @@ const HostPort kTrackers[] = {
 const HostPort kStun[] = {{"stun.l.google.com", 19302}, {"stun.cloudflare.com", 3478}, {"stun1.l.google.com", 19302}};
 
 bool resolve_v4(const char *host, uint16_t port, sockaddr_in &out) {
+    // Degraded-network test hooks (never set in play): EOD_NETPLAY_TEST_DNS_DELAY_MS makes every lookup take
+    // that long, as a blackholed DNS server does; EOD_NETPLAY_TEST_UNREACHABLE answers every lookup with an
+    // address that never replies (TEST-NET-1), as a dead tracker or a network with no route out does.
+    static const int dns_delay = std::getenv("EOD_NETPLAY_TEST_DNS_DELAY_MS") ? std::atoi(std::getenv("EOD_NETPLAY_TEST_DNS_DELAY_MS")) : 0;
+    if (dns_delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(dns_delay));
+    if (std::getenv("EOD_NETPLAY_TEST_UNREACHABLE")) {
+        out = sockaddr_in{}; out.sin_family = AF_INET; out.sin_addr.s_addr = htonl(0xC0000201); out.sin_port = htons(port);
+        return true;
+    }
     addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
     if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return false;
@@ -518,6 +527,9 @@ struct Online::Impl {
             }
             EOD_CLOSESOCK(tsock); tsock = -1;
         }
+#ifndef _WIN32
+        if (game_fd >= 0) { close(game_fd); game_fd = -1; }
+#endif
         running = false;
     }
     void finish() {
@@ -537,7 +549,14 @@ void Online::start(int game_fd, uint16_t local_port, bool want_mapping) {
     if (d_->running) return;
     std::shared_ptr<Impl> dp = d_;
     Impl &d = *dp;
-    d.game_fd = game_fd; d.local_port = local_port; d.stop_flag = false; d.running = true;
+    // Its own handle on the game socket: stop() returns before the network thread has ended, and the caller
+    // closes its socket right after, so the thread must never send on a descriptor number the next socket reuses.
+#ifdef _WIN32
+    d.game_fd = game_fd;
+#else
+    d.game_fd = dup(game_fd);
+#endif
+    d.local_port = local_port; d.stop_flag = false; d.running = true;
     d.rep = Report{};
     d.state.clear(); d.ports_cache.clear(); d.trackers.clear(); d.stun_in.clear();
     d.net_thread = std::thread([dp] { dp->net_thread_main(); });
@@ -545,14 +564,21 @@ void Online::start(int game_fd, uint16_t local_port, bool want_mapping) {
     else { d.rep.map_done = true; }
 }
 
+// Called on the game thread, which is also the app's main thread: never wait here. The network thread
+// can be inside a DNS lookup or a tracker exchange for seconds, so joining it, the tracker goodbyes and
+// the router unmapping all happen on the cleanup thread.
 void Online::stop() {
     if (!d_->running) return;
     std::shared_ptr<Impl> old = d_;
-    old->halt();
+    {
+        std::lock_guard<std::mutex> l(old->m);
+        old->stop_flag = true;
+    }
+    old->cv.notify_all();
     d_ = std::make_shared<Impl>();
     std::memcpy(d_->peer_id, old->peer_id, 20);
     ++g_cleanups;
-    std::thread([old] { old->finish(); --g_cleanups; }).detach();
+    std::thread([old] { old->halt(); old->finish(); --g_cleanups; }).detach();
 }
 void Online::wait_cleanup(int ms) {
     const uint64_t t0 = now_ms();

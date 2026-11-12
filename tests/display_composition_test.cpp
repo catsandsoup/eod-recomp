@@ -12,6 +12,7 @@
 #ifdef EOD_DISPLAY_BACKEND_TEST
 extern "C" { uint8_t *g_ram = nullptr; }
 uint64_t kernel_vblank_count() { return 0; }
+uint64_t kernel_menu_hold_frames() { return 0; }
 void gs_editor_preview_software_frame(bool) {} // no renderer/GS in this CPU-only display test
 uint64_t platform_time_us() { return 0; }
 bool mac_app_settings() { return false; }

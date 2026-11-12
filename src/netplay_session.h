@@ -25,6 +25,7 @@ public:
     ~Session() override;
     // game_frontend::Network
     game_frontend::Snapshot snapshot() const override;
+    void viewing_online() override;
     void submit(game_frontend::Command c) override;
 
     // ---- pump (EE thread)

@@ -14,6 +14,7 @@ uint8_t *g_iop_ram;
 bool g_log_enabled[LOG_CAT_COUNT] = {};
 void log_write(LogCat, const char *, ...) {}
 uint64_t kernel_vblank_count() { return 0; }
+uint64_t kernel_menu_hold_frames() { return 0; }
 
 static uint64_t fake_now;
 static SDL_AudioStream *stream;

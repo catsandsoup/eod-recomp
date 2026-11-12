@@ -3,6 +3,7 @@
 #include <cstdio>
 static uint64_t frame;
 uint64_t kernel_vblank_count() { return frame; }
+uint64_t kernel_menu_hold_frames() { return 0; }
 static int failures, checks;
 #define CHECK(c) do { checks++; if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 int main() {

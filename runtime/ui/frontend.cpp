@@ -524,7 +524,7 @@ void Menu::rows_mods(std::vector<Row> &r) {
 
 void Menu::rows_online(std::vector<Row> &r) {
     game_frontend::Snapshot s;
-    if (net_) s = net_->snapshot();
+    if (net_) { net_->viewing_online(); s = net_->snapshot(); }
     pic_track_ = s.track_pic; pic_car_ = s.car_pic;
     using P = game_frontend::Snapshot::Phase;
     const bool connected = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;

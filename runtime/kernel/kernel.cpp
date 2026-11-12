@@ -318,9 +318,11 @@ void debug_watch() {
 
 // The in-game menu holds the game: keep its window alive and the menu drawn,
 // then resume the timing as if no time had passed.
+uint64_t g_menu_hold_frames = 0;  // menu frames drawn while the game is held (scripted input clock)
 static void hold_for_menu() {
     ProfScope prof(P_EE_IDLE);
     while (overlay_paused()) {
+        ++g_menu_hold_frames;
         gs_overlay_redraw();
         platform_sleep_us(16000);
         if (!platform_pump()) {
@@ -1134,6 +1136,7 @@ void kernel_set_interrupts_enabled(bool on) {
 }
 bool kernel_in_interrupt() { return g_in_interrupt; }
 uint64_t kernel_vblank_count() { return g_vblank_count; }
+uint64_t kernel_menu_hold_frames() { return g_menu_hold_frames; }
 
 bool kernel_call_trampoline(uint32_t addr) {
     if (addr == kThreadExitAddr) {

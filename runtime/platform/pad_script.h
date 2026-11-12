@@ -19,6 +19,7 @@
 #include "platform.h"
 
 extern uint64_t kernel_vblank_count();
+extern uint64_t kernel_menu_hold_frames();  // advances while the in-game menu holds the game
 
 struct PadScriptEntry {
     uint64_t frame;
@@ -72,7 +73,9 @@ inline bool pad_script_state(int port, HostPadState *out) {
         }
     }
     if (port < 0 || port > 1 || !active[port]) return false;
-    uint64_t f = kernel_vblank_count();
+    // Script frames are presented frames: game vblanks plus menu frames drawn while the menu holds the game,
+    // so a script can drive the pausing menu.
+    uint64_t f = kernel_vblank_count() + kernel_menu_hold_frames();
     PadScriptEntry cur = {0, 0, 128, 128};
     for (auto &e : script[port])
         if (f >= e.frame) cur = e;

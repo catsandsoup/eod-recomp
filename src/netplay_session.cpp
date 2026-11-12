@@ -14,7 +14,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <atomic>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <random>
 #include <sstream>
 
@@ -193,6 +196,37 @@ struct Session::Impl {
     bool abort_requested = false;
     std::string last_error;
     std::string content_note, content_id;
+    // Game-content check (hashes the whole DATA tree: seconds) runs off the game thread, which is the app's main
+    // thread. It starts when the ONLINE tab comes on screen; HOST/JOIN pressed before it finishes waits for it.
+    struct ContentJob { std::mutex m; bool done = false; netplay::ContentFingerprint result; uint64_t finished_us = 0; };
+    std::shared_ptr<ContentJob> content_job;
+    std::unique_ptr<game_frontend::Command> pending_join;   // HOST/JOIN waiting for the content check
+    void start_content_check() {
+        auto job = std::make_shared<ContentJob>();
+        content_job = job;
+        const char *overlay = std::getenv("EOD_MOD_DIR");
+        std::thread([job, root = g_game_root, ov = std::string(overlay ? overlay : "")] {
+            auto r = netplay::content_fingerprint(root, ov);
+            std::lock_guard<std::mutex> l(job->m);
+            job->result = r; job->done = true; job->finished_us = now_us();
+        }).detach();
+    }
+    bool content_ready(netplay::ContentFingerprint &out) {
+        if (!content_job) return false;
+        std::lock_guard<std::mutex> l(content_job->m);
+        if (!content_job->done) return false;
+        out = content_job->result;
+        return true;
+    }
+    // Re-check on each visit to the tab (content can change between sessions), at most every 30 s.
+    void refresh_content_check() {
+        bool stale = !content_job;
+        if (!stale) {
+            std::lock_guard<std::mutex> l(content_job->m);
+            stale = content_job->done && now_us() - content_job->finished_us > 30000000;
+        }
+        if (stale) start_content_check();
+    }
     // ---- internet (Garage Code), see docs/NETPLAY_INTERNET.md
     netplay_online::Online online;
     bool online_on = false;
@@ -202,7 +236,8 @@ struct Session::Impl {
     std::vector<Friend> friends; bool friends_loaded = false;
     std::vector<sockaddr_in> targets;          // guest: host candidates from the rendezvous (JOIN is sent to all)
     std::vector<sockaddr_in> punch_targets;    // host: joiners found at the trackers (we send them a punch)
-    uint64_t join_started = 0, last_punch = 0, last_probe = 0, ui_seen = 0, last_remember = 0;
+    uint64_t join_started = 0, last_punch = 0, last_probe = 0, last_remember = 0;
+    std::atomic<uint64_t> ui_seen{0};   // last frame the ONLINE tab was on screen (viewing_online)
     bool joining_online = false, remembered = false;
     std::string join_note;
     std::map<std::string, CrewHost> crew;      // remembered friends currently hosting, by secret
@@ -562,7 +597,6 @@ game_frontend::Snapshot Session::snapshot() const {
     Impl &d = *d_;
     Session *self = const_cast<Session *>(this);
     self->d_->ensure_discovery();
-    d.ui_seen = now_us();
     using S = game_frontend::Snapshot;
     S s;
     s.direct_connect = true; s.internet_invites = true; s.native_race_sync = true;
@@ -574,7 +608,9 @@ game_frontend::Snapshot Session::snapshot() const {
     s.error = d.last_error;
     s.content_problem = d.content_note;
     s.is_host = d.role == Impl::Role::Host;
-    if (d.role == Impl::Role::None) {
+    if (d.role == Impl::Role::None && d.pending_join && !in_event_) {
+        s.phase = S::Phase::Connecting; s.status = "Checking your game files"; s.can_cancel = true;
+    } else if (d.role == Impl::Role::None) {
         s.phase = in_event_ ? S::Phase::Results : S::Phase::Offline;
         s.status = in_event_ ? "Leaving the match" : "Not connected";
         if (d.online_on) s.route = d.route_text;
@@ -637,6 +673,13 @@ game_frontend::Snapshot Session::snapshot() const {
     return s;
 }
 
+void Session::viewing_online() {
+    Impl &d = *d_;
+    const uint64_t t = now_us();
+    if (t - d.ui_seen >= 3000000) d.refresh_content_check();   // tab just came on screen
+    d.ui_seen = t;
+}
+
 void Session::submit(game_frontend::Command c) {
     Impl &d = *d_;
     using K = game_frontend::Command::Kind;
@@ -644,11 +687,16 @@ void Session::submit(game_frontend::Command c) {
     const bool joining = c.kind == K::Host || c.kind == K::JoinCode || c.kind == K::JoinAddress || c.kind == K::JoinCrew;
     if (joining) {
         if (in_event_ || d.role != Impl::Role::None) return;
+        netplay::ContentFingerprint content;
+        if (!d.content_ready(content)) {   // never hash the game files on the game (main) thread
+            if (!d.content_job) d.start_content_check();
+            d.pending_join = std::make_unique<game_frontend::Command>(c);
+            return;
+        }
+        d.pending_join.reset();
         d.name = clean_name(g_config.nickname);
         if (d.name.empty()) d.name = default_name();
-        const char *overlay = std::getenv("EOD_MOD_DIR");
-        auto content = content_fingerprint(g_game_root, overlay ? overlay : "");
-        if (!content.error.empty()) { d.last_error = "Could not check game compatibility: " + content.error; return; }
+        if (!content.error.empty()) { d.content_job.reset(); d.last_error = "Could not check game compatibility: " + content.error; return; }
         d.content_id = content.value;
         std::fprintf(stderr,"[netplay] content %s\n",d.content_id.c_str());
         d.rules = 0;
@@ -752,6 +800,7 @@ void Session::submit(game_frontend::Command c) {
         break;
     }
     case K::Cancel: case K::Disconnect: {
+        d.pending_join.reset();
         if (d.role == Impl::Role::Guest && d.welcomed) { Writer w; d.send_to(d.host_addr, K_LEAVE, d.my_id, w); }
         if (d.role == Impl::Role::Host) { Writer w; for (auto &kv : d.peers) d.send_to(kv.second.addr, K_KICK, 0, w); }
         for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
@@ -895,6 +944,10 @@ void Session::poll() {
         }
     }
     auto_drive(now_us());
+    if (d.pending_join) {   // HOST/JOIN pressed while the content check was running
+        netplay::ContentFingerprint ready;
+        if (d.content_ready(ready)) { const game_frontend::Command c = *d.pending_join; submit(c); }
+    }
     const uint64_t t = now_us();
     d.poll_voice(t);
     if (std::getenv("EOD_NETPLAY_TEST_VOICE_PCM") && (std::getenv("EOD_HEADLESS") || std::getenv("EOD_MUTE"))) {
