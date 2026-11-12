@@ -52,6 +52,7 @@ extern "C" void f_0018AAD0_orig() { s_orig_calls[6]++; g_ee.r[2].sd[0] = 1; }
 extern "C" void f_001741C0_orig() { g_ee.r[2].ud[0] = MEM_LW(0x3CDA24) != 6 ? 1 : 0; }
 static int s_info_calls;
 extern "C" void f_003702F0_orig() { s_info_calls++; }
+extern "C" void f_00370608_orig() {}
 #include <functional>
 static int s_buyscreen_orig_calls;
 static std::function<void()> s_buyscreen_hook;
