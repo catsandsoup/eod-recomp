@@ -1,26 +1,25 @@
 # Eve of Destruction Remaster 1.0 · PC and Mac
 
-**An expanded, multiplatform remaster built on the original static recompilation, featuring online multiplayer, new vehicles, expanded Career gameplay and a growing modding toolkit.**
+**A native, multiplatform remaster of the 2004 demolition racer.** Built on the original static recompilation, this project expands the game with online multiplayer, substantial Career and Battle changes, bonus vehicles, high-resolution rendering, and a growing set of tools for creating and editing mods.
 
-[Download 1.0 for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
+[Download the 1.0 game for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
 
-**Development:** [Repository and branch guide](docs/REPOSITORY_MAP.md) · [Creation Kit preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.2-preview)
+**Development:** [Repository and branch guide](docs/REPOSITORY_MAP.md) · [EOD Creation Kit preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.2-preview)
 
-The Creation Kit is a separate development app in this repository. Use `dev/creation-kit` for Kit work; `main` remains the published game baseline.
+The game is available for Apple Silicon macOS and Windows x64. The Creation Kit is a separate development application; its current public preview is for Apple Silicon macOS. The `main` branch is the published game baseline, while `dev/creation-kit` contains the newer editor and asset-tool development.
 
 ![Two cars collide under the floodlights during a night demolition derby](docs/img/night-battle-demolition-derby.jpg)
 
-Play a local split-screen Battle with a friend beside you, or host an online race with friends. Choose the original 4:3 framing or widescreen, adjust the internal resolution, and keep the game's physics while you tune the picture for your machine.
+Play a local split-screen Battle, host an online race, or work through the expanded Career. Choose original 4:3 framing or widescreen, adjust render scale, and use a controller or keyboard and mouse.
 
-The screenshots show the remaster with its bonus car and event pack.
-
-## Features
+## What is included in the game
 
 ### Play your way
 
+* **Native PC and Mac applications.** The game is statically recompiled into native code; it is not running inside a conventional emulator.
 * **Controller first.** Xbox and PlayStation controllers work out of the box, with analog triggers for gas and brake. Keyboard and mouse work too.
 * **Hot-plug 2-player split screen.** Plug in a second pad whenever you like and the game is ready for two.
-* **Widescreen and higher resolutions.** Sharper than the PS2 ever managed, in 4:3 or true widescreen.
+* **Widescreen and higher resolutions.** Play in original 4:3 framing or true widescreen, with adjustable internal render scale.
 * **Everything unlocked outside Career.** Jump straight into any car and any map in the other modes.
 
 ### Battle mode everywhere
@@ -90,15 +89,31 @@ Drop your own **MP3, AAC, FLAC or WAV** files into a folder and they play alongs
 
 ![Night race on a floodlit dirt oval in Test Drive: Eve of Destruction](docs/img/night-race-dirt-oval.jpg)
 
-## Coming soon
+## Modding tools and ongoing development
 
-No dates, just where we are headed:
+The project now extends beyond the playable remaster. Alongside the game, the repository contains asset-format tools, vehicle-building workflows and a separate Creation Kit for inspecting and editing supported game assets.
 
-* **Higher draw distance and more detail**
-* **More cars on track**
-* **Texture packs**, including 4K
-* **The full NASCAR roster**
-* **Mod support** for custom cars and tracks
+### Vehicle creation
+
+The custom-vehicle tools can build a vehicle variant from a retail chassis, generate a livery, change supported performance and vehicle data, and package the result as a game mod. A generated Phantom package has been taken through vehicle selection and a rendered race test.
+
+The current workflow has defined limits: it reuses a retail chassis mesh rather than importing arbitrary modern 3D geometry, and each generated chassis variant targets one native vehicle class. See the [custom vehicle pipeline](https://github.com/catsandsoup/eod-recomp/blob/dev/creation-kit/docs/CUSTOM_VEHICLE_PIPELINE.md).
+
+### Track and environment editing
+
+The Creation Kit development build can browse track assets, preview models and textures, export supported textures to PNG, replace supported same-size indexed textures, edit sky palette values, edit native tables, save changes to an isolated mod project and launch that project in a separate test runtime.
+
+This is asset and environment editing, not yet a general-purpose track creator: arbitrary track geometry, collision compilation and live 3D world placement are not supported. See the [track environment workflow](https://github.com/catsandsoup/eod-recomp/blob/dev/creation-kit/docs/TRACK_ENVIRONMENT_WORKFLOW.md).
+
+### Creation Kit
+
+The Kit is a separate app rather than an in-game menu. Its development work includes searchable asset browsing, model and texture inspection, background export jobs, project-based mod packaging and isolated test sessions. The public [0.3.2 preview](https://github.com/catsandsoup/eod-recomp/releases/tag/creation-kit-v0.3.2-preview) is an early Apple Silicon macOS build; newer work remains on the development branch. See the [Creation Kit development notes](https://github.com/catsandsoup/eod-recomp/blob/dev/creation-kit/docs/CREATION_KIT.md).
+
+### Rendering and runtime work
+
+The remaster is being developed for high-resolution output, widescreen presentation and smooth native rendering, with ongoing work on draw distance, LOD selection, visibility and runtime responsiveness. Performance depends on the machine and build; no single frame-rate result is guaranteed across hardware.
+
+The project also maintains technical documentation for the recompiled game, its renderer, asset formats, gameplay systems and runtime hooks. The [engine documentation index](docs/INDEX.md) maps those investigations to the corresponding source and tools.
 
 ## Getting started
 
@@ -113,7 +128,9 @@ No dates, just where we are headed:
 
 **Does it include the game?** No. You must own the game and supply your own copy.
 
-**Which platforms?** Apple Silicon macOS and Windows x64.
+**Which platforms?** The game release supports Apple Silicon macOS and Windows x64. The current Creation Kit preview is for Apple Silicon macOS; a Windows editor is not included in that preview.
+
+**Can I make entirely new cars and tracks?** The vehicle workflow can build supported custom vehicle variants using existing chassis geometry. The Creation Kit can edit supported track environments and assets. Arbitrary mesh import and full new-track geometry/collision creation are not yet supported.
 
 ## Legal, credits and licences
 
@@ -121,4 +138,4 @@ This is an unofficial fan project. It is **not affiliated with or endorsed by At
 
 **No game data is included.** You must own the game to use this port.
 
-Credits: this port builds on [eod-recomp by pareidolico](https://github.com/pareidolico/eod-recomp), the original static recompilation of the game for Windows, which takes its approach from projects such as N64Recomp and Zelda64Recomp. The menu system uses [Dear ImGui](https://github.com/ocornut/imgui) (MIT licence) and the Mac version uses SDL3 and Vulkan through MoltenVK. Thanks to everyone who built those projects.
+Credits: this project builds on [eod-recomp by pareidolico](https://github.com/pareidolico/eod-recomp), the original static recompilation of the game for Windows, which takes its approach from projects such as N64Recomp and Zelda64Recomp. It has since been expanded into a multiplatform remaster with additional game modes, online play, runtime and rendering work, and mod-development tools. The menu system uses [Dear ImGui](https://github.com/ocornut/imgui) (MIT licence) and the Mac version uses SDL3 and Vulkan through MoltenVK. Thanks to everyone who built those projects.
