@@ -51,7 +51,7 @@ def bundle_info():
                 CFBundleIdentifier='org.eod-recomp.creationkit.development',
                 CFBundleExecutable='EODModdingSuite', CFBundlePackageType='APPL',
                 CFBundleIconFile='AppIcon',
-                CFBundleShortVersionString='0.4.1', CFBundleVersion='7',
+                CFBundleShortVersionString='0.5.1', CFBundleVersion='9',
                 LSMinimumSystemVersion='14.0', NSHighResolutionCapable=True)
 
 
@@ -84,6 +84,10 @@ def main():
     # Labelled format views (docs/FORMAT_VIEW_CONTRACT.md); decoders are self-contained.
     shutil.copytree(ROOT / 'tools' / 'formats', backend / 'formats',
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    # Persistent backend service and MCP server (docs/KIT_SERVICE.md, docs/MCP_SERVER.md).
+    for package in ('kit_service', 'eod_mcp'):
+        shutil.copytree(ROOT / 'tools' / package, backend / package,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'tests'))
     (resources / 'studio-runtime.json').write_text(json.dumps(config))
     # Reuse the repository's existing artwork and standard macOS icon tooling.
     icon = ROOT / 'tools/macos/assets/AppIcon.png'

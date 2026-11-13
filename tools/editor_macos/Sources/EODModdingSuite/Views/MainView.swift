@@ -225,7 +225,7 @@ struct MainView: View {
                             let fields = section.fields.filter { $0.featured == true }
                             if !fields.isEmpty {
                                 Divider()
-                                Text(section.name).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                                Text(section.label ?? section.name).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                                 ForEach(fields.indices, id: \.self) { i in
                                     let field = fields[i]
                                     let key = field.id

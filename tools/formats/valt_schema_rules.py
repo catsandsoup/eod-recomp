@@ -146,7 +146,7 @@ family("other", "Game data table", "A key/value table the game reads at start-up
 # ======================================================================= physics.val
 family("physics", "Car handling and engine",
        "The car's physics sheet: body dimensions and weight, engine power curve, gearbox, tyre grip model, "
-       "cockpit camera and gauge calibration. The game reads it when the car loads (car physics setup, 0x00185470).")
+       "cockpit camera and gauge calibration. The game reads it when the car loads.")
 MEMBER_TITLES["physics.val"] = ("Car handling and engine", FAMILIES["physics"]["summary"])
 
 sections("""
@@ -254,8 +254,7 @@ physics | (Front|Rear|FrontDirt|RearDirt) | (anti_pitch|aspect|brake_force|bump|
 # ======================================================================= shadow.val
 family("shadow", "Track shadows",
        "Dark patches painted onto the track surface: soft ellipses (trees, buildings, bleachers), arcs and "
-       "parallelograms. Each patch lowers the light level of the road inside its outline. Loaded per track by "
-       "\"trkshad\" (0x0032AC00); the log line reads \"loaded N shadow areas\".")
+       "parallelograms. Each patch lowers the light level of the road inside its outline. Loaded with the track.")
 MEMBER_TITLES["shadow.val"] = ("Track shadows", FAMILIES["shadow"]["summary"])
 sections("""
 shadow | ellipse | Shadow ellipse {n} | Round or oval shadow. Its light level goes from the centre value to the edge value (nested table). Position, size and direction below are in metres on the track plane.
@@ -434,7 +433,7 @@ collision_planes | plane | k | Plane offset | Shape | m | Distance of the plane 
 # executable's own error strings, and the key->function cross-reference in valt_schema_data.json.
 family("career", "Career data", "Tables the Career mode reads: dealer stock, car classes, ratings, challenges, sponsors, news and awards.")
 family("catalog", "Part shop", "Every upgrade part sold in Career: name, price, which cars it fits and how much it changes the car. "
-       "Loaded into the in-memory part catalog (0x3D9374) and applied to the car's tuning multipliers, which start at 1.0.")
+       "Values are added to the car's tuning multipliers, which start at 1.0.")
 family("eves", "Career events (Eves)", "The races and contests of each town: event type, laps, field size, opponents' skill, prize money "
        "and which cars may enter.")
 family("drivers", "AI drivers", "The computer-controlled drivers of a league: name, number, car, colour and skill rank.")

@@ -32,7 +32,7 @@ from vehicle_materials import BODY_TEXTURE_ALIASES
 FIELDS = {
     ("Chassis", "mass"): "lb",
     ("Chassis", "grip"): "scale",
-    ("Chassis", "damage_scale"): "scale",
+    ("Chassis", "damage_tweak"): "scale",
     ("EngineNormal", "power_max"): "hp",
     ("EngineNormal", "torque_max"): "lb-ft",
     ("EngineNormal", "redline"): "rpm",
