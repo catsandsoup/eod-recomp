@@ -34,6 +34,8 @@
 #include "gs_mem.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
+#include "texture_replacements.h"
+#include "../vu/scene_capture.h"
 
 namespace gs {
 
@@ -248,6 +250,24 @@ inline uint32_t texel(const Env &e, TexEntry &t, int x, int y) {
     return t.data[(size_t)y * t.w + x];
 }
 
+// EOD_SCENE_CAPTURE: the texture of this draw state with the host-texture
+// identity keys (texture_replacements.h), so a captured draw can be paired
+// with per-texture data such as materials.
+void capture_texture(const Env &e, bool four, bool eight) {
+    uint64_t ik = 0, pk = 0;
+    if (four || eight) {
+        if (hw::g_on) hw::vram_needed(e.mip_tbp[0], e.mip_tbw[0], e.tpsm, 0, 0, (int)e.tw, (int)e.th, "scene capture");
+        static std::vector<uint8_t> plane;
+        plane.resize((size_t)e.tw * e.th);
+        for (uint32_t y = 0; y < e.th; y++)
+            for (uint32_t x = 0; x < e.tw; x++)
+                plane[(size_t)y * e.tw + x] = (uint8_t)read_pixel(e.tpsm, (int)x, (int)y, e.mip_tbp[0], e.mip_tbw[0]);
+        ik = gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data());
+        pk = gs::hosttex::palette_key(e.pal, eight ? 256 : 16);
+    }
+    scene_capture::gs_texture(e.mip_tbp[0], e.mip_tbw[0], e.tpsm, e.tw, e.th, e.cpsm, e.csa, ik, pk);
+}
+
 void setup_env(uint32_t attr) {
     attr &= ~7u;  // the primitive type doesn't matter here
     if (attr == g_env_attr && g_reg_gen == g_env_gen) return;
@@ -417,6 +437,7 @@ void setup_env(uint32_t attr) {
                 e.pal_hash = h;
             }
         }
+        if (scene_capture::g_on && scene_capture::gs_active()) capture_texture(e, four, eight);
         if (hw::g_on) {  // the hardware renderer keeps its own textures
             e.tcached = false;
             return;

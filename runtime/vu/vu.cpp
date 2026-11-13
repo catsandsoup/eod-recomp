@@ -27,6 +27,7 @@
 #include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "ee.h"
+#include "scene_capture.h"
 #include "vif.h"
 
 VUState g_vu0, g_vu1;
@@ -1554,6 +1555,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     uint32_t pc = start_pc & vu->micro_mask & ~7u;
     vu_rec_hook(vu, pc);
     vu_dump(vu, pc);
+    if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         if (!check) {

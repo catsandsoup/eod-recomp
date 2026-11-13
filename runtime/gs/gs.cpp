@@ -1,4 +1,5 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
+#include "../vu/scene_capture.h"
 #include "gs.h"
 #include "gs_hw.h"
 
@@ -634,6 +635,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
 }
 
 void gif_process(int path, const uint8_t *data, uint32_t qwc) {
+    if (scene_capture::g_on) scene_capture::gs_packet(path);
     PathState &ps = g_path[path];
     for (uint32_t i = 0; i < qwc; i++) {
         const uint8_t *q = data + i * 16;
@@ -907,6 +909,7 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
 void gs_frame_end(uint64_t frame, int aspect) {
+    if (scene_capture::g_on) scene_capture::gs_vblank(frame);
     presentation::set(aspect);
     if (hw::g_on) {
         bool changed = display_changed();
@@ -1468,6 +1471,7 @@ void gs_init() {
 
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc) {
     ProfScope prof(P_EE_GIF);
+    if (scene_capture::g_on) scene_capture::gif(path, data, qwc);
     if (!g_threaded) {
         gif_process(path, data, qwc);
         return;
@@ -1820,6 +1824,7 @@ void gs_vblank() {
         uint64_t f = g_frames;
         const uint32_t aspect = presentation::tag(eod_presentation_aspect());
         offload_run([f, aspect] {
+            if (scene_capture::g_on) scene_capture::vblank(f);
             push_cmd(CMD_VBLANK, (uint32_t)f, aspect, nullptr, 0);
             gs_flush();
         });
@@ -1830,6 +1835,7 @@ void gs_vblank() {
         g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
         g_ee_wait_us += platform_time_us() - t;
     } else {
+        if (scene_capture::g_on) offload_run([f = g_frames] { scene_capture::vblank(f); });
         gs_frame_end(g_frames, eod_presentation_aspect());
     }
     {
