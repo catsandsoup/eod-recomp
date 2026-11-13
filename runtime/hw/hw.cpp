@@ -113,7 +113,7 @@ int chan_from_addr(uint32_t off) {
 // Host pointer to n quadwords at a DMA address (bit 31 = scratchpad).
 uint8_t *dma_ptr(uint32_t addr) {
     if (addr & 0x80000000u) return g_scratchpad + (addr & 0x3FF0);
-    addr &= 0x01FFFFF0;
+    addr &= (EE_RAM_SIZE - 1) & ~0xFu;
     return g_ram + addr;
 }
 

@@ -129,13 +129,30 @@ bool platform_last_frame(std::vector<uint32_t> &pix, int &w, int &h) {
 
 #endif  // !EOD_SDL3
 
+// Developer time scale (EOD_TIME_SCALE=N, 1..64, headless test runs only): the game's clock runs N times
+// faster than real time, so a scripted run that needs a minute of menus or driving takes seconds. Every
+// timed event (vblank, alarms, sound, pad scripts that count vblanks) reads this clock, so the game sees
+// normal 60 Hz frames; sleeps are shortened by the same factor. Off (1) unless the variable is set.
+static uint64_t time_scale() {
+    static const uint64_t scale = [] {
+        const char *e = getenv("EOD_TIME_SCALE");
+        const long v = e ? strtol(e, nullptr, 10) : 1;
+        return (uint64_t)(v < 1 ? 1 : v > 64 ? 64 : v);
+    }();
+    return scale;
+}
+
 uint64_t platform_time_us() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+    const uint64_t real = (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+    const uint64_t scale = time_scale();
+    if (scale == 1) return real;
+    static const uint64_t origin = real;
+    return origin + (real - origin) * scale;
 }
 
-void platform_sleep_us(uint32_t us) { usleep(us); }
+void platform_sleep_us(uint32_t us) { usleep(us / (uint32_t)time_scale()); }
 
 void platform_thread_fast() {
 #if defined(__APPLE__)

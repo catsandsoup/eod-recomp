@@ -65,9 +65,14 @@ extern EEState g_ee;
 #define FCC g_ee.fcc
 
 /* ------------------------------------------------------------- memory */
-#define EE_RAM_SIZE 0x02000000u
+/* Guest main memory. The console had 32 MB; the game sizes its main pool from whatever its
+ * malloc can reach, so a larger guest RAM lifts the game's 25 MB pool limit (quit-to-menu
+ * "MemAlloc(...): exceeded stack" crash). Host pages are committed only when touched (calloc of
+ * a large block is lazily zero-mapped), so memory use grows with what the game actually uses.
+ * Must stay a power of two (DMA masks with EE_RAM_SIZE - 1) and below 0x10000000 (I/O space). */
+#define EE_RAM_SIZE 0x08000000u
 
-extern uint8_t *g_ram;   /* 32MB main memory (+ guard) */
+extern uint8_t *g_ram;   /* guest main memory (+ guard) */
 
 uint8_t ee_read8_slow(uint32_t a);
 uint16_t ee_read16_slow(uint32_t a);

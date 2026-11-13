@@ -61,7 +61,7 @@ void on_trap(int, siginfo_t *, void *ctx) {
 void debug_watch_init() {
     const char *w = getenv("EOD_WATCHW");
     if (!w) return;
-    uint32_t ee = (uint32_t)strtoul(w, nullptr, 16) & 0x1FFFFFF;
+    uint32_t ee = (uint32_t)strtoul(w, nullptr, 16) & (EE_RAM_SIZE - 1);
     g_watch = g_ram + ee;
     g_page = (uint8_t *)((uintptr_t)g_watch & ~(uintptr_t)4095);
     struct sigaction sa = {};

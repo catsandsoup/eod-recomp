@@ -479,7 +479,7 @@ void iop_stream_init() {
             tmp.resize(bytes);
             disc_read(lsn, tmp.data(), bytes);
             ee_write_block(dst & 0x1FFFFFFF, tmp.data(), bytes);
-            ee_w32(status & 0x01FFFFFF, 0);
+            ee_w32(status & 0x0FFFFFFF, 0);
             LOG(LOG_FILE, "stream read lsn %u x%u -> %08x", lsn, sectors, dst);
             return 0;
         }

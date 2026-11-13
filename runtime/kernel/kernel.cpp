@@ -768,7 +768,11 @@ int sys_set_alarm(uint32_t time, uint32_t func, uint32_t arg) {
 
 void sys_setup_thread(uint32_t gp, uint32_t stack, uint32_t stack_size, uint32_t args, uint32_t root) {
     (void)root;
-    if (stack == 0xFFFFFFFF) stack = EE_RAM_SIZE - stack_size;
+    // The main stack always goes at the top of guest RAM. crt0 asks for its linker-placed _stack just under
+    // the console's 32 MB, and SetupHeap(-1) ends the heap at the stack, so leaving it there would cap the
+    // game's main pool at ~27 MB however much RAM the guest has (ee.h EE_RAM_SIZE).
+    (void)stack;
+    stack = EE_RAM_SIZE - stack_size;
     g_main_stack = stack;
     g_main_stack_size = stack_size;
     Thread &t = g_threads[1];

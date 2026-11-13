@@ -6,7 +6,7 @@
 
 namespace battle_navigation {
 namespace {
-constexpr uint32_t ram_size=0x02000000;
+constexpr uint32_t ram_size=0x08000000; // guest RAM, runtime/include/ee.h EE_RAM_SIZE (this file also builds standalone in tests)
 bool span(uint32_t a,uint32_t size) { return a && !(a&3) && size<=ram_size && a<=ram_size-size; }
 bool finite(Point p) { return std::isfinite(p.x)&&std::isfinite(p.z); }
 float distance(Point a,Point b) { return std::hypot(a.x-b.x,a.z-b.z); }
