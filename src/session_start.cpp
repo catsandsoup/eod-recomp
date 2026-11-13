@@ -30,6 +30,9 @@ void f_002BEC08_orig(void);
 void f_002A75E0_orig(void);
 void f_002C7340_orig(void);
 void f_00270C10_orig(void);
+}
+extern uint64_t kernel_vblank_count();
+extern "C" {
 void f_00120650_orig(void);
 void f_00120FB8_orig(void);
 void f_002A2C98(void);
@@ -93,6 +96,9 @@ struct Plan {
     bool mode_answered = false;   // online: the Arcade single/multi prompt was answered once
     bool net = false;   // online event (lobby START)
     bool direct = false; // online event with track, event and car chosen in the lobby: every native screen is auto-answered
+    // mode=career: the main menu answers Career once; the Career's opening screens are answered until the hub
+    // has said Drive Around (then src/career_warp.cpp takes over in free roam).
+    bool career = false, career_entered = false, career_driving = false;
 } P;
 
 void log(const char *fmt, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
@@ -217,6 +223,12 @@ void start() {
     std::string err;
     if (!session_parse(text, P.req, err)) { log("EOD_DIRECT_START rejected: "); std::fprintf(stderr, "[SESSION]   %s\n", err.c_str()); return; }
     P.requested = true;
+    if (P.req.mode == "career") {
+        P.career = true;
+        std::fprintf(stderr, "[SESSION] career start (the Career on the memory card, or a new one), then %s%s\n", career_place_name(career_place_index(P.req.place)),
+                     P.req.eve >= 0 ? (", then Eve " + std::to_string(P.req.eve)).c_str() : "");
+        return;
+    }
     if (ee_r32(kEveCount) == 0 || ee_r32(kMode) != kActionMode) {
         log("mode is %x with %u Eves: selecting Action (0x123958)", ee_r32(kMode), ee_r32(kEveCount));
         native(f_00123958);
@@ -291,14 +303,57 @@ bool session_parse(const char *text, SessionRequest &out, std::string &err) {
         else if (key == "paint") { if (!number(val, v) || v < 0 || v > 63) { err = "bad paint '" + val + "'"; return false; } r.paint = (int)v; }
         else if (key == "humans") { if (!number(val, v) || v < 1 || v > 4) { err = "bad humans '" + val + "'"; return false; } r.humans = (int)v; }
         else if (key == "ai") { if (!number(val, v) || v < 0 || v > 12) { err = "bad ai '" + val + "'"; return false; } r.ai = (int)v; }
+        else if (key == "place") r.place = val;
+        else if (key == "eve") { if (!number(val, v) || v < 0 || v > 63) { err = "bad eve '" + val + "'"; return false; } r.eve = (int)v; }
         else { err = "unknown key '" + key + "'"; return false; }
     }
-    if (r.mode != "action") { err = "mode '" + r.mode + "' is not implemented (only action)"; return false; }
     if (r.humans != 1) { err = "humans > 1 is not implemented (GameDoHeadToHead path is mapped, not wired)"; return false; }
+    if (r.mode == "career") {
+        if (!r.track.empty() || !r.event.empty() || !r.car.empty() || r.ai >= 0)
+            { err = "career takes place= and eve=, not track/event/car/ai"; return false; }
+        if (r.place.empty()) r.place = "home";
+        if (career_place_index(r.place) < 0) {
+            err = "unknown place '" + r.place + "' (home, malt, next_eve, dealer, paintshop, gate1, gate2, petes)";
+            return false;
+        }
+        out = r;
+        return true;
+    }
+    if (r.mode != "action") { err = "mode '" + r.mode + "' is not implemented (action or career)"; return false; }
+    if (!r.place.empty() || r.eve >= 0) { err = "place= and eve= are career keys (mode=career)"; return false; }
     if (r.track.empty() || r.event.empty() || r.car.empty()) { err = "track, event and car are required"; return false; }
     out = r;
     return true;
 }
+
+namespace {
+// teleport.lyt items in order (0x386DE8 builds them with codes 0..7; the code is the Home area index).
+struct PlaceName { const char *id; const char *alias[3]; const char *plain; };
+const PlaceName kPlaces[kCareerPlaces] = {
+    {"home", {"your home", "garage", nullptr}, "home"},
+    {"malt", {"maltshop", "malt shop", "the malt shop"}, "Malt Shop"},
+    {"next_eve", {"eve", "next eve", nullptr}, "next Eve"},
+    {"junkyard", {"dealer", "scrapyard", "sweeny's scrapyard"}, "dealer (Sweeny's Scrapyard)"},
+    {"paintshop", {"paint shop", "the paintshop", "paint"}, "Paintshop"},
+    {"gate1", {"gate 1", nullptr, nullptr}, "Gate 1"},
+    {"gate2", {"gate 2", nullptr, nullptr}, "Gate 2"},
+    {"petes", {"pete's", "pete", nullptr}, "Pete's"},
+};
+}  // namespace
+
+int career_place_index(const std::string &name) {
+    const std::string n = lower(trim(name));
+    for (int i = 0; i < kCareerPlaces; ++i) {
+        if (n == kPlaces[i].id) return i;
+        for (const char *a : kPlaces[i].alias) if (a && n == a) return i;
+    }
+    long v = 0;
+    if (number(n, v) && v >= 0 && v < kCareerPlaces) return (int)v;
+    return -1;
+}
+const char *career_place_name(int index) { return index >= 0 && index < kCareerPlaces ? kPlaces[index].plain : "?"; }
+
+const SessionRequest *career_warp_request() { return P.career ? &P.req : nullptr; }
 
 std::string session_event_name(const SessionRequest &r) {
     if (r.ai >= 0 && ieq(r.event, "battle")) return r.ai == 1 ? "Battle (1v1)" : "Battle (" + std::to_string(r.ai) + " AI)";
@@ -325,6 +380,14 @@ extern "C" void f_002BEC08(void) {
 extern "C" void f_002A1298(void) {
     static bool tried = false;
     if (!tried) { tried = true; start(); if (std::getenv("EOD_CATALOG_DUMP") && session_catalog::refresh()) session_catalog::dump(); }
+    if (P.career && !P.career_entered) {
+        // MainMenuUpdate's result 15 is CAREER: the dispatcher (0x2A2720, table 0x414460) runs the Career driver
+        // 0x112298 exactly as when the player picks it. Nothing of the main menu has been built yet.
+        P.career_entered = true;
+        log("main menu answered CAREER (15)");
+        ret_s32(15);
+        return;
+    }
     if (P.net) {   // the online event that was running has returned to the main menu
         P = Plan{};
         if (netplay_hooks::event_ended) netplay_hooks::event_ended();
@@ -356,7 +419,19 @@ extern "C" void f_00270C10(void) {
         else ret_s32(-1);
         return;
     }
+    if (P.career && P.career_entered && !P.career_driving) {
+        // A fresh Career's opening screens (callers from EOD_MENU_RUN_TRACE): the tutorial note (0x3861B4) and the
+        // "select Drive Around" note (0x383C94) close with -2; the Career hub (0x36AB8C) answers Drive Around (4).
+        // The loading screens (0x2C1A0C) run natively.
+        if (caller == 0x003861B4 || caller == 0x00383C94) { log("career: note %08x closed", caller); ret_s32(-2); return; }
+        if (caller == 0x0036AB8C) { P.career_driving = true; log("career: hub answered Drive Around (4)"); ret_s32(4); return; }
+    }
     f_00270C10_orig();
+    // Developer (EOD_MENU_RUN_TRACE=1): every native menu screen's caller and the answer it returned, the map
+    // a direct start needs to answer a screen without showing it.
+    static const bool trace = std::getenv("EOD_MENU_RUN_TRACE") != nullptr;
+    if (trace) std::fprintf(stderr, "[MENU_RUN] caller=%08x result=%d vblank=%llu\n", caller, g_ee.r[2].sw[0],
+                            (unsigned long long)kernel_vblank_count());
 }
 
 // GameDoSingle opens the car screen first. The answer is the human's vehicle number, which

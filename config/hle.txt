@@ -101,6 +101,7 @@
 003702F0 wrap     # dealer car list: per-frame selection details; tells career_vblank the dealer screen is up (page banner)
 0018AA70 wrap     # CarSetThrottle: KillableChallengers holds a wrecked free-roam challenger at no throttle
 0018AA68 wrap     # CarSetBrake: KillableChallengers holds a wrecked free-roam challenger on full brake
+0016FE48 wrap     # Home Driver per-frame update (Career free roam): EOD_DIRECT_START mode=career teleports to its place
 001741C0 wrap     # Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck
 00114358 wrap     # Finish one online contest after native race cleanup
 0036E9C0 wrap     # dealer Buy screen: pass-through to MenuRun loop

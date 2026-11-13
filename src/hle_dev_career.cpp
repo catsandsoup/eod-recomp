@@ -5,6 +5,7 @@
 #include "core/cpu.h"
 #include "core/memory.h"
 #include "funcs.h"
+#include "session_start.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,10 +16,14 @@ void f_002D58E8_orig(void);
 
 extern "C" void f_002D58E8(void) {
     static bool done = false;
+    // EOD_CAREER_EVE=<n>, or eve=<n> in a Career direct start (EOD_DIRECT_START="mode=career;eve=<n>").
     const char *text = std::getenv("EOD_CAREER_EVE");
-    if (!done && text && *text) {
+    const SessionRequest *warp = career_warp_request();
+    const bool wanted = (text && *text) || (warp && warp->eve >= 0);
+    if (!done && wanted) {
         done = true;
-        const uint32_t eve = static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
+        const uint32_t eve = (warp && warp->eve >= 0) ? static_cast<uint32_t>(warp->eve)
+                                                       : static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
         ee_w32(0x004AAFC8, eve);  // chosen Eve (read by 0x2E2F28)
         ee_w32(0x004AAFCC, 1);    // its "chosen" flag (set by 0x2E2F38)
         std::fprintf(stderr, "[CAREER_EVE] entering Eve %u\n", eve);

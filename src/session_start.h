@@ -9,19 +9,36 @@
 // Everything else (human count, pad map, session description, roster, world load,
 // results, return to the native menus) is the unmodified native code.
 // See docs RACE_SETUP_MAP.md.
+//
+// EOD_DIRECT_START="mode=career;place=dealer" (or ;eve=3) starts a fresh Career straight from boot and
+// puts the car at a free-roam place with the game's own Jump To teleport, or runs a Career Eve. The main
+// menu is answered with its Career result (15), the Career driver (0x112298) runs natively, its tutorial
+// notes are dismissed and its hub answers Drive Around; then src/career_warp.cpp teleports once the
+// free-roam Home Driver is running. See docs/CAREER_WARP.md.
 #include <cstdint>
 #include <string>
 #include <vector>
 
 struct SessionRequest {
-    std::string mode = "action";   // only "action" is implemented
+    std::string mode = "action";   // "action" or "career"
     std::string track;             // Eve track: internal id ("Anoka") or display name
     std::string event;             // contest name ("No-Rules Race", "Battle (8 AI)") or "#<position>"
     std::string car;               // vehicle model name ("Phantom") or vehicle number
     int paint = 0;                 // 0-based paint index among the model's vehicle records
     int humans = 1;                // only 1 is implemented
     int ai = -1;                   // Battle variant helper: event=Battle + ai=8 -> "Battle (8 AI)"
+    std::string place;             // career: free-roam place (career_place_index); default home
+    int eve = -1;                  // career: run this Career Eve (index) as soon as free roam starts
 };
+
+// Career free-roam places, in the game's Jump To order (teleport.lyt items, area index for 0x16F488).
+// Accepts the game's area ids and plain names ("dealer", "malt shop", "pete's"). -1 when unknown.
+int career_place_index(const std::string &name);
+const char *career_place_name(int index);     // plain name for logs ("dealer (junkyard)")
+constexpr int kCareerPlaces = 8;
+
+// The career request of this run (mode=career), or nullptr. Read by src/career_warp.cpp.
+const SessionRequest *career_warp_request();
 
 // Parses "k=v;k=v". Returns false and sets err for unknown keys / bad numbers.
 bool session_parse(const char *text, SessionRequest &out, std::string &err);

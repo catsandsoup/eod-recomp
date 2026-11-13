@@ -19,6 +19,9 @@ void f_002C7340_orig(void) {} void f_00270C10_orig(void) {} void f_00120650_orig
 void f_00119428(void) {} void f_00128CB0(void) {} void f_002C1338(void) {} void f_00120BE8(void) {}
 void f_001252C0(void) {} void f_00123958(void) {}
 }
+uint64_t kernel_vblank_count() { return 0; }
+extern "C" {
+}
 int main() {
     SessionRequest r; std::string e;
     CHECK(session_parse("mode=action;track=Anoka;event=Battle (8 AI);car=Phantom;paint=0;humans=1", r, e));
@@ -27,6 +30,13 @@ int main() {
     CHECK(session_parse("track=Anoka;event=battle;ai=4;car=12", r, e) && session_event_name(r) == "Battle (4 AI)");
     CHECK(!session_parse("track=Anoka;event=x;car=y;bogus=1", r, e));
     CHECK(!session_parse("mode=career;track=a;event=b;car=c", r, e));
+    CHECK(session_parse("mode=career", r, e) && r.mode == "career" && r.place == "home" && r.eve == -1);
+    CHECK(session_parse("mode=career;place=dealer", r, e) && career_place_index(r.place) == 3);
+    CHECK(session_parse("mode=career;place=Malt Shop;eve=2", r, e) && career_place_index(r.place) == 1 && r.eve == 2);
+    CHECK(career_place_index("pete's") == 7 && career_place_index("gate 2") == 6 && career_place_index("5") == 5);
+    CHECK(!session_parse("mode=career;place=moon", r, e));
+    CHECK(!session_parse("mode=career;eve=99", r, e));
+    CHECK(!session_parse("track=a;event=b;car=c;place=home", r, e));
     CHECK(!session_parse("track=a;event=b;car=c;humans=2", r, e));
     CHECK(!session_parse("track=a;event=b", r, e));
     return failures ? 1 : 0;

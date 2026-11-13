@@ -3,6 +3,7 @@
 00106338 RaceDrawGameplayViewports [V]  # Gameplay-state draw callback: world viewport overlays and per-player HUD via 00101618/00101C00; editor readiness evidence -> docs/TRACK_ENVIRONMENT_WORKFLOW.md
 0010AFA0 EventTypeGetDisplayName [V]  # Resolves event-type ID to localized display string; wrapped for Battle (4 AI)/(8 AI) -> docs/BATTLE_RECOVERY.md
 001116E0 RosterResolveCarDescriptions [V]  # Resolves driver/vehicle description records for event roster; wrapped for multi-class Battle AI -> docs/BATTLE_RECOVERY.md
+00112298 CareerRun [V]  # Career driver: hub, free roam, Eves; started by main menu result 15 -> docs/CAREER_WARP.md
 00113FF8 SessionDrawFrame [V]  # Dispatches current session scene through table 003C3CF8, including loading/interlude states; wraps frame draw scope -> docs/TRACK_ENVIRONMENT_WORKFLOW.md
 00114358 RunRaceContest [I]  # Race lifecycle and cleanup; checked by the Eve loop -> docs/NETPLAY_STATE_SYNC.md
 00119428 HudGetParticipantDisplayName [V]  # Returns participant display name for HUD/kill messages -> docs/BATTLE_RECOVERY.md
@@ -35,8 +36,10 @@
 001675C0 BattleRespawnCar [V]  # Resets damage, detaches/reattaches parts, and teleports wrecked car to spawn point -> docs/BATTLE_RECOVERY.md
 00167C70 BattlePlaceInitialCars [V]  # Places Battle participants on initial spawn transforms; wrapped for >4 cars -> docs/BATTLE_RECOVERY.md
 00167D58 BattleUpdate [V]  # Per-frame BattleMaster state machine, scoring, and respawn tick -> docs/BATTLE_RECOVERY.md
+0016F488 HomeTeleportToArea [V]  # Jump To teleport (area index 0..7, teleport.lyt order); EOD_DIRECT_START mode=career -> docs/CAREER_WARP.md
 0016F4E8 HomebaseGetSlotForCar [V]  # Maps car index to homebase lot slot safely -> docs/CAREER_UNLOCKS.md
 0016F748 HomebaseGetBuySlotForCar [V]  # Maps car to homebase buy slot 0..4 without asserting -> docs/CAREER_UNLOCKS.md
+0016FE48 HomeDriverUpdate [V]  # Career free-roam Home Driver per-frame update (vtable 0x3F8398); wrapped for the Career warp -> docs/CAREER_WARP.md
 001741C0 CareerIsFreeRoamActive [V]  # Returns non-zero during Career free-roam / challenge staging; wrapped by KillableChallengers -> docs/CAREER_UNLOCKS.md
 00176698 RaceSessionInitPhase [V]  # Initializes race-start phase and RNG epoch; wrapped for netplay lockstep -> docs/INDEX.md
 00176918 RaceSessionSeedRng [V]  # Seeds per-session race RNG state; wrapped for netplay lockstep -> docs/INDEX.md
@@ -198,6 +201,7 @@
 00383AA0 sceSifBindRpc [V]  # SIF RPC bind client to IOP server SID
 00383C40 sceSifCallRpc [V]  # SIF RPC synchronous/asynchronous call
 00383DF0 sceSifCheckStatRpc [V]  # SIF RPC completion check
+00386C90 CareerJumpTo [V]  # Pause menu Jump To (action 9): teleport list 0x386DE8, Eve list 0x387080 -> docs/CAREER_WARP.md
 0038F868 scePadInit [V]  # libpad init (SID 0x80000100) -> docs/INPUT_CONTINUATION.md
 0038FB40 scePadPortOpen [V]  # libpad open controller port/slot -> docs/INPUT_CONTINUATION.md
 0038FF40 scePadRead [V]  # libpad read 32-byte DualShock2 pad DMA buffer -> docs/INPUT_CONTINUATION.md
