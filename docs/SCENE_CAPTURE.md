@@ -206,3 +206,44 @@ never commit them.
    HUD boundary rule.
 5. Next build step: the decoded-batch emitter (design step 1-2) feeding a test viewer that
    renders the live race from the captured camera, measured for per-frame cost.
+
+## STAR handoff (2026-11-13)
+
+**Situation.** The GS renderer only sees pre-lit 2D triangles, so modern lighting is
+impossible there. The agreed plan: capture the 3D scene at the VU1 boundary, let a modern
+renderer (Filament candidate) draw world and cars, keep the GS for HUD/2D with shared depth.
+
+**Task.** Prove the real 3D scene can be taken from the running game each frame and paired
+with textures/materials, without changing Original mode; propose the production capture.
+
+**Action.**
+- Files: `runtime/vu/scene_capture.{h,cpp}` (new, opt-in recorder), hooks in
+  `runtime/vu/vu.cpp` (`vu_execute`), `runtime/gs/gs.cpp` (`gif_transfer`, `gif_process`,
+  `gs_frame_end`, vblank), `runtime/gs/gs_draw.cpp` (`capture_texture` in `setup_env`),
+  `tools/scene_capture.py` (stats / runs / reconstruct), this document,
+  `docs/RENDERER_REFERENCES.md` (RT64 and Road Trip reuse check), `docs/INDEX.md`.
+- Separate commit: Windows build fix (`src/hle_movie.cpp` missing `<cstdio>`) and Win32
+  `EOD_MUTE=1` support (`runtime/platform/win32/platform_win32.cpp`).
+- Real game runs: Afton, No-Rules Race, Venom, headless, muted, frame 1000 window; GS dump at
+  vblank 995 replayed with capture off/on.
+
+**Result.**
+- Verified: program roles by (entry, ITOP); batch layout (count, normal/colour + ADC,
+  position, s/t, TOP+198/199 offsets); vf4-vf7 = model->screen (median 0.06 px); camera =
+  shared x/y/w rows; rigid per-object model matrices; light direction at VU1 qword 17 (model
+  space, one world vector for all batches); UVs exact to 1e-7; texture pairing via the TEX0
+  slot (two alternating VRAM slots) with 79/80 keys resolved to disc textures; frame order and
+  the HUD start (0x270 ITOP 0x200); rebuilt frame lines up with the game's screenshot;
+  Original mode byte-identical in GS replay.
+- Derived: vf8-vf11 clip matrix; car skin = translation offsets at qwords 143+i; HUD boundary
+  rule beyond this one frame.
+- Hypothesis: q17.w ambient; meaning of vf12 (second light/environment); vf1/vf2 light
+  colours; driver program 0x24b0 uses bone matrices.
+- Not done: the modern renderer; the compact per-batch emitter (the spike writes about 40 MB
+  per frame and stalls the producer for ~5 vblanks); menus/split screen/garage captures.
+
+**Next decisive test.** Implement design steps 1-2 (decoded-batch emitter at `vu_execute`,
+no 16 KB snapshots), run a full race lap with it on at native speed, and render the live
+camera's world+objects in a test viewer next to the GS image every frame: success is matching
+geometry each frame at no frame-time loss, with Original mode unchanged. Then repeat the
+capture on a menu, split screen and the garage to confirm the HUD boundary rule.
