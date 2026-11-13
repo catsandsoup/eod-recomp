@@ -1,6 +1,6 @@
 # Eve of Destruction Remaster 1.0 · PC and Mac
 
-**An expanded, multiplatform remaster built on the original static recompilation, featuring online multiplayer, new vehicles, expanded Career gameplay and a growing modding toolkit. **
+**An expanded, multiplatform remaster built on the original static recompilation, featuring online multiplayer, new vehicles, expanded Career gameplay and a growing modding toolkit.**
 
 [Download 1.0 for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
 
