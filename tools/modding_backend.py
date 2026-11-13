@@ -25,6 +25,7 @@ from tex import write_png
 from texture_preview import decode_preview
 import vif_mesh
 import formats
+from formats import valt_schema
 from vehicle_materials import BODY_TEXTURE_ALIASES
 
 # Units for the curated vehicle inspector. Native tables retain their own data.
@@ -386,11 +387,24 @@ def inspect(request, disc):
         if edits:
             apply_edits(table, edits)
         editable = not table.get("is_v6", False)
-        result.update(kind="table", sections=[dict(name=s["name"], fields=[
-            dict(id=f"{si}:{pi}", sectionIndex=si, pairIndex=pi, key=k, value=v, original=original[si][pi],
-                 editable=editable,
-                 featured=(s["name"], k) in FIELDS and entry["name"].lower() == "physics.val",
-                 unit=FIELDS.get((s["name"], k), "")) for pi, (k, v) in enumerate(s["pairs"])])
+        schema = valt_schema.describe_table(request["archive"], entry["name"], table)
+
+        def field_json(si, pi, section, key, value):
+            spec = schema["fields"][(section["name"], key)]
+            explanation = spec["explanation"]
+            note = valt_schema.value_note(schema["family"], section["name"], key, value)
+            if note:
+                explanation = (explanation + " " + note + ".").strip()
+            return dict(id=f"{si}:{pi}", sectionIndex=si, pairIndex=pi, key=key, value=value, original=original[si][pi],
+                        editable=editable and spec["editable"],
+                        featured=(section["name"], key) in FIELDS and entry["name"].lower() == "physics.val",
+                        unit=spec["unit"] or FIELDS.get((section["name"], key), ""),
+                        label=spec["label"], group=spec["group"], explanation=explanation,
+                        confidence=spec["confidence"], used=spec["used"], min=spec["min"], max=spec["max"])
+
+        result.update(kind="table", title=schema["title"], summary=schema["summary"], sections=[
+            dict(name=s["name"], label=schema["sections"][si]["label"], explanation=schema["sections"][si]["explanation"],
+                 fields=[field_json(si, pi, s, k, v) for pi, (k, v) in enumerate(s["pairs"])])
             for si, s in enumerate(table["sections"])])
     elif entry["type"] == "TEX":
         edit = request.get("textureEdit") or saved_edits(request, disc, archive_sha(path))
