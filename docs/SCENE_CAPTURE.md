@@ -10,7 +10,11 @@ the running game each frame and records the data a renderer such as Filament nee
 
 Status: the capture spike works in the real game (Afton, No-Rules Race, Venom, headless,
 muted). One race frame was captured, rebuilt in world space with its real textures, and
-re-projected onto the game's own screenshot of that frame. No modern renderer exists yet.
+re-projected onto the game's own screenshot of that frame. The production-shaped
+**decoded-batch emitter** (`EOD_SCENE_EMIT`, design steps 1-2) now runs every frame of a live
+race at full speed, and a test viewer renders its output from the captured camera with the
+game's light, lined up with the game's screenshot (section "Decoded-batch emitter"). No
+modern renderer exists yet.
 
 Confidence labels: **V** verified against the captured frame (numbers below), **D** derived
 from reading the micro program or from data consistency, **H** hypothesis.
@@ -180,6 +184,63 @@ generation pairs VU1 per-object matrices with PATH1 packets (`MotionTracker::pac
 but replaces no renderer and captures no world-space scene. Details in
 `docs/RENDERER_REFERENCES.md`.
 
+## Decoded-batch emitter (design steps 1-2, built)
+
+`runtime/vu/scene_emit.{h,cpp}`, hooked next to the spike (`vu_execute`, `gif_transfer`,
+`gif_process`, `gs_frame_end`, the producer vblank, `setup_env`). Off unless `EOD_SCENE_EMIT`
+is set; every hook is behind `scene_emit::g_on`.
+
+Per frame, on the producer (VIF1/VU1 worker) thread:
+
+* **Meshes** (`GEOM`), once per distinct content: model-space positions and s, t with the
+  TOP+198/199 offsets applied, normals (int8) or vertex colours, authored strip flags (ADC).
+  The id hashes the batch's vertex block, so static meshes are sent once and then referenced
+  (design step 2's cache, keyed by content instead of VIF address).
+* **Batches** (`BATC`): (entry, ITOP), kick range, mesh id, world matrix
+  `M = inv(camera_xyw) * batch_xyw`, the light direction (q17) and vf12 rotated to world,
+  q17.w, and the batch's model->screen matrix. Runs that kick nothing are dropped. Programs:
+  the geometry entries of section 1 plus 0x350 (facing sprites); shadows, particles and state
+  programs are left out (`EOD_SCENE_EMIT_ALL=1` admits every program, for diagnosis).
+* **Camera** (`CAMR`): the most common x/y/w rows of the frame's batches.
+
+On the GS thread, one row per textured PATH1 draw state: kick number, TEX0 pointer, FRAME,
+XYOFFSET and the host-texture keys. The index key (a decode of every texel) is cached by a
+linear hash of the VRAM pages the texture occupies.
+
+`tools/scene_view.py` is the test viewer: `stats`, `verify` (reprojection against the kicks
+of an `EOD_SCENE_EMIT_VERIFY` frame), `render` (the frame from the emitted camera and light:
+texel x (q17.w ambient + diffuse max(0, N.L)), or texel x vertex colour; beside the game's
+screenshot with an edge overlay) and `strip`. It reads only emitted data; textures come from
+the disc through the keys.
+
+Results (Windows, D3D11, headless, muted; Afton/No-Rules Race/Venom, which the session start
+resolves to Eve 16 "Woodly", 14 cars; 3,000-frame runs):
+
+| Measure | Result | Conf. |
+|---|---|---|
+| Reprojection, all 1:1 batches of the verify frame (2,319 batches, 73,481 on-screen vertices), emitted camera x emitted M | median 0.056 px, 94.1% under 0.5 px | V |
+| Same without the skinned driver (0x24b0, 0x318) | median 0.054 px, p99 0.34 px, max 2.3 px, 99.3% under 0.5 px | V |
+| Camera x M vs the batch's own matrix | identical: the decomposition adds no error | V |
+| On-screen vertices over 1 px | all from the driver programs 0x24b0 and 0x318 (open question 1) | V |
+| Viewer vs game screenshot | car, livery, wheels, ground and road layers, tyre stacks, fences, trucks and skyline line up; 128/129 texture keys resolve to disc textures | V |
+| Producer (VU1 worker) cost per drawn frame | mean 1.25 ms, p50 1.00, p95 2.11, max 18.1 (2,024 frames, including the stream write) | V |
+| GS-thread cost | mean 1.99 ms, p50 1.64, p95 3.32, max 14.0; the first frame after a load decodes every key (~16 ms, cold cache) | V |
+| Stream | 276 KB per drawn frame (~16 MB/s); 1,540 batches per frame on average, 2,400 in busy frames; 19,700 distinct meshes over 2,100 frames | V |
+| Frame rate | 59.9 vblank/s off and on; game frames/s 55.6 and 56.6 (off), 54.9 (on), 53.2 (on, decode only); EE busy 70-74% off, 78% on; GS busy 35-37% off, 42-45% on. Within run-to-run spread (runs are not deterministic) | V |
+| Original mode | GS replay of a race dump (vblank 1500, 4 vblanks): VRAM after the replay byte-identical with the emitter off and on (md5 `f30d64c0...`), while the emitter logged texture rows | V |
+
+Frame numbering: the emitter names a frame by the vblank that ends it; `--screenshot-every`
+frame N shows the work emitted as frame N-1 (frame 997 vs `frame_00998.png`: edge agreement
+40%, vs 34% against `frame_00997.png`). Saving a screenshot every vblank slows the game, so
+around the shots some vblanks carry no draw work; elsewhere the game draws nearly every vblank.
+
+The comparison image (game | viewer | viewer edges on the game) is kept outside Git in the
+session notes (`scene-capture/emitter_compare_frame997.png`).
+
+Viewer gaps (renderer, not data): no fog, no blend equations for the car's multi-pass layers,
+nearest texels, no shadow pass, no particles. The start-line flag is not in the emitted set
+(its program is not identified yet).
+
 ## Tools
 
 ```
@@ -187,6 +248,13 @@ EOD_SCENE_CAPTURE=scene.bin EOD_SCENE_CAPTURE_AT=1000 [EOD_SCENE_CAPTURE_N=3]   
 python3 tools/scene_capture.py stats scene.bin
 python3 tools/scene_capture.py runs scene.bin --pc 0270 --kicks 2
 python3 tools/scene_capture.py reconstruct scene.bin --out DIR [--disc GAME] [--screenshot PNG]
+```
+
+```
+EOD_SCENE_EMIT=scene.emit [EOD_SCENE_EMIT_FROM=900] [EOD_SCENE_EMIT_N=200] [EOD_SCENE_EMIT_VERIFY=996]
+python3 tools/scene_view.py stats scene.emit [--frame N]
+python3 tools/scene_view.py verify scene.emit
+python3 tools/scene_view.py render scene.emit --frame 997 --disc GAME --screenshot frame_00998.png --out DIR
 ```
 
 `reconstruct` writes `scene.obj`/`.mtl` (world space, one group per batch, texture PNGs when
@@ -204,8 +272,13 @@ never commit them.
    2632-2638): identify them (skid marks, sun flare, mirror?).
 4. Repeat the capture on a menu, split screen, a crash replay and the garage before fixing the
    HUD boundary rule.
-5. Next build step: the decoded-batch emitter (design step 1-2) feeding a test viewer that
-   renders the live race from the captured camera, measured for per-frame cost.
+5. Done: the decoded-batch emitter and test viewer (section "Decoded-batch emitter").
+6. Identify the start-line flag's program (`EOD_SCENE_EMIT_ALL=1` lists 0x0790 ITOP 0/1,
+   0x0020 and the particle programs as the remaining programs that kick).
+7. Car damage moves vertices through the bone offsets (qwords 143+i), so a damaged car's
+   mesh gets a new content id each frame. Emit the undeformed mesh plus the offsets.
+8. Move the stream write off the producer thread (it is inside the measured 1.25 ms) and
+   warm the texture-key cache at track load to remove the 14-16 ms first-frame spike.
 
 ## STAR handoff (2026-11-13)
 
@@ -247,3 +320,30 @@ no 16 KB snapshots), run a full race lap with it on at native speed, and render 
 camera's world+objects in a test viewer next to the GS image every frame: success is matching
 geometry each frame at no frame-time loss, with Original mode unchanged. Then repeat the
 capture on a menu, split screen and the garage to confirm the HUD boundary rule.
+
+## STAR handoff: decoded-batch emitter (2026-11-13)
+
+**Situation.** The spike proved the 3D scene is available at the VU1 boundary but
+snapshotted 16 KB per run (40 MB per frame, producer stalls). A modern renderer needs a
+compact per-frame feed.
+
+**Task.** Build design steps 1-2 as an opt-in emitter and a test viewer that renders the live
+race from the captured camera with the game's light; measure accuracy and cost with Original
+rendering unchanged.
+
+**Action.** `runtime/vu/scene_emit.{h,cpp}` (new); hooks in `runtime/vu/vu.cpp`,
+`runtime/gs/gs.cpp` and `runtime/gs/gs_draw.cpp` (`emit_texture`); `tools/scene_view.py`
+(new); this document. Real game runs on Windows (headless, muted, `EOD_DIRECT_START`
+Afton/No-Rules Race/Venom): emitter off/on pairs of 3,000 frames with `EOD_FPS`, a verify
+frame, screenshots 990-1010, a decode-only run, and a GS dump replayed off and on.
+
+**Result.** Verified: reprojection median 0.056 px (0.054 px and 99.3% under 0.5 px without
+the skinned driver); the viewer frame lines up with the game's screenshot; producer 1.25 ms
+and GS 2.0 ms mean per frame, 276 KB per frame; 59.9 vblank/s and the game frame rate within
+run-to-run spread; GS replay VRAM byte-identical off and on. Not done: the modern renderer;
+the skinned driver; damage deformation; the flag's program; an asynchronous write; the
+HUD-boundary rule on menus, split screen and the garage.
+
+**Next decisive test.** Feed this stream to an embedded modern renderer (Vulkan) that draws
+world and cars into a depth buffer shared with the GS HUD, in a live race at full speed,
+with Original mode toggleable and unchanged.
