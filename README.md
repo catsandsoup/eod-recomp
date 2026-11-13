@@ -1,6 +1,6 @@
 # Eve of Destruction Remaster 1.0 · PC and Mac
 
-**Take the dirt oval at night, or trade paint under the floodlights.** The 2004 PS2 demolition racer runs as a native app on Apple Silicon and Windows x64. Bring your North American game disc, plug in a controller and pick your first event.
+**An expanded, multiplatform remaster built on the original static recompilation, featuring online multiplayer, new vehicles, expanded Career gameplay and a growing modding toolkit. **
 
 [Download 1.0 for Mac and Windows](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0)
 
