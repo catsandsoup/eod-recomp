@@ -32,8 +32,9 @@ int main() {
     CHECK(!session_parse("mode=career;track=a;event=b;car=c", r, e));
     CHECK(session_parse("mode=career", r, e) && r.mode == "career" && r.place == "home" && r.eve == -1);
     CHECK(session_parse("mode=career;place=dealer", r, e) && career_place_index(r.place) == 3);
-    CHECK(session_parse("mode=career;place=Malt Shop;eve=2", r, e) && career_place_index(r.place) == 1 && r.eve == 2);
-    CHECK(career_place_index("pete's") == 7 && career_place_index("gate 2") == 6 && career_place_index("5") == 5);
+    CHECK(session_parse("mode=career;place=TJ's;eve=2", r, e) && career_place_index(r.place) == 1 && r.eve == 2);
+    CHECK(session_parse("mode=career;place=here", r, e));
+    CHECK(career_place_index("troy's place") == 7 && career_place_index("garage") == 4 && career_place_index("gate 2") == 6 && career_place_index("5") == 5);
     CHECK(!session_parse("mode=career;place=moon", r, e));
     CHECK(!session_parse("mode=career;eve=99", r, e));
     CHECK(!session_parse("track=a;event=b;car=c;place=home", r, e));

@@ -225,7 +225,8 @@ void start() {
     P.requested = true;
     if (P.req.mode == "career") {
         P.career = true;
-        std::fprintf(stderr, "[SESSION] career start (the Career on the memory card, or a new one), then %s%s\n", career_place_name(career_place_index(P.req.place)),
+        std::fprintf(stderr, "[SESSION] career start (the Career on the memory card, or a new one), then %s%s\n",
+                     lower(P.req.place) == "here" ? "where it was saved" : career_place_name(career_place_index(P.req.place)),
                      P.req.eve >= 0 ? (", then Eve " + std::to_string(P.req.eve)).c_str() : "");
         return;
     }
@@ -312,8 +313,8 @@ bool session_parse(const char *text, SessionRequest &out, std::string &err) {
         if (!r.track.empty() || !r.event.empty() || !r.car.empty() || r.ai >= 0)
             { err = "career takes place= and eve=, not track/event/car/ai"; return false; }
         if (r.place.empty()) r.place = "home";
-        if (career_place_index(r.place) < 0) {
-            err = "unknown place '" + r.place + "' (home, malt, next_eve, dealer, paintshop, gate1, gate2, petes)";
+        if (lower(r.place) != "here" && career_place_index(r.place) < 0) {
+            err = "unknown place '" + r.place + "' (here, home, malt, next_eve, dealer, paintshop, gate1, gate2, petes)";
             return false;
         }
         out = r;
@@ -330,14 +331,14 @@ namespace {
 // teleport.lyt items in order (0x386DE8 builds them with codes 0..7; the code is the Home area index).
 struct PlaceName { const char *id; const char *alias[3]; const char *plain; };
 const PlaceName kPlaces[kCareerPlaces] = {
-    {"home", {"your home", "garage", nullptr}, "home"},
-    {"malt", {"maltshop", "malt shop", "the malt shop"}, "Malt Shop"},
-    {"next_eve", {"eve", "next eve", nullptr}, "next Eve"},
-    {"junkyard", {"dealer", "scrapyard", "sweeny's scrapyard"}, "dealer (Sweeny's Scrapyard)"},
-    {"paintshop", {"paint shop", "the paintshop", "paint"}, "Paintshop"},
-    {"gate1", {"gate 1", nullptr, nullptr}, "Gate 1"},
-    {"gate2", {"gate 2", nullptr, nullptr}, "Gate 2"},
-    {"petes", {"pete's", "pete", nullptr}, "Pete's"},
+    {"home", {"hub", "trailer", "your home"}, "home (Career hub)"},
+    {"malt", {"maltshop", "tj's", "tjs"}, "TJ's Diner (Malt Shop)"},
+    {"next_eve", {"eve", "next eve", "choose eve"}, "Choose Eve"},
+    {"junkyard", {"dealer", "scrapyard", "sweeny's"}, "dealer (Sweeny's Scrapyard)"},
+    {"paintshop", {"garage", "upgrades", "paint"}, "Garage (Upgrades and Paint)"},
+    {"gate1", {"gate 1", "time challenge 1", "time1"}, "Time Challenge (Gate 1)"},
+    {"gate2", {"gate 2", "time challenge 2", "time2"}, "Time Challenge (Gate 2)"},
+    {"petes", {"troy", "troy's", "troy's place"}, "Troy's Place (challengers)"},
 };
 }  // namespace
 

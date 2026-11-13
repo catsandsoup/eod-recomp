@@ -17,18 +17,20 @@ Combine with `EOD_TIME_SCALE=8` (docs/MODERN_HARDWARE.md) for headless runs at s
 
 ## Places
 
-The game's own Jump To list (`teleport.lyt`), in its order; the index is the Home area the teleport takes.
+The game's own Jump To list (`teleport.lyt`), in its order; the index is the Home area the teleport takes. Checked
+from a copy of a rank-1 save at 8x (13 Nov 2026): each place opens the screen listed.
 
-| index | `place=` (aliases) | where |
+| index | `place=` (aliases) | arrives at |
 |---|---|---|
-| 0 | `home` (`garage`, `your home`) | home |
-| 1 | `malt` (`maltshop`, `malt shop`) | The Malt Shop |
-| 2 | `next_eve` (`eve`, `next eve`) | the next Eve |
-| 3 | `junkyard` (`dealer`, `scrapyard`) | Sweeny's Scrapyard, the car dealer |
-| 4 | `paintshop` (`paint shop`) | The Paintshop |
-| 5 | `gate1` (`gate 1`) | Gate 1 |
-| 6 | `gate2` (`gate 2`) | Gate 2 |
-| 7 | `petes` (`pete's`) | Pete's |
+| - | `here` | where the save left the car (no teleport) |
+| 0 | `home` (`hub`, `trailer`) | the Career hub (Drive Around / Save / New Career / Exit) |
+| 1 | `malt` (`tj's`, `maltshop`) | TJ's Diner: the car stops in the area, no screen opens (not yet understood) |
+| 2 | `next_eve` (`eve`, `choose eve`) | the Choose Eve list |
+| 3 | `junkyard` (`dealer`, `scrapyard`) | Sweeny's Buy / Sell / Drive screen |
+| 4 | `paintshop` (`garage`, `upgrades`, `paint`) | the Garage: Upgrades / Paint / Drive |
+| 5 | `gate1` (`time challenge 1`) | Time Challenge: Race the Course / Drive Around |
+| 6 | `gate2` (`time challenge 2`) | Time Challenge (the second course) |
+| 7 | `petes` (`troy's place`, `troy`) | Troy's Place: Choose a challenger |
 
 `eve=<n>` runs that Career Eve as soon as free roam starts (CareerDoEve `0x2DDC08`, src/hle_dev_career.cpp; the
 same as `EOD_CAREER_EVE`). With `EOD_CAREER_LAST=1` the Eve starts its last listed event.
@@ -49,17 +51,14 @@ same as `EOD_CAREER_EVE`). With `EOD_CAREER_LAST=1` the Eve starts its last list
 
 `EOD_MENU_RUN_TRACE=1` logs every native menu screen's caller and answer (how the callers above were found).
 
-## Status (13 Nov 2026)
+## Timing
 
-Verified in the game: boot -> Career hub -> Drive Around with no input, for a new Career (tutorial notes closed)
-and for a saved Career; the teleport moves the car into the chosen area (area word `0x3CDA00` becomes the area).
-
-Open: after the teleport the Home Driver stops the car on entering the area (`home + 3064 = 0`, `0x170F30`), but
-the Career drive loop (`0x3694D0`) does not open that place's screen, so the car waits. The pause menu's own
-Jump To runs inside the pause path (`0x386C90` then `0x386D98`, `0x369840`, `0x384478`); the warp has to
-reproduce that hand-off. Until then, a save made at a place resumes there directly.
+The teleport runs 30 Home Driver updates after free roam starts (`EOD_CAREER_WARP_DELAY=<updates>` changes it),
+paused around the call as the pause menu does (`0x176710`/`0x2393B8`, then `0x1766F8`/`0x2393A8`). Entering the
+area stops the car (`home + 3064 = 0`) and the Career drive loop opens the place's screen. With a new Career the
+intro fly-by is still running at that point and the screen does not open: use a copy of a real save.
 
 ## Not covered
 
 - Choosing between several saves on the card (the game loads the profile it finds).
-- The Highway (`hiway` area) is not in the game's Jump To list.
+- The Highway (`hiway`), Bug's Place and the TJ's challenger prompt.
