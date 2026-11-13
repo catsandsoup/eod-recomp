@@ -156,7 +156,7 @@ def edited_material(disc, archive, name, request):
             continue
         selected = dict(request, archive=relative, asset=entry["name"])
         pending = request.get("textureEdits", {}) if relative == request["archive"] else {}
-        edit = pending.get(entry["name"]) or saved_edits(selected, disc, sha(archive.read_bytes()))
+        edit = pending.get(entry["name"]) or saved_edits(selected, disc, archive_sha(archive))
         if edit:
             return texture_edit_bytes(edit, payload(archive, entry["name"], entries, verify_crc=False)[0])
     return None
@@ -194,15 +194,24 @@ def resolve_material(disc, archive, name, paint=None, request=None):
     return None
 
 
+@lru_cache(maxsize=1024)
+def _member(path, modified, size, offset, length, crc):
+    with open(path, "rb") as handle:
+        handle.seek(offset)
+        data = handle.read(length)
+    return data, eod_crc(data) == crc
+
+
 def payload(path, name, entries=None, verify_crc=True):
     matches = [e for e in (entries or directory(path)) if e["name"] == name]
     if len(matches) != 1:
         raise ValueError(f"{name} is not in this archive. Refresh the list and choose again.")
     entry = matches[0]
-    with path.open("rb") as handle:
-        handle.seek(entry["offset"])
-        data = handle.read(entry["size"])
-    entry = dict(entry, crcOk=eod_crc(data) == entry["crc"])
+    # Members are cached per archive version (path, mtime, size): repeated material lookups for a
+    # model read and checksum each member once.
+    stat = path.stat()
+    data, crc_ok = _member(str(path), stat.st_mtime_ns, stat.st_size, entry["offset"], entry["size"], entry["crc"])
+    entry = dict(entry, crcOk=crc_ok)
     if verify_crc and not entry["crcOk"]:
         raise PlainError(f"{name} does not match its stored checksum, so it was not used. "
                          "Re-extract the game folder from your disc and try again.", "member checksum mismatch")
@@ -459,13 +468,19 @@ def inspect(request, disc):
 
 
 def texture(data, cache):
-    w, h, rgba, meta = decode_preview(data)
     cache.mkdir(parents=True, exist_ok=True)
-    path = cache / (sha(data + b"studio-preview-v2" + rgba) + ".png")
-    if path.resolve() != path:
+    key = sha(data + b"studio-preview-v3")
+    path, side = cache / (key + ".png"), cache / (key + ".json")
+    if path.resolve() != path or side.resolve() != side:
         raise ValueError("The preview cache contains a shortcut (symbolic link) and was not used. Delete the project's .cache folder and try again.")
-    if not path.exists():
-        write_png(str(path), w, h, rgba)
+    if path.exists() and side.exists():
+        try:
+            return str(path), json.loads(side.read_text())
+        except ValueError:
+            pass
+    w, h, rgba, meta = decode_preview(data)
+    write_png(str(path), w, h, rgba)
+    side.write_text(json.dumps(meta))
     return str(path), meta
 
 

@@ -126,6 +126,10 @@ def _source_lanes(width, height, bits):
     return lanes
 
 
+_LOW_NIBBLE = bytes(i & 15 for i in range(256))
+_HIGH_NIBBLE = bytes(i >> 4 for i in range(256))
+
+
 def decode_preview(data):
     """Return (width, height, RGBA bytes, numeric metadata) for indexed TEX.
 
@@ -168,15 +172,19 @@ def decode_preview(data):
     # relocation f_003521E8 treats palette and mip offsets separately.
     if pal < 32 or pal + 1024 > len(data) or mip < pal + 1024 or mip + size > len(data):
         raise ValueError('Truncated or overlapping TEX palette/image extent')
-    palette = [bytes((data[o+1], data[o+2], data[o+3], data[o]))
-               for o in range(pal, pal + 1024, 4)]
-    body = memoryview(data)[mip:mip + size]
+    channels = [bytes(data[o + c] for o in range(pal, pal + 1024, 4)) for c in (1, 2, 3, 0)]
+    body = bytes(data[mip:mip + size])
+    if bits == 4:
+        # One byte per nibble, low nibble first, so lanes index it directly.
+        nibbles = bytearray(len(body) * 2)
+        nibbles[0::2] = body.translate(_LOW_NIBBLE)
+        nibbles[1::2] = body.translate(_HIGH_NIBBLE)
+        body = bytes(nibbles)
     if height < 32:
-        indices = body if bits == 8 else ((body[i // 2] >> ((i & 1) * 4)) & 15
-                                         for i in range(width * height))
+        indices = body[:width * height]
     else:
-        lanes = _source_lanes(width, height, bits)
-        indices = (body[i] for i in lanes) if bits == 8 else (
-            (body[i >> 1] >> ((i & 1) * 4)) & 15 for i in lanes)
-    pixels = b''.join(palette[i] for i in indices)
-    return width, height, pixels, metadata
+        indices = bytes(map(body.__getitem__, _source_lanes(width, height, bits)))
+    pixels = bytearray(len(indices) * 4)
+    for lane, table in enumerate(channels):
+        pixels[lane::4] = indices.translate(table)
+    return width, height, bytes(pixels), metadata

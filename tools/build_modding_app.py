@@ -102,6 +102,7 @@ def main():
         subprocess.run(['iconutil', '-c', 'icns', str(iconset), '-o', str(resources / 'AppIcon.icns')], check=True)
     with (stage / 'Contents/Info.plist').open('wb') as handle:
         plistlib.dump(bundle_info(), handle)
+    subprocess.run(['xattr', '-cr', str(stage)], check=True)
     subprocess.run(['codesign', '--force', '--sign', '-', str(stage)], check=True)
     subprocess.run(['codesign', '--verify', '--strict', str(stage)], check=True)
     legacy_previous = layout['output'] / 'EOD Creation Kit Development.previous.app'
