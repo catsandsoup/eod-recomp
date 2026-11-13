@@ -21,9 +21,9 @@ blocks the game thread; online play unaffected; the original Jump To still works
 
 | Job | Now | Plan |
 |---|---|---|
-| Start in Career at a place | `EOD_DIRECT_START="mode=career;place=..."` + a copy of a real save (done) | Arrive inside the place, every place (incl. Highway, TJ's, Troy's), each Eve and event |
+| Start in Career at a place | `EOD_DIRECT_START="mode=career;place=..."` + a copy of a real save: arrives inside every Jump To place (done) | Highway, TJ's challenger prompt, each event of an Eve |
 | Run faster than real time | `EOD_TIME_SCALE=N` (done, ~6.5x at 8) | Unchanged |
-| Reach a hard scenario (moving challenger, dealer page 5, 1 h of play then quit) | Script it every time | **Snapshots**: save the whole game state once, load it in under a second, any number of times |
+| Reach a hard scenario (moving challenger, dealer page 5, 1 h of play then quit) | Script it every time | Scenarios from saves made at that point (save states are not feasible, phase 4) |
 | Prove a fix | Hand-built pad scripts and screenshots | `tools/scenario.py <name>`: snapshot or warp + script + contact sheet + log checks, one command |
 
 ## Phases
@@ -37,12 +37,15 @@ blocks the game thread; online play unaffected; the original Jump To still works
    Done when every place is reached from every other in the real game, and locked places explain themselves.
 3. **Continue and no waiting.** Main-menu Continue; skip the memory card loading screen where the write is
    already done (NVMe); returning players skip the intro fly-by and tutorial notes.
-4. **Snapshots.** Full guest state (EE RAM, only the pages in use; scratchpad; VU; GS registers and VRAM;
-   IOP and sound state; host-side HLE state), versioned and compressed. Developer first (`EOD_SNAPSHOT_SAVE`,
-   `EOD_SNAPSHOT_LOAD`), then player Quick Save / Quick Load once restores are proven identical
-   (state hash after load matches state hash at save, and the next 600 frames match).
-5. **Scenario library.** Named scenarios built from saves, warps and snapshots, used by every Career fix
-   (dealer lot, challengers, quit-to-menu, sound in the garage).
+4. **Snapshots: not feasible as save states (finding, 13 Nov 2026).** Guest threads are host fibers whose 1 MB
+   native stacks hold return addresses into recompiled code and pointers into host objects (renderer, sound,
+   HLE state, IOP); a restore would have to rebuild all of that host state, which means making every subsystem
+   serializable. The testing outcome is delivered instead by scenarios (phase 5): a copy of a real save + a
+   warp + the time scale reaches any Career place in a few seconds. Player Quick Save becomes "save the Career
+   anywhere in free roam" with the game's own save code, resumed by Continue (phase 3).
+5. **Scenario library (started).** `python3 tools/scenario.py <name>` (list: `python3 tools/scenario.py list`):
+   a fresh copy of your memory card, a Career warp, 8x time, optional pad input, then `sheet.png` and
+   `summary.txt`. Phase 1 is done: every Jump To place opens its screen (docs/CAREER_WARP.md).
 
 ## Risks
 
