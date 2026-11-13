@@ -156,3 +156,10 @@ non-player car (`$s2 = R[18]`, `car + 0x1E0 != 0x50`), it returns `0`, letting H
 reach `1.0f` damage, shed a wheel, and wreck while keeping the player's own car from softlocking free roam. If the
 active Highway challenger (`*(0x3CDA78)`) is wrecked before a challenge is accepted (`*(int32_t*)0x3CDA24` in `0` or
 `1`), `career_vblank` sets `0x3CDA24` to `6` so a wrecked challenger never offers a race prompt.
+
+A wrecked challenger stops where it died: its free-roam driver keeps setting controls through `CarSetThrottle`
+(`0x18AA70`, `car + 0x1B70`) and `CarSetBrake` (`0x18AA68`, `car + 0x1B74`); with `KillableChallengers` on, both
+are wrapped and, for a non-player car in Career free roam at 100 % damage (or wreck state `0xA`-`0xC`), hold the
+throttle at 0 and the brake at full. Checked in the game with `EOD_CAREER_WRECK_TEST=<frame>` (sets every AI car
+to 100 % damage and logs speed, throttle and brake each second): the wrapped values hold. Not yet checked: a
+challenger that is moving when it is wrecked (free-roam AI cars stay parked until a challenge starts).

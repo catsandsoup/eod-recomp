@@ -56,6 +56,8 @@
 0017E718 ChickenWeaponDetonate [V]  # Triggers explosion SFX, particle burst, and radial shockwave at impact point -> docs/BATTLE_RECOVERY.md
 0017EA10 ChickenWeaponInit [V]  # Initializes projectile scene nodes, SFX handles, and weapon registry entry -> docs/BATTLE_RECOVERY.md
 00188F20 CarResetForRespawn [V]  # Clears velocity, repairs damage/wheels/panels, and resets deform bones -> docs/BATTLE_RECOVERY.md
+0018AA68 CarSetBrake [V]  # Stores footbrake into car + 0x1B74; wrapped by KillableChallengers (wrecked challenger brakes) -> docs/CAREER_UNLOCKS.md
+0018AA70 CarSetThrottle [V]  # Stores throttle into car + 0x1B70; wrapped by KillableChallengers (wrecked challenger stops) -> docs/CAREER_UNLOCKS.md
 0018AA80 CarSetSteering [V]  # Writes normalized steering angle [-1, 1] to car+0x1B6C -> docs/BATTLE_RECOVERY.md
 0018AAD0 CarCanTakeDamage [V]  # Returns whether car can take damage in current mode; traced by EOD_CAREER_TRACE -> docs/CAREER_UNLOCKS.md
 0018AD20 CarSetScalarDamage [V]  # Sets normalized scalar damage (car+0x1B54); wrapped for Invincible/GodMode -> docs/GAMEPLAY_MODS_RE.md

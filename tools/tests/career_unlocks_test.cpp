@@ -50,6 +50,8 @@ extern "C" void f_002E35F0_orig() {
 }
 extern "C" void f_0018AAD0_orig() { s_orig_calls[6]++; g_ee.r[2].sd[0] = 1; }
 extern "C" void f_001741C0_orig() { g_ee.r[2].ud[0] = MEM_LW(0x3CDA24) != 6 ? 1 : 0; }
+extern "C" void f_0018AA70_orig() { MEM_SW(g_ee.r[4].uw[0] + 0x1B70, FPR[12].u); }
+extern "C" void f_0018AA68_orig() { MEM_SW(g_ee.r[4].uw[0] + 0x1B74, FPR[12].u); }
 static int s_info_calls;
 extern "C" void f_003702F0_orig() { s_info_calls++; }
 extern "C" void f_00370608_orig() {}
@@ -325,15 +327,20 @@ int main() {
         f_003702F0();
         check(s_banner.find("PAGE 1 OF 2") != std::string::npos, "live paging: L1/Q cycled back to page 1");
 
-        // Live page cycle forward via PAD_RIGHT (gamepad Right / keyboard Right arrow)
-        career_vblank(PAD_RIGHT);
+        // Live page cycle forward via PAD_R2 (gamepad R2 / keyboard D or 3)
+        career_vblank(PAD_R2);
         f_003702F0();
-        check(s_banner.find("PAGE 2 OF 2") != std::string::npos, "live paging: Right arrow cycled to page 2");
+        check(s_banner.find("PAGE 2 OF 2") != std::string::npos, "live paging: R2/D cycled to page 2");
 
-        // Live page cycle backward via PAD_LEFT (gamepad Left / keyboard Left arrow)
+        // Left/Right belong to the game (Buy / Sell / Drive): they must not turn the page
         career_vblank(PAD_LEFT);
         f_003702F0();
-        check(s_banner.find("PAGE 1 OF 2") != std::string::npos, "live paging: Left arrow cycled to page 1");
+        check(s_banner.find("PAGE 2 OF 2") != std::string::npos, "live paging: Left arrow leaves the page alone");
+
+        // Live page cycle backward via PAD_L2 (gamepad L2 / keyboard A or 1)
+        career_vblank(PAD_L2);
+        f_003702F0();
+        check(s_banner.find("PAGE 1 OF 2") != std::string::npos, "live paging: L2/A cycled back to page 1");
     };
 
     g_ee.r[29].uw[0] = simulated_sp + 0x980;

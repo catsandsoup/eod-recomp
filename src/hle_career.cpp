@@ -30,6 +30,8 @@ void f_002E3E70_orig(void);
 void f_002E35F0_orig(void);
 void f_0018AAD0_orig(void);
 void f_001741C0_orig(void);
+void f_0018AA70_orig(void);
+void f_0018AA68_orig(void);
 void f_003702F0_orig(void);
 void f_00370608_orig(void);
 void f_0036E9C0_orig(void);
@@ -368,6 +370,31 @@ extern "C" void f_001741C0(void) {
     }
 }
 
+// A wrecked challenger stops. With KillableChallengers a Highway / Malt Shop challenger can reach 100 %
+// damage, but its free-roam driver keeps steering it along its route to the race start. The car's
+// controls are set through CarSetThrottle (0x18AA70, car + 0x1B70) and CarSetBrake (0x18AA68,
+// car + 0x1B74), value in $f12: for a wrecked non-player car in Career free roam the throttle is held at
+// 0 and the brake at full, so it rolls to a stop where it died, like a wrecked car in a race.
+namespace {
+bool wrecked_freeroam_ai(uint32_t car) {
+    if (!g_config.career_killable || ee_r32(kEventWord) != 0x8000226u) return false;
+    if (!sane(car, 0x1C00) || ee_r32(car + 0x1E0) == 0x50) return false;
+    const uint32_t bits = ee_r32(car + 0x1BEC);
+    float damage; std::memcpy(&damage, &bits, 4);
+    const uint32_t state = ee_r32(car + 0x1BE8);
+    return damage >= 1.0f || (state >= 0xA && state <= 0xC);
+}
+}  // namespace
+
+extern "C" void f_0018AA70(void) {  // CarSetThrottle(car, $f12)
+    if (wrecked_freeroam_ai(g_ee.r[4].uw[0])) FPR[12].f = 0.0f;
+    f_0018AA70_orig();
+}
+extern "C" void f_0018AA68(void) {  // CarSetBrake(car, $f12)
+    if (wrecked_freeroam_ai(g_ee.r[4].uw[0])) FPR[12].f = 1.0f;
+    f_0018AA68_orig();
+}
+
 // ---- per-frame (game_patches_vblank) ----------------------------------------------------------
 namespace {
 const uint32_t kCareerSave = 0x3D9384;  // pointer: +0 non-zero while a Career is active
@@ -433,6 +460,23 @@ void career_vblank(uint16_t pressed) {
         }
     }
     if (idle) crash_probe();
+    // Developer probe (EOD_CAREER_WRECK_TEST=<frame>): at that free-roam frame every AI car is set to 100 % damage;
+    // each AI car's speed is logged every second afterwards (a wrecked challenger should roll to a stop).
+    if (idle) {
+        static const char *wt = std::getenv("EOD_CAREER_WRECK_TEST");
+        static int f;
+        if (wt && ++f >= std::atoi(wt)) {
+            const uint32_t n = ee_r32(0x48522C);
+            for (uint32_t i = 0; n <= 20 && i < n; i++) {
+                const uint32_t c = ee_r32(0x447458 + 4 * i);
+                if (!sane(c, 0x1C34) || ee_r32(c + 0x1E0) == 0x50) continue;
+                if (f == std::atoi(wt)) wf(c + 0x1BEC, 1.0f);
+                if ((f - std::atoi(wt)) % 60 == 0)
+                    LOG(LOG_CORE, "[WRECK_TEST] t=%ds car %u speed=%.2f damage=%.2f throttle=%.2f brake=%.2f", (f - std::atoi(wt)) / 60, i,
+                        std::sqrt(rf(c + 0x104) * rf(c + 0x104) + rf(c + 0x10C) * rf(c + 0x10C)), rf(c + 0x1BEC), rf(c + 0x1B70), rf(c + 0x1B74));
+            }
+        }
+    }
     showroom_update_camera(1.0f / 60.0f);
     showroom_update_turntable(1.0f / 60.0f);
     // the dealer's car list is on screen (its callback ran within the last few vblanks): say which page it is
