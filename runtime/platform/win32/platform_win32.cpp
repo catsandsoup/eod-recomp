@@ -519,6 +519,8 @@ void platform_audio_feedback(bool enabled) {
 // ------------------------------------------------------------------ audio
 bool platform_audio_open(int sample_rate) {
     InitializeCriticalSection(&g_audio_cs);
+    const char *m = getenv("EOD_MUTE");  // as platform_sdl3.cpp: no audio device
+    if (m && m[0] == '1') return false;
     WAVEFORMATEX wf = {};
     wf.wFormatTag = WAVE_FORMAT_PCM;
     wf.nChannels = 2;
