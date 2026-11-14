@@ -555,6 +555,19 @@ void vu1_start(const VUState *vu, uint32_t pc) {
         replaced = true;
     }
     if (g_modern && !replaced) mark(-1);
+    // EOD_MODERN_LOGTAG=<frame>: a geometry run's input header (TOP+0, qwords 20-23) for comparison
+    // with the GIF tags it kicks (gif() prints them)
+    static const uint64_t tag_at = env_u64("EOD_MODERN_LOGTAG", 0);
+    if (tag_at && g_frame >= tag_at && g_frame < tag_at + 4 && geometry_program(pc)) {
+        const uint64_t *t0 = (const uint64_t *)qword(vu, g_vif1_top);
+        fprintf(stderr, "[tag] run %u pc %04x itop %03x top %03x in0 %016llx %016llx",
+                g_run, pc, g_vif1_itop, g_vif1_top, (unsigned long long)t0[0], (unsigned long long)t0[1]);
+        for (uint32_t q = 20; q < 24; q++) {
+            const uint64_t *w = (const uint64_t *)qword(vu, q);
+            fprintf(stderr, " q%u %016llx %016llx", q, (unsigned long long)w[0], (unsigned long long)w[1]);
+        }
+        fprintf(stderr, "\n");
+    }
     // EOD_MODERN_LOGPROGS=<frame>: every VU1 program run in that frame, with whether it was replaced
     static const uint64_t log_at = env_u64("EOD_MODERN_LOGPROGS", 0);
     if (log_at && g_frame == log_at) {
@@ -569,6 +582,13 @@ void gif(int path, const uint8_t *data, uint32_t qwc) {
     if (!g_frame_active || path != 1) return;
     EOD_ZONE("emit.gif");
     g_kicks++;
+    static const uint64_t tag_at = env_u64("EOD_MODERN_LOGTAG", 0);
+    if (tag_at && g_frame >= tag_at && g_frame < tag_at + 4 && qwc) {
+        const uint64_t *w = (const uint64_t *)data;
+        fprintf(stderr, "[tag]   kick run %u qwc %u q0 %016llx %016llx q1 %016llx %016llx\n", g_run, qwc,
+                (unsigned long long)w[0], (unsigned long long)w[1], qwc > 1 ? (unsigned long long)w[2] : 0ull,
+                qwc > 1 ? (unsigned long long)w[3] : 0ull);
+    }
     if (g_pending) {
         g_batches.back().kicks++;
         Batch &cur = g_batches.back();
