@@ -24,7 +24,7 @@ struct Vertex {
     float p[3];      // model space
     float uv[2];
     int8_t n[4];     // normal (x, y, z / 127), [3] = 127 when present
-    uint8_t c[4];    // vertex colour (0x80 = 1.0) when there is no normal
+    uint8_t c[4];    // vertex colour and alpha (0x80 = 1.0) when there is no normal
 };
 static_assert(sizeof(Vertex) == 28, "vertex layout");
 
@@ -42,6 +42,8 @@ struct Batch {
     float light[4];    // world light direction, .w = ambient (VU1 qword 17)
     uint32_t pc, itop, role, layer;
     bool drawn;        // the game kicked something for it
+    std::vector<uint8_t> valpha;  // per vertex: the kicked alpha and 255 if its primitive blends
+                                  // (empty: the kick was not 1:1 with the mesh)
 };
 
 struct Frame {

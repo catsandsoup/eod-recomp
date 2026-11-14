@@ -24,7 +24,7 @@ cbuffer Batch : register(b1) {
     float4 light;        // world direction, w = ambient (VU1 qword 17)
     float4 info;         // x role (0 sky, 1 world, 2 object), y layer, z textured, w gloss
     float4 info2;        // x 1: an additive/subtractive GS layer (unlit, as the game draws it), y vertex alpha,
-                         // z alpha from the vertex only
+                         // z alpha from the vertex only, w use the mesh's vertex alpha
     float4 atest;        // the GS alpha test: x method (-1 off), y reference (GS units), z discard on fail
 };
 Texture2D tex : register(t0);
@@ -33,9 +33,10 @@ SamplerState smp : register(s0);
 SamplerComparisonState shadow_smp : register(s1);
 struct VIn {
     float3 p : POSITION;
-    float2 uv : TEXCOORD;
+    float2 uv : TEXCOORD0;
     float4 n : NORMAL;
     float4 c : COLOR;
+    float2 va : TEXCOORD1;  // the kicked vertex alpha (0x80 = 1.0) and whether the primitive blends
 };
 struct VOut {
     float4 pos : SV_Position;
@@ -43,6 +44,7 @@ struct VOut {
     float3 n : TEXCOORD1;
     float3 wp : TEXCOORD2;
     float4 c : COLOR;
+    float2 va : TEXCOORD3;
 };
 float4 world(float3 p) {
     float4 q = float4(p, 1);
@@ -62,6 +64,7 @@ VOut vs_modern(VIn i) {
     o.n = float3(dot(m0.xyz, i.n.xyz), dot(m1.xyz, i.n.xyz), dot(m2.xyz, i.n.xyz));
     o.wp = w.xyz;
     o.c = float4(i.c.rgb * (255.0 / 128.0), i.n.w);  // a: normal present
+    o.va = float2(i.va.x * (255.0 / 128.0), i.va.y);
     return o;
 }
 struct SOut {
@@ -108,15 +111,21 @@ float3 sky_env(float3 r) {
 float4 ps_modern(VOut i) : SV_Target {
     float4 t = info.z > 0 ? tex.Sample(smp, i.uv) : float4(0.75, 0.75, 0.75, 128.0 / 255.0);
     // the GS alpha test on the source alpha (GS units: 0x80 = 1.0), as the game sets it per batch
-    float as_gs = info2.z > 0 ? info2.y * 128 : t.a * 255 * info2.y;
-    if (atest.x >= 0 && atest.z > 0) {
+    // source alpha by the texture function (GS): MODULATE At * Av, DECAL / HIGHLIGHT2 At,
+    // HIGHLIGHT At + Av; without TCC only Av
+    float av = info2.y * i.va.x;
+    int tfx = (int)info2.w;
+    float as_gs = info2.z > 0 ? av * 128 : tfx == 0 ? t.a * 255 * av : tfx == 2 ? t.a * 255 + av * 128 : t.a * 255;
+    if (atest.x >= 0 && atest.z > 0) {  // AFAIL KEEP: a failing pixel writes nothing
         float r = atest.y;
         int m = (int)atest.x;
         bool ok = m == 1 || (m == 2 && as_gs < r) || (m == 3 && as_gs <= r) || (m == 4 && abs(as_gs - r) < 0.5) ||
                     (m == 5 && as_gs >= r) || (m == 6 && as_gs > r) || (m == 7 && abs(as_gs - r) >= 0.5);
         if (!ok) discard;
     }
-    t.a = saturate(as_gs / 128.0);
+    // a blended primitive that adds nothing (alpha 0) writes nothing, depth included
+    if (i.va.y > 0.5 && as_gs < 1) discard;
+    t.a = i.va.y > 0.5 ? saturate(as_gs / 128.0) : 1;  // an unblended primitive is opaque
     if (atest.x < 0 && t.a < (info.x == 2 && info2.y >= 0.99 ? 0.5 : 0.02)) discard;
     if (info.x == 0 || info2.x > 0) return float4(t.rgb * (i.c.a > 0.5 ? 1 : i.c.rgb), t.a);  // as authored
     float3 albedo = lin(t.rgb);
@@ -158,14 +167,19 @@ float4 ps_modern(VOut i) : SV_Target {
 struct MeshGpu {
     ID3D11Buffer *vb = nullptr, *ib = nullptr;
     UINT count = 0;
+    bool normals = false;
 };
 std::unordered_map<uint64_t, MeshGpu> g_mmesh;
 std::vector<ID3D11ShaderResourceView *> g_mtex;  // this frame's batch textures (one reference each)
 ID3D11VertexShader *g_mvs, *g_mvs_shadow, *g_mvs_full;
 ID3D11PixelShader *g_mps, *g_mps_shadow, *g_mps_full;
 ID3D11InputLayout *g_mlayout;
+ID3D11Buffer *g_malpha_vb, *g_mones_vb;
+constexpr UINT kAlphaRing = 1 << 20;
+UINT g_malpha_pos;
 ID3D11Buffer *g_mcb_frame, *g_mcb_batch;
 ID3D11SamplerState *g_msampler, *g_mshadow_smp;
+ID3D11SamplerState *g_msamplers[4];  // repeat / clamp in u (bit 0) and v (bit 1)
 ID3D11BlendState *g_mblend;
 ID3D11DepthStencilState *g_mds_sky, *g_mds_draw, *g_mds_shadow;
 ID3D11RasterizerState *g_mrs, *g_mrs_shadow;
@@ -287,8 +301,24 @@ bool modern_init() {
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R8G8B8A8_SNORM, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 1, DXGI_FORMAT_R8G8_UNORM, 1, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    CHECK(g_dev->CreateInputLayout(il, 4, e[0].blob->GetBufferPointer(), e[0].blob->GetBufferSize(), &g_mlayout));
+    {  // per-vertex alpha: a ring for the car passes, and 0x80 everywhere else
+        D3D11_BUFFER_DESC vb = {};
+        vb.Usage = D3D11_USAGE_DYNAMIC;
+        vb.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        vb.ByteWidth = kAlphaRing;
+        CHECK(g_dev->CreateBuffer(&vb, nullptr, &g_malpha_vb));
+        static uint8_t ones[65536];  // alpha 0x80, blending as the batch's state says
+        for (size_t k = 0; k < sizeof ones; k += 2) ones[k] = 0x80, ones[k + 1] = 0xFF;
+        vb.Usage = D3D11_USAGE_IMMUTABLE;
+        vb.CPUAccessFlags = 0;
+        vb.ByteWidth = sizeof ones;
+        D3D11_SUBRESOURCE_DATA od = {ones, 0, 0};
+        CHECK(g_dev->CreateBuffer(&vb, &od, &g_mones_vb));
+    }
+    CHECK(g_dev->CreateInputLayout(il, 5, e[0].blob->GetBufferPointer(), e[0].blob->GetBufferSize(), &g_mlayout));
     for (Entry &x : e) x.blob->Release();
     D3D11_BUFFER_DESC bd = {};
     bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -304,6 +334,12 @@ bool modern_init() {
     sd.MaxAnisotropy = 16;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     CHECK(g_dev->CreateSamplerState(&sd, &g_msampler));
+    for (int k = 0; k < 4; k++) {
+        D3D11_SAMPLER_DESC s2 = sd;
+        s2.AddressU = (k & 1) ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
+        s2.AddressV = (k & 2) ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
+        CHECK(g_dev->CreateSamplerState(&s2, &g_msamplers[k]));
+    }
     sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
     sd.BorderColor[0] = sd.BorderColor[1] = sd.BorderColor[2] = sd.BorderColor[3] = 1.0f;
@@ -423,6 +459,7 @@ void modern_upload(const modern::Mesh &m) {
         return;
     }
     g.count = (UINT)m.idx.size();
+    g.normals = !m.v.empty() && m.v[0].n[3] != 0;
     g_mmesh.emplace(m.id, g);
 }
 
@@ -468,8 +505,11 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass,
             if (b.pc == skip_pc) continue;
             // the car body passes: the game drives their alpha per vertex (damage); a per-batch value
             // cannot stand in for it, so the damage overlay waits for per-vertex alpha
-            const bool car = b.pc == 0x2e0 || b.pc == 0xd48 || b.pc == 0x15a8;
-            if (b.pc == 0x15a8) continue;
+            // car passes without the per-vertex alpha (clipped): their alpha cannot be formed, so the
+            // damage overlay is left out and the others are drawn plainly
+            const bool car = (b.pc == 0x2e0 || b.pc == 0xd48 || b.pc == 0x15a8) && b.valpha.empty();
+            if (car && b.pc == 0x15a8) continue;
+            const bool per_vertex = !b.valpha.empty();
             auto it = g_mmesh.find(b.mesh);
             if (it == g_mmesh.end()) continue;
             ID3D11ShaderResourceView *srv = i < g_mtex.size() ? g_mtex[i] : nullptr;
@@ -482,7 +522,10 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass,
             const uint32_t key = i < g_mblend_key.size() ? g_mblend_key[i] : ~0u;
             bool raw = false;
             if (!shadow_pass && role != modern::SKY) {
-                ID3D11BlendState *bs = modern_blend(key, raw);
+                // per-vertex data: the primitive decides whether it blends, so the batch's equation is
+                // used with blending on (unblended primitives output alpha 1)
+                const uint32_t bkey = per_vertex && key != ~0u ? (key | 1u) : key;
+                ID3D11BlendState *bs = modern_blend(bkey, raw);
                 const float fix = key == ~0u ? 1.0f : (float)((key >> 9) & 0xFF) / 128.0f;
                 const float bf[4] = {fix, fix, fix, 128.0f / 255.0f};
                 g_ctx->OMSetBlendState(bs ? bs : g_mblend, bf, 0xFFFFFFFF);
@@ -497,7 +540,15 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass,
             const float av = (va & 0xFFFFFF) ? std::min(2.0f, (float)(va >> 24) / (float)(va & 0xFFFFFF) / 128.0f) : 1.0f;
             bc.info2[1] = by_as && tfx != 1 ? av : 1.0f;
             bc.info2[2] = key != ~0u && !((key >> 19) & 1) ? 1.0f : 0.0f;  // alpha from the vertex only
-            if (key != ~0u && tfx != 1) bc.info2[1] = av;  // the source alpha the GS tests and blends with
+            if (key != ~0u && tfx != 1) bc.info2[1] = b.valpha.empty() ? av : 1.0f;  // per vertex: in the stream
+            bc.info2[3] = key == ~0u ? 0.0f : (float)tfx;
+            // the game's CLAMP per texture: repeat or clamp in u and v
+            {
+                const uint32_t wm = key == ~0u ? 0 : (key >> 21) & 15;
+                const int su = (wm & 3) == 1 || (wm & 3) == 2 ? 1 : 0, sv = ((wm >> 2) & 3) == 1 || ((wm >> 2) & 3) == 2 ? 1 : 0;
+                ID3D11SamplerState *smp = g_msamplers[su | sv << 1];
+                g_ctx->PSSetSamplers(0, 1, &smp);
+            }
             const uint32_t at = i < g_matest.size() ? g_matest[i] : 0;
             bc.atest[0] = (at & 1) ? (float)((at >> 1) & 7) : -1.0f;
             bc.atest[1] = (float)((at >> 8) & 0xFF);
@@ -513,6 +564,27 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass,
             g_ctx->PSSetShaderResources(0, 1, &srv);
             UINT stride = sizeof(modern::Vertex), offset = 0;
             g_ctx->IASetVertexBuffers(0, 1, &it->second.vb, &stride, &offset);
+            {
+                ID3D11Buffer *avb = g_mones_vb;
+                UINT astride = 2, aoff = 0;
+                const UINT nv = (UINT)b.valpha.size();
+                if (nv && g_malpha_vb) {
+                    D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+                    if (g_malpha_pos + nv > kAlphaRing) {
+                        g_malpha_pos = 0;
+                        mode = D3D11_MAP_WRITE_DISCARD;
+                    }
+                    D3D11_MAPPED_SUBRESOURCE am;
+                    if (SUCCEEDED(g_ctx->Map(g_malpha_vb, 0, mode, 0, &am))) {
+                        memcpy((uint8_t *)am.pData + g_malpha_pos, b.valpha.data(), nv);
+                        g_ctx->Unmap(g_malpha_vb, 0);
+                        avb = g_malpha_vb;
+                        aoff = g_malpha_pos;
+                        g_malpha_pos += (nv + 15) & ~15u;
+                    }
+                }
+                g_ctx->IASetVertexBuffers(1, 1, &avb, &astride, &aoff);
+            }
             g_ctx->IASetIndexBuffer(it->second.ib, DXGI_FORMAT_R32_UINT, 0);
             g_ctx->DrawIndexed(it->second.count, 0, 0);
             drawn++;
@@ -535,7 +607,8 @@ void modern_texture(int32_t batch, const Env &e) {
     g_matest[(size_t)batch] = (e.ate ? 1u : 0u) | (uint32_t)(e.atst & 7) << 1 | (uint32_t)(e.afail & 3) << 4 | (e.aref & 0xFF) << 8;
     g_mblend_key[(size_t)batch] = (e.abe ? 1u : 0u) | (uint32_t)(e.ba & 3) << 1 | (uint32_t)(e.bb & 3) << 3 |
                                   (uint32_t)(e.bc & 3) << 5 | (uint32_t)(e.bd & 3) << 7 | (e.bfix & 0xFF) << 9 |
-                                  (uint32_t)(e.tfx & 3) << 17 | (e.tcc ? 1u : 0u) << 19 | (e.tme ? 1u : 0u) << 20;
+                                  (uint32_t)(e.tfx & 3) << 17 | (e.tcc ? 1u : 0u) << 19 | (e.tme ? 1u : 0u) << 20 |
+                                  (uint32_t)(e.wms & 3) << 21 | (uint32_t)(e.wmt & 3) << 23;
     if (!e.tme) return;
     // render-to-texture sources (a surface owns the texture's memory) are left untextured here
     const uint32_t p0 = (e.tbp >> 5) % kPages;

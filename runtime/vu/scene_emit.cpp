@@ -89,7 +89,53 @@ struct Batch {
     float mvp[16];  // column-major: column c = vf[4 + c]
     float q17[4], vf12[4];
     int32_t mi;  // index in the modern frame (-1: not replaced)
+    uint32_t n;  // vertices
+    bool want_alpha;               // collect the kicked per-vertex alpha (car passes)
+    std::vector<uint8_t> valpha;
 };
+
+// For every vertex a PATH1 packet draws, in order (PACKED and REGLIST GIF tags): the alpha of
+// the RGBAQ in force when its XYZ2/XYZF2/XYZ3/XYZF3 is written, and whether its primitive blends
+// (PRIM.ABE, which the game switches within one batch).
+void kick_alphas(const uint8_t *d, uint32_t qwc, std::vector<uint8_t> &out) {
+    uint32_t p = 0;
+    uint8_t a = 0x80, abe = 0;
+    while (p < qwc) {
+        uint64_t lo, hi;
+        memcpy(&lo, d + p * 16, 8);
+        memcpy(&hi, d + p * 16 + 8, 8);
+        p++;
+        const uint32_t nloop = (uint32_t)(lo & 0x7FFF), eop = (uint32_t)(lo >> 15) & 1, flg = (uint32_t)(lo >> 58) & 3;
+        if ((lo >> 46) & 1) abe = (uint8_t)((lo >> 53) & 1);  // PRE: PRIM bit 6 (ABE)
+        uint32_t nreg = (uint32_t)(lo >> 60) & 15;
+        if (!nreg) nreg = 16;
+        if (flg == 0) {
+            for (uint32_t l = 0; l < nloop; l++)
+                for (uint32_t r = 0; r < nreg; r++, p++) {
+                    if (p >= qwc) return;
+                    const uint32_t reg = (uint32_t)(hi >> (4 * r)) & 15;
+                    if (reg == 1) a = d[p * 16 + 12];
+                    else if (reg == 0) abe = (d[p * 16] >> 6) & 1;
+                    else if (reg == 4 || reg == 5 || reg == 12 || reg == 13) out.insert(out.end(), {a, abe ? (uint8_t)255 : (uint8_t)0});
+                }
+        } else if (flg == 1) {
+            const uint32_t total = nloop * nreg;
+            if (p + (total + 1) / 2 > qwc) return;
+            for (uint32_t i = 0; i < total; i++) {
+                uint64_t w;
+                memcpy(&w, d + p * 16 + i * 8, 8);
+                const uint32_t reg = (uint32_t)(hi >> (4 * (i % nreg))) & 15;
+                if (reg == 1) a = (uint8_t)(w >> 24);
+                else if (reg == 0) abe = (uint8_t)((w >> 6) & 1);
+                else if (reg == 4 || reg == 5 || reg == 12 || reg == 13) out.insert(out.end(), {a, abe ? (uint8_t)255 : (uint8_t)0});
+            }
+            p += (total + 1) / 2;
+        } else {
+            p += nloop;
+        }
+        if (eop) break;
+    }
+}
 
 // modern feed (producer)
 modern::Frame *g_mf;
@@ -302,6 +348,7 @@ void post_modern() {
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 4; c++) m.model[r * 4 + c] = (float)M[r][c];
         world_dir(M, b.q17, m.light);
+        if (b.valpha.size() == 2 * (size_t)b.n) m.valpha = b.valpha;  // 1:1 with the mesh (nothing clipped)
         double dev = 0, rot = 0;
         for (int r = 0; r < 4; r++)
             for (int c = 0; c < 4; c++) dev = std::max(dev, std::fabs(M[r][c] - (r == c)));
@@ -428,6 +475,8 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                 memcpy(b.q17, qword(vu, 17), 16);
                 memcpy(b.vf12, vu->vf[12].f, 16);
                 b.mi = -1;
+                b.n = n;
+                b.want_alpha = false;
                 // the sky dome (0x270 in ITOP mode 0x280) stays with the GS: the modern pass starts from it
                 const bool sky_dome = pc == 0x270 && b.itop == 0x280;
                 if (g_live && !hud && !sky_dome && !g_triggered) {
@@ -439,6 +488,7 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                     m.itop = b.itop;
                     g_mf->batches.push_back(m);
                     mark(b.mi);
+                    b.want_alpha = true;
                     replaced = true;
                 }
                 g_batches.push_back(b);
@@ -455,7 +505,9 @@ void gif(int path, const uint8_t *data, uint32_t qwc) {
     g_kicks++;
     if (g_pending) {
         g_batches.back().kicks++;
-        if (g_mf && g_batches.back().mi >= 0) g_mf->batches[(size_t)g_batches.back().mi].drawn = true;
+        Batch &cur = g_batches.back();
+        if (g_mf && cur.mi >= 0) g_mf->batches[(size_t)cur.mi].drawn = true;
+        if (cur.want_alpha) kick_alphas(data, qwc, cur.valpha);
     }
     if (g_frame >= g_verify && g_frame - g_verify < 4) {  // a few vblanks: the game draws every 2-3
         const uint64_t t = now_ns();
