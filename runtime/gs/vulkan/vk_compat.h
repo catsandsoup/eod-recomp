@@ -3,6 +3,8 @@
 // all allocation, synchronization and drawing below use Vulkan exclusively.
 #pragma once
 #include "present_timing.h"
+#include "core/trace.h"
+#include "core/prof.h"
 #ifndef _WIN32
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -25,6 +27,13 @@
 #include "../../platform/platform.h"
 #else
 #include <vulkan/vulkan.h>
+#endif
+#ifdef EOD_TRACY
+#include <tracy/TracyVulkan.hpp>
+// GPU zone in the current command buffer: EOD_GPU_ZONE(ctx, "name")
+#define EOD_GPU_ZONE(c, name) TracyVkNamedZone((c)->tracyVk, EOD_ZONE_CAT(eod_gpu_zone_, __LINE__), (c)->cmd, name, (c)->tracyVk != nullptr)
+#else
+#define EOD_GPU_ZONE(c, name)
 #endif
 #ifdef __APPLE__
 #include <mach/mach_time.h>
@@ -274,7 +283,105 @@ struct Context {
         std::vector<VkDescriptorPool> pools;
         std::vector<std::function<void()>> garbage;
         uint64_t serial = 0;
+        VkQueryPool qpool{};
+        uint32_t qused = 0;
+        std::vector<std::pair<uint8_t, uint32_t>> qzones;  // (label, first query)
     };
+    // GPU timer (EOD_FPS or EOD_GPU_PROF): timestamp pairs per labelled zone, read when the
+    // command buffer's flight completes, reported as GPU milliseconds per presented frame.
+    enum GpuLabel : uint8_t { GPU_CMDBUF, GPU_M_SHADOW, GPU_M_SCENE, GPU_M_RESOLVE, GPU_M_POST, GPU_M_GSDEPTH,
+                              GPU_M_UPLOAD, GPU_LABELS };
+    static constexpr uint32_t kQueries = 256;
+    int gpuProf = -1;
+    double tsPeriod = 1;
+    VkQueryPool qpool{};
+    uint32_t qused = 0;
+    std::vector<std::pair<uint8_t, uint32_t>> qzones;
+    double gpuNs[GPU_LABELS]{};
+    uint64_t drawTicks[5]{}, drawTick0 = 0, drawUs0 = 0;
+    uint64_t cntDraws = 0, cntSets = 0, cntPasses = 0, cntBarriers = 0, cntSubmits = 0;
+    uint64_t gpuPresents = 0, gpuReportUs = 0, gpuFirst = UINT64_MAX, gpuLast = 0, gpuCmdbufs = 0, gpuWaits0 = 0;
+    bool gpu_prof() {
+        if (gpuProf < 0) {
+            gpuProf = (getenv("EOD_FPS") || getenv("EOD_GPU_PROF")) ? 1 : 0;
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(physical, &p);
+            tsPeriod = p.limits.timestampPeriod;
+            if (!p.limits.timestampComputeAndGraphics)
+                gpuProf = 0;
+        }
+        return gpuProf > 0;
+    }
+    // Opens a zone in the current command buffer; returns its index (or ~0u).
+    uint32_t gpu_begin(GpuLabel label) {
+        if (!recording || !qpool || qused + 2 > kQueries)
+            return ~0u;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, qused);
+        qzones.push_back({label, qused});
+        qused += 2;
+        return (uint32_t)qzones.size() - 1;
+    }
+    void gpu_end(uint32_t zone) {
+        if (zone == ~0u || zone >= qzones.size())
+            return;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, qzones[zone].second + 1);
+    }
+    void gpu_collect(Flight &f) {
+        if (!f.qpool || !f.qused)
+            return;
+        uint64_t ts[kQueries];
+        if (vkGetQueryPoolResults(device, f.qpool, 0, f.qused, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            for (auto &z : f.qzones)
+                if (ts[z.second + 1] >= ts[z.second]) {
+                    gpuNs[z.first] += (double)(ts[z.second + 1] - ts[z.second]) * tsPeriod;
+                    if (z.first == GPU_CMDBUF) {  // wall span of the GPU timeline this window
+                        gpuFirst = std::min(gpuFirst, ts[z.second]);
+                        gpuLast = std::max(gpuLast, ts[z.second + 1]);
+                        ++gpuCmdbufs;
+                    }
+                }
+        f.qused = 0;
+        f.qzones.clear();
+    }
+    void gpu_report() {
+        ++gpuPresents;
+        const uint64_t now = now_us();
+        if (!gpuReportUs)
+            gpuReportUs = now;
+        if (now - gpuReportUs < 5000000 || !gpuPresents)
+            return;
+        static const char *names[GPU_LABELS] = {"all GS command buffers", "modern shadows", "modern scene",
+                                                "modern resolve", "modern post", "modern GS depth", "modern uploads"};
+        fprintf(stderr, "  GPU ms per presented frame:");
+        for (int i = 0; i < GPU_LABELS; i++)
+            fprintf(stderr, " %s %.2f%s", names[i], gpuNs[i] / 1e6 / (double)gpuPresents, i + 1 < GPU_LABELS ? "," : "\n");
+        const double span = gpuLast > gpuFirst ? (double)(gpuLast - gpuFirst) * tsPeriod : 0;
+        fprintf(stderr, "  GPU busy %.0f%% of its timeline (%.1f ms span), %.1f command buffers and %.1f ms CPU fence wait per frame\n",
+                span > 0 ? 100.0 * gpuNs[GPU_CMDBUF] / span : 0.0, span / 1e6, (double)gpuCmdbufs / (double)gpuPresents,
+                (double)(wait_us - gpuWaits0) / 1000.0 / (double)gpuPresents);
+        {
+            const double n = (double)gpuPresents;
+            fprintf(stderr, "  per frame: %.0f draws, %.0f descriptor sets written, %.0f render passes, %.0f full barriers, %.1f submits (push descriptors %s)\n",
+                    cntDraws / n, cntSets / n, cntPasses / n, cntBarriers / n, cntSubmits / n, push ? "yes" : "no");
+            {
+                const uint64_t t1 = prof_ticks(), u1 = now_us();
+                const double per_us = drawUs0 && u1 > drawUs0 ? (double)(t1 - drawTick0) / (double)(u1 - drawUs0) : 1;
+                static const char *dn[5] = {"pipeline", "pass+dynamic", "descriptors+constants", "vertices+draw", "flush"};
+                fprintf(stderr, "  Draw ms per frame:");
+                for (int i = 0; i < 5; i++) { fprintf(stderr, " %s %.2f", dn[i], drawTicks[i] / per_us / 1000.0 / n); drawTicks[i] = 0; }
+                fprintf(stderr, "\n");
+                drawTick0 = t1; drawUs0 = u1;
+            }
+            cntDraws = cntSets = cntPasses = cntBarriers = cntSubmits = 0;
+        }
+        gpuFirst = UINT64_MAX;
+        gpuLast = gpuCmdbufs = 0;
+        gpuWaits0 = wait_us;
+        for (double &v : gpuNs)
+            v = 0;
+        gpuPresents = 0;
+        gpuReportUs = now;
+    }
     // Without VK_KHR_push_descriptor (older AMD drivers) descriptor sets come from
     // pools owned by the command buffer's flight and reset when it completes.
     std::vector<VkDescriptorPool> pools;
@@ -315,6 +422,7 @@ struct Context {
     // vkCmdPushDescriptorSetKHR, or the same writes into a fresh set of `setLayout`
     void push_set(VkPipelineBindPoint bind, VkPipelineLayout pl, uint32_t set, uint32_t n,
                   const VkWriteDescriptorSet *w, VkDescriptorSetLayout setLayout) {
+        ++cntSets;
         if (push) {
             push(cmd, bind, pl, set, n, w);
             return;
@@ -467,13 +575,59 @@ struct Context {
         require(vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.map), "map buffer");
         return b;
     }
+#ifdef EOD_TRACY
+    // Tracy GPU timeline: one zone per command buffer (the modern pass nests its own).
+    tracy::VkCtx *tracyVk = nullptr;
+    tracy::VkCtxScope *tracyCmd = nullptr;
+    bool tracyTried = false;
+    void tracy_init() {
+        tracyTried = true;
+        VkCommandPool tp{};
+        VkCommandBuffer tc{};
+        VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cp.queueFamilyIndex = family;
+        if (vkCreateCommandPool(device, &cp, nullptr, &tp) != VK_SUCCESS)
+            return;
+        VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ca.commandPool = tp;
+        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ca.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &ca, &tc) != VK_SUCCESS)
+            return;
+        tracyVk = TracyVkContext(physical, device, queue, tc);
+        TracyVkContextName(tracyVk, "GPU", 3);
+    }
+#endif
     void begin() {
         if (recording)
             return;
+#ifdef EOD_TRACY
+        if (!tracyTried)
+            tracy_init();
+#endif
         VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         require(vkBeginCommandBuffer(cmd, &b), "begin commands");
         recording = true;
+        if (gpu_prof()) {
+            if (!qpool) {
+                VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                q.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                q.queryCount = kQueries;
+                vkCreateQueryPool(device, &q, nullptr, &qpool);
+            }
+            if (qpool) {
+                vkCmdResetQueryPool(cmd, qpool, 0, kQueries);
+                qused = 0;
+                qzones.clear();
+                gpu_begin(GPU_CMDBUF);
+            }
+        }
+#ifdef EOD_TRACY
+        if (tracyVk)
+            TracyVkCollect(tracyVk, cmd);
+#endif
         // A reset/recycled command buffer inherits no graphics state, including
         // when the two in-flight command pools exchange ownership.
         boundPipeline = VK_NULL_HANDLE;
@@ -495,6 +649,7 @@ struct Context {
         }
     }
     void barrier(int cause = 0) {
+        ++cntBarriers;
         begin();
         end_render(cause);
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -506,6 +661,7 @@ struct Context {
     // Recycles a completed flight: its commands, uploads and garbage are done.
     void recycle(Flight &f) {
         completed = std::max(completed, f.serial);
+        gpu_collect(f);
         for (auto &g : f.garbage)
             g();
         f.garbage.clear();
@@ -520,6 +676,7 @@ struct Context {
     // Retires submitted flights in order: every one with serial <= `upTo` is
     // waited for, later ones only if already complete.
     bool retire(uint64_t upTo) {
+        EOD_ZONE("vk.retire");
         bool waited = false;
         while (!inflight.empty()) {
             Flight &f = inflight.front();
@@ -527,7 +684,10 @@ struct Context {
                 if (f.serial > upTo)
                     break;
                 uint64_t wait_start = now_us();
-                require(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX), "retire GPU work");
+                {
+                    EOD_ZONE("vk.WAIT_GPU_fence");
+                    require(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX), "retire GPU work");
+                }
                 wait_us += now_us() - wait_start;
                 waited = true;
             }
@@ -556,6 +716,7 @@ struct Context {
     // in flight, as with two alternating command buffers); a mid-frame kick
     // only submits. The recorded commands move to a flight the GPU owns.
     void submit(bool synchronous = true, bool frameEnd = true) {
+        EOD_ZONE("vk.submit");
         if (!recording) {
             if (synchronous)
                 retire(UINT64_MAX);
@@ -566,6 +727,12 @@ struct Context {
         end_render();
         if (passLog > 0)
             fprintf(stderr, "SUBMIT %s\n", synchronous ? "sync" : frameEnd ? "frame" : "kick");
+#ifdef EOD_TRACY
+        delete tracyCmd;
+        tracyCmd = nullptr;
+#endif
+        if (!qzones.empty() && qzones[0].first == GPU_CMDBUF)
+            gpu_end(0);
         require(vkEndCommandBuffer(cmd), "end commands");
         VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         s.commandBufferCount = 1;
@@ -583,6 +750,7 @@ struct Context {
         require(vkQueueSubmit(queue, 1, &s, fence), "submit");
         windowUploaded = false;
         ++submit_count;
+        ++cntSubmits;
         drawsSinceSubmit = 0;
         const bool presented = waitAcquire || signalPresent;
         waitAcquire = signalPresent = false;
@@ -596,6 +764,11 @@ struct Context {
         done.pools.swap(pools);
         done.garbage.swap(garbage);
         done.serial = submitted;
+        done.qpool = qpool;
+        done.qused = qused;
+        done.qzones.swap(qzones);
+        qpool = VK_NULL_HANDLE;
+        qused = 0;
         inflight.push_back(std::move(done));
         if (synchronous)
             retire(UINT64_MAX);
@@ -623,6 +796,8 @@ struct Context {
         fence = next.fence;
         chunks.swap(next.chunks);
         pools.swap(next.pools);
+        qpool = next.qpool;
+        next.qpool = VK_NULL_HANDLE;
         chunkIndex = 0;
         poolIndex = 0;
     }
@@ -664,6 +839,7 @@ struct Context {
         return {&c, off};
     }
     void transition(Texture *t, VkImageLayout old, VkImageLayout next) {
+        EOD_ZONE("vk.transition");
         begin();
         end_render(6);
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -772,6 +948,7 @@ struct Context {
         return 0;
     }
     void UpdateSubresource(Texture *t, UINT level, const D3D11_BOX *b, const void *p, UINT pitch, UINT) {
+        EOD_ZONE("vk.UpdateSubresource");
         barrier(1);
         UINT w = b->right - b->left, h = b->bottom - b->top;
         std::vector<uint8_t> tight((size_t)w * h * 4);
@@ -814,6 +991,7 @@ struct Context {
         });
     }
     void CopySubresourceRegion(Texture *d, UINT, UINT x, UINT y, UINT, Texture *s, UINT, const D3D11_BOX *b) {
+        EOD_ZONE("vk.CopySubresourceRegion");
         barrier(2);
         auto aspect = s->desc.Format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         VkExtent3D sz{b->right - b->left, b->bottom - b->top, 1};
@@ -1087,8 +1265,13 @@ inline VkPipeline Context::specialized(const PipelineKey &key) {
     return VK_NULL_HANDLE;
 }
 inline void Context::Draw(UINT count, UINT first) {
+    EOD_ZONE("vk.Draw");
     if (!rt && !ds)
         return;
+    ++cntDraws;
+    const bool timed = gpuProf > 0;  // section timing only with EOD_FPS / EOD_GPU_PROF
+    uint64_t tk = timed ? prof_ticks() : 0, tk2;
+#define EOD_DRAW_SECTION(i) (timed ? (tk2 = prof_ticks(), drawTicks[i] += tk2 - tk, tk = tk2) : 0)
     if (!rendering && chunkDraws && recording && drawsSinceSubmit >= chunkDraws && !waitAcquire && !signalPresent) {
         // Between render passes: hand the commands so far to MoltenVK/the GPU.
         ++chunk_submits;
@@ -1129,6 +1312,7 @@ inline void Context::Draw(UINT count, UINT first) {
         pipelines.emplace(key, pipeline);
         remember(key, pipeline);
     }
+    EOD_DRAW_SECTION(0);
     auto *target = rt ? rt : ds;
     if (!rendering) {
         VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO},
@@ -1148,6 +1332,7 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdBeginRendering(cmd, &render);
         rendering = true;
         ++passes;
+        ++cntPasses;
         if (passLog < 0) { const char *e = getenv("EOD_VK_PASS_LOG"); passLog = e && *e == '1'; }
         if (passLog > 0) { pd = {}; pd.w = target->desc.Width; pd.h = target->desc.Height; pd.rtf = rt ? rt->desc.Format : 0; pd.ds = ds != nullptr; pd.sx0 = pd.sy0 = ~0u; }
     }
@@ -1188,6 +1373,7 @@ inline void Context::Draw(UINT count, UINT first) {
         pd.sx0 = std::min<uint32_t>(pd.sx0, rect.offset.x); pd.sy0 = std::min<uint32_t>(pd.sy0, rect.offset.y);
         pd.sx1 = std::max<uint32_t>(pd.sx1, rect.offset.x + rect.extent.width); pd.sy1 = std::max<uint32_t>(pd.sy1, rect.offset.y + rect.extent.height);
     }
+    EOD_DRAW_SECTION(1);
     VkDescriptorImageInfo images[6]{};
     VkWriteDescriptorSet writes[6]{};
     for (int i = 0; i < 6; i++) {
@@ -1218,6 +1404,7 @@ inline void Context::Draw(UINT count, UINT first) {
         boundConstantBytes = constantBytes;
         constantsValid = true;
     }
+    EOD_DRAW_SECTION(2);
     if (vs->id == 0 || vs->id == kOverlayVertexShader) {
         VkBuffer buffer;
         VkDeviceSize offset;
@@ -1247,6 +1434,8 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdDraw(cmd, count, 1, start, 0);
     } else
         vkCmdDraw(cmd, count, 1, first, 0);
+    EOD_DRAW_SECTION(3);
+#undef EOD_DRAW_SECTION
 }
 inline bool Context::init(bool withWindow) {
     wantVsync = g_config.vsync;
@@ -1616,7 +1805,19 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     transition(t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     return t;
 }
+// A GPU timer zone for the scope (closed only in the command buffer that opened it).
+struct GpuZone {
+    Context *c;
+    VkCommandBuffer cb;
+    uint32_t z;
+    GpuZone(Context *ctx, Context::GpuLabel l) : c(ctx), cb(ctx->cmd), z(ctx->gpu_begin(l)) {}
+    ~GpuZone() {
+        if (c->recording && c->cmd == cb)
+            c->gpu_end(z);
+    }
+};
 inline bool Context::present() {
+    EOD_ZONE("vk.present");
     auto *t = back[backIndex];
     transition(t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     signalPresent = true;

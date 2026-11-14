@@ -16,7 +16,10 @@
 // Batches whose run kicked nothing are dropped. The camera is the most common
 // x/y/w screen rows among the frame's batches (docs/SCENE_CAPTURE.md section 2);
 // each batch's model matrix is inv(camera_xyw) * batch_xyw.
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 #include "scene_emit.h"
+#include "core/trace.h"
 
 #include <algorithm>
 #include <chrono>
@@ -204,6 +207,7 @@ struct AtExit {
 // Decodes a new mesh into a GEOM record. False if the run's input is not the
 // batch layout (docs/SCENE_CAPTURE.md section 2).
 bool decode(const VUState *vu, uint32_t top, uint32_t n, uint64_t id) {
+    EOD_ZONE("emit.decode");
     float off[4], uvo[4];
     memcpy(off, qword(vu, top + 199), 16);
     memcpy(uvo, qword(vu, top + 198), 16);
@@ -332,6 +336,7 @@ void model_of(const Batch &b, const double cinv[4][4], double M[4][4]) {
 
 // The modern frame so far: camera, model matrices, roles, layers; queued for the GS.
 void post_modern() {
+    EOD_ZONE("emit.post_modern");
     if (!g_mf) g_mf = new modern::Frame();
     modern::Frame *f = g_mf;
     g_mf = nullptr;
@@ -375,6 +380,7 @@ void post_modern() {
 
 // End of a frame: camera vote, model matrices, records, write.
 void flush_frame() {
+    EOD_ZONE("emit.flush_frame");
     finish_pending();
     if (g_modern && !g_triggered) post_modern();
     g_triggered = false;
@@ -433,7 +439,31 @@ void flush_frame() {
 
 bool g_on = (g_path && *g_path) || g_modern;
 
+// The sky dome: program 0x270 in ITOP mode 0x280 with the sky's own matrix (camera translation,
+// no rotation), all drawn before the first world geometry of the frame. The same program and mode
+// also draws terrain (most of the ground in Career free roam) with the camera matrix; those runs
+// are world geometry and are replaced like any other.
+bool g_sky_known, g_world_seen;
+float g_sky_mvp[16];
+bool is_sky_dome(const VUState *vu, uint32_t pc, uint32_t itop) {
+    if (pc != 0x270 || itop != 0x280) {
+        if (geometry_program(pc) && itop != 0x200) g_world_seen = true;
+        return false;
+    }
+    float m[16];
+    for (int c = 0; c < 4; c++) memcpy(m + c * 4, vu->vf[4 + c].f, 16);
+    if (!g_sky_known && !g_world_seen) {
+        memcpy(g_sky_mvp, m, sizeof m);
+        g_sky_known = true;
+        return true;
+    }
+    if (g_sky_known && !memcmp(g_sky_mvp, m, sizeof m)) return true;
+    g_world_seen = true;
+    return false;
+}
+
 void vu1_start(const VUState *vu, uint32_t pc) {
+    EOD_ZONE("emit.vu1_start");
     if (!g_frame_active) return;
     const uint64_t t = now_ns();
     finish_pending();
@@ -450,20 +480,26 @@ void vu1_start(const VUState *vu, uint32_t pc) {
         g_triggered = true;
     }
     bool replaced = false;
+    const bool sky_dome = is_sky_dome(vu, pc, g_vif1_itop);
     if (geometry_program(pc)) {
         const uint32_t top = g_vif1_top;
         const uint32_t n = *(const uint32_t *)qword(vu, top) & 0x7FFF;
         if (n > 0 && n <= 120) {
             // content id: the vertex block and its offsets (static meshes repeat every frame)
+            // (XXH3 over the contiguous vertex block: the per-qword mix cost ~0.6 us per run, about
+            // 5,000 runs a frame on the producer thread)
             uint64_t id = mix(0, n);
-            for (uint32_t q = 1; q <= 3 * n; q++) {
-                const uint64_t *w = (const uint64_t *)qword(vu, top + q);
-                id = mix(mix(id, w[0]), w[1]);
+            const uint32_t first = ((top + 1) * 16) & vu->mem_mask;
+            if (first + 48u * n <= vu->mem_mask + 1u) {
+                id = mix(id, XXH3_64bits(vu->mem + first, 48u * n));
+            } else {
+                for (uint32_t q = 1; q <= 3 * n; q++) {
+                    const uint64_t *w = (const uint64_t *)qword(vu, top + q);
+                    id = mix(mix(id, w[0]), w[1]);
+                }
             }
-            for (uint32_t q : {198u, 199u}) {
-                const uint64_t *w = (const uint64_t *)qword(vu, top + q);
-                id = mix(mix(id, w[0]), w[1]);
-            }
+            id = mix(id, XXH3_64bits(qword(vu, top + 198), 16));
+            id = mix(id, XXH3_64bits(qword(vu, top + 199), 16));
             auto it = g_geoms.find(id);
             bool ok;
             if (it == g_geoms.end()) {
@@ -487,7 +523,6 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                 b.n = n;
                 b.want_alpha = false;
                 // the sky dome (0x270 in ITOP mode 0x280) stays with the GS: the modern pass starts from it
-                const bool sky_dome = pc == 0x270 && b.itop == 0x280;
                 if (g_live && !hud && !sky_dome && !g_triggered) {
                     if (!g_mf) g_mf = new modern::Frame();
                     b.mi = (int32_t)g_mf->batches.size();
@@ -513,10 +548,18 @@ void vu1_start(const VUState *vu, uint32_t pc) {
         replaced = true;
     }
     if (g_modern && !replaced) mark(-1);
+    // EOD_MODERN_LOGPROGS=<frame>: every VU1 program run in that frame, with whether it was replaced
+    static const uint64_t log_at = env_u64("EOD_MODERN_LOGPROGS", 0);
+    if (log_at && g_frame == log_at) {
+        const uint32_t n = *(const uint32_t *)qword(vu, g_vif1_top) & 0x7FFF;
+        fprintf(stderr, "[progs] run %u pc %04x itop %03x n %u geometry %d replaced %d live %d triggered %d\n", g_run, pc,
+                g_vif1_itop, n, geometry_program(pc) ? 1 : 0, replaced ? 1 : 0, g_live ? 1 : 0, g_triggered ? 1 : 0);
+    }
     g_ns += now_ns() - t;
 }
 
 void gif(int path, const uint8_t *data, uint32_t qwc) {
+    EOD_ZONE("emit.gif");
     if (!g_frame_active || path != 1) return;
     g_kicks++;
     if (g_pending) {
@@ -536,6 +579,7 @@ void gif(int path, const uint8_t *data, uint32_t qwc) {
 }
 
 void vblank(uint64_t frame) {
+    EOD_ZONE("emit.vblank");
     if (!g_on) return;
     if (g_frame_active) flush_frame();
     // the frame that starts now gets the number of the next vblank (as the
@@ -548,6 +592,7 @@ void vblank(uint64_t frame) {
     }
     g_frame_active = in_range(g_frame);
     g_kicks = g_run = g_new_geoms = 0;
+    g_sky_known = g_world_seen = false;
     g_ns = 0;
     if (!emit_range(g_frame) && g_f && g_frame > g_from) {
         fclose(g_f);

@@ -2,6 +2,7 @@
 // are ported from gs_d3d11.cpp; vk_compat.h maps its small state API to Vulkan.
 #ifdef EOD_VULKAN
 #include <algorithm>
+#include "core/trace.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -536,6 +537,7 @@ void bind_targets(Surface *rt, Surface *ds);
 void acquire(Surface *s, int x0, int y0, int x1, int y1);
 
 void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
+    EOD_ZONE("gs.draw_batch");
     // The alpha-test half (F_ATEST_PASS/F_ATEST_FAIL) is a ps_draw pipeline
     // specialization: both halves of a two-pass group share the constants.
     g_ctx->PSSetSpecialization(s.two_pass ? (fail_pass ? 0x800u : 0x400u) : 0u);
@@ -553,6 +555,7 @@ void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
 }
 
 void flush() {
+    EOD_ZONE("gs.flush");
     if (g_verts.empty())
         return;
     std::vector<HwVertex> verts;
@@ -682,6 +685,7 @@ void flush() {
 Surface *g_bound_rt, *g_bound_ds;
 
 void bind_targets(Surface *rt, Surface *ds) {
+    EOD_ZONE("gs.bind_targets");
     Surface *any = rt ? rt : ds;
     ID3D11RenderTargetView *rtv = rt ? rt->rtv : nullptr;
     // unbind textures first (a target may have been a texture of the previous
@@ -765,6 +769,7 @@ bool create_raw_textures() {
 // Uploads rectangle (x, y, w, h) of the surface from gs::vram.
 void deferred_before_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why);
 void upload_rect(Surface *s, int x, int y, int w, int h) {
+    EOD_ZONE("gs.upload_rect");
     if (w <= 0 || h <= 0)
         return;
     flush();
@@ -823,6 +828,7 @@ void readback_record(Surface *s, int x, int y, int w, int h) {
 
 // Writes rectangle (x, y, w, h) of the surface back to gs::vram.
 void readback_rect(Surface *s, int x, int y, int w, int h) {
+    EOD_ZONE("gs.readback_rect");
     if (w <= 0 || h <= 0)
         return;
     readback_record(s, x, y, w, h);
@@ -894,6 +900,7 @@ void deferred_free(uint32_t page) {
 
 // Completes page `page`: waits for its copies and merges the untouched bits.
 void deferred_resolve(uint32_t page, const char *why = "") {
+    EOD_ZONE("gs.deferred_resolve");
     DeferredPage *d = g_deferred[page];
     if (!d)
         return;
@@ -1162,6 +1169,7 @@ inline void pixel_bytes(uint32_t psm, uint32_t a, uint32_t &addr, uint32_t &n) {
 }
 
 void snapshot_complete(SnapshotPage &sp) {
+    EOD_ZONE("gs.snapshot_complete");
     if (sp.complete)
         return;
     if (sp.serial && g_dev->wait_serial(sp.serial))
@@ -1470,6 +1478,7 @@ template <class F> void for_rects(const std::vector<PageRect> &pages, F fn) {
 // Makes the surface the owner of the pages under rectangle (x0, y0)-(x1, y1),
 // bringing over what the memory held.
 void acquire(Surface *s, int x0, int y0, int x1, int y1) {
+    EOD_ZONE("gs.acquire");
     std::vector<PageRect> pages;
     surface_pages_rect(s, x0, y0, x1, y1, pages);
     std::vector<PageRect> up;
@@ -1665,6 +1674,7 @@ uint64_t hash_level(uint32_t tbp, uint32_t tbw, uint32_t psm, int w, int h) {
 
 // RGBA texels of a level
 void decode_level(const Env &e, int lvl, int w, int h, std::vector<uint32_t> &out) {
+    EOD_ZONE("gs.decode_level");
     out.resize((size_t)w * h);
     uint32_t bp = e.mip_tbp[lvl], bw = e.mip_tbw[lvl];
     const SwizzleTab *T = swizzle_table(e.tpsm, bw);
@@ -1699,6 +1709,7 @@ ID3D11ShaderResourceView *host_texture(int idx, uint32_t native_alpha_high, alph
 
 // Palette indices of mip 0, row-major (PSMT8/PSMT4 and the high-bit forms).
 void host_index_plane(const Env &e, std::vector<uint8_t> &out) {
+    EOD_ZONE("gs.host_index_plane");
     out.resize((size_t)e.tw * e.th);
     const SwizzleTab *T = swizzle_table(e.tpsm, e.mip_tbw[0]);
     uint32_t bp = e.mip_tbp[0];
@@ -2098,6 +2109,7 @@ struct TexSource {
 };
 
 TexSource texture_for(const Env &e, Surface *target) {
+    EOD_ZONE("gs.texture_for");
     TexSource ts;
     int levels = tex_levels(e);
     // A page may still contain unrelated GPU-owned pixels while every block
@@ -2244,6 +2256,7 @@ TexSource texture_for(const Env &e, Surface *target) {
 uint32_t g_reg_gen_seen; // g_env_serial the state was built for
 
 void build_state(const Env &e, int topology) {
+    EOD_ZONE("gs.build_state");
     DrawState s;
     memset(&s, 0, sizeof s); // (compared bytewise below)
     s.topology = topology;
@@ -2640,6 +2653,7 @@ void draw_point(const Env &e, const Vertex &a) {
 }
 
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    EOD_ZONE("gs.vram_written");
     if (!g_on)
         return;
     // All prior GPU primitives precede these actual CPU bytes. Do not invalidate
@@ -2689,6 +2703,7 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
 }
 
 void vram_write_complete() {
+    EOD_ZONE("gs.vram_write_complete");
     if (!g_on || g_pending_uploads.empty()) return;
     // A later region in this same chunk may have invalidated an earlier owner.
     // Patch only owners still retained. All actual CPU bytes are now present.
@@ -2721,6 +2736,7 @@ void vram_write_complete() {
 }
 
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    EOD_ZONE("gs.readback_pages");
     if (!g_on)
         return;
     const PageCoverage requested = page_coverage(bp, bw, psm, x, y, w, h);
@@ -2759,6 +2775,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
 }
 
 void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *) {
+    EOD_ZONE("gs.vram_needed");
     flush(); // CPU reads observe all earlier queued GS primitives.
     g_rb_reason = 0;
     readback_pages(bp, bw, psm, x, y, w, h);
@@ -2882,6 +2899,7 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
 
 // draws the display into rtv (size tw x th) at rectangle (rx, ry, rw, rh)
 void compose(ID3D11RenderTargetView *rtv, int tw, int th, int rx, int ry, int rw, int rh, bool smooth) {
+    EOD_ZONE("gs.compose");
     Circuit c[2] = {g_last[0], g_last[1]};
     // circuit 1 over circuit 2 with PMODE.ALP (MMOD = 1) or opaque (as the
     // software compositor)
@@ -2987,6 +3005,7 @@ ID3D11ShaderResourceView *overlay_srv(uint32_t id) {
 
 // Draws the published overlay into rtv (tw x th pixels at its origin).
 void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
+    EOD_ZONE("gs.draw_overlay");
     static OverlayDraw d;
     if (!overlay_latest(d) || d.w <= 0 || d.h <= 0 || d.cmds.empty()) return;
     try {
@@ -3130,6 +3149,7 @@ void bind_thread() {
 }
 
 void vblank() {
+    EOD_ZONE("gs.vblank");
     if (!g_on)
         return;
     std::unique_lock<std::mutex> lk(g_shot_mtx);
@@ -3142,6 +3162,7 @@ void vblank() {
 
 namespace { void show(bool vsync, bool fresh_scanout = false); }
 void present(bool vsync) {
+    EOD_ZONE("gs.present");
     if (!g_on)
         return;
     flush();
@@ -3165,6 +3186,8 @@ void redraw() {
 
 namespace {
 void show(bool vsync, bool fresh_scanout) {
+    EOD_ZONE("gs.show");
+    g_dev->gpu_report();
     if (g_dev->surface) {
         if (auto *back = g_dev->acquire(vsync)) {
             float black[4] = {0, 0, 0, 1};

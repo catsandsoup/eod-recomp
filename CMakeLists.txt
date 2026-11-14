@@ -469,6 +469,26 @@ elseif(MSVC)
   endif()
 endif()
 
+# Tracy frame profiler (developer builds only): CPU zones on the EE, VU1 producer and GS
+# threads and Vulkan GPU zones (runtime/core/trace.h). Connect tracy-profiler or
+# tracy-capture to a running game. Off in release builds: the macros compile to nothing.
+option(EOD_TRACY "Tracy profiler zones (developer builds)" OFF)
+if(EOD_TRACY)
+  include(FetchContent)
+  FetchContent_Declare(eod_tracy
+    URL https://codeload.github.com/wolfpld/tracy/tar.gz/refs/tags/v0.11.1
+    URL_HASH SHA256=2c11ca816f2b756be2730f86b0092920419f3dabc7a7173829ffd897d91888a1
+    SOURCE_SUBDIR none
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(eod_tracy)
+  target_sources(eod PRIVATE ${eod_tracy_SOURCE_DIR}/public/TracyClient.cpp)
+  target_include_directories(eod PRIVATE ${eod_tracy_SOURCE_DIR}/public)
+  target_compile_definitions(eod PRIVATE TRACY_ENABLE TRACY_NO_SAMPLING TRACY_NO_SYSTEM_TRACING EOD_TRACY)
+  if(WIN32)
+    target_link_libraries(eod PRIVATE ws2_32 dbghelp)
+  endif()
+endif()
+
 if(WIN32)
   target_sources(eod PRIVATE runtime/app/windows_disc.cpp runtime/app/disc_import.cpp runtime/app/iso9660.cpp)
   target_link_libraries(eod PRIVATE comdlg32 shell32 uuid)

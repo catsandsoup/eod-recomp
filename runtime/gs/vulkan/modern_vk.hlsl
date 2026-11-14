@@ -15,7 +15,7 @@ B0(0) cbuffer Frame {
     float4 sh_x, sh_y, sh_z;        // world -> shadow map rows
     float4 fog;                     // fog colour (gamma); w debug view
     float4 sun;                     // world direction to the sun, w ambient
-    float4 gsz;                     // x 1 / 2^bits of the GS depth format
+    float4 gsz;                     // x 1 / 2^bits of the GS depth format, y daylight (0 night, 1 day)
     float4 c0_x, c0_y, c0_z;        // cascade 0 (near, sharp) world -> shadow rows
     float4 c1_x, c1_y, c1_z;        // cascade 1 (far)
     float4 cs;                      // x, y world size of a texel in cascade 0 / 1; z, w depth range of each
@@ -227,7 +227,8 @@ float shadow_raw(float3 wp, float3 n, float2 pix) {
 }
 float shadow_at(float3 wp, float3 n, float2 pix) {
     if (set.x <= 0) return 1;
-    return lerp(1, shadow_raw(wp, n, pix), set.x);
+    // at night the moon casts only a faint shadow (the floodlights are not shadow casters)
+    return lerp(1, shadow_raw(wp, n, pix), set.x * lerp(0.2, 1.0, gsz.y));
 }
 static const float PI = 3.14159265;
 float D_GGX(float NoH, float a) {
@@ -276,7 +277,9 @@ float4 ps_modern(VOut i) : SV_Target {
     float3 albedo = lin(t.rgb);
     float3 V = normalize(cam_pos.xyz - i.wp);
     float3 L = normalize(sun.xyz);
-    float3 sun_col = float3(1.0, 0.94, 0.84) * 1.7;
+    // night: a dim cool moonlight and ambient (the floodlights are painted into the world's vertex light)
+    float day = gsz.y;
+    float3 sun_col = lerp(float3(0.30, 0.36, 0.50) * 0.35, float3(1.0, 0.94, 0.84) * 1.7, day);
     float3 col;
     if (i.c.a > 0.5) {
         float3 n = normalize(i.n);
@@ -285,7 +288,7 @@ float4 ps_modern(VOut i) : SV_Target {
         float nl = saturate(dot(n, L));
         if (fog.w > 0) return float4(sh, nl, 0, 1);
         float hemi = dot(n, up.xyz) * 0.5 + 0.5;
-        float3 ambient = lerp(lin(fog.rgb) * 0.3, float3(0.30, 0.38, 0.55), hemi) * (0.5 + sun.w);
+        float3 ambient = lerp(lin(fog.rgb) * 0.3, float3(0.30, 0.38, 0.55), hemi) * (0.5 + sun.w) * lerp(0.28, 1.0, day);
         float gloss = info.w * set.y;
         float rough = gloss > 0 ? lerp(0.85, 0.45, saturate(gloss * 2.2)) : 0.85;
         float a = rough * rough;
@@ -296,7 +299,7 @@ float4 ps_modern(VOut i) : SV_Target {
         col = (albedo * (1 - F) + Fr) * sun_col * nl * sh;
         float2 ab = dfg(NoV, rough);
         float spec_occ = 0.5 + 0.5 * sh;
-        col += albedo * ambient + sky_rough(reflect(-V, n), n, rough) * (0.04 * ab.x + ab.y) * spec_occ * 0.5 * set.y;
+        col += albedo * ambient + sky_rough(reflect(-V, n), n, rough) * (0.04 * ab.x + ab.y) * spec_occ * 0.5 * set.y * lerp(0.15, 1.0, day);
         float cc = saturate(gloss * 0.8);
         if (cc > 0) {
             const float ca = 0.08 * 0.08;
@@ -304,11 +307,13 @@ float4 ps_modern(VOut i) : SV_Target {
             float Frc = D_GGX(NoH, ca) * V_Kelemen(LoH) * Fc * PI;
             col = col * (1 - Fc) + Frc * sun_col * nl * sh;
             float Fcv = (0.04 + 0.96 * pow(1 - NoV, 5)) * cc;
-            col = col * (1 - Fcv) + sky_env(reflect(-V, n)) * spec_occ * Fcv;
+            col = col * (1 - Fcv) + sky_env(reflect(-V, n)) * spec_occ * Fcv * lerp(0.15, 1.0, day);
         }
     } else {
         float sh = shadow_at(i.wp, up.xyz, i.pos.xy);
-        col = albedo * lin(i.c.rgb) * 1.35 * (0.5 + 0.5 * sh);
+        // baked vertex light: ACES lifts low values ~1.45x, so 0.75 sunlit matches the original;
+        // shadowed ground keeps 43% (skylight)
+        col = albedo * lin(i.c.rgb) * (0.32 + 0.43 * sh);
         if (fog.w > 0) return float4(sh, 0, 1, 1);
     }
     float dist = length(i.wp - cam_pos.xyz);

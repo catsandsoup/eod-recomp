@@ -5,6 +5,7 @@
 // instruction, Q/P results become visible after their latency, branches
 // have a delay slot and the E bit ends the program after the next pair.
 #include "vu.h"
+#include "core/trace.h"
 #include "../core/prof.h"
 
 #include "sse_compat.h"
@@ -1552,6 +1553,7 @@ void vu_rec_hook(VUState *vu, uint32_t pc) {
 }  // namespace
 
 void vu_execute(VUState *vu, uint32_t start_pc) {
+    EOD_ZONE("vu_execute");
     ProfScope prof(P_EE_VU);
     uint32_t pc = start_pc & vu->micro_mask & ~7u;
     vu_rec_hook(vu, pc);
@@ -1603,6 +1605,26 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
                  (unsigned long long)vu->cycle, (unsigned long long)after.cycle, vu->status, after.status, vu->mac,
                  after.mac, vu->clip, after.clip, vu->q, after.q, vu->tpc, after.tpc,
                  memcmp(vu->mem, mem_after, msize) ? "differs" : "same");
+        }
+        return;
+    }
+    // EOD_VU_STATS=1: which programs run interpreted (no compiled match), with their time
+    static const bool stats = getenv("EOD_VU_STATS") != nullptr;
+    if (stats) {
+        static uint64_t cnt[2][0x800], tk[2][0x800], last;
+        const uint64_t t0 = prof_ticks();
+        vu_interp(vu, pc);
+        const uint64_t t1 = prof_ticks();
+        cnt[vu->index & 1][(pc >> 3) & 0x7FF]++;
+        tk[vu->index & 1][(pc >> 3) & 0x7FF] += t1 - t0;
+        if (!last) last = t1;
+        if (t1 - last > 30000000000ull) {
+            last = t1;
+            for (int u = 0; u < 2; u++)
+                for (int i = 0; i < 0x800; i++)
+                    if (cnt[u][i] > 1000)
+                        fprintf(stderr, "[vu-stats] VU%d %04x interpreted %llu runs, %.0f Mticks\n", u, i << 3,
+                                (unsigned long long)cnt[u][i], tk[u][i] / 1e6);
         }
         return;
     }

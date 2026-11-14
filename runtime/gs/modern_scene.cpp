@@ -1,5 +1,6 @@
 // modern_scene.cpp - GS-thread side of EOD_MODERN (modern_scene.h).
 #include "modern_scene.h"
+#include "core/trace.h"
 
 #include <atomic>
 #include <cstdio>
@@ -76,6 +77,7 @@ bool gs_replaced(const gs::Env &e, uint32_t alpha) {
 }
 
 void gs_draw(Frame *f) {
+    EOD_ZONE("modern.gs_draw");
     g_batch = g_noted = -1;
     if (gs::hw::g_on)  // (new meshes go to the cache even when nothing is drawn)
         gs::hw::modern_draw(f);

@@ -1,4 +1,5 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
+#include "core/trace.h"
 #include "../vu/scene_capture.h"
 #include "../vu/scene_emit.h"
 #include "modern_scene.h"
@@ -1143,7 +1144,7 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     (unsigned long long)g_gs_vblanks.load(), (unsigned long long)g_flips.load(),
                     (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
             break;
-        case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
+        case CMD_GIF: { EOD_ZONE("gs.gif_process"); gif_process((int)h[1], d, h[3] / 16); } break;
         case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer
             if (!live) break;
             if (h[1] == 0) {
@@ -1162,7 +1163,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         }
         case CMD_VBLANK:
             g_gs_vblanks = h[1];
-            gs_frame_end(h[1], presentation::from_tag(h[2]));
+            { EOD_ZONE("gs.frame_end"); gs_frame_end(h[1], presentation::from_tag(h[2])); }
+            EOD_FRAME_MARK_NAMED("GS vblank");
             frames = h[1];
             if (live) {
                 if (g_cold_zip && h[1] >= g_dump_end) close_cold_zip("written");
@@ -1411,6 +1413,7 @@ static void gs_worker() {
     pthread_setname_np(pthread_self(), "eod-gs");
 #endif
     hw::bind_thread();
+    EOD_THREAD_NAME("GS");
     prof_thread_begin(P_GS_CMDS);
     for (;;) {
         Chunk c;
@@ -1423,7 +1426,11 @@ static void gs_worker() {
             g_q.pop_front();
         }
         uint64_t t_start = platform_time_us();
-        uint64_t frames = run_cmds(c.data(), c.size(), true);
+        uint64_t frames;
+        {
+            EOD_ZONE("gs.chunk");
+            frames = run_cmds(c.data(), c.size(), true);
+        }
         g_gs_busy_us += platform_time_us() - t_start;
         {
             std::lock_guard<std::mutex> lk(g_q_mtx);

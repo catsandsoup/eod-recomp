@@ -24,6 +24,7 @@
 #include <pthread.h>
 #endif
 
+#include "core/trace.h"
 #include "../core/config.h"
 #include "../core/log.h"
 #include "../core/prof.h"
@@ -331,7 +332,7 @@ void setup_env(uint32_t attr) {
         uint32_t fbp = bits(st.ctx[(attr >> 9) & 1].frame, 0, 9) * 32;
         uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
         if (fbp != e.fbp && fbp == shown) {
-            if (!g_skip_frame) g_flips++;
+            if (!g_skip_frame) { g_flips++; EOD_FRAME_MARK; }
             g_game_flips++;
             presenting = true;
         } else if (fbp != shown && presenting) {
@@ -1397,6 +1398,7 @@ void run_job(const Job &j, int wid, int nw, WStats &ws) {
 
 void raster_worker(int id) {
     platform_thread_fast();
+    EOD_THREAD_NAME("GS raster");
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-raster");
 #endif

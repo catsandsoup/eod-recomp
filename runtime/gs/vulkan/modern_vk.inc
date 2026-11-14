@@ -134,7 +134,13 @@ struct MeshGpu {
     VkDeviceSize vb = 0, ib = 0;  // offsets in buf
     uint32_t count = 0;
     bool normals = false;
+    float c[3] = {0, 0, 0}, r = 0;  // bounding sphere (model space)
 };
+// The shadow cascade being drawn: batches whose bounds miss its square (across the light) are culled.
+struct MCull {
+    bool on = false;
+    float u[3], v[3], cu, cv, half;
+} g_mcull;
 std::unordered_map<uint64_t, MeshGpu> g_mmesh;
 std::vector<vkgs::Texture *> g_mtex;  // this frame's batch textures (one reference each)
 std::vector<uint32_t> g_matest;      // per batch: ate | atst << 1 | afail << 4 | aref << 8
@@ -403,6 +409,15 @@ void modern_upload(const modern::Mesh &m) {
     vkCmdCopyBuffer(g_ctx->cmd, si.first->buffer, g.buf, 1, &c);
     g.count = (uint32_t)m.idx.size();
     g.normals = m.v[0].n[3] != 0;
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (const modern::Vertex &v : m.v)
+        for (int k = 0; k < 3; k++) lo[k] = std::min(lo[k], v.p[k]), hi[k] = std::max(hi[k], v.p[k]);
+    for (int k = 0; k < 3; k++) g.c[k] = 0.5f * (lo[k] + hi[k]);
+    for (const modern::Vertex &v : m.v) {
+        const float d[3] = {v.p[0] - g.c[0], v.p[1] - g.c[1], v.p[2] - g.c[2]};
+        g.r = std::max(g.r, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    }
+    g.r = std::sqrt(g.r);
     g_mmesh.emplace(m.id, g);
 }
 
@@ -606,6 +621,19 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, int pass, std::in
             const bool per_vertex = !b.valpha.empty();
             auto it = g_mmesh.find(b.mesh);
             if (it == g_mmesh.end()) continue;
+            if (pass == 1 && g_mcull.on) {
+                const MeshGpu &g = it->second;
+                const float *M = b.model;
+                const float w[3] = {M[0] * g.c[0] + M[1] * g.c[1] + M[2] * g.c[2] + M[3],
+                                    M[4] * g.c[0] + M[5] * g.c[1] + M[6] * g.c[2] + M[7],
+                                    M[8] * g.c[0] + M[9] * g.c[1] + M[10] * g.c[2] + M[11]};
+                const float sc = std::sqrt(std::max({M[0] * M[0] + M[4] * M[4] + M[8] * M[8], M[1] * M[1] + M[5] * M[5] + M[9] * M[9],
+                                                     M[2] * M[2] + M[6] * M[6] + M[10] * M[10]}));
+                const float r = g.r * sc + g_mcull.half * 0.02f;
+                if (std::fabs(dot3(g_mcull.u, w) - g_mcull.cu) > g_mcull.half + r ||
+                    std::fabs(dot3(g_mcull.v, w) - g_mcull.cv) > g_mcull.half + r)
+                    continue;
+            }
             vkgs::Texture *t = i < g_mtex.size() ? g_mtex[i] : nullptr;
             memcpy(bc.m, b.model, 48);
             memcpy(bc.light, b.light, 16);
@@ -615,6 +643,21 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, int pass, std::in
             bc.info[2] = t ? 1.0f : 0.0f;
             bc.info[3] = modern_gloss(b);
             const uint32_t key = i < g_mblend_key.size() ? g_mblend_key[i] : ~0u;
+            static const bool log_keys = getenv("EOD_MODERN_LOGKEYS") != nullptr;
+            if (log_keys && pass == 0) {
+                static std::unordered_map<uint64_t, int> seen;
+                const uint64_t sk = (uint64_t)b.pc << 32 ^ key;
+                if (seen[sk]++ == 0)
+                    fprintf(stderr, "[modern] batch pc %x itop %x role %u key %08x abe %u A%u B%u C%u D%u fix %u tfx %u tcc %u tex %d valpha %zu atest %08x\n",
+                            b.pc, b.itop, b.role, key, key & 1, (key >> 1) & 3, (key >> 3) & 3, (key >> 5) & 3, (key >> 7) & 3,
+                            (key >> 9) & 0xFF, (key >> 17) & 3, (key >> 19) & 1, t ? 1 : 0, b.valpha.size(),
+                            i < g_matest.size() ? g_matest[i] : 0);
+            }
+            // The GS never received a draw for this batch (no blend, texture or test state): the
+            // game did not draw it as a normal primitive (the projected car-shadow quad reads the
+            // off-screen shadow buffer). Drawing it with defaults paints a lit grey patch over the
+            // real shadow, so it is left out of every pass.
+            if (key == ~0u && role != modern::SKY) continue;
             bool raw = false;
             MPipeKey k = base;
             if (pass == 0) {
@@ -702,6 +745,7 @@ void modern_texture(int32_t batch, const Env &e) {
 }
 
 void modern_draw(modern::Frame *frame) {
+    EOD_ZONE("modern.draw");
     std::unique_ptr<modern::Frame> f(frame);
     if (!modern_init()) {  // the GS draws everything again
         modern_release_textures();
@@ -711,7 +755,12 @@ void modern_draw(modern::Frame *frame) {
     flush();
     g_ctx->barrier(2);  // the GS's commands so far, then the pass's own
     g_mcmd = g_ctx->cmd;
-    for (const modern::Mesh &m : f->meshes) modern_upload(m);
+    {
+        EOD_ZONE("modern.mesh_upload");
+        EOD_PLOT("modern new meshes", f->meshes.size());
+        for (const modern::Mesh &m : f->meshes) modern_upload(m);
+    }
+    EOD_PLOT("modern batches", f->batches.size());
     if (f->batches.empty() || g_skip_frame || !modern::g_target.valid) {
         modern_release_textures();
         return;
@@ -805,12 +854,17 @@ void modern_draw(modern::Frame *frame) {
     cross3(L, ref, u);
     norm3(u);
     cross3(L, u, v);
-    float casc[2][3][4];
+    float casc[2][3][4], ccu[2], ccv[2], chalf[2];
     for (int c = 0; c < 2; c++) {
-        const float half = s_scale * k_shadow * (c == 0 ? 0.35f : 2.0f);
+        // Cascade extents follow the camera, not the scene's objects: the median object distance
+        // ran from ~30 units on a race track to ~570 in Career free roam (distant houses and
+        // traffic), which spread the near cascade over hundreds of units (washed-out, blocky
+        // shadows). Near: 22 units around a point ahead of the camera; far: 160.
+        const float half = k_shadow * (c == 0 ? 18.0f : 135.0f);
         float ctr[3] = {cam[0] + fwd[0] * half * 0.6f, cam[1] + fwd[1] * half * 0.6f, cam[2] + fwd[2] * half * 0.6f};
         const float texel = 2 * half / (kShadowSize / 2);
         float cu = std::floor(dot3(u, ctr) / texel) * texel, cv = std::floor(dot3(v, ctr) / texel) * texel;
+        ccu[c] = cu, ccv[c] = cv, chalf[c] = half;
         const float cl = dot3(L, ctr);
         for (int i = 0; i < 3; i++) {
             casc[c][0][i] = u[i] / half;
@@ -841,7 +895,7 @@ void modern_draw(modern::Frame *frame) {
     fc.set2[2] = gc.modern_soft_shadows ? 0.03f : 0.0f;
     fc.set2[3] = pct(gc.modern_haze);
     fc.post[0] = std::sqrt(fc.clip_x[0] * fc.clip_x[0] + fc.clip_x[1] * fc.clip_x[1] + fc.clip_x[2] * fc.clip_x[2]) * W * 0.5f;
-    fc.post[1] = s_scale * k_ao;
+    fc.post[1] = 32.0f * k_ao;  // AO radius in world units (fixed: the object median varies 20x between scenes)
     fc.post[2] = 0.72f;
     fc.post[3] = 0.35f * pct(gc.modern_bloom);
     fc.post2[0] = 1.0f / W;
@@ -858,17 +912,27 @@ void modern_draw(modern::Frame *frame) {
     static const bool dbg = getenv("EOD_MODERN_DEBUG") != nullptr;
     fc.fog[3] = dbg ? 1.0f : 0.0f;
     fc.sun[3] = f->batches[0].light[3];
+    // Daylight from the game's fog colour: ~0.8 by day, black on the night tracks (Anoka). The game
+    // gives the same light direction and ambient (q17) at night, so without this the sun lit the
+    // night cars and props at full daytime strength.
+    {
+        const float lum = 0.2126f * fc.fog[0] + 0.7152f * fc.fog[1] + 0.0722f * fc.fog[2];
+        fc.gsz[1] = std::clamp((lum - 0.05f) / 0.45f, 0.0f, 1.0f);
+    }
     static bool logged;
     if (!logged) {
         logged = true;
-        fprintf(stderr, "[modern] camera (%.1f %.1f %.1f) up (%.2f %.2f %.2f) sun (%.2f %.2f %.2f) object median %.1f\n",
-                cam[0], cam[1], cam[2], up[0], up[1], up[2], L[0], L[1], L[2], med);
+        fprintf(stderr, "[modern] camera (%.1f %.1f %.1f) up (%.2f %.2f %.2f) sun (%.2f %.2f %.2f) object median %.1f ambient %.3f fog %.2f %.2f %.2f\n",
+                cam[0], cam[1], cam[2], up[0], up[1], up[2], L[0], L[1], L[2], med, fc.sun[3], fc.fog[0], fc.fog[1], fc.fog[2]);
     }
     ModernBatchCB bc = {};
     uint32_t drawn = 0;
 
     // sun shadow cascades: the atlas' left half (near) and right half (far)
     if (fc.set[0] > 0) {
+        EOD_ZONE("modern.shadow_record");
+        EOD_GPU_ZONE(g_ctx, "modern shadows");
+        vkgs::GpuZone gz(g_ctx, vkgs::Context::GPU_M_SHADOW);
         mbegin(VK_NULL_HANDLE, g_mshadow.view, g_mshadow.w, g_mshadow.h, 1.0f);
         MPipeKey k{};
         k.vs = VS_SHADOW;
@@ -885,12 +949,21 @@ void modern_draw(modern::Frame *frame) {
             mviewport((float)(c * kShadowSize / 2), 0, (float)(kShadowSize / 2), (float)(kShadowSize / 2));
             auto ubo = mframe(fc);
             mset0(ubo.first, ubo.second, {});
+            g_mcull.on = true;
+            memcpy(g_mcull.u, u, 12);
+            memcpy(g_mcull.v, v, 12);
+            g_mcull.cu = ccu[c], g_mcull.cv = ccv[c], g_mcull.half = chalf[c];
             modern_batches(*f, bc, 1, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn, k);
+            g_mcull.on = false;
         }
     }
     auto ubo = mframe(fc);
 
     // the scene, over the GS frame so far (the game's sky)
+    EOD_ZONE("modern.scene_record");
+    {
+    EOD_GPU_ZONE(g_ctx, "modern scene");
+    vkgs::GpuZone gz(g_ctx, vkgs::Context::GPU_M_SCENE);
     mbegin(g_mcolor.view, g_mdepth.view, (uint32_t)W, (uint32_t)H, 0.0f);
     {
         MPipeKey k{};
@@ -912,7 +985,9 @@ void modern_draw(modern::Frame *frame) {
         modern_batches(*f, bc, 0, {(uint32_t)modern::SKY, (uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn, k);
     }
     mbarrier();
+    }
     {
+        vkgs::GpuZone gz(g_ctx, vkgs::Context::GPU_M_RESOLVE);
         VkImageResolve r{};
         r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.extent = {(uint32_t)W, (uint32_t)H, 1};
@@ -927,6 +1002,8 @@ void modern_draw(modern::Frame *frame) {
     MImage *out = &g_mresolve;
     if (!no_post && g_msamples != VK_SAMPLE_COUNT_1_BIT) {
         const uint32_t hw = g_mao.w, hh = g_mao.h;
+        EOD_GPU_ZONE(g_ctx, "modern post (AO, bloom, grade)");
+        vkgs::GpuZone gz(g_ctx, vkgs::Context::GPU_M_POST);
         mfullscreen(PS_AO, VK_FORMAT_R8_UNORM, g_mao.view, hw, hh, ubo, {{MB_DEPTHMS, g_mdepth.view}});
         mfullscreen(PS_BRIGHT, VK_FORMAT_R8G8B8A8_UNORM, g_mb1.view, hw, hh, ubo, {{MB_SRC, g_mresolve.view}});
         fc.post2[2] = 2.0f / W;
@@ -950,6 +1027,7 @@ void modern_draw(modern::Frame *frame) {
 
     // the GS depth the replaced draws would have written, so what the GS draws next (particles,
     // the flag, the camera-space batches before the HUD) is hidden behind the world correctly
+    EOD_ZONE("modern.gsdepth_record");
     if (Surface *zs = get_surface(t.zbp, t.fbw, t.zpsm, true, rows)) {
         if (zs->tex) {
             mbarrier();
@@ -961,6 +1039,8 @@ void modern_draw(modern::Frame *frame) {
             fc.gsz[0] = (float)(1.0 / (double)(1ull << bits));
             auto zubo = mframe(fc);
             const uint32_t zw = (uint32_t)(zs->w * g_scale), zh = (uint32_t)(zs->h * g_scale);
+            EOD_GPU_ZONE(g_ctx, "modern GS depth");
+            vkgs::GpuZone gz(g_ctx, vkgs::Context::GPU_M_GSDEPTH);
             mbegin(VK_NULL_HANDLE, zs->tex->view, zw, zh);
             MPipeKey k{};
             k.vs = VS_GSDEPTH;
