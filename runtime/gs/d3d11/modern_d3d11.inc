@@ -18,6 +18,7 @@ cbuffer Frame : register(b0) {
     float4 sh_x, sh_y, sh_z;        // world -> shadow map rows
     float4 fog;                     // fog colour (gamma)
     float4 sun;                     // world direction to the sun, w ambient
+    float4 gsz;                     // x 1 / 2^bits of the GS depth format
 };
 cbuffer Batch : register(b1) {
     float4 m0, m1, m2;   // model rows
@@ -26,6 +27,7 @@ cbuffer Batch : register(b1) {
     float4 info2;        // x 1: an additive/subtractive GS layer (unlit, as the game draws it), y vertex alpha,
                          // z alpha from the vertex only, w use the mesh's vertex alpha
     float4 atest;        // the GS alpha test: x method (-1 off), y reference (GS units), z discard on fail
+    float4 zrow;         // the batch's GS depth row (model space)
 };
 Texture2D tex : register(t0);
 Texture2D<float> shadow_map : register(t1);
@@ -75,6 +77,15 @@ SOut vs_shadow(VIn i) {
     SOut o;
     float4 w = world(i.p);
     o.pos = float4(dot(sh_x, w), dot(sh_y, w), dot(sh_z, w), 1);
+    o.uv = i.uv;
+    return o;
+}
+// the depth the GS would have written for this batch, into the game's own depth buffer
+SOut vs_gsdepth(VIn i) {
+    SOut o;
+    float4 w = world(i.p);
+    float4 q = float4(i.p, 1);
+    o.pos = float4(dot(clip_x, w), dot(clip_y, w), dot(zrow, q) * gsz.x, dot(clip_w, w));
     o.uv = i.uv;
     return o;
 }
@@ -171,7 +182,7 @@ struct MeshGpu {
 };
 std::unordered_map<uint64_t, MeshGpu> g_mmesh;
 std::vector<ID3D11ShaderResourceView *> g_mtex;  // this frame's batch textures (one reference each)
-ID3D11VertexShader *g_mvs, *g_mvs_shadow, *g_mvs_full;
+ID3D11VertexShader *g_mvs, *g_mvs_shadow, *g_mvs_full, *g_mvs_gsdepth;
 ID3D11PixelShader *g_mps, *g_mps_shadow, *g_mps_full;
 ID3D11InputLayout *g_mlayout;
 ID3D11Buffer *g_malpha_vb, *g_mones_vb;
@@ -182,7 +193,7 @@ ID3D11SamplerState *g_msampler, *g_mshadow_smp;
 ID3D11SamplerState *g_msamplers[4];  // repeat / clamp in u (bit 0) and v (bit 1)
 ID3D11BlendState *g_mblend;
 ID3D11DepthStencilState *g_mds_sky, *g_mds_draw, *g_mds_shadow;
-ID3D11RasterizerState *g_mrs, *g_mrs_shadow;
+ID3D11RasterizerState *g_mrs, *g_mrs_shadow, *g_mrs_gsdepth;
 ID3D11Texture2D *g_mcolor, *g_mdepth, *g_mresolve, *g_mshadow;
 ID3D11RenderTargetView *g_mrtv;
 ID3D11DepthStencilView *g_mdsv, *g_mshadow_dsv;
@@ -193,10 +204,10 @@ UINT g_msamples = 4;
 bool g_mready, g_mfailed;
 
 struct ModernFrameCB {
-    float clip_x[4], clip_y[4], clip_w[4], params[4], cam_pos[4], up[4], sh_x[4], sh_y[4], sh_z[4], fog[4], sun[4];
+    float clip_x[4], clip_y[4], clip_w[4], params[4], cam_pos[4], up[4], sh_x[4], sh_y[4], sh_z[4], fog[4], sun[4], gsz[4];
 };
 struct ModernBatchCB {
-    float m[12], light[4], info[4], info2[4], atest[4];
+    float m[12], light[4], info[4], info2[4], atest[4], zrow[4];
 };
 std::vector<uint32_t> g_matest;  // per batch: ate | atst << 1 | afail << 4 | aref << 8
 // per batch of this frame: the GS blend (abe | a << 1 | b << 3 | c << 5 | d << 7 | fix << 9), ~0 unknown
@@ -280,8 +291,9 @@ bool modern_init() {
     struct Entry {
         const char *name, *target;
         ID3DBlob *blob;
-    } e[6] = {{"vs_modern", "vs_4_0", nullptr}, {"ps_modern", "ps_4_0", nullptr}, {"vs_shadow", "vs_4_0", nullptr},
-              {"ps_shadow", "ps_4_0", nullptr},   {"vs_full", "vs_4_0", nullptr},   {"ps_full", "ps_4_0", nullptr}};
+    } e[7] = {{"vs_modern", "vs_4_0", nullptr}, {"ps_modern", "ps_4_0", nullptr}, {"vs_shadow", "vs_4_0", nullptr},
+              {"ps_shadow", "ps_4_0", nullptr},   {"vs_full", "vs_4_0", nullptr},   {"ps_full", "ps_4_0", nullptr},
+              {"vs_gsdepth", "vs_4_0", nullptr}};
     for (Entry &x : e) {
         ID3DBlob *err = nullptr;
         if (FAILED(compile(k_modern_hlsl, sizeof k_modern_hlsl - 1, "modern.hlsl", nullptr, nullptr, x.name, x.target,
@@ -296,6 +308,7 @@ bool modern_init() {
     CHECK(g_dev->CreatePixelShader(e[3].blob->GetBufferPointer(), e[3].blob->GetBufferSize(), nullptr, &g_mps_shadow));
     CHECK(g_dev->CreateVertexShader(e[4].blob->GetBufferPointer(), e[4].blob->GetBufferSize(), nullptr, &g_mvs_full));
     CHECK(g_dev->CreatePixelShader(e[5].blob->GetBufferPointer(), e[5].blob->GetBufferSize(), nullptr, &g_mps_full));
+    CHECK(g_dev->CreateVertexShader(e[6].blob->GetBufferPointer(), e[6].blob->GetBufferSize(), nullptr, &g_mvs_gsdepth));
     D3D11_INPUT_ELEMENT_DESC il[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -374,6 +387,7 @@ bool modern_init() {
     rd.MultisampleEnable = TRUE;
     CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs));
     rd.MultisampleEnable = FALSE;
+    CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs_gsdepth));
     rd.DepthBias = 200;
     rd.SlopeScaledDepthBias = 2.0f;
     rd.DepthBiasClamp = 0.01f;
@@ -401,7 +415,7 @@ bool modern_init() {
     UINT q = 0;
     while (g_msamples > 1 && (FAILED(g_dev->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, g_msamples, &q)) || !q))
         g_msamples /= 2;
-    g_mready = g_mvs && g_mps && g_mvs_shadow && g_mps_shadow && g_mvs_full && g_mps_full && g_mlayout && g_mcb_frame && g_mcb_batch && g_msampler &&
+    g_mready = g_mvs && g_mps && g_mvs_shadow && g_mps_shadow && g_mvs_full && g_mps_full && g_mvs_gsdepth && g_mlayout && g_mcb_frame && g_mcb_batch && g_msampler &&
                g_mshadow_smp && g_mblend && g_mds_sky && g_mds_draw && g_mds_shadow && g_mrs && g_mrs_shadow &&
                g_mshadow_dsv && g_mshadow_srv;
     g_mfailed = !g_mready;
@@ -515,6 +529,7 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass,
             ID3D11ShaderResourceView *srv = i < g_mtex.size() ? g_mtex[i] : nullptr;
             memcpy(bc.m, b.model, 48);
             memcpy(bc.light, b.light, 16);
+            memcpy(bc.zrow, b.zrow, 16);
             bc.info[0] = (float)b.role;
             bc.info[1] = (float)b.layer;
             bc.info[2] = srv ? 1.0f : 0.0f;
@@ -806,6 +821,31 @@ void modern_draw(modern::Frame *frame) {
     g_ctx->ResolveSubresource(g_mresolve, 0, g_mcolor, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
     D3D11_BOX box = {0, 0, 0, (UINT)(std::min(cols, s->w) * g_scale), (UINT)(std::min(rows, s->h) * g_scale), 1};
     g_ctx->CopySubresourceRegion(s->tex, 0, 0, 0, 0, g_mresolve, 0, &box);
+
+    // the GS depth the replaced draws would have written, so what the GS draws next (particles,
+    // the flag, the five camera-space batches before the HUD) is hidden behind the world correctly
+    if (Surface *zs = get_surface(t.zbp, t.fbw, t.zpsm, true, rows)) {
+        if (zs->dsv) {
+            acquire(zs, 0, 0, std::min(cols, zs->w), std::min(rows, zs->h));
+            zs->version++;
+            const int bits = t.zpsm == 0x30 ? 32 : t.zpsm == 0x31 ? 24 : 16;
+            fc.gsz[0] = (float)(1.0 / (double)(1ull << bits));
+            if (SUCCEEDED(CHECK(g_ctx->Map(g_mcb_frame, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp)))) {
+                memcpy(mp.pData, &fc, sizeof fc);
+                g_ctx->Unmap(g_mcb_frame, 0);
+            }
+            g_ctx->OMSetRenderTargets(0, nullptr, zs->dsv);
+            set_viewport(zs->w * g_scale, zs->h * g_scale);
+            g_ctx->RSSetState(g_mrs_gsdepth);
+            g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            g_ctx->OMSetDepthStencilState(g_mds_draw, 0);  // GEQUAL + write, as the GS draws the world
+            g_ctx->VSSetShader(g_mvs_gsdepth, nullptr, 0);
+            g_ctx->PSSetShader(g_mps_shadow, nullptr, 0);
+            uint32_t dz = 0;
+            modern_batches(*f, bc, true, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, dz);
+            g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+    }
     g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     g_stats.draws += drawn;
     {  // diagnosis: what one frame (the 600th drawn) contained

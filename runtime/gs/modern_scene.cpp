@@ -45,7 +45,7 @@ void gs_batch(int32_t index) { g_batch = index; }
 
 bool gs_replaced(const gs::Env &e, uint32_t alpha) {
     if (g_path != 1 || g_batch < 0) return false;
-    g_target = {true, e.fbp, e.fbw, e.fpsm, gs::st.ctx[0].xyoffset, gs::st.ctx[0].scissor};
+    g_target = {true, e.fbp, e.fbw, e.fpsm, gs::st.ctx[0].xyoffset, gs::st.ctx[0].scissor, e.zbp, e.zpsm};
     if (g_noted != g_batch && gs::hw::g_on) {  // the batch's texture and blend state (first draw)
         gs::hw::modern_texture(g_batch, e);
         g_noted = g_batch;

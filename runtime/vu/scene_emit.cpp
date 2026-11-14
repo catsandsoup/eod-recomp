@@ -348,6 +348,7 @@ void post_modern() {
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 4; c++) m.model[r * 4 + c] = (float)M[r][c];
         world_dir(M, b.q17, m.light);
+        for (int c = 0; c < 4; c++) m.zrow[c] = b.mvp[c * 4 + 2];
         if (b.valpha.size() == 2 * (size_t)b.n) m.valpha = b.valpha;  // 1:1 with the mesh (nothing clipped)
         double dev = 0, rot = 0;
         for (int r = 0; r < 4; r++)
@@ -436,7 +437,10 @@ void vu1_start(const VUState *vu, uint32_t pc) {
     // (the same program also draws camera-space batches in that mode earlier in the frame; the HUD's
     // matrix faces the screen: its w row is (0, 0, 1, 365), with no x or y term)
     const bool hud = pc == 0x270 && g_vif1_itop == 0x200 && vu->vf[4].f[3] == 0.0f && vu->vf[5].f[3] == 0.0f;
-    if (g_live && hud && !g_triggered) {
+    // ... or the first particle program after the scene (they come after the last car): the GS then
+    // draws the particles over the modern image, tested against the depth it writes
+    const bool particles = (pc == 0x1b8 || pc == 0x8e0 || pc == 0x5e0) && g_mf && !g_mf->batches.empty();
+    if (g_live && (hud || particles) && !g_triggered) {
         post_modern();
         g_triggered = true;
     }

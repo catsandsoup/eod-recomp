@@ -40,6 +40,7 @@ struct Batch {
     uint64_t mesh;
     float model[12];   // rows of the 3x4 world matrix
     float light[4];    // world light direction, .w = ambient (VU1 qword 17)
+    float zrow[4];     // the batch's GS depth row (model space): the depth the GS would have written
     uint32_t pc, itop, role, layer;
     bool drawn;        // the game kicked something for it
     std::vector<uint8_t> valpha;  // per vertex: the kicked alpha and 255 if its primitive blends
@@ -64,6 +65,7 @@ struct Target {
     bool valid;
     uint32_t fbp, fbw, fpsm;
     uint64_t xyoffset, scissor;
+    uint32_t zbp, zpsm;
 };
 extern Target g_target;
 
