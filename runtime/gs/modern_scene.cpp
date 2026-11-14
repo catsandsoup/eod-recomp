@@ -13,10 +13,10 @@
 
 namespace modern {
 
-// available on Windows (the d3d11 backend draws it) unless EOD_MODERN=0; EOD_MODERN=1 also
+// available with a hardware backend that draws it (Direct3D 11 or Vulkan) unless EOD_MODERN=0; EOD_MODERN=1 also
 // switches it on at start. Whether it draws is the config's ModernRenderer (Graphics panel).
 bool g_on = [] {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EOD_VULKAN)
     const char *v = getenv("EOD_MODERN");
     return !(v && strcmp(v, "0") == 0);
 #else

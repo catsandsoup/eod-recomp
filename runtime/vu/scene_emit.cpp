@@ -50,7 +50,7 @@ const bool g_all = env_u64("EOD_SCENE_EMIT_ALL", 0) != 0;  // diagnostic: every 
 // EOD_MODERN=1: also feed the modern renderer live (read here directly: the
 // static initialisation order across files is not defined)
 const bool g_modern = [] {  // as modern::g_on (initialised in another file)
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EOD_VULKAN)
     const char *v = getenv("EOD_MODERN");
     return !(v && strcmp(v, "0") == 0);
 #else

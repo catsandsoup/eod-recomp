@@ -73,7 +73,9 @@ uint32_t gif_reg_ctrl, gif_reg_mode;
 // Host->local transfers: on Windows (Direct3D 11) the declared TRXREG extent is
 // reported when the transfer starts, as upstream does; the other backends
 // report each supplied chunk from xfer_data (docs/GS_CPU_WRITE_PRESERVATION.md).
-#ifdef _WIN32
+#if defined(_WIN32) && defined(EOD_HW_SELECT)
+#define kChunkedHostWrites (hw::vulkan_active())  // the backend chosen at start
+#elif defined(_WIN32)
 constexpr bool kChunkedHostWrites = false;
 #else
 constexpr bool kChunkedHostWrites = true;

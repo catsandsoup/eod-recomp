@@ -294,13 +294,8 @@ struct Context {
         require(vkCreateDescriptorPool(device, &i, nullptr, &p), "descriptor pool");
         return p;
     }
-    // vkCmdPushDescriptorSetKHR, or the same writes into a fresh set of `setLayout`
-    void push_set(VkPipelineBindPoint bind, VkPipelineLayout pl, uint32_t set, uint32_t n,
-                  const VkWriteDescriptorSet *w, VkDescriptorSetLayout setLayout) {
-        if (push) {
-            push(cmd, bind, pl, set, n, w);
-            return;
-        }
+    // A descriptor set that lives until the current command buffer completes.
+    VkDescriptorSet alloc_set(VkDescriptorSetLayout setLayout) {
         VkDescriptorSet ds{};
         for (;;) {
             if (poolIndex == pools.size())
@@ -311,11 +306,20 @@ struct Context {
             a.pSetLayouts = &setLayout;
             VkResult r = vkAllocateDescriptorSets(device, &a, &ds);
             if (r == VK_SUCCESS)
-                break;
+                return ds;
             if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL)
                 require(r, "descriptor set");
             ++poolIndex;
         }
+    }
+    // vkCmdPushDescriptorSetKHR, or the same writes into a fresh set of `setLayout`
+    void push_set(VkPipelineBindPoint bind, VkPipelineLayout pl, uint32_t set, uint32_t n,
+                  const VkWriteDescriptorSet *w, VkDescriptorSetLayout setLayout) {
+        if (push) {
+            push(cmd, bind, pl, set, n, w);
+            return;
+        }
+        VkDescriptorSet ds = alloc_set(setLayout);
         VkWriteDescriptorSet local[16];
         for (uint32_t i = 0; i < n && i < 16; i++) {
             local[i] = w[i];
@@ -336,6 +340,7 @@ struct Context {
     uint64_t chunk_submits = 0;
     std::vector<VkSemaphore> presentDone;
     bool wantVsync = true; // snapshotted once from the launch configuration
+    VkBool32 anisotropy = VK_FALSE;
     bool displayTiming = false;
     PFN_vkGetRefreshCycleDurationGOOGLE refreshDuration{};
     PFN_vkGetPastPresentationTimingGOOGLE pastPresentation{};
@@ -448,8 +453,8 @@ struct Context {
         b.size = bytes;
         VkBufferCreateInfo i{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         i.size = bytes;
-        i.usage =
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        i.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
         require(vkCreateBuffer(device, &i, nullptr, &b.buffer), "buffer");
         VkMemoryRequirements r;
         vkGetBufferMemoryRequirements(device, b.buffer, &r);
@@ -1344,6 +1349,8 @@ inline bool Context::init(bool withWindow) {
     VkPhysicalDeviceFeatures enabled{};
     enabled.dualSrcBlend = VK_TRUE;
     enabled.depthClamp = VK_TRUE;
+    anisotropy = features.samplerAnisotropy; // the modern renderer's texture filtering
+    enabled.samplerAnisotropy = features.samplerAnisotropy;
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
     std::vector<VkExtensionProperties> available(ne);

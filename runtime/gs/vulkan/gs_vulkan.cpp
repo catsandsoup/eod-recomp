@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,7 @@
 #include "gpu_upload_blocks.h"
 
 namespace gs {
+extern bool g_skip_frame; // gs_draw.cpp
 namespace hw {
 #ifdef EOD_HW_SELECT
 namespace vulkan {  // one of two backends (gs_hw_select.cpp chooses)
@@ -3286,14 +3288,9 @@ void stats_line(char *buf, size_t size) {
     g_stats = Stats();
 }
 
+#include "modern_vk.inc"
+
 #ifdef EOD_HW_SELECT
-// the modern pass is not ported to Vulkan yet: Original
-void modern_texture(int32_t, const Env &) {}
-void modern_draw(modern::Frame *f) {
-    delete f;
-    modern::disable();
-}
-void modern_alpha(int32_t, uint32_t) {}
 } // namespace vulkan
 #endif
 } // namespace hw

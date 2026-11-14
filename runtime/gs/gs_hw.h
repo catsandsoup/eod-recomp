@@ -78,7 +78,7 @@ void reset();
 void finish();
 // EOD_MODERN (modern_scene.h): the texture and blend state of a replaced batch, and the
 // modern pass of a frame into the current frame buffer (takes ownership).
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EOD_VULKAN)
 void modern_texture(int32_t batch, const Env &e);
 void modern_draw(modern::Frame *f);
 void modern_alpha(int32_t batch, uint32_t alpha);
@@ -86,6 +86,10 @@ void modern_alpha(int32_t batch, uint32_t alpha);
 inline void modern_alpha(int32_t, uint32_t) {}
 inline void modern_texture(int32_t, const Env &) {}
 inline void modern_draw(modern::Frame *f) { delete f; }
+#endif
+#ifdef EOD_HW_SELECT
+// Windows: the Vulkan backend (not Direct3D 11) is the one running
+bool vulkan_active();
 #endif
 // Statistics line for the log (draw calls, uploads, conversions per frame).
 void stats_line(char *buf, size_t size);
