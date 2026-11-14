@@ -457,8 +457,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(eod_gen PRIVATE -msse2 -mfpmath=sse -march=pentium4 -mtune=core2)
     target_compile_options(eod PRIVATE -msse2 -mfpmath=sse -march=pentium4 -mtune=core2)
   else()
-    target_compile_options(eod_gen PRIVATE -mtune=core2)
-    target_compile_options(eod PRIVATE -mtune=core2)
+    # x86-64-v2 (SSE4.2/POPCNT, every x86-64 CPU since 2009) instead of the 2003 baseline:
+    # SSE4.1 blends, rounding and dot products for the VU and recompiled EE code. No FMA
+    # contraction, so float results stay bit-identical to the SSE2 build (netplay).
+    set(EOD_X86_LEVEL "x86-64-v2" CACHE STRING "x86-64 micro-architecture level (-march)")
+    target_compile_options(eod_gen PRIVATE -march=${EOD_X86_LEVEL} -mtune=generic -ffp-contract=off)
+    target_compile_options(eod PRIVATE -march=${EOD_X86_LEVEL} -mtune=generic -ffp-contract=off)
   endif()
 elseif(MSVC)
   target_compile_options(eod_gen PRIVATE /w /bigobj)

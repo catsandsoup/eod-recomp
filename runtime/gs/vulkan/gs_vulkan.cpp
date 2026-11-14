@@ -558,8 +558,16 @@ void flush() {
     EOD_ZONE("gs.flush");
     if (g_verts.empty())
         return;
+    // two persistent vectors swapped back and forth: g_verts keeps its capacity (a fresh
+    // vector per batch reallocated log2(n) times while the next batch was built)
+    static thread_local std::vector<HwVertex> spare;  // empty, with the last batch's capacity
     std::vector<HwVertex> verts;
-    verts.swap(g_verts); // (the passes below flush too)
+    verts.swap(g_verts); // this batch (the passes below flush too)
+    g_verts.swap(spare); // the next batch starts with capacity
+    struct GiveBack {
+        std::vector<HwVertex> &v;
+        ~GiveBack() { v.clear(); spare.swap(v); }
+    } give_back{verts};
     DrawState s = g_state;
     // take the pages under the batch (not the whole scissor: buffers share memory
     // with textures)
@@ -661,6 +669,9 @@ void flush() {
         alpha_order::Tiles tiles(s.rt->w*sc,s.rt->h*sc);
         const alpha_order::Bounds clip{s.scissor[0],s.scissor[1],s.scissor[2],s.scissor[3]};
         UINT group_first=0;
+        struct GroupTri { UINT offset; float x0,y0,x1,y1; };
+        static thread_local std::vector<GroupTri> group_tris;
+        group_tris.clear();
         auto draw_group=[&](UINT end) {
             if(end==group_first) return;
             draw_batch(s,first+group_first,end-group_first,false);
@@ -673,9 +684,25 @@ void flush() {
                 x0=std::min(x0,v.x);y0=std::min(y0,v.y);x1=std::max(x1,v.x);y1=std::max(y1,v.y);
             }
             const auto coverage=alpha_order::bounds(x0,y0,x1,y1,sc,clip);
-            if(!group_disjoint || !tiles.append(coverage)) {
-                draw_group(offset);group_first=offset;tiles.clear();tiles.append(coverage);
+            if(group_disjoint && tiles.append(coverage)) { group_tris.push_back({offset,x0,y0,x1,y1}); continue; }
+            // The tiles overlap: an exact test against the group's triangles. Strip and fan
+            // neighbours only share edges and never write the same pixel, so they stay in one
+            // group (one pass/fail pair) instead of one pair per triangle.
+            bool conflict=!group_disjoint || primitive_size!=3 || group_tris.size()>48;
+            if(!conflict) {
+                int32_t t[6];  // GS 12.4 fixed point (the vertices are exact multiples of 1/16)
+                for(int k=0;k<3;k++) t[k*2]=(int32_t)std::lround(verts[offset+k].x*16.0f),t[k*2+1]=(int32_t)std::lround(verts[offset+k].y*16.0f);
+                for(const GroupTri &g:group_tris) {
+                    if(g.x1<=x0 || x1<=g.x0 || g.y1<=y0 || y1<=g.y0) continue;
+                    int32_t u[6];
+                    for(int k=0;k<3;k++) u[k*2]=(int32_t)std::lround(verts[g.offset+k].x*16.0f),u[k*2+1]=(int32_t)std::lround(verts[g.offset+k].y*16.0f);
+                    if(alpha_order::triangles_overlap(t,u)) { conflict=true; break; }
+                }
             }
+            if(conflict) {
+                draw_group(offset);group_first=offset;tiles.clear();tiles.append(coverage);group_tris.clear();
+            } else tiles.force(coverage);
+            group_tris.push_back({offset,x0,y0,x1,y1});
         }
         draw_group(count);
     } else draw_batch(s, first, count, false);
@@ -1737,6 +1764,7 @@ void host_index_plane(const Env &e, std::vector<uint8_t> &out) {
 }
 
 ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, float &scale, uint32_t &flags) {
+    EOD_ZONE("tex.vram_texture");
     int levels = tex_levels(e);
     // description key: what identifies the texture apart from the memory contents
     uint64_t desc = mix64(0, e.tpsm | (e.tw << 8) | ((uint64_t)e.th << 20) | ((uint64_t)levels << 40));
@@ -1762,6 +1790,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, 
             newest = std::max(newest, g_page_gen[(first + k) % kPages]);
     }
     uint64_t key;
+    EOD_ZONE("tex.lookup");
     auto ck = g_tex_check.find(desc);
     if (ck != g_tex_check.end() && ck->second.clock >= newest) {
         key = ck->second.key;
@@ -1770,6 +1799,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, 
         // has to change whenever a decoded texel does, and decode below never
         // reads a bit still awaiting deferred GPU data.
         key = desc;
+        EOD_ZONE("tex.hash_level");
         for (int i = 0; i < levels; i++)
             key = mix64(key, hash_level(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i),
                                         std::max(1, (int)e.th >> i)));
@@ -2118,6 +2148,7 @@ TexSource texture_for(const Env &e, Surface *target) {
     // the validity proof and can force a later, unnecessary palette readback.
     // Keep the alternate texture-source selection within the opt-in experiment.
     bool cpu_current = gpu_uploads_enabled();
+    { EOD_ZONE("tex.cpu_current");
     for (int i = 0; i < levels && cpu_current; ++i) {
         const PageCoverage requested = page_coverage(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0,
             std::max(1, (int)e.tw >> i), std::max(1, (int)e.th >> i));
@@ -2128,6 +2159,7 @@ TexSource texture_for(const Env &e, Surface *target) {
                 break;
             }
         }
+    }
     }
     if (cpu_current) {
         ts.srv = vram_texture(e, ts.alpha, ts.scale, ts.flags);
@@ -2165,10 +2197,20 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (!owner) {
-        std::vector<uint32_t> pages;
         for (int i = 0; i < levels; i++) {
-            exact_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i), std::max(1, (int)e.th >> i),
-                        pages);
+            // the pages of a texture depend only on where it is and its size: remembered
+            // (walking every block per lookup cost ~2 ms a frame; the Direct3D 11 backend caches it too)
+            static std::unordered_map<uint64_t, std::vector<uint32_t>> known;
+            const uint32_t lw = std::max(1, (int)e.tw >> i), lh = std::max(1, (int)e.th >> i);
+            const uint64_t k = (uint64_t)e.mip_tbp[i] | (uint64_t)e.mip_tbw[i] << 14 | (uint64_t)e.tpsm << 20 |
+                               (uint64_t)lw << 26 | (uint64_t)lh << 38;
+            auto kp = known.find(k);
+            if (kp == known.end()) {
+                if (known.size() > 4096) known.clear();
+                kp = known.emplace(k, std::vector<uint32_t>()).first;
+                exact_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, (int)lw, (int)lh, kp->second);
+            }
+            const std::vector<uint32_t> &pages = kp->second;
             for (uint32_t p : pages) {
                 Surface *o = g_owner[p];
                 if (!o || g_vram_ok[p])
@@ -3305,6 +3347,15 @@ void stats_line(char *buf, size_t size) {
                  g_hstats.evictions, (unsigned long long)(g_host_gpu_bytes >> 20));
     }
     g_hstats = HostStats();
+    if (g_dev->gpuProf > 0) {  // EOD_DRAW_PROF: CPU cost of each section of Context::Draw (replays)
+        used = strlen(buf);
+        const double per_ms = 3.8e6;  // rdtsc ticks per ms (nominal clock; ratios are what matter)
+        snprintf(buf + used, size > used ? size - used : 0,
+                 "; Draw ms: pipeline %.1f pass+dynamic %.1f descriptors+constants %.1f vertices+draw %.1f",
+                 g_dev->drawTicks[0] / per_ms, g_dev->drawTicks[1] / per_ms, g_dev->drawTicks[2] / per_ms,
+                 g_dev->drawTicks[3] / per_ms);
+        std::fill(std::begin(g_dev->drawTicks), std::end(g_dev->drawTicks), 0);
+    }
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = g_dev->chunk_submits = 0;

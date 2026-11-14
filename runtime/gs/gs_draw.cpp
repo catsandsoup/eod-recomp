@@ -1946,6 +1946,7 @@ void clut_resolve() {
 }
 
 void clut_load(uint64_t tex0) {
+    EOD_ZONE("gs.clut_load");
     uint32_t psm = bits(tex0, 20, 6);
     bool four = psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH;
     bool eight = psm == PSMT8 || psm == PSMT8H;

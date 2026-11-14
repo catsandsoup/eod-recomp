@@ -192,6 +192,8 @@ struct Texture : Ref {
     VkImage image{};
     VkImageView view{};
     VkDeviceMemory memory{};
+    uint64_t poolKey = 0;   // image recycling class (0: not recyclable)
+    VkDeviceSize bytes = 0;
     HostBuffer host;
     bool external = false;
     ~Texture();
@@ -303,7 +305,7 @@ struct Context {
     uint64_t gpuPresents = 0, gpuReportUs = 0, gpuFirst = UINT64_MAX, gpuLast = 0, gpuCmdbufs = 0, gpuWaits0 = 0;
     bool gpu_prof() {
         if (gpuProf < 0) {
-            gpuProf = (getenv("EOD_FPS") || getenv("EOD_GPU_PROF")) ? 1 : 0;
+            gpuProf = (getenv("EOD_FPS") || getenv("EOD_GPU_PROF") || getenv("EOD_DRAW_PROF")) ? 1 : 0;
             VkPhysicalDeviceProperties p;
             vkGetPhysicalDeviceProperties(physical, &p);
             tsPeriod = p.limits.timestampPeriod;
@@ -855,6 +857,17 @@ struct Context {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &b);
     }
+    // Retired images by (size, format, levels, usage), reused instead of vkCreateImage +
+    // vkAllocateMemory + vkCreateImageView: the game streams textures through VRAM every
+    // frame, and on Windows drivers each fresh allocation costs ~100 us of GS-thread time.
+    struct PooledImage { VkImage image; VkImageView view; VkDeviceMemory memory; VkDeviceSize bytes; };
+    std::unordered_map<uint64_t, std::vector<PooledImage>> imagePool;
+    VkDeviceSize imagePoolBytes = 0;
+    static constexpr VkDeviceSize kImagePoolMax = 192ull << 20;
+    static uint64_t image_class(const D3D11_TEXTURE2D_DESC *d, VkImageUsageFlags usage) {
+        return (uint64_t)d->Width | (uint64_t)d->Height << 16 | (uint64_t)(d->MipLevels & 15) << 32 |
+               (uint64_t)(d->Format & 0xFFFF) << 36 | (uint64_t)(usage & 0xFF) << 52 | 1ull << 63;
+    }
     int CreateTexture2D(const D3D11_TEXTURE2D_DESC *d, const D3D11_SUBRESOURCE_DATA *initial, Texture **out) {
         auto *t = new Texture;
         t->desc = *d;
@@ -876,6 +889,24 @@ struct Context {
             i.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         if (d->BindFlags & D3D11_BIND_RENDER_TARGET)
             i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        t->poolKey = d->Width <= 0xFFFF && d->Height <= 0xFFFF ? image_class(d, i.usage) : 0;
+        if (t->poolKey) {
+            auto pit = imagePool.find(t->poolKey);
+            if (pit != imagePool.end() && !pit->second.empty()) {
+                const PooledImage pi = pit->second.back();
+                pit->second.pop_back();
+                imagePoolBytes -= pi.bytes;
+                t->image = pi.image, t->view = pi.view, t->memory = pi.memory, t->bytes = pi.bytes;
+                transition(t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                if (initial)
+                    for (UINT l = 0; l < d->MipLevels; l++) {
+                        D3D11_BOX box{0, 0, 0, std::max(1u, d->Width >> l), std::max(1u, d->Height >> l), 1};
+                        UpdateSubresource(t, l, &box, initial[l].pSysMem, initial[l].SysMemPitch, 0);
+                    }
+                *out = t;
+                return 0;
+            }
+        }
         require(vkCreateImage(device, &i, nullptr, &t->image), "image");
         VkMemoryRequirements r;
         vkGetImageMemoryRequirements(device, t->image, &r);
@@ -883,6 +914,7 @@ struct Context {
         a.allocationSize = r.size;
         a.memoryTypeIndex = memory_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         require(vkAllocateMemory(device, &a, nullptr, &t->memory), "image memory");
+        t->bytes = r.size;
         require(vkBindImageMemory(device, t->image, t->memory, 0), "bind image");
         VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         v.image = t->image;
@@ -1106,7 +1138,16 @@ inline Texture::~Texture() {
     auto m = memory;
     auto b = host;
     bool ext = external;
+    const uint64_t key = poolKey;
+    const VkDeviceSize bytes = this->bytes;
+    Context *c = ctx;
     ctx->garbage.push_back([=] {
+        // GPU work that used it has completed: recycle the image when the pool has room
+        if (key && i && v && m && !ext && !b.buffer && c->imagePoolBytes + bytes <= Context::kImagePoolMax) {
+            c->imagePool[key].push_back({i, v, m, bytes});
+            c->imagePoolBytes += bytes;
+            return;
+        }
         if (v)
             vkDestroyImageView(d, v, nullptr);
         if (i && !ext)

@@ -618,7 +618,7 @@ void xgkick(VUState *vu, uint32_t addr_qw) {
     // send a GIF packet (possibly several tags) from VU1 memory via PATH1
     uint32_t a = addr_qw & 0x3FF;
     // walk tags until EOP to find the length (wrapping at 16KB)
-    uint8_t buf[0x4000];
+    static thread_local uint8_t buf[0x4000];  // (not on the stack: 16 KB there means a 4-page probe per kick)
     uint32_t n = 0;
     for (;;) {
         if (n >= 0x400) break;

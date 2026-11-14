@@ -69,11 +69,13 @@ bool in_range(uint64_t f) { return (g_modern && g_live) || emit_range(f); }
 constexpr uint32_t fourcc(const char (&s)[5]) {
     return (uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24;
 }
-uint64_t now_ns() {
+uint64_t now_ns_raw() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+// producer cost statistics only matter for the EOD_SCENE_EMIT file (QueryPerformanceCounter per VU1 run)
+uint64_t now_ns() { return g_write ? now_ns_raw() : 0; }
 uint64_t mix(uint64_t h, uint64_t v) {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
     return h * 0xFF51AFD7ED558CCDull;
@@ -350,7 +352,7 @@ void post_modern() {
     }
     memcpy(f->cam, g_batches[best].mvp, 64);
     std::vector<uint64_t> zrows;  // world layers in order of first appearance
-    for (const Batch &b : g_batches) {
+    for (Batch &b : g_batches) {
         if (b.mi < 0) continue;
         modern::Batch &m = f->batches[(size_t)b.mi];
         double M[4][4];
@@ -359,7 +361,7 @@ void post_modern() {
             for (int c = 0; c < 4; c++) m.model[r * 4 + c] = (float)M[r][c];
         world_dir(M, b.q17, m.light);
         for (int c = 0; c < 4; c++) m.zrow[c] = b.mvp[c * 4 + 2];
-        if (b.valpha.size() == 2 * (size_t)b.n) m.valpha = b.valpha;  // 1:1 with the mesh (nothing clipped)
+        if (b.valpha.size() == 2 * (size_t)b.n) m.valpha = std::move(b.valpha);  // 1:1 with the mesh (nothing clipped)
         double dev = 0, rot = 0;
         for (int r = 0; r < 4; r++)
             for (int c = 0; c < 4; c++) dev = std::max(dev, std::fabs(M[r][c] - (r == c)));
@@ -385,6 +387,11 @@ void flush_frame() {
     if (g_modern && !g_triggered) post_modern();
     g_triggered = false;
     if (g_modern) mark(-1);
+    if (!(g_write && emit_range(g_frame))) {  // the records only feed the EOD_SCENE_EMIT file
+        g_out.clear();
+        g_batches.clear();
+        return;
+    }
     const size_t best = camera_vote();
     double cam[4][4], cinv[4][4];
     const bool have_cam = best != SIZE_MAX && (xyw(g_batches[best].mvp, cam), invert4(cam, cinv));
@@ -463,8 +470,8 @@ bool is_sky_dome(const VUState *vu, uint32_t pc, uint32_t itop) {
 }
 
 void vu1_start(const VUState *vu, uint32_t pc) {
-    EOD_ZONE("emit.vu1_start");
     if (!g_frame_active) return;
+    EOD_ZONE("emit.vu1_start");
     const uint64_t t = now_ns();
     finish_pending();
     g_run++;
@@ -535,7 +542,7 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                     b.want_alpha = true;
                     replaced = true;
                 }
-                g_batches.push_back(b);
+                g_batches.push_back(std::move(b));
                 g_pending = true;
             }
         }
@@ -559,14 +566,17 @@ void vu1_start(const VUState *vu, uint32_t pc) {
 }
 
 void gif(int path, const uint8_t *data, uint32_t qwc) {
-    EOD_ZONE("emit.gif");
     if (!g_frame_active || path != 1) return;
+    EOD_ZONE("emit.gif");
     g_kicks++;
     if (g_pending) {
         g_batches.back().kicks++;
         Batch &cur = g_batches.back();
         if (g_mf && cur.mi >= 0) g_mf->batches[(size_t)cur.mi].drawn = true;
-        if (cur.want_alpha) kick_alphas(data, qwc, cur.valpha);
+        if (cur.want_alpha) {
+            if (cur.valpha.empty()) cur.valpha.reserve(2 * (size_t)cur.n + 8);
+            kick_alphas(data, qwc, cur.valpha);
+        }
     }
     if (g_frame >= g_verify && g_frame - g_verify < 4) {  // a few vblanks: the game draws every 2-3
         const uint64_t t = now_ns();

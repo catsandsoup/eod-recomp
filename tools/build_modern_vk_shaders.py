@@ -23,7 +23,7 @@ ENTRIES = [
     ("vs_shadow", "vs"), ("ps_shadow", "ps"),
     ("vs_gsdepth", "vs"),
     ("vs_full", "vs"), ("ps_full", "ps"),
-    ("ps_ao", "ps"), ("ps_bright", "ps"), ("ps_blur", "ps"), ("ps_comp", "ps"),
+    ("ps_ao", "ps"), ("ps_bright", "ps"), ("ps_blur", "ps"), ("ps_comp", "ps"), ("ps_ao1", "ps"),
 ]
 
 

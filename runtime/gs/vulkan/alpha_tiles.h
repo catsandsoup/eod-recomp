@@ -6,6 +6,35 @@
 #include <cstdint>
 #include <vector>
 namespace alpha_order {
+// Whether two triangles may write a common pixel, in exact integer arithmetic on GS 12.4
+// coordinates (a, b: x0 y0 x1 y1 x2 y2 in 1/16 pixel units). Separated: an edge normal of either
+// triangle with the projections strictly apart, or touching only along an edge both triangles
+// share (identical end points, third vertices on opposite sides): the rasterization rules give
+// every pixel centre on a shared edge to exactly one of the two. Vertex-only contact and
+// T-junctions count as overlap (they are disjoint only under a top-left rule, which the
+// Vulkan specification does not require).
+inline bool triangles_overlap(const int32_t *a, const int32_t *b) {
+    auto has = [](const int32_t *t, int32_t x, int32_t y) {
+        return (t[0] == x && t[1] == y) || (t[2] == x && t[3] == y) || (t[4] == x && t[5] == y);
+    };
+    auto separated = [&](const int32_t *p, const int32_t *q) {
+        for (int e = 0; e < 3; e++) {
+            const int32_t *v0 = p + e * 2, *v1 = p + ((e + 1) % 3) * 2;
+            const int64_t nx = (int64_t)v1[1] - v0[1], ny = -((int64_t)v1[0] - v0[0]);
+            int64_t pmin = INT64_MAX, pmax = INT64_MIN, qmin = INT64_MAX, qmax = INT64_MIN;
+            for (int k = 0; k < 3; k++) {
+                const int64_t dp = p[k * 2] * nx + p[k * 2 + 1] * ny, dq = q[k * 2] * nx + q[k * 2 + 1] * ny;
+                pmin = std::min(pmin, dp), pmax = std::max(pmax, dp);
+                qmin = std::min(qmin, dq), qmax = std::max(qmax, dq);
+            }
+            if (pmax < qmin || qmax < pmin) return true;
+            const bool shared = has(q, v0[0], v0[1]) && has(q, v1[0], v1[1]);
+            if (shared && (pmax == qmin || qmax == pmin) && pmin != pmax && qmin != qmax) return true;
+        }
+        return false;
+    };
+    return !separated(a, b) && !separated(b, a);
+}
 struct Bounds { int x0,y0,x1,y1; }; // half-open physical pixels after scissor
 inline Bounds bounds(float min_x,float min_y,float max_x,float max_y,int scale,Bounds clip) {
     // VS adds half a logical pixel before viewport scaling. Expand one physical
@@ -46,6 +75,8 @@ public:
         masks(b,[&](size_t i,uint64_t mask){if(!occupied_[i]) touched_.push_back(i);occupied_[i]|=mask;});
         return true;
     }
+    // Marks the tiles of a primitive proven (by an exact test) not to share a pixel with the group.
+    void force(Bounds b) { masks(b,[&](size_t i,uint64_t mask){if(!occupied_[i]) touched_.push_back(i);occupied_[i]|=mask;}); }
     void clear() { for(auto i:touched_) occupied_[i]=0;touched_.clear(); }
 };
 }

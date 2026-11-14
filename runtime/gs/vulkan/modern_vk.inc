@@ -96,6 +96,8 @@ struct MArena {
 };
 std::vector<MArena> g_marena;
 constexpr VkDeviceSize kArenaBlock = 32ull << 20;
+// vertex alpha 0x80 for every vertex an arena block can hold (2 bytes each)
+constexpr size_t kOnesBytes = (size_t)(kArenaBlock / sizeof(modern::Vertex) + 4096) * 2;
 
 bool marena_alloc(VkDeviceSize bytes, VkBuffer &buf, VkDeviceSize &off) {
     bytes = (bytes + 255) & ~VkDeviceSize(255);
@@ -158,7 +160,7 @@ static_assert(sizeof(ModernBatchCB) == 128, "push constants");
 
 // descriptor set 0 bindings (modern_vk.hlsl)
 enum : uint32_t { MB_FRAME = 0, MB_SHADOW = 1, MB_GSFRAME = 2, MB_DEPTHMS = 3, MB_SRC = 4, MB_AO = 5, MB_BLOOM = 6,
-                  MB_IMAGES_END = 7, MB_SHADOW_SMP = 20, MB_LIN = 21 };
+                  MB_DEPTH1 = 7, MB_IMAGES_END = 8, MB_SHADOW_SMP = 20, MB_LIN = 21 };
 
 VkDescriptorSetLayout g_mset0, g_mset1;
 VkPipelineLayout g_mlayout;
@@ -167,10 +169,10 @@ MImage g_mdummy, g_mdummy_ms;
 vkgs::HostBuffer g_mones;  // vertex alpha 0x80 and "blends" for meshes without per-vertex alpha
 
 enum MShader { VS_MODERN, PS_MODERN, VS_SHADOW, PS_SHADOW, VS_GSDEPTH, VS_FULL, PS_FULL, PS_AO, PS_BRIGHT, PS_BLUR,
-               PS_COMP, kMShaders };
+               PS_COMP, PS_AO1, kMShaders };
 VkShaderModule g_mshader[kMShaders];
 const char *const k_mentry[kMShaders] = {"vs_modern", "ps_modern", "vs_shadow", "ps_shadow", "vs_gsdepth", "vs_full",
-                                         "ps_full",   "ps_ao",     "ps_bright", "ps_blur",   "ps_comp"};
+                                         "ps_full",   "ps_ao",     "ps_bright", "ps_blur",   "ps_comp",  "ps_ao1"};
 
 // pipeline state: shaders, blend, depth mode, attachments
 struct MPipeKey {
@@ -281,7 +283,7 @@ VkPipeline mpipeline(const MPipeKey &k) {
 MImage g_mcolor, g_mdepth, g_mresolve, g_mfinal, g_mao, g_mb1, g_mb2, g_mshadow;
 constexpr int kShadowSize = 4096;  // atlas width: two 2048x2048 cascades side by side
 int g_mw, g_mh;
-VkSampleCountFlagBits g_msamples = VK_SAMPLE_COUNT_4_BIT;
+VkSampleCountFlagBits g_msamples = VK_SAMPLE_COUNT_4_BIT, g_msamples_max = VK_SAMPLE_COUNT_4_BIT;
 bool g_mready, g_mfailed;
 
 VkSampler msampler(VkFilter f, VkSamplerAddressMode u, VkSamplerAddressMode v, float aniso, bool compare) {
@@ -317,7 +319,7 @@ bool modern_init() {
             {k_mspv_vs_gsdepth, sizeof k_mspv_vs_gsdepth}, {k_mspv_vs_full, sizeof k_mspv_vs_full},
             {k_mspv_ps_full, sizeof k_mspv_ps_full},       {k_mspv_ps_ao, sizeof k_mspv_ps_ao},
             {k_mspv_ps_bright, sizeof k_mspv_ps_bright},   {k_mspv_ps_blur, sizeof k_mspv_ps_blur},
-            {k_mspv_ps_comp, sizeof k_mspv_ps_comp}};
+            {k_mspv_ps_comp, sizeof k_mspv_ps_comp},       {k_mspv_ps_ao1, sizeof k_mspv_ps_ao1}};
         for (int i = 0; i < kMShaders; i++) {
             VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             info.codeSize = k_code[i].bytes;
@@ -362,13 +364,14 @@ bool modern_init() {
                                                      &ifp) != VK_SUCCESS ||
             !(ifp.sampleCounts & VK_SAMPLE_COUNT_4_BIT))
             g_msamples = VK_SAMPLE_COUNT_1_BIT;
+        g_msamples_max = g_msamples;
         if (!mimage(g_mdummy, 1, 1, VK_FORMAT_R8G8B8A8_UNORM) ||
-            !mimage(g_mdummy_ms, 1, 1, VK_FORMAT_D32_SFLOAT, g_msamples) ||
+            !mimage(g_mdummy_ms, 1, 1, VK_FORMAT_D32_SFLOAT, g_msamples_max) ||
             !mimage(g_mshadow, kShadowSize, kShadowSize / 2, VK_FORMAT_D32_SFLOAT))
             throw std::runtime_error("modern images");
-        g_mones = g_dev->host_buffer(1 << 19);
+        g_mones = g_dev->host_buffer(kOnesBytes);
         uint8_t *ones = (uint8_t *)g_mones.map;
-        for (size_t k = 0; k < (1 << 19); k += 2) ones[k] = 0x80, ones[k + 1] = 0xFF;
+        for (size_t k = 0; k < kOnesBytes; k += 2) ones[k] = 0x80, ones[k + 1] = 0xFF;
     } catch (const std::exception &e) {
         WARN("modern renderer: %s", e.what());
         return false;
@@ -381,7 +384,13 @@ bool modern_init() {
 }
 
 bool modern_targets(int w, int h) {
-    if (g_mcolor.img && g_mw == w && g_mh == h) return true;
+    // 4x MSAA only below 3x render scale: from 3x up the internal resolution already
+    // supersamples the window (and 4x targets at 6x are ~330 MB of bandwidth per frame)
+    static const int force = getenv("EOD_MODERN_MSAA") ? atoi(getenv("EOD_MODERN_MSAA")) : -1;
+    const VkSampleCountFlagBits want = force == 0 ? VK_SAMPLE_COUNT_1_BIT : force > 0 ? g_msamples_max
+                                     : g_scale >= 3 ? VK_SAMPLE_COUNT_1_BIT : g_msamples_max;
+    if (g_mcolor.img && g_mw == w && g_mh == h && want == g_msamples) return true;
+    g_msamples = want;
     const uint32_t W = (uint32_t)w, H = (uint32_t)h, hw = std::max(1u, W / 2), hh = std::max(1u, H / 2);
     bool ok = mimage(g_mcolor, W, H, VK_FORMAT_R8G8B8A8_UNORM, g_msamples) &&
               mimage(g_mdepth, W, H, VK_FORMAT_D32_SFLOAT, g_msamples) &&
@@ -398,9 +407,11 @@ void modern_upload(const modern::Mesh &m) {
     const VkDeviceSize vbytes = m.v.size() * sizeof(modern::Vertex), ibytes = m.idx.size() * 4;
     MeshGpu g;
     VkDeviceSize off;
-    if (!marena_alloc(vbytes + ibytes + 256, g.buf, off)) return;
-    g.vb = off;
-    g.ib = (off + vbytes + 255) & ~VkDeviceSize(255);
+    if (!marena_alloc(vbytes + ibytes + 256 + sizeof(modern::Vertex), g.buf, off)) return;
+    // the vertices start at a whole vertex (draws address them with vertexOffset, the indices with
+    // firstIndex, so the arena's buffers are bound once per pass instead of once per batch)
+    g.vb = (off + sizeof(modern::Vertex) - 1) / sizeof(modern::Vertex) * sizeof(modern::Vertex);
+    g.ib = (g.vb + vbytes + 255) & ~VkDeviceSize(255);
     auto sv = g_ctx->upload(m.v.data(), (size_t)vbytes);
     VkBufferCopy c{sv.second, g.vb, vbytes};
     vkCmdCopyBuffer(g_ctx->cmd, sv.first->buffer, g.buf, 1, &c);
@@ -568,8 +579,8 @@ void mset0(VkBuffer ubo, VkDeviceSize ubo_off, std::initializer_list<std::pair<u
     vkUpdateDescriptorSets(g_dev->device, n, w, 0, nullptr);
     vkCmdBindDescriptorSets(g_mcmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_mlayout, 0, 1, &ds, 0, nullptr);
 }
-// set 1: a batch's texture and sampler
-void mset1(VkImageView view, VkSampler smp) {
+// set 1: a batch's texture and sampler (cached for this command buffer)
+VkDescriptorSet mset1_get(VkImageView view, VkSampler smp) {
     if (g_mset1_serial != g_ctx->serial) {
         g_mset1_cache.clear();
         g_mset1_serial = g_ctx->serial;
@@ -584,6 +595,10 @@ void mset1(VkImageView view, VkSampler smp) {
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &si, nullptr, nullptr}};
         vkUpdateDescriptorSets(g_dev->device, 2, w, 0, nullptr);
     }
+    return ds;
+}
+void mset1(VkImageView view, VkSampler smp) {
+    VkDescriptorSet ds = mset1_get(view, smp);
     vkCmdBindDescriptorSets(g_mcmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_mlayout, 1, 1, &ds, 0, nullptr);
 }
 // the frame constants into this command buffer's upload memory
@@ -606,24 +621,119 @@ void mfullscreen(MShader ps, VkFormat color, VkImageView view, uint32_t w, uint3
     vkCmdDraw(g_mcmd, 3, 1, 0, 0);
 }
 
-// The batches of the given roles. pass: 0 the scene (lit), 1 shadow casters, 2 GS depth.
-void modern_batches(const modern::Frame &f, ModernBatchCB &bc, int pass, std::initializer_list<uint32_t> roles,
-                    uint32_t &drawn, MPipeKey base) {
+// One frame's batches, resolved once and drawn by every pass (two shadow cascades, the scene,
+// the GS depth): the mesh, constants, pipeline state, texture set and vertex alpha.
+struct MPrep {
+    const MeshGpu *mesh;
+    ModernBatchCB bc;
+    MPipeKey scene;       // pass 0 blend and depth state (shader and attachments filled per pass)
+    float bf[4];          // pass 0 blend constants
+    VkDescriptorSet set1;
+    VkBuffer va_buf;      // per-vertex alpha (null: none, the arena's ones)
+    VkDeviceSize va_off;
+    uint32_t role;
+};
+std::vector<MPrep> g_mprep;
+uint64_t g_mprep_serial;            // command buffer the sets and uploads belong to
+const modern::Frame *g_mprep_frame;
+
+void modern_prepare(const modern::Frame &f) {
+    g_mprep_serial = g_ctx->serial;
+    g_mprep_frame = &f;
+    g_mprep.clear();
+    g_mprep.reserve(f.batches.size());
+    static const uint32_t skip_pc = getenv("EOD_MODERN_SKIP") ? (uint32_t)strtoul(getenv("EOD_MODERN_SKIP"), nullptr, 16) : 0;
+    static const bool no_atest = getenv("EOD_MODERN_NOATEST") != nullptr;
+    static const bool log_keys = getenv("EOD_MODERN_LOGKEYS") != nullptr;
+    for (size_t i = 0; i < f.batches.size(); i++) {
+        const modern::Batch &b = f.batches[i];
+        if (!b.drawn || b.pc == skip_pc) continue;
+        // car passes without the per-vertex alpha (clipped): the damage overlay is left out
+        const bool car = (b.pc == 0x2e0 || b.pc == 0xd48 || b.pc == 0x15a8) && b.valpha.empty();
+        if (car && b.pc == 0x15a8) continue;
+        const bool per_vertex = !b.valpha.empty();
+        auto it = g_mmesh.find(b.mesh);
+        if (it == g_mmesh.end()) continue;
+        const uint32_t key = i < g_mblend_key.size() ? g_mblend_key[i] : ~0u;
+        vkgs::Texture *t = i < g_mtex.size() ? g_mtex[i] : nullptr;
+        if (log_keys) {
+            static std::unordered_map<uint64_t, int> seen;
+            const uint64_t sk = (uint64_t)b.pc << 32 ^ key;
+            if (seen[sk]++ == 0)
+                fprintf(stderr, "[modern] batch pc %x itop %x role %u key %08x abe %u A%u B%u C%u D%u fix %u tfx %u tcc %u tex %d valpha %zu atest %08x\n",
+                        b.pc, b.itop, b.role, key, key & 1, (key >> 1) & 3, (key >> 3) & 3, (key >> 5) & 3, (key >> 7) & 3,
+                        (key >> 9) & 0xFF, (key >> 17) & 3, (key >> 19) & 1, t ? 1 : 0, b.valpha.size(),
+                        i < g_matest.size() ? g_matest[i] : 0);
+        }
+        // The GS never received a draw for this batch (no blend, texture or test state): the
+        // game did not draw it as a normal primitive (the projected car-shadow quad reads the
+        // off-screen shadow buffer). Drawing it with defaults paints a lit grey patch over the
+        // real shadow, so it is left out of every pass.
+        if (key == ~0u && b.role != modern::SKY) continue;
+        MPrep p{};
+        p.mesh = &it->second;
+        p.role = b.role;
+        ModernBatchCB &bc = p.bc;
+        memcpy(bc.m, b.model, 48);
+        memcpy(bc.light, b.light, 16);
+        memcpy(bc.zrow, b.zrow, 16);
+        bc.info[0] = (float)b.role;
+        bc.info[1] = (float)b.layer;
+        bc.info[2] = t ? 1.0f : 0.0f;
+        bc.info[3] = modern_gloss(b);
+        bool raw = false;
+        if (b.role != modern::SKY) {
+            const uint32_t bkey = per_vertex && key != ~0u ? (key | 1u) : key;
+            modern_blend(bkey, raw, p.scene);
+            const float fix = key == ~0u ? 1.0f : (float)((key >> 9) & 0xFF) / 128.0f;
+            p.bf[0] = p.bf[1] = p.bf[2] = fix;
+        } else {
+            p.scene.blend_on = 1, p.scene.src = VK_BLEND_FACTOR_SRC_ALPHA, p.scene.dst = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            p.scene.op = VK_BLEND_OP_ADD;
+        }
+        p.bf[3] = 128.0f / 255.0f;
+        p.scene.depth = b.role == modern::SKY ? 1 : 2;
+        bc.info2[0] = raw ? 1.0f : 0.0f;
+        const uint64_t va = i < g_malpha.size() ? g_malpha[i] : 0;
+        const bool by_as = key != ~0u && (key & 1) && ((key >> 5) & 3) == 0;
+        const int tfx = (int)((key >> 17) & 3);
+        const float av = (va & 0xFFFFFF) ? std::min(2.0f, (float)(va >> 24) / (float)(va & 0xFFFFFF) / 128.0f) : 1.0f;
+        bc.info2[1] = by_as && tfx != 1 ? av : 1.0f;
+        bc.info2[2] = key != ~0u && !((key >> 19) & 1) ? 1.0f : 0.0f;
+        if (key != ~0u && tfx != 1) bc.info2[1] = b.valpha.empty() ? av : 1.0f;
+        bc.info2[3] = key == ~0u ? 0.0f : (float)tfx;
+        const uint32_t wm = key == ~0u ? 0 : (key >> 21) & 15;
+        const int su = (wm & 3) == 1 || (wm & 3) == 2 ? 1 : 0, sv = ((wm >> 2) & 3) == 1 || ((wm >> 2) & 3) == 2 ? 1 : 0;
+        const uint32_t at = i < g_matest.size() ? g_matest[i] : 0;
+        bc.atest[0] = (at & 1) ? (float)((at >> 1) & 7) : -1.0f;
+        bc.atest[1] = (float)((at >> 8) & 0xFF);
+        bc.atest[2] = ((at >> 4) & 3) == 0 ? 1.0f : 0.0f;
+        if (no_atest || car) bc.atest[0] = -1.0f;
+        if (car) bc.info2[1] = 1.0f, bc.info2[2] = 0.0f;
+        if (raw) bc.info[3] = 0;
+        p.set1 = mset1_get(t ? t->view : g_mdummy.view, g_msamplers[su | sv << 1]);
+        if (!b.valpha.empty()) {
+            auto u = g_ctx->upload(b.valpha.data(), b.valpha.size());
+            p.va_buf = u.first->buffer;
+            p.va_off = u.second;
+        }
+        g_mprep.push_back(p);
+    }
+}
+
+// The prepared batches of the given roles. pass: 0 the scene (lit), 1 shadow casters, 2 GS depth.
+void modern_batches(int pass, std::initializer_list<uint32_t> roles, uint32_t &drawn, MPipeKey base) {
+    // descriptor sets and upload memory live with one command buffer: prepare again after a submit
+    if (g_mprep_serial != g_ctx->serial && g_mprep_frame) modern_prepare(*g_mprep_frame);
+    VkDescriptorSet bound_set = VK_NULL_HANDLE;
+    VkBuffer bound_arena = VK_NULL_HANDLE;
+    float bound_bf[4] = {-1, -1, -1, -1};
     for (uint32_t role : roles) {
-        for (size_t i = 0; i < f.batches.size(); i++) {
-            const modern::Batch &b = f.batches[i];
-            if (b.role != role || !b.drawn) continue;
-            static const uint32_t skip_pc = getenv("EOD_MODERN_SKIP") ? (uint32_t)strtoul(getenv("EOD_MODERN_SKIP"), nullptr, 16) : 0;
-            if (b.pc == skip_pc) continue;
-            // car passes without the per-vertex alpha (clipped): the damage overlay is left out
-            const bool car = (b.pc == 0x2e0 || b.pc == 0xd48 || b.pc == 0x15a8) && b.valpha.empty();
-            if (car && b.pc == 0x15a8) continue;
-            const bool per_vertex = !b.valpha.empty();
-            auto it = g_mmesh.find(b.mesh);
-            if (it == g_mmesh.end()) continue;
+        for (const MPrep &p : g_mprep) {
+            if (p.role != role) continue;
+            const MeshGpu &g = *p.mesh;
             if (pass == 1 && g_mcull.on) {
-                const MeshGpu &g = it->second;
-                const float *M = b.model;
+                const float *M = p.bc.m;
                 const float w[3] = {M[0] * g.c[0] + M[1] * g.c[1] + M[2] * g.c[2] + M[3],
                                     M[4] * g.c[0] + M[5] * g.c[1] + M[6] * g.c[2] + M[7],
                                     M[8] * g.c[0] + M[9] * g.c[1] + M[10] * g.c[2] + M[11]};
@@ -634,79 +744,39 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, int pass, std::in
                     std::fabs(dot3(g_mcull.v, w) - g_mcull.cv) > g_mcull.half + r)
                     continue;
             }
-            vkgs::Texture *t = i < g_mtex.size() ? g_mtex[i] : nullptr;
-            memcpy(bc.m, b.model, 48);
-            memcpy(bc.light, b.light, 16);
-            memcpy(bc.zrow, b.zrow, 16);
-            bc.info[0] = (float)b.role;
-            bc.info[1] = (float)b.layer;
-            bc.info[2] = t ? 1.0f : 0.0f;
-            bc.info[3] = modern_gloss(b);
-            const uint32_t key = i < g_mblend_key.size() ? g_mblend_key[i] : ~0u;
-            static const bool log_keys = getenv("EOD_MODERN_LOGKEYS") != nullptr;
-            if (log_keys && pass == 0) {
-                static std::unordered_map<uint64_t, int> seen;
-                const uint64_t sk = (uint64_t)b.pc << 32 ^ key;
-                if (seen[sk]++ == 0)
-                    fprintf(stderr, "[modern] batch pc %x itop %x role %u key %08x abe %u A%u B%u C%u D%u fix %u tfx %u tcc %u tex %d valpha %zu atest %08x\n",
-                            b.pc, b.itop, b.role, key, key & 1, (key >> 1) & 3, (key >> 3) & 3, (key >> 5) & 3, (key >> 7) & 3,
-                            (key >> 9) & 0xFF, (key >> 17) & 3, (key >> 19) & 1, t ? 1 : 0, b.valpha.size(),
-                            i < g_matest.size() ? g_matest[i] : 0);
-            }
-            // The GS never received a draw for this batch (no blend, texture or test state): the
-            // game did not draw it as a normal primitive (the projected car-shadow quad reads the
-            // off-screen shadow buffer). Drawing it with defaults paints a lit grey patch over the
-            // real shadow, so it is left out of every pass.
-            if (key == ~0u && role != modern::SKY) continue;
-            bool raw = false;
             MPipeKey k = base;
             if (pass == 0) {
-                k.depth = role == modern::SKY ? 1 : 2;
-                if (role != modern::SKY) {
-                    const uint32_t bkey = per_vertex && key != ~0u ? (key | 1u) : key;
-                    modern_blend(bkey, raw, k);
-                    const float fix = key == ~0u ? 1.0f : (float)((key >> 9) & 0xFF) / 128.0f;
-                    const float bf[4] = {fix, fix, fix, 128.0f / 255.0f};
-                    mblend_constants(bf);
-                } else {
-                    k.blend_on = 1, k.src = VK_BLEND_FACTOR_SRC_ALPHA, k.dst = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, k.op = VK_BLEND_OP_ADD;
-                    const float bf[4] = {0, 0, 0, 128.0f / 255.0f};
-                    mblend_constants(bf);
+                k.depth = p.scene.depth;
+                k.blend_on = p.scene.blend_on, k.src = p.scene.src, k.dst = p.scene.dst, k.op = p.scene.op;
+                if (memcmp(bound_bf, p.bf, sizeof bound_bf)) {
+                    mblend_constants(p.bf);
+                    memcpy(bound_bf, p.bf, sizeof bound_bf);
                 }
             }
-            bc.info2[0] = raw ? 1.0f : 0.0f;
-            const uint64_t va = i < g_malpha.size() ? g_malpha[i] : 0;
-            const bool by_as = key != ~0u && (key & 1) && ((key >> 5) & 3) == 0;
-            const int tfx = (int)((key >> 17) & 3);
-            const float av = (va & 0xFFFFFF) ? std::min(2.0f, (float)(va >> 24) / (float)(va & 0xFFFFFF) / 128.0f) : 1.0f;
-            bc.info2[1] = by_as && tfx != 1 ? av : 1.0f;
-            bc.info2[2] = key != ~0u && !((key >> 19) & 1) ? 1.0f : 0.0f;
-            if (key != ~0u && tfx != 1) bc.info2[1] = b.valpha.empty() ? av : 1.0f;
-            bc.info2[3] = key == ~0u ? 0.0f : (float)tfx;
-            const uint32_t wm = key == ~0u ? 0 : (key >> 21) & 15;
-            const int su = (wm & 3) == 1 || (wm & 3) == 2 ? 1 : 0, sv = ((wm >> 2) & 3) == 1 || ((wm >> 2) & 3) == 2 ? 1 : 0;
-            const uint32_t at = i < g_matest.size() ? g_matest[i] : 0;
-            bc.atest[0] = (at & 1) ? (float)((at >> 1) & 7) : -1.0f;
-            bc.atest[1] = (float)((at >> 8) & 0xFF);
-            bc.atest[2] = ((at >> 4) & 3) == 0 ? 1.0f : 0.0f;
-            static const bool no_atest = getenv("EOD_MODERN_NOATEST") != nullptr;
-            if (no_atest || car) bc.atest[0] = -1.0f;
-            if (car) bc.info2[1] = 1.0f, bc.info2[2] = 0.0f;
-            if (raw) bc.info[3] = 0;
             mbind(k);
-            vkCmdPushConstants(g_mcmd, g_mlayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bc, &bc);
-            mset1(t ? t->view : g_mdummy.view, g_msamplers[su | sv << 1]);
-            VkBuffer vbs[2] = {it->second.buf, g_mones.buffer};
-            VkDeviceSize offs[2] = {it->second.vb, 0};
-            const uint32_t nv = (uint32_t)b.valpha.size();
-            if (nv) {
-                auto u = g_ctx->upload(b.valpha.data(), nv);
-                vbs[1] = u.first->buffer;
-                offs[1] = u.second;
+            vkCmdPushConstants(g_mcmd, g_mlayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p.bc, &p.bc);
+            if (p.set1 != bound_set) {
+                vkCmdBindDescriptorSets(g_mcmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_mlayout, 1, 1, &p.set1, 0, nullptr);
+                bound_set = p.set1;
             }
-            vkCmdBindVertexBuffers(g_mcmd, 0, 2, vbs, offs);
-            vkCmdBindIndexBuffer(g_mcmd, it->second.buf, it->second.ib, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(g_mcmd, it->second.count, 1, 0, 0, 0);
+            const uint32_t first_index = (uint32_t)(g.ib / 4);
+            if (p.va_buf) {  // its own vertex alpha: the mesh's vertices from 0
+                VkBuffer vbs[2] = {g.buf, p.va_buf};
+                VkDeviceSize offs[2] = {g.vb, p.va_off};
+                vkCmdBindVertexBuffers(g_mcmd, 0, 2, vbs, offs);
+                bound_arena = VK_NULL_HANDLE;
+                vkCmdBindIndexBuffer(g_mcmd, g.buf, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(g_mcmd, g.count, 1, first_index, 0, 0);
+            } else {
+                if (g.buf != bound_arena) {
+                    VkBuffer vbs[2] = {g.buf, g_mones.buffer};
+                    VkDeviceSize offs[2] = {0, 0};
+                    vkCmdBindVertexBuffers(g_mcmd, 0, 2, vbs, offs);
+                    vkCmdBindIndexBuffer(g_mcmd, g.buf, 0, VK_INDEX_TYPE_UINT32);
+                    bound_arena = g.buf;
+                }
+                vkCmdDrawIndexed(g_mcmd, g.count, 1, first_index, (int32_t)(g.vb / sizeof(modern::Vertex)), 0);
+            }
             drawn++;
         }
     }
@@ -925,8 +995,11 @@ void modern_draw(modern::Frame *frame) {
         fprintf(stderr, "[modern] camera (%.1f %.1f %.1f) up (%.2f %.2f %.2f) sun (%.2f %.2f %.2f) object median %.1f ambient %.3f fog %.2f %.2f %.2f\n",
                 cam[0], cam[1], cam[2], up[0], up[1], up[2], L[0], L[1], L[2], med, fc.sun[3], fc.fog[0], fc.fog[1], fc.fog[2]);
     }
-    ModernBatchCB bc = {};
     uint32_t drawn = 0;
+    {
+        EOD_ZONE("modern.prepare");
+        modern_prepare(*f);
+    }
 
     // sun shadow cascades: the atlas' left half (near) and right half (far)
     if (fc.set[0] > 0) {
@@ -953,7 +1026,7 @@ void modern_draw(modern::Frame *frame) {
             memcpy(g_mcull.u, u, 12);
             memcpy(g_mcull.v, v, 12);
             g_mcull.cu = ccu[c], g_mcull.cv = ccv[c], g_mcull.half = chalf[c];
-            modern_batches(*f, bc, 1, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn, k);
+            modern_batches(1, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn, k);
             g_mcull.on = false;
         }
     }
@@ -982,7 +1055,7 @@ void modern_draw(modern::Frame *frame) {
         k.ps = PS_MODERN;
         mset0(ubo.first, ubo.second, {});
         // sky first (no depth), then the world in draw order (layers), then objects
-        modern_batches(*f, bc, 0, {(uint32_t)modern::SKY, (uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn, k);
+        modern_batches(0, {(uint32_t)modern::SKY, (uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn, k);
     }
     mbarrier();
     }
@@ -1000,11 +1073,14 @@ void modern_draw(modern::Frame *frame) {
     }
     static const bool no_post = getenv("EOD_MODERN_NOPOST") != nullptr;
     MImage *out = &g_mresolve;
-    if (!no_post && g_msamples != VK_SAMPLE_COUNT_1_BIT) {
+    if (!no_post) {
         const uint32_t hw = g_mao.w, hh = g_mao.h;
         EOD_GPU_ZONE(g_ctx, "modern post (AO, bloom, grade)");
         vkgs::GpuZone gz(g_ctx, vkgs::Context::GPU_M_POST);
-        mfullscreen(PS_AO, VK_FORMAT_R8_UNORM, g_mao.view, hw, hh, ubo, {{MB_DEPTHMS, g_mdepth.view}});
+        if (g_msamples != VK_SAMPLE_COUNT_1_BIT)
+            mfullscreen(PS_AO, VK_FORMAT_R8_UNORM, g_mao.view, hw, hh, ubo, {{MB_DEPTHMS, g_mdepth.view}});
+        else
+            mfullscreen(PS_AO1, VK_FORMAT_R8_UNORM, g_mao.view, hw, hh, ubo, {{MB_DEPTH1, g_mdepth.view}});
         mfullscreen(PS_BRIGHT, VK_FORMAT_R8G8B8A8_UNORM, g_mb1.view, hw, hh, ubo, {{MB_SRC, g_mresolve.view}});
         fc.post2[2] = 2.0f / W;
         fc.post2[3] = 0;
@@ -1052,7 +1128,7 @@ void modern_draw(modern::Frame *frame) {
             mviewport(0, 0, (float)zw, (float)zh);
             mset0(zubo.first, zubo.second, {});
             uint32_t dz = 0;
-            modern_batches(*f, bc, 2, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, dz, k);
+            modern_batches(2, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, dz, k);
         }
     }
     mbarrier();

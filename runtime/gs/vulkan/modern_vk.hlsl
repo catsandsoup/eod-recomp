@@ -51,6 +51,7 @@ B0(3) Texture2DMS<float> scene_depth;
 B0(4) Texture2D<float4> post_src;
 B0(5) Texture2D<float> ao_tex;
 B0(6) Texture2D<float4> bloom_tex;
+B0(7) Texture2D<float> scene_depth1;
 B0(20) SamplerComparisonState shadow_smp;
 B0(21) SamplerState lin_clamp;
 
@@ -130,26 +131,14 @@ float view_w(int2 p) {
     float d = scene_depth.Load(p, 0);
     return d > 0 ? params.x / d : 1e9;
 }
-float ps_ao(float4 pos : SV_Position) : SV_Target {  // half resolution
-    int2 p = int2(pos.xy * 2);
-    float w = view_w(p);
-    if (w > 1e8) return 1;
-    float gx = (view_w(p + int2(2, 0)) - view_w(p - int2(2, 0))) * 0.25;
-    float gy = (view_w(p + int2(0, 2)) - view_w(p - int2(0, 2))) * 0.25;
-    if (abs(gx) > w || abs(gy) > w) gx = gy = 0;  // a depth edge: no plane
-    float r = clamp(post.y * post.x / w, 3, 80);
-    int2 cell = int2(pos.xy) & 3;
-    float a0 = (cell.x * 4 + cell.y) * (6.2832 / 16);
-    float occ = 0;
-    [unroll] for (int k = 0; k < 12; k++) {
-        float a = a0 + k * 2.3999, rr = r * (k + 0.5) / 12;
-        float2 o = float2(cos(a), sin(a)) * rr;
-        float pred = w + gx * o.x + gy * o.y;
-        float dz = pred - view_w(p + int2(o));
-        occ += dz > post.y * 0.08 && dz < post.y * 3 ? 1 - dz / (post.y * 3) : 0;
-    }
-    return saturate(1 - occ / 12 * 1.2);
+// single-sample scene depth (render scales that already supersample run without MSAA)
+float view_w1(int2 p) {
+    float d = scene_depth1.Load(int3(p, 0));
+    return d > 0 ? params.x / d : 1e9;
 }
+#define AO_BODY(VW)                                                                             int2 p = int2(pos.xy * 2);                                                                  float w = VW(p);                                                                            if (w > 1e8) return 1;                                                                      float gx = (VW(p + int2(2, 0)) - VW(p - int2(2, 0))) * 0.25;                                float gy = (VW(p + int2(0, 2)) - VW(p - int2(0, 2))) * 0.25;                                if (abs(gx) > w || abs(gy) > w) gx = gy = 0;                                                float r = clamp(post.y * post.x / w, 3, 80);                                                int2 cell = int2(pos.xy) & 3;                                                               float a0 = (cell.x * 4 + cell.y) * (6.2832 / 16);                                           float occ = 0;                                                                              [unroll] for (int k = 0; k < 12; k++) {                                                         float a = a0 + k * 2.3999, rr = r * (k + 0.5) / 12;                                         float2 o = float2(cos(a), sin(a)) * rr;                                                     float pred = w + gx * o.x + gy * o.y;                                                       float dz = pred - VW(p + int2(o));                                                          occ += dz > post.y * 0.08 && dz < post.y * 3 ? 1 - dz / (post.y * 3) : 0;               }                                                                                           return saturate(1 - occ / 12 * 1.2);
+float ps_ao(float4 pos : SV_Position) : SV_Target { AO_BODY(view_w) }   // half resolution
+float ps_ao1(float4 pos : SV_Position) : SV_Target { AO_BODY(view_w1) }
 float4 ps_bright(float4 pos : SV_Position) : SV_Target {  // half resolution
     float3 c = post_src.Sample(lin_clamp, pos.xy * post2.xy * 2).rgb;
     float l = max(c.r, max(c.g, c.b));

@@ -238,6 +238,7 @@ void xfer_small(Transfer &t, const uint8_t *p, uint32_t n) {
 }
 
 void xfer_data(const uint8_t *p, uint32_t n) {
+    EOD_ZONE("gs.xfer_data");
     Transfer &t = g_xfer;
     if (!t.active) return;
     // Source bytes are available now, unlike TRXREG's promised transfer size.
