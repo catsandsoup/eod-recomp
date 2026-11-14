@@ -19,6 +19,9 @@ cbuffer Frame : register(b0) {
     float4 fog;                     // fog colour (gamma)
     float4 sun;                     // world direction to the sun, w ambient
     float4 gsz;                     // x 1 / 2^bits of the GS depth format
+    float4 c0_x, c0_y, c0_z;        // cascade 0 (near, sharp) world -> shadow rows
+    float4 c1_x, c1_y, c1_z;        // cascade 1 (far)
+    float4 cs;                      // x, y world size of a texel in cascade 0 / 1
 };
 cbuffer Batch : register(b1) {
     float4 m0, m1, m2;   // model rows
@@ -103,16 +106,24 @@ float4 ps_full(float4 pos : SV_Position) : SV_Target {
     return float4(gs_frame.Load(int3(pos.xy, 0)).rgb, 128.0 / 255.0);
 }
 float3 aces(float3 x) { return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)); }
-float shadow_at(float3 wp, float3 n) {
-    float4 w = float4(wp + n * 0.02, 1);
-    float3 s = float3(dot(sh_x, w), dot(sh_y, w), dot(sh_z, w));
-    float2 uv = float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
-    if (any(uv < 0) || any(uv > 1) || s.z > 1) return 1;
+float shadow_cascade(float3 s, float off) {
+    float2 uv = float2((s.x * 0.5 + 0.5) * 0.5 + off, 0.5 - s.y * 0.5);
     float sum = 0;
-    [unroll] for (int y = -1; y <= 1; y++)
-        [unroll] for (int x = -1; x <= 1; x++)
-            sum += shadow_map.SampleCmpLevelZero(shadow_smp, uv + float2(x, y) * params.y, s.z - 0.0015);
-    return sum / 9;
+    [unroll] for (int y = -2; y <= 2; y++)
+        [unroll] for (int x = -2; x <= 2; x++)
+            sum += shadow_map.SampleCmpLevelZero(shadow_smp, uv + float2(x * 0.5, y) * params.y, s.z);
+    return sum / 25;
+}
+float shadow_at(float3 wp, float3 n) {
+    // normal offset by a texel and a half of the cascade used: no acne, no floating shadows
+    float4 w0 = float4(wp + n * cs.x * 1.5, 1);
+    float3 s0 = float3(dot(c0_x, w0), dot(c0_y, w0), dot(c0_z, w0));
+    if (all(abs(s0.xy) < 0.92) && s0.z < 1) return shadow_cascade(s0, 0);
+    float4 w1 = float4(wp + n * cs.y * 1.5, 1);
+    float3 s1 = float3(dot(c1_x, w1), dot(c1_y, w1), dot(c1_z, w1));
+    if (any(abs(s1.xy) > 1) || s1.z > 1) return 1;
+    float k = saturate(1 - max(abs(s1.x), abs(s1.y)) * 1.1 + 0.1) * 4;  // fade out at the far edge
+    return lerp(1, shadow_cascade(s1, 0.5), saturate(k));
 }
 float3 sky_env(float3 r) {
     float h = saturate(dot(r, up.xyz));
@@ -198,13 +209,14 @@ ID3D11Texture2D *g_mcolor, *g_mdepth, *g_mresolve, *g_mshadow;
 ID3D11RenderTargetView *g_mrtv;
 ID3D11DepthStencilView *g_mdsv, *g_mshadow_dsv;
 ID3D11ShaderResourceView *g_mshadow_srv;
-constexpr int kShadowSize = 2048;
+constexpr int kShadowSize = 4096;  // atlas width: two 2048x2048 cascades side by side
 int g_mw, g_mh;
 UINT g_msamples = 4;
 bool g_mready, g_mfailed;
 
 struct ModernFrameCB {
     float clip_x[4], clip_y[4], clip_w[4], params[4], cam_pos[4], up[4], sh_x[4], sh_y[4], sh_z[4], fog[4], sun[4], gsz[4];
+    float c0_x[4], c0_y[4], c0_z[4], c1_x[4], c1_y[4], c1_z[4], cs[4];
 };
 struct ModernBatchCB {
     float m[12], light[4], info[4], info2[4], atest[4], zrow[4];
@@ -388,12 +400,13 @@ bool modern_init() {
     CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs));
     rd.MultisampleEnable = FALSE;
     CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs_gsdepth));
-    rd.DepthBias = 200;
-    rd.SlopeScaledDepthBias = 2.0f;
+    rd.DepthBias = 100;
+    rd.SlopeScaledDepthBias = 1.5f;
     rd.DepthBiasClamp = 0.01f;
     CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs_shadow));
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = td.Height = kShadowSize;
+    td.Width = kShadowSize;
+    td.Height = kShadowSize / 2;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -730,24 +743,42 @@ void modern_draw(modern::Frame *frame) {
     static const float k_shadow = getenv("EOD_MODERN_SHADOW") ? (float)atof(getenv("EOD_MODERN_SHADOW")) : 1.2f;
     static const float k_haze = getenv("EOD_MODERN_HAZE") ? (float)atof(getenv("EOD_MODERN_HAZE")) : 40.0f;
     static const float k_exposure = getenv("EOD_MODERN_EXPOSURE") ? (float)atof(getenv("EOD_MODERN_EXPOSURE")) : 1.0f;
-    const float half = med * k_shadow;
-    const float ctr[3] = {cam[0] + fwd[0] * half * 0.7f, cam[1] + fwd[1] * half * 0.7f, cam[2] + fwd[2] * half * 0.7f};
+    // scene scale for the shadow cascades: smoothed over many frames, so the cascades keep their
+    // size (a size that changes each frame makes shadows swim and change softness)
+    static float s_scale = 0;
+    s_scale = s_scale == 0 ? med : s_scale + (med - s_scale) * 0.002f;
     float u[3], v[3];
     float ref[3] = {0, 0, 1};
     if (std::fabs(dot3(ref, L)) > 0.9f) ref[0] = 1, ref[2] = 0;
     cross3(L, ref, u);
     norm3(u);
     cross3(L, u, v);
-    for (int i = 0; i < 3; i++) {
-        fc.sh_x[i] = u[i] / half;
-        fc.sh_y[i] = v[i] / half;
-        fc.sh_z[i] = -L[i] / (4 * half);
+    float casc[2][3][4];
+    for (int c = 0; c < 2; c++) {
+        const float half = s_scale * k_shadow * (c == 0 ? 0.35f : 2.0f);
+        float ctr[3] = {cam[0] + fwd[0] * half * 0.6f, cam[1] + fwd[1] * half * 0.6f, cam[2] + fwd[2] * half * 0.6f};
+        // snap the centre to whole texels in the light's plane: edges stay put while the camera moves
+        const float texel = 2 * half / (kShadowSize / 2);
+        float cu = std::floor(dot3(u, ctr) / texel) * texel, cv = std::floor(dot3(v, ctr) / texel) * texel;
+        const float cl = dot3(L, ctr);
+        for (int i = 0; i < 3; i++) {
+            casc[c][0][i] = u[i] / half;
+            casc[c][1][i] = v[i] / half;
+            casc[c][2][i] = -L[i] / (6 * half);
+        }
+        casc[c][0][3] = -cu / half;
+        casc[c][1][3] = -cv / half;
+        casc[c][2][3] = 0.5f + cl / (6 * half);
+        fc.cs[c] = texel;
     }
-    fc.sh_x[3] = -dot3(u, ctr) / half;
-    fc.sh_y[3] = -dot3(v, ctr) / half;
-    fc.sh_z[3] = 0.5f + dot3(L, ctr) / (4 * half);
+    memcpy(fc.c0_x, casc[0][0], 16);
+    memcpy(fc.c0_y, casc[0][1], 16);
+    memcpy(fc.c0_z, casc[0][2], 16);
+    memcpy(fc.c1_x, casc[1][0], 16);
+    memcpy(fc.c1_y, casc[1][1], 16);
+    memcpy(fc.c1_z, casc[1][2], 16);
     fc.params[0] = 0.05f;  // near
-    fc.params[1] = 1.0f / kShadowSize;
+    fc.params[1] = 1.0f / (kShadowSize / 2);  // one texel of a cascade (the atlas is 2:1)
     fc.params[2] = med * k_haze;
     fc.params[3] = k_exposure;
     memcpy(fc.cam_pos, cam, 12);
@@ -784,16 +815,26 @@ void modern_draw(modern::Frame *frame) {
     ModernBatchCB bc = {};
     uint32_t drawn = 0;
 
-    // sun shadow map
+    // sun shadow cascades: the atlas' left half (near) and right half (far)
     g_ctx->OMSetRenderTargets(0, nullptr, g_mshadow_dsv);
     g_ctx->ClearDepthStencilView(g_mshadow_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
-    set_viewport(kShadowSize, kShadowSize);
     g_ctx->RSSetState(g_mrs_shadow);
     g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     g_ctx->OMSetDepthStencilState(g_mds_shadow, 0);
     g_ctx->VSSetShader(g_mvs_shadow, nullptr, 0);
     g_ctx->PSSetShader(g_mps_shadow, nullptr, 0);
-    modern_batches(*f, bc, true, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn);
+    for (int c = 0; c < 2; c++) {
+        memcpy(fc.sh_x, casc[c][0], 16);
+        memcpy(fc.sh_y, casc[c][1], 16);
+        memcpy(fc.sh_z, casc[c][2], 16);
+        if (SUCCEEDED(CHECK(g_ctx->Map(g_mcb_frame, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp)))) {
+            memcpy(mp.pData, &fc, sizeof fc);
+            g_ctx->Unmap(g_mcb_frame, 0);
+        }
+        D3D11_VIEWPORT vp = {(float)(c * kShadowSize / 2), 0, (float)(kShadowSize / 2), (float)(kShadowSize / 2), 0, 1};
+        g_ctx->RSSetViewports(1, &vp);
+        modern_batches(*f, bc, true, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn);
+    }
 
     // the scene, over the GS frame so far (the game's sky)
     g_ctx->OMSetRenderTargets(1, &g_mrtv, g_mdsv);
