@@ -232,3 +232,31 @@ renderer subsystem. An explicit `EOD_MOD_DIR` selects one read-only overlay;
 without it staged mods are inactive. The selected overlay merges before sector
 assignment, so replacement sizes and newly named cars are reflected consistently
 in FILEIO and streaming reads. Disposable-file tests cover both paths.
+
+## Scene capture for a modern renderer: reuse check — 2026-11-13
+
+Question: does an existing recomp already take the 3D scene (world-space geometry, matrices,
+per-draw identity) from the game for a modern renderer, instead of consuming rasterizer
+input? Findings feed `docs/SCENE_CAPTURE.md`.
+
+- [RT64](https://github.com/rt64/rt64) (`main`, no pinned commit visible): the N64 renderer
+  used by N64 recomps. RSP vertex work runs in a compute shader and draw calls are matched
+  between frames by parameters, textures and tracked motion. Its
+  [extended GBI](https://raw.githubusercontent.com/rt64/rt64/main/include/rt64_extended_gbi.h)
+  lets a port tag transforms at the source: `gEXMatrixGroup*` (group `id` plus per-component
+  interpolation), `gEXSetViewMatrixFloat` / `gEXSetProjMatrixFloat`, `gEXPushProjectionMatrix`.
+  Reused idea: identify transforms where the game issues them. The equivalent EOD source is
+  the VU1 entry (registers vf4-vf7 and the batch at TOP), not the GS. No code applies: the N64
+  display-list format has no counterpart here.
+- [RoadTripAdventure-recomp](https://github.com/silentsudin/RoadTripAdventure-recomp)
+  (`main`; earlier pin `0f6d3613e8e32ccda5305227a578b1fb659983a8`) with
+  [PS2Recomp](https://github.com/silentsudin/PS2Recomp) (`818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4`):
+  renders from GS/GIF packets (hardware GS or paraLLEl-GS). Its high-refresh frame generation
+  moves recorded PATH1 vertices forward with motion from per-object VU1 matrices
+  (`MotionTracker::packetReproject`, read from the project's CLAUDE.md summary, source not
+  inspected). `RT_VU1_CAPTURE` records VU1 runs only to compare recompiled VU1 with the
+  interpreter. Reused idea: pair per-object VU1 matrices with the PATH1 packets they produce.
+  No world-space capture or replacement renderer exists there to adopt.
+
+Decision: build EOD's capture at its own `vu_execute`/`xgkick` boundary (spike in
+`runtime/vu/scene_capture.cpp`); no third-party code copied.

@@ -13,6 +13,7 @@
 
 #include "gs_env.h"
 #include "gs_state.h"
+#include "modern_scene.h"
 
 namespace gs {
 namespace hw {
@@ -34,7 +35,7 @@ void draw_point(const Env &e, const Vertex &a);
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 // All prepared CPU bytes are now supplied; upload proven complete storage
 // blocks into retained GPU owners without reading their untouched pixels back.
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(EOD_VULKAN)
 inline void vram_write_complete() {}  // Direct3D 11 keeps its synchronous uploads
 #else
 void vram_write_complete();
@@ -50,7 +51,7 @@ void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, in
 // clut_snapshot_page() returns an 8 KB page image (waiting on first use) with
 // exactly the bytes a synchronous readback would have left in gs::vram then.
 struct ClutSnapshot;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(EOD_VULKAN)
 inline ClutSnapshot *clut_snapshot(uint32_t, uint32_t, uint32_t, int, int, int, int) { return nullptr; }
 inline const uint8_t *clut_snapshot_page(ClutSnapshot *, uint32_t) { return nullptr; }
 inline void clut_snapshot_free(ClutSnapshot *) {}
@@ -75,6 +76,21 @@ void vblank();
 void reset();
 // Submits everything and waits for the GPU (replay timing).
 void finish();
+// EOD_MODERN (modern_scene.h): the texture and blend state of a replaced batch, and the
+// modern pass of a frame into the current frame buffer (takes ownership).
+#if defined(_WIN32) || defined(EOD_VULKAN)
+void modern_texture(int32_t batch, const Env &e);
+void modern_draw(modern::Frame *f);
+void modern_alpha(int32_t batch, uint32_t alpha);
+#else
+inline void modern_alpha(int32_t, uint32_t) {}
+inline void modern_texture(int32_t, const Env &) {}
+inline void modern_draw(modern::Frame *f) { delete f; }
+#endif
+#ifdef EOD_HW_SELECT
+// Windows: the Vulkan backend (not Direct3D 11) is the one running
+bool vulkan_active();
+#endif
 // Statistics line for the log (draw calls, uploads, conversions per frame).
 void stats_line(char *buf, size_t size);
 

@@ -24,6 +24,7 @@
 #include "../../ui/overlay.h"
 #include "../platform.h"
 #include "../pad_script.h"
+#include "../../gs/modern_scene.h"
 
 void build_key_map();
 
@@ -154,6 +155,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_F11) toggle_fullscreen();
+        if (wp == VK_F9 && !(lp & (1 << 30))) modern::toggle();  // renderer: modern <-> original
         g_keys[wp & 255] = true;
         return 0;
     case WM_KEYUP:
@@ -467,6 +469,13 @@ void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
 }
 
 void *platform_native_window() { return g_hwnd; }
+void *platform_native_instance() { return GetModuleHandleW(nullptr); }
+void platform_window_pixels(int *w, int *h) {
+    RECT rc{};
+    if (g_hwnd) GetClientRect(g_hwnd, &rc);
+    *w = rc.right - rc.left;
+    *h = rc.bottom - rc.top;
+}
 
 void platform_set_fullscreen(bool on) {
     if (g_hwnd && on != g_fullscreen) toggle_fullscreen();
@@ -519,6 +528,8 @@ void platform_audio_feedback(bool enabled) {
 // ------------------------------------------------------------------ audio
 bool platform_audio_open(int sample_rate) {
     InitializeCriticalSection(&g_audio_cs);
+    const char *m = getenv("EOD_MUTE");  // as platform_sdl3.cpp: no audio device
+    if (m && m[0] == '1') return false;
     WAVEFORMATEX wf = {};
     wf.wFormatTag = WAVE_FORMAT_PCM;
     wf.nChannels = 2;

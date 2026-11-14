@@ -1,5 +1,6 @@
 // offload.cpp - the VIF1/VU1, GIF DMA and GS command stream on a worker thread
 // (see offload.h).
+#include "core/trace.h"
 #include "offload.h"
 
 #include <condition_variable>
@@ -29,6 +30,7 @@ bool g_running;  // the worker is executing jobs taken from the queue (guarded b
 
 void worker() {
     platform_thread_fast();
+    EOD_THREAD_NAME("VU1 producer");
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-vu1");
 #endif

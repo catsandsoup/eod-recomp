@@ -33,6 +33,7 @@
 #include "hle_career.h"
 #include "iop/iop.h"
 #include "platform/platform.h"
+#include "gs/modern_scene.h"
 
 // The Career unlocks (hle_career.cpp); standalone unit tests that do not link it get this no-op.
 __attribute__((weak)) void career_vblank(uint16_t) {}
@@ -621,6 +622,10 @@ void game_patches_vblank() {
             platform_haptic_pulse(0, 150, 1, 180);
             platform_audio_feedback(g_config.cheat_chickens);
             LOG(LOG_CORE, "[MOD COMBO L1+R1+SELECT] Chicken Fight: %s", g_config.cheat_chickens ? "ON" : "OFF");
+        }
+        if ((pressed & PAD_R3) && modern::g_on) {  // renderer: modern <-> original (F9 on the keyboard)
+            modern::toggle();
+            platform_show_hud_banner(modern::live() ? "RENDERER: MODERN" : "RENDERER: ORIGINAL");
         }
         if (pressed & PAD_SQUARE) {
             g_config.cheat_invincible = !g_config.cheat_invincible;

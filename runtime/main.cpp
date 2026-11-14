@@ -6,6 +6,7 @@
 // DIR is the root of the game disc (the directory that contains
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
+#include "core/trace.h"
 #include "core/host_file.h"
 #include <csignal>
 #ifdef _WIN32
@@ -473,6 +474,7 @@ int main(int argc, char **argv) {
 
     if (!platform_init(cfg)) fatal("platform initialisation failed");
     platform_thread_fast();  // the EE runs on this thread
+    EOD_THREAD_NAME("EE");
     mem_init();
     cpu_init();
     hw_init();

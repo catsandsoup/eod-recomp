@@ -1,4 +1,8 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
+#include "core/trace.h"
+#include "../vu/scene_capture.h"
+#include "../vu/scene_emit.h"
+#include "modern_scene.h"
 #include "gs.h"
 #include "gs_hw.h"
 
@@ -70,7 +74,9 @@ uint32_t gif_reg_ctrl, gif_reg_mode;
 // Host->local transfers: on Windows (Direct3D 11) the declared TRXREG extent is
 // reported when the transfer starts, as upstream does; the other backends
 // report each supplied chunk from xfer_data (docs/GS_CPU_WRITE_PRESERVATION.md).
-#ifdef _WIN32
+#if defined(_WIN32) && defined(EOD_HW_SELECT)
+#define kChunkedHostWrites (hw::vulkan_active())  // the backend chosen at start
+#elif defined(_WIN32)
 constexpr bool kChunkedHostWrites = false;
 #else
 constexpr bool kChunkedHostWrites = true;
@@ -232,6 +238,7 @@ void xfer_small(Transfer &t, const uint8_t *p, uint32_t n) {
 }
 
 void xfer_data(const uint8_t *p, uint32_t n) {
+    EOD_ZONE("gs.xfer_data");
     Transfer &t = g_xfer;
     if (!t.active) return;
     // Source bytes are available now, unlike TRXREG's promised transfer size.
@@ -634,6 +641,9 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
 }
 
 void gif_process(int path, const uint8_t *data, uint32_t qwc) {
+    if (scene_capture::g_on) scene_capture::gs_packet(path);
+    if (scene_emit::g_on) scene_emit::gs_packet(path);
+    if (modern::g_on) modern::gs_packet(path);
     PathState &ps = g_path[path];
     for (uint32_t i = 0; i < qwc; i++) {
         const uint8_t *q = data + i * 16;
@@ -843,7 +853,7 @@ namespace { void editor_preview_capture(uint64_t frame, bool offscreen, bool sof
 // it when it reads state the worker produces.
 namespace {
 
-enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME };
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN };
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -905,8 +915,20 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 
 }  // namespace
 
+// EOD_MODERN commands from the producer, in GS order (modern_scene.h).
+void modern::post_batch(int32_t index) {
+    if (!g_threaded) return gs_batch(index);
+    push_cmd(CMD_MODERN, 0, (uint32_t)index, nullptr, 0);
+}
+void modern::post_draw(Frame *f) {
+    if (!g_threaded) return gs_draw(f);
+    push_cmd(CMD_MODERN, 1, 0, &f, sizeof f);
+}
+
 // Publishes the display and does the per-frame bookkeeping (GS side).
 void gs_frame_end(uint64_t frame, int aspect) {
+    if (scene_capture::g_on) scene_capture::gs_vblank(frame);
+    if (scene_emit::g_on) scene_emit::gs_vblank(frame, st.fogcol);
     presentation::set(aspect);
     if (hw::g_on) {
         bool changed = display_changed();
@@ -1099,12 +1121,12 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
         // Presentation-only markers are not part of the portable GS capture format.
-        if (live && h[0] != CMD_EDITOR_RACE_FRAME && g_cold_zip) {
+        if (live && h[0] != CMD_EDITOR_RACE_FRAME && h[0] != CMD_MODERN && g_cold_zip) {
             if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
             else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
                 close_cold_zip("stopped at compressed limit or write error");
         }
-        if (live && g_dump) {
+        if (live && g_dump && h[0] != CMD_MODERN) {
             // Never let a diagnostic boot trace grow without a bound. Close at
             // a command boundary so even a size-limited trace stays parseable.
             if (g_cold_dump && g_cold_dump_bytes + len > 256ull * 1024 * 1024) {
@@ -1123,7 +1145,17 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     (unsigned long long)g_gs_vblanks.load(), (unsigned long long)g_flips.load(),
                     (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
             break;
-        case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
+        case CMD_GIF: { EOD_ZONE("gs.gif_process"); gif_process((int)h[1], d, h[3] / 16); } break;
+        case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer
+            if (!live) break;
+            if (h[1] == 0) {
+                modern::gs_batch((int32_t)h[2]);
+            } else {
+                modern::Frame *f;
+                memcpy(&f, d, sizeof f);
+                modern::gs_draw(f);
+            }
+            break;
         case CMD_PRIV: {
             uint64_t v;
             memcpy(&v, d, 8);
@@ -1132,7 +1164,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         }
         case CMD_VBLANK:
             g_gs_vblanks = h[1];
-            gs_frame_end(h[1], presentation::from_tag(h[2]));
+            { EOD_ZONE("gs.frame_end"); gs_frame_end(h[1], presentation::from_tag(h[2])); }
+            EOD_FRAME_MARK_NAMED("GS vblank");
             frames = h[1];
             if (live) {
                 if (g_cold_zip && h[1] >= g_dump_end) close_cold_zip("written");
@@ -1381,6 +1414,7 @@ static void gs_worker() {
     pthread_setname_np(pthread_self(), "eod-gs");
 #endif
     hw::bind_thread();
+    EOD_THREAD_NAME("GS");
     prof_thread_begin(P_GS_CMDS);
     for (;;) {
         Chunk c;
@@ -1393,7 +1427,11 @@ static void gs_worker() {
             g_q.pop_front();
         }
         uint64_t t_start = platform_time_us();
-        uint64_t frames = run_cmds(c.data(), c.size(), true);
+        uint64_t frames;
+        {
+            EOD_ZONE("gs.chunk");
+            frames = run_cmds(c.data(), c.size(), true);
+        }
         g_gs_busy_us += platform_time_us() - t_start;
         {
             std::lock_guard<std::mutex> lk(g_q_mtx);
@@ -1468,6 +1506,8 @@ void gs_init() {
 
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc) {
     ProfScope prof(P_EE_GIF);
+    if (scene_capture::g_on) scene_capture::gif(path, data, qwc);
+    if (scene_emit::g_on) scene_emit::gif(path, data, qwc);
     if (!g_threaded) {
         gif_process(path, data, qwc);
         return;
@@ -1808,6 +1848,18 @@ void gs_overlay_redraw() {
     }
 }
 
+void gs_menu_hold_frame(uint64_t n) {
+    if (g_opt_screenshot_every && n % (uint64_t)g_opt_screenshot_every == 0) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/menu_%05llu.png", g_opt_screenshot_dir.c_str(), (unsigned long long)n);
+        gs_screenshot(path);
+    }
+    if (g_opt_frames && g_frames + n >= (uint64_t)g_opt_frames) {
+        LOG(LOG_CORE, "reached %d frames (menu open) - exiting", g_opt_frames);
+        app_exit(0);
+    }
+}
+
 void gs_vblank() {
     // VSINT, field toggle
     g_csr |= 8;
@@ -1820,6 +1872,8 @@ void gs_vblank() {
         uint64_t f = g_frames;
         const uint32_t aspect = presentation::tag(eod_presentation_aspect());
         offload_run([f, aspect] {
+            if (scene_capture::g_on) scene_capture::vblank(f);
+            if (scene_emit::g_on) scene_emit::vblank(f);
             push_cmd(CMD_VBLANK, (uint32_t)f, aspect, nullptr, 0);
             gs_flush();
         });
@@ -1830,6 +1884,8 @@ void gs_vblank() {
         g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
         g_ee_wait_us += platform_time_us() - t;
     } else {
+        if (scene_capture::g_on) offload_run([f = g_frames] { scene_capture::vblank(f); });
+        if (scene_emit::g_on) offload_run([f = g_frames] { scene_emit::vblank(f); });
         gs_frame_end(g_frames, eod_presentation_aspect());
     }
     {

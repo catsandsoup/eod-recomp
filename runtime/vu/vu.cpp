@@ -5,6 +5,7 @@
 // instruction, Q/P results become visible after their latency, branches
 // have a delay slot and the E bit ends the program after the next pair.
 #include "vu.h"
+#include "core/trace.h"
 #include "../core/prof.h"
 
 #include "sse_compat.h"
@@ -27,6 +28,8 @@
 #include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "ee.h"
+#include "scene_capture.h"
+#include "scene_emit.h"
 #include "vif.h"
 
 VUState g_vu0, g_vu1;
@@ -615,7 +618,7 @@ void xgkick(VUState *vu, uint32_t addr_qw) {
     // send a GIF packet (possibly several tags) from VU1 memory via PATH1
     uint32_t a = addr_qw & 0x3FF;
     // walk tags until EOP to find the length (wrapping at 16KB)
-    uint8_t buf[0x4000];
+    static thread_local uint8_t buf[0x4000];  // (not on the stack: 16 KB there means a 4-page probe per kick)
     uint32_t n = 0;
     for (;;) {
         if (n >= 0x400) break;
@@ -1550,12 +1553,41 @@ void vu_rec_hook(VUState *vu, uint32_t pc) {
 }  // namespace
 
 void vu_execute(VUState *vu, uint32_t start_pc) {
+    EOD_ZONE("vu_execute");
     ProfScope prof(P_EE_VU);
     uint32_t pc = start_pc & vu->micro_mask & ~7u;
     vu_rec_hook(vu, pc);
     vu_dump(vu, pc);
+    if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
+    if (scene_emit::g_on && vu->index == 1) scene_emit::vu1_start(vu, pc);
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
+        static const bool stats = getenv("EOD_VU_STATS") != nullptr;
+        if (stats && !check) {  // EOD_VU_STATS=1: time per compiled program (VU1 by entry and ITOP)
+            static uint64_t cnt[0x800], tk[0x800], last;
+            static uint32_t itops[0x800];
+            const uint64_t t0 = prof_ticks();
+            p->fn(vu, pc);
+            const uint64_t t1 = prof_ticks();
+            if (vu->index == 1) {
+                cnt[(pc >> 3) & 0x7FF]++;
+                tk[(pc >> 3) & 0x7FF] += t1 - t0;
+                itops[(pc >> 3) & 0x7FF] = g_vif1_itop;
+            }
+            if (!last) last = t1;
+            if (t1 - last > 20000000000ull) {
+                last = t1;
+                uint64_t total = 0;
+                for (int i = 0; i < 0x800; i++) total += tk[i];
+                for (int i = 0; i < 0x800; i++)
+                    if (tk[i] > total / 100)
+                        fprintf(stderr, "[vu-stats] VU1 %04x runs %llu, %.1f%% of VU1 time, %.2f us/run\n", i << 3,
+                                (unsigned long long)cnt[i], 100.0 * tk[i] / total, tk[i] / 3500.0 / (double)cnt[i]);
+                std::fill(std::begin(cnt), std::end(cnt), 0);
+                std::fill(std::begin(tk), std::end(tk), 0);
+            }
+            return;
+        }
         if (!check) {
             p->fn(vu, pc);
             return;
@@ -1599,6 +1631,26 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
                  (unsigned long long)vu->cycle, (unsigned long long)after.cycle, vu->status, after.status, vu->mac,
                  after.mac, vu->clip, after.clip, vu->q, after.q, vu->tpc, after.tpc,
                  memcmp(vu->mem, mem_after, msize) ? "differs" : "same");
+        }
+        return;
+    }
+    // EOD_VU_STATS=1: which programs run interpreted (no compiled match), with their time
+    static const bool stats = getenv("EOD_VU_STATS") != nullptr;
+    if (stats) {
+        static uint64_t cnt[2][0x800], tk[2][0x800], last;
+        const uint64_t t0 = prof_ticks();
+        vu_interp(vu, pc);
+        const uint64_t t1 = prof_ticks();
+        cnt[vu->index & 1][(pc >> 3) & 0x7FF]++;
+        tk[vu->index & 1][(pc >> 3) & 0x7FF] += t1 - t0;
+        if (!last) last = t1;
+        if (t1 - last > 30000000000ull) {
+            last = t1;
+            for (int u = 0; u < 2; u++)
+                for (int i = 0; i < 0x800; i++)
+                    if (cnt[u][i] > 1000)
+                        fprintf(stderr, "[vu-stats] VU%d %04x interpreted %llu runs, %.0f Mticks\n", u, i << 3,
+                                (unsigned long long)cnt[u][i], tk[u][i] / 1e6);
         }
         return;
     }

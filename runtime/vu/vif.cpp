@@ -374,13 +374,18 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         case 0x30: memcpy(v.row, d, 16); break;          // STROW
         case 0x31: memcpy(v.col, d, 16); break;          // STCOL
         case 0x4A: {                                      // MPG
-            g_vu_micro_gen[v.n]++;
             uint32_t n = numf ? numf : 256;
             uint32_t a = imm * 8;
+            // The game re-sends the same micro programs often; only a real change of the code
+            // invalidates the compiled-program lookup (which then re-matches every program).
+            bool changed = false;
             for (uint32_t k = 0; k < n * 2; k++) {
                 uint32_t w = d[k];
-                memcpy(v.vu->micro + ((a + k * 4) & v.vu->micro_mask), &w, 4);
+                uint8_t *dst = v.vu->micro + ((a + k * 4) & v.vu->micro_mask);
+                if (!changed && memcmp(dst, &w, 4) != 0) changed = true;
+                memcpy(dst, &w, 4);
             }
+            if (changed) g_vu_micro_gen[v.n]++;
             break;
         }
         case 0x50:

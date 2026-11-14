@@ -155,7 +155,28 @@ else()
        ${CMAKE_SOURCE_DIR}/runtime/ui/ui_art.cpp ${CMAKE_SOURCE_DIR}/runtime/ui/ui_preview.cpp)
 endif()
 
-if(NOT WIN32)
+if(WIN32)
+  # Vulkan is the default Windows GS backend; Direct3D 11 stays selectable
+  # (Renderer=d3d11). No Vulkan SDK is needed: the headers are fetched and volk
+  # opens the system loader (vulkan-1.dll) at run time.
+  option(EOD_VULKAN "Build the Vulkan GS backend" ON)
+  if(EOD_VULKAN)
+    include(FetchContent)
+    FetchContent_Declare(eod_vulkan_headers
+      URL https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/vulkan-sdk-1.4.357.0
+      URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3
+      SOURCE_SUBDIR none
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_Declare(eod_volk
+      URL https://codeload.github.com/zeux/volk/tar.gz/refs/tags/vulkan-sdk-1.4.357.0
+      URL_HASH SHA256=6400c7b23e24d17e4f04bac49b55b06c4e87677d33398e90344743ec73560ca6
+      SOURCE_SUBDIR none
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(eod_vulkan_headers eod_volk)
+    file(GLOB VULKAN_GS_SOURCES ${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/*.cpp)
+    list(APPEND PLATFORM_SOURCES ${VULKAN_GS_SOURCES} ${eod_volk_SOURCE_DIR}/volk.c)
+  endif()
+else()
   option(EOD_VULKAN "Build the Vulkan GS backend" ON)
   if(EOD_VULKAN)
     find_package(Vulkan QUIET)
@@ -346,7 +367,12 @@ if(EOD_VULKAN)
   FetchContent_MakeAvailable(eod_xxhash)
   target_include_directories(eod PRIVATE ${eod_xxhash_SOURCE_DIR})
   target_compile_definitions(eod PRIVATE EOD_VULKAN)
-  target_link_libraries(eod PRIVATE Vulkan::Vulkan)
+  if(WIN32)
+    target_compile_definitions(eod PRIVATE EOD_HW_SELECT VK_NO_PROTOTYPES)
+    target_include_directories(eod PRIVATE ${eod_vulkan_headers_SOURCE_DIR}/include ${eod_volk_SOURCE_DIR})
+  else()
+    target_link_libraries(eod PRIVATE Vulkan::Vulkan)
+  endif()
   include(CTest)
   if(BUILD_TESTING)
     add_executable(eod_present_timing_test tools/tests/present_timing_test.cpp)
@@ -431,8 +457,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(eod_gen PRIVATE -msse2 -mfpmath=sse -march=pentium4 -mtune=core2)
     target_compile_options(eod PRIVATE -msse2 -mfpmath=sse -march=pentium4 -mtune=core2)
   else()
-    target_compile_options(eod_gen PRIVATE -mtune=core2)
-    target_compile_options(eod PRIVATE -mtune=core2)
+    # x86-64-v2 (SSE4.2/POPCNT, every x86-64 CPU since 2009) instead of the 2003 baseline:
+    # SSE4.1 blends, rounding and dot products for the VU and recompiled EE code. No FMA
+    # contraction, so float results stay bit-identical to the SSE2 build (netplay).
+    set(EOD_X86_LEVEL "x86-64-v2" CACHE STRING "x86-64 micro-architecture level (-march)")
+    target_compile_options(eod_gen PRIVATE -march=${EOD_X86_LEVEL} -mtune=generic -ffp-contract=off)
+    target_compile_options(eod PRIVATE -march=${EOD_X86_LEVEL} -mtune=generic -ffp-contract=off)
   endif()
 elseif(MSVC)
   target_compile_options(eod_gen PRIVATE /w /bigobj)
@@ -440,6 +470,26 @@ elseif(MSVC)
   if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_compile_options(eod_gen PRIVATE /arch:SSE2)
     target_compile_options(eod PRIVATE /arch:SSE2)
+  endif()
+endif()
+
+# Tracy frame profiler (developer builds only): CPU zones on the EE, VU1 producer and GS
+# threads and Vulkan GPU zones (runtime/core/trace.h). Connect tracy-profiler or
+# tracy-capture to a running game. Off in release builds: the macros compile to nothing.
+option(EOD_TRACY "Tracy profiler zones (developer builds)" OFF)
+if(EOD_TRACY)
+  include(FetchContent)
+  FetchContent_Declare(eod_tracy
+    URL https://codeload.github.com/wolfpld/tracy/tar.gz/refs/tags/v0.11.1
+    URL_HASH SHA256=2c11ca816f2b756be2730f86b0092920419f3dabc7a7173829ffd897d91888a1
+    SOURCE_SUBDIR none
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(eod_tracy)
+  target_sources(eod PRIVATE ${eod_tracy_SOURCE_DIR}/public/TracyClient.cpp)
+  target_include_directories(eod PRIVATE ${eod_tracy_SOURCE_DIR}/public)
+  target_compile_definitions(eod PRIVATE TRACY_ENABLE TRACY_NO_SAMPLING TRACY_NO_SYSTEM_TRACING EOD_TRACY)
+  if(WIN32)
+    target_link_libraries(eod PRIVATE ws2_32 dbghelp)
   endif()
 endif()
 

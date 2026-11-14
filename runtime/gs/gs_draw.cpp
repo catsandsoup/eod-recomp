@@ -24,6 +24,7 @@
 #include <pthread.h>
 #endif
 
+#include "core/trace.h"
 #include "../core/config.h"
 #include "../core/log.h"
 #include "../core/prof.h"
@@ -34,6 +35,10 @@
 #include "gs_mem.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
+#include "texture_replacements.h"
+#include "../vu/scene_capture.h"
+#include "../vu/scene_emit.h"
+#include "modern_scene.h"
 
 namespace gs {
 
@@ -248,6 +253,58 @@ inline uint32_t texel(const Env &e, TexEntry &t, int x, int y) {
     return t.data[(size_t)y * t.w + x];
 }
 
+// EOD_SCENE_CAPTURE: the texture of this draw state with the host-texture
+// identity keys (texture_replacements.h), so a captured draw can be paired
+// with per-texture data such as materials.
+void capture_texture(const Env &e, bool four, bool eight) {
+    uint64_t ik = 0, pk = 0;
+    if (four || eight) {
+        if (hw::g_on) hw::vram_needed(e.mip_tbp[0], e.mip_tbw[0], e.tpsm, 0, 0, (int)e.tw, (int)e.th, "scene capture");
+        static std::vector<uint8_t> plane;
+        plane.resize((size_t)e.tw * e.th);
+        for (uint32_t y = 0; y < e.th; y++)
+            for (uint32_t x = 0; x < e.tw; x++)
+                plane[(size_t)y * e.tw + x] = (uint8_t)read_pixel(e.tpsm, (int)x, (int)y, e.mip_tbp[0], e.mip_tbw[0]);
+        ik = gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data());
+        pk = gs::hosttex::palette_key(e.pal, eight ? 256 : 16);
+    }
+    scene_capture::gs_texture(e.mip_tbp[0], e.mip_tbw[0], e.tpsm, e.tw, e.th, e.cpsm, e.csa, ik, pk);
+}
+
+// EOD_SCENE_EMIT: one texture row per textured PATH1 draw state. The index key
+// (a decode of every texel) is cached by a hash of the raw VRAM pages the
+// texture occupies, so a texture seen before costs one linear hash.
+void emit_texture(const Env &e, bool four, bool eight, uint32_t attr) {
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t ik = 0, pk = 0;
+    if (four || eight) {
+        if (hw::g_on) hw::vram_needed(e.mip_tbp[0], e.mip_tbw[0], e.tpsm, 0, 0, (int)e.tw, (int)e.th, "scene emit");
+        // page geometry: PSMT4 128x128, PSMT8 128x64, the H formats live in 32-bit pages (64x32)
+        const bool h = e.tpsm == PSMT8H || e.tpsm == PSMT4HH || e.tpsm == PSMT4HL;
+        const uint32_t pw = h ? 64 : 128, ph = h ? 32 : (four ? 128 : 64);
+        const uint32_t bw = std::max<uint32_t>(e.mip_tbw[0] * 64, e.tw);
+        const uint32_t pages = ((bw + pw - 1) / pw) * ((e.th + ph - 1) / ph);
+        const uint32_t start = (e.mip_tbp[0] * 256u) & 0x3FFFFF;
+        const uint32_t bytes = std::min<uint32_t>(pages * 8192u, 0x400000 - start);
+        uint64_t raw = 0xCBF29CE484222325ull ^ ((uint64_t)e.tpsm << 48 | (uint64_t)e.tw << 24 | e.th);
+        const uint64_t *w = (const uint64_t *)(vram + start);
+        for (uint32_t i = 0; i < bytes / 8; i++) raw = (raw ^ w[i]) * 0x100000001B3ull + (raw >> 29);
+        if (!scene_emit::gs_key_lookup(raw, ik)) {
+            static std::vector<uint8_t> plane;
+            plane.resize((size_t)e.tw * e.th);
+            for (uint32_t y = 0; y < e.th; y++)
+                for (uint32_t x = 0; x < e.tw; x++)
+                    plane[(size_t)y * e.tw + x] = (uint8_t)read_pixel(e.tpsm, (int)x, (int)y, e.mip_tbp[0], e.mip_tbw[0]);
+            ik = gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data());
+            scene_emit::gs_key_store(raw, ik);
+        }
+        pk = gs::hosttex::palette_key(e.pal, eight ? 256 : 16);
+    }
+    scene_emit::gs_texture(e.mip_tbp[0], e.tpsm, e.tw, e.th, ik, pk, st.ctx[(attr >> 9) & 1].xyoffset, e.fbp);
+    scene_emit::gs_cost_ns((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - t0).count());
+}
+
 void setup_env(uint32_t attr) {
     attr &= ~7u;  // the primitive type doesn't matter here
     if (attr == g_env_attr && g_reg_gen == g_env_gen) return;
@@ -275,7 +332,7 @@ void setup_env(uint32_t attr) {
         uint32_t fbp = bits(st.ctx[(attr >> 9) & 1].frame, 0, 9) * 32;
         uint32_t shown = bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32;
         if (fbp != e.fbp && fbp == shown) {
-            if (!g_skip_frame) g_flips++;
+            if (!g_skip_frame) { g_flips++; EOD_FRAME_MARK; }
             g_game_flips++;
             presenting = true;
         } else if (fbp != shown && presenting) {
@@ -417,6 +474,8 @@ void setup_env(uint32_t attr) {
                 e.pal_hash = h;
             }
         }
+        if (scene_capture::g_on && scene_capture::gs_active()) capture_texture(e, four, eight);
+        if (scene_emit::g_on && scene_emit::gs_wants_texture()) emit_texture(e, four, eight, attr);
         if (hw::g_on) {  // the hardware renderer keeps its own textures
             e.tcached = false;
             return;
@@ -1339,6 +1398,7 @@ void run_job(const Job &j, int wid, int nw, WStats &ws) {
 
 void raster_worker(int id) {
     platform_thread_fast();
+    EOD_THREAD_NAME("GS raster");
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-raster");
 #endif
@@ -1505,7 +1565,7 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         census::draw(e, "sprite", (uint64_t)std::abs((b.x - a.x) >> 4) * (uint64_t)std::abs((b.y - a.y) >> 4));
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_sprite(e, a, b);
+            if (!(modern::g_on && modern::gs_replaced(e, b.a))) hw::draw_sprite(e, a, b);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1588,7 +1648,7 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     }
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_triangle(e, a0, b0, c0);
+            if (!(modern::g_on && modern::gs_replaced(e, (a0.a + b0.a + c0.a) / 3u))) hw::draw_triangle(e, a0, b0, c0);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1724,7 +1784,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
     if (census::g_on) census::draw(e, "line", 1);
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_line(e, a, b);
+            if (!(modern::g_on && modern::gs_replaced(e, b.a))) hw::draw_line(e, a, b);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1769,7 +1829,7 @@ void draw_point(const Vertex &a) {
     if (census::g_on) census::draw(e, "point", 1);
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_point(e, a);
+            if (!(modern::g_on && modern::gs_replaced(e, a.a))) hw::draw_point(e, a);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1886,6 +1946,7 @@ void clut_resolve() {
 }
 
 void clut_load(uint64_t tex0) {
+    EOD_ZONE("gs.clut_load");
     uint32_t psm = bits(tex0, 20, 6);
     bool four = psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH;
     bool eight = psm == PSMT8 || psm == PSMT8H;

@@ -31,6 +31,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <map>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -54,9 +57,13 @@
 #include "../gs_swizzle.h"
 
 namespace gs {
+extern bool g_skip_frame;  // gs_draw.cpp
 namespace hw {
-
+#ifdef EOD_HW_SELECT
+namespace d3d11 {  // one of two backends (gs_hw_select.cpp chooses)
+#else
 bool g_on;
+#endif
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 
 namespace {
@@ -1948,6 +1955,11 @@ bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
     flush();
     TempTex *t = temp_texture(w, h);  // (scaled; we render at 1x into its corner)
     if (!t) return false;
+    // EOD_SCREENSHOT_SCALE=k: k x the display size, up to the internal resolution
+    static const int shot_k = getenv("EOD_SCREENSHOT_SCALE") ? atoi(getenv("EOD_SCREENSHOT_SCALE")) : 1;
+    const int k = std::max(1, std::min(shot_k, g_scale));
+    w *= k;
+    h *= k;
     compose(t->rtv, t->w * g_scale, t->h * g_scale, 0, 0, w, h, false);
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)w;
@@ -2218,6 +2230,11 @@ void stats_line(char *buf, size_t size) {
     g_stats = Stats();
 }
 
+#include "modern_d3d11.inc"
+
+#ifdef EOD_HW_SELECT
+}  // namespace d3d11
+#endif
 }  // namespace hw
 }  // namespace gs
 #endif  // _WIN32

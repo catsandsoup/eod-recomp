@@ -1,5 +1,6 @@
 // frontend.cpp - the front end's model (see frontend.h).
 #include "frontend.h"
+#include "../gs/modern_scene.h"
 
 #include <algorithm>
 #include <cmath>
@@ -312,6 +313,31 @@ void Menu::rows_graphics(std::vector<Row> &r) {
     r.push_back(choice("detail", "DETAIL PRESET", upper(kDetails[index_of(kDetails, 3, cfg_.detail)]), "NEXT LAUNCH",
                        "Optional car and scenery level-of-detail preset (docs/DETAIL_PRESETS.md)."));
     r.push_back(toggle("fps", "SHOW FRAME RATE", cfg_.show_fps, "LIVE", "Frame counter in the top right corner."));
+#ifdef _WIN32
+    r.push_back(header("MODERN RENDERER"));
+    Row mr = choice("modern", "RENDERER", cfg_.modern_renderer ? "MODERN" : "ORIGINAL", "LIVE",
+                    "MODERN redraws the race's world and cars with real-time lighting, soft sun shadows, "
+                    "reflections and ambient occlusion; ORIGINAL is the PS2 look. F9 or L1+R1+R3 switch it in a race.");
+    if (!modern::available()) { mr.enabled = false; mr.note = "D3D11 ONLY"; }
+    r.push_back(mr);
+    auto pc = [&](const char *id, const char *label, int v, const char *help) {
+        Row row = choice(id, label, v == 0 ? std::string("OFF") : percent(v), "LIVE", help);
+        row.enabled = cfg_.modern_renderer;
+        r.push_back(row);
+    };
+    pc("m_shadows", "SUN SHADOWS", cfg_.modern_shadows, "Strength of the sun's shadows (OFF also saves their drawing time).");
+    Row ss = toggle("m_soft", "SOFT SHADOWS", cfg_.modern_soft_shadows, "LIVE",
+                    "Shadows soften with distance from what casts them and stay sharp where they touch.");
+    ss.enabled = cfg_.modern_renderer;
+    r.push_back(ss);
+    pc("m_refl", "REFLECTIONS", cfg_.modern_reflections, "Clear coat on car paint, sky reflections and highlights.");
+    pc("m_ao", "AMBIENT OCCLUSION", cfg_.modern_ao, "Contact shading in creases, under cars and against walls.");
+    pc("m_bloom", "BLOOM", cfg_.modern_bloom, "Glow around bright highlights.");
+    pc("m_exposure", "EXPOSURE", cfg_.modern_exposure, "Overall brightness of the lit scene.");
+    pc("m_haze", "DISTANCE HAZE", cfg_.modern_haze, "Atmospheric haze toward the horizon.");
+    pc("m_grade", "COLOUR GRADE", cfg_.modern_grade, "Saturation and contrast of the filmic grade (OFF: neutral).");
+    pc("m_vignette", "VIGNETTE", cfg_.modern_vignette, "Darkened screen corners.");
+#endif
 }
 
 void Menu::rows_settings(std::vector<Row> &r) {
@@ -717,6 +743,10 @@ void Menu::reset_tab(Tab t) {
     case Tab::Graphics:
         cfg_.render_scale = d.render_scale; cfg_.aspect = d.aspect; cfg_.fullscreen = d.fullscreen; cfg_.vsync = d.vsync;
         cfg_.smooth_display = d.smooth_display; cfg_.frame_skip = d.frame_skip; cfg_.detail = d.detail; cfg_.show_fps = d.show_fps;
+        cfg_.modern_shadows = d.modern_shadows; cfg_.modern_soft_shadows = d.modern_soft_shadows;
+        cfg_.modern_reflections = d.modern_reflections; cfg_.modern_ao = d.modern_ao; cfg_.modern_bloom = d.modern_bloom;
+        cfg_.modern_vignette = d.modern_vignette; cfg_.modern_exposure = d.modern_exposure;
+        cfg_.modern_haze = d.modern_haze; cfg_.modern_grade = d.modern_grade;
         break;
     case Tab::Settings:
         cfg_.audio = d.audio; cfg_.volume = d.volume; cfg_.music_volume = d.music_volume; cfg_.pause_in_menu = d.pause_in_menu; cfg_.unlock_all = d.unlock_all;
@@ -784,6 +814,16 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "mute" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Muted; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
     else if (id == "deafen" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Deafened; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
     else if (id == "fps") cfg_.show_fps = !cfg_.show_fps;
+    else if (id == "modern") cfg_.modern_renderer = !cfg_.modern_renderer;
+    else if (id == "m_shadows") step(cfg_.modern_shadows, 0, 150, 10);
+    else if (id == "m_soft") cfg_.modern_soft_shadows = !cfg_.modern_soft_shadows;
+    else if (id == "m_refl") step(cfg_.modern_reflections, 0, 200, 10);
+    else if (id == "m_ao") step(cfg_.modern_ao, 0, 200, 10);
+    else if (id == "m_bloom") step(cfg_.modern_bloom, 0, 200, 10);
+    else if (id == "m_exposure") step(cfg_.modern_exposure, 50, 200, 5);
+    else if (id == "m_haze") step(cfg_.modern_haze, 0, 200, 10);
+    else if (id == "m_grade") step(cfg_.modern_grade, 0, 200, 10);
+    else if (id == "m_vignette") step(cfg_.modern_vignette, 0, 200, 10);
     else if (id == "audio") { cfg_.audio = !cfg_.audio; fx.audio = true; }
     else if (id == "musicvolume") { step(cfg_.music_volume, 0, 100, 5); fx.audio = true; }
     else if (id == "volume") { step(cfg_.volume, 0, 100, 5); fx.audio = true; }

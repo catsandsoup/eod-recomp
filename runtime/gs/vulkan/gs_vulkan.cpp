@@ -2,10 +2,12 @@
 // are ported from gs_d3d11.cpp; vk_compat.h maps its small state API to Vulkan.
 #ifdef EOD_VULKAN
 #include <algorithm>
+#include "core/trace.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,9 +41,13 @@
 #include "gpu_upload_blocks.h"
 
 namespace gs {
+extern bool g_skip_frame; // gs_draw.cpp
 namespace hw {
-
+#ifdef EOD_HW_SELECT
+namespace vulkan {  // one of two backends (gs_hw_select.cpp chooses)
+#else
 bool g_on;
+#endif
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 
 namespace {
@@ -531,6 +537,7 @@ void bind_targets(Surface *rt, Surface *ds);
 void acquire(Surface *s, int x0, int y0, int x1, int y1);
 
 void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
+    EOD_ZONE("gs.draw_batch");
     // The alpha-test half (F_ATEST_PASS/F_ATEST_FAIL) is a ps_draw pipeline
     // specialization: both halves of a two-pass group share the constants.
     g_ctx->PSSetSpecialization(s.two_pass ? (fail_pass ? 0x800u : 0x400u) : 0u);
@@ -548,10 +555,19 @@ void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
 }
 
 void flush() {
+    EOD_ZONE("gs.flush");
     if (g_verts.empty())
         return;
+    // two persistent vectors swapped back and forth: g_verts keeps its capacity (a fresh
+    // vector per batch reallocated log2(n) times while the next batch was built)
+    static thread_local std::vector<HwVertex> spare;  // empty, with the last batch's capacity
     std::vector<HwVertex> verts;
-    verts.swap(g_verts); // (the passes below flush too)
+    verts.swap(g_verts); // this batch (the passes below flush too)
+    g_verts.swap(spare); // the next batch starts with capacity
+    struct GiveBack {
+        std::vector<HwVertex> &v;
+        ~GiveBack() { v.clear(); spare.swap(v); }
+    } give_back{verts};
     DrawState s = g_state;
     // take the pages under the batch (not the whole scissor: buffers share memory
     // with textures)
@@ -653,6 +669,9 @@ void flush() {
         alpha_order::Tiles tiles(s.rt->w*sc,s.rt->h*sc);
         const alpha_order::Bounds clip{s.scissor[0],s.scissor[1],s.scissor[2],s.scissor[3]};
         UINT group_first=0;
+        struct GroupTri { UINT offset; float x0,y0,x1,y1; };
+        static thread_local std::vector<GroupTri> group_tris;
+        group_tris.clear();
         auto draw_group=[&](UINT end) {
             if(end==group_first) return;
             draw_batch(s,first+group_first,end-group_first,false);
@@ -665,9 +684,25 @@ void flush() {
                 x0=std::min(x0,v.x);y0=std::min(y0,v.y);x1=std::max(x1,v.x);y1=std::max(y1,v.y);
             }
             const auto coverage=alpha_order::bounds(x0,y0,x1,y1,sc,clip);
-            if(!group_disjoint || !tiles.append(coverage)) {
-                draw_group(offset);group_first=offset;tiles.clear();tiles.append(coverage);
+            if(group_disjoint && tiles.append(coverage)) { group_tris.push_back({offset,x0,y0,x1,y1}); continue; }
+            // The tiles overlap: an exact test against the group's triangles. Strip and fan
+            // neighbours only share edges and never write the same pixel, so they stay in one
+            // group (one pass/fail pair) instead of one pair per triangle.
+            bool conflict=!group_disjoint || primitive_size!=3 || group_tris.size()>48;
+            if(!conflict) {
+                int32_t t[6];  // GS 12.4 fixed point (the vertices are exact multiples of 1/16)
+                for(int k=0;k<3;k++) t[k*2]=(int32_t)std::lround(verts[offset+k].x*16.0f),t[k*2+1]=(int32_t)std::lround(verts[offset+k].y*16.0f);
+                for(const GroupTri &g:group_tris) {
+                    if(g.x1<=x0 || x1<=g.x0 || g.y1<=y0 || y1<=g.y0) continue;
+                    int32_t u[6];
+                    for(int k=0;k<3;k++) u[k*2]=(int32_t)std::lround(verts[g.offset+k].x*16.0f),u[k*2+1]=(int32_t)std::lround(verts[g.offset+k].y*16.0f);
+                    if(alpha_order::triangles_overlap(t,u)) { conflict=true; break; }
+                }
             }
+            if(conflict) {
+                draw_group(offset);group_first=offset;tiles.clear();tiles.append(coverage);group_tris.clear();
+            } else tiles.force(coverage);
+            group_tris.push_back({offset,x0,y0,x1,y1});
         }
         draw_group(count);
     } else draw_batch(s, first, count, false);
@@ -677,6 +712,7 @@ void flush() {
 Surface *g_bound_rt, *g_bound_ds;
 
 void bind_targets(Surface *rt, Surface *ds) {
+    EOD_ZONE("gs.bind_targets");
     Surface *any = rt ? rt : ds;
     ID3D11RenderTargetView *rtv = rt ? rt->rtv : nullptr;
     // unbind textures first (a target may have been a texture of the previous
@@ -760,6 +796,7 @@ bool create_raw_textures() {
 // Uploads rectangle (x, y, w, h) of the surface from gs::vram.
 void deferred_before_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why);
 void upload_rect(Surface *s, int x, int y, int w, int h) {
+    EOD_ZONE("gs.upload_rect");
     if (w <= 0 || h <= 0)
         return;
     flush();
@@ -818,6 +855,7 @@ void readback_record(Surface *s, int x, int y, int w, int h) {
 
 // Writes rectangle (x, y, w, h) of the surface back to gs::vram.
 void readback_rect(Surface *s, int x, int y, int w, int h) {
+    EOD_ZONE("gs.readback_rect");
     if (w <= 0 || h <= 0)
         return;
     readback_record(s, x, y, w, h);
@@ -889,6 +927,7 @@ void deferred_free(uint32_t page) {
 
 // Completes page `page`: waits for its copies and merges the untouched bits.
 void deferred_resolve(uint32_t page, const char *why = "") {
+    EOD_ZONE("gs.deferred_resolve");
     DeferredPage *d = g_deferred[page];
     if (!d)
         return;
@@ -1157,6 +1196,7 @@ inline void pixel_bytes(uint32_t psm, uint32_t a, uint32_t &addr, uint32_t &n) {
 }
 
 void snapshot_complete(SnapshotPage &sp) {
+    EOD_ZONE("gs.snapshot_complete");
     if (sp.complete)
         return;
     if (sp.serial && g_dev->wait_serial(sp.serial))
@@ -1465,6 +1505,7 @@ template <class F> void for_rects(const std::vector<PageRect> &pages, F fn) {
 // Makes the surface the owner of the pages under rectangle (x0, y0)-(x1, y1),
 // bringing over what the memory held.
 void acquire(Surface *s, int x0, int y0, int x1, int y1) {
+    EOD_ZONE("gs.acquire");
     std::vector<PageRect> pages;
     surface_pages_rect(s, x0, y0, x1, y1, pages);
     std::vector<PageRect> up;
@@ -1660,6 +1701,7 @@ uint64_t hash_level(uint32_t tbp, uint32_t tbw, uint32_t psm, int w, int h) {
 
 // RGBA texels of a level
 void decode_level(const Env &e, int lvl, int w, int h, std::vector<uint32_t> &out) {
+    EOD_ZONE("gs.decode_level");
     out.resize((size_t)w * h);
     uint32_t bp = e.mip_tbp[lvl], bw = e.mip_tbw[lvl];
     const SwizzleTab *T = swizzle_table(e.tpsm, bw);
@@ -1694,6 +1736,7 @@ ID3D11ShaderResourceView *host_texture(int idx, uint32_t native_alpha_high, alph
 
 // Palette indices of mip 0, row-major (PSMT8/PSMT4 and the high-bit forms).
 void host_index_plane(const Env &e, std::vector<uint8_t> &out) {
+    EOD_ZONE("gs.host_index_plane");
     out.resize((size_t)e.tw * e.th);
     const SwizzleTab *T = swizzle_table(e.tpsm, e.mip_tbw[0]);
     uint32_t bp = e.mip_tbp[0];
@@ -1721,6 +1764,7 @@ void host_index_plane(const Env &e, std::vector<uint8_t> &out) {
 }
 
 ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, float &scale, uint32_t &flags) {
+    EOD_ZONE("tex.vram_texture");
     int levels = tex_levels(e);
     // description key: what identifies the texture apart from the memory contents
     uint64_t desc = mix64(0, e.tpsm | (e.tw << 8) | ((uint64_t)e.th << 20) | ((uint64_t)levels << 40));
@@ -1746,6 +1790,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, 
             newest = std::max(newest, g_page_gen[(first + k) % kPages]);
     }
     uint64_t key;
+    EOD_ZONE("tex.lookup");
     auto ck = g_tex_check.find(desc);
     if (ck != g_tex_check.end() && ck->second.clock >= newest) {
         key = ck->second.key;
@@ -1754,6 +1799,7 @@ ID3D11ShaderResourceView *vram_texture(const Env &e, alpha_order::Range &alpha, 
         // has to change whenever a decoded texel does, and decode below never
         // reads a bit still awaiting deferred GPU data.
         key = desc;
+        EOD_ZONE("tex.hash_level");
         for (int i = 0; i < levels; i++)
             key = mix64(key, hash_level(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i),
                                         std::max(1, (int)e.th >> i)));
@@ -2093,6 +2139,7 @@ struct TexSource {
 };
 
 TexSource texture_for(const Env &e, Surface *target) {
+    EOD_ZONE("gs.texture_for");
     TexSource ts;
     int levels = tex_levels(e);
     // A page may still contain unrelated GPU-owned pixels while every block
@@ -2101,6 +2148,7 @@ TexSource texture_for(const Env &e, Surface *target) {
     // the validity proof and can force a later, unnecessary palette readback.
     // Keep the alternate texture-source selection within the opt-in experiment.
     bool cpu_current = gpu_uploads_enabled();
+    { EOD_ZONE("tex.cpu_current");
     for (int i = 0; i < levels && cpu_current; ++i) {
         const PageCoverage requested = page_coverage(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, 0, 0,
             std::max(1, (int)e.tw >> i), std::max(1, (int)e.th >> i));
@@ -2111,6 +2159,7 @@ TexSource texture_for(const Env &e, Surface *target) {
                 break;
             }
         }
+    }
     }
     if (cpu_current) {
         ts.srv = vram_texture(e, ts.alpha, ts.scale, ts.flags);
@@ -2148,10 +2197,20 @@ TexSource texture_for(const Env &e, Surface *target) {
         }
     }
     if (!owner) {
-        std::vector<uint32_t> pages;
         for (int i = 0; i < levels; i++) {
-            exact_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, std::max(1, (int)e.tw >> i), std::max(1, (int)e.th >> i),
-                        pages);
+            // the pages of a texture depend only on where it is and its size: remembered
+            // (walking every block per lookup cost ~2 ms a frame; the Direct3D 11 backend caches it too)
+            static std::unordered_map<uint64_t, std::vector<uint32_t>> known;
+            const uint32_t lw = std::max(1, (int)e.tw >> i), lh = std::max(1, (int)e.th >> i);
+            const uint64_t k = (uint64_t)e.mip_tbp[i] | (uint64_t)e.mip_tbw[i] << 14 | (uint64_t)e.tpsm << 20 |
+                               (uint64_t)lw << 26 | (uint64_t)lh << 38;
+            auto kp = known.find(k);
+            if (kp == known.end()) {
+                if (known.size() > 4096) known.clear();
+                kp = known.emplace(k, std::vector<uint32_t>()).first;
+                exact_pages(e.mip_tbp[i], e.mip_tbw[i], e.tpsm, (int)lw, (int)lh, kp->second);
+            }
+            const std::vector<uint32_t> &pages = kp->second;
             for (uint32_t p : pages) {
                 Surface *o = g_owner[p];
                 if (!o || g_vram_ok[p])
@@ -2239,6 +2298,7 @@ TexSource texture_for(const Env &e, Surface *target) {
 uint32_t g_reg_gen_seen; // g_env_serial the state was built for
 
 void build_state(const Env &e, int topology) {
+    EOD_ZONE("gs.build_state");
     DrawState s;
     memset(&s, 0, sizeof s); // (compared bytewise below)
     s.topology = topology;
@@ -2635,6 +2695,7 @@ void draw_point(const Env &e, const Vertex &a) {
 }
 
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    EOD_ZONE("gs.vram_written");
     if (!g_on)
         return;
     // All prior GPU primitives precede these actual CPU bytes. Do not invalidate
@@ -2684,6 +2745,7 @@ void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, i
 }
 
 void vram_write_complete() {
+    EOD_ZONE("gs.vram_write_complete");
     if (!g_on || g_pending_uploads.empty()) return;
     // A later region in this same chunk may have invalidated an earlier owner.
     // Patch only owners still retained. All actual CPU bytes are now present.
@@ -2716,6 +2778,7 @@ void vram_write_complete() {
 }
 
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+    EOD_ZONE("gs.readback_pages");
     if (!g_on)
         return;
     const PageCoverage requested = page_coverage(bp, bw, psm, x, y, w, h);
@@ -2754,6 +2817,7 @@ void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w,
 }
 
 void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *) {
+    EOD_ZONE("gs.vram_needed");
     flush(); // CPU reads observe all earlier queued GS primitives.
     g_rb_reason = 0;
     readback_pages(bp, bw, psm, x, y, w, h);
@@ -2877,6 +2941,7 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
 
 // draws the display into rtv (size tw x th) at rectangle (rx, ry, rw, rh)
 void compose(ID3D11RenderTargetView *rtv, int tw, int th, int rx, int ry, int rw, int rh, bool smooth) {
+    EOD_ZONE("gs.compose");
     Circuit c[2] = {g_last[0], g_last[1]};
     // circuit 1 over circuit 2 with PMODE.ALP (MMOD = 1) or opaque (as the
     // software compositor)
@@ -2982,6 +3047,7 @@ ID3D11ShaderResourceView *overlay_srv(uint32_t id) {
 
 // Draws the published overlay into rtv (tw x th pixels at its origin).
 void draw_overlay(ID3D11RenderTargetView *rtv, int tw, int th) {
+    EOD_ZONE("gs.draw_overlay");
     static OverlayDraw d;
     if (!overlay_latest(d) || d.w <= 0 || d.h <= 0 || d.cmds.empty()) return;
     try {
@@ -3125,6 +3191,7 @@ void bind_thread() {
 }
 
 void vblank() {
+    EOD_ZONE("gs.vblank");
     if (!g_on)
         return;
     std::unique_lock<std::mutex> lk(g_shot_mtx);
@@ -3137,6 +3204,7 @@ void vblank() {
 
 namespace { void show(bool vsync, bool fresh_scanout = false); }
 void present(bool vsync) {
+    EOD_ZONE("gs.present");
     if (!g_on)
         return;
     flush();
@@ -3160,6 +3228,8 @@ void redraw() {
 
 namespace {
 void show(bool vsync, bool fresh_scanout) {
+    EOD_ZONE("gs.show");
+    g_dev->gpu_report();
     if (g_dev->surface) {
         if (auto *back = g_dev->acquire(vsync)) {
             float black[4] = {0, 0, 0, 1};
@@ -3277,12 +3347,26 @@ void stats_line(char *buf, size_t size) {
                  g_hstats.evictions, (unsigned long long)(g_host_gpu_bytes >> 20));
     }
     g_hstats = HostStats();
+    if (g_dev->gpuProf > 0) {  // EOD_DRAW_PROF: CPU cost of each section of Context::Draw (replays)
+        used = strlen(buf);
+        const double per_ms = 3.8e6;  // rdtsc ticks per ms (nominal clock; ratios are what matter)
+        snprintf(buf + used, size > used ? size - used : 0,
+                 "; Draw ms: pipeline %.1f pass+dynamic %.1f descriptors+constants %.1f vertices+draw %.1f",
+                 g_dev->drawTicks[0] / per_ms, g_dev->drawTicks[1] / per_ms, g_dev->drawTicks[2] / per_ms,
+                 g_dev->drawTicks[3] / per_ms);
+        std::fill(std::begin(g_dev->drawTicks), std::end(g_dev->drawTicks), 0);
+    }
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = g_dev->chunk_submits = 0;
     g_stats = Stats();
 }
 
+#include "modern_vk.inc"
+
+#ifdef EOD_HW_SELECT
+} // namespace vulkan
+#endif
 } // namespace hw
 } // namespace gs
 

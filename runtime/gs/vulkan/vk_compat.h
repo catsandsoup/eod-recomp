@@ -3,8 +3,12 @@
 // all allocation, synchronization and drawing below use Vulkan exclusively.
 #pragma once
 #include "present_timing.h"
+#include "core/trace.h"
+#include "core/prof.h"
+#ifndef _WIN32
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#endif
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -15,7 +19,22 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#ifdef _WIN32
+// Windows: the system loader (vulkan-1.dll) is opened at run time by volk, so the
+// build needs only the headers. No <windows.h> here: the D3D11-shaped names below
+// would collide with it.
+#include <volk.h>
+#include "../../platform/platform.h"
+#else
 #include <vulkan/vulkan.h>
+#endif
+#ifdef EOD_TRACY
+#include <tracy/TracyVulkan.hpp>
+// GPU zone in the current command buffer: EOD_GPU_ZONE(ctx, "name")
+#define EOD_GPU_ZONE(c, name) TracyVkNamedZone((c)->tracyVk, EOD_ZONE_CAT(eod_gpu_zone_, __LINE__), (c)->cmd, name, (c)->tracyVk != nullptr)
+#else
+#define EOD_GPU_ZONE(c, name)
+#endif
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -24,6 +43,9 @@
 #include <time.h>
 #endif
 
+// Everything below lives in its own namespace: the Windows build links the real
+// Direct3D 11 backend too, whose interface types share these names.
+namespace vkgs {
 using UINT = uint32_t;
 using UINT8 = uint8_t;
 using HRESULT = int;
@@ -129,7 +151,11 @@ struct D3D11_SHADER_RESOURCE_VIEW_DESC {
     } Texture2D;
 };
 
-namespace vkgs {
+#ifdef _WIN32
+inline void window_pixels(void *, int &w, int &h) { platform_window_pixels(&w, &h); }
+#else
+inline void window_pixels(SDL_Window *win, int &w, int &h) { SDL_GetWindowSizeInPixels(win, &w, &h); }
+#endif
 #ifdef __APPLE__
 // MoltenVK encodes the whole Metal command buffer inside vkQueueSubmit. Its
 // asynchronous submission mode runs that encoding on MoltenVK's own queue
@@ -166,6 +192,8 @@ struct Texture : Ref {
     VkImage image{};
     VkImageView view{};
     VkDeviceMemory memory{};
+    uint64_t poolKey = 0;   // image recycling class (0: not recyclable)
+    VkDeviceSize bytes = 0;
     HostBuffer host;
     bool external = false;
     ~Texture();
@@ -254,9 +282,162 @@ struct Context {
         VkCommandBuffer cmd{};
         VkFence fence{};
         std::vector<HostBuffer> chunks;
+        std::vector<VkDescriptorPool> pools;
         std::vector<std::function<void()>> garbage;
         uint64_t serial = 0;
+        VkQueryPool qpool{};
+        uint32_t qused = 0;
+        std::vector<std::pair<uint8_t, uint32_t>> qzones;  // (label, first query)
     };
+    // GPU timer (EOD_FPS or EOD_GPU_PROF): timestamp pairs per labelled zone, read when the
+    // command buffer's flight completes, reported as GPU milliseconds per presented frame.
+    enum GpuLabel : uint8_t { GPU_CMDBUF, GPU_M_SHADOW, GPU_M_SCENE, GPU_M_RESOLVE, GPU_M_POST, GPU_M_GSDEPTH,
+                              GPU_M_UPLOAD, GPU_LABELS };
+    static constexpr uint32_t kQueries = 256;
+    int gpuProf = -1;
+    double tsPeriod = 1;
+    VkQueryPool qpool{};
+    uint32_t qused = 0;
+    std::vector<std::pair<uint8_t, uint32_t>> qzones;
+    double gpuNs[GPU_LABELS]{};
+    uint64_t drawTicks[5]{}, drawTick0 = 0, drawUs0 = 0;
+    uint64_t cntDraws = 0, cntSets = 0, cntPasses = 0, cntBarriers = 0, cntSubmits = 0;
+    uint64_t gpuPresents = 0, gpuReportUs = 0, gpuFirst = UINT64_MAX, gpuLast = 0, gpuCmdbufs = 0, gpuWaits0 = 0;
+    bool gpu_prof() {
+        if (gpuProf < 0) {
+            gpuProf = (getenv("EOD_FPS") || getenv("EOD_GPU_PROF") || getenv("EOD_DRAW_PROF")) ? 1 : 0;
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(physical, &p);
+            tsPeriod = p.limits.timestampPeriod;
+            if (!p.limits.timestampComputeAndGraphics)
+                gpuProf = 0;
+        }
+        return gpuProf > 0;
+    }
+    // Opens a zone in the current command buffer; returns its index (or ~0u).
+    uint32_t gpu_begin(GpuLabel label) {
+        if (!recording || !qpool || qused + 2 > kQueries)
+            return ~0u;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, qused);
+        qzones.push_back({label, qused});
+        qused += 2;
+        return (uint32_t)qzones.size() - 1;
+    }
+    void gpu_end(uint32_t zone) {
+        if (zone == ~0u || zone >= qzones.size())
+            return;
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, qzones[zone].second + 1);
+    }
+    void gpu_collect(Flight &f) {
+        if (!f.qpool || !f.qused)
+            return;
+        uint64_t ts[kQueries];
+        if (vkGetQueryPoolResults(device, f.qpool, 0, f.qused, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            for (auto &z : f.qzones)
+                if (ts[z.second + 1] >= ts[z.second]) {
+                    gpuNs[z.first] += (double)(ts[z.second + 1] - ts[z.second]) * tsPeriod;
+                    if (z.first == GPU_CMDBUF) {  // wall span of the GPU timeline this window
+                        gpuFirst = std::min(gpuFirst, ts[z.second]);
+                        gpuLast = std::max(gpuLast, ts[z.second + 1]);
+                        ++gpuCmdbufs;
+                    }
+                }
+        f.qused = 0;
+        f.qzones.clear();
+    }
+    void gpu_report() {
+        ++gpuPresents;
+        const uint64_t now = now_us();
+        if (!gpuReportUs)
+            gpuReportUs = now;
+        if (now - gpuReportUs < 5000000 || !gpuPresents)
+            return;
+        static const char *names[GPU_LABELS] = {"all GS command buffers", "modern shadows", "modern scene",
+                                                "modern resolve", "modern post", "modern GS depth", "modern uploads"};
+        fprintf(stderr, "  GPU ms per presented frame:");
+        for (int i = 0; i < GPU_LABELS; i++)
+            fprintf(stderr, " %s %.2f%s", names[i], gpuNs[i] / 1e6 / (double)gpuPresents, i + 1 < GPU_LABELS ? "," : "\n");
+        const double span = gpuLast > gpuFirst ? (double)(gpuLast - gpuFirst) * tsPeriod : 0;
+        fprintf(stderr, "  GPU busy %.0f%% of its timeline (%.1f ms span), %.1f command buffers and %.1f ms CPU fence wait per frame\n",
+                span > 0 ? 100.0 * gpuNs[GPU_CMDBUF] / span : 0.0, span / 1e6, (double)gpuCmdbufs / (double)gpuPresents,
+                (double)(wait_us - gpuWaits0) / 1000.0 / (double)gpuPresents);
+        {
+            const double n = (double)gpuPresents;
+            fprintf(stderr, "  per frame: %.0f draws, %.0f descriptor sets written, %.0f render passes, %.0f full barriers, %.1f submits (push descriptors %s)\n",
+                    cntDraws / n, cntSets / n, cntPasses / n, cntBarriers / n, cntSubmits / n, push ? "yes" : "no");
+            {
+                const uint64_t t1 = prof_ticks(), u1 = now_us();
+                const double per_us = drawUs0 && u1 > drawUs0 ? (double)(t1 - drawTick0) / (double)(u1 - drawUs0) : 1;
+                static const char *dn[5] = {"pipeline", "pass+dynamic", "descriptors+constants", "vertices+draw", "flush"};
+                fprintf(stderr, "  Draw ms per frame:");
+                for (int i = 0; i < 5; i++) { fprintf(stderr, " %s %.2f", dn[i], drawTicks[i] / per_us / 1000.0 / n); drawTicks[i] = 0; }
+                fprintf(stderr, "\n");
+                drawTick0 = t1; drawUs0 = u1;
+            }
+            cntDraws = cntSets = cntPasses = cntBarriers = cntSubmits = 0;
+        }
+        gpuFirst = UINT64_MAX;
+        gpuLast = gpuCmdbufs = 0;
+        gpuWaits0 = wait_us;
+        for (double &v : gpuNs)
+            v = 0;
+        gpuPresents = 0;
+        gpuReportUs = now;
+    }
+    // Without VK_KHR_push_descriptor (older AMD drivers) descriptor sets come from
+    // pools owned by the command buffer's flight and reset when it completes.
+    std::vector<VkDescriptorPool> pools;
+    size_t poolIndex = 0;
+    VkDescriptorPool new_pool() {
+        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
+                                              {VK_DESCRIPTOR_TYPE_SAMPLER, 4096},
+                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096},
+                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2048},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}};
+        VkDescriptorPoolCreateInfo i{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        i.maxSets = 2048;
+        i.poolSizeCount = 6;
+        i.pPoolSizes = sizes;
+        VkDescriptorPool p{};
+        require(vkCreateDescriptorPool(device, &i, nullptr, &p), "descriptor pool");
+        return p;
+    }
+    // A descriptor set that lives until the current command buffer completes.
+    VkDescriptorSet alloc_set(VkDescriptorSetLayout setLayout) {
+        VkDescriptorSet ds{};
+        for (;;) {
+            if (poolIndex == pools.size())
+                pools.push_back(new_pool());
+            VkDescriptorSetAllocateInfo a{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            a.descriptorPool = pools[poolIndex];
+            a.descriptorSetCount = 1;
+            a.pSetLayouts = &setLayout;
+            VkResult r = vkAllocateDescriptorSets(device, &a, &ds);
+            if (r == VK_SUCCESS)
+                return ds;
+            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL)
+                require(r, "descriptor set");
+            ++poolIndex;
+        }
+    }
+    // vkCmdPushDescriptorSetKHR, or the same writes into a fresh set of `setLayout`
+    void push_set(VkPipelineBindPoint bind, VkPipelineLayout pl, uint32_t set, uint32_t n,
+                  const VkWriteDescriptorSet *w, VkDescriptorSetLayout setLayout) {
+        ++cntSets;
+        if (push) {
+            push(cmd, bind, pl, set, n, w);
+            return;
+        }
+        VkDescriptorSet ds = alloc_set(setLayout);
+        VkWriteDescriptorSet local[16];
+        for (uint32_t i = 0; i < n && i < 16; i++) {
+            local[i] = w[i];
+            local[i].dstSet = ds;
+        }
+        vkUpdateDescriptorSets(device, std::min(n, 16u), local, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, bind, pl, set, 1, &ds, 0, nullptr);
+    }
     std::deque<Flight> inflight;
     std::vector<Flight> idle;
     VkSemaphore spareAcquired{};
@@ -269,6 +450,7 @@ struct Context {
     uint64_t chunk_submits = 0;
     std::vector<VkSemaphore> presentDone;
     bool wantVsync = true; // snapshotted once from the launch configuration
+    VkBool32 anisotropy = VK_FALSE;
     bool displayTiming = false;
     PFN_vkGetRefreshCycleDurationGOOGLE refreshDuration{};
     PFN_vkGetPastPresentationTimingGOOGLE pastPresentation{};
@@ -285,6 +467,10 @@ struct Context {
         }();
         const uint64_t ticks = mach_absolute_time();
         return (ticks / scale.denom) * scale.numer + (ticks % scale.denom) * scale.numer / scale.denom;
+#elif defined(_WIN32)
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
 #else
         timespec time{};
         clock_gettime(CLOCK_MONOTONIC, &time);
@@ -355,7 +541,11 @@ struct Context {
     float blendFactor[4]{};
     VkSurfaceKHR surface{};
     VkSwapchainKHR swap{};
+#ifdef _WIN32
+    void *window{}; // HWND
+#else
     SDL_Window *window{};
+#endif
     VkExtent2D extent{};
     VkFormat swapFormat{};
     std::vector<Texture *> back;
@@ -373,8 +563,8 @@ struct Context {
         b.size = bytes;
         VkBufferCreateInfo i{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         i.size = bytes;
-        i.usage =
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        i.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
         require(vkCreateBuffer(device, &i, nullptr, &b.buffer), "buffer");
         VkMemoryRequirements r;
         vkGetBufferMemoryRequirements(device, b.buffer, &r);
@@ -387,13 +577,59 @@ struct Context {
         require(vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.map), "map buffer");
         return b;
     }
+#ifdef EOD_TRACY
+    // Tracy GPU timeline: one zone per command buffer (the modern pass nests its own).
+    tracy::VkCtx *tracyVk = nullptr;
+    tracy::VkCtxScope *tracyCmd = nullptr;
+    bool tracyTried = false;
+    void tracy_init() {
+        tracyTried = true;
+        VkCommandPool tp{};
+        VkCommandBuffer tc{};
+        VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cp.queueFamilyIndex = family;
+        if (vkCreateCommandPool(device, &cp, nullptr, &tp) != VK_SUCCESS)
+            return;
+        VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ca.commandPool = tp;
+        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ca.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &ca, &tc) != VK_SUCCESS)
+            return;
+        tracyVk = TracyVkContext(physical, device, queue, tc);
+        TracyVkContextName(tracyVk, "GPU", 3);
+    }
+#endif
     void begin() {
         if (recording)
             return;
+#ifdef EOD_TRACY
+        if (!tracyTried)
+            tracy_init();
+#endif
         VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         require(vkBeginCommandBuffer(cmd, &b), "begin commands");
         recording = true;
+        if (gpu_prof()) {
+            if (!qpool) {
+                VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                q.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                q.queryCount = kQueries;
+                vkCreateQueryPool(device, &q, nullptr, &qpool);
+            }
+            if (qpool) {
+                vkCmdResetQueryPool(cmd, qpool, 0, kQueries);
+                qused = 0;
+                qzones.clear();
+                gpu_begin(GPU_CMDBUF);
+            }
+        }
+#ifdef EOD_TRACY
+        if (tracyVk)
+            TracyVkCollect(tracyVk, cmd);
+#endif
         // A reset/recycled command buffer inherits no graphics state, including
         // when the two in-flight command pools exchange ownership.
         boundPipeline = VK_NULL_HANDLE;
@@ -415,6 +651,7 @@ struct Context {
         }
     }
     void barrier(int cause = 0) {
+        ++cntBarriers;
         begin();
         end_render(cause);
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -426,11 +663,14 @@ struct Context {
     // Recycles a completed flight: its commands, uploads and garbage are done.
     void recycle(Flight &f) {
         completed = std::max(completed, f.serial);
+        gpu_collect(f);
         for (auto &g : f.garbage)
             g();
         f.garbage.clear();
         for (auto &c : f.chunks)
             c.used = 0;
+        for (auto p : f.pools)
+            vkResetDescriptorPool(device, p, 0);
         vkResetFences(device, 1, &f.fence);
         vkResetCommandPool(device, f.pool, 0);
         idle.push_back(std::move(f));
@@ -438,6 +678,7 @@ struct Context {
     // Retires submitted flights in order: every one with serial <= `upTo` is
     // waited for, later ones only if already complete.
     bool retire(uint64_t upTo) {
+        EOD_ZONE("vk.retire");
         bool waited = false;
         while (!inflight.empty()) {
             Flight &f = inflight.front();
@@ -445,7 +686,10 @@ struct Context {
                 if (f.serial > upTo)
                     break;
                 uint64_t wait_start = now_us();
-                require(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX), "retire GPU work");
+                {
+                    EOD_ZONE("vk.WAIT_GPU_fence");
+                    require(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX), "retire GPU work");
+                }
                 wait_us += now_us() - wait_start;
                 waited = true;
             }
@@ -474,6 +718,7 @@ struct Context {
     // in flight, as with two alternating command buffers); a mid-frame kick
     // only submits. The recorded commands move to a flight the GPU owns.
     void submit(bool synchronous = true, bool frameEnd = true) {
+        EOD_ZONE("vk.submit");
         if (!recording) {
             if (synchronous)
                 retire(UINT64_MAX);
@@ -484,6 +729,12 @@ struct Context {
         end_render();
         if (passLog > 0)
             fprintf(stderr, "SUBMIT %s\n", synchronous ? "sync" : frameEnd ? "frame" : "kick");
+#ifdef EOD_TRACY
+        delete tracyCmd;
+        tracyCmd = nullptr;
+#endif
+        if (!qzones.empty() && qzones[0].first == GPU_CMDBUF)
+            gpu_end(0);
         require(vkEndCommandBuffer(cmd), "end commands");
         VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         s.commandBufferCount = 1;
@@ -501,6 +752,7 @@ struct Context {
         require(vkQueueSubmit(queue, 1, &s, fence), "submit");
         windowUploaded = false;
         ++submit_count;
+        ++cntSubmits;
         drawsSinceSubmit = 0;
         const bool presented = waitAcquire || signalPresent;
         waitAcquire = signalPresent = false;
@@ -511,8 +763,14 @@ struct Context {
         done.cmd = cmd;
         done.fence = fence;
         done.chunks.swap(chunks);
+        done.pools.swap(pools);
         done.garbage.swap(garbage);
         done.serial = submitted;
+        done.qpool = qpool;
+        done.qused = qused;
+        done.qzones.swap(qzones);
+        qpool = VK_NULL_HANDLE;
+        qused = 0;
         inflight.push_back(std::move(done));
         if (synchronous)
             retire(UINT64_MAX);
@@ -539,7 +797,11 @@ struct Context {
         cmd = next.cmd;
         fence = next.fence;
         chunks.swap(next.chunks);
+        pools.swap(next.pools);
+        qpool = next.qpool;
+        next.qpool = VK_NULL_HANDLE;
         chunkIndex = 0;
+        poolIndex = 0;
     }
     // Makes earlier transfer writes visible to host reads once this command
     // buffer completes, without submitting it (see wait_serial).
@@ -579,6 +841,7 @@ struct Context {
         return {&c, off};
     }
     void transition(Texture *t, VkImageLayout old, VkImageLayout next) {
+        EOD_ZONE("vk.transition");
         begin();
         end_render(6);
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -593,6 +856,17 @@ struct Context {
                               0, t->desc.MipLevels, 0, 1};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &b);
+    }
+    // Retired images by (size, format, levels, usage), reused instead of vkCreateImage +
+    // vkAllocateMemory + vkCreateImageView: the game streams textures through VRAM every
+    // frame, and on Windows drivers each fresh allocation costs ~100 us of GS-thread time.
+    struct PooledImage { VkImage image; VkImageView view; VkDeviceMemory memory; VkDeviceSize bytes; };
+    std::unordered_map<uint64_t, std::vector<PooledImage>> imagePool;
+    VkDeviceSize imagePoolBytes = 0;
+    static constexpr VkDeviceSize kImagePoolMax = 192ull << 20;
+    static uint64_t image_class(const D3D11_TEXTURE2D_DESC *d, VkImageUsageFlags usage) {
+        return (uint64_t)d->Width | (uint64_t)d->Height << 16 | (uint64_t)(d->MipLevels & 15) << 32 |
+               (uint64_t)(d->Format & 0xFFFF) << 36 | (uint64_t)(usage & 0xFF) << 52 | 1ull << 63;
     }
     int CreateTexture2D(const D3D11_TEXTURE2D_DESC *d, const D3D11_SUBRESOURCE_DATA *initial, Texture **out) {
         auto *t = new Texture;
@@ -615,6 +889,24 @@ struct Context {
             i.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         if (d->BindFlags & D3D11_BIND_RENDER_TARGET)
             i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        t->poolKey = d->Width <= 0xFFFF && d->Height <= 0xFFFF ? image_class(d, i.usage) : 0;
+        if (t->poolKey) {
+            auto pit = imagePool.find(t->poolKey);
+            if (pit != imagePool.end() && !pit->second.empty()) {
+                const PooledImage pi = pit->second.back();
+                pit->second.pop_back();
+                imagePoolBytes -= pi.bytes;
+                t->image = pi.image, t->view = pi.view, t->memory = pi.memory, t->bytes = pi.bytes;
+                transition(t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                if (initial)
+                    for (UINT l = 0; l < d->MipLevels; l++) {
+                        D3D11_BOX box{0, 0, 0, std::max(1u, d->Width >> l), std::max(1u, d->Height >> l), 1};
+                        UpdateSubresource(t, l, &box, initial[l].pSysMem, initial[l].SysMemPitch, 0);
+                    }
+                *out = t;
+                return 0;
+            }
+        }
         require(vkCreateImage(device, &i, nullptr, &t->image), "image");
         VkMemoryRequirements r;
         vkGetImageMemoryRequirements(device, t->image, &r);
@@ -622,6 +914,7 @@ struct Context {
         a.allocationSize = r.size;
         a.memoryTypeIndex = memory_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         require(vkAllocateMemory(device, &a, nullptr, &t->memory), "image memory");
+        t->bytes = r.size;
         require(vkBindImageMemory(device, t->image, t->memory, 0), "bind image");
         VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         v.image = t->image;
@@ -687,6 +980,7 @@ struct Context {
         return 0;
     }
     void UpdateSubresource(Texture *t, UINT level, const D3D11_BOX *b, const void *p, UINT pitch, UINT) {
+        EOD_ZONE("vk.UpdateSubresource");
         barrier(1);
         UINT w = b->right - b->left, h = b->bottom - b->top;
         std::vector<uint8_t> tight((size_t)w * h * 4);
@@ -729,6 +1023,7 @@ struct Context {
         });
     }
     void CopySubresourceRegion(Texture *d, UINT, UINT x, UINT y, UINT, Texture *s, UINT, const D3D11_BOX *b) {
+        EOD_ZONE("vk.CopySubresourceRegion");
         barrier(2);
         auto aspect = s->desc.Format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         VkExtent3D sz{b->right - b->left, b->bottom - b->top, 1};
@@ -843,7 +1138,16 @@ inline Texture::~Texture() {
     auto m = memory;
     auto b = host;
     bool ext = external;
+    const uint64_t key = poolKey;
+    const VkDeviceSize bytes = this->bytes;
+    Context *c = ctx;
     ctx->garbage.push_back([=] {
+        // GPU work that used it has completed: recycle the image when the pool has room
+        if (key && i && v && m && !ext && !b.buffer && c->imagePoolBytes + bytes <= Context::kImagePoolMax) {
+            c->imagePool[key].push_back({i, v, m, bytes});
+            c->imagePoolBytes += bytes;
+            return;
+        }
         if (v)
             vkDestroyImageView(d, v, nullptr);
         if (i && !ext)
@@ -1002,8 +1306,13 @@ inline VkPipeline Context::specialized(const PipelineKey &key) {
     return VK_NULL_HANDLE;
 }
 inline void Context::Draw(UINT count, UINT first) {
+    EOD_ZONE("vk.Draw");
     if (!rt && !ds)
         return;
+    ++cntDraws;
+    const bool timed = gpuProf > 0;  // section timing only with EOD_FPS / EOD_GPU_PROF
+    uint64_t tk = timed ? prof_ticks() : 0, tk2;
+#define EOD_DRAW_SECTION(i) (timed ? (tk2 = prof_ticks(), drawTicks[i] += tk2 - tk, tk = tk2) : 0)
     if (!rendering && chunkDraws && recording && drawsSinceSubmit >= chunkDraws && !waitAcquire && !signalPresent) {
         // Between render passes: hand the commands so far to MoltenVK/the GPU.
         ++chunk_submits;
@@ -1044,6 +1353,7 @@ inline void Context::Draw(UINT count, UINT first) {
         pipelines.emplace(key, pipeline);
         remember(key, pipeline);
     }
+    EOD_DRAW_SECTION(0);
     auto *target = rt ? rt : ds;
     if (!rendering) {
         VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO},
@@ -1063,6 +1373,7 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdBeginRendering(cmd, &render);
         rendering = true;
         ++passes;
+        ++cntPasses;
         if (passLog < 0) { const char *e = getenv("EOD_VK_PASS_LOG"); passLog = e && *e == '1'; }
         if (passLog > 0) { pd = {}; pd.w = target->desc.Width; pd.h = target->desc.Height; pd.rtf = rt ? rt->desc.Format : 0; pd.ds = ds != nullptr; pd.sx0 = pd.sy0 = ~0u; }
     }
@@ -1103,6 +1414,7 @@ inline void Context::Draw(UINT count, UINT first) {
         pd.sx0 = std::min<uint32_t>(pd.sx0, rect.offset.x); pd.sy0 = std::min<uint32_t>(pd.sy0, rect.offset.y);
         pd.sx1 = std::max<uint32_t>(pd.sx1, rect.offset.x + rect.extent.width); pd.sy1 = std::max<uint32_t>(pd.sy1, rect.offset.y + rect.extent.height);
     }
+    EOD_DRAW_SECTION(1);
     VkDescriptorImageInfo images[6]{};
     VkWriteDescriptorSet writes[6]{};
     for (int i = 0; i < 6; i++) {
@@ -1119,7 +1431,7 @@ inline void Context::Draw(UINT count, UINT first) {
             images[i].sampler = samplers[i - 4]->sampler;
     }
     if (!cacheState || !imagesValid || memcmp(boundImages, images, sizeof images)) {
-        push(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 6, writes);
+        push_set(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 6, writes, descriptors);
         memcpy(boundImages, images, sizeof images);
         imagesValid = true;
     }
@@ -1133,6 +1445,7 @@ inline void Context::Draw(UINT count, UINT first) {
         boundConstantBytes = constantBytes;
         constantsValid = true;
     }
+    EOD_DRAW_SECTION(2);
     if (vs->id == 0 || vs->id == kOverlayVertexShader) {
         VkBuffer buffer;
         VkDeviceSize offset;
@@ -1162,6 +1475,8 @@ inline void Context::Draw(UINT count, UINT first) {
         vkCmdDraw(cmd, count, 1, start, 0);
     } else
         vkCmdDraw(cmd, count, 1, first, 0);
+    EOD_DRAW_SECTION(3);
+#undef EOD_DRAW_SECTION
 }
 inline bool Context::init(bool withWindow) {
     wantVsync = g_config.vsync;
@@ -1172,6 +1487,15 @@ inline bool Context::init(bool withWindow) {
     app.apiVersion = VK_API_VERSION_1_3;
     std::vector<const char *> exts;
     uint32_t n = 0;
+#ifdef _WIN32
+    if (volkInitialize() != VK_SUCCESS)
+        throw std::runtime_error("no Vulkan loader (vulkan-1.dll)");
+    if (withWindow) {
+        window = platform_native_window();
+        exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        exts.push_back("VK_KHR_win32_surface");
+    }
+#else
     if (withWindow) {
         window = (SDL_Window *)platform_native_window();
         auto names = SDL_Vulkan_GetInstanceExtensions(&n);
@@ -1179,15 +1503,48 @@ inline bool Context::init(bool withWindow) {
             throw std::runtime_error(SDL_GetError());
         exts.assign(names, names + n);
     }
-    exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
+    // portability enumeration (MoltenVK) only where the loader offers it
+    bool portability = false;
+    {
+        uint32_t en = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> props(en);
+        vkEnumerateInstanceExtensionProperties(nullptr, &en, props.data());
+        for (auto &p : props)
+            if (!strcmp(p.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+                portability = true;
+    }
+    if (portability)
+        exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     VkInstanceCreateInfo i{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     i.pApplicationInfo = &app;
-    i.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    i.flags = portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
     i.enabledExtensionCount = (uint32_t)exts.size();
     i.ppEnabledExtensionNames = exts.data();
     require(vkCreateInstance(&i, nullptr, &instance), "instance");
+#ifdef _WIN32
+    volkLoadInstance(instance);
+    if (withWindow) {
+        // VkWin32SurfaceCreateInfoKHR without <windows.h>: HINSTANCE and HWND are pointers
+        struct Win32SurfaceInfo {
+            VkStructureType sType;
+            const void *pNext;
+            VkFlags flags;
+            void *hinstance, *hwnd;
+        } si{(VkStructureType)1000009000 /* VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR */, nullptr, 0,
+             platform_native_instance(), window};
+        using CreateWin32Surface = VkResult(VKAPI_PTR *)(VkInstance, const Win32SurfaceInfo *,
+                                                         const VkAllocationCallbacks *, VkSurfaceKHR *);
+        auto create = (CreateWin32Surface)vkGetInstanceProcAddr(instance, "vkCreateWin32SurfaceKHR");
+        if (!create)
+            throw std::runtime_error("no VK_KHR_win32_surface");
+        require(create(instance, &si, nullptr, &surface), "win32 surface");
+    }
+#else
     if (withWindow && !SDL_Vulkan_CreateSurface(window, instance, nullptr, &surface))
         throw std::runtime_error(SDL_GetError());
+#endif
     require(vkEnumeratePhysicalDevices(instance, &n, nullptr), "enumerate GPUs");
     std::vector<VkPhysicalDevice> devices(n);
     require(vkEnumeratePhysicalDevices(instance, &n, devices.data()), "GPUs");
@@ -1222,6 +1579,8 @@ inline bool Context::init(bool withWindow) {
     VkPhysicalDeviceFeatures enabled{};
     enabled.dualSrcBlend = VK_TRUE;
     enabled.depthClamp = VK_TRUE;
+    anisotropy = features.samplerAnisotropy; // the modern renderer's texture filtering
+    enabled.samplerAnisotropy = features.samplerAnisotropy;
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
     std::vector<VkExtensionProperties> available(ne);
@@ -1229,7 +1588,9 @@ inline bool Context::init(bool withWindow) {
     auto has = [&](const char *s) {
         return std::any_of(available.begin(), available.end(), [&](auto &e) { return !strcmp(e.extensionName, s); });
     };
-    std::vector<const char *> dext{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    std::vector<const char *> dext;
+    if (has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
+        dext.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     if (has("VK_KHR_portability_subset"))
         dext.push_back("VK_KHR_portability_subset");
     if (surface)
@@ -1246,14 +1607,36 @@ inline bool Context::init(bool withWindow) {
     q.pQueuePriorities = &priority;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
+    // A Vulkan 1.2 driver (older Windows drivers) has dynamic rendering as an extension
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    fdr.dynamicRendering = VK_TRUE;
+    const bool core13 = prop.apiVersion >= VK_API_VERSION_1_3;
+    if (!core13)
+        dext.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    if (getenv("EOD_VK_EXTENSIONS"))
+        for (auto &e : available)
+            fprintf(stderr, "[vulkan] device extension %s %u\n", e.extensionName, e.specVersion);
+    for (const char *e : dext)
+        if (!has(e))
+            throw std::runtime_error(std::string("the GPU driver lacks ") + e);
     VkDeviceCreateInfo d{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    d.pNext = &f13;
+    d.pNext = core13 ? (void *)&f13 : (void *)&fdr;
     d.queueCreateInfoCount = 1;
     d.pQueueCreateInfos = &q;
     d.pEnabledFeatures = &enabled;
     d.enabledExtensionCount = (uint32_t)dext.size();
     d.ppEnabledExtensionNames = dext.data();
     require(vkCreateDevice(physical, &d, nullptr, &device), "device");
+#ifdef _WIN32
+    volkLoadDevice(device);
+    if (!core13) {
+        vkCmdBeginRendering = vkCmdBeginRenderingKHR;
+        vkCmdEndRendering = vkCmdEndRenderingKHR;
+    }
+#else
+    if (!core13)
+        throw std::runtime_error("Vulkan 1.3 required");
+#endif
     vkGetDeviceQueue(device, family, 0, &queue);
     if (displayTiming) {
         refreshDuration = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
@@ -1264,9 +1647,11 @@ inline bool Context::init(bool withWindow) {
         if (displayTiming)
             fprintf(stderr, "[vulkan] refresh-grid presentation timing enabled\n");
     }
-    push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
+    push = has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
+               ? (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR")
+               : nullptr;
     if (!push)
-        throw std::runtime_error("push descriptors unavailable");
+        fprintf(stderr, "[vulkan] no push descriptors: descriptor sets from per-frame pools\n");
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cp.queueFamilyIndex = family;
     require(vkCreateCommandPool(device, &cp, nullptr, &pool), "command pool");
@@ -1289,7 +1674,7 @@ inline bool Context::init(bool withWindow) {
         bindings[j].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    dl.flags = push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
     dl.bindingCount = 6;
     dl.pBindings = bindings;
     require(vkCreateDescriptorSetLayout(device, &dl, nullptr, &descriptors), "descriptor layout");
@@ -1364,7 +1749,7 @@ inline bool Context::resize() {
         vkDestroySwapchainKHR(device, swap, nullptr);
     swap = VK_NULL_HANDLE;
     int w, h;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    window_pixels(window, w, h);
     if (w <= 0 || h <= 0)
         return false;
     VkSurfaceCapabilitiesKHR caps;
@@ -1442,7 +1827,7 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     // missed frame. Honor the user's launch VSync setting for this swapchain;
     // frame skipping and the game's clock remain under the existing GS policy.
     int w, h;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    window_pixels(window, w, h);
     if (w <= 0 || h <= 0)
         return nullptr;
     if (!swap || (uint32_t)w != extent.width || (uint32_t)h != extent.height)
@@ -1461,7 +1846,19 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     transition(t, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     return t;
 }
+// A GPU timer zone for the scope (closed only in the command buffer that opened it).
+struct GpuZone {
+    Context *c;
+    VkCommandBuffer cb;
+    uint32_t z;
+    GpuZone(Context *ctx, Context::GpuLabel l) : c(ctx), cb(ctx->cmd), z(ctx->gpu_begin(l)) {}
+    ~GpuZone() {
+        if (c->recording && c->cmd == cb)
+            c->gpu_end(z);
+    }
+};
 inline bool Context::present() {
+    EOD_ZONE("vk.present");
     auto *t = back[backIndex];
     transition(t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     signalPresent = true;
@@ -1486,7 +1883,6 @@ inline bool Context::present() {
         require(r, "present");
     return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
 }
-} // namespace vkgs
 using ID3D11Texture2D = vkgs::Texture;
 using ID3D11RenderTargetView = vkgs::Texture;
 using ID3D11DepthStencilView = vkgs::Texture;
@@ -1501,3 +1897,5 @@ using ID3D11SamplerState = vkgs::Sampler;
 using ID3D11BlendState = vkgs::Blend;
 using ID3D11DepthStencilState = vkgs::Depth;
 using ID3D11RasterizerState = vkgs::Raster;
+} // namespace vkgs
+using namespace vkgs;

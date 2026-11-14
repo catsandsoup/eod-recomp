@@ -35,6 +35,8 @@ void gs_editor_preview_software_frame(bool offscreen);
 uint64_t gs_drawn_frames();
 // Presents the last image again (with the in-game menu over it) while the game is paused.
 void gs_overlay_redraw();
+// A menu frame drawn while the menu holds the game (tests: screenshots, --frames).
+void gs_menu_hold_frame(uint64_t n);
 // Writes a debug screenshot of the current display to a PPM file.
 bool gs_screenshot(const char *path);
 // replays a GS capture (EOD_GS_DUMP) standalone; returns the exit code

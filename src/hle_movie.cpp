@@ -2,6 +2,7 @@
 // ezmpegstr player (libmpeg + IPU).  With EOD_SKIP_MOVIES=1 movies are
 // skipped the same way the game skips them when it is short of memory.
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 #include "core/cpu.h"
