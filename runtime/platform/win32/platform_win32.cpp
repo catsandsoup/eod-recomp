@@ -24,6 +24,7 @@
 #include "../../ui/overlay.h"
 #include "../platform.h"
 #include "../pad_script.h"
+#include "../../gs/modern_scene.h"
 
 void build_key_map();
 
@@ -154,6 +155,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_F11) toggle_fullscreen();
+        if (wp == VK_F9 && !(lp & (1 << 30))) modern::toggle();  // renderer: modern <-> original
         g_keys[wp & 255] = true;
         return 0;
     case WM_KEYUP:

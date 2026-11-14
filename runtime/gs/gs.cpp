@@ -1,6 +1,7 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
 #include "../vu/scene_capture.h"
 #include "../vu/scene_emit.h"
+#include "modern_scene.h"
 #include "gs.h"
 #include "gs_hw.h"
 
@@ -638,6 +639,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
 void gif_process(int path, const uint8_t *data, uint32_t qwc) {
     if (scene_capture::g_on) scene_capture::gs_packet(path);
     if (scene_emit::g_on) scene_emit::gs_packet(path);
+    if (modern::g_on) modern::gs_packet(path);
     PathState &ps = g_path[path];
     for (uint32_t i = 0; i < qwc; i++) {
         const uint8_t *q = data + i * 16;
@@ -847,7 +849,7 @@ namespace { void editor_preview_capture(uint64_t frame, bool offscreen, bool sof
 // it when it reads state the worker produces.
 namespace {
 
-enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME };
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN };
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -908,6 +910,16 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 }
 
 }  // namespace
+
+// EOD_MODERN commands from the producer, in GS order (modern_scene.h).
+void modern::post_batch(int32_t index) {
+    if (!g_threaded) return gs_batch(index);
+    push_cmd(CMD_MODERN, 0, (uint32_t)index, nullptr, 0);
+}
+void modern::post_draw(Frame *f) {
+    if (!g_threaded) return gs_draw(f);
+    push_cmd(CMD_MODERN, 1, 0, &f, sizeof f);
+}
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
 void gs_frame_end(uint64_t frame, int aspect) {
@@ -1105,12 +1117,12 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
         // Presentation-only markers are not part of the portable GS capture format.
-        if (live && h[0] != CMD_EDITOR_RACE_FRAME && g_cold_zip) {
+        if (live && h[0] != CMD_EDITOR_RACE_FRAME && h[0] != CMD_MODERN && g_cold_zip) {
             if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
             else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
                 close_cold_zip("stopped at compressed limit or write error");
         }
-        if (live && g_dump) {
+        if (live && g_dump && h[0] != CMD_MODERN) {
             // Never let a diagnostic boot trace grow without a bound. Close at
             // a command boundary so even a size-limited trace stays parseable.
             if (g_cold_dump && g_cold_dump_bytes + len > 256ull * 1024 * 1024) {
@@ -1130,6 +1142,16 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
             break;
         case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
+        case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer
+            if (!live) break;
+            if (h[1] == 0) {
+                modern::gs_batch((int32_t)h[2]);
+            } else {
+                modern::Frame *f;
+                memcpy(&f, d, sizeof f);
+                modern::gs_draw(f);
+            }
+            break;
         case CMD_PRIV: {
             uint64_t v;
             memcpy(&v, d, 8);

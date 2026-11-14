@@ -13,6 +13,7 @@
 
 #include "gs_env.h"
 #include "gs_state.h"
+#include "modern_scene.h"
 
 namespace gs {
 namespace hw {
@@ -75,6 +76,17 @@ void vblank();
 void reset();
 // Submits everything and waits for the GPU (replay timing).
 void finish();
+// EOD_MODERN (modern_scene.h): the texture and blend state of a replaced batch, and the
+// modern pass of a frame into the current frame buffer (takes ownership).
+#ifdef _WIN32
+void modern_texture(int32_t batch, const Env &e);
+void modern_draw(modern::Frame *f);
+void modern_alpha(int32_t batch, uint32_t alpha);
+#else
+inline void modern_alpha(int32_t, uint32_t) {}
+inline void modern_texture(int32_t, const Env &) {}
+inline void modern_draw(modern::Frame *f) { delete f; }
+#endif
 // Statistics line for the log (draw calls, uploads, conversions per frame).
 void stats_line(char *buf, size_t size);
 

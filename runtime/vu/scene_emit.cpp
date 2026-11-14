@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "../core/log.h"
+#include "../gs/modern_scene.h"
 #include "vu.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
@@ -46,7 +47,15 @@ const uint64_t g_count = env_u64("EOD_SCENE_EMIT_N", ~0ull);
 const uint64_t g_verify = env_u64("EOD_SCENE_EMIT_VERIFY", ~0ull);
 const bool g_nowrite = env_u64("EOD_SCENE_EMIT_NOWRITE", 0) != 0;
 const bool g_all = env_u64("EOD_SCENE_EMIT_ALL", 0) != 0;  // diagnostic: every program with the batch layout
-bool in_range(uint64_t f) { return f >= g_from && f - g_from < g_count; }
+// EOD_MODERN=1: also feed the modern renderer live (read here directly: the
+// static initialisation order across files is not defined)
+const bool g_modern = [] {
+    const char *v = getenv("EOD_MODERN");
+    return v && *v && strcmp(v, "0") != 0;
+}();
+const bool g_write = g_path && *g_path && !g_nowrite;
+bool emit_range(uint64_t f) { return g_path && *g_path && f >= g_from && f - g_from < g_count; }
+bool in_range(uint64_t f) { return g_modern || emit_range(f); }
 
 constexpr uint32_t fourcc(const char (&s)[5]) {
     return (uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24;
@@ -79,7 +88,19 @@ struct Batch {
     uint64_t geom;
     float mvp[16];  // column-major: column c = vf[4 + c]
     float q17[4], vf12[4];
+    int32_t mi;  // index in the modern frame (-1: not replaced)
 };
+
+// modern feed (producer)
+modern::Frame *g_mf;
+bool g_triggered;      // this frame's modern pass is queued
+bool g_live;           // the modern renderer draws this frame (latched at the vblank)
+int32_t g_marker = -1; // last batch marker sent to the GS
+void mark(int32_t i) {
+    if (i == g_marker) return;
+    g_marker = i;
+    modern::post_batch(i);
+}
 
 // ---- producer state
 FILE *g_f;
@@ -136,6 +157,9 @@ bool decode(const VUState *vu, uint32_t top, uint32_t n, uint64_t id) {
     memcpy(off, qword(vu, top + 199), 16);
     memcpy(uvo, qword(vu, top + 198), 16);
     size_t at = g_out.size();
+    modern::Mesh mesh;
+    mesh.id = id;
+    if (g_modern) mesh.v.resize(n);
     rec(fourcc("GEOM"), 16 + n * 24);
     uint32_t hdr[2] = {n, 0};
     put(&id, 8);
@@ -159,6 +183,24 @@ bool decode(const VUState *vu, uint32_t top, uint32_t n, uint64_t id) {
         a[3] = (uint8_t)(((w & 0x8000) || w == 0x80) | (normal ? 2 : 0));
         put(v, 20);
         put(a, 4);
+        if (g_modern) {
+            modern::Vertex &mv = mesh.v[k];
+            memcpy(mv.p, v, 12);
+            memcpy(mv.uv, v + 3, 8);
+            for (int i = 0; i < 3; i++) {
+                mv.n[i] = normal ? (int8_t)a[i] : 0;
+                mv.c[i] = normal ? 0x80 : a[i];
+            }
+            mv.n[3] = normal ? 127 : 0;
+            mv.c[3] = 0x80;
+            // strip: a triangle ends at every vertex without ADC (no culling, so winding is free)
+            if (k >= 2 && !(a[3] & 1)) mesh.idx.insert(mesh.idx.end(), {k - 2, k - 1, k});
+        }
+    }
+    if (!g_write) g_out.resize(at);  // only the modern feed wants it
+    if (g_modern) {
+        if (!g_mf) g_mf = new modern::Frame();
+        g_mf->meshes.push_back(std::move(mesh));
     }
     return true;
 }
@@ -210,10 +252,8 @@ void world_dir(const double M[4][4], const float *v, float *out) {
     out[3] = v[3];
 }
 
-// End of a frame: camera vote, model matrices, records, write.
-void flush_frame() {
-    finish_pending();
-    // camera = the most common x/y/w rows (rounded to 0.01)
+// camera = the most common x/y/w rows (rounded to 0.01); SIZE_MAX if none
+size_t camera_vote() {
     std::unordered_map<uint64_t, std::pair<uint32_t, size_t>> votes;
     size_t best = SIZE_MAX;
     uint32_t best_n = 0;
@@ -225,6 +265,68 @@ void flush_frame() {
         if (v.first++ == 0) v.second = i;
         if (v.first > best_n) best_n = v.first, best = v.second;
     }
+    return best;
+}
+
+void model_of(const Batch &b, const double cinv[4][4], double M[4][4]) {
+    double bx[4][4];
+    xyw(b.mvp, bx);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            double s = 0;
+            for (int k = 0; k < 4; k++) s += cinv[r][k] * bx[k][c];
+            M[r][c] = s;
+        }
+}
+
+// The modern frame so far: camera, model matrices, roles, layers; queued for the GS.
+void post_modern() {
+    if (!g_mf) g_mf = new modern::Frame();
+    modern::Frame *f = g_mf;
+    g_mf = nullptr;
+    mark(-1);
+    const size_t best = camera_vote();
+    double cam[4][4], cinv[4][4];
+    if (best == SIZE_MAX || f->batches.empty() || (xyw(g_batches[best].mvp, cam), !invert4(cam, cinv))) {
+        f->batches.clear();
+        modern::post_draw(f);  // (the meshes still go to the backend cache)
+        return;
+    }
+    memcpy(f->cam, g_batches[best].mvp, 64);
+    std::vector<uint64_t> zrows;  // world layers in order of first appearance
+    for (const Batch &b : g_batches) {
+        if (b.mi < 0) continue;
+        modern::Batch &m = f->batches[(size_t)b.mi];
+        double M[4][4];
+        model_of(b, cinv, M);
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 4; c++) m.model[r * 4 + c] = (float)M[r][c];
+        world_dir(M, b.q17, m.light);
+        double dev = 0, rot = 0;
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) dev = std::max(dev, std::fabs(M[r][c] - (r == c)));
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) rot = std::max(rot, std::fabs(M[r][c] - (r == c)));
+        m.role = dev < 1e-3 ? modern::WORLD : (b.itop == 0x280 && rot < 1e-3) ? modern::SKY : modern::OBJECT;
+        m.layer = 0;
+        if (m.role == modern::WORLD) {
+            uint64_t z = 0;
+            for (int c = 0; c < 4; c++) z = mix(z, (uint64_t)(int64_t)std::llround(b.mvp[c * 4 + 2] * 16.0));
+            auto it = std::find(zrows.begin(), zrows.end(), z);
+            m.layer = (uint32_t)(it - zrows.begin());
+            if (it == zrows.end()) zrows.push_back(z);
+        }
+    }
+    modern::post_draw(f);
+}
+
+// End of a frame: camera vote, model matrices, records, write.
+void flush_frame() {
+    finish_pending();
+    if (g_modern && !g_triggered) post_modern();
+    g_triggered = false;
+    if (g_modern) mark(-1);
+    const size_t best = camera_vote();
     double cam[4][4], cinv[4][4];
     const bool have_cam = best != SIZE_MAX && (xyw(g_batches[best].mvp, cam), invert4(cam, cinv));
     if (have_cam) {
@@ -234,14 +336,8 @@ void flush_frame() {
     }
     for (const Batch &b : g_batches) {
         if (!have_cam) break;
-        double bx[4][4], M[4][4];
-        xyw(b.mvp, bx);
-        for (int r = 0; r < 4; r++)
-            for (int c = 0; c < 4; c++) {
-                double s = 0;
-                for (int k = 0; k < 4; k++) s += cinv[r][k] * bx[k][c];
-                M[r][c] = s;
-            }
+        double M[4][4];
+        model_of(b, cinv, M);
         float model[12], light[4], dir2[4];
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 4; c++) model[r * 4 + c] = (float)M[r][c];
@@ -262,7 +358,7 @@ void flush_frame() {
     put(counts, 8);
     put(&g_ns, 8);  // the frame's cost before the write (the write is timed below)
     uint64_t t = now_ns();
-    if (!g_nowrite) {
+    if (g_write && emit_range(g_frame)) {
         if (!g_f && !g_open_failed) {
             g_f = fopen(g_path, "wb");
             if (!g_f) {
@@ -282,13 +378,22 @@ void flush_frame() {
 }
 }  // namespace
 
-bool g_on = g_path && *g_path;
+bool g_on = (g_path && *g_path) || g_modern;
 
 void vu1_start(const VUState *vu, uint32_t pc) {
     if (!g_frame_active) return;
     const uint64_t t = now_ns();
     finish_pending();
     g_run++;
+    // the HUD: the modern pass goes into the frame buffer before it (docs/SCENE_CAPTURE.md section 4)
+    // (the same program also draws camera-space batches in that mode earlier in the frame; the HUD's
+    // matrix faces the screen: its w row is (0, 0, 1, 365), with no x or y term)
+    const bool hud = pc == 0x270 && g_vif1_itop == 0x200 && vu->vf[4].f[3] == 0.0f && vu->vf[5].f[3] == 0.0f;
+    if (g_live && hud && !g_triggered) {
+        post_modern();
+        g_triggered = true;
+    }
+    bool replaced = false;
     if (geometry_program(pc)) {
         const uint32_t top = g_vif1_top;
         const uint32_t n = *(const uint32_t *)qword(vu, top) & 0x7FFF;
@@ -322,18 +427,36 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                 for (int c = 0; c < 4; c++) memcpy(b.mvp + c * 4, vu->vf[4 + c].f, 16);
                 memcpy(b.q17, qword(vu, 17), 16);
                 memcpy(b.vf12, vu->vf[12].f, 16);
+                b.mi = -1;
+                // the sky dome (0x270 in ITOP mode 0x280) stays with the GS: the modern pass starts from it
+                const bool sky_dome = pc == 0x270 && b.itop == 0x280;
+                if (g_live && !hud && !sky_dome && !g_triggered) {
+                    if (!g_mf) g_mf = new modern::Frame();
+                    b.mi = (int32_t)g_mf->batches.size();
+                    modern::Batch m = {};
+                    m.mesh = id;
+                    m.pc = pc;
+                    m.itop = b.itop;
+                    g_mf->batches.push_back(m);
+                    mark(b.mi);
+                    replaced = true;
+                }
                 g_batches.push_back(b);
                 g_pending = true;
             }
         }
     }
+    if (g_modern && !replaced) mark(-1);
     g_ns += now_ns() - t;
 }
 
 void gif(int path, const uint8_t *data, uint32_t qwc) {
     if (!g_frame_active || path != 1) return;
     g_kicks++;
-    if (g_pending) g_batches.back().kicks++;
+    if (g_pending) {
+        g_batches.back().kicks++;
+        if (g_mf && g_batches.back().mi >= 0) g_mf->batches[(size_t)g_batches.back().mi].drawn = true;
+    }
     if (g_frame >= g_verify && g_frame - g_verify < 4) {  // a few vblanks: the game draws every 2-3
         const uint64_t t = now_ns();
         rec(fourcc("KICK"), 8 + qwc * 16);
@@ -351,9 +474,14 @@ void vblank(uint64_t frame) {
     // GS side and --screenshot-every count it)
     g_frame = frame + 1;
     g_frame_active = in_range(g_frame);
+    if (g_modern) {
+        static const uint64_t flip = env_u64("EOD_MODERN_FLIP_EVERY", 0);  // diagnosis: alternate renderers
+        if (flip && g_frame % flip == 0) modern::toggle();
+        g_live = modern::live();
+    }
     g_kicks = g_run = g_new_geoms = 0;
     g_ns = 0;
-    if (!g_frame_active && g_f && g_frame > g_from) {
+    if (!emit_range(g_frame) && g_f && g_frame > g_from) {
         fclose(g_f);
         g_f = nullptr;
         fprintf(stderr, "[scene-emit] wrote %s\n", g_path);
@@ -384,7 +512,7 @@ void gs_vblank(uint64_t frame, uint64_t fogcol) {
         tput(&g_gs_frame, 8);
         tput(&fogcol, 8);
         tput(&g_gs_ns, 8);
-        if (!g_nowrite) {
+        if (g_write) {
             if (!g_tex && !g_tex_failed) {
                 std::string p = std::string(g_path) + ".tex";
                 g_tex = fopen(p.c_str(), "wb");
@@ -402,7 +530,7 @@ void gs_vblank(uint64_t frame, uint64_t fogcol) {
     }
     // gs_frame_end(frame) closes frame `frame`; the next one is frame + 1
     g_gs_frame = frame + 1;
-    g_gs_active = in_range(g_gs_frame);
+    g_gs_active = emit_range(g_gs_frame);
     g_gs_kicks = 0;
     g_gs_ns = 0;
     if (!g_gs_active && g_tex && g_gs_frame > g_from) {

@@ -1,0 +1,774 @@
+// modern_d3d11.inc - the EOD_MODERN pass (modern_scene.h), included at the end of
+// gs_d3d11.cpp inside gs::hw so it shares the device, the surfaces and the
+// texture cache. It draws the frame's sky, world and objects from the decoded
+// batches at the internal resolution with 4x MSAA and 16x anisotropic filtering:
+// linear-space lighting from the game's own light direction, a sun shadow map,
+// glossy car paint (specular + sky reflection with Fresnel), distance haze in the
+// game's fog colour and filmic tone mapping. The result is resolved into the
+// game's frame buffer before the GS draws the HUD on top.
+
+namespace {
+
+const char k_modern_hlsl[] = R"(
+cbuffer Frame : register(b0) {
+    float4 clip_x, clip_y, clip_w;  // world -> clip rows (z is set below)
+    float4 params;                  // x near, y shadow texel, z haze distance, w exposure
+    float4 cam_pos;                 // world camera position
+    float4 up;                      // world up
+    float4 sh_x, sh_y, sh_z;        // world -> shadow map rows
+    float4 fog;                     // fog colour (gamma)
+    float4 sun;                     // world direction to the sun, w ambient
+};
+cbuffer Batch : register(b1) {
+    float4 m0, m1, m2;   // model rows
+    float4 light;        // world direction, w = ambient (VU1 qword 17)
+    float4 info;         // x role (0 sky, 1 world, 2 object), y layer, z textured, w gloss
+    float4 info2;        // x 1: an additive/subtractive GS layer (unlit, as the game draws it), y vertex alpha,
+                         // z alpha from the vertex only
+    float4 atest;        // the GS alpha test: x method (-1 off), y reference (GS units), z discard on fail
+};
+Texture2D tex : register(t0);
+Texture2D<float> shadow_map : register(t1);
+SamplerState smp : register(s0);
+SamplerComparisonState shadow_smp : register(s1);
+struct VIn {
+    float3 p : POSITION;
+    float2 uv : TEXCOORD;
+    float4 n : NORMAL;
+    float4 c : COLOR;
+};
+struct VOut {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+    float3 n : TEXCOORD1;
+    float3 wp : TEXCOORD2;
+    float4 c : COLOR;
+};
+float4 world(float3 p) {
+    float4 q = float4(p, 1);
+    return float4(dot(m0, q), dot(m1, q), dot(m2, q), 1);
+}
+VOut vs_modern(VIn i) {
+    VOut o;
+    float4 w = world(i.p);
+    float4 c;
+    c.x = dot(clip_x, w);
+    c.y = dot(clip_y, w);
+    c.w = dot(clip_w, w);
+    // reverse depth: depth = near / w (later world layers a little nearer); the sky is farthest
+    c.z = info.x == 0 ? 0 : params.x * (1 + info.y * 2e-5);
+    o.pos = c;
+    o.uv = i.uv;
+    o.n = float3(dot(m0.xyz, i.n.xyz), dot(m1.xyz, i.n.xyz), dot(m2.xyz, i.n.xyz));
+    o.wp = w.xyz;
+    o.c = float4(i.c.rgb * (255.0 / 128.0), i.n.w);  // a: normal present
+    return o;
+}
+struct SOut {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+SOut vs_shadow(VIn i) {
+    SOut o;
+    float4 w = world(i.p);
+    o.pos = float4(dot(sh_x, w), dot(sh_y, w), dot(sh_z, w), 1);
+    o.uv = i.uv;
+    return o;
+}
+void ps_shadow(SOut i) {
+    if (info.z > 0 && tex.Sample(smp, i.uv).a * (255.0 / 128.0) < 0.5) discard;
+}
+float3 lin(float3 c) { return pow(saturate(c), 2.2); }
+// the GS frame so far (the game's own sky), copied into the multisampled target
+Texture2D<float4> gs_frame : register(t2);
+float4 vs_full(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps_full(float4 pos : SV_Position) : SV_Target {
+    return float4(gs_frame.Load(int3(pos.xy, 0)).rgb, 128.0 / 255.0);
+}
+float3 aces(float3 x) { return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)); }
+float shadow_at(float3 wp, float3 n) {
+    float4 w = float4(wp + n * 0.02, 1);
+    float3 s = float3(dot(sh_x, w), dot(sh_y, w), dot(sh_z, w));
+    float2 uv = float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
+    if (any(uv < 0) || any(uv > 1) || s.z > 1) return 1;
+    float sum = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++)
+            sum += shadow_map.SampleCmpLevelZero(shadow_smp, uv + float2(x, y) * params.y, s.z - 0.0015);
+    return sum / 9;
+}
+float3 sky_env(float3 r) {
+    float h = saturate(dot(r, up.xyz));
+    float3 horizon = lin(fog.rgb), zenith = float3(0.16, 0.32, 0.62);
+    return lerp(horizon, zenith, sqrt(h)) * (dot(r, up.xyz) < 0 ? 0.35 : 1.0);
+}
+float4 ps_modern(VOut i) : SV_Target {
+    float4 t = info.z > 0 ? tex.Sample(smp, i.uv) : float4(0.75, 0.75, 0.75, 128.0 / 255.0);
+    // the GS alpha test on the source alpha (GS units: 0x80 = 1.0), as the game sets it per batch
+    float as_gs = info2.z > 0 ? info2.y * 128 : t.a * 255 * info2.y;
+    if (atest.x >= 0 && atest.z > 0) {
+        float r = atest.y;
+        int m = (int)atest.x;
+        bool ok = m == 1 || (m == 2 && as_gs < r) || (m == 3 && as_gs <= r) || (m == 4 && abs(as_gs - r) < 0.5) ||
+                    (m == 5 && as_gs >= r) || (m == 6 && as_gs > r) || (m == 7 && abs(as_gs - r) >= 0.5);
+        if (!ok) discard;
+    }
+    t.a = saturate(as_gs / 128.0);
+    if (atest.x < 0 && t.a < (info.x == 2 && info2.y >= 0.99 ? 0.5 : 0.02)) discard;
+    if (info.x == 0 || info2.x > 0) return float4(t.rgb * (i.c.a > 0.5 ? 1 : i.c.rgb), t.a);  // as authored
+    float3 albedo = lin(t.rgb);
+    float3 V = normalize(cam_pos.xyz - i.wp);
+    float3 L = normalize(sun.xyz);
+    float3 sun_col = float3(1.0, 0.94, 0.84) * 1.7;
+    float3 col;
+    if (i.c.a > 0.5) {
+        float3 n = normalize(i.n);
+        if (dot(n, V) < 0) n = -n;  // two-sided
+        float sh = shadow_at(i.wp, n);
+        float nl = saturate(dot(n, L));
+        float hemi = dot(n, up.xyz) * 0.5 + 0.5;
+        float3 ambient = lerp(lin(fog.rgb) * 0.3, float3(0.30, 0.38, 0.55), hemi) * (0.5 + sun.w);
+        col = albedo * (sun_col * nl * sh + ambient);
+        if (fog.w > 0) return float4(sh, nl, 0, 1);  // EOD_MODERN_DEBUG: red = lit by the sun, green = facing it
+        float gloss = info.w;
+        if (gloss > 0) {
+            float3 h = normalize(L + V);
+            float spec = pow(saturate(dot(n, h)), 16 + 240 * gloss) * (2 + 30 * gloss) * gloss;
+            float fres = 0.04 + 0.96 * pow(1 - saturate(dot(n, V)), 5);
+            col += sun_col * spec * nl * sh * 0.25;
+            col = lerp(col, sky_env(reflect(-V, n)) * (0.5 + 0.5 * sh), fres * gloss * 0.6);
+        }
+    } else {
+        // baked lighting (the world's vertex colours) under the sun shadow
+        float sh = shadow_at(i.wp, up.xyz);
+        col = albedo * lin(i.c.rgb) * 1.35 * (0.5 + 0.5 * sh);
+        if (fog.w > 0) return float4(sh, 0, 1, 1);
+    }
+    float dist = length(i.wp - cam_pos.xyz);
+    float haze = 1 - exp(-dist / params.z);
+    col = lerp(col, lerp(lin(fog.rgb), float3(0.45, 0.55, 0.75), 0.4), haze * 0.35);
+    col = aces(col * params.w);
+    return float4(pow(col, 1 / 2.2), t.a);
+}
+)";
+
+struct MeshGpu {
+    ID3D11Buffer *vb = nullptr, *ib = nullptr;
+    UINT count = 0;
+};
+std::unordered_map<uint64_t, MeshGpu> g_mmesh;
+std::vector<ID3D11ShaderResourceView *> g_mtex;  // this frame's batch textures (one reference each)
+ID3D11VertexShader *g_mvs, *g_mvs_shadow, *g_mvs_full;
+ID3D11PixelShader *g_mps, *g_mps_shadow, *g_mps_full;
+ID3D11InputLayout *g_mlayout;
+ID3D11Buffer *g_mcb_frame, *g_mcb_batch;
+ID3D11SamplerState *g_msampler, *g_mshadow_smp;
+ID3D11BlendState *g_mblend;
+ID3D11DepthStencilState *g_mds_sky, *g_mds_draw, *g_mds_shadow;
+ID3D11RasterizerState *g_mrs, *g_mrs_shadow;
+ID3D11Texture2D *g_mcolor, *g_mdepth, *g_mresolve, *g_mshadow;
+ID3D11RenderTargetView *g_mrtv;
+ID3D11DepthStencilView *g_mdsv, *g_mshadow_dsv;
+ID3D11ShaderResourceView *g_mshadow_srv;
+constexpr int kShadowSize = 2048;
+int g_mw, g_mh;
+UINT g_msamples = 4;
+bool g_mready, g_mfailed;
+
+struct ModernFrameCB {
+    float clip_x[4], clip_y[4], clip_w[4], params[4], cam_pos[4], up[4], sh_x[4], sh_y[4], sh_z[4], fog[4], sun[4];
+};
+struct ModernBatchCB {
+    float m[12], light[4], info[4], info2[4], atest[4];
+};
+std::vector<uint32_t> g_matest;  // per batch: ate | atst << 1 | afail << 4 | aref << 8
+// per batch of this frame: the GS blend (abe | a << 1 | b << 3 | c << 5 | d << 7 | fix << 9), ~0 unknown
+std::vector<uint32_t> g_mblend_key;
+std::vector<uint64_t> g_malpha;  // per batch: vertex alpha sum << 24 | draws
+std::unordered_map<uint32_t, ID3D11BlendState *> g_mblend_cache;
+
+// The GS blend (A - B) * C + D (A, B, D: 0 Cs, 1 Cd, 2 zero; C: 0 As, 1 Ad, 2 FIX) as a D3D11 blend
+// state. raw: the layer is drawn unlit (add / subtract layers). Ad is taken as 1.0 (the modern
+// target's alpha is the constant 0x80). The alpha channel always gets the blend factor's alpha.
+ID3D11BlendState *modern_blend(uint32_t key, bool &raw) {
+    raw = false;
+    if (key != ~0u && !(key & 1)) {  // the game draws it without blending
+        static ID3D11BlendState *opaque = [] {
+            D3D11_BLEND_DESC bl = {};
+            bl.RenderTarget[0].BlendEnable = TRUE;
+            bl.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+            bl.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+            bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
+            bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+            bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            ID3D11BlendState *b = nullptr;
+            g_dev->CreateBlendState(&bl, &b);
+            return b;
+        }();
+        return opaque;
+    }
+    if (key == ~0u) key = 1 | 0 << 1 | 1 << 3 | 0 << 5 | 1 << 7;  // unknown: (Cs - Cd) * As + Cd
+    const int A = (key >> 1) & 3, B = (key >> 3) & 3, C = (key >> 5) & 3, D = (key >> 7) & 3;
+    const uint32_t ck = key & 0x1FF;
+    auto it = g_mblend_cache.find(ck);
+    D3D11_BLEND c = C == 0 ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_BLEND_FACTOR;
+    D3D11_BLEND ic = C == 0 ? D3D11_BLEND_INV_SRC_ALPHA : D3D11_BLEND_INV_BLEND_FACTOR;
+    D3D11_BLEND sf = c, df = ic;
+    D3D11_BLEND_OP op = D3D11_BLEND_OP_ADD;
+    if (A == 0 && B == 1 && D == 1) {  // mix
+    } else if (A == 0 && B == 2 && D == 1) {  // add
+        df = D3D11_BLEND_ONE;
+        raw = true;
+    } else if (A == 2 && B == 0 && D == 1) {  // subtract
+        df = D3D11_BLEND_ONE;
+        op = D3D11_BLEND_OP_REV_SUBTRACT;
+        raw = true;
+    } else if (A == 1 && B == 0 && D == 0) {  // reverse mix
+        sf = ic;
+        df = c;
+    } else if (A == 0 && B == 2 && D == 2) {  // scaled source
+        df = D3D11_BLEND_ZERO;
+    }
+    if (it != g_mblend_cache.end()) return it->second;
+    D3D11_BLEND_DESC bl = {};
+    bl.RenderTarget[0].BlendEnable = TRUE;
+    bl.RenderTarget[0].SrcBlend = sf;
+    bl.RenderTarget[0].DestBlend = df;
+    bl.RenderTarget[0].BlendOp = op;
+    bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
+    bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11BlendState *bs = nullptr;
+    CHECK(g_dev->CreateBlendState(&bl, &bs));
+    g_mblend_cache[ck] = bs;
+    return bs;
+}
+
+bool modern_init() {
+    if (g_mready || g_mfailed) return g_mready;
+    g_mfailed = true;
+    typedef HRESULT(WINAPI * Compile_t)(LPCVOID, SIZE_T, LPCSTR, const void *, void *, LPCSTR, LPCSTR, UINT, UINT,
+                                        ID3DBlob **, ID3DBlob **);
+    Compile_t compile = nullptr;
+    for (const char *d : {"d3dcompiler_47.dll", "d3dcompiler_46.dll", "d3dcompiler_43.dll"})
+        if (HMODULE m = LoadLibraryA(d))
+            if ((compile = (Compile_t)GetProcAddress(m, "D3DCompile"))) break;
+    if (!compile) {
+        WARN("modern renderer: no shader compiler (d3dcompiler_47.dll)");
+        return false;
+    }
+    struct Entry {
+        const char *name, *target;
+        ID3DBlob *blob;
+    } e[6] = {{"vs_modern", "vs_4_0", nullptr}, {"ps_modern", "ps_4_0", nullptr}, {"vs_shadow", "vs_4_0", nullptr},
+              {"ps_shadow", "ps_4_0", nullptr},   {"vs_full", "vs_4_0", nullptr},   {"ps_full", "ps_4_0", nullptr}};
+    for (Entry &x : e) {
+        ID3DBlob *err = nullptr;
+        if (FAILED(compile(k_modern_hlsl, sizeof k_modern_hlsl - 1, "modern.hlsl", nullptr, nullptr, x.name, x.target,
+                           1 << 15 /* OPTIMIZATION_LEVEL3 */, 0, &x.blob, &err))) {
+            fprintf(stderr, "[modern] shader %s: %s\n", x.name, err ? (const char *)err->GetBufferPointer() : "?");
+            return false;
+        }
+    }
+    CHECK(g_dev->CreateVertexShader(e[0].blob->GetBufferPointer(), e[0].blob->GetBufferSize(), nullptr, &g_mvs));
+    CHECK(g_dev->CreatePixelShader(e[1].blob->GetBufferPointer(), e[1].blob->GetBufferSize(), nullptr, &g_mps));
+    CHECK(g_dev->CreateVertexShader(e[2].blob->GetBufferPointer(), e[2].blob->GetBufferSize(), nullptr, &g_mvs_shadow));
+    CHECK(g_dev->CreatePixelShader(e[3].blob->GetBufferPointer(), e[3].blob->GetBufferSize(), nullptr, &g_mps_shadow));
+    CHECK(g_dev->CreateVertexShader(e[4].blob->GetBufferPointer(), e[4].blob->GetBufferSize(), nullptr, &g_mvs_full));
+    CHECK(g_dev->CreatePixelShader(e[5].blob->GetBufferPointer(), e[5].blob->GetBufferSize(), nullptr, &g_mps_full));
+    D3D11_INPUT_ELEMENT_DESC il[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R8G8B8A8_SNORM, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    CHECK(g_dev->CreateInputLayout(il, 4, e[0].blob->GetBufferPointer(), e[0].blob->GetBufferSize(), &g_mlayout));
+    for (Entry &x : e) x.blob->Release();
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    bd.ByteWidth = sizeof(ModernFrameCB);
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_mcb_frame));
+    bd.ByteWidth = sizeof(ModernBatchCB);
+    CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_mcb_batch));
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_ANISOTROPIC;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.MaxAnisotropy = 16;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    CHECK(g_dev->CreateSamplerState(&sd, &g_msampler));
+    sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+    sd.BorderColor[0] = sd.BorderColor[1] = sd.BorderColor[2] = sd.BorderColor[3] = 1.0f;
+    sd.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+    sd.MaxAnisotropy = 1;
+    CHECK(g_dev->CreateSamplerState(&sd, &g_mshadow_smp));
+    D3D11_BLEND_DESC bl = {};
+    bl.RenderTarget[0].BlendEnable = TRUE;
+    bl.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    // the frame buffer's alpha is the GS's 0x80 (1.0): the blend factor's alpha
+    bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
+    bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    CHECK(g_dev->CreateBlendState(&bl, &g_mblend));
+    D3D11_DEPTH_STENCIL_DESC dd = {};
+    dd.DepthEnable = TRUE;
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    CHECK(g_dev->CreateDepthStencilState(&dd, &g_mds_sky));
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dd.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    CHECK(g_dev->CreateDepthStencilState(&dd, &g_mds_draw));
+    dd.DepthFunc = D3D11_COMPARISON_LESS;
+    CHECK(g_dev->CreateDepthStencilState(&dd, &g_mds_shadow));
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    rd.MultisampleEnable = TRUE;
+    CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs));
+    rd.MultisampleEnable = FALSE;
+    rd.DepthBias = 200;
+    rd.SlopeScaledDepthBias = 2.0f;
+    rd.DepthBiasClamp = 0.01f;
+    CHECK(g_dev->CreateRasterizerState(&rd, &g_mrs_shadow));
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = td.Height = kShadowSize;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32_TYPELESS;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_mshadow));
+    if (g_mshadow) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv = {};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        CHECK(g_dev->CreateDepthStencilView(g_mshadow, &dv, &g_mshadow_dsv));
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = DXGI_FORMAT_R32_FLOAT;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        CHECK(g_dev->CreateShaderResourceView(g_mshadow, &sv, &g_mshadow_srv));
+    }
+    UINT q = 0;
+    while (g_msamples > 1 && (FAILED(g_dev->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, g_msamples, &q)) || !q))
+        g_msamples /= 2;
+    g_mready = g_mvs && g_mps && g_mvs_shadow && g_mps_shadow && g_mvs_full && g_mps_full && g_mlayout && g_mcb_frame && g_mcb_batch && g_msampler &&
+               g_mshadow_smp && g_mblend && g_mds_sky && g_mds_draw && g_mds_shadow && g_mrs && g_mrs_shadow &&
+               g_mshadow_dsv && g_mshadow_srv;
+    g_mfailed = !g_mready;
+    if (g_mready)
+        fprintf(stderr, "[modern] renderer ready: %ux MSAA, 16x anisotropic, %d sun shadow map, scale %d\n", g_msamples,
+                kShadowSize, g_scale);
+    return g_mready;
+}
+
+bool modern_targets(int w, int h) {
+    if (g_mcolor && g_mw == w && g_mh == h) return true;
+    release(g_mrtv);
+    release(g_mdsv);
+    release(g_mcolor);
+    release(g_mdepth);
+    release(g_mresolve);
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)w;
+    td.Height = (UINT)h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = g_msamples;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_mcolor)))) return false;
+    CHECK(g_dev->CreateRenderTargetView(g_mcolor, nullptr, &g_mrtv));
+    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_mdepth)))) return false;
+    CHECK(g_dev->CreateDepthStencilView(g_mdepth, nullptr, &g_mdsv));
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = 0;
+    if (FAILED(CHECK(g_dev->CreateTexture2D(&td, nullptr, &g_mresolve)))) return false;
+    g_mw = w;
+    g_mh = h;
+    return g_mrtv && g_mdsv;
+}
+
+void modern_upload(const modern::Mesh &m) {
+    if (m.idx.empty() || g_mmesh.count(m.id)) return;
+    MeshGpu g;
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.ByteWidth = (UINT)(m.v.size() * sizeof(modern::Vertex));
+    D3D11_SUBRESOURCE_DATA init = {m.v.data(), 0, 0};
+    if (FAILED(CHECK(g_dev->CreateBuffer(&bd, &init, &g.vb)))) return;
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    bd.ByteWidth = (UINT)(m.idx.size() * 4);
+    init.pSysMem = m.idx.data();
+    if (FAILED(CHECK(g_dev->CreateBuffer(&bd, &init, &g.ib)))) {
+        release(g.vb);
+        return;
+    }
+    g.count = (UINT)m.idx.size();
+    g_mmesh.emplace(m.id, g);
+}
+
+void modern_release_textures() {
+    for (ID3D11ShaderResourceView *&s : g_mtex) release(s);
+    g_mtex.clear();
+    g_mblend_key.clear();
+    g_malpha.clear();
+    g_matest.clear();
+}
+
+// gloss of the car body passes (paint, detail, damage) and other objects
+float modern_gloss(const modern::Batch &b) {
+    switch (b.pc) {
+    case 0x2e0: return 0.45f;
+    case 0xd48: return 0.2f;
+    case 0x15a8: return 0.1f;
+    }
+    return b.role == modern::OBJECT ? 0.08f : 0.0f;
+}
+
+void norm3(float *v) {
+    const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 0)
+        for (int i = 0; i < 3; i++) v[i] /= l;
+}
+float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+void cross3(const float *a, const float *b, float *o) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass, std::initializer_list<uint32_t> roles,
+                    uint32_t &drawn) {
+    D3D11_MAPPED_SUBRESOURCE mp;
+    for (uint32_t role : roles) {
+        if (!shadow_pass) g_ctx->OMSetDepthStencilState(role == modern::SKY ? g_mds_sky : g_mds_draw, 0);
+        for (size_t i = 0; i < f.batches.size(); i++) {
+            const modern::Batch &b = f.batches[i];
+            if (b.role != role || !b.drawn) continue;
+            static const uint32_t skip_pc = getenv("EOD_MODERN_SKIP") ? (uint32_t)strtoul(getenv("EOD_MODERN_SKIP"), nullptr, 16) : 0;
+            if (b.pc == skip_pc) continue;
+            // the car body passes: the game drives their alpha per vertex (damage); a per-batch value
+            // cannot stand in for it, so the damage overlay waits for per-vertex alpha
+            const bool car = b.pc == 0x2e0 || b.pc == 0xd48 || b.pc == 0x15a8;
+            if (b.pc == 0x15a8) continue;
+            auto it = g_mmesh.find(b.mesh);
+            if (it == g_mmesh.end()) continue;
+            ID3D11ShaderResourceView *srv = i < g_mtex.size() ? g_mtex[i] : nullptr;
+            memcpy(bc.m, b.model, 48);
+            memcpy(bc.light, b.light, 16);
+            bc.info[0] = (float)b.role;
+            bc.info[1] = (float)b.layer;
+            bc.info[2] = srv ? 1.0f : 0.0f;
+            bc.info[3] = modern_gloss(b);
+            const uint32_t key = i < g_mblend_key.size() ? g_mblend_key[i] : ~0u;
+            bool raw = false;
+            if (!shadow_pass && role != modern::SKY) {
+                ID3D11BlendState *bs = modern_blend(key, raw);
+                const float fix = key == ~0u ? 1.0f : (float)((key >> 9) & 0xFF) / 128.0f;
+                const float bf[4] = {fix, fix, fix, 128.0f / 255.0f};
+                g_ctx->OMSetBlendState(bs ? bs : g_mblend, bf, 0xFFFFFFFF);
+            }
+            bc.info2[0] = raw ? 1.0f : 0.0f;
+            const uint64_t va = i < g_malpha.size() ? g_malpha[i] : 0;
+            // source alpha as the GS forms it: MODULATE / HIGHLIGHT multiply the texture alpha by the vertex
+            // alpha, DECAL keeps the texture's, without TCC only the vertex alpha counts. It only matters
+            // where the game blends by source alpha (the car damage layer fades in with it).
+            const bool by_as = key != ~0u && (key & 1) && ((key >> 5) & 3) == 0;
+            const int tfx = (int)((key >> 17) & 3);
+            const float av = (va & 0xFFFFFF) ? std::min(2.0f, (float)(va >> 24) / (float)(va & 0xFFFFFF) / 128.0f) : 1.0f;
+            bc.info2[1] = by_as && tfx != 1 ? av : 1.0f;
+            bc.info2[2] = key != ~0u && !((key >> 19) & 1) ? 1.0f : 0.0f;  // alpha from the vertex only
+            if (key != ~0u && tfx != 1) bc.info2[1] = av;  // the source alpha the GS tests and blends with
+            const uint32_t at = i < g_matest.size() ? g_matest[i] : 0;
+            bc.atest[0] = (at & 1) ? (float)((at >> 1) & 7) : -1.0f;
+            bc.atest[1] = (float)((at >> 8) & 0xFF);
+            bc.atest[2] = ((at >> 4) & 3) == 0 ? 1.0f : 0.0f;  // AFAIL KEEP: nothing is written
+            static const bool no_atest = getenv("EOD_MODERN_NOATEST") != nullptr;
+            if (no_atest || car) bc.atest[0] = -1.0f;
+            if (car) bc.info2[1] = 1.0f, bc.info2[2] = 0.0f;
+            if (raw) bc.info[3] = 0;
+            if (SUCCEEDED(g_ctx->Map(g_mcb_batch, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+                memcpy(mp.pData, &bc, sizeof bc);
+                g_ctx->Unmap(g_mcb_batch, 0);
+            }
+            g_ctx->PSSetShaderResources(0, 1, &srv);
+            UINT stride = sizeof(modern::Vertex), offset = 0;
+            g_ctx->IASetVertexBuffers(0, 1, &it->second.vb, &stride, &offset);
+            g_ctx->IASetIndexBuffer(it->second.ib, DXGI_FORMAT_R32_UINT, 0);
+            g_ctx->DrawIndexed(it->second.count, 0, 0);
+            drawn++;
+        }
+    }
+}
+
+}  // namespace
+
+void modern_alpha(int32_t batch, uint32_t alpha) {
+    if (batch < 0) return;
+    if ((size_t)batch >= g_malpha.size()) g_malpha.resize((size_t)batch + 1, 0);
+    g_malpha[(size_t)batch] += (uint64_t)alpha << 24 | 1;
+}
+
+void modern_texture(int32_t batch, const Env &e) {
+    if (!g_on || batch < 0) return;
+    if ((size_t)batch >= g_mblend_key.size()) g_mblend_key.resize((size_t)batch + 1, ~0u);
+    if ((size_t)batch >= g_matest.size()) g_matest.resize((size_t)batch + 1, 0);
+    g_matest[(size_t)batch] = (e.ate ? 1u : 0u) | (uint32_t)(e.atst & 7) << 1 | (uint32_t)(e.afail & 3) << 4 | (e.aref & 0xFF) << 8;
+    g_mblend_key[(size_t)batch] = (e.abe ? 1u : 0u) | (uint32_t)(e.ba & 3) << 1 | (uint32_t)(e.bb & 3) << 3 |
+                                  (uint32_t)(e.bc & 3) << 5 | (uint32_t)(e.bd & 3) << 7 | (e.bfix & 0xFF) << 9 |
+                                  (uint32_t)(e.tfx & 3) << 17 | (e.tcc ? 1u : 0u) << 19 | (e.tme ? 1u : 0u) << 20;
+    if (!e.tme) return;
+    // render-to-texture sources (a surface owns the texture's memory) are left untextured here
+    const uint32_t p0 = (e.tbp >> 5) % kPages;
+    if (g_owner[p0] && !g_vram_ok[p0]) return;
+    ID3D11ShaderResourceView *srv = vram_texture(e);
+    if (!srv) return;
+    if ((size_t)batch >= g_mtex.size()) g_mtex.resize((size_t)batch + 1, nullptr);
+    if (g_mtex[(size_t)batch]) return;
+    srv->AddRef();
+    g_mtex[(size_t)batch] = srv;
+}
+
+void modern_draw(modern::Frame *frame) {
+    std::unique_ptr<modern::Frame> f(frame);
+    if (!modern_init()) {  // the GS draws everything again
+        modern_release_textures();
+        modern::disable();
+        return;
+    }
+    for (const modern::Mesh &m : f->meshes) modern_upload(m);
+    if (f->batches.empty() || g_skip_frame || !modern::g_target.valid) {
+        modern_release_textures();
+        return;
+    }
+    ProfScope prof(P_GS_DRAW);
+    flush();
+    const modern::Target &t = modern::g_target;
+    const int cols = (int)((t.scissor >> 16) & 0x7FF) + 1, rows = (int)((t.scissor >> 48) & 0x7FF) + 1;
+    Surface *s = get_surface(t.fbp, t.fbw, t.fpsm, false, rows);
+    if (!s || !s->rtv || cols <= 0 || rows <= 0) {
+        modern_release_textures();
+        return;
+    }
+    const int W = s->w * g_scale, H = s->h * g_scale;
+    if (!modern_targets(W, H)) {
+        modern_release_textures();
+        return;
+    }
+    acquire(s, 0, 0, std::min(cols, s->w), std::min(rows, s->h));
+    s->version++;
+
+    // world -> GS screen (rows x, y, w of the camera) -> clip for this surface
+    const float *cm = f->cam;  // column-major: element (r, c) = cm[c * 4 + r]
+    const float ox = (float)(t.xyoffset & 0xFFFF) / 16.0f, oy = (float)((t.xyoffset >> 32) & 0xFFFF) / 16.0f;
+    const float sw = (float)s->w, sh = (float)s->h;
+    ModernFrameCB fc = {};
+    for (int c = 0; c < 4; c++) {
+        const float x = cm[c * 4 + 0], y = cm[c * 4 + 1], w = cm[c * 4 + 3];
+        fc.clip_x[c] = 2.0f / sw * x - (1.0f + 2.0f * ox / sw) * w;
+        fc.clip_y[c] = -2.0f / sh * y + (1.0f + 2.0f * oy / sh) * w;
+        fc.clip_w[c] = w;
+    }
+    // camera position: where the x, y and w rows all vanish
+    double A[3][3], b3[3];
+    const int rr[3] = {0, 1, 3};
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) A[r][c] = cm[c * 4 + rr[r]];
+        b3[r] = -cm[12 + rr[r]];
+    }
+    auto det3 = [](double m[3][3]) {
+        return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    };
+    const double D = det3(A);
+    float cam[3] = {0, 0, 0};
+    if (std::fabs(D) > 1e-12)
+        for (int k = 0; k < 3; k++) {
+            double M2[3][3];
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) M2[r][c] = c == k ? b3[r] : A[r][c];
+            cam[k] = (float)(det3(M2) / D);
+        }
+    float fwd[3] = {cm[0 * 4 + 3], cm[1 * 4 + 3], cm[2 * 4 + 3]};
+    norm3(fwd);
+    // world up: against the screen's y direction (GS y grows downwards) at the screen centre
+    const float cy = oy + sh * 0.5f;
+    float up[3] = {-(cm[0 * 4 + 1] - cy * cm[0 * 4 + 3]), -(cm[1 * 4 + 1] - cy * cm[1 * 4 + 3]),
+                   -(cm[2 * 4 + 1] - cy * cm[2 * 4 + 3])};
+    {  // keep only the part across the view direction
+        const float d = dot3(up, fwd);
+        for (int i = 0; i < 3; i++) up[i] -= d * fwd[i];
+        norm3(up);
+    }
+    // scene scale: the median camera distance of the objects (cars, props)
+    std::vector<float> dists;
+    float L[3] = {0, 1, 0};
+    bool have_l = false;
+    for (const modern::Batch &b : f->batches) {
+        if (!b.drawn) continue;
+        if (!have_l && b.role != modern::SKY) {
+            memcpy(L, b.light, 12);
+            have_l = true;
+        }
+        if (b.role != modern::OBJECT) continue;
+        const float d[3] = {b.model[3] - cam[0], b.model[7] - cam[1], b.model[11] - cam[2]};
+        dists.push_back(std::sqrt(dot3(d, d)));
+    }
+    norm3(L);
+    float med = 40.0f;
+    if (!dists.empty()) {
+        std::nth_element(dists.begin(), dists.begin() + (long)dists.size() / 2, dists.end());
+        med = std::max(dists[dists.size() / 2], 1.0f);
+    }
+    static const float k_shadow = getenv("EOD_MODERN_SHADOW") ? (float)atof(getenv("EOD_MODERN_SHADOW")) : 1.2f;
+    static const float k_haze = getenv("EOD_MODERN_HAZE") ? (float)atof(getenv("EOD_MODERN_HAZE")) : 40.0f;
+    static const float k_exposure = getenv("EOD_MODERN_EXPOSURE") ? (float)atof(getenv("EOD_MODERN_EXPOSURE")) : 1.0f;
+    const float half = med * k_shadow;
+    const float ctr[3] = {cam[0] + fwd[0] * half * 0.7f, cam[1] + fwd[1] * half * 0.7f, cam[2] + fwd[2] * half * 0.7f};
+    float u[3], v[3];
+    float ref[3] = {0, 0, 1};
+    if (std::fabs(dot3(ref, L)) > 0.9f) ref[0] = 1, ref[2] = 0;
+    cross3(L, ref, u);
+    norm3(u);
+    cross3(L, u, v);
+    for (int i = 0; i < 3; i++) {
+        fc.sh_x[i] = u[i] / half;
+        fc.sh_y[i] = v[i] / half;
+        fc.sh_z[i] = -L[i] / (4 * half);
+    }
+    fc.sh_x[3] = -dot3(u, ctr) / half;
+    fc.sh_y[3] = -dot3(v, ctr) / half;
+    fc.sh_z[3] = 0.5f + dot3(L, ctr) / (4 * half);
+    fc.params[0] = 0.05f;  // near
+    fc.params[1] = 1.0f / kShadowSize;
+    fc.params[2] = med * k_haze;
+    fc.params[3] = k_exposure;
+    memcpy(fc.cam_pos, cam, 12);
+    memcpy(fc.up, up, 12);
+    const uint64_t fog = st.fogcol;
+    fc.fog[0] = (fog & 0xFF) / 255.0f;
+    fc.fog[1] = ((fog >> 8) & 0xFF) / 255.0f;
+    fc.fog[2] = ((fog >> 16) & 0xFF) / 255.0f;
+    memcpy(fc.sun, L, 12);
+    static const bool dbg = getenv("EOD_MODERN_DEBUG") != nullptr;
+    fc.fog[3] = dbg ? 1.0f : 0.0f;
+    fc.sun[3] = f->batches.empty() ? 0.19f : f->batches[0].light[3];
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "[modern] camera (%.1f %.1f %.1f) up (%.2f %.2f %.2f) sun (%.2f %.2f %.2f) object median %.1f\n",
+                cam[0], cam[1], cam[2], up[0], up[1], up[2], L[0], L[1], L[2], med);
+    }
+    D3D11_MAPPED_SUBRESOURCE mp;
+    if (SUCCEEDED(CHECK(g_ctx->Map(g_mcb_frame, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp)))) {
+        memcpy(mp.pData, &fc, sizeof fc);
+        g_ctx->Unmap(g_mcb_frame, 0);
+    }
+
+    ID3D11ShaderResourceView *null_srv[4] = {};
+    g_ctx->PSSetShaderResources(0, 4, null_srv);
+    g_ctx->IASetInputLayout(g_mlayout);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11Buffer *cbs[2] = {g_mcb_frame, g_mcb_batch};
+    g_ctx->VSSetConstantBuffers(0, 2, cbs);
+    g_ctx->PSSetConstantBuffers(0, 2, cbs);
+    ID3D11SamplerState *ss[2] = {g_msampler, g_mshadow_smp};
+    g_ctx->PSSetSamplers(0, 2, ss);
+    ModernBatchCB bc = {};
+    uint32_t drawn = 0;
+
+    // sun shadow map
+    g_ctx->OMSetRenderTargets(0, nullptr, g_mshadow_dsv);
+    g_ctx->ClearDepthStencilView(g_mshadow_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    set_viewport(kShadowSize, kShadowSize);
+    g_ctx->RSSetState(g_mrs_shadow);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_ctx->OMSetDepthStencilState(g_mds_shadow, 0);
+    g_ctx->VSSetShader(g_mvs_shadow, nullptr, 0);
+    g_ctx->PSSetShader(g_mps_shadow, nullptr, 0);
+    modern_batches(*f, bc, true, {(uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn);
+
+    // the scene, over the GS frame so far (the game's sky)
+    g_ctx->OMSetRenderTargets(1, &g_mrtv, g_mdsv);
+    g_ctx->ClearDepthStencilView(g_mdsv, D3D11_CLEAR_DEPTH, 0.0f, 0);
+    set_viewport(W, H);
+    g_ctx->RSSetState(g_mrs);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_ctx->OMSetDepthStencilState(g_mds_sky, 0);
+    g_ctx->VSSetShader(g_mvs_full, nullptr, 0);
+    g_ctx->PSSetShader(g_mps_full, nullptr, 0);
+    g_ctx->PSSetShaderResources(2, 1, &s->srv);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(2, 1, null_srv);
+    const float bf[4] = {0, 0, 0, 128.0f / 255.0f};
+    g_ctx->OMSetBlendState(g_mblend, bf, 0xFFFFFFFF);
+    g_ctx->VSSetShader(g_mvs, nullptr, 0);
+    g_ctx->PSSetShader(g_mps, nullptr, 0);
+    g_ctx->PSSetShaderResources(1, 1, &g_mshadow_srv);
+    // sky first (no depth), then the world in draw order (layers), then objects
+    modern_batches(*f, bc, false, {(uint32_t)modern::SKY, (uint32_t)modern::WORLD, (uint32_t)modern::OBJECT}, drawn);
+
+    // resolve, then copy the frame's rows into the game's frame buffer
+    g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    g_ctx->PSSetShaderResources(0, 4, null_srv);
+    g_ctx->ResolveSubresource(g_mresolve, 0, g_mcolor, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+    D3D11_BOX box = {0, 0, 0, (UINT)(std::min(cols, s->w) * g_scale), (UINT)(std::min(rows, s->h) * g_scale), 1};
+    g_ctx->CopySubresourceRegion(s->tex, 0, 0, 0, 0, g_mresolve, 0, &box);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_stats.draws += drawn;
+    {  // diagnosis: what one frame (the 600th drawn) contained
+        static int n;
+        if (++n == 600) {
+            int cnt[3][4] = {};  // role x (drawn, not kicked, no mesh, alpha-faded)
+            for (size_t i = 0; i < f->batches.size(); i++) {
+                const modern::Batch &b = f->batches[i];
+                const int r = b.role < 3 ? (int)b.role : 2;
+                const uint64_t va = i < g_malpha.size() ? g_malpha[i] : 0;
+                if (!b.drawn) cnt[r][1]++;
+                else if (!g_mmesh.count(b.mesh)) cnt[r][2]++;
+                else cnt[r][0]++;
+                if ((va & 0xFFFFFF) && (va >> 24) / (va & 0xFFFFFF) < 32) cnt[r][3]++;
+            }
+            std::map<uint32_t, std::array<int, 6>> pcs;  // pc -> batches, abe, alpha <32, <96, <160, more
+            for (size_t i = 0; i < f->batches.size(); i++) {
+                const modern::Batch &b = f->batches[i];
+                if (b.role != modern::OBJECT || !b.drawn) continue;
+                auto &c = pcs[b.pc | (i < g_mblend_key.size() && g_mblend_key[i] != ~0u ? (g_mblend_key[i] >> 17 & 7) << 16 : 7u << 16)];
+                const uint64_t va = i < g_malpha.size() ? g_malpha[i] : 0;
+                const uint32_t k = i < g_mblend_key.size() ? g_mblend_key[i] : 0;
+                const uint64_t av = (va & 0xFFFFFF) ? (va >> 24) / (va & 0xFFFFFF) : 999;
+                c[0]++;
+                c[1] += (k != ~0u && (k & 1)) ? 1 : 0;
+                c[av < 32 ? 2 : av < 96 ? 3 : av < 160 ? 4 : 5]++;
+            }
+            for (auto &kv : pcs)
+                fprintf(stderr, "[modern] object pc %05x (tfx|tcc<<2 above 0xffff): %d batches, %d blended, vertex alpha <32 %d, <96 %d, <160 %d, more %d\n",
+                        kv.first, kv.second[0], kv.second[1], kv.second[2], kv.second[3], kv.second[4], kv.second[5]);
+            fprintf(stderr, "[modern] frame: sky %d/%d/%d/%d world %d/%d/%d/%d object %d/%d/%d/%d (drawn/unkicked/no mesh/low alpha)\n",
+                    cnt[0][0], cnt[0][1], cnt[0][2], cnt[0][3], cnt[1][0], cnt[1][1], cnt[1][2], cnt[1][3], cnt[2][0],
+                    cnt[2][1], cnt[2][2], cnt[2][3]);
+        }
+    }
+    modern_release_textures();
+    // the GS's next batch rebinds its own state (bind_targets, shaders, buffers, samplers)
+    g_state_valid = false;
+}

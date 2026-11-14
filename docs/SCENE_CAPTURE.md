@@ -241,6 +241,65 @@ Viewer gaps (renderer, not data): no fog, no blend equations for the car's multi
 nearest texels, no shadow pass, no particles. The start-line flag is not in the emitted set
 (its program is not identified yet).
 
+## Modern renderer, first live pass (`EOD_MODERN=1`)
+
+The emitter now also feeds a live modern pass in the Direct3D 11 backend. The GS keeps the
+HUD, menus, 2D, particles and the game's own sky dome; the modern pass draws the race's
+world, cars and props from the decoded batches and is switched live: **F9**, or
+**L1+R1+R3** on the controller (with an on-screen banner). The original renderer keeps running
+underneath, so the switch is instant.
+
+How it composes (`runtime/gs/modern_scene.{h,cpp}`, `runtime/gs/d3d11/modern_d3d11.inc`, hooks in
+`scene_emit.cpp`, `gs.cpp`, `gs_draw.cpp`):
+
+* Producer: for each replaced batch it queues a batch marker into the GS command stream
+  (`CMD_MODERN`, live only, never written to GS dumps); the GS skips the draws of that batch's
+  PATH1 kicks and hands the backend the batch's texture, blend equation, alpha test and vertex
+  alpha. At the HUD (program 0x270 in ITOP mode 0x200 with the screen-facing matrix: w row
+  (0, 0, 1, 365); the same program also draws camera-space batches earlier in the frame) the
+  producer queues the frame (camera, model matrices, roles, world layers, new meshes).
+* Backend: copies the GS frame so far (the sky) into a 4x MSAA target at the internal
+  resolution, renders a 2048² sun shadow map from the game's light direction, draws the
+  world in draw order (layers by the batch's GS depth row) and the objects with reverse
+  depth (near / camera w), resolves and copies the result into the game's frame buffer; the
+  GS then draws the HUD on top.
+* Shading: linear-space lighting from the game's light and ambient (q17), baked vertex
+  colours for the terrain under the sun shadow, glossy car paint (specular and a sky
+  reflection with Fresnel), distance haze in the game's fog colour, filmic tone mapping,
+  16x anisotropic filtering. Blend equations follow the GS (mix / add / subtract / fixed);
+  the GS alpha test and source alpha (MODULATE / DECAL / TCC) are honoured per batch.
+* Safety: if the backend cannot start the pass (no shader compiler, device failure) it turns
+  itself off and the GS draws everything.
+
+Results (Windows, D3D11, Afton/No-Rules Race/Venom, headless, muted):
+
+| Measure | Result | Conf. |
+|---|---|---|
+| Same-moment comparison (`EOD_MODERN_FLIP_EVERY=50` alternates the renderers) at 3x (1920x1344) | world, props, cones, fences, trucks and the car line up with the original frame; HUD and messages intact; car lit with gloss and reflections; image kept in the session notes (`scene-capture/modern_vs_original_3x.png`) | V |
+| Original mode | GS replay of the race dump with this build: VRAM after the replay byte-identical to the build before the modern pass (md5 `f30d64c0...`); every hook is behind `modern::g_on` | V |
+| Frame rate at 3x (3,000 frames each) | 59.9 vblank/s in both modes; game frames/s 58.7 (modern off) and 56.0 (modern on), inside the run-to-run spread measured before (53-57); EE busy 77% -> 84%, GS busy 37% -> 35% (the GS skips the replaced draws) | V |
+| Failure path | the shader-compile failure seen during development switched the pass off; the GS then draws everything | V |
+
+Known gaps (each a follow-up):
+
+* **Car damage layers** (0x15a8, and the reveal of 0xd48 parts) need per-vertex alpha: the game
+  sets the alpha per vertex from the damage, and a per-batch average cuts the car apart. The
+  damage overlay is left out of the modern pass until the emitter carries per-vertex alpha
+  (from the kicked RGBAQ). An undamaged car looks right; dents and scrapes do not show yet.
+* The car paint texture's light scratch pattern shows more than in the original (the game's
+  layer logic darkens it).
+* Sun shadows are soft and weaker than the game's own car shadow blob; the shadow box follows
+  the camera with a scale from the object distances.
+* Particles (dust, sparks, fire), the start-line flag and shadows drawn by the GS before the
+  HUD are covered by the modern pass.
+* Textures are still the game's (from VRAM). Higher-resolution and remade textures plug in
+  through the same keys; that is the next visual step, with an engine-grade renderer
+  (Filament) behind the same feed.
+* The pass is Direct3D 11 only; the Vulkan backend (macOS) is the same code over
+  `vk_compat.h` and still has to be built and tested there. Shaders are compiled at start
+  with `d3dcompiler_47.dll`; shipping needs them precompiled (`tools/build_shaders.py`).
+* GPU mesh cache has no eviction yet (about 25 MB after a race).
+
 ## Tools
 
 ```

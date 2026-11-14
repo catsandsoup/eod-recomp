@@ -37,6 +37,7 @@
 #include "texture_replacements.h"
 #include "../vu/scene_capture.h"
 #include "../vu/scene_emit.h"
+#include "modern_scene.h"
 
 namespace gs {
 
@@ -1562,7 +1563,7 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         census::draw(e, "sprite", (uint64_t)std::abs((b.x - a.x) >> 4) * (uint64_t)std::abs((b.y - a.y) >> 4));
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_sprite(e, a, b);
+            if (!(modern::g_on && modern::gs_replaced(e, b.a))) hw::draw_sprite(e, a, b);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1645,7 +1646,7 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     }
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_triangle(e, a0, b0, c0);
+            if (!(modern::g_on && modern::gs_replaced(e, (a0.a + b0.a + c0.a) / 3u))) hw::draw_triangle(e, a0, b0, c0);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1781,7 +1782,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
     if (census::g_on) census::draw(e, "line", 1);
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_line(e, a, b);
+            if (!(modern::g_on && modern::gs_replaced(e, b.a))) hw::draw_line(e, a, b);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
@@ -1826,7 +1827,7 @@ void draw_point(const Vertex &a) {
     if (census::g_on) census::draw(e, "point", 1);
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            hw::draw_point(e, a);
+            if (!(modern::g_on && modern::gs_replaced(e, a.a))) hw::draw_point(e, a);
             note_draw();  // (the display is presented when its pages change)
         }
         return;
