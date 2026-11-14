@@ -17,6 +17,8 @@
 // x/y/w screen rows among the frame's batches (docs/SCENE_CAPTURE.md section 2);
 // each batch's model matrix is inv(camera_xyw) * batch_xyw.
 #define XXH_INLINE_ALL
+#include <tuple>
+#include <map>
 #include <xxhash.h>
 #include "scene_emit.h"
 #include "core/trace.h"
@@ -33,6 +35,7 @@
 
 #include "../core/log.h"
 #include "../gs/modern_scene.h"
+#include "../gs/gs.h"
 #include "vu.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
@@ -103,6 +106,10 @@ struct Batch {
     uint32_t n;  // vertices
     bool want_alpha;               // collect the kicked per-vertex alpha (car passes)
     std::vector<uint8_t> valpha;
+    std::vector<uint8_t> pred;     // EOD_MODERN_SKIPCHECK: valpha predicted from the inputs
+    std::vector<uint32_t> in_w;    // EOD_MODERN_SKIPCHECK: each input vertex's first qword .w
+    bool skipped = false;          // the program was not run (cached results)
+    uint64_t tag;                  // EOD_MODERN_SKIPCHECK: the GIF tag template (VU1 qword 23)
 };
 
 // For every vertex a PATH1 packet draws, in order (PACKED and REGLIST GIF tags): the alpha of
@@ -337,6 +344,115 @@ void model_of(const Batch &b, const double cinv[4][4], double M[4][4]) {
 }
 
 // The modern frame so far: camera, model matrices, roles, layers; queued for the GS.
+// EOD_MODERN_SKIPCHECK=1: how well the inputs predict what each program kicks, per program
+bool skip_check() {
+    static const bool on = getenv("EOD_MODERN_SKIPCHECK") != nullptr;
+    return on;
+}
+struct CheckStats { uint64_t batches, drawn, full, verts, alpha_bad, abe_bad, tag_bad; };
+std::map<uint32_t, CheckStats> g_check;
+void check_prediction(const Batch &b) {
+    CheckStats &c = g_check[b.pc << 12 | b.itop];
+    c.batches++;
+    if (b.kicks) c.drawn++;
+    if (b.valpha.size() != b.pred.size()) return;
+    c.full++;
+    static int samples;
+    for (size_t k = 0; k + 1 < b.pred.size(); k += 2) {
+        c.verts++;
+        if (b.valpha[k] != b.pred[k]) {
+            c.alpha_bad++;
+            if (samples++ < 12)
+                fprintf(stderr, "[skipcheck] pc %04x itop %03x vertex %zu alpha kicked %02x predicted %02x\n", b.pc, b.itop,
+                        k / 2, b.valpha[k], b.pred[k]);
+        }
+        if (b.valpha[k + 1] != b.pred[k + 1]) c.abe_bad++;
+        // detail: (program, input .w, tag ABE) -> kicked (alpha, abe) histogram
+        static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> hist;
+        if (hist.size() < 4000)
+            hist[{b.pc, b.in_w[k / 2] & 0x8000FFFFu, (uint32_t)(b.pred[k + 1] != 0), (uint32_t)b.valpha[k] << 8 | b.valpha[k + 1]}]++;
+        static uint64_t n_seen;
+        if (++n_seen == 20000000)
+            for (auto &h : hist)
+                if (h.second > 200)
+                    fprintf(stderr, "[skipdetail] pc %04x in.w %08x tagABE %u -> kicked a %02x abe %02x x%llu\n", std::get<0>(h.first),
+                            std::get<1>(h.first), std::get<2>(h.first), std::get<3>(h.first) >> 8, std::get<3>(h.first) & 0xFF,
+                            (unsigned long long)h.second);
+    }
+}
+void check_report() {
+    if (!skip_check()) return;
+    static uint64_t frames;
+    if (++frames % 600) return;
+    for (auto &e : g_check)
+        fprintf(stderr, "[skipcheck] pc %04x itop %03x: %llu batches, %llu drawn, %llu 1:1, %llu verts, alpha mismatches %llu, blend mismatches %llu\n",
+                e.first >> 12, e.first & 0xFFF, (unsigned long long)e.second.batches, (unsigned long long)e.second.drawn,
+                (unsigned long long)e.second.full, (unsigned long long)e.second.verts, (unsigned long long)e.second.alpha_bad,
+                (unsigned long long)e.second.abe_bad);
+}
+
+// ---- VU1 skip for replaced batches (EOD_MODERN_SKIPVU, on by default)
+// A replaced batch's program output is thrown away except three things the modern renderer reads:
+// that it kicked (the game never culls inside these programs), the per-vertex alpha and blend
+// flags it kicked, and the GS state its kicks select (PRIM from the tag template at VU1 qword 23,
+// texture and blend registers from the separate state program). Once a mesh's kicked alpha/blend
+// pattern has repeated unchanged, with no fade, the program is skipped: the GS gets a one-triangle
+// packet with the same tag (state capture only, nothing is drawn) and the cached pattern is used.
+bool skip_enabled() {
+    static const bool on = [] {
+        const char *e = getenv("EOD_MODERN_SKIPVU");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+bool skip_program(uint32_t pc) {
+    switch (pc) {
+    case 0x618: case 0x270: case 0x920: case 0x2a8: case 0x1f90: case 0x350: case 0x24b0: case 0x318:
+        return true;  // world, props, facing sprites, driver; not the car paint passes (their alpha fades)
+    }
+    return false;
+}
+struct SkipEntry {
+    std::vector<uint8_t> valpha;
+    uint32_t stable = 0;  // consecutive runs with an identical pattern
+    uint32_t avg = 0x80;  // average kicked alpha
+};
+std::unordered_map<uint64_t, SkipEntry> g_skip;
+uint64_t g_skip_hits, g_skip_runs;
+void skip_learn(const Batch &b) {
+    if (!skip_enabled() || !skip_program(b.pc) || b.skipped || b.valpha.size() != 2 * (size_t)b.n || !b.n) return;
+    for (size_t k = 0; k < b.valpha.size(); k += 2)
+        if (b.valpha[k] != 0x80) {  // a fade: always run
+            g_skip.erase(b.geom);
+            return;
+        }
+    if (g_skip.size() > 200000) g_skip.clear();
+    SkipEntry &e = g_skip[b.geom];
+    if (e.valpha == b.valpha) {
+        e.stable++;
+    } else {
+        e.valpha = b.valpha;
+        e.stable = 0;
+    }
+}
+// The GIF packet a skipped run sends: the program's own tag template (PRE + PRIM) with one
+// zero-area triangle, so the GS selects and reports the batch's texture and blend state exactly
+// as for the real kick; the replaced draw is dropped as before.
+void skip_kick(const VUState *vu, uint32_t alpha) {
+    uint64_t tmpl;
+    memcpy(&tmpl, qword(vu, 23), 8);
+    alignas(16) uint64_t pkt[2 + 3 * 3 * 2] = {};
+    pkt[0] = 3u | 1ull << 15 | (tmpl & (1ull << 46)) | (tmpl & (0x7FFull << 47)) | 0ull << 58 | 3ull << 60;
+    pkt[1] = 0x412;  // ST, RGBAQ, XYZ2
+    for (int v = 0; v < 3; v++) {
+        uint64_t *q = pkt + 2 + v * 6;
+        q[0] = 0; q[1] = 0x3F800000ull;                          // ST (s, t = 0), Q = 1 in RGBAQ below
+        q[2] = 0x80ull | 0x80ull << 32; q[3] = (uint64_t)alpha | (uint64_t)0x3F800000 << 32;  // RGBAQ
+        q[4] = 0; q[5] = 0;                                      // XYZ2 (all at the origin: no area)
+    }
+    gif_transfer(GIF_PATH1, (const uint8_t *)pkt, 1 + 9);
+}
+
 void post_modern() {
     EOD_ZONE("emit.post_modern");
     if (!g_mf) g_mf = new modern::Frame();
@@ -361,6 +477,8 @@ void post_modern() {
             for (int c = 0; c < 4; c++) m.model[r * 4 + c] = (float)M[r][c];
         world_dir(M, b.q17, m.light);
         for (int c = 0; c < 4; c++) m.zrow[c] = b.mvp[c * 4 + 2];
+        if (skip_check()) check_prediction(b);
+        skip_learn(b);
         if (b.valpha.size() == 2 * (size_t)b.n) m.valpha = std::move(b.valpha);  // 1:1 with the mesh (nothing clipped)
         double dev = 0, rot = 0;
         for (int r = 0; r < 4; r++)
@@ -378,6 +496,7 @@ void post_modern() {
         }
     }
     modern::post_draw(f);
+    check_report();
 }
 
 // End of a frame: camera vote, model matrices, records, write.
@@ -469,8 +588,8 @@ bool is_sky_dome(const VUState *vu, uint32_t pc, uint32_t itop) {
     return false;
 }
 
-void vu1_start(const VUState *vu, uint32_t pc) {
-    if (!g_frame_active) return;
+bool vu1_start(const VUState *vu, uint32_t pc) {
+    if (!g_frame_active) return false;
     EOD_ZONE("emit.vu1_start");
     const uint64_t t = now_ns();
     finish_pending();
@@ -486,7 +605,7 @@ void vu1_start(const VUState *vu, uint32_t pc) {
         post_modern();
         g_triggered = true;
     }
-    bool replaced = false;
+    bool replaced = false, skip = false;
     const bool sky_dome = is_sky_dome(vu, pc, g_vif1_itop);
     if (geometry_program(pc)) {
         const uint32_t top = g_vif1_top;
@@ -529,6 +648,22 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                 b.mi = -1;
                 b.n = n;
                 b.want_alpha = false;
+                if (skip_check()) {
+                    // prediction: alpha = the input colour's alpha byte (normal-lit vertices: 0x80),
+                    // blend = PRIM.ABE of the tag template the program kicks
+                    memcpy(&b.tag, qword(vu, 23), 8);
+                    const uint8_t abe = ((b.tag >> 46) & 1) && ((b.tag >> 53) & 1) ? 255 : 0;
+                    b.pred.resize(2 * (size_t)n);
+                    b.in_w.resize(n);
+                    for (uint32_t k = 0; k < n; k++) {
+                        uint32_t ni[4];
+                        memcpy(ni, qword(vu, top + 1 + 3 * k), 16);
+                        const bool normal = (ni[0] & 0xFFFFFF00u) == 0x47800000u;
+                        b.pred[2 * k] = normal ? 0x80 : (uint8_t)(ni[3] & 0xFF);
+                        b.pred[2 * k + 1] = abe;
+                        b.in_w[k] = ni[3] | (normal ? 0x80000000u : 0);
+                    }
+                }
                 // the sky dome (0x270 in ITOP mode 0x280) stays with the GS: the modern pass starts from it
                 if (g_live && !hud && !sky_dome && !g_triggered) {
                     if (!g_mf) g_mf = new modern::Frame();
@@ -542,8 +677,21 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                     b.want_alpha = true;
                     replaced = true;
                 }
+                // a mesh whose kicked pattern is known: no program run, a state-only kick
+                const bool cached = replaced && skip_enabled() && !skip_check() && skip_program(pc);
+                auto sk = cached ? g_skip.find(id) : g_skip.end();
+                if (sk != g_skip.end() && sk->second.stable >= 2) {
+                    b.skipped = true;
+                    skip = true;
+                }
                 g_batches.push_back(std::move(b));
                 g_pending = true;
+                if (skip) {
+                    skip_kick(vu, 0x80);
+                    Batch &cur = g_batches.back();
+                    cur.valpha = sk->second.valpha;
+                    g_skip_hits++;
+                }
             }
         }
     }
@@ -553,11 +701,22 @@ void vu1_start(const VUState *vu, uint32_t pc) {
     if (g_live && !g_triggered && !keep_blobs && (pc == 0x0020 || pc == 0x0338)) {
         mark(modern::kSuppressed);
         replaced = true;
+        // their output is dropped anyway (the modern pass casts real shadows): not run at all
+        if (skip_enabled()) skip = true;
     }
     if (g_modern && !replaced) mark(-1);
     // EOD_MODERN_LOGTAG=<frame>: a geometry run's input header (TOP+0, qwords 20-23) for comparison
     // with the GIF tags it kicks (gif() prints them)
     static const uint64_t tag_at = env_u64("EOD_MODERN_LOGTAG", 0);
+    if (tag_at && g_frame >= tag_at && g_frame < tag_at + 4 && pc == 0x350) {
+        static int dumped;
+        if (dumped++ < 3)
+            for (uint32_t q = 0; q < 14; q++) {
+                const float *f = (const float *)qword(vu, g_vif1_top + q);
+                const uint32_t *u = (const uint32_t *)f;
+                fprintf(stderr, "[s350] run %u top+%u %g %g %g %g | %08x %08x %08x %08x\n", g_run, q, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
+            }
+    }
     if (tag_at && g_frame >= tag_at && g_frame < tag_at + 4 && geometry_program(pc)) {
         const uint64_t *t0 = (const uint64_t *)qword(vu, g_vif1_top);
         fprintf(stderr, "[tag] run %u pc %04x itop %03x top %03x in0 %016llx %016llx",
@@ -576,6 +735,8 @@ void vu1_start(const VUState *vu, uint32_t pc) {
                 g_vif1_itop, n, geometry_program(pc) ? 1 : 0, replaced ? 1 : 0, g_live ? 1 : 0, g_triggered ? 1 : 0);
     }
     g_ns += now_ns() - t;
+    if (geometry_program(pc) && replaced) g_skip_runs++;
+    return skip;
 }
 
 void gif(int path, const uint8_t *data, uint32_t qwc) {
@@ -583,6 +744,15 @@ void gif(int path, const uint8_t *data, uint32_t qwc) {
     EOD_ZONE("emit.gif");
     g_kicks++;
     static const uint64_t tag_at = env_u64("EOD_MODERN_LOGTAG", 0);
+    if (tag_at && g_frame >= tag_at && g_frame < tag_at + 4 && qwc == 13 && !g_batches.empty() && g_batches.back().pc == 0x350) {
+        static int dumped;
+        if (dumped++ < 2)
+            for (uint32_t q = 0; q < qwc; q++) {
+                const uint32_t *u = (const uint32_t *)(data + q * 16);
+                const float *f = (const float *)u;
+                fprintf(stderr, "[k350] q%u %08x %08x %08x %08x | %g %g %g %g\n", q, u[0], u[1], u[2], u[3], f[0], f[1], f[2], f[3]);
+            }
+    }
     if (tag_at && g_frame >= tag_at && g_frame < tag_at + 4 && qwc) {
         const uint64_t *w = (const uint64_t *)data;
         fprintf(stderr, "[tag]   kick run %u qwc %u q0 %016llx %016llx q1 %016llx %016llx\n", g_run, qwc,

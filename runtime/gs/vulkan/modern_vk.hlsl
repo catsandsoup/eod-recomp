@@ -161,8 +161,9 @@ float4 ps_comp(float4 pos : SV_Position) : SV_Target {
     c *= lerp(1, ao / 9, set.z);
     c += bloom_tex.Sample(lin_clamp, uv).rgb * post.w;
     float l = dot(c, float3(0.299, 0.587, 0.114));
-    c = saturate(lerp(l.xxx, c, 1 + 0.12 * set2.y));
-    c = lerp(c, c * c * (3 - 2 * c), 0.35 * set2.y);
+    // a light grade: the world keeps the original's colours (the scene already tone maps)
+    c = saturate(lerp(l.xxx, c, 1 + 0.03 * set2.y));
+    c = lerp(c, c * c * (3 - 2 * c), 0.08 * set2.y);
     float2 v = uv - 0.5;
     c *= 1 - dot(v, v) * set.w;
     return float4(c, 128.0 / 255.0);
@@ -177,6 +178,13 @@ float4 ps_full(float4 pos : SV_Position) : SV_Target {
     return float4(gs_frame.Load(int3(pos.xy, 0)).rgb, 128.0 / 255.0);
 }
 float3 aces(float3 x) { return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)); }
+// the input that aces() maps to y (y < 1): baked-light world colours go through it, so sunlit
+// ground leaves the tone curve exactly as bright as the original game drew it
+float3 aces_inv(float3 y) {
+    y = min(y, 0.985);
+    float3 a = 2.43 * y - 2.51, b = 0.59 * y - 0.03, c = 0.14 * y;
+    return (-b - sqrt(max(b * b - 4 * a * c, 0))) / (2 * a);
+}
 static const float2 k_disk[16] = {
     float2(-0.94, -0.40), float2(0.95, -0.77), float2(-0.09, -0.93), float2(0.34, 0.29),
     float2(-0.92, 0.46), float2(-0.82, -0.88), float2(-0.38, 0.28), float2(-0.11, 0.65),
@@ -302,7 +310,9 @@ float4 ps_modern(VOut i) : SV_Target {
         float sh = shadow_at(i.wp, up.xyz, i.pos.xy);
         // baked vertex light: ACES lifts low values ~1.45x, so 0.75 sunlit matches the original;
         // shadowed ground keeps 43% (skylight)
-        col = albedo * lin(i.c.rgb) * (0.32 + 0.43 * sh);
+        // the GS modulate: texture x vertex colour (0x80 = 1, up to 2x), clamped, in display space
+        float3 g = saturate(t.rgb * i.c.rgb);
+        col = aces_inv(lin(g)) / max(params.w, 0.05) * lerp(0.45, 1.0, sh);
         if (fog.w > 0) return float4(sh, 0, 1, 1);
     }
     float dist = length(i.wp - cam_pos.xyz);

@@ -1559,7 +1559,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     vu_rec_hook(vu, pc);
     vu_dump(vu, pc);
     if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
-    if (scene_emit::g_on && vu->index == 1) scene_emit::vu1_start(vu, pc);
+    if (scene_emit::g_on && vu->index == 1 && scene_emit::vu1_start(vu, pc)) return;
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;
