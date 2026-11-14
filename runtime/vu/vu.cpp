@@ -1562,6 +1562,32 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     if (scene_emit::g_on && vu->index == 1) scene_emit::vu1_start(vu, pc);
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
+        static const bool stats = getenv("EOD_VU_STATS") != nullptr;
+        if (stats && !check) {  // EOD_VU_STATS=1: time per compiled program (VU1 by entry and ITOP)
+            static uint64_t cnt[0x800], tk[0x800], last;
+            static uint32_t itops[0x800];
+            const uint64_t t0 = prof_ticks();
+            p->fn(vu, pc);
+            const uint64_t t1 = prof_ticks();
+            if (vu->index == 1) {
+                cnt[(pc >> 3) & 0x7FF]++;
+                tk[(pc >> 3) & 0x7FF] += t1 - t0;
+                itops[(pc >> 3) & 0x7FF] = g_vif1_itop;
+            }
+            if (!last) last = t1;
+            if (t1 - last > 20000000000ull) {
+                last = t1;
+                uint64_t total = 0;
+                for (int i = 0; i < 0x800; i++) total += tk[i];
+                for (int i = 0; i < 0x800; i++)
+                    if (tk[i] > total / 100)
+                        fprintf(stderr, "[vu-stats] VU1 %04x runs %llu, %.1f%% of VU1 time, %.2f us/run\n", i << 3,
+                                (unsigned long long)cnt[i], 100.0 * tk[i] / total, tk[i] / 3500.0 / (double)cnt[i]);
+                std::fill(std::begin(cnt), std::end(cnt), 0);
+                std::fill(std::begin(tk), std::end(tk), 0);
+            }
+            return;
+        }
         if (!check) {
             p->fn(vu, pc);
             return;
