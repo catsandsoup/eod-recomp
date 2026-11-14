@@ -105,7 +105,8 @@ bool config_load(const std::string &path, Config &c) {
         };
         if (ieq(section, "Video")) {
 #ifdef _WIN32
-            if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "warp") ? "warp" : "d3d11";
+            if (ieq(k, "Renderer"))
+                c.renderer = ieq(v, "software") ? "software" : ieq(v, "warp") ? "warp" : ieq(v, "d3d11") ? "d3d11" : "vulkan";
 #else
             if (ieq(k, "Renderer")) c.renderer = ieq(v, "software") ? "software" : ieq(v, "vulkan") ? "vulkan" : ieq(v, "warp") ? "warp" : "d3d11";
 #endif
@@ -245,7 +246,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "Detail=%s\n", c.detail.c_str());
     if (c.draw_distance != 1.0f) fprintf(f, "DrawDistance=%g\n", double(c.draw_distance));
 #ifdef _WIN32
-    fprintf(f, "Renderer=%s        ; d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
+    fprintf(f, "Renderer=%s        ; vulkan, d3d11, software or warp (Direct3D 11 without the graphics driver)\n", c.renderer.c_str());
 #else
     fprintf(f, "Renderer=%s        ; vulkan or software\n", c.renderer.c_str());
 #endif

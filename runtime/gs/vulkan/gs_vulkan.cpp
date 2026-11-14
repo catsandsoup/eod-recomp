@@ -40,8 +40,11 @@
 
 namespace gs {
 namespace hw {
-
+#ifdef EOD_HW_SELECT
+namespace vulkan {  // one of two backends (gs_hw_select.cpp chooses)
+#else
 bool g_on;
+#endif
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 
 namespace {
@@ -3283,6 +3286,16 @@ void stats_line(char *buf, size_t size) {
     g_stats = Stats();
 }
 
+#ifdef EOD_HW_SELECT
+// the modern pass is not ported to Vulkan yet: Original
+void modern_texture(int32_t, const Env &) {}
+void modern_draw(modern::Frame *f) {
+    delete f;
+    modern::disable();
+}
+void modern_alpha(int32_t, uint32_t) {}
+} // namespace vulkan
+#endif
 } // namespace hw
 } // namespace gs
 

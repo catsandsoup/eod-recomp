@@ -3,8 +3,10 @@
 // all allocation, synchronization and drawing below use Vulkan exclusively.
 #pragma once
 #include "present_timing.h"
+#ifndef _WIN32
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#endif
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -15,7 +17,15 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#ifdef _WIN32
+// Windows: the system loader (vulkan-1.dll) is opened at run time by volk, so the
+// build needs only the headers. No <windows.h> here: the D3D11-shaped names below
+// would collide with it.
+#include <volk.h>
+#include "../../platform/platform.h"
+#else
 #include <vulkan/vulkan.h>
+#endif
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -24,6 +34,9 @@
 #include <time.h>
 #endif
 
+// Everything below lives in its own namespace: the Windows build links the real
+// Direct3D 11 backend too, whose interface types share these names.
+namespace vkgs {
 using UINT = uint32_t;
 using UINT8 = uint8_t;
 using HRESULT = int;
@@ -129,7 +142,11 @@ struct D3D11_SHADER_RESOURCE_VIEW_DESC {
     } Texture2D;
 };
 
-namespace vkgs {
+#ifdef _WIN32
+inline void window_pixels(void *, int &w, int &h) { platform_window_pixels(&w, &h); }
+#else
+inline void window_pixels(SDL_Window *win, int &w, int &h) { SDL_GetWindowSizeInPixels(win, &w, &h); }
+#endif
 #ifdef __APPLE__
 // MoltenVK encodes the whole Metal command buffer inside vkQueueSubmit. Its
 // asynchronous submission mode runs that encoding on MoltenVK's own queue
@@ -254,9 +271,59 @@ struct Context {
         VkCommandBuffer cmd{};
         VkFence fence{};
         std::vector<HostBuffer> chunks;
+        std::vector<VkDescriptorPool> pools;
         std::vector<std::function<void()>> garbage;
         uint64_t serial = 0;
     };
+    // Without VK_KHR_push_descriptor (older AMD drivers) descriptor sets come from
+    // pools owned by the command buffer's flight and reset when it completes.
+    std::vector<VkDescriptorPool> pools;
+    size_t poolIndex = 0;
+    VkDescriptorPool new_pool() {
+        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192},
+                                              {VK_DESCRIPTOR_TYPE_SAMPLER, 4096},
+                                              {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096},
+                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2048},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}};
+        VkDescriptorPoolCreateInfo i{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        i.maxSets = 2048;
+        i.poolSizeCount = 6;
+        i.pPoolSizes = sizes;
+        VkDescriptorPool p{};
+        require(vkCreateDescriptorPool(device, &i, nullptr, &p), "descriptor pool");
+        return p;
+    }
+    // vkCmdPushDescriptorSetKHR, or the same writes into a fresh set of `setLayout`
+    void push_set(VkPipelineBindPoint bind, VkPipelineLayout pl, uint32_t set, uint32_t n,
+                  const VkWriteDescriptorSet *w, VkDescriptorSetLayout setLayout) {
+        if (push) {
+            push(cmd, bind, pl, set, n, w);
+            return;
+        }
+        VkDescriptorSet ds{};
+        for (;;) {
+            if (poolIndex == pools.size())
+                pools.push_back(new_pool());
+            VkDescriptorSetAllocateInfo a{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            a.descriptorPool = pools[poolIndex];
+            a.descriptorSetCount = 1;
+            a.pSetLayouts = &setLayout;
+            VkResult r = vkAllocateDescriptorSets(device, &a, &ds);
+            if (r == VK_SUCCESS)
+                break;
+            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL)
+                require(r, "descriptor set");
+            ++poolIndex;
+        }
+        VkWriteDescriptorSet local[16];
+        for (uint32_t i = 0; i < n && i < 16; i++) {
+            local[i] = w[i];
+            local[i].dstSet = ds;
+        }
+        vkUpdateDescriptorSets(device, std::min(n, 16u), local, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, bind, pl, set, 1, &ds, 0, nullptr);
+    }
     std::deque<Flight> inflight;
     std::vector<Flight> idle;
     VkSemaphore spareAcquired{};
@@ -285,6 +352,10 @@ struct Context {
         }();
         const uint64_t ticks = mach_absolute_time();
         return (ticks / scale.denom) * scale.numer + (ticks % scale.denom) * scale.numer / scale.denom;
+#elif defined(_WIN32)
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
 #else
         timespec time{};
         clock_gettime(CLOCK_MONOTONIC, &time);
@@ -355,7 +426,11 @@ struct Context {
     float blendFactor[4]{};
     VkSurfaceKHR surface{};
     VkSwapchainKHR swap{};
+#ifdef _WIN32
+    void *window{}; // HWND
+#else
     SDL_Window *window{};
+#endif
     VkExtent2D extent{};
     VkFormat swapFormat{};
     std::vector<Texture *> back;
@@ -431,6 +506,8 @@ struct Context {
         f.garbage.clear();
         for (auto &c : f.chunks)
             c.used = 0;
+        for (auto p : f.pools)
+            vkResetDescriptorPool(device, p, 0);
         vkResetFences(device, 1, &f.fence);
         vkResetCommandPool(device, f.pool, 0);
         idle.push_back(std::move(f));
@@ -511,6 +588,7 @@ struct Context {
         done.cmd = cmd;
         done.fence = fence;
         done.chunks.swap(chunks);
+        done.pools.swap(pools);
         done.garbage.swap(garbage);
         done.serial = submitted;
         inflight.push_back(std::move(done));
@@ -539,7 +617,9 @@ struct Context {
         cmd = next.cmd;
         fence = next.fence;
         chunks.swap(next.chunks);
+        pools.swap(next.pools);
         chunkIndex = 0;
+        poolIndex = 0;
     }
     // Makes earlier transfer writes visible to host reads once this command
     // buffer completes, without submitting it (see wait_serial).
@@ -1119,7 +1199,7 @@ inline void Context::Draw(UINT count, UINT first) {
             images[i].sampler = samplers[i - 4]->sampler;
     }
     if (!cacheState || !imagesValid || memcmp(boundImages, images, sizeof images)) {
-        push(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 6, writes);
+        push_set(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 6, writes, descriptors);
         memcpy(boundImages, images, sizeof images);
         imagesValid = true;
     }
@@ -1172,6 +1252,15 @@ inline bool Context::init(bool withWindow) {
     app.apiVersion = VK_API_VERSION_1_3;
     std::vector<const char *> exts;
     uint32_t n = 0;
+#ifdef _WIN32
+    if (volkInitialize() != VK_SUCCESS)
+        throw std::runtime_error("no Vulkan loader (vulkan-1.dll)");
+    if (withWindow) {
+        window = platform_native_window();
+        exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        exts.push_back("VK_KHR_win32_surface");
+    }
+#else
     if (withWindow) {
         window = (SDL_Window *)platform_native_window();
         auto names = SDL_Vulkan_GetInstanceExtensions(&n);
@@ -1179,15 +1268,48 @@ inline bool Context::init(bool withWindow) {
             throw std::runtime_error(SDL_GetError());
         exts.assign(names, names + n);
     }
-    exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
+    // portability enumeration (MoltenVK) only where the loader offers it
+    bool portability = false;
+    {
+        uint32_t en = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> props(en);
+        vkEnumerateInstanceExtensionProperties(nullptr, &en, props.data());
+        for (auto &p : props)
+            if (!strcmp(p.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+                portability = true;
+    }
+    if (portability)
+        exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     VkInstanceCreateInfo i{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     i.pApplicationInfo = &app;
-    i.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    i.flags = portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
     i.enabledExtensionCount = (uint32_t)exts.size();
     i.ppEnabledExtensionNames = exts.data();
     require(vkCreateInstance(&i, nullptr, &instance), "instance");
+#ifdef _WIN32
+    volkLoadInstance(instance);
+    if (withWindow) {
+        // VkWin32SurfaceCreateInfoKHR without <windows.h>: HINSTANCE and HWND are pointers
+        struct Win32SurfaceInfo {
+            VkStructureType sType;
+            const void *pNext;
+            VkFlags flags;
+            void *hinstance, *hwnd;
+        } si{(VkStructureType)1000009000 /* VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR */, nullptr, 0,
+             platform_native_instance(), window};
+        using CreateWin32Surface = VkResult(VKAPI_PTR *)(VkInstance, const Win32SurfaceInfo *,
+                                                         const VkAllocationCallbacks *, VkSurfaceKHR *);
+        auto create = (CreateWin32Surface)vkGetInstanceProcAddr(instance, "vkCreateWin32SurfaceKHR");
+        if (!create)
+            throw std::runtime_error("no VK_KHR_win32_surface");
+        require(create(instance, &si, nullptr, &surface), "win32 surface");
+    }
+#else
     if (withWindow && !SDL_Vulkan_CreateSurface(window, instance, nullptr, &surface))
         throw std::runtime_error(SDL_GetError());
+#endif
     require(vkEnumeratePhysicalDevices(instance, &n, nullptr), "enumerate GPUs");
     std::vector<VkPhysicalDevice> devices(n);
     require(vkEnumeratePhysicalDevices(instance, &n, devices.data()), "GPUs");
@@ -1229,7 +1351,9 @@ inline bool Context::init(bool withWindow) {
     auto has = [&](const char *s) {
         return std::any_of(available.begin(), available.end(), [&](auto &e) { return !strcmp(e.extensionName, s); });
     };
-    std::vector<const char *> dext{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    std::vector<const char *> dext;
+    if (has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
+        dext.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     if (has("VK_KHR_portability_subset"))
         dext.push_back("VK_KHR_portability_subset");
     if (surface)
@@ -1246,14 +1370,36 @@ inline bool Context::init(bool withWindow) {
     q.pQueuePriorities = &priority;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
+    // A Vulkan 1.2 driver (older Windows drivers) has dynamic rendering as an extension
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    fdr.dynamicRendering = VK_TRUE;
+    const bool core13 = prop.apiVersion >= VK_API_VERSION_1_3;
+    if (!core13)
+        dext.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    if (getenv("EOD_VK_EXTENSIONS"))
+        for (auto &e : available)
+            fprintf(stderr, "[vulkan] device extension %s %u\n", e.extensionName, e.specVersion);
+    for (const char *e : dext)
+        if (!has(e))
+            throw std::runtime_error(std::string("the GPU driver lacks ") + e);
     VkDeviceCreateInfo d{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    d.pNext = &f13;
+    d.pNext = core13 ? (void *)&f13 : (void *)&fdr;
     d.queueCreateInfoCount = 1;
     d.pQueueCreateInfos = &q;
     d.pEnabledFeatures = &enabled;
     d.enabledExtensionCount = (uint32_t)dext.size();
     d.ppEnabledExtensionNames = dext.data();
     require(vkCreateDevice(physical, &d, nullptr, &device), "device");
+#ifdef _WIN32
+    volkLoadDevice(device);
+    if (!core13) {
+        vkCmdBeginRendering = vkCmdBeginRenderingKHR;
+        vkCmdEndRendering = vkCmdEndRenderingKHR;
+    }
+#else
+    if (!core13)
+        throw std::runtime_error("Vulkan 1.3 required");
+#endif
     vkGetDeviceQueue(device, family, 0, &queue);
     if (displayTiming) {
         refreshDuration = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
@@ -1264,9 +1410,11 @@ inline bool Context::init(bool withWindow) {
         if (displayTiming)
             fprintf(stderr, "[vulkan] refresh-grid presentation timing enabled\n");
     }
-    push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
+    push = has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
+               ? (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR")
+               : nullptr;
     if (!push)
-        throw std::runtime_error("push descriptors unavailable");
+        fprintf(stderr, "[vulkan] no push descriptors: descriptor sets from per-frame pools\n");
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cp.queueFamilyIndex = family;
     require(vkCreateCommandPool(device, &cp, nullptr, &pool), "command pool");
@@ -1289,7 +1437,7 @@ inline bool Context::init(bool withWindow) {
         bindings[j].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    dl.flags = push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
     dl.bindingCount = 6;
     dl.pBindings = bindings;
     require(vkCreateDescriptorSetLayout(device, &dl, nullptr, &descriptors), "descriptor layout");
@@ -1364,7 +1512,7 @@ inline bool Context::resize() {
         vkDestroySwapchainKHR(device, swap, nullptr);
     swap = VK_NULL_HANDLE;
     int w, h;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    window_pixels(window, w, h);
     if (w <= 0 || h <= 0)
         return false;
     VkSurfaceCapabilitiesKHR caps;
@@ -1442,7 +1590,7 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     // missed frame. Honor the user's launch VSync setting for this swapchain;
     // frame skipping and the game's clock remain under the existing GS policy.
     int w, h;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    window_pixels(window, w, h);
     if (w <= 0 || h <= 0)
         return nullptr;
     if (!swap || (uint32_t)w != extent.width || (uint32_t)h != extent.height)
@@ -1486,7 +1634,6 @@ inline bool Context::present() {
         require(r, "present");
     return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
 }
-} // namespace vkgs
 using ID3D11Texture2D = vkgs::Texture;
 using ID3D11RenderTargetView = vkgs::Texture;
 using ID3D11DepthStencilView = vkgs::Texture;
@@ -1501,3 +1648,5 @@ using ID3D11SamplerState = vkgs::Sampler;
 using ID3D11BlendState = vkgs::Blend;
 using ID3D11DepthStencilState = vkgs::Depth;
 using ID3D11RasterizerState = vkgs::Raster;
+} // namespace vkgs
+using namespace vkgs;

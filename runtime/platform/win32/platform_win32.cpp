@@ -469,6 +469,13 @@ void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
 }
 
 void *platform_native_window() { return g_hwnd; }
+void *platform_native_instance() { return GetModuleHandleW(nullptr); }
+void platform_window_pixels(int *w, int *h) {
+    RECT rc{};
+    if (g_hwnd) GetClientRect(g_hwnd, &rc);
+    *w = rc.right - rc.left;
+    *h = rc.bottom - rc.top;
+}
 
 void platform_set_fullscreen(bool on) {
     if (g_hwnd && on != g_fullscreen) toggle_fullscreen();

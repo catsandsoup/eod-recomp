@@ -324,6 +324,7 @@ static void hold_for_menu() {
     while (overlay_paused()) {
         ++g_menu_hold_frames;
         gs_overlay_redraw();
+        gs_menu_hold_frame(g_menu_hold_frames);
         platform_sleep_us(16000);
         if (!platform_pump()) {
             LOG(LOG_CORE, "window closed - exiting");

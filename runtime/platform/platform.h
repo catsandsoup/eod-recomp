@@ -32,6 +32,11 @@ void platform_set_aspect(int aspect);
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h);
 // The native window (HWND on Windows; null when headless).
 void *platform_native_window();
+#ifdef _WIN32
+// The module instance (HINSTANCE) and the window's client size in pixels (Vulkan surface).
+void *platform_native_instance();
+void platform_window_pixels(int *w, int *h);
+#endif
 // Borderless fullscreen (window thread).
 void platform_set_fullscreen(bool on);
 bool platform_fullscreen();

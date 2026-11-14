@@ -1838,6 +1838,18 @@ void gs_overlay_redraw() {
     }
 }
 
+void gs_menu_hold_frame(uint64_t n) {
+    if (g_opt_screenshot_every && n % (uint64_t)g_opt_screenshot_every == 0) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/menu_%05llu.png", g_opt_screenshot_dir.c_str(), (unsigned long long)n);
+        gs_screenshot(path);
+    }
+    if (g_opt_frames && g_frames + n >= (uint64_t)g_opt_frames) {
+        LOG(LOG_CORE, "reached %d frames (menu open) - exiting", g_opt_frames);
+        app_exit(0);
+    }
+}
+
 void gs_vblank() {
     // VSINT, field toggle
     g_csr |= 8;

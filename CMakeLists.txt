@@ -155,7 +155,28 @@ else()
        ${CMAKE_SOURCE_DIR}/runtime/ui/ui_art.cpp ${CMAKE_SOURCE_DIR}/runtime/ui/ui_preview.cpp)
 endif()
 
-if(NOT WIN32)
+if(WIN32)
+  # Vulkan is the default Windows GS backend; Direct3D 11 stays selectable
+  # (Renderer=d3d11). No Vulkan SDK is needed: the headers are fetched and volk
+  # opens the system loader (vulkan-1.dll) at run time.
+  option(EOD_VULKAN "Build the Vulkan GS backend" ON)
+  if(EOD_VULKAN)
+    include(FetchContent)
+    FetchContent_Declare(eod_vulkan_headers
+      URL https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/vulkan-sdk-1.4.357.0
+      URL_HASH SHA256=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3
+      SOURCE_SUBDIR none
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_Declare(eod_volk
+      URL https://codeload.github.com/zeux/volk/tar.gz/refs/tags/vulkan-sdk-1.4.357.0
+      URL_HASH SHA256=6400c7b23e24d17e4f04bac49b55b06c4e87677d33398e90344743ec73560ca6
+      SOURCE_SUBDIR none
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(eod_vulkan_headers eod_volk)
+    file(GLOB VULKAN_GS_SOURCES ${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/*.cpp)
+    list(APPEND PLATFORM_SOURCES ${VULKAN_GS_SOURCES} ${eod_volk_SOURCE_DIR}/volk.c)
+  endif()
+else()
   option(EOD_VULKAN "Build the Vulkan GS backend" ON)
   if(EOD_VULKAN)
     find_package(Vulkan QUIET)
@@ -346,7 +367,12 @@ if(EOD_VULKAN)
   FetchContent_MakeAvailable(eod_xxhash)
   target_include_directories(eod PRIVATE ${eod_xxhash_SOURCE_DIR})
   target_compile_definitions(eod PRIVATE EOD_VULKAN)
-  target_link_libraries(eod PRIVATE Vulkan::Vulkan)
+  if(WIN32)
+    target_compile_definitions(eod PRIVATE EOD_HW_SELECT VK_NO_PROTOTYPES)
+    target_include_directories(eod PRIVATE ${eod_vulkan_headers_SOURCE_DIR}/include ${eod_volk_SOURCE_DIR})
+  else()
+    target_link_libraries(eod PRIVATE Vulkan::Vulkan)
+  endif()
   include(CTest)
   if(BUILD_TESTING)
     add_executable(eod_present_timing_test tools/tests/present_timing_test.cpp)

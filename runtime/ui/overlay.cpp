@@ -17,6 +17,7 @@
 
 #include "../core/config.h"
 #include "../platform/platform.h"
+#include "../platform/pad_script.h"
 
 void build_key_map();
 extern std::string g_game_root;
@@ -60,7 +61,15 @@ bool overlay_wndproc(void *hwnd, unsigned msg, uintptr_t wp, intptr_t lp) {
     return false;
 }
 
-void overlay_platform_pad(int port, HostPadState *out) { platform_get_controller(port, out); }
+void overlay_platform_pad(int port, HostPadState *out) {
+    platform_get_controller(port, out);
+    // EOD_PAD_SCRIPT (automated tests) reaches the menu too: Start+Select opens it headless
+    uint16_t sb;
+    if (port == 0 && pad_script_buttons(sb)) {
+        out->connected = true;
+        out->buttons |= sb;
+    }
+}
 bool overlay_platform_keys_held() {
     for (int vk = 0x08; vk < 0x100; vk++)
         if (GetAsyncKeyState(vk) & 0x8000) return true;

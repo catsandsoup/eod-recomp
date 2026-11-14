@@ -22,7 +22,7 @@ struct Config {
 #elif defined(__APPLE__)
     std::string renderer = "software";
 #else
-    std::string renderer = "d3d11";  // d3d11 | software | warp (Direct3D 11 in software)
+    std::string renderer = "vulkan";  // vulkan | d3d11 | software | warp (Direct3D 11 in software)
 #endif
     int adapter = 0;                 // DXGI adapter index
     bool fullscreen = false;         // borderless window covering the monitor

@@ -35,7 +35,7 @@ void draw_point(const Env &e, const Vertex &a);
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 // All prepared CPU bytes are now supplied; upload proven complete storage
 // blocks into retained GPU owners without reading their untouched pixels back.
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(EOD_VULKAN)
 inline void vram_write_complete() {}  // Direct3D 11 keeps its synchronous uploads
 #else
 void vram_write_complete();
@@ -51,7 +51,7 @@ void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, in
 // clut_snapshot_page() returns an 8 KB page image (waiting on first use) with
 // exactly the bytes a synchronous readback would have left in gs::vram then.
 struct ClutSnapshot;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(EOD_VULKAN)
 inline ClutSnapshot *clut_snapshot(uint32_t, uint32_t, uint32_t, int, int, int, int) { return nullptr; }
 inline const uint8_t *clut_snapshot_page(ClutSnapshot *, uint32_t) { return nullptr; }
 inline void clut_snapshot_free(ClutSnapshot *) {}

@@ -59,8 +59,11 @@
 namespace gs {
 extern bool g_skip_frame;  // gs_draw.cpp
 namespace hw {
-
+#ifdef EOD_HW_SELECT
+namespace d3d11 {  // one of two backends (gs_hw_select.cpp chooses)
+#else
 bool g_on;
+#endif
 void readback_pages(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 
 namespace {
@@ -2229,6 +2232,9 @@ void stats_line(char *buf, size_t size) {
 
 #include "modern_d3d11.inc"
 
+#ifdef EOD_HW_SELECT
+}  // namespace d3d11
+#endif
 }  // namespace hw
 }  // namespace gs
 #endif  // _WIN32
