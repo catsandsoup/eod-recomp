@@ -37,6 +37,18 @@ struct Config {
     bool smooth_display = true;      // bilinear filtering when scaling the image to the window
     bool frame_skip = true;          // drop frames when drawing can't keep up (the game keeps its speed)
     bool show_fps = false;           // frame rate in a corner (d3d11 renderer)
+    // the modern renderer (Windows, d3d11): switched live in the Graphics panel, F9 or L1+R1+R3;
+    // its effects in percent of the default look (docs/SCENE_CAPTURE.md "Modern renderer")
+    bool modern_renderer = false;
+    int modern_shadows = 100;        // sun shadow strength (0: off)
+    bool modern_soft_shadows = true; // soft shadows that harden at contact
+    int modern_reflections = 100;    // paint clear coat, sky reflections, highlights
+    int modern_ao = 100;             // ambient occlusion
+    int modern_bloom = 100;
+    int modern_vignette = 0;
+    int modern_exposure = 100;
+    int modern_haze = 100;           // distance haze
+    int modern_grade = 100;          // colour grade (saturation and contrast)
     // [Audio]
     bool audio = true;
     int music_volume = 100;

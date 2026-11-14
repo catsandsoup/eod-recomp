@@ -130,6 +130,16 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);
             else if (ieq(k, "ShowFps")) c.show_fps = to_bool(v);
+            else if (ieq(k, "ModernRenderer")) c.modern_renderer = to_bool(v);
+            else if (ieq(k, "ModernShadows")) c.modern_shadows = num(0, 200);
+            else if (ieq(k, "ModernSoftShadows")) c.modern_soft_shadows = to_bool(v);
+            else if (ieq(k, "ModernReflections")) c.modern_reflections = num(0, 200);
+            else if (ieq(k, "ModernAO")) c.modern_ao = num(0, 200);
+            else if (ieq(k, "ModernBloom")) c.modern_bloom = num(0, 200);
+            else if (ieq(k, "ModernVignette")) c.modern_vignette = num(0, 200);
+            else if (ieq(k, "ModernExposure")) c.modern_exposure = num(25, 200);
+            else if (ieq(k, "ModernHaze")) c.modern_haze = num(0, 200);
+            else if (ieq(k, "ModernGrade")) c.modern_grade = num(0, 200);
         } else if (ieq(section, "Audio")) {
             if (ieq(k, "Enabled")) c.audio = to_bool(v);
             else if (ieq(k, "MusicVolume")) c.music_volume = num(0, 100);
@@ -254,6 +264,12 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "SmoothDisplay=%d\n", c.smooth_display ? 1 : 0);
     fprintf(f, "FrameSkip=%d\n", c.frame_skip ? 1 : 0);
     fprintf(f, "ShowFps=%d\n", c.show_fps ? 1 : 0);
+    fprintf(f, "ModernRenderer=%d     ; the modern renderer (F9 or L1+R1+R3 switch it live); effects in percent:\n",
+            c.modern_renderer ? 1 : 0);
+    fprintf(f, "ModernShadows=%d\nModernSoftShadows=%d\nModernReflections=%d\nModernAO=%d\nModernBloom=%d\n",
+            c.modern_shadows, c.modern_soft_shadows ? 1 : 0, c.modern_reflections, c.modern_ao, c.modern_bloom);
+    fprintf(f, "ModernVignette=%d\nModernExposure=%d\nModernHaze=%d\nModernGrade=%d\n", c.modern_vignette,
+            c.modern_exposure, c.modern_haze, c.modern_grade);
     fprintf(f, "\n[Audio]\n");
     fprintf(f, "Enabled=%d\n", c.audio ? 1 : 0);
     fprintf(f, "Volume=%d\nMusicVolume=%d\n", c.volume, c.music_volume);

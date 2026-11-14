@@ -21,9 +21,11 @@ cbuffer Frame : register(b0) {
     float4 gsz;                     // x 1 / 2^bits of the GS depth format
     float4 c0_x, c0_y, c0_z;        // cascade 0 (near, sharp) world -> shadow rows
     float4 c1_x, c1_y, c1_z;        // cascade 1 (far)
-    float4 cs;                      // x, y world size of a texel in cascade 0 / 1
+    float4 cs;                      // x, y world size of a texel in cascade 0 / 1; z, w depth range of each
     float4 post;                    // x pixels per world unit at w = 1, y AO radius (world), z bloom threshold, w bloom
     float4 post2;                   // x 1 / width, y 1 / height, zw blur step (uv)
+    float4 set;                     // settings: x shadows, y reflections, z ambient occlusion, w vignette
+    float4 set2;                    // x bloom, y colour grade, z soft shadows (light size), w haze
 };
 cbuffer Batch : register(b1) {
     float4 m0, m1, m2;   // model rows
@@ -77,12 +79,14 @@ VOut vs_modern(VIn i) {
 struct SOut {
     float4 pos : SV_Position;
     float2 uv : TEXCOORD0;
+    float2 va : TEXCOORD1;
 };
 SOut vs_shadow(VIn i) {
     SOut o;
     float4 w = world(i.p);
     o.pos = float4(dot(sh_x, w), dot(sh_y, w), dot(sh_z, w), 1);
     o.uv = i.uv;
+    o.va = float2(i.va.x * (255.0 / 128.0), i.va.y);
     return o;
 }
 // the depth the GS would have written for this batch, into the game's own depth buffer
@@ -92,10 +96,19 @@ SOut vs_gsdepth(VIn i) {
     float4 q = float4(i.p, 1);
     o.pos = float4(dot(clip_x, w), dot(clip_y, w), dot(zrow, q) * gsz.x, dot(clip_w, w));
     o.uv = i.uv;
+    o.va = i.va;
     return o;
 }
+// only what is visible casts: a blended primitive casts by its alpha as the GS forms it (the
+// car's reflection and damage layers are kicked at alpha 0 until damaged), alpha-tested texels
+// that fail do not cast
 void ps_shadow(SOut i) {
-    if (info.z > 0 && tex.Sample(smp, i.uv).a * (255.0 / 128.0) < 0.5) discard;
+    float ta = info.z > 0 ? tex.Sample(smp, i.uv).a * (255.0 / 128.0) : 1;
+    int tfx = (int)info2.w;
+    float av = info2.y * i.va.x;
+    float a = info2.z > 0 ? av : tfx == 0 ? ta * av : tfx == 2 ? ta + av : ta;
+    if (i.va.y > 0.5 && a < 0.5) discard;
+    if (ta < 0.5) discard;
 }
 float3 lin(float3 c) { return pow(saturate(c), 2.2); }
 // ---- post: ambient occlusion from the scene depth, bloom, composite with a filmic grade
@@ -149,13 +162,13 @@ float4 ps_comp(float4 pos : SV_Position) : SV_Target {
     float ao = 0;
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++) ao += ao_tex.Sample(lin_clamp, uv + h * float2(x, y) * 2.5);
-    c *= lerp(1, ao / 9, 0.75);
+    c *= lerp(1, ao / 9, set.z);
     c += bloom_tex.Sample(lin_clamp, uv).rgb * post.w;
     float l = dot(c, float3(0.299, 0.587, 0.114));
-    c = saturate(lerp(l.xxx, c, 1.12));                // a little more colour
-    c = lerp(c, c * c * (3 - 2 * c), 0.35);            // gentle S-curve
+    c = saturate(lerp(l.xxx, c, 1 + 0.12 * set2.y));    // a little more colour
+    c = lerp(c, c * c * (3 - 2 * c), 0.35 * set2.y);    // gentle S-curve
     float2 v = uv - 0.5;
-    c *= 1 - dot(v, v) * 0.3;                          // soft vignette
+    c *= 1 - dot(v, v) * set.w;                         // vignette (off unless chosen)
     return float4(c, 128.0 / 255.0);
 }
 
@@ -169,29 +182,81 @@ float4 ps_full(float4 pos : SV_Position) : SV_Target {
     return float4(gs_frame.Load(int3(pos.xy, 0)).rgb, 128.0 / 255.0);
 }
 float3 aces(float3 x) { return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)); }
-float shadow_cascade(float3 s, float off) {
+static const float2 k_disk[16] = {
+    float2(-0.94, -0.40), float2(0.95, -0.77), float2(-0.09, -0.93), float2(0.34, 0.29),
+    float2(-0.92, 0.46), float2(-0.82, -0.88), float2(-0.38, 0.28), float2(-0.11, 0.65),
+    float2(0.54, -0.41), float2(0.45, -0.89), float2(0.24, 0.92), float2(-0.81, 0.15),
+    float2(0.97, 0.76), float2(0.44, 0.13), float2(-0.62, 0.96), float2(0.79, 0.19)};
+// soft shadows that harden at contact (PCSS): the blocker's distance sets the filter width
+// range: world depth of the cascade (z unit), texel: world size of one of its texels
+float shadow_cascade(float3 s, float off, float range, float texel, float2 rot) {
     float2 uv = float2((s.x * 0.5 + 0.5) * 0.5 + off, 0.5 - s.y * 0.5);
+    float2 tx = float2(0.5, 1) * params.y;
+    float2x2 R = float2x2(rot.x, -rot.y, rot.y, rot.x);
+    float r = 1.5;
+    if (set2.z > 0) {
+        float zb = 0, nb = 0;
+        [unroll] for (int k = 0; k < 16; k += 2) {
+            float d = shadow_map.SampleLevel(lin_clamp, uv + mul(R, k_disk[k]) * tx * 10, 0);
+            if (d < s.z) { zb += d; nb++; }
+        }
+        if (nb == 0) return 1;
+        zb /= nb;
+        // the penumbra grows with the distance to the blocker (a sun about 1.5 degrees across, softened)
+        r = clamp((s.z - zb) * range / texel * set2.z, 1.5, 12);
+    }
     float sum = 0;
-    [unroll] for (int y = -2; y <= 2; y++)
-        [unroll] for (int x = -2; x <= 2; x++)
-            sum += shadow_map.SampleCmpLevelZero(shadow_smp, uv + float2(x * 0.5, y) * params.y, s.z);
-    return sum / 25;
+    [unroll] for (int k = 0; k < 16; k++)
+        sum += shadow_map.SampleCmpLevelZero(shadow_smp, uv + mul(R, k_disk[k]) * tx * r, s.z);
+    return sum / 16;
 }
-float shadow_at(float3 wp, float3 n) {
+float shadow_raw(float3 wp, float3 n, float2 pix) {
+    // a per-pixel rotation of the sample disk (interleaved gradient noise): no banding
+    float ign = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+    float2 rot = float2(cos(ign * 6.2832), sin(ign * 6.2832));
     // normal offset by a texel and a half of the cascade used: no acne, no floating shadows
     float4 w0 = float4(wp + n * cs.x * 1.5, 1);
     float3 s0 = float3(dot(c0_x, w0), dot(c0_y, w0), dot(c0_z, w0));
-    if (all(abs(s0.xy) < 0.92) && s0.z < 1) return shadow_cascade(s0, 0);
+    if (all(abs(s0.xy) < 0.9) && s0.z < 1) return shadow_cascade(s0, 0, cs.z, cs.x, rot);
     float4 w1 = float4(wp + n * cs.y * 1.5, 1);
     float3 s1 = float3(dot(c1_x, w1), dot(c1_y, w1), dot(c1_z, w1));
     if (any(abs(s1.xy) > 1) || s1.z > 1) return 1;
     float k = saturate(1 - max(abs(s1.x), abs(s1.y)) * 1.1 + 0.1) * 4;  // fade out at the far edge
-    return lerp(1, shadow_cascade(s1, 0.5), saturate(k));
+    return lerp(1, shadow_cascade(s1, 0.5, cs.w, cs.y, rot), saturate(k));
+}
+float shadow_at(float3 wp, float3 n, float2 pix) {
+    if (set.x <= 0) return 1;
+    return lerp(1, shadow_raw(wp, n, pix), set.x);
+}
+static const float PI = 3.14159265;
+float D_GGX(float NoH, float a) {
+    float a2 = a * a, f = (NoH * a2 - NoH) * NoH + 1;
+    return a2 / (PI * f * f);
+}
+float V_SmithGGXCorrelated(float NoV, float NoL, float a) {
+    float a2 = a * a;
+    float gv = NoL * sqrt(NoV * NoV * (1 - a2) + a2), gl = NoV * sqrt(NoL * NoL * (1 - a2) + a2);
+    return 0.5 / max(gv + gl, 1e-5);
+}
+float V_Kelemen(float LoH) { return 0.25 / max(LoH * LoH, 1e-3); }
+float3 F_Schlick(float3 f0, float VoH) { return f0 + (1 - f0) * pow(1 - VoH, 5); }
+// the split-sum DFG term, analytic fit (Karis): scale and bias of f0
+float2 dfg(float NoV, float rough) {
+    const float4 c0 = float4(-1, -0.0275, -0.572, 0.022), c1 = float4(1, 0.0425, 1.04, -0.04);
+    float4 r = rough * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    return float2(-1.04, 1.04) * a004 + r.zw;
 }
 float3 sky_env(float3 r) {
     float h = saturate(dot(r, up.xyz));
     float3 horizon = lin(fog.rgb), zenith = float3(0.16, 0.32, 0.62);
     return lerp(horizon, zenith, sqrt(h)) * (dot(r, up.xyz) < 0 ? 0.35 : 1.0);
+}
+// the sky seen by a rough surface: the reflection widens toward the whole hemisphere
+float3 sky_rough(float3 r, float3 n, float rough) {  // (dimmed: the ground reflects too)
+    float3 d = normalize(lerp(r, n, rough * rough));
+    float3 avg = lerp(lin(fog.rgb) * 0.6, float3(0.30, 0.40, 0.58), dot(n, up.xyz) * 0.5 + 0.5);
+    return lerp(sky_env(d), avg, rough * rough);
 }
 float4 ps_modern(VOut i) : SV_Target {
     float4 t = info.z > 0 ? tex.Sample(smp, i.uv) : float4(0.75, 0.75, 0.75, 128.0 / 255.0);
@@ -221,29 +286,42 @@ float4 ps_modern(VOut i) : SV_Target {
     if (i.c.a > 0.5) {
         float3 n = normalize(i.n);
         if (dot(n, V) < 0) n = -n;  // two-sided
-        float sh = shadow_at(i.wp, n);
+        float sh = shadow_at(i.wp, n, i.pos.xy);
         float nl = saturate(dot(n, L));
+        if (fog.w > 0) return float4(sh, nl, 0, 1);  // EOD_MODERN_DEBUG: red = lit by the sun, green = facing it
         float hemi = dot(n, up.xyz) * 0.5 + 0.5;
         float3 ambient = lerp(lin(fog.rgb) * 0.3, float3(0.30, 0.38, 0.55), hemi) * (0.5 + sun.w);
-        col = albedo * (sun_col * nl * sh + ambient);
-        if (fog.w > 0) return float4(sh, nl, 0, 1);  // EOD_MODERN_DEBUG: red = lit by the sun, green = facing it
-        float gloss = info.w;
-        if (gloss > 0) {
-            float3 h = normalize(L + V);
-            float spec = pow(saturate(dot(n, h)), 16 + 240 * gloss) * (2 + 30 * gloss) * gloss;
-            float fres = 0.04 + 0.96 * pow(1 - saturate(dot(n, V)), 5);
-            col += sun_col * spec * nl * sh * 0.25;
-            col = lerp(col, sky_env(reflect(-V, n)) * (0.5 + 0.5 * sh), fres * gloss * 0.6);
+        // base layer: a dielectric, rougher where the game draws a plain object
+        float gloss = info.w * set.y;
+        float rough = gloss > 0 ? lerp(0.85, 0.45, saturate(gloss * 2.2)) : 0.85;
+        float a = rough * rough;
+        float3 H = normalize(L + V);
+        float NoV = max(dot(n, V), 1e-3), NoH = saturate(dot(n, H)), LoH = saturate(dot(L, H));
+        float3 F = F_Schlick(0.04, LoH);
+        float3 Fr = D_GGX(NoH, a) * V_SmithGGXCorrelated(NoV, nl, a) * F * PI;
+        col = (albedo * (1 - F) + Fr) * sun_col * nl * sh;
+        float2 ab = dfg(NoV, rough);
+        float spec_occ = 0.5 + 0.5 * sh;  // the sun's shadow stands in for the sky's occlusion
+        col += albedo * ambient + sky_rough(reflect(-V, n), n, rough) * (0.04 * ab.x + ab.y) * spec_occ * 0.5 * set.y;
+        // clear coat (car paint): a smooth varnish over the base, as Filament's clearCoat layer
+        float cc = saturate(gloss * 0.8);  // weathered paint: a thin, worn varnish
+        if (cc > 0) {
+            const float ca = 0.08 * 0.08;
+            float Fc = F_Schlick(0.04, LoH).x * cc;
+            float Frc = D_GGX(NoH, ca) * V_Kelemen(LoH) * Fc * PI;
+            col = col * (1 - Fc) + Frc * sun_col * nl * sh;
+            float Fcv = (0.04 + 0.96 * pow(1 - NoV, 5)) * cc;
+            col = col * (1 - Fcv) + sky_env(reflect(-V, n)) * spec_occ * Fcv;
         }
     } else {
         // baked lighting (the world's vertex colours) under the sun shadow
-        float sh = shadow_at(i.wp, up.xyz);
+        float sh = shadow_at(i.wp, up.xyz, i.pos.xy);
         col = albedo * lin(i.c.rgb) * 1.35 * (0.5 + 0.5 * sh);
         if (fog.w > 0) return float4(sh, 0, 1, 1);
     }
     float dist = length(i.wp - cam_pos.xyz);
     float haze = 1 - exp(-dist / params.z);
-    col = lerp(col, lerp(lin(fog.rgb), float3(0.45, 0.55, 0.75), 0.4), haze * 0.35);
+    col = lerp(col, lerp(lin(fog.rgb), float3(0.45, 0.55, 0.75), 0.4), haze * 0.35 * set2.w);
     col = aces(col * params.w);
     return float4(pow(col, 1 / 2.2), t.a);
 }
@@ -286,7 +364,7 @@ bool g_mready, g_mfailed;
 
 struct ModernFrameCB {
     float clip_x[4], clip_y[4], clip_w[4], params[4], cam_pos[4], up[4], sh_x[4], sh_y[4], sh_z[4], fog[4], sun[4], gsz[4];
-    float c0_x[4], c0_y[4], c0_z[4], c1_x[4], c1_y[4], c1_z[4], cs[4], post[4], post2[4];
+    float c0_x[4], c0_y[4], c0_z[4], c1_x[4], c1_y[4], c1_z[4], cs[4], post[4], post2[4], set[4], set2[4];
 };
 struct ModernBatchCB {
     float m[12], light[4], info[4], info2[4], atest[4], zrow[4];
@@ -860,8 +938,10 @@ void modern_draw(modern::Frame *frame) {
         med = std::max(dists[dists.size() / 2], 1.0f);
     }
     static const float k_shadow = getenv("EOD_MODERN_SHADOW") ? (float)atof(getenv("EOD_MODERN_SHADOW")) : 1.2f;
-    static const float k_haze = getenv("EOD_MODERN_HAZE") ? (float)atof(getenv("EOD_MODERN_HAZE")) : 40.0f;
-    static const float k_exposure = getenv("EOD_MODERN_EXPOSURE") ? (float)atof(getenv("EOD_MODERN_EXPOSURE")) : 1.0f;
+    const float k_haze = 40.0f;
+    const Config &gc = g_config;
+    auto pct = [](int v) { return std::clamp(v, 0, 200) / 100.0f; };
+    const float k_exposure = pct(gc.modern_exposure);
     // scene scale for the shadow cascades: smoothed over many frames, so the cascades keep their
     // size (a size that changes each frame makes shadows swim and change softness)
     static float s_scale = 0;
@@ -889,6 +969,7 @@ void modern_draw(modern::Frame *frame) {
         casc[c][1][3] = -cv / half;
         casc[c][2][3] = 0.5f + cl / (6 * half);
         fc.cs[c] = texel;
+        fc.cs[2 + c] = 6 * half;
     }
     memcpy(fc.c0_x, casc[0][0], 16);
     memcpy(fc.c0_y, casc[0][1], 16);
@@ -898,8 +979,16 @@ void modern_draw(modern::Frame *frame) {
     memcpy(fc.c1_z, casc[1][2], 16);
     fc.params[0] = 0.05f;  // near
     fc.params[1] = 1.0f / (kShadowSize / 2);  // one texel of a cascade (the atlas is 2:1)
-    static const float k_ao = getenv("EOD_MODERN_AO") ? (float)atof(getenv("EOD_MODERN_AO")) : 0.05f;
-    static const float k_bloom = getenv("EOD_MODERN_BLOOM") ? (float)atof(getenv("EOD_MODERN_BLOOM")) : 0.35f;
+    const float k_ao = 0.05f;
+    const float k_bloom = 0.35f * pct(gc.modern_bloom);
+    fc.set[0] = pct(gc.modern_shadows);
+    fc.set[1] = pct(gc.modern_reflections);
+    fc.set[2] = 0.75f * pct(gc.modern_ao);
+    fc.set[3] = 0.6f * pct(gc.modern_vignette);
+    fc.set2[0] = pct(gc.modern_bloom);
+    fc.set2[1] = pct(gc.modern_grade);
+    fc.set2[2] = gc.modern_soft_shadows ? 0.03f : 0.0f;
+    fc.set2[3] = pct(gc.modern_haze);
     fc.post[0] = std::sqrt(fc.clip_x[0] * fc.clip_x[0] + fc.clip_x[1] * fc.clip_x[1] + fc.clip_x[2] * fc.clip_x[2]) * W * 0.5f;
     fc.post[1] = s_scale * k_ao;
     fc.post[2] = 0.72f;
@@ -937,8 +1026,8 @@ void modern_draw(modern::Frame *frame) {
     ID3D11Buffer *cbs[2] = {g_mcb_frame, g_mcb_batch};
     g_ctx->VSSetConstantBuffers(0, 2, cbs);
     g_ctx->PSSetConstantBuffers(0, 2, cbs);
-    ID3D11SamplerState *ss[2] = {g_msampler, g_mshadow_smp};
-    g_ctx->PSSetSamplers(0, 2, ss);
+    ID3D11SamplerState *ss[3] = {g_msampler, g_mshadow_smp, g_mlin_clamp};
+    g_ctx->PSSetSamplers(0, 3, ss);
     ModernBatchCB bc = {};
     uint32_t drawn = 0;
 
@@ -950,7 +1039,7 @@ void modern_draw(modern::Frame *frame) {
     g_ctx->OMSetDepthStencilState(g_mds_shadow, 0);
     g_ctx->VSSetShader(g_mvs_shadow, nullptr, 0);
     g_ctx->PSSetShader(g_mps_shadow, nullptr, 0);
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < (fc.set[0] > 0 ? 2 : 0); c++) {
         memcpy(fc.sh_x, casc[c][0], 16);
         memcpy(fc.sh_y, casc[c][1], 16);
         memcpy(fc.sh_z, casc[c][2], 16);

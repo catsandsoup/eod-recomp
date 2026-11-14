@@ -53,10 +53,11 @@ struct Frame {
     std::vector<Mesh> meshes;    // meshes first seen this frame
 };
 
-extern bool g_on;  // EOD_MODERN=1: the modern renderer is available
+extern bool g_on;  // the modern renderer can be used in this build (not EOD_MODERN=0)
 // It draws (true) or the original GS draws everything (false); switched live
 // with F9 or L1+R1+R3, read by the producer once per frame.
 bool live();
+bool available();  // the backend can draw it (Windows d3d11, shaders built)
 void toggle();
 void disable();  // the modern renderer cannot run here: Original from now on
 
@@ -72,6 +73,7 @@ extern Target g_target;
 // GS thread
 void gs_packet(int path);
 void gs_batch(int32_t index);
+constexpr int32_t kSuppressed = -2;  // batch(kSuppressed): the following PATH1 draws are dropped
 // true: this draw belongs to a replaced batch (the caller skips it); its texture is noted
 // alpha: the draw's vertex alpha (0x80 = 1.0; the car damage layer fades in with it)
 bool gs_replaced(const gs::Env &e, uint32_t alpha);

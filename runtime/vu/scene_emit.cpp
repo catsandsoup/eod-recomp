@@ -49,13 +49,19 @@ const bool g_nowrite = env_u64("EOD_SCENE_EMIT_NOWRITE", 0) != 0;
 const bool g_all = env_u64("EOD_SCENE_EMIT_ALL", 0) != 0;  // diagnostic: every program with the batch layout
 // EOD_MODERN=1: also feed the modern renderer live (read here directly: the
 // static initialisation order across files is not defined)
-const bool g_modern = [] {
+const bool g_modern = [] {  // as modern::g_on (initialised in another file)
+#ifdef _WIN32
     const char *v = getenv("EOD_MODERN");
-    return v && *v && strcmp(v, "0") != 0;
+    return !(v && strcmp(v, "0") == 0);
+#else
+    return false;
+#endif
 }();
 const bool g_write = g_path && *g_path && !g_nowrite;
 bool emit_range(uint64_t f) { return g_path && *g_path && f >= g_from && f - g_from < g_count; }
-bool in_range(uint64_t f) { return g_modern || emit_range(f); }
+bool g_live;  // the modern renderer draws this frame (latched at the vblank)
+// the emitter decodes a frame for the modern renderer only while it draws: Original costs nothing
+bool in_range(uint64_t f) { return (g_modern && g_live) || emit_range(f); }
 
 constexpr uint32_t fourcc(const char (&s)[5]) {
     return (uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24;
@@ -140,7 +146,6 @@ void kick_alphas(const uint8_t *d, uint32_t qwc, std::vector<uint8_t> &out) {
 // modern feed (producer)
 modern::Frame *g_mf;
 bool g_triggered;      // this frame's modern pass is queued
-bool g_live;           // the modern renderer draws this frame (latched at the vblank)
 int32_t g_marker = -1; // last batch marker sent to the GS
 void mark(int32_t i) {
     if (i == g_marker) return;
@@ -500,6 +505,13 @@ void vu1_start(const VUState *vu, uint32_t pc) {
             }
         }
     }
+    // the game's own projected car shadows (blurred blobs composited onto the ground): the modern
+    // pass casts real shadows, so the blobs are not drawn while it is live
+    static const bool keep_blobs = getenv("EOD_MODERN_BLOBS") != nullptr;
+    if (g_live && !g_triggered && !keep_blobs && (pc == 0x0020 || pc == 0x0338)) {
+        mark(modern::kSuppressed);
+        replaced = true;
+    }
     if (g_modern && !replaced) mark(-1);
     g_ns += now_ns() - t;
 }
@@ -529,12 +541,12 @@ void vblank(uint64_t frame) {
     // the frame that starts now gets the number of the next vblank (as the
     // GS side and --screenshot-every count it)
     g_frame = frame + 1;
-    g_frame_active = in_range(g_frame);
     if (g_modern) {
         static const uint64_t flip = env_u64("EOD_MODERN_FLIP_EVERY", 0);  // diagnosis: alternate renderers
         if (flip && g_frame % flip == 0) modern::toggle();
         g_live = modern::live();
     }
+    g_frame_active = in_range(g_frame);
     g_kicks = g_run = g_new_geoms = 0;
     g_ns = 0;
     if (!emit_range(g_frame) && g_f && g_frame > g_from) {

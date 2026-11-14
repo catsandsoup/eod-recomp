@@ -280,24 +280,87 @@ Results (Windows, D3D11, Afton/No-Rules Race/Venom, headless, muted):
 | Frame rate at 3x (3,000 frames each) | 59.9 vblank/s in both modes; game frames/s 58.7 (modern off) and 56.0 (modern on), inside the run-to-run spread measured before (53-57); EE busy 77% -> 84%, GS busy 37% -> 35% (the GS skips the replaced draws) | V |
 | Failure path | the shader-compile failure seen during development switched the pass off; the GS then draws everything | V |
 
+Since the first pass (commits after `8007e86`):
+
+* Per-vertex alpha and per-primitive blending from the game's own PATH1 kicks: the car damage
+  layers fade in vertex by vertex as in the original; terrain blends per primitive.
+* The modern pass runs before the particles (at the first particle program after the scene) and
+  writes the depth the GS would have written, so particles, the start flag and the late
+  camera-space batches are drawn by the GS over it and hidden correctly.
+* Sun shadows: a 4096x2048 atlas with two cascades, sizes smoothed per track, centres snapped
+  to texels. Only what is visible casts (blended primitives by their GS alpha, alpha-tested
+  texels). Percentage-closer soft shadows: the blocker distance sets the filter width (soft
+  away from the caster, sharp at contact), 16 rotated disk taps.
+* The game's own projected car shadow (programs 0x0020 / 0x0338, a hard dark quad on the
+  ground) is not drawn while the modern pass is live (`EOD_MODERN_BLOBS=1` keeps it).
+* Shading follows Filament's standard model (docs: Filament "Physically Based Rendering in
+  Filament"): GGX distribution, height-correlated Smith visibility, Schlick Fresnel, a clear
+  coat layer on car paint (Kelemen visibility), split-sum image light from the game's sky with
+  an analytic DFG fit. Post: ambient occlusion from depth with a surface-plane test, bloom,
+  filmic grade.
+* Settings in the in-game menu (Graphics, MODERN RENDERER; saved in `eod.ini` [Video]):
+  RENDERER (MODERN / ORIGINAL, also F9 and L1+R1+R3), SUN SHADOWS, SOFT SHADOWS, REFLECTIONS,
+  AMBIENT OCCLUSION, BLOOM, EXPOSURE, DISTANCE HAZE, COLOUR GRADE, VIGNETTE (off by default).
+  All live. The renderer is available in every Windows D3D11 build (`EOD_MODERN=0` removes it,
+  `EOD_MODERN=1` starts in it); while ORIGINAL is chosen the emitter does no work.
+
+Results of this round (Windows, D3D11, Afton/No-Rules Race/Venom, headless, muted):
+
+| Measure | Result | Conf. |
+|---|---|---|
+| Original mode | GS replay of the race dump: VRAM byte-identical with the modern path available and with `EOD_MODERN=0` (md5 `f30d64c0...`, as before) | V |
+| Same-moment pair at 3x (1920x1344) | modern frame: soft car-shaped shadow under the car, no hard quad; original frame shows the game's quad shadow | V |
+| Run-to-run determinism | two runs with identical settings give different screenshots (the game is not frame-deterministic headless); pixel identity is therefore proved by GS replay, not screenshots | V |
+
+### Effects audit: what the game has, and where it stands in Modern
+
+| Effect | In the original game | Modern pass today |
+|---|---|---|
+| Car body, paint, numbers | VU1 programs 0x2e0 (body), 0xd48 (detail), 0x15a8 (damage) | redrawn: lit, clear coat, sun shadow, damage fades per vertex |
+| Car shadow | 0x0020 / 0x0338 project a hard quad onto the ground | replaced by real cascaded soft shadows |
+| Driver | 0x24b0 / 0x318 (skinned) | redrawn; about 1 px off (bone matrices not decoded) |
+| Tyre smoke, dust, exhaust and engine flames, sparks, fire | particle programs 0x1b8 / 0x8e0 / 0x5e0, textured sprites drawn by the GS | still the game's sprites, drawn by the GS over the modern image with correct depth; not relit, no soft-particle fade, no light emitted |
+| Explosions | the same particle programs (billboard fireballs and debris sprites) | as above: original sprites; no flash light, no heat haze |
+| Headlights / tail lights | none: the races are in daylight; lamps are only painted in the texture | none. A light list exists nowhere yet |
+| Street and track lights | none lit; light poles are plain props | drawn as props; no emissive or light |
+| Metal poles, fences, barrels | props lit by the vertex colours | lit by the sun with a rough dielectric response; no metal material (the game has no material ids) |
+| Track surface reflections | none (dirt, no wet tracks) | none; the dirt is matte. Screen-space reflections would only matter for wet or polished surfaces |
+| Glass | the window frames are open cages, no glass | n/a |
+| Skid marks | late camera-space 0x270 batches before the HUD | drawn by the GS over the modern image |
+| Sky | dome 0x270 in ITOP mode 0x280 | kept from the GS; also used as the reflected environment |
+| HUD, menus, movies | GS | unchanged |
+
+### Filament techniques mapped onto this pass
+
+The Filament library itself is not linked: it has Vulkan, OpenGL and Metal backends but no
+Direct3D 11 one, and its materials need its offline compiler. Its documented techniques are
+implemented directly in the pass (no Filament code copied):
+
+| Filament feature | Here |
+|---|---|
+| Standard lit model (GGX, Smith-GGX correlated, Schlick, Lambert) | yes |
+| Clear coat layer | yes (car paint) |
+| Image-based lighting (split sum, DFG) | yes, from the analytic sky (no captured cube map yet) |
+| Cascaded shadow maps, PCSS soft shadows | yes (2 cascades) |
+| SSAO | yes (surface-plane AO) |
+| Bloom, ACES tone mapping, colour grading, vignette | yes, all in the settings |
+| Fog | distance haze in the game's fog colour |
+| MSAA / supersampling | 4x MSAA at the render scale |
+| Punctual lights (point, spot), clustered forward | no: no light sources in the game's data; headlights would need car-front positions |
+| Screen-space reflections | no |
+| TAA, depth of field, motion blur | no |
+| Anisotropic, cloth, subsurface materials | no material ids to drive them |
+
 Known gaps (each a follow-up):
 
-* **Car damage layers** (0x15a8, and the reveal of 0xd48 parts) need per-vertex alpha: the game
-  sets the alpha per vertex from the damage, and a per-batch average cuts the car apart. The
-  damage overlay is left out of the modern pass until the emitter carries per-vertex alpha
-  (from the kicked RGBAQ). An undamaged car looks right; dents and scrapes do not show yet.
-* The car paint texture's light scratch pattern shows more than in the original (the game's
-  layer logic darkens it).
-* Sun shadows are soft and weaker than the game's own car shadow blob; the shadow box follows
-  the camera with a scale from the object distances.
-* Particles (dust, sparks, fire), the start-line flag and shadows drawn by the GS before the
-  HUD are covered by the modern pass.
-* Textures are still the game's (from VRAM). Higher-resolution and remade textures plug in
-  through the same keys; that is the next visual step, with an engine-grade renderer
-  (Filament) behind the same feed.
-* The pass is Direct3D 11 only; the Vulkan backend (macOS) is the same code over
-  `vk_compat.h` and still has to be built and tested there. Shaders are compiled at start
-  with `d3dcompiler_47.dll`; shipping needs them precompiled (`tools/build_shaders.py`).
+* **Vulkan**: the pass is Direct3D 11 only. The Vulkan backend (macOS) is a separate port with
+  its own precompiled shaders and is not built on Windows. Moving Windows to Vulkan (one backend
+  for both platforms) and porting this pass to it is the next platform step.
+* Particles, fire and explosions are the original sprites; rebuilding them (lit, soft, emitting
+  light) needs the particle programs decoded like the geometry ones.
+* Driver skinning (0x24b0 bone matrices).
+* Textures are still the game's (from VRAM).
+* Shaders are compiled at start with `d3dcompiler_47.dll`; shipping needs them precompiled.
 * GPU mesh cache has no eviction yet (about 25 MB after a race).
 
 ## Tools

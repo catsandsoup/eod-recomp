@@ -9,28 +9,48 @@
 #include "gs_env.h"
 #include "gs_hw.h"
 #include "gs_state.h"
+#include "../core/config.h"
 
 namespace modern {
 
+// available on Windows (the d3d11 backend draws it) unless EOD_MODERN=0; EOD_MODERN=1 also
+// switches it on at start. Whether it draws is the config's ModernRenderer (Graphics panel).
 bool g_on = [] {
+#ifdef _WIN32
     const char *v = getenv("EOD_MODERN");
-    return v && *v && strcmp(v, "0") != 0;
+    return !(v && strcmp(v, "0") == 0);
+#else
+    return false;
+#endif
 }();
 
 Target g_target;
 
 namespace {
-std::atomic<bool> g_live{true};
+std::atomic<bool> g_failed{false};
+void env_start() {
+    static bool once = [] {
+        const char *v = getenv("EOD_MODERN");
+        if (v && *v && strcmp(v, "0") != 0) g_config.modern_renderer = true;
+        return true;
+    }();
+    (void)once;
 }
-bool live() { return g_on && g_live.load(std::memory_order_relaxed); }
+}  // namespace
+bool available() { return g_on && gs::hw::g_on && !g_failed.load(std::memory_order_relaxed); }
+bool live() {
+    if (!available()) return false;
+    env_start();
+    return g_config.modern_renderer;
+}
 void disable() {
-    if (g_live.exchange(false)) fprintf(stderr, "[modern] renderer unavailable: original\n");
+    if (!g_failed.exchange(true)) fprintf(stderr, "[modern] renderer unavailable: original\n");
 }
 void toggle() {
-    if (!g_on) return;
-    const bool on = !g_live.load();
-    g_live = on;
-    fprintf(stderr, "[modern] renderer: %s\n", on ? "modern" : "original");
+    if (!available()) return;
+    env_start();
+    g_config.modern_renderer = !g_config.modern_renderer;
+    fprintf(stderr, "[modern] renderer: %s\n", g_config.modern_renderer ? "modern" : "original");
 }
 
 namespace {
@@ -44,7 +64,8 @@ void gs_packet(int path) { g_path = path; }
 void gs_batch(int32_t index) { g_batch = index; }
 
 bool gs_replaced(const gs::Env &e, uint32_t alpha) {
-    if (g_path != 1 || g_batch < 0) return false;
+    if (g_path != 1 || g_batch == -1) return false;
+    if (g_batch == kSuppressed) return true;
     g_target = {true, e.fbp, e.fbw, e.fpsm, gs::st.ctx[0].xyoffset, gs::st.ctx[0].scissor, e.zbp, e.zpsm};
     if (g_noted != g_batch && gs::hw::g_on) {  // the batch's texture and blend state (first draw)
         gs::hw::modern_texture(g_batch, e);
