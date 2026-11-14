@@ -9,7 +9,7 @@ This is the player contract for the 1.0 release. “Implemented” describes cod
 | How many can join? | The protocol assigns IDs 0–15. The host occupies 0 and can admit up to 15 guests. A full room refuses a new connection. | This is an admission ceiling. Only two simultaneous humans have exercised the traced rematch. Test 3, 4, 5, event capacity, 16, and a 17th connection. |
 | Can I customize lobby size? | The host sets MAX PLAYERS from 1 to 16, including themselves. It cannot shrink below current occupancy. Independent AI count, laps, reservations and access control remain separate work. | Actual UDP admission tested at 16, overflow refused, clamp at occupancy, reduction to 15 and replacement admission after restoring 16. |
 | How many humans can race? | Each machine supplies one locally driven car. Human-driver and pad-zero bindings are validated before GO; initial grid poses are acknowledged before simulation. Remote drivers occupy eligible AI seats in the selected event. The roster reader accepts 1–16 total cars. Battle construction caps **all** cars at 10, including humans and AI. Event choice and available AI seats can lower the human limit. | Preflight the actual grid before Start and show a reason if anyone lacks a seat. Do not promise a universal 16-human race. Define AI displacement or lobby-only seats before advertising larger rooms. |
-| Who can speak? | The Opus session handles all player IDs 0–15. | Codec tests mix 15 remote streams including sender 15. Physical microphone and acoustic evidence are separated in VOICE_AND_MUSIC_ACCEPTANCE.md. |
+| Who can speak? | The Opus session handles all player IDs 0–15. | Codec tests mix 15 remote streams including sender 15. Physical microphone and acoustic evidence are separated in the voice tests. |
 | Can I join during a race? | The host refuses a fresh join while its event is active. | Show “Race in progress” and allow retry. A waiting room, spectating, and guaranteed seat reservation are proposed. |
 | Can we mix local split screen and online? | The online setup selects single local player per machine. Local split screen is a separate game path. | Mixed local/online seats are outside this release. |
 
@@ -116,7 +116,7 @@ start records, handshake the initial grid, scope snapshots to events, normalize
 shared rules, check effective game content, add nickname/capacity/moderation UI,
 and verify the specifically listed scenarios.
 Result: the listed long race, standing start, rematch and protocol checks passed.
-Remaining acceptance is recorded above and in INVESTIGATION_QUEUE.md. The next
+Remaining acceptance is recorded above. The next
 broad confidence test is a real three-machine race with network impairment and
 natural finish, followed by physical Mac/Windows input and audio.
 
@@ -128,4 +128,4 @@ Installed assets are assumed read-only during a session. Music and movie exclusi
 keeps individual soundtrack choice independent of gameplay parity.
 
 The final 1.0 packages repeated two-race rematches in both hosting directions;
-see RELEASE_1_0_ACCEPTANCE.md for the final checkpoint.
+the 1.0 release was the final checkpoint.

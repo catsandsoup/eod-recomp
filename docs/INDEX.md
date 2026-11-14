@@ -25,7 +25,7 @@ This index maps every reverse-engineered subsystem in *Test Drive: Eve of Destru
 - **Entry & Frame Synchronization**: `_start` (`0x00100008`), `main` (`0x00100138`), `FrameWaitVblank` (`0x0035C460`), `FrameWaitDrawDone` (`0x0035C528`).
 - **Allocator & Diagnostics**: `MemAlloc` (`0x0012DDB8`), `MemFree` (`0x0012DB78`), `MemPoolGetAvailable` (`0x0012DEC8`), `Panic` (`0x00331DF0`), `DebugPrintf` (`0x00331E48`). Checked at runtime by `src/hle_heapcheck.cpp` (`EOD_HEAP_CHECK=1`).
 - **StreamFS & Archives**: `StrmMountArchive` (`0x0033D408`), `StrmFindFile` (`0x0033D4F8`), `StrmOpenFile` (`0x0033D8E8`), `ResLoadAsset` (`0x001323E8`).
-- **Docs**: [`DEVELOPER_HANDOFF.md`](DEVELOPER_HANDOFF.md), [`STATUS.md`](STATUS.md), [`MACOS.md`](MACOS.md), [`WORKER_SHUTDOWN.md`](WORKER_SHUTDOWN.md), [`TIMING_TRACE.md`](TIMING_TRACE.md).
+- **Docs**: [`DEVELOPER_HANDOFF.md`](DEVELOPER_HANDOFF.md), [`MACOS.md`](MACOS.md), [`WORKER_SHUTDOWN.md`](WORKER_SHUTDOWN.md).
 
 ### Career Mode, AutoShop, Garage & Unlocks (`0x002C0000`–`0x002EFFFF`, `0x003698E8`–`0x003702F0`)
 - **Functions**: `AutoShopSetAvailable` (`0x002E35F0`), `AutoShopUpdateSelection` (`0x003702F0`), `HomebaseBuildMenu` (`0x003698E8`), `CareerIsEveRankEligible` (`0x002E5200`), `CareerLoadChallengesVal` (`0x002E5758`), `CareerApplyPostEveRank` (`0x002E6C78`), `CareerGetPlayerRank` (`0x002E0F10`), `CareerCalcTradeInDepreciation` (`0x002E3BC8`), `CareerGetOwnedCarResaleValue` (`0x002E3E70`), `CareerFreeRoamRun` (`0x002D58E8`), `CareerIsFreeRoamActive` (`0x001741C0`).
@@ -43,7 +43,7 @@ This index maps every reverse-engineered subsystem in *Test Drive: Eve of Destru
 - **Driving & Recovery**: `HumanDriverUpdate` (`0x0018F2A8`), `CarSetSteering` (`0x0018AA80`), `CarRecoveryCountdownUpdate` (`0x001B8370`).
 - **Detached Debris Phob Pools**: `DetachedWheelPoolReset` (`0x001B2868`), `DetachedWheelPoolFreeAll` (`0x001B2DD8`), `DetachedWheelPhobUpdate` (`0x001B2E78`), `DetachedWheelSpawn` (`0x001B3068`), `DetachedPanelPoolInit` (`0x001E0DC8`), `DetachedPanelSpawn` (`0x001E1E88`), `DetachedPanelPhobUpdate` (`0x001E25C8`), `DetachedPanelPoolClear` (`0x001E29C0`).
 - **Globals**: `g_DetachablePanelSpecTable` (`0x0044AE68`), `g_DetachedWheelPhobPool` (`0x00484E68`), `g_RecoveryConfigFlag` (`0x00485098`), `g_DetachedPanelPhobPool` (`0x00494D60`).
-- **Docs**: [`MANUAL_RECOVERY.md`](MANUAL_RECOVERY.md), [`NASCAR_A2_RECOVERY.md`](NASCAR_A2_RECOVERY.md), [`NASCAR_CUP_WHEELS.md`](NASCAR_CUP_WHEELS.md), [`CUSTOM_VEHICLE_PIPELINE.md`](CUSTOM_VEHICLE_PIPELINE.md), [`ASSET_PIPELINE_RECOVERY.md`](ASSET_PIPELINE_RECOVERY.md).
+- **Docs**: [`MANUAL_RECOVERY.md`](MANUAL_RECOVERY.md), [`NASCAR_A2_RECOVERY.md`](NASCAR_A2_RECOVERY.md), [`NASCAR_CUP_WHEELS.md`](NASCAR_CUP_WHEELS.md), [`CUSTOM_VEHICLE_PIPELINE.md`](CUSTOM_VEHICLE_PIPELINE.md).
 
 ### Camera, Widescreen, Draw Distance, LOD & Texture Cache (`0x00211318`–`0x00220788`, `0x0033ECB8`–`0x003653F8`)
 - **Camera & Frustum**: `DisplaySetAspectMode` (`0x0034D328`), `ProjectionSetPerspective` (`0x0034E530`), `FrustumTestSphere` (`0x0034E308`), `CameraBuildViewportProjection` (`0x00212B58`), `FogConfigureRange` (`0x0033ECB8`), `GsFogWriteTables` (`0x003653F8`), `HudDrawLeftRaceRows` (`0x00119888`), `HudDrawRightSpeedRows` (`0x00119F40`).
@@ -53,7 +53,7 @@ This index maps every reverse-engineered subsystem in *Test Drive: Eve of Destru
 - **Docs**: [`LOD_CULLING_INVESTIGATION.md`](LOD_CULLING_INVESTIGATION.md), [`LOD_RUNTIME.md`](LOD_RUNTIME.md), [`DETAIL_PRESETS.md`](DETAIL_PRESETS.md), [`NATIVE_CAMERA_ASPECT.md`](NATIVE_CAMERA_ASPECT.md), [`HUD_EDGE_ANCHORS.md`](HUD_EDGE_ANCHORS.md), [`TEXTURE_FORMAT_NOTES.md`](TEXTURE_FORMAT_NOTES.md).
 
 ### GS Renderer (Vulkan & Direct3D 11)
-- **Docs**: [`GS_ALPHA_ORDER.md`](GS_ALPHA_ORDER.md), [`GS_CPU_WRITE_PRESERVATION.md`](GS_CPU_WRITE_PRESERVATION.md), [`GS_COLD_PACKET_REPLAY.md`](GS_COLD_PACKET_REPLAY.md), [`COLLISION_PERFORMANCE.md`](COLLISION_PERFORMANCE.md), [`VULKAN_SYNC_DIAGNOSTICS.md`](VULKAN_SYNC_DIAGNOSTICS.md), [`RECOMP_RENDERER_RECON.md`](RECOMP_RENDERER_RECON.md), [`RENDERER_REFERENCES.md`](RENDERER_REFERENCES.md), [`SCENE_CAPTURE.md`](SCENE_CAPTURE.md).
+- **Docs**: [`GS_ALPHA_ORDER.md`](GS_ALPHA_ORDER.md), [`GS_CPU_WRITE_PRESERVATION.md`](GS_CPU_WRITE_PRESERVATION.md), [`GS_COLD_PACKET_REPLAY.md`](GS_COLD_PACKET_REPLAY.md), [`COLLISION_PERFORMANCE.md`](COLLISION_PERFORMANCE.md), [`RENDERER_REFERENCES.md`](RENDERER_REFERENCES.md), [`SCENE_CAPTURE.md`](SCENE_CAPTURE.md).
 
 ### Input, Audio, Replay & Netplay (`0x0012F3C8`–`0x0012F4F0`, `0x00176698`–`0x00177718`, `0x00191548`, `0x0038F868`–`0x003919A0`)
 - **Simulation & Determinism**: `WorldSimulationStep` (`0x00177718`), `RaceSessionInitPhase` (`0x00176698`), `RaceSessionSeedRng` (`0x00176918`), `ReplayRecordHumanTick` (`0x00191548`), `RngNextFloat01` (`0x0012F3C8`), `RngNextRange` (`0x0012F470`), `RngNextSignedFloat` (`0x0012F4F0`).

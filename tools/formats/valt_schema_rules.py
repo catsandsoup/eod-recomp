@@ -506,7 +506,7 @@ add("""
 ## ---- dealer (buycar.val)
 career | car | chassis | Chassis | Dealer | | Car model (the DATA/CAR file name) sold by this entry. | conf=high used=1 ev=docs/CAREER_UNLOCKS.md; "No matching chassis to %s from buy list"
 career | car | price | Price | Dealer | $ | Dealer price before the price multiplier. | conf=high used=1 ev=docs/CAREER_UNLOCKS.md (wealth tiering 0x2E35F0)
-career | car | desc | Description | Dealer | | Text shown at the dealer. A backslash starts a new line. | conf=high used=1 ev=docs/MOD_CAPABILITY_ACCEPTANCE.md (desc written and shown)
+career | car | desc | Description | Dealer | | Text shown at the dealer. A backslash starts a new line. | conf=high used=1 ev=in-game test (desc written and shown)
 career | settings | car_price_multiplier | Price multiplier | Dealer | x | Multiplies every dealer price. | conf=medium used=1 ev=Read by the dealer loader; effect from the name
 career | vehicle | chassis | Chassis | Dealer | | Chassis this variant belongs to. Must match a [car] entry. | conf=high used=1 ev=docs/CAREER_UNLOCKS.md
 career | vehicle | number | Vehicle number | Dealer | | Number of the paint and dealer art (CT.RES <n>.tex, UICAR.RES uicar_<n>). | conf=high used=1 ev=docs/CAREER_UNLOCKS.md

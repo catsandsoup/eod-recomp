@@ -123,7 +123,7 @@ leave it unset for the native baseline. EOD_HUD_EDGE_ANCHORS=0 disables wide HUD
 anchor adjustment for same-binary comparison. Leave enhancements off while
 establishing the original baseline.
 
-Before new renderer work, read RECOMP_RENDERER_RECON.md and
+Before new renderer work, read
 RENDERER_REFERENCES.md: pinned PCSX2, Road Trip/PS2Recomp/paraLLEl-GS, Play! and
 SDK references include applicability limits. Reuse proven approaches and verify
 against this game's actual outputs; another project's success is not correctness

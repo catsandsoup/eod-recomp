@@ -10,7 +10,7 @@ A scenario is: a memory card (a fresh copy of your real card, never the original
 the developer time scale (EOD_TIME_SCALE, default 8), optional scripted pad input (tools/padscript.py syntax),
 and screenshots. The output folder gets game.log, the screenshots, sheet.png (a contact sheet) and summary.txt
 (the session / warp / menu lines and any panic). Runs take the shared game-run lock, so only one game runs at once.
-See docs/CAREER_WARP.md and docs/FAST_TRAVEL_AND_INSTANT_TESTING.md.
+See docs/CAREER_WARP.md.
 """
 import argparse
 import os
