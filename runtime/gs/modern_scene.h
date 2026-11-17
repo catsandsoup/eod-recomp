@@ -45,6 +45,10 @@ struct Batch {
     bool drawn;        // the game kicked something for it
     std::vector<uint8_t> valpha;  // per vertex: the kicked alpha and 255 if its primitive blends
                                   // (empty: the kick was not 1:1 with the mesh)
+    // this frame's vertices with the program's bones applied (driver and pedestrian skeletons,
+    // car damage offsets); same count and order as the mesh, drawn with its indices. Empty: the
+    // cached mesh as it is.
+    std::vector<Vertex> skinned;
 };
 
 struct Frame {
@@ -77,10 +81,14 @@ constexpr int32_t kSuppressed = -2;  // batch(kSuppressed): the following PATH1 
 // true: this draw belongs to a replaced batch (the caller skips it); its texture is noted
 // alpha: the draw's vertex alpha (0x80 = 1.0; the car damage layer fades in with it)
 bool gs_replaced(const gs::Env &e, uint32_t alpha);
+// A batch whose program was not run (its state-only GIF output was replayed): its texture, blend
+// and test state are taken from the GS registers as they stand at this point in command order.
+void gs_batch_state(int32_t index);
 void gs_draw(Frame *f);  // takes ownership
 
 // Producer thread: queue the commands above in GS order
 void post_batch(int32_t index);
+void post_batch_state(int32_t index);
 void post_draw(Frame *f);
 
 }  // namespace modern

@@ -62,9 +62,23 @@ int32_t g_noted = -1;   // its texture was handed to the backend
 
 void gs_packet(int path) { g_path = path; }
 
-void gs_batch(int32_t index) { g_batch = index; }
+void gs_batch(int32_t index) {
+    g_batch = index;
+    gs::attr_mark();
+}
 
+static bool gs_replaced_(const gs::Env &e, uint32_t alpha);
 bool gs_replaced(const gs::Env &e, uint32_t alpha) {
+    const bool r = gs_replaced_(e, alpha);
+    if (gs::g_stale_prim && !r) {
+        if (gs::g_stale_visible++ < 8)
+            fprintf(stderr, "[skipproof] drawn stale primitive: path %d tme %u abe %u fbp %x fbmsk %x tfx %d tcc %u fge %u zbp %x zmsk %u\n", g_path,
+                    e.tme, e.abe, e.fbp, e.fbmsk, e.tfx, e.tcc, e.fge, e.zbp, e.zmsk);
+    }
+    gs::g_stale_prim = false;
+    return r;
+}
+static bool gs_replaced_(const gs::Env &e, uint32_t alpha) {
     if (g_path != 1 || g_batch == -1) return false;
     if (g_batch == kSuppressed) return true;
     g_target = {true, e.fbp, e.fbw, e.fpsm, gs::st.ctx[0].xyoffset, gs::st.ctx[0].scissor, e.zbp, e.zpsm};
@@ -74,6 +88,17 @@ bool gs_replaced(const gs::Env &e, uint32_t alpha) {
     }
     if (gs::hw::g_on) gs::hw::modern_alpha(g_batch, alpha);
     return true;
+}
+
+void gs_batch_state(int32_t index) {
+    gs::taint_attributes();
+    if (index < 0 || !gs::hw::g_on) return;
+    const gs::Env &e = gs::current_env();
+    g_target = {true, e.fbp, e.fbw, e.fpsm, gs::st.ctx[0].xyoffset, gs::st.ctx[0].scissor, e.zbp, e.zpsm};
+    if (g_noted != index) {
+        gs::hw::modern_texture(index, e);
+        g_noted = index;
+    }
 }
 
 void gs_draw(Frame *f) {

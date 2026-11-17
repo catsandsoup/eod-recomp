@@ -318,7 +318,7 @@ Results of this round (Windows, D3D11, Afton/No-Rules Race/Venom, headless, mute
 |---|---|---|
 | Car body, paint, numbers | VU1 programs 0x2e0 (body), 0xd48 (detail), 0x15a8 (damage) | redrawn: lit, clear coat, sun shadow, damage fades per vertex |
 | Car shadow | 0x0020 / 0x0338 project a hard quad onto the ground | replaced by real cascaded soft shadows |
-| Driver | 0x24b0 / 0x318 (skinned) | redrawn; about 1 px off (bone matrices not decoded) |
+| Driver, pedestrians | 0x24b0 / 0x318 (skinned) | redrawn in this frame's pose: the emitter applies the bones (see "Bones") |
 | Tyre smoke, dust, exhaust and engine flames, sparks, fire | particle programs 0x1b8 / 0x8e0 / 0x5e0, textured sprites drawn by the GS | still the game's sprites, drawn by the GS over the modern image with correct depth; not relit, no soft-particle fade, no light emitted |
 | Explosions | the same particle programs (billboard fireballs and debris sprites) | as above: original sprites; no flash light, no heat haze |
 | Headlights / tail lights | none: the races are in daylight; lamps are only painted in the texture | none. A light list exists nowhere yet |
@@ -358,7 +358,6 @@ Known gaps (each a follow-up):
   for both platforms) and porting this pass to it is the next platform step.
 * Particles, fire and explosions are the original sprites; rebuilding them (lit, soft, emitting
   light) needs the particle programs decoded like the geometry ones.
-* Driver skinning (0x24b0 bone matrices).
 * Textures are still the game's (from VRAM).
 * Shaders are compiled at start with `d3dcompiler_47.dll`; shipping needs them precompiled.
 * GPU mesh cache has no eviction yet (about 25 MB after a race).
@@ -469,3 +468,21 @@ HUD-boundary rule on menus, split screen and the garage.
 **Next decisive test.** Feed this stream to an embedded modern renderer (Vulkan) that draws
 world and cars into a depth buffer shared with the GS HUD, in a live race at full speed,
 with Original mode toggleable and unchanged.
+
+## Bones (2026-11-17)
+
+Decoded from the VU1 microcode (`config/vu`, image fd0ce30ab0ec263c). Per vertex k the program reads a
+skin word at TOP+149+n-k: `.x`, `.y` = bone a, b (low 16 bits of the word: an absolute VU1 qword
+address), `.z`, `.w` = weights biased by 32768.
+
+| Programs | Bone | Position | Normal |
+|---|---|---|---|
+| 0x24b0, 0x318 (driver, pedestrians; body 0x1ff0) | 3x4 matrix, columns at qwords i+144..i+147 | wa*(Ma p) + wb*(Mb p) | rotated the same way |
+| 0x2e0, 0xd48, 0x15a8 (player car passes) | translation at qword i+143 (damage dents) | p + wa*Da + wb*Db | unchanged |
+
+The emitter (`skin_vertices` in `runtime/vu/scene_emit.cpp`) poses each such batch on the CPU and the
+modern pass draws the cached bind-pose mesh's indices with those vertices (`modern::Batch::skinned`).
+`EOD_MODERN_SKINCHECK=1` projects the posed vertices through the batch matrix and compares them
+with the XYZ the program kicked. Afton race and Career dealer, Vulkan, 2x: mean 0.048 px, max 0.088 px
+(the GS 1/16 px step) for 0x24b0, 0x318, 0xd48 and 0x15a8; 0x2e0 the same apart from one early burst
+of 5,514 vertices projecting near the camera plane.

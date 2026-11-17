@@ -109,6 +109,11 @@ struct Batch {
     std::vector<uint8_t> pred;     // EOD_MODERN_SKIPCHECK: valpha predicted from the inputs
     std::vector<uint32_t> in_w;    // EOD_MODERN_SKIPCHECK: each input vertex's first qword .w
     bool skipped = false;          // the program was not run (cached results)
+    uint64_t state_key = 0;        // every VU1 input a program's GS state output depends on
+    std::vector<std::vector<uint8_t>> state_rec;  // a real run's PATH1 kicks without vertices
+    bool state_ok = true;          // every kick could be reduced exactly (else: never skipped)
+    std::vector<float> skin_xy;    // EOD_MODERN_SKINCHECK: the skinned vertices projected (GS pixels)
+    std::vector<float> kick_xy;    // EOD_MODERN_SKINCHECK: the XYZ the program kicked (GS pixels)
     uint64_t tag;                  // EOD_MODERN_SKIPCHECK: the GIF tag template (VU1 qword 23)
 };
 
@@ -213,6 +218,113 @@ struct AtExit {
     }
 } g_at_exit;
 
+// Input vertex k of a batch: v = model-space position (TOP+199 offset applied) and s, t (TOP+198
+// offset applied); a = normal (int8) or colour, and flags (bit0 ADC, bit1 normal).
+void input_vertex(const VUState *vu, uint32_t top, uint32_t k, const float off[4], const float uvo[4], float v[5],
+                  uint8_t a[4]) {
+    float p[4], s[4];
+    uint32_t ni[4];
+    memcpy(ni, qword(vu, top + 1 + 3 * k), 16);
+    memcpy(p, qword(vu, top + 2 + 3 * k), 16);
+    memcpy(s, qword(vu, top + 3 + 3 * k), 16);
+    v[0] = p[0] + off[0], v[1] = p[1] + off[1], v[2] = p[2] + off[2], v[3] = s[0] + uvo[0], v[4] = s[1] + uvo[1];
+    const bool normal = (ni[0] & 0xFFFFFF00u) == 0x47800000u;  // offset-mode V4-8 (STROW 65536)
+    for (int i = 0; i < 3; i++) a[i] = normal ? (uint8_t)(int8_t)((int)(ni[i] & 0xFF) - 128) : (uint8_t)ni[i];
+    const uint32_t w = ni[3] & 0xFFFF;
+    a[3] = (uint8_t)(((w & 0x8000) || w == 0x80) | (normal ? 2 : 0));
+}
+void modern_vertex(const float v[5], const uint8_t a[4], modern::Vertex &mv) {
+    const bool normal = (a[3] & 2) != 0;
+    memcpy(mv.p, v, 12);
+    memcpy(mv.uv, v + 3, 8);
+    for (int i = 0; i < 3; i++) {
+        mv.n[i] = normal ? (int8_t)a[i] : 0;
+        mv.c[i] = normal ? 0x80 : a[i];
+    }
+    mv.n[3] = normal ? 127 : 0;
+    mv.c[3] = 0x80;
+}
+
+// ---- bones (VU1 microcode, config/vu fd0ce30ab0ec263c)
+// Per vertex k the program reads a skin word at TOP+149+n-k: .x, .y = bone a, b (the low 16 bits
+// of the word, an absolute VU1 qword address), .z, .w = weights a, b as floats biased by 32768.
+//   0x24b0 / 0x318 (driver, pedestrians; body at 0x1ff0): bone i is a 3x4 matrix, columns at
+//     qwords i+144..i+147; position = wa*(Ma p) + wb*(Mb p), normal = wa*(Ra n) + wb*(Rb n).
+//   0x2e0 / 0xd48 / 0x15a8 (player car passes; bodies at 0x948/0xd70/0x10f0): bone i is a
+//     translation at qword i+143 (damage dents); position = p + wa*Da + wb*Db, normal unchanged.
+// The modern renderer draws the cached bind-pose mesh with these per-frame vertices.
+enum SkinKind { SKIN_NONE, SKIN_MATRIX, SKIN_OFFSET };
+SkinKind skin_kind(uint32_t pc) {
+    switch (pc) {
+    case 0x24b0: case 0x318: return SKIN_MATRIX;
+    case 0x2e0: case 0xd48: case 0x15a8: return SKIN_OFFSET;
+    }
+    return SKIN_NONE;
+}
+uint32_t skin_index(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return u & 0xFFFF;
+}
+// The batch's vertices with its bones applied; false when they are the bind pose (no dents) or
+// the skin data is not usable (the cached mesh is drawn then).
+bool skin_vertices(const VUState *vu, uint32_t pc, uint32_t top, uint32_t n, std::vector<modern::Vertex> &out) {
+    const SkinKind kind = skin_kind(pc);
+    if (kind == SKIN_NONE || !n) return false;
+    EOD_ZONE("emit.skin");
+    constexpr float kBias = 32768.0f;
+    float off[4], uvo[4];
+    memcpy(off, qword(vu, top + 199), 16);
+    memcpy(uvo, qword(vu, top + 198), 16);
+    out.resize(n);
+    bool moved = kind == SKIN_MATRIX;
+    for (uint32_t k = 0; k < n; k++) {
+        float v[5], sk[4], pw[4];
+        uint8_t a[4];
+        input_vertex(vu, top, k, off, uvo, v, a);
+        memcpy(pw, qword(vu, top + 2 + 3 * k), 16);  // .w: the position's w (the matrix translation weight)
+        memcpy(sk, qword(vu, top + 149 + n - k), 16);
+        const uint32_t ba = skin_index(sk[0]), bb = skin_index(sk[1]);
+        const float wa = sk[2] - kBias, wb = sk[3] - kBias;
+        if (!(std::fabs(wa) <= 4.0f && std::fabs(wb) <= 4.0f)) return false;
+        modern::Vertex &mv = out[k];
+        modern_vertex(v, a, mv);
+        float p[3];
+        if (kind == SKIN_OFFSET) {
+            const float *da = (const float *)qword(vu, ba + 143), *db = (const float *)qword(vu, bb + 143);
+            for (int i = 0; i < 3; i++) {
+                const float d = wa * da[i] + wb * db[i];
+                p[i] = v[i] + d;
+                if (std::fabs(d) > 1e-6f) moved = true;
+            }
+        } else {
+            const float *A[4], *B[4];
+            for (int c = 0; c < 4; c++) A[c] = (const float *)qword(vu, ba + 144 + c), B[c] = (const float *)qword(vu, bb + 144 + c);
+            float nrm[3] = {0, 0, 0};
+            const bool has_n = (a[3] & 2) != 0;
+            for (int i = 0; i < 3; i++) {
+                const float pa = A[0][i] * v[0] + A[1][i] * v[1] + A[2][i] * v[2] + A[3][i] * pw[3];
+                const float pb = B[0][i] * v[0] + B[1][i] * v[1] + B[2][i] * v[2] + B[3][i] * pw[3];
+                p[i] = wa * pa + wb * pb;
+                if (has_n) {
+                    const float n0 = mv.n[0], n1 = mv.n[1], n2 = mv.n[2];
+                    nrm[i] = wa * (A[0][i] * n0 + A[1][i] * n1 + A[2][i] * n2) + wb * (B[0][i] * n0 + B[1][i] * n1 + B[2][i] * n2);
+                }
+            }
+            if (has_n) {
+                const float l = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+                if (l > 1e-6f)
+                    for (int i = 0; i < 3; i++) mv.n[i] = (int8_t)std::lround(std::clamp(nrm[i] / l, -1.0f, 1.0f) * 127.0f);
+            }
+        }
+        for (int i = 0; i < 3; i++) {
+            if (!(std::fabs(p[i]) < 1e6f)) return false;
+            mv.p[i] = p[i];
+        }
+    }
+    return moved;
+}
+
 // Decodes a new mesh into a GEOM record. False if the run's input is not the
 // batch layout (docs/SCENE_CAPTURE.md section 2).
 bool decode(const VUState *vu, uint32_t top, uint32_t n, uint64_t id) {
@@ -229,34 +341,18 @@ bool decode(const VUState *vu, uint32_t top, uint32_t n, uint64_t id) {
     put(&id, 8);
     put(hdr, 8);
     for (uint32_t k = 0; k < n; k++) {
-        float p[4], s[4];
-        uint32_t ni[4];
-        memcpy(ni, qword(vu, top + 1 + 3 * k), 16);
-        memcpy(p, qword(vu, top + 2 + 3 * k), 16);
-        memcpy(s, qword(vu, top + 3 + 3 * k), 16);
-        float v[5] = {p[0] + off[0], p[1] + off[1], p[2] + off[2], s[0] + uvo[0], s[1] + uvo[1]};
+        float v[5];
+        uint8_t a[4];
+        input_vertex(vu, top, k, off, uvo, v, a);
         for (int i = 0; i < 3; i++)
             if (!(std::fabs(v[i]) < 1e6f)) {
                 g_out.resize(at);
                 return false;
             }
-        uint8_t a[4];
-        const bool normal = (ni[0] & 0xFFFFFF00u) == 0x47800000u;  // offset-mode V4-8 (STROW 65536)
-        for (int i = 0; i < 3; i++) a[i] = normal ? (uint8_t)(int8_t)((int)(ni[i] & 0xFF) - 128) : (uint8_t)ni[i];
-        const uint32_t w = ni[3] & 0xFFFF;
-        a[3] = (uint8_t)(((w & 0x8000) || w == 0x80) | (normal ? 2 : 0));
         put(v, 20);
         put(a, 4);
         if (g_modern) {
-            modern::Vertex &mv = mesh.v[k];
-            memcpy(mv.p, v, 12);
-            memcpy(mv.uv, v + 3, 8);
-            for (int i = 0; i < 3; i++) {
-                mv.n[i] = normal ? (int8_t)a[i] : 0;
-                mv.c[i] = normal ? 0x80 : a[i];
-            }
-            mv.n[3] = normal ? 127 : 0;
-            mv.c[3] = 0x80;
+            modern_vertex(v, a, mesh.v[k]);
             // strip: a triangle ends at every vertex without ADC (no culling, so winding is free)
             if (k >= 2 && !(a[3] & 1)) mesh.idx.insert(mesh.idx.end(), {k - 2, k - 1, k});
         }
@@ -391,17 +487,22 @@ void check_report() {
                 (unsigned long long)e.second.abe_bad);
 }
 
-// ---- VU1 skip for replaced batches (EOD_MODERN_SKIPVU, on by default)
+// ---- VU1 skip for replaced batches (EOD_MODERN_SKIPVU=1; off by default, not exact: see skip_enabled)
 // A replaced batch's program output is thrown away except three things the modern renderer reads:
 // that it kicked (the game never culls inside these programs), the per-vertex alpha and blend
-// flags it kicked, and the GS state its kicks select (PRIM from the tag template at VU1 qword 23,
-// texture and blend registers from the separate state program). Once a mesh's kicked alpha/blend
-// pattern has repeated unchanged, with no fade, the program is skipped: the GS gets a one-triangle
-// packet with the same tag (state capture only, nothing is drawn) and the cached pattern is used.
+// flags it kicked, and the GS register writes its kicks make. A real run's kicks are recorded
+// reduced to their register effects (state_only); once a mesh's kicked alpha/blend pattern and
+// its reduced kicks have repeated unchanged for the same state inputs, with no fade, the program is
+// skipped: the GS receives the recorded register writes (the state a real run leaves, without
+// vertices), the batch's texture and blend state are read from the registers at that point
+// (modern::post_batch_state) and the cached alpha pattern is used.
 bool skip_enabled() {
     static const bool on = [] {
+        // off by default: a skipped run leaves the GS vertex attribute registers as the previous run
+        // left them, and the game draws a few PATH2 primitives with that leftover colour (the
+        // [skipproof] count); EOD_MODERN_SKIPVU=1 for measurement only
         const char *e = getenv("EOD_MODERN_SKIPVU");
-        return !e || atoi(e) != 0;
+        return e && atoi(e) != 0;
     }();
     return on;
 }
@@ -414,43 +515,170 @@ bool skip_program(uint32_t pc) {
 }
 struct SkipEntry {
     std::vector<uint8_t> valpha;
+    uint64_t state_key = 0;
+    std::vector<std::vector<uint8_t>> state;
     uint32_t stable = 0;  // consecutive runs with an identical pattern
-    uint32_t avg = 0x80;  // average kicked alpha
 };
 std::unordered_map<uint64_t, SkipEntry> g_skip;
-uint64_t g_skip_hits, g_skip_runs;
+uint64_t g_skip_hits, g_skip_runs, g_state_mismatch, g_state_compared;
+uint64_t g_learn, g_learn_fade, g_learn_bad, g_learn_empty, g_learn_key;
 void skip_learn(const Batch &b) {
     if (!skip_enabled() || !skip_program(b.pc) || b.skipped || b.valpha.size() != 2 * (size_t)b.n || !b.n) return;
-    for (size_t k = 0; k < b.valpha.size(); k += 2)
-        if (b.valpha[k] != 0x80) {  // a fade: always run
-            g_skip.erase(b.geom);
-            return;
-        }
+    g_learn++;
+    if (!b.state_ok) g_learn_bad++;
+    else if (b.state_rec.empty()) g_learn_empty++;
+    bool always_run = !b.state_ok || b.state_rec.empty();
+    for (size_t k = 0; k < b.valpha.size() && !always_run; k += 2)
+        if (b.valpha[k] != 0x80) always_run = true;
+    if (always_run) {  // a fade, or kicks that cannot be reduced exactly
+        g_skip.erase(b.geom);
+        return;
+    }
     if (g_skip.size() > 200000) g_skip.clear();
     SkipEntry &e = g_skip[b.geom];
-    if (e.valpha == b.valpha) {
+    const bool same_inputs = e.state_key == b.state_key;
+    if (!same_inputs) g_learn_key++;
+    if (e.stable >= 2 && same_inputs) {  // a replay would have been used: was it exact?
+        g_state_compared++;
+        if (e.state != b.state_rec || e.valpha != b.valpha) g_state_mismatch++;
+    }
+    if (e.valpha == b.valpha && same_inputs && e.state == b.state_rec) {
         e.stable++;
     } else {
         e.valpha = b.valpha;
+        e.state_key = b.state_key;
+        e.state = b.state_rec;
         e.stable = 0;
     }
 }
-// The GIF packet a skipped run sends: the program's own tag template (PRE + PRIM) with one
-// zero-area triangle, so the GS selects and reports the batch's texture and blend state exactly
-// as for the real kick; the replaced draw is dropped as before.
-void skip_kick(const VUState *vu, uint32_t alpha) {
-    uint64_t tmpl;
-    memcpy(&tmpl, qword(vu, 23), 8);
-    alignas(16) uint64_t pkt[2 + 3 * 3 * 2] = {};
-    pkt[0] = 3u | 1ull << 15 | (tmpl & (1ull << 46)) | (tmpl & (0x7FFull << 47)) | 0ull << 58 | 3ull << 60;
-    pkt[1] = 0x412;  // ST, RGBAQ, XYZ2
-    for (int v = 0; v < 3; v++) {
-        uint64_t *q = pkt + 2 + v * 6;
-        q[0] = 0; q[1] = 0x3F800000ull;                          // ST (s, t = 0), Q = 1 in RGBAQ below
-        q[2] = 0x80ull | 0x80ull << 32; q[3] = (uint64_t)alpha | (uint64_t)0x3F800000 << 32;  // RGBAQ
-        q[4] = 0; q[5] = 0;                                      // XYZ2 (all at the origin: no area)
+
+// A PATH1 packet reduced to its GS register writes other than vertex data: A+D tags are kept as
+// they are; every other tag keeps its PRE/PRIM write with no loops. The vertex attribute registers
+// (RGBAQ, Q, ST, UV, FOG) are left as they were: every geometry program writes them before each
+// vertex, and the GS counts any drawn vertex that reads one a skipped run did not write
+// (gs::attr_taint_reads, "[skipproof]" at exit; must stay 0). False when the packet holds other
+// register writes among its vertices or an IMAGE transfer: that batch always runs.
+bool state_only(const uint8_t *d, uint32_t qwc, std::vector<uint8_t> &out) {
+    uint32_t p = 0;
+    size_t last_tag = SIZE_MAX;
+    auto vertex_reg = [](uint32_t r) {
+        return r == 1 || r == 2 || r == 3 || r == 4 || r == 5 || r == 0xA || r == 0xC || r == 0xD || r == 0xF;
+    };
+    while (p < qwc) {
+        uint64_t lo, hi;
+        memcpy(&lo, d + p * 16, 8);
+        memcpy(&hi, d + p * 16 + 8, 8);
+        p++;
+        const uint32_t nloop = (uint32_t)(lo & 0x7FFF), eop = (uint32_t)(lo >> 15) & 1, flg = (uint32_t)(lo >> 58) & 3;
+        uint32_t nreg = (uint32_t)(lo >> 60) & 15;
+        if (!nreg) nreg = 16;
+        if (flg >= 2) return false;
+        bool all_ad = flg == 0;
+        for (uint32_t r = 0; r < nreg; r++)
+            if (((hi >> (4 * r)) & 15) != 0xE) all_ad = false;
+        const uint32_t words = flg == 0 ? nloop * nreg : (nloop * nreg + 1) / 2;
+        if (p + words > qwc) return false;
+        last_tag = out.size();
+        if (all_ad) {
+            out.insert(out.end(), d + (p - 1) * 16, d + (p + words) * 16);
+        } else {
+            for (uint32_t r = 0; r < nreg; r++)
+                if (!vertex_reg((uint32_t)(hi >> (4 * r)) & 15)) return false;
+            const uint64_t tq[2] = {(lo & ~(0x7FFFull | 1ull << 15)) | (uint64_t)eop << 15, hi};
+            const uint8_t *tb = (const uint8_t *)tq;
+            out.insert(out.end(), tb, tb + 16);
+        }
+        p += words;
+        if (eop) break;
     }
-    gif_transfer(GIF_PATH1, (const uint8_t *)pkt, 1 + 9);
+    if (last_tag != SIZE_MAX) out[last_tag + 1] |= 0x80;  // EOP on the last tag (bit 15)
+    return true;
+}
+// The state inputs of a run: the GS packet template and the values the programs patch it from
+// (VU1 qwords 20-23, the input header and its TOP+198/199 qwords).
+uint64_t state_inputs(const VUState *vu, uint32_t top) {
+    uint64_t h = XXH3_64bits(qword(vu, 20), 64);
+    h = mix(h, XXH3_64bits(qword(vu, top), 16));
+    h = mix(h, XXH3_64bits(qword(vu, top + 198), 16));
+    return mix(h, XXH3_64bits(qword(vu, top + 199), 16));
+}
+void skip_report() {
+    static uint64_t frames;
+    if (!skip_check() || ++frames % 600) return;
+    fprintf(stderr, "[skipstate] replays checked %llu, wrong %llu; learned %llu: not reducible %llu, no kicks %llu, inputs changed %llu; skipped %llu of %llu runs\n",
+            (unsigned long long)g_state_compared, (unsigned long long)g_state_mismatch, (unsigned long long)g_learn,
+            (unsigned long long)g_learn_bad, (unsigned long long)g_learn_empty, (unsigned long long)g_learn_key,
+            (unsigned long long)g_skip_hits, (unsigned long long)g_skip_runs);
+}
+
+// EOD_MODERN_SKINCHECK=1: the skinned vertices projected through the batch matrix against the XYZ
+// the program kicked (the program then always runs), per program, every 600 frames
+bool skin_check() {
+    static const bool on = getenv("EOD_MODERN_SKINCHECK") != nullptr;
+    return on;
+}
+// the XY of every XYZ2/XYZF2/XYZ3/XYZF3 a PATH1 packet writes, in GS pixels
+void kick_xy(const uint8_t *d, uint32_t qwc, std::vector<float> &out) {
+    uint32_t p = 0;
+    while (p < qwc) {
+        uint64_t lo, hi;
+        memcpy(&lo, d + p * 16, 8);
+        memcpy(&hi, d + p * 16 + 8, 8);
+        p++;
+        const uint32_t nloop = (uint32_t)(lo & 0x7FFF), eop = (uint32_t)(lo >> 15) & 1, flg = (uint32_t)(lo >> 58) & 3;
+        uint32_t nreg = (uint32_t)(lo >> 60) & 15;
+        if (!nreg) nreg = 16;
+        if (flg == 0) {
+            for (uint32_t l = 0; l < nloop; l++)
+                for (uint32_t r = 0; r < nreg; r++, p++) {
+                    if (p >= qwc) return;
+                    const uint32_t reg = (uint32_t)(hi >> (4 * r)) & 15;
+                    if (reg == 4 || reg == 5 || reg == 12 || reg == 13) {
+                        uint32_t u[2];
+                        memcpy(u, d + p * 16, 8);
+                        out.insert(out.end(), {(float)(u[0] & 0xFFFF) / 16.0f, (float)(u[1] & 0xFFFF) / 16.0f});
+                    }
+                }
+        } else if (flg == 1) {
+            const uint32_t total = nloop * nreg;
+            if (p + (total + 1) / 2 > qwc) return;
+            for (uint32_t i = 0; i < total; i++) {
+                uint64_t w;
+                memcpy(&w, d + p * 16 + i * 8, 8);
+                const uint32_t reg = (uint32_t)(hi >> (4 * (i % nreg))) & 15;
+                if (reg == 4 || reg == 5 || reg == 12 || reg == 13)
+                    out.insert(out.end(), {(float)(w & 0xFFFF) / 16.0f, (float)((w >> 16) & 0xFFFF) / 16.0f});
+            }
+            p += (total + 1) / 2;
+        } else {
+            p += nloop;
+        }
+        if (eop) break;
+    }
+}
+struct SkinStats { uint64_t batches, compared, verts, over1; double max_px, sum_px; };
+std::map<uint32_t, SkinStats> g_skin_stats;
+void skin_compare(const Batch &b) {
+    SkinStats &s = g_skin_stats[b.pc];
+    s.batches++;
+    if (b.skin_xy.empty() || b.skin_xy.size() != b.kick_xy.size()) return;
+    s.compared++;
+    for (size_t k = 0; k + 1 < b.skin_xy.size(); k += 2) {
+        const double e = std::hypot(b.skin_xy[k] - b.kick_xy[k], b.skin_xy[k + 1] - b.kick_xy[k + 1]);
+        s.verts++;
+        s.sum_px += e;
+        s.max_px = std::max(s.max_px, e);
+        if (e > 1.0) s.over1++;
+    }
+}
+void skin_report() {
+    static uint64_t frames;
+    if (++frames % 600) return;
+    for (auto &e : g_skin_stats)
+        fprintf(stderr, "[skincheck] pc %04x: %llu batches, %llu compared 1:1, %llu verts, mean %.3f px, max %.3f px, over 1 px %llu\n",
+                e.first, (unsigned long long)e.second.batches, (unsigned long long)e.second.compared,
+                (unsigned long long)e.second.verts, e.second.verts ? e.second.sum_px / e.second.verts : 0.0, e.second.max_px,
+                (unsigned long long)e.second.over1);
 }
 
 void post_modern() {
@@ -478,6 +706,7 @@ void post_modern() {
         world_dir(M, b.q17, m.light);
         for (int c = 0; c < 4; c++) m.zrow[c] = b.mvp[c * 4 + 2];
         if (skip_check()) check_prediction(b);
+        if (skin_check() && skin_kind(b.pc) != SKIN_NONE) skin_compare(b);
         skip_learn(b);
         if (b.valpha.size() == 2 * (size_t)b.n) m.valpha = std::move(b.valpha);  // 1:1 with the mesh (nothing clipped)
         double dev = 0, rot = 0;
@@ -497,6 +726,8 @@ void post_modern() {
     }
     modern::post_draw(f);
     check_report();
+    skip_report();
+    if (skin_check()) skin_report();
 }
 
 // End of a frame: camera vote, model matrices, records, write.
@@ -673,23 +904,41 @@ bool vu1_start(const VUState *vu, uint32_t pc) {
                     m.pc = pc;
                     m.itop = b.itop;
                     g_mf->batches.push_back(m);
+                    // bones: this frame's pose (the cached mesh is the bind pose)
+                    if (skin_kind(pc) != SKIN_NONE) {
+                        modern::Batch &mb = g_mf->batches.back();
+                        if (!skin_vertices(vu, pc, top, n, mb.skinned)) mb.skinned.clear();
+                        if (skin_check() && !mb.skinned.empty()) {
+                            b.skin_xy.reserve(2 * (size_t)n);
+                            for (const modern::Vertex &sv : mb.skinned) {
+                                float s[4];
+                                for (int r = 0; r < 4; r++)
+                                    s[r] = vu->vf[4].f[r] * sv.p[0] + vu->vf[5].f[r] * sv.p[1] + vu->vf[6].f[r] * sv.p[2] + vu->vf[7].f[r];
+                                b.skin_xy.insert(b.skin_xy.end(), {s[0] / s[3], s[1] / s[3]});
+                            }
+                        }
+                    }
                     mark(b.mi);
                     b.want_alpha = true;
                     replaced = true;
                 }
-                // a mesh whose kicked pattern is known: no program run, a state-only kick
-                const bool cached = replaced && skip_enabled() && !skip_check() && skip_program(pc);
+                // a mesh whose kicks are known for these state inputs: the program is not run, its
+                // register writes are replayed
+                if (replaced && skip_enabled() && skip_program(pc)) b.state_key = state_inputs(vu, top);
+                const bool cached = replaced && skip_enabled() && !skip_check() && !skin_check() && skip_program(pc);
                 auto sk = cached ? g_skip.find(id) : g_skip.end();
-                if (sk != g_skip.end() && sk->second.stable >= 2) {
+                if (sk != g_skip.end() && sk->second.stable >= 2 && sk->second.state_key == b.state_key) {
                     b.skipped = true;
                     skip = true;
                 }
                 g_batches.push_back(std::move(b));
                 g_pending = true;
                 if (skip) {
-                    skip_kick(vu, 0x80);
+                    for (const std::vector<uint8_t> &pk : sk->second.state)
+                        gif_transfer(GIF_PATH1, pk.data(), (uint32_t)(pk.size() / 16));
                     Batch &cur = g_batches.back();
                     cur.valpha = sk->second.valpha;
+                    modern::post_batch_state(cur.mi);
                     g_skip_hits++;
                 }
             }
@@ -766,6 +1015,15 @@ void gif(int path, const uint8_t *data, uint32_t qwc) {
         if (cur.want_alpha) {
             if (cur.valpha.empty()) cur.valpha.reserve(2 * (size_t)cur.n + 8);
             kick_alphas(data, qwc, cur.valpha);
+        }
+        if (!cur.skin_xy.empty()) kick_xy(data, qwc, cur.kick_xy);
+        if (!cur.skipped && cur.mi >= 0 && cur.state_ok && skip_enabled() && skip_program(cur.pc)) {
+            std::vector<uint8_t> pk;
+            if (state_only(data, qwc, pk)) {
+                if (!pk.empty()) cur.state_rec.push_back(std::move(pk));
+            } else {
+                cur.state_ok = false;
+            }
         }
     }
     if (g_frame >= g_verify && g_frame - g_verify < 4) {  // a few vblanks: the game draws every 2-3

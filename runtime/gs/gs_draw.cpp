@@ -1556,6 +1556,11 @@ static uint32_t current_attr() {
     return (st.prmodecont & 1) ? (uint32_t)st.prim : ((uint32_t)st.prmode & ~7u) | ((uint32_t)st.prim & 7);
 }
 
+const Env &current_env() {
+    setup_env(current_attr());
+    return g_env;
+}
+
 void draw_sprite(const Vertex &a, const Vertex &b) {
     if (!count_prim()) return;
     uint32_t attr = current_attr();

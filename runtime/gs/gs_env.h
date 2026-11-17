@@ -96,5 +96,13 @@ extern uint32_t g_env_serial;
 extern uint32_t g_clut_gen;
 // One texel of level lvl in RGBA (any format; slow, see decode helpers).
 uint32_t tex_fetch(const Env &e, int u, int v, int lvl);
+// The draw state a primitive would get now (registers and PRIM/PRMODE), without drawing one.
+const Env &current_env();
+// A skipped VU1 run's state was replayed: its vertex attribute registers were not written (gs.cpp).
+void taint_attributes();
+void attr_mark();
+// the primitive being set up read a stale attribute; counted when the GS draws it
+extern bool g_stale_prim;
+extern uint64_t g_stale_visible;  // a batch marker: attribute writes are counted from here
 
 }  // namespace gs

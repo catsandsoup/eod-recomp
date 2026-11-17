@@ -329,7 +329,7 @@ float4 ps_modern(VOut i) : SV_Target {
 
 struct MeshGpu {
     ID3D11Buffer *vb = nullptr, *ib = nullptr;
-    UINT count = 0;
+    UINT count = 0, nv = 0;
     bool normals = false;
 };
 std::unordered_map<uint64_t, MeshGpu> g_mmesh;
@@ -347,6 +347,9 @@ ID3D11InputLayout *g_mlayout;
 ID3D11Buffer *g_malpha_vb, *g_mones_vb;
 constexpr UINT kAlphaRing = 1 << 20;
 UINT g_malpha_pos;
+ID3D11Buffer *g_mskin_vb;  // ring of this frame's skinned vertices (driver, pedestrians, car dents)
+constexpr UINT kSkinRing = 8u << 20;
+UINT g_mskin_pos;
 ID3D11Buffer *g_mcb_frame, *g_mcb_batch;
 ID3D11SamplerState *g_msampler, *g_mshadow_smp;
 ID3D11SamplerState *g_msamplers[4];  // repeat / clamp in u (bit 0) and v (bit 1)
@@ -489,6 +492,9 @@ bool modern_init() {
         vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         vb.ByteWidth = kAlphaRing;
         CHECK(g_dev->CreateBuffer(&vb, nullptr, &g_malpha_vb));
+        vb.ByteWidth = kSkinRing;
+        CHECK(g_dev->CreateBuffer(&vb, nullptr, &g_mskin_vb));
+        vb.ByteWidth = kAlphaRing;
         static uint8_t ones[65536];  // alpha 0x80, blending as the batch's state says
         for (size_t k = 0; k < sizeof ones; k += 2) ones[k] = 0x80, ones[k + 1] = 0xFF;
         vb.Usage = D3D11_USAGE_IMMUTABLE;
@@ -683,6 +689,7 @@ void modern_upload(const modern::Mesh &m) {
         return;
     }
     g.count = (UINT)m.idx.size();
+    g.nv = (UINT)m.v.size();
     g.normals = !m.v.empty() && m.v[0].n[3] != 0;
     g_mmesh.emplace(m.id, g);
 }
@@ -788,7 +795,26 @@ void modern_batches(const modern::Frame &f, ModernBatchCB &bc, bool shadow_pass,
             }
             g_ctx->PSSetShaderResources(0, 1, &srv);
             UINT stride = sizeof(modern::Vertex), offset = 0;
-            g_ctx->IASetVertexBuffers(0, 1, &it->second.vb, &stride, &offset);
+            ID3D11Buffer *vbuf = it->second.vb;
+            const UINT sbytes = (UINT)(b.skinned.size() * sizeof(modern::Vertex));
+            if (!b.skinned.empty() && b.skinned.size() == it->second.nv && g_mskin_vb && sbytes <= kSkinRing) {
+                // this frame's pose: its own vertices with the mesh's indices
+                D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+                g_mskin_pos = (g_mskin_pos + stride - 1) / stride * stride;
+                if (g_mskin_pos + sbytes > kSkinRing) {
+                    g_mskin_pos = 0;
+                    mode = D3D11_MAP_WRITE_DISCARD;
+                }
+                D3D11_MAPPED_SUBRESOURCE sm;
+                if (SUCCEEDED(g_ctx->Map(g_mskin_vb, 0, mode, 0, &sm))) {
+                    memcpy((uint8_t *)sm.pData + g_mskin_pos, b.skinned.data(), sbytes);
+                    g_ctx->Unmap(g_mskin_vb, 0);
+                    vbuf = g_mskin_vb;
+                    offset = g_mskin_pos;
+                    g_mskin_pos += sbytes;
+                }
+            }
+            g_ctx->IASetVertexBuffers(0, 1, &vbuf, &stride, &offset);
             {
                 ID3D11Buffer *avb = g_mones_vb;
                 UINT astride = 2, aoff = 0;

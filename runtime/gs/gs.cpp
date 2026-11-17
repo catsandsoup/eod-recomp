@@ -379,6 +379,17 @@ void tex0_write(int c, uint64_t v) {
     clut_load(v);
 }
 
+// Skipped-run proof (scene_emit state replay): attribute registers a skipped VU1 run would have
+// written are tainted until rewritten; a drawn vertex that reads a tainted one is counted.
+enum : uint32_t { TAINT_RGBA = 1, TAINT_Q = 2, TAINT_ST = 4, TAINT_UV = 8, TAINT_FOG = 16 };
+uint32_t g_attr_taint, g_attr_written;  // written: since the last batch marker
+uint64_t g_attr_taint_reads;
+struct TaintReport {
+    ~TaintReport() {
+        if (g_attr_taint_reads) fprintf(stderr, "[skipproof] stale attribute reads %llu\n", (unsigned long long)g_attr_taint_reads);
+    }
+} g_taint_report;
+
 void write_reg(uint32_t reg, uint64_t v) {
     // vertex data, image transfer words and the drawing state registers (below) don't count as changes here
     if (reg >= 0x3F && reg != 0x54 && !(reg >= 0x40 && reg <= 0x4F)) g_reg_gen++;
@@ -388,20 +399,21 @@ void write_reg(uint32_t reg, uint64_t v) {
         st.vcount = 0;
         break;
     case 0x01: {  // RGBAQ
+        g_attr_taint &= ~(TAINT_RGBA | TAINT_Q), g_attr_written |= TAINT_RGBA | TAINT_Q;
         st.rgbaq = v;
         uint32_t q = (uint32_t)(v >> 32);
         memcpy(&st.q, &q, 4);
         break;
     }
-    case 0x02: st.st = v; break;
-    case 0x03: st.uv = v; break;
+    case 0x02: st.st = v; g_attr_taint &= ~TAINT_ST, g_attr_written |= TAINT_ST; break;
+    case 0x03: st.uv = v; g_attr_taint &= ~TAINT_UV, g_attr_written |= TAINT_UV; break;
     case 0x04: vertex_kick(true, v, true, (uint8_t)(v >> 56)); break;   // XYZF2
     case 0x05: vertex_kick(true, v, false, 0); break;                   // XYZ2
     case 0x06: tex0_write(0, v); break;
     case 0x07: tex0_write(1, v); break;
     case 0x08: set_state(st.ctx[0].clamp, v); break;
     case 0x09: set_state(st.ctx[1].clamp, v); break;
-    case 0x0A: st.fog = v; break;
+    case 0x0A: st.fog = v; g_attr_taint &= ~TAINT_FOG, g_attr_written |= TAINT_FOG; break;
     case 0x0C: vertex_kick(false, v, true, (uint8_t)(v >> 56)); break;  // XYZF3
     case 0x0D: vertex_kick(false, v, false, 0); break;                  // XYZ3
     case 0x14: set_state(st.ctx[0].tex1, v); break;
@@ -485,6 +497,15 @@ uint32_t prim_attr() {
 
 void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog) {
     uint32_t attr = prim_attr();
+    if (g_attr_taint && draw) {
+        const bool tme = (attr >> 4) & 1, fst = (attr >> 8) & 1, fge = (attr >> 5) & 1;
+        const uint32_t reads = TAINT_RGBA | (tme && !fst ? TAINT_Q | TAINT_ST : 0) | (tme && fst ? TAINT_UV : 0) |
+                               (fge && !has_fog ? TAINT_FOG : 0);
+        if (reads & g_attr_taint) {
+            g_attr_taint_reads++;
+            g_stale_prim = true;
+        }
+    }
     int ctxt = (attr >> 9) & 1;
     const Context &c = st.ctx[ctxt];
     Vertex v;
@@ -590,9 +611,11 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
         uint32_t q;
         memcpy(&q, &st.q, 4);
         st.rgbaq = v | ((uint64_t)q << 32);
+        g_attr_taint &= ~TAINT_RGBA, g_attr_written |= TAINT_RGBA;
         break;
     }
     case 0x2: {  // ST (+Q)
+        g_attr_taint &= ~(TAINT_ST | TAINT_Q), g_attr_written |= TAINT_ST | TAINT_Q;
         st.st = lo;
         uint32_t q = (uint32_t)hi;
         memcpy(&st.q, &q, 4);
@@ -600,6 +623,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
     }
     case 0x3:  // UV
         st.uv = (lo & 0x3FFF) | (((lo >> 32) & 0x3FFF) << 16);
+        g_attr_taint &= ~TAINT_UV, g_attr_written |= TAINT_UV;
         break;
     case 0x4: {  // XYZF2
         uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF;
@@ -617,6 +641,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
     }
     case 0xA:  // FOG
         st.fog = ((hi >> 36) & 0xFF) << 56;
+        g_attr_taint &= ~TAINT_FOG, g_attr_written |= TAINT_FOG;
         break;
     case 0xC: {  // XYZF3
         uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF;
@@ -831,6 +856,19 @@ bool compose_display() {
 }
 
 }  // namespace
+
+uint64_t g_taint_sets;
+bool g_stale_prim;
+uint64_t g_stale_visible;
+void attr_mark() { g_attr_written = 0; }
+void taint_attributes() {
+    // what the skipped run would have written and its replayed register writes did not
+    g_attr_taint |= (TAINT_RGBA | TAINT_Q | TAINT_ST | TAINT_UV | TAINT_FOG) & ~g_attr_written;
+    // the proof, every 2^20 skipped batches: stale reads must stay 0
+    if ((++g_taint_sets & 0xFFFFF) == 0)
+        fprintf(stderr, "[skipproof] skipped batches %llu, stale attribute reads %llu, in drawn primitives %llu\n",
+                (unsigned long long)g_taint_sets, (unsigned long long)g_attr_taint_reads, (unsigned long long)g_stale_visible);
+}
 }  // namespace gs
 
 using namespace gs;
@@ -919,6 +957,10 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 void modern::post_batch(int32_t index) {
     if (!g_threaded) return gs_batch(index);
     push_cmd(CMD_MODERN, 0, (uint32_t)index, nullptr, 0);
+}
+void modern::post_batch_state(int32_t index) {
+    if (!g_threaded) return gs_batch_state(index);
+    push_cmd(CMD_MODERN, 2, (uint32_t)index, nullptr, 0);
 }
 void modern::post_draw(Frame *f) {
     if (!g_threaded) return gs_draw(f);
@@ -1146,10 +1188,13 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
             break;
         case CMD_GIF: { EOD_ZONE("gs.gif_process"); gif_process((int)h[1], d, h[3] / 16); } break;
-        case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer
+        case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer,
+                          // 2 = batch state capture (a[2])
             if (!live) break;
             if (h[1] == 0) {
                 modern::gs_batch((int32_t)h[2]);
+            } else if (h[1] == 2) {
+                modern::gs_batch_state((int32_t)h[2]);
             } else {
                 modern::Frame *f;
                 memcpy(&f, d, sizeof f);

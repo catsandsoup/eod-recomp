@@ -134,7 +134,7 @@ bool marena_alloc(VkDeviceSize bytes, VkBuffer &buf, VkDeviceSize &off) {
 struct MeshGpu {
     VkBuffer buf{};
     VkDeviceSize vb = 0, ib = 0;  // offsets in buf
-    uint32_t count = 0;
+    uint32_t count = 0, nv = 0;
     bool normals = false;
     float c[3] = {0, 0, 0}, r = 0;  // bounding sphere (model space)
 };
@@ -419,6 +419,7 @@ void modern_upload(const modern::Mesh &m) {
     c = {si.second, g.ib, ibytes};
     vkCmdCopyBuffer(g_ctx->cmd, si.first->buffer, g.buf, 1, &c);
     g.count = (uint32_t)m.idx.size();
+    g.nv = (uint32_t)m.v.size();
     g.normals = m.v[0].n[3] != 0;
     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
     for (const modern::Vertex &v : m.v)
@@ -631,6 +632,8 @@ struct MPrep {
     VkDescriptorSet set1;
     VkBuffer va_buf;      // per-vertex alpha (null: none, the arena's ones)
     VkDeviceSize va_off;
+    VkBuffer sk_buf;      // this frame's skinned vertices (null: the cached mesh)
+    VkDeviceSize sk_off;
     uint32_t role;
 };
 std::vector<MPrep> g_mprep;
@@ -717,6 +720,11 @@ void modern_prepare(const modern::Frame &f) {
             p.va_buf = u.first->buffer;
             p.va_off = u.second;
         }
+        if (!b.skinned.empty() && b.skinned.size() == p.mesh->nv) {
+            auto u = g_ctx->upload(b.skinned.data(), b.skinned.size() * sizeof(modern::Vertex));
+            p.sk_buf = u.first->buffer;
+            p.sk_off = u.second;
+        }
         g_mprep.push_back(p);
     }
 }
@@ -732,7 +740,7 @@ void modern_batches(int pass, std::initializer_list<uint32_t> roles, uint32_t &d
         for (const MPrep &p : g_mprep) {
             if (p.role != role) continue;
             const MeshGpu &g = *p.mesh;
-            if (pass == 1 && g_mcull.on) {
+            if (pass == 1 && g_mcull.on && !p.sk_buf) {  // (a posed mesh leaves its bind-pose bounds)
                 const float *M = p.bc.m;
                 const float w[3] = {M[0] * g.c[0] + M[1] * g.c[1] + M[2] * g.c[2] + M[3],
                                     M[4] * g.c[0] + M[5] * g.c[1] + M[6] * g.c[2] + M[7],
@@ -760,7 +768,14 @@ void modern_batches(int pass, std::initializer_list<uint32_t> roles, uint32_t &d
                 bound_set = p.set1;
             }
             const uint32_t first_index = (uint32_t)(g.ib / 4);
-            if (p.va_buf) {  // its own vertex alpha: the mesh's vertices from 0
+            if (p.sk_buf) {  // this frame's pose: its own vertices, the mesh's indices
+                VkBuffer vbs[2] = {p.sk_buf, p.va_buf ? p.va_buf : g_mones.buffer};
+                VkDeviceSize offs[2] = {p.sk_off, p.va_buf ? p.va_off : 0};
+                vkCmdBindVertexBuffers(g_mcmd, 0, 2, vbs, offs);
+                bound_arena = VK_NULL_HANDLE;
+                vkCmdBindIndexBuffer(g_mcmd, g.buf, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(g_mcmd, g.count, 1, first_index, 0, 0);
+            } else if (p.va_buf) {  // its own vertex alpha: the mesh's vertices from 0
                 VkBuffer vbs[2] = {g.buf, p.va_buf};
                 VkDeviceSize offs[2] = {g.vb, p.va_off};
                 vkCmdBindVertexBuffers(g_mcmd, 0, 2, vbs, offs);
