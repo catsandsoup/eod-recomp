@@ -336,7 +336,7 @@ To prove adherence to the unified architecture without regression:
 - [x] **Invariant 1 (Memory Sizing)**: Total EE RAM allocation is exactly 32 MB (`EE_RAM_SIZE 0x02000000u`) with a 64 KB guard page; Scratchpad is exactly 16 KB (`0x70000000`).
 - [x] **Invariant 2 (CRC32 Engine)**: Container and texture CRC matches the generator polynomial `0x04C11DB7` referencing table `0x003F2598`.
 - [x] **Invariant 3 (Vehicle Limits)**: Active car world participant slots capped at 20 (`0x00485230`), debris wheel phobs capped at 16 (`0x00484E68`), debris panel phobs capped at 16 (`0x00494D60`).
-- [x] **Invariant 4 (Deformation Model)**: `Bone.mvl` contains exactly 157 mesh bones with dual-bone skinning weights $\Delta \vec{P} = \frac{w_a}{256}\vec{D}_a + \frac{w_b}{256}\vec{D}_b$.
+- [x] **Invariant 4 (Deformation Model)**: `Bone.mvl` contains exactly 157 mesh bones with dual-bone skinning: $\Delta \vec{P} = w_a\vec{D}_a + w_b\vec{D}_b$, where the VU1 skin word carries each weight as a float biased by 32768 ($w = f - 32768$), not $w/256$ (verified against kicked vertices; see docs/EE_RENDER_SUBMISSION.md). The on-disk encoding in `Bone.mvl` is not yet verified.
 - [x] **Invariant 5 (Chicken Weapon)**: Allocation size is strictly 0x228 bytes, vtable is `0x003F9528`, reload cooldown is strictly 3.0 seconds, blast radius is 7.5 metres, blast force is 25,000 Newtons.
 - [x] **Invariant 6 (Solid Collision Boxes)**: `track.sol` (`SOBL` v3) records have a fixed stride of 264 bytes (`0x108`) with 3x3 orthonormal matrices and half-extents.
 - [x] **Invariant 7 (Surface Terrain Mesh)**: `track.bsc` (`SCOL` v4) partitions into a 32-byte Table 1 (topology) and 20-byte Table 2 (plane equations and surface material IDs).

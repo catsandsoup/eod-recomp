@@ -17,6 +17,10 @@
 #include "vu.h"
 #include "ipu.h"
 
+// EE address of the DMA tag (chain mode) or data (normal mode) VIF1 is reading now; 0xFFFFFFF0 for
+// EE writes to the VIF1 FIFO. Read by EOD_RENDER_TRACE (src/render_trace.cpp) to attribute VU1 starts.
+uint32_t g_vif1_dma_tag;
+
 namespace {
 
 // ----------------------------------------------------------------- timers
@@ -158,6 +162,7 @@ void dma_run_normal(int ch) {
         c.sadr = s;
     } else {
         // the chunk may straddle the end of RAM in theory; copy in pieces
+        if (ch == DMA_VIF1) g_vif1_dma_tag = c.madr;
         dma_sink(ch, dma_ptr(c.madr), qwc);
         c.madr += qwc * 16;
     }
@@ -171,6 +176,7 @@ void dma_run_chain(int ch) {
     int guard = 0;
     // a transfer already in progress (qwc != 0) first finishes the pending data
     if (c.qwc & 0xFFFF) {
+        if (ch == DMA_VIF1) g_vif1_dma_tag = c.madr;
         dma_sink(ch, dma_ptr(c.madr), c.qwc & 0xFFFF);
         c.madr += (c.qwc & 0xFFFF) * 16;
         c.qwc = 0;
@@ -190,6 +196,7 @@ void dma_run_chain(int ch) {
         if (tag >> 63) addr |= 0x80000000u;
         c.chcr = (c.chcr & 0xFFFF) | ((uint32_t)(tag >> 16) & 0xFFFF0000u);
         LOG(LOG_DMA, "DMA ch%d tag @%08x id=%d qwc=%x addr=%08x", ch, c.tadr, id, qwc, addr);
+        if (ch == DMA_VIF1) g_vif1_dma_tag = c.tadr;
         if (tte && (ch == DMA_VIF0 || ch == DMA_VIF1)) {
             vif_write(ch, reinterpret_cast<const uint32_t *>(tp + 8), 2);
         } else if (tte && ch == DMA_GIF) {
@@ -691,7 +698,12 @@ void hw_write128(uint32_t p, const uint32_t v[4]) {
         return;
     case 0x5000: {
         std::array<uint32_t, 4> q = {v[0], v[1], v[2], v[3]};
-        offload_run([q] { vif_write(1, q.data(), 4); });
+        offload_run([q] {
+            const uint32_t tag = g_vif1_dma_tag;
+            g_vif1_dma_tag = 0xFFFFFFF0u;
+            vif_write(1, q.data(), 4);
+            g_vif1_dma_tag = tag;
+        });
         return;
     }
     case 0x6000: {

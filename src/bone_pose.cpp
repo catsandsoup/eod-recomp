@@ -1,0 +1,121 @@
+// Skinned-mesh bone palette upload (SLUS_209.10), see docs/EE_RENDER_SUBMISSION.md.
+//
+//   0x34C9F8 BonePaletteUpload(first, bones, count): forwards to 0x35DBD8.
+//   0x35DBD8 BonePaletteWrite(first, bones, count): widens count 3x4 bone matrices (12 floats,
+//            stride 0x30) to 4x4 in its stack frame and appends them to the current VU1 DMA packet
+//            with 0x35A810, targeting VU1 qword 0x90 + 4*first; returns the packet pointer or 0.
+//   0x35A810 VifWriteUnpackMscal(dst, qwc, addr, components, count, src): header word, UNPACK
+//            V<components>-32 of count vectors to VU1 qword 0x8F + addr, the data, then
+//            MSCAL 0x24D8 (the skin setup program) padded to a quadword.
+//   Callers of 0x34C9F8: 0x20B8D0 (pedestrians, drawn by 0x20DE68) and 0x20C800 (drivers, from
+//   0x1E4610 and 0x235D98); both evaluate the animation inline and pass the pose array.
+//
+// EOD_FREEZE_POSE=<vblank> (diagnostic): from that vblank on, every upload replays the pose the
+// same call (by return address and order within the frame) uploaded on that vblank.
+#include "core/cpu.h"
+#include "core/diff_harness.h"
+#include "core/memory.h"
+#include "kernel/kernel.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <utility>
+#include <vector>
+
+extern "C" {
+void f_0034C9F8_orig(void);
+void f_0035DBD8_orig(void);
+void f_0035A810_orig(void);
+void f_00366C88(void);  // PacketReserve(qwc) -> host-visible guest pointer or 0
+}
+
+namespace {
+
+constexpr uint32_t kSkinSetupProgram = 0x24D8;              // VU1 setup run after each upload
+constexpr uint32_t kMscalSkinSetup = 0x14000000u | (kSkinSetupProgram >> 3);
+constexpr uint32_t kVifUnpackBase = 0x8F;                   // VU1 qword of addr 0
+constexpr uint32_t kBoneMatrixBytes = 0x30;                 // 3x4 floats in the pose array
+
+// 0x35A810
+void vif_write_unpack_mscal(uint32_t dst, uint32_t qwc, uint32_t addr, uint32_t components, uint32_t count,
+                            uint32_t src) {
+    const uint32_t vn = components == 3 ? 0x08000000u : 0x0C000000u;  // V3-32 or V4-32
+    MEM_SW(dst, 0x14000000u | (qwc << 16) | (kSkinSetupProgram >> 3));
+    MEM_SW(dst + 4, 0x60000000u | vn | ((count & 0xFF) << 16) | 0x4000u | ((addr + kVifUnpackBase) & 0x3FF));
+    const uint32_t bytes = components * count * 4;
+    std::memmove(g_ram + dst + 8, g_ram + src, bytes);
+    uint32_t p = dst + 8 + bytes;
+    MEM_SW(p, kMscalSkinSetup);
+    for (p += 4; ((p - dst) >> 2) & 3; p += 4) MEM_SW(p, 0);
+}
+
+void f_0035A810_new() {
+    vif_write_unpack_mscal(g_ee.r[4].uw[0], g_ee.r[5].uw[0], g_ee.r[6].uw[0], g_ee.r[7].uw[0], g_ee.r[8].uw[0],
+                           g_ee.r[9].uw[0]);
+    g_ee.r[2].ud[0] = 0;
+}
+
+// 0x35DBD8
+uint32_t bone_palette_write(uint32_t first, uint32_t bones, int32_t count) {
+    const uint32_t sp = g_ee.r[29].uw[0];
+    const uint32_t palette = sp - 0x550;  // the original's frame; the 4x4 palette sits at its base
+    for (int32_t i = 0; i < count; i++) {
+        const uint32_t s = bones + (uint32_t)i * kBoneMatrixBytes, d = palette + (uint32_t)i * 64;
+        for (uint32_t row = 0; row < 4; row++) {
+            for (uint32_t c = 0; c < 3; c++) MEM_SW(d + row * 16 + c * 4, MEM_LW(s + row * 12 + c * 4));
+            MEM_SW(d + row * 16 + 12, row == 3 ? 0x3F800000u : 0);  // w: 0, 0, 0, 1
+        }
+    }
+    const int32_t qwc = (16 * count + 6 >= 0 ? 16 * count + 6 : 16 * count + 9) >> 2;  // header + data + MSCAL
+    g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)palette;
+    g_ee.r[4].sd[0] = qwc;
+    f_00366C88();
+    const uint32_t packet = g_ee.r[2].uw[0];
+    if (packet) {
+        // 4 components per vector, 4 vectors per bone, to VU1 qword 0x90 + 4*first
+        vif_write_unpack_mscal(packet, (uint32_t)qwc, 4 * first + 1, 4, 4 * (uint32_t)count, palette);
+    }
+    g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;
+    return packet;
+}
+
+void f_0035DBD8_new() {
+    const uint32_t first = g_ee.r[4].uw[0], bones = g_ee.r[5].uw[0];
+    const int32_t count = g_ee.r[6].sw[0];
+    g_ee.r[2].sd[0] = (int64_t)(int32_t)bone_palette_write(first, bones, count);
+}
+
+const uint64_t kFreezeAt = [] {
+    const char *e = std::getenv("EOD_FREEZE_POSE");
+    return e && *e ? std::strtoull(e, nullptr, 10) : ~0ull;
+}();
+std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> g_frozen;  // (ra, order) -> pose
+uint64_t g_frame = ~0ull;
+uint32_t g_order = 0;
+
+void freeze_pose() {
+    const uint64_t vb = kernel_vblank_count();
+    if (vb != g_frame) g_frame = vb, g_order = 0;
+    const uint32_t bones = g_ee.r[5].uw[0], count = g_ee.r[6].uw[0], ra = g_ee.r[31].uw[0];
+    const auto key = std::make_pair(ra, g_order++);
+    const size_t bytes = (size_t)count * kBoneMatrixBytes;
+    if (count == 0 || count > 64 || bones + bytes >= EE_RAM_SIZE) return;
+    if (vb == kFreezeAt) {
+        g_frozen[key].assign(g_ram + bones, g_ram + bones + bytes);
+    } else if (vb > kFreezeAt) {
+        auto it = g_frozen.find(key);
+        if (it != g_frozen.end() && it->second.size() == bytes) std::memcpy(g_ram + bones, it->second.data(), bytes);
+    }
+}
+
+}  // namespace
+
+extern "C" void f_0034C9F8(void) {
+    if (kFreezeAt != ~0ull) freeze_pose();
+    f_0034C9F8_orig();  // a tail call to 0x35DBD8
+}
+
+extern "C" void f_0035DBD8(void) { diff_run(0x0035DBD8, f_0035DBD8_new, f_0035DBD8_orig); }
+extern "C" void f_0035A810(void) { diff_run(0x0035A810, f_0035A810_new, f_0035A810_orig); }

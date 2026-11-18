@@ -1061,8 +1061,12 @@ extern "C" void ee_syscall(uint32_t pc) {
     if (g_ee_irq_pending && g_ints_enabled && !g_in_interrupt) ee_service_interrupts();
 }
 
+// Nonzero while runtime/core/diff_harness.cpp compares two runs of one call: pending interrupts
+// wait (the flag stays set) and are taken at the next safe point after it.
+extern "C" int g_ee_irq_hold = 0;
+
 extern "C" void ee_service_interrupts(void) {
-    if (g_in_interrupt) return;
+    if (g_in_interrupt || g_ee_irq_hold) return;
     if (!g_ints_enabled) {
         // code polling INTC_STAT with interrupts disabled (libgraph's vsync
         // wait) must still see vblanks; EI re-arms dispatch for what latched

@@ -117,3 +117,26 @@
 002E1BB0 wrap     # Career garage car count: extended garage slots (up to 16 cars)
 002E1BC0 wrap     # Career add car to garage: routes vehicles 4..15 into extended garage
 002E1380 wrap     # Career get car tuning block: tuning parameters for extended garage slots
+0034C9F8 wrap     # BonePaletteUpload: skinned pose to VU1 (src/bone_pose.cpp)
+0035DBD8 wrap     # BonePaletteWrite (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)
+0035A810 wrap     # VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)
+
+# EOD_RENDER_TRACE (diagnostic, src/render_trace.cpp): 3D submission and flush order, observe only.
+0034C9C0 wrap     # FrameBegin: open queue set 1
+0034C930 wrap     # flush layers 0..8
+0034C860 wrap     # flush layer 9, reset queue
+0034AF98 wrap     # Flush(layer, set)
+0034BDA8 wrap     # ModelSubmitVu1Packets: queue draw records
+0034BF90 wrap     # queue draw records without material
+0034C208 wrap     # projected shadow submit
+0034C4B0 wrap     # projected shadow submit (layer mask)
+0035CB88 wrap     # emit one queued batch to the VU1 DMA chain
+0035B3D0 wrap     # camera packet (VU1 qwords 1..16)
+0035CD28 wrap     # matrix packet (VU1 TOPS+0..6)
+0035D298 wrap     # emit one shadow batch
+0034B140 wrap     # append a model's batches to the queue
+0034CC98 wrap     # queue a world-space model (src/render_queue.cpp)
+00366C88 wrap     # packet reserve (top): tagged for VU1 start attribution (render_trace)
+00366D30 wrap     # packet reserve: tagged for VU1 start attribution
+00366D78 wrap     # packet reserve, second manager: tagged for VU1 start attribution
+00366DD8 wrap     # packet reserve, second manager: tagged for VU1 start attribution

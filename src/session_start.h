@@ -25,7 +25,7 @@ struct SessionRequest {
     std::string event;             // contest name ("No-Rules Race", "Battle (8 AI)") or "#<position>"
     std::string car;               // vehicle model name ("Phantom") or vehicle number
     int paint = 0;                 // 0-based paint index among the model's vehicle records
-    int humans = 1;                // only 1 is implemented
+    int humans = 1;                // 2..4: head-to-head split screen (GameDoHeadToHead)
     int ai = -1;                   // Battle variant helper: event=Battle + ai=8 -> "Battle (8 AI)"
     std::string place;             // career: free-roam place (career_place_index); default home
     int eve = -1;                  // career: run this Career Eve (index) as soon as free roam starts

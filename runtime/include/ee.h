@@ -378,6 +378,7 @@ void ee_jump_unknown(uint32_t addr);
 
 /* Interrupt delivery points (back-edges of loops). */
 extern volatile int g_ee_irq_pending;
+extern int g_ee_irq_hold;  /* nonzero: interrupts stay pending (diff_harness.cpp) */
 void ee_service_interrupts(void);
 #define IRQ_CHECK() do { if (EE_UNLIKELY(g_ee_irq_pending)) ee_service_interrupts(); } while (0)
 /* Back edge of a loop polling memory that only interrupt handlers change

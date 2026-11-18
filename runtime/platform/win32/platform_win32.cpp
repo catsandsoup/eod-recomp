@@ -388,12 +388,13 @@ void platform_get_pad(int port, HostPadState *out) {
         *out = HostPadState();
         out->connected = true;
     }
-    // EOD_PAD_SCRIPT (automated testing) replaces port 0's input
-    uint16_t sb;
-    if (port == 0 && pad_script_buttons(sb)) {
-        *out = HostPadState();
+    // EOD_PAD_SCRIPT / EOD_PAD_SCRIPT1 (automated testing) replace the port's input, sticks and
+    // pressures included (as on SDL3), so 2-player split screen can be driven by two scripts
+    HostPadState scripted;
+    if (pad_script_state(port, &scripted)) {
+        *out = scripted;
         out->connected = true;
-        out->buttons = sb;
+        return;
     }
     // pressure for digital buttons
     static const uint16_t order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,

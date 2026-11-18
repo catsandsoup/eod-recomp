@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <cstdio>
+#include <string>
 
 #include "../core/log.h"
 #include "../gs/gs.h"
@@ -16,6 +18,11 @@
 #include "../core/prof.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
+extern uint8_t *g_ram;
+// VU1 program starts per program address (addr / 8), for EOD_RENDER_TRACE (src/render_trace.cpp).
+uint32_t g_vu1_program_starts[0x800];
+// Called at each VU1 program start when set (EOD_RENDER_TRACE).
+void (*g_vu1_start_hook)(uint32_t addr) = nullptr;
 extern uint32_t g_vu_micro_gen[2];  // vu.cpp
 
 namespace {
@@ -38,6 +45,8 @@ uint32_t avail(const Vif &v) { return (uint32_t)(v.q.size() - v.qpos); }
 
 void start_micro(Vif &v, uint32_t addr) {
     if (v.n == 1) {
+        g_vu1_program_starts[(addr >> 3) & 0x7FF]++;
+        if (g_vu1_start_hook) g_vu1_start_hook(addr);
         v.itop = v.itops;
         v.top = v.tops;
         v.dbf = !v.dbf;
@@ -209,6 +218,28 @@ const UnpackGenFn g_unpack_gen[4][4][2] = {
 #undef UG
 
 void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
+    {   // EOD_BONE_SRC=1 (diagnostic): VU1 unpacks into the bone area (qwords 0x90..0xff), and
+        // where their raw bytes are in EE RAM
+        static const bool on = getenv("EOD_BONE_SRC") != nullptr;
+        if (on && v.n == 1 && kernel_vblank_count() % 120 == 0) {
+            static uint64_t lvb = ~0ull;
+            static int cnt = 0;
+            if (lvb != kernel_vblank_count()) lvb = kernel_vblank_count(), cnt = 0;
+            uint32_t a0 = c & 0x3FF;
+            if (((c >> 15) & 1)) a0 += v.tops;
+            uint32_t num0 = (c >> 16) & 0xFF;
+            if (!num0) num0 = 256;
+            if (a0 < 0xe0 && a0 + num0 > 0x90 && a0 != 0xac && cnt++ < 40) {
+                const uint8_t *raw = reinterpret_cast<const uint8_t *>(data);
+                std::string hits;
+                for (size_t a = 0; a + 16 <= (32u << 20) && hits.size() < 80; a += 4)
+                    if (memcmp(g_ram + a, raw, 16) == 0) { char t[16]; snprintf(t, sizeof t, " %08zx", a); hits += t; }
+                fprintf(stderr, "[bonevif] vb %llu UNPACK %08x vn%u vl%u addr %03x num %u cycle %04x mode %u raw %08x %08x %08x %08x ram:%s\n",
+                        (unsigned long long)kernel_vblank_count(), c, (c >> 26) & 3, (c >> 24) & 3, a0, num0, v.cycle, v.mode,
+                        data[0], data[1], data[2], data[3], hits.c_str());
+            }
+        }
+    }
     uint32_t vn = (c >> 26) & 3, vl = (c >> 24) & 3;
     bool masked = (c >> 28) & 1;
     uint32_t num = (c >> 16) & 0xFF;

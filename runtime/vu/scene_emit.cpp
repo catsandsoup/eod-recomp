@@ -39,6 +39,8 @@
 #include "vu.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
+uint64_t kernel_vblank_count();
+extern uint8_t *g_ram;
 
 namespace scene_emit {
 
@@ -323,6 +325,46 @@ bool skin_vertices(const VUState *vu, uint32_t pc, uint32_t top, uint32_t n, std
         }
     }
     return moved;
+}
+
+// EOD_BONE_SRC=1 (diagnostic): for matrix-skinned batches, finds each bone's 3x4 matrix in EE RAM
+// by content and logs where it is, so the EE code that builds the pose can be traced.
+void bone_source_probe(const VUState *vu, uint32_t pc, uint32_t top, uint32_t n) {
+    static const bool on = getenv("EOD_BONE_SRC") != nullptr;
+    if (!on || skin_kind(pc) != SKIN_MATRIX) return;
+    static uint64_t last_vb = ~0ull;
+    static int in_vb = 0;
+    if (kernel_vblank_count() % 120 != 0) return;
+    if (last_vb != kernel_vblank_count()) last_vb = kernel_vblank_count(), in_vb = 0;
+    if (in_vb++ >= 3) return;
+    std::vector<uint32_t> bones;
+    for (uint32_t k = 0; k < n; k++) {
+        float sk[4];
+        memcpy(sk, qword(vu, top + 149 + n - k), 16);
+        for (int j = 0; j < 2; j++) {
+            const uint32_t b = skin_index(sk[j]);
+            if (std::find(bones.begin(), bones.end(), b) == bones.end()) bones.push_back(b);
+        }
+    }
+    std::sort(bones.begin(), bones.end());
+    const size_t ram = 32u << 20;
+    fprintf(stderr, "[bonesrc] vb %llu pc %04x top %03x n %u bones %zu\n", (unsigned long long)kernel_vblank_count(), pc, top, n,
+            bones.size());
+    for (uint32_t b : bones) {
+        const uint8_t *col0 = qword(vu, b + 144);
+        float m[16];
+        for (int c = 0; c < 4; c++) memcpy(m + 4 * c, qword(vu, b + 144 + c), 16);
+        fprintf(stderr, "[bonesrc]   bone q%03x  c0 %.4f %.4f %.4f %.4f  c3 %.3f %.3f %.3f %.3f ->", b + 144, m[0], m[1], m[2],
+                m[3], m[12], m[13], m[14], m[15]);
+        int hits = 0;
+        for (size_t a = 0; a + 64 <= ram && hits < 6; a += 16) {
+            if (memcmp(g_ram + a, col0, 12) != 0) continue;
+            const bool full = memcmp(g_ram + a, m, 64) == 0;
+            fprintf(stderr, " %08zx%s", a, full ? "(64)" : "");
+            hits++;
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 // Decodes a new mesh into a GEOM record. False if the run's input is not the
@@ -908,6 +950,7 @@ bool vu1_start(const VUState *vu, uint32_t pc) {
                     if (skin_kind(pc) != SKIN_NONE) {
                         modern::Batch &mb = g_mf->batches.back();
                         if (!skin_vertices(vu, pc, top, n, mb.skinned)) mb.skinned.clear();
+                        bone_source_probe(vu, pc, top, n);
                         if (skin_check() && !mb.skinned.empty()) {
                             b.skin_xy.reserve(2 * (size_t)n);
                             for (const modern::Vertex &sv : mb.skinned) {

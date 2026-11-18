@@ -6,6 +6,9 @@
 //   0x2A2C98  GameDoSingle: Action single player session driver
 //   0x2A75E0  GameDoSingle car-select screen: (u32 *car_number, 0) -> nonzero = proceed
 //   0x2C7340  GameDoSingle track-select screen: (i32 *eve, i32 *aux, Options *) -> nonzero = proceed
+//   0x2A3220  GameDoHeadToHead: multiplayer session driver (MenuDoRace 'multi', 0x2C0E10)
+//   0x2B7710  GameDoHeadToHead join/car screen: (i32 *players, i32 cars[]) -> 1 = back, else play;
+//             then 0x2A30B0 runs the same track screen (0x2C7340) and event setup (0x120650)
 //   0x120650  per-event setup (EveTracker at 0x3C4BF8 -> contest -> roster -> session description)
 //   0x120BE8  SelectEvent(pos): tracker vtable +0x14 (0x121850: pending = pos) then 0x3C4BE8 = 1, the flag the in-world event list sets
 #include "session_start.h"
@@ -36,6 +39,7 @@ extern "C" {
 void f_00120650_orig(void);
 void f_00120FB8_orig(void);
 void f_002A2C98(void);
+void f_002A3220(void);
 void f_00119428(void);
 void f_00128CB0(void);
 void f_002C1338(void);
@@ -93,6 +97,7 @@ struct Plan {
     SessionRequest req;
     uint32_t eve = 0, contest = 0, car = 0;
     bool car_done = false, track_done = false, event_done = false;
+    bool players_done = false;  // humans > 1: the head-to-head join/car screen was answered
     bool mode_answered = false;   // online: the Arcade single/multi prompt was answered once
     bool net = false;   // online event (lobby START)
     bool direct = false; // online event with track, event and car chosen in the lobby: every native screen is auto-answered
@@ -250,10 +255,16 @@ void start() {
     // single player driver (which sets the human count and pad map itself).
     const uint32_t old = ee_r32(kFlags) & 1;
     ee_w32(kFlags, ee_r32(kFlags) | 1);
-    const uint32_t profile = native(f_00119428, {0});
-    native(f_00128CB0, {profile, 0});
-    native(f_002C1338);
-    native(f_002A2C98);
+    if (P.req.humans > 1) {
+        // MenuDoRace's "multi" branch (0x2C0DF4-0x2C0E18) minus the menu and its pad-count prompt: the
+        // head-to-head driver, whose join/car screen (0x2B7710 below) sets the human count and cars.
+        native(f_002A3220);
+    } else {
+        const uint32_t profile = native(f_00119428, {0});
+        native(f_00128CB0, {profile, 0});
+        native(f_002C1338);
+        native(f_002A2C98);
+    }
     ee_w32(kFlags, (ee_r32(kFlags) & ~1u) | old);
     P.armed = false;
     std::fprintf(stderr, "[SESSION] session returned to the front end\n");
@@ -308,7 +319,7 @@ bool session_parse(const char *text, SessionRequest &out, std::string &err) {
         else if (key == "eve") { if (!number(val, v) || v < 0 || v > 63) { err = "bad eve '" + val + "'"; return false; } r.eve = (int)v; }
         else { err = "unknown key '" + key + "'"; return false; }
     }
-    if (r.humans != 1) { err = "humans > 1 is not implemented (GameDoHeadToHead path is mapped, not wired)"; return false; }
+    if (r.humans > 1 && r.ai >= 0) { err = "humans > 1 takes no ai= (head-to-head races have no AI roster choice)"; return false; }
     if (r.mode == "career") {
         if (!r.track.empty() || !r.event.empty() || !r.car.empty() || r.ai >= 0)
             { err = "career takes place= and eve=, not track/event/car/ai"; return false; }
@@ -403,6 +414,8 @@ extern "C" void f_002A1298(void) {
 // online, every game has exactly one local human and the others are puppets, so the answer is always
 // "single" (1). When that single-player session returns the prompt loops; answering "back" (-1) leaves
 // the Arcade menu for the main menu, where the lobby reopens.
+bool head_to_head_menu();  // below: answers the head-to-head join screen
+
 extern "C" void f_00270C10(void) {
     const uint32_t caller = g_ee.r[31].uw[0];
     if (caller == 0x002A16D8) {
@@ -420,6 +433,7 @@ extern "C" void f_00270C10(void) {
         else ret_s32(-1);
         return;
     }
+    if (caller == 0x002B8120 && P.armed && !P.net && P.req.humans > 1 && head_to_head_menu()) return;
     if (P.career && P.career_entered && !P.career_driving) {
         // A fresh Career's opening screens (callers from EOD_MENU_RUN_TRACE): the tutorial note (0x3861B4) and the
         // "select Drive Around" note (0x383C94) close with -2; the Career hub (0x36AB8C) answers Drive Around (4).
@@ -470,6 +484,29 @@ extern "C" void f_002A75E0(void) {
         return;
     }
     f_002A75E0_orig();
+}
+
+// Head-to-head join/car screen: (i32 *players, i32 cars[]). Answered once with the requested human count,
+// every player in the requested car; when the race returns to it, "back" (1) ends the session.
+// The screen itself runs: only its menu loop (MenuRun, called at 0x2B8118) is answered, after the join
+// records the UI would fill are written. The screen's own "play" branch then registers every human (pad map
+// 0x13D448, name 0x1193B0, profile 0x119410, count 0x12A260) as the event rosters need.
+constexpr uint32_t kJoinRecords = 0x003D7B18, kJoinStride = 0x24, kJoinCount = 0x003D7BA8;
+bool head_to_head_menu() {
+    if (P.players_done) { log("head-to-head: back to the front end"); ret_s32(1); return true; }
+    P.players_done = true;
+    for (int i = 0; i < P.req.humans; ++i) {
+        const uint32_t r = kJoinRecords + kJoinStride * (uint32_t)i;
+        for (uint32_t o = 0; o < kJoinStride; o += 4) ee_w32(r + o, 0);
+        ee_w32(r + 0x00, (uint32_t)i);  // pad port
+        ee_w32(r + 0x04, P.car);        // vehicle
+        const std::string name = guest_text(native(f_00119428, {(uint32_t)i}), 0x13);
+        for (size_t k = 0; k < name.size(); ++k) MEM_SB(r + 0x08 + (uint32_t)k, (uint8_t)name[k]);
+    }
+    ee_w32(kJoinCount, (uint32_t)P.req.humans);
+    log("head-to-head: %u players joined, vehicle %u each", (uint32_t)P.req.humans, P.car);
+    ret_s32(0);
+    return true;
 }
 
 // Track screen: *eve = chosen Eve, *aux = 5 (its initial value), options+0x28 = 1 (both
@@ -532,6 +569,12 @@ extern "C" void f_002C7340(void) {
 // First event setup of the session: put the chosen event in the native tracker's pending slot
 // so 0x120650 starts it instead of the Eve's opening lobby event.
 extern "C" void f_00120650(void) {
+    // Head-to-head builds its rosters in its own event lobby: pre-selecting a contest there leaves player 0
+    // out of the event (game panic "Didn't find player 0 in event 0"), so its lobby runs natively.
+    if (P.armed && !P.event_done && P.req.humans > 1) {
+        P.event_done = true;
+        log("head-to-head: event chosen in the native lobby");
+    }
     if (P.armed && !P.event_done) {
         P.event_done = true;
         const uint32_t tracker = ee_r32(kTrackerPtr);
@@ -539,6 +582,16 @@ extern "C" void f_00120650(void) {
         int pos = -1;
         for (uint32_t i = 0; i < count && i < 64; ++i)
             if (ee_r32(tracker + kTrackerList + 4 * i) == P.contest) pos = (int)i;
+        // Head-to-head lists its own contests (other ids than single player): match the event by name.
+        const std::string wanted = session_event_name(P.req);
+        for (uint32_t i = 0; pos < 0 && i < count && i < 64; ++i)
+            if (ieq(guest_text(native(f_001252C0, {ee_r32(tracker + kTrackerList + 4 * i)}), 40), wanted)) pos = (int)i;
+        if (pos < 0) {
+            std::fprintf(stderr, "[SESSION] events in this list:");
+            for (uint32_t i = 0; i < count && i < 64; ++i)
+                std::fprintf(stderr, " [%s]", guest_text(native(f_001252C0, {ee_r32(tracker + kTrackerList + 4 * i)}), 40).c_str());
+            std::fprintf(stderr, "\n");
+        }
         if (pos >= 0) {
             native(f_00120BE8, {(uint32_t)pos});
             log("event pre-selected: tracker position %u (contest %u)", (uint32_t)pos, P.contest);
