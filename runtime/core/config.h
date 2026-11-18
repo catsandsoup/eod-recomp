@@ -42,6 +42,8 @@ struct Config {
     bool modern_renderer = false;
     // the native renderer (docs/NATIVE_RENDERER.md, R1): queued 3D objects drawn by plume
     bool native_renderer = false;
+    // split-screen views run the single-view track passes, mlist and water (P8; docs/NATIVE_RENDERER.md R2)
+    bool split_screen_parity = true;
     int modern_shadows = 100;        // sun shadow strength (0: off)
     bool modern_soft_shadows = true; // soft shadows that harden at contact
     int modern_reflections = 100;    // paint clear coat, sky reflections, highlights

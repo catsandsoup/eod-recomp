@@ -22,6 +22,8 @@
 
 extern "C" void f_00214678_orig();
 extern "C" void f_003582B8_orig();
+// readable replacement (src/native_world.cpp registers it); the recompiled original otherwise
+extern "C" { void (*eod_mlist_calc_impl)(void) = nullptr; }
 
 namespace {
 constexpr uint32_t kGraf = 0x3d1c18;          // loaded track.grf header {root, mlistA, mlistB}
@@ -138,7 +140,8 @@ extern "C" void f_003582B8() {
     FILE *csv = frame_log();
     const bool sampled_trace = trace();
     const uint64_t t0 = csv ? now_us() : 0;
-    f_003582B8_orig();
+    if (eod_mlist_calc_impl) eod_mlist_calc_impl();
+    else f_003582B8_orig();
     if (!csv && !sampled_trace) return;
     const uint64_t t1 = csv ? now_us() : 0;
     static unsigned calls, lines;

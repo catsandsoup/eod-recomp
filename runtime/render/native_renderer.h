@@ -20,6 +20,8 @@
 // does anything and the GS command stream is unchanged.
 #pragma once
 #include <cstdint>
+#include <map>
+#include <utility>
 #include <vector>
 
 namespace gs {
@@ -38,13 +40,37 @@ void ee_object_end();                 // after EmitBatch
 // packet manager reserve (src/render_trace.cpp wrappers): addr, qwc, return address
 void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra);
 
+// ---- EE thread, track world (src/native_world.cpp, stage R2) --------------------------------
+// WorldRenderPass 0x358BD0: the pass starts (its identity matrix packet), each world batch REF it
+// writes (the REF qword, the 4SPS part, the matrix packet, ITOP 0x80 / 0x280), the texture
+// record's packet commit (0x35CBB8 result: false = no packet space, nothing is drawn), the end.
+void ee_world_pass(int32_t pass, uint32_t identity_packet);
+void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop);
+void ee_world_record(uint32_t slot, bool committed);
+void ee_world_pass_end();
+// WaterDraw 0x325728: begin (before ImmediateBegin 0x35DF10, whose packets are the water's), each
+// vertex ImmediateVertex 0x361708 accepted (colour word, strip flag = draws a triangle, guest
+// address of {xyz, colour, -, st}), end (after ImmediateEnd 0x361BC8; drawn = false when
+// ImmediateBegin had no packet space).
+void ee_water_begin(uint32_t surface);
+void ee_water_vertex(uint32_t colour, uint32_t strip, uint32_t vertex);
+void ee_water_end(bool drawn);
+// GS thread: what the EE submitted per EE frame before `before` (world leaves committed, water
+// draws), removed from the EE's list.
+void take_expected(uint64_t before, std::map<uint64_t, std::pair<uint32_t, uint32_t>> &out);
+// EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
+bool native_only();
+
 // ---- VIF1 thread (runtime/vu/vif.cpp) -------------------------------------------------------
 void vu1_start(uint32_t program, uint32_t itop);
 
 // ---- GS command stream ----------------------------------------------------------------------
 // One queue record as the GS receives it.
+enum : uint32_t { KIND_QUEUE = 0, KIND_WORLD = 1, KIND_WATER = 2 };
 struct Packet {
     uint64_t frame;            // EE vblank of the frame it was queued in
+    uint32_t kind;             // KIND_*: draw-queue record, track world leaf, water surface
+    uint32_t pass;             // world pass (0x358BD0 argument)
     uint32_t serial;           // record number within that frame (draw order)
     uint32_t mesh;             // mesh id (0: no geometry decoded)
     uint32_t batch;
@@ -70,6 +96,7 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     uint32_t replaces;         // id of the mesh this batch had before (0 = none)
     uint32_t batch;
     bool skinned;              // drawn in bind pose (R3)
+    bool transient = false;    // one draw's geometry (water, camera-facing parts): released after use
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 };

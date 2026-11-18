@@ -55,13 +55,74 @@ LOD, passes and effects as single player (P8).
 | --- | --- | --- |
 | R0 | plume owns the device; the game looks and runs exactly as before | Original GS replay md5 unchanged; fullscreen race and menus |
 | R1 | cars, props and characters drawn by plume from the draw queue (PS2 look, textured) in place of the GS's drawing of them (done: section "Stage R1") | every queue record drawn (counts equal); frame comparison against the GS |
-| R2 | track world, sky and water from the world renderer | world leaf counts equal; Dundas water visible in 1P and 2P |
+| R2 | track world, sky and water from the world renderer (done: section "Stage R2", evidence in docs/NATIVE_RENDERER_SUCCESS.md section 7) | world leaf counts equal; water visible in 1P and split screen (only Afton.trk has a water body) |
 | R3 | skinned characters and car damage from bone palettes | posed vertices within 1/16 px of the GS |
 | R4 | shadows, particles, sprites, flares, glare | effect counts equal; visual comparison |
 | R5 | PS2 look matches GS replay (P3 thresholds) | comparison tool |
 | R6 | Modern look: PBR, shadows, IBL, reflections, water; live toggle | P4, P5 |
 | R7 | HUD, menus, fonts, movies, render targets native; GS and VU1 out of the frame path | S4 = 0 |
 | R8 | 60 fps at RenderScale 6, max LOD, Modern look on the target box; floors on the minimum box | S1, S2 with Tracy and EOD_GPU_PROF |
+
+## Stage R2: track world, sky and water (specification)
+
+Written before the code (rule 6.2). Sources: PS2 Ghidra decompile and `tools/ee_dis.py` of
+SLUS_209.10, the VU1 image `config/vu/vu1_fd0ce30ab0ec263c.bin` (`tools/vudis.py`), and the Xbox
+`default.xbe` Ghidra project (`FUN_000a8390` = `0x214B68`, `FUN_00138840` = `0x358BD0`,
+`FUN_00138280` = `0x3582B8`). Readable C++: `src/native_world.cpp`; native side:
+`runtime/render/native_feed.cpp`.
+
+### Functions replaced (config/hle.txt `wrap`, `diff_run`)
+
+| PS2 | name (this project) | Xbox | what it does |
+| --- | --- | --- | --- |
+| `0x214B68` | WorldFrameRender | `0x0A8390` | per view: `0x3D1B30 = 0x212DD0()`, sun quad `0x34C1F0(0x2217A8())`, mlist calc `0x3582B8(f12 *(0x3D1B28), f13 *(0x3D1B2C), mlist, *(0x3D1B30), 0, 0)` with mlist `*(*(0x3D1C18)+4)` (1 view) or `+8` (split, `*(0x3D1B0C) != 0`); pass 0; if not split: flags `0x34DFE0(8)`, `0x34DEC0(4)`, near/far x `1.1` (`0x3F8CCCCD`, `0x34E4D8`), pass 1, `0x32E638`, `0x34E518`, `0x34DEC0(8)`, pass 2, effects `0x2E7300(0)`; queued frame `0x22D7F0`; sun quad again; pass 3; if not split: shadows `0x30A580(0)`, `0x2283D0`, pass 4; `0x359238` (mlist = 0) |
+| `0x3582B8` | MlistVisibilityCalc | `0x138280` | uploads VU0 microcode (VIF0 DMA from `0x3BD4D0`), matrix table `0x70001C00[0..255]` (identity packet `0x35CD28`), camera rows `0x4D2E90..0x4D2EC0` from `0x34FC68` (`0x4CD2F8`), VU0 frustum constants vf20..vf26, then per mlist sphere / group / model a visibility byte in the scratchpad (`[0] = 0x81`, spheres from 1, then groups, then models): VU0 `vcallms 0x40` clip flags `& 0xBD0` -> 0, `& 0x42F` -> `0x81` (partly outside), else 1; groups through `0x357E60` (LOD); model depth to `0x3DE6E8[i]`; then each mlist object's vtable `+0xC` |
+| `0x358BD0` | WorldRenderPass(pass) | `0x138840` | identity matrix packet into `0x70001C00[0]`; for texture records `[first,last)` of pass (`mlist + 0x38 + 16*pass`), batches whose scratchpad byte `& 0x7F` equals the batch's required value: texture `0x34F8D0(slot)`, packet `0x35DEE0(2*n)`, per batch DMA REF to the matrix packet when it changes and a DMA REF to the part's VIF data, then `0x35CBB8(qwords)`; then the pass's display objects (vtable `+0x14`) |
+| `0x35DEE0` | WorldPacketBegin(qwc) | (inline) | `0x35BA10` (camera/matrix/material REFs), `0x366D30(qwc)` |
+| `0x35CBB8` | PacketCommit(qwc) | (inline) | jump to `0x366CD0`: commit `qwc` qwords of the open packet; 0 when the buffer is full |
+| `0x223858` | SkyDraw (vtable `0x408350 + 0x18`) | | sky dome at the camera (`0x4CD2F8 + 0x24`); type 1 (`+8`): part k (32 parts, centre/radius at `+0x2C + 16k`) visible when `cos(r + 0.625 fov) < dir . centre` (`0x39BB28` = cosf, fov `0x2111D0(-1)`), else all 32; `0x34BDA8(model *(+0x3C)+4, matrix +0xC, -1, mask)` |
+| `0x223800` | SkyDestroy (vtable `0x408318 + 8`) | | vtable `0x408318`, colour reset `0x34E8A8(0xFFFFFFFF)`, base `0x223D00` |
+| `0x326168` | WaterDrawIfPresent | | `0x325728(*(0x3DC134))` when the track has water |
+| `0x325728` | WaterDraw(surface) | | when `surface+0x38` (visible, set by display object `0x223E00` through `0x359198`): texture `0x34F8D0(+0x3C)`, immediate begin `0x35DF10(0x3000)`, per tile (list `+0x40`, next `+0x1B8`) inside bounds `0x423788..94`: 4 vertices `0x326B80(tile, v, 0|8, 0|8)`, colour/uv `0x31E7E0(tile, v, 0x4AEFA8)`, `0x361708(xyz, st, colour, ADC = k < 2)`; else `0x324928(tile)`; `0x361BC8` |
+| `0x325E40` | WaterSimulate | | per car (`0x2E87B0`, `0x2E8768`) faster than `2.2222223` (`0x400E38E4`): splash strength `(v - 2.2222223) * 0.09`, find the tile (`0x31BFA0`, `0x31C7E8`), when visible push `0x31CA30(-min(1, s))`; then `0x325AD0` and every tile `0x31C7E0` |
+
+### Structures
+
+| address / record | layout |
+| --- | --- |
+| mlist (`*(0x4D6F10)` while drawing) | `+0x10` n spheres, `+0x14` spheres (16 B: centre, radius), `+0x18` n groups, `+0x1C` groups (32 B), `+0x20` n models, `+0x24` models (32 B: sphere, `+0x10` u16 parent, `+0x12` u16 required), `+0x28` n batches, `+0x2C` batches, `+0x30` n texture records, `+0x34` texture records, `+0x38 + 16*pass` {first, last texture record, first, last object}, `+0x88` n objects, `+0x90` objects |
+| texture record (0x1C B) | `+0x10` texture slot, `+0x14` first batch, `+0x18` end batch |
+| world batch (12 B) | u16 scratchpad index, u16 required value, u16 matrix index (`0x70001C00[i]`), u16 qwc, part pointer (`4SPS`, VIF at `+0x38`) |
+| scratchpad byte | bit 7: partly outside the frustum (VU1 clip path, ITOP `0x280`), low 7 bits compared with the batch's required value |
+| world packet qwords (`0x358BD0`) | matrix: `{0x30000000 | *(u16*)0x429A98, matrix packet & 0x0FFFFFFF}`, `0x01000101` STCYCL 1,1, `0x05000000` STMOD 0; batch: `{0x30000000 | qwc, (part + 0x38) & 0x7FFFFFFF}`, `0x04000080` / `0x04000280` ITOP, `0x05000000` STMOD 0 |
+| sun quad (`0x34C1F0` -> `0x35CBD8`) | material packet `*(0x4D7C54)`: `0x35A810(p, 4, 0x1D, 3, 4)` = V3-32 x4 to VU1 qwords `0xAC..0xAF` = `+10 r`, `-10 r`, `+10 u`, `-10 u` (r, u from `0x2217A8`: camera right / up), z bits `& 0xFFFFFF00 | 0x80` |
+| water surface (`*(0x3DC134)`) | `+0x24` position, `+0x38` visible, `+0x3C` texture slot, `+0x40` tile list, `+0x50` lists; tile `+0x160` axis A, `+0x178` axis B, `+0x184` centre, `+0x190`/`+0x194` sizes, `+0x1A4..0x1B0` bounds, `+0x1B8` next |
+
+### VU1 programs (what the native renderer does instead)
+
+| program | entry (VU1) | read in the microcode | native |
+| --- | --- | --- | --- |
+| `0x0270` (MSCAL `0x4E`) | clip `0x388` (ITOP & `0x200`), else `0x640` | colour qword = V4-5 colour, `mfir.w vf18, vi1` = ITOP (alpha), `itof0.w` ADC; no lighting, `maxw.z` q = 1 | prelit colour, alpha = ITOP low byte (`0x80`, from the EE packet) |
+| `0x0618`, `0x0920` | continuation entries (MSCNT) into `0x388` / `0x650` of `0x0270` | same | same as `0x0270` |
+| `0x0350` (MSCAL `0x6A`) | `0x10D0` (non-clip), `0x15D0` (clip) | skin word at TOP+149+n-k: `p + wa C[a] + wb C[b]` with `C` = qword `143 + bone`, weights `lane - 32768`; lit `min(TOPS+5 + max(0, n.vf12) TOPS+4, 128)`; alpha `mfir.w` of `C[a].z` low 16 bits | camera-facing quads: `C` = the sun quad (`0xAC..0xAF` = bone 29..32) read from the EE material packet; expanded on the CPU per frame |
+| water (MSCAL `0x4E`) | `0x0270` through the immediate API (`0x361468` ITOP `0x200`, `0x361708`, `0x364D18`) | positions/st given by `0x361708`, colour `(c >> 1)` rounded, R/B swapped | the same vertices from the replaced `0x325728`, strip per tile (ADC on the first 2) |
+
+`track.grf` geometry is decoded with `fix_winding = false` (raw strip parity) and drawn with no
+culling (the VU1 programs have no backface test). Textures, blend, alpha test and depth state
+come from the GS state the texture manager (`0x34F8D0`) sets for the leaf, as in R1.
+
+### Split screen (P8)
+
+PS2 and Xbox both skip passes 1, 2 and 4 (and their water display objects, effects and
+projected shadows) and use the coarse mlist (`+8`) when `*(0x3D1B0C) != 0`. With
+`[Video] SplitScreenParity=1` (default; `EOD_SPLIT_PARITY=0` gives the original) the readable
+`0x214B68` runs the single-view sequence in every split view. `EOD_DIFF` equivalence is checked
+with parity off.
+
+`EOD_NATIVE_ONLY=1` (implies `EOD_NATIVE=1`) drops every primitive the GS emulator would draw, so a
+path not yet native shows as missing geometry. `EOD_NATIVE_WORLD_LIST=1` prints each mlist's
+pass objects and texture names; `EOD_NATIVE_WATER_LOG=1` the water surface state;
+`EOD_NATIVE_PARITY_LOG=1` every frame whose world/water counts differ.
 
 ## Stage R1: queued 3D objects drawn by plume
 

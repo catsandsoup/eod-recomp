@@ -140,3 +140,16 @@
 00366D30 wrap     # packet reserve: tagged for VU1 start attribution
 00366D78 wrap     # packet reserve, second manager: tagged for VU1 start attribution
 00366DD8 wrap     # packet reserve, second manager: tagged for VU1 start attribution
+
+# Track world, sky and water (src/native_world.cpp, readable C++; EOD_DIFF checks each; stage R2 of
+# docs/NATIVE_RENDERER.md). 0x3582B8 above is the mlist calc (hle_draw_distance.cpp forwards to it).
+00214B68 wrap     # WorldFrameRender: mlist calc and world passes 0..4 around the queued frame
+00358BD0 wrap     # WorldRenderPass(pass): DMA REFs to the visible world batches
+0035DEE0 wrap     # WorldPacketBegin(qwc)
+0035CBB8 wrap     # PacketCommit(qwc) (0x366CD0)
+00223858 wrap     # SkyDraw: dome parts through the draw queue
+00223800 wrap     # SkyDestroy (vtable 0x408318 slot 2)
+00326168 wrap     # WaterDrawIfPresent
+00325728 wrap     # WaterDraw(surface): tiles through the immediate geometry API
+00325E40 wrap     # WaterSimulate: car splashes
+00326188 wrap     # WaterCreate(pos, axis a, axis b): only with one view; SplitScreenParity creates it in split screen too (P8)

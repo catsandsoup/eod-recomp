@@ -132,3 +132,60 @@ cleanly. Stop and report if a sender needs a design decision."
 | Native renderer | decided: own renderer on plume (Filament rejected, docs/NATIVE_RENDERER.md); plume's Vulkan backend builds with the project toolchain | stage R0 next |
 | P3 comparison tool | not started | needed before any native PS2-look work is judged |
 | S4 counters | not started | per-frame VU1 program and emulated GS primitive counts |
+
+## 7. Stage R2: track world, sky, water (2026-11-18)
+
+Build `ninja -C build eod`, headless and muted (`EOD_HEADLESS=1 EOD_MUTE=1 --headless`),
+`FrameSkip=0`, RenderScale 1, Radeon Pro 580. Code: `src/native_world.cpp`,
+`runtime/render/native_feed.cpp`, `runtime/render/native_renderer.cpp`; spec in
+docs/NATIVE_RENDERER.md "Stage R2". Every run logged `[SESSION] start: Eve N ... contest M`.
+
+### D2: EOD_DIFF (0 mismatches each; counts are the harness's last power-of-two report)
+
+| function | checked | mismatched | run |
+| --- | --- | --- | --- |
+| `0x214B68` WorldFrameRender | 2,048 | 0 | Woodly (Afton.trk) Jump Race, `EOD_SPLIT_PARITY=0` |
+| `0x3582B8` MlistVisibilityCalc | 1,024 | 0 | same |
+| `0x358BD0` WorldRenderPass | 4,096 | 0 | same |
+| `0x35DEE0` WorldPacketBegin | 2,048 | 0 | same |
+| `0x35CBB8` PacketCommit | 2,048 | 0 | same |
+| `0x223858` SkyDraw | 1,024 | 0 | same |
+| `0x223800` SkyDestroy | 1,024 | 0 | deterministic replay `EOD_R2_REPLAY_SKY_DESTROY=2` (it runs only at track unload) |
+| `0x326168` WaterDrawIfPresent | 2,048 | 0 | same race |
+| `0x325728` WaterDraw | 1,024 | 0 | deterministic replay `EOD_R2_REPLAY_WATER=2` (surface seldom in view) |
+| `0x325E40` WaterSimulate | 3,072 | 0 | same race |
+
+Not reached by `EOD_DIFF`: the split-screen branch of `0x214B68` with parity off (the shipped
+default runs the single-view branch, which is the one checked).
+
+### P1: world leaves and water submitted == drawn (every frame, `EOD_NATIVE=1`)
+
+| scene | frames | world leaves drawn / submitted | water drawn / submitted | heap (`EOD_HEAP_CHECK=1`) / exit |
+| --- | --- | --- | --- | --- |
+| Woodly (Afton.trk) Jump Race 1P, 3000 vb | 1,634 / 1,634 equal | 705,071 / 705,071 | 1,232 / 1,232 | 0 corruptions / clean |
+| Career free roam (`mode=career;place=home`), 3000 vb | 2,310 / 2,310 | 291,231 / 291,231 | 0 / 0 | 0 / clean |
+| Dundas No-Rules Race 1P, 3000 vb | 1,884 / 1,884 | 1,139,087 / 1,139,087 | 0 / 0 (no water body) | 0 / clean |
+| Dundas No-Rules Race 2P split, parity on, 3000 vb | 1,835 / 1,835 | 1,404,456 / 1,404,456 | 0 / 0 | 0 / clean |
+| Carnage: Anoka Battle (8 AI), chickens, x from 600, l2 every 30, 3600 vb | 2,761 / 2,761 | 808,882 / 808,882 | 0 / 0 | 0 / clean |
+| `EOD_NATIVE_ONLY=1` Woodly, 1500 vb | 476 / 476 | 185,011 / 185,011 | 424 / 424 | 818,236 GS primitives dropped |
+
+0 world records dropped for packet space in every run; camera-facing parts (VU1 `0x350`) drawn
+natively with the sun quad found every time (`no sun quad 0`).
+
+### P8 and Dundas water (finding)
+
+- Retail data: of the 15 `track.grf` files only AFTON.TRK (in-game Eve 16 'Woodly') has a Water
+  display object (subtype 28); DUNDAS.TRK has none, and its mlists have no water texture, so
+  `0x325728` never draws on Dundas in 1P or 2P (`*(0x3DC134) == 0`, logged by
+  `EOD_NATIVE_WATER_LOG=1`). Water on Woodly is drawn natively in every frame it is in view.
+- Split screen: both the PS2 (`0x214B68`) and the Xbox (`FUN_000a8390`) skip world passes 1, 2, 4
+  and use the coarse mlist, and `0x326188` creates the water surface only for one view
+  (`*(0x439858) < 2`). `SplitScreenParity=1` (default) gives split views the single-view
+  sequence, mlist and water. Woodly is not offered in head-to-head (the head-to-head contest
+  table has no Eve 16 entry), so water in split screen could not be shown with a retail session.
+
+### Still open after R2
+
+Per-vertex fog and mip levels (R5); the projected-shadow, particle and immediate-geometry passes
+that `0x214B68` calls are still drawn by the GS (R4); PS2 caps owned here are tracked, not
+removed (docs/PS2_LIMITS.md).

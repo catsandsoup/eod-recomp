@@ -44,9 +44,19 @@ struct FrameStats {
     uint32_t lost = 0;        // not drawn: no mesh, no surface or no renderer
     uint32_t textured = 0, untextured_rt = 0, skinned = 0, flushes = 0;
     uint64_t suppressed = 0;  // GS primitives not drawn because they were a native object's
+    // by Packet::kind (draw queue record, world leaf, water surface)
+    uint32_t k_objects[3] = {}, k_drawn[3] = {}, k_skipped[3] = {}, k_lost[3] = {};
 };
 std::map<uint64_t, FrameStats> g_frames;
 uint64_t g_newest_frame = 0;
+// P1 (docs/NATIVE_RENDERER_SUCCESS.md): frames whose world leaves / water draws the EE submitted
+// equal what was drawn (frames the GS skips with FrameSkip count separately)
+struct Parity {
+    uint64_t frames = 0, world_equal = 0, water_equal = 0, world_submitted = 0, world_drawn = 0, water_submitted = 0,
+             water_drawn = 0, skipped_frames = 0;
+};
+Parity g_parity;
+uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
 
 uint64_t log_every() {
     static const uint64_t n = [] {
@@ -162,6 +172,7 @@ struct Renderer {
     std::vector<Item> pending;
     Target target{};
     std::vector<Texture *> uploads;
+    std::deque<std::pair<uint32_t, uint64_t>> transient;  // one-draw meshes (id, vblank they arrived)
 };
 Renderer g_r;
 
@@ -491,6 +502,7 @@ void flush() {
         FrameStats &fs = g_frames[it.p.frame];
         if (!it.mesh || !it.mesh->buf) {
             fs.drawn++;
+            fs.k_drawn[it.p.kind % 3]++;
             fs.empty++;
             continue;
         }
@@ -523,6 +535,7 @@ void flush() {
         cl->setIndexBuffer(&ibv);
         cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
         fs.drawn++;
+        fs.k_drawn[it.p.kind % 3]++;
         if (it.tex) fs.textured++;
         if (m.cpu->skinned) fs.skinned++;
     }
@@ -553,16 +566,20 @@ void finalize() {
     if (!g_active || g_finalized) return;
     g_finalized = true;
     FrameStats &fs = g_frames[g_cur.frame];
+    const uint32_t kind = g_cur.kind % 3;
     if (gs::g_skip_frame) {
         fs.skipped++;
+        fs.k_skipped[kind]++;
         return;
     }
     if (!init()) {
         fs.lost++;
+        fs.k_lost[kind]++;
         return;
     }
     if (modern::g_on && modern::live()) {  // the Modern renderer draws these batches itself
         fs.lost++;
+        fs.k_lost[kind]++;
         return;
     }
     const gs::Env &e = g_have_env ? g_env : gs::current_env();
@@ -570,6 +587,7 @@ void finalize() {
     GpuMesh *mesh = g_cur.mesh ? gpu_mesh(g_cur.mesh) : nullptr;
     if (g_cur.mesh && !mesh) {
         fs.lost++;
+        fs.k_lost[kind]++;
         return;
     }
     const bool zwrite = !e.zmsk && e.ztst != 0, ztest = e.ztst >= 2;
@@ -655,10 +673,24 @@ void end_vblank(uint64_t vb) {
     }
     g_r.wrappers.clear();
     while (!g_r.trash.empty() && g_r.trash.front().vb + 8 <= vb) g_r.trash.pop_front();
+    // one-draw geometry (water, camera-facing parts) goes 8 vblanks after it arrived (drawn by then)
+    while (!g_r.transient.empty() && g_r.transient.front().second + 8 <= vb) {
+        auto it = g_r.meshes.find(g_r.transient.front().first);
+        if (it != g_r.meshes.end()) {
+            Trash t{vb};
+            t.buf = std::move(it->second.buf);
+            g_r.trash.push_back(std::move(t));
+            g_r.meshes.erase(it);
+        }
+        g_r.transient.pop_front();
+    }
 }
 #else
 void finalize() {
-    if (g_active && !g_finalized) g_frames[g_cur.frame].lost++;
+    if (g_active && !g_finalized) {
+        g_frames[g_cur.frame].lost++;
+        g_frames[g_cur.frame].k_lost[g_cur.kind % 3]++;
+    }
     g_finalized = true;
 }
 void flush() {}
@@ -672,20 +704,64 @@ void begin_object(const Packet &p) {
     g_finalized = false;
     g_have_env = false;
     g_frames[p.frame].objects++;
+    g_frames[p.frame].k_objects[p.kind % 3]++;
     g_newest_frame = std::max(g_newest_frame, p.frame);
 }
 
 void report(uint64_t vb) {
     const uint64_t every = log_every();
-    for (auto it = g_frames.begin(); it != g_frames.end() && it->first < g_newest_frame;) {
-        const FrameStats &s = it->second;
-        if (every && (every == 1 || it->first % every < 2))
+    // EE frames older than the newest one the GS has seen are complete on both sides
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected;
+    take_expected(g_newest_frame, expected);
+    std::vector<uint64_t> frames;
+    for (auto &e : expected) frames.push_back(e.first);
+    for (auto &f : g_frames)
+        if (f.first < g_newest_frame && !expected.count(f.first)) frames.push_back(f.first);
+    std::sort(frames.begin(), frames.end());
+    const bool log_parity = std::getenv("EOD_NATIVE_PARITY_LOG") != nullptr;
+    for (const uint64_t frame : frames) {
+        auto it = g_frames.find(frame);
+        FrameStats none;
+        const FrameStats &s = it != g_frames.end() ? it->second : none;
+        auto e = expected.find(frame);
+        const uint32_t world = e != expected.end() ? e->second.first : 0, water = e != expected.end() ? e->second.second : 0;
+        if (s.skipped) {
+            g_parity.skipped_frames++;
+        } else {
+            g_parity.frames++;
+            g_parity.world_submitted += world;
+            g_parity.world_drawn += s.k_drawn[KIND_WORLD];
+            g_parity.water_submitted += water;
+            g_parity.water_drawn += s.k_drawn[KIND_WATER];
+            const bool we = s.k_drawn[KIND_WORLD] == world && s.k_objects[KIND_WORLD] == world;
+            const bool ae = s.k_drawn[KIND_WATER] == water && s.k_objects[KIND_WATER] == water;
+            g_parity.world_equal += we;
+            g_parity.water_equal += ae;
+            if (log_parity && (!we || !ae))
+                std::fprintf(stderr,
+                             "[native] parity frame %llu world submitted %u objects %u drawn %u lost %u | water submitted %u "
+                             "objects %u drawn %u lost %u\n",
+                             (unsigned long long)frame, world, s.k_objects[KIND_WORLD], s.k_drawn[KIND_WORLD],
+                             s.k_lost[KIND_WORLD], water, s.k_objects[KIND_WATER], s.k_drawn[KIND_WATER], s.k_lost[KIND_WATER]);
+        }
+        if (every && (every == 1 || frame % every < 2)) {
             std::fprintf(stderr,
                          "[native] gs frame %llu objects %u drawn %u (empty %u, textured %u, skinned bind pose %u, "
                          "render-target texture untextured %u) skipped %u lost %u suppressed GS prims %llu render passes %u (gs vb %llu)\n",
-                         (unsigned long long)it->first, s.objects, s.drawn, s.empty, s.textured, s.skinned,
-                         s.untextured_rt, s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb);
-        it = g_frames.erase(it);
+                         (unsigned long long)frame, s.objects, s.drawn, s.empty, s.textured, s.skinned, s.untextured_rt,
+                         s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb);
+            std::fprintf(stderr,
+                         "[native] gs frame %llu world leaves submitted %u drawn %u (lost %u) water submitted %u drawn %u | "
+                         "P1 frames world equal %llu/%llu water equal %llu/%llu (leaves drawn %llu of %llu, water %llu of %llu) "
+                         "frame-skipped %llu | native-only dropped GS prims %llu\n",
+                         (unsigned long long)frame, world, s.k_drawn[KIND_WORLD], s.k_lost[KIND_WORLD], water,
+                         s.k_drawn[KIND_WATER], (unsigned long long)g_parity.world_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.water_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.world_drawn, (unsigned long long)g_parity.world_submitted,
+                         (unsigned long long)g_parity.water_drawn, (unsigned long long)g_parity.water_submitted,
+                         (unsigned long long)g_parity.skipped_frames, (unsigned long long)g_only_dropped);
+        }
+        if (it != g_frames.end()) g_frames.erase(it);
     }
 }
 
@@ -708,9 +784,15 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
         Mesh *m;
         std::memcpy(&m, data, sizeof m);
 #ifdef EOD_PLUME
+        if (m->transient) g_r.transient.emplace_back(m->id, g_r.vb);
         if (m->replaces) {
             auto it = g_r.meshes.find(m->replaces);
             if (it != g_r.meshes.end()) {
+                for (const Item &pi : g_r.pending)
+                    if (pi.mesh == &it->second) {
+                        flush();  // an object still to be drawn uses the old geometry
+                        break;
+                    }
                 Trash t{g_r.vb};
                 t.buf = std::move(it->second.buf);
                 g_r.trash.push_back(std::move(t));
@@ -732,13 +814,26 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v) {
 #ifdef EOD_PLUME
         if (!g_r.pending.empty()) flush();  // before the GS draws something of its own
 #endif
+        if (native_only()) {
+            g_only_dropped++;
+            return true;
+        }
         return false;
     }
 #ifdef EOD_PLUME
     if (!g_r.tried) init();
-    if (!g_r.ok) return false;  // no renderer: the GS draws the object
-    if (modern::g_on && modern::live()) return false;
+    if (!g_r.ok || (modern::g_on && modern::live())) {  // no renderer: the GS draws the object
+        if (native_only()) {
+            g_only_dropped++;
+            return true;
+        }
+        return false;
+    }
 #else
+    if (native_only()) {
+        g_only_dropped++;
+        return true;
+    }
     return false;
 #endif
     if (!g_have_env && !g_finalized) {

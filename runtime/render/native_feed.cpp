@@ -14,6 +14,7 @@
 #include <xxhash.h>
 
 #include "../core/config.h"
+#include "../core/limit_tracker.h"
 #include "../core/memory.h"
 #include "scene_tap.h"
 #include "vif_mesh.h"
@@ -27,10 +28,11 @@ namespace native {
 bool enabled() {
     static const bool on = [] {
         const char *e = std::getenv("EOD_NATIVE");
-        const bool v = e && *e ? *e != '0' : g_config.native_renderer;
+        const char *only = std::getenv("EOD_NATIVE_ONLY");
+        const bool v = (e && *e ? *e != '0' : g_config.native_renderer) || (only && *only && *only != '0');
         if (v) {
             scene_tap::set_enabled(true);
-            std::fprintf(stderr, "[native] renderer on: queued 3D objects drawn by plume\n");
+            std::fprintf(stderr, "[native] renderer on: queued 3D objects, track world and water drawn by plume\n");
         }
         return v;
     }();
@@ -54,10 +56,21 @@ float rf(uint32_t a) {
 }
 
 // ---- mesh cache (EE thread) ----
+// A vertex of a camera-facing batch (VU1 0x350, MSCAL 0x6A): p + wa C[a] + wb C[b], where C are the
+// sun quad corners at VU1 qwords 0xAC..0xAF (bone 29..32 = qword 143 + bone).
+struct FacingVertex {
+    uint32_t vertex;
+    uint8_t corner[2];      // bone - 29 (4 = not a corner: no offset)
+    float weight[2];        // lane - 32768 = byte / 256
+};
 struct CacheEntry {
     uint64_t hash = 0;
     uint64_t checked = ~0ull;  // vblank the hash was last compared
     uint32_t id = 0;
+    // camera-facing parts keep their decoded geometry on the EE side and get a transient mesh per draw
+    std::vector<Vertex> base;
+    std::vector<uint32_t> indices;
+    std::vector<FacingVertex> facing;
 };
 std::unordered_map<uint32_t, CacheEntry> g_cache;
 uint32_t g_next_mesh = 1;
@@ -70,6 +83,7 @@ std::mutex g_mutex;
 struct Tagged {
     uint32_t end;
     Packet packet;
+    bool range;  // any DMA tag in [start, end) (immediate geometry); else the REF to batch + 0x38
 };
 std::map<uint32_t, Tagged> g_tags;     // batch packet start -> record; latest writer wins
 std::vector<Mesh *> g_new_meshes;      // decoded, not yet in the GS stream
@@ -81,6 +95,24 @@ uint64_t g_frame_vb = ~0ull;
 uint32_t g_serial = 0;
 // counters (EE frame)
 uint32_t g_records = 0, g_tagged = 0, g_meshes_decoded = 0, g_mesh_fail = 0;
+
+// ---- EE state: track world (0x358BD0) and water (0x325728) ----
+constexpr uint32_t kImmBeginRa = 0x3614CC;      // reserve in 0x361468 (immediate geometry begin)
+constexpr uint32_t kImmVertexRa = 0x3617E4;     // reserve in 0x361708 (next chunk)
+constexpr uint32_t kImmMoreRa = 0x364DF0;       // reserve in 0x364D18 (strip continuation)
+constexpr uint32_t kMlist = 0x4D6F10;           // the mlist 0x358BD0 draws (set by 0x3582B8)
+constexpr uint32_t kMaterialPacket = 0x4D7C54;  // material packet 0x35BA10 sends (sun quad for 0x6A)
+bool g_in_water = false;
+int32_t g_world_pass = 0;
+std::vector<std::pair<uint32_t, Packet>> g_leaves;  // this texture record's REFs, until its commit
+Packet g_water;
+Mesh *g_water_mesh = nullptr;
+// counters (EE frame)
+struct WorldCounts {
+    uint32_t passes = 0, leaves = 0, facing = 0, no_quad = 0, nomesh = 0, dropped_records = 0, dropped_leaves = 0;
+    uint32_t water_draws = 0, water_vertices = 0, water_tris = 0;
+};
+WorldCounts g_wc;
 
 // ---- VIF1 state ----
 uint64_t g_sent_key = ~0ull;  // (frame << 32 | serial) of the record whose kicks are being sent
@@ -100,8 +132,11 @@ bool read_guest(void *, uint64_t addr, void *dst, size_t n) {
 }
 
 // The record's batch as a mesh id, decoding it when it is new or its data changed.
-uint32_t mesh_for(uint32_t batch, uint64_t vb) {
+// World parts (track.grf, prelit V4-5) decode with raw strip winding (fix_winding = false); they
+// are drawn without culling.
+uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **entry = nullptr) {
     CacheEntry &c = g_cache[batch];
+    if (entry) *entry = &c;
     if (c.checked == vb && c.id) return c.id;
     const uint32_t qwc = MEM_LW(batch + 0x34);
     if (qwc == 0 || qwc > 0x10000) return 0;
@@ -111,9 +146,13 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb) {
     const uint64_t h = XXH3_64bits(g_bytes.data(), bytes);
     c.checked = vb;
     if (c.id && c.hash == h) return c.id;
+    c.base.clear();
+    c.indices.clear();
+    c.facing.clear();
     if (!g_decoder) g_decoder = new vifmesh::Decoder();
     g_scratch.clear();
     vifmesh::Options opt;
+    opt.fix_winding = !world;
     const vifmesh::Status st = g_decoder->decode_vif(g_bytes.data() + 0x38, qwc * 16, g_scratch, opt);
     auto *m = new Mesh();
     m->id = g_next_mesh++;
@@ -121,8 +160,22 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb) {
     m->batch = batch;
     m->skinned = false;
     if (st != vifmesh::Status::Ok) g_mesh_fail++;
-    for (const vifmesh::Batch &b : g_scratch.batches)
+    for (const vifmesh::Batch &b : g_scratch.batches) {
         if (b.skin == vifmesh::Skin::Matrix || b.skin == vifmesh::Skin::Offset) m->skinned = true;
+        if (b.program != 0x6A) continue;
+        for (uint32_t v = b.first_vertex; v < b.first_vertex + b.vertex_count; v++) {
+            const vifmesh::Vertex &s = g_scratch.vertices[v];
+            FacingVertex f{v, {4, 4}, {0, 0}};
+            if (s.flags & vifmesh::kHasAux) {
+                for (int k = 0; k < 2; k++) {
+                    const int corner = (int)s.aux[k] + 143 - 0xAC;  // lq 143(vi5): qword 143 + bone
+                    f.corner[k] = corner >= 0 && corner < 4 ? (uint8_t)corner : 4;
+                    f.weight[k] = (float)s.aux[2 + k] / 256.0f;  // V4-8 offset 32768.0f: lane - 32768
+                }
+            }
+            c.facing.push_back(f);
+        }
+    }
     m->vertices.resize(g_scratch.vertices.size());
     for (size_t i = 0; i < g_scratch.vertices.size(); i++) {
         const vifmesh::Vertex &s = g_scratch.vertices[i];
@@ -145,6 +198,10 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb) {
             m->indices.push_back(p.first_vertex + g_scratch.indices[p.first_index + i]);
     c.hash = h;
     c.id = m->id;
+    if (!c.facing.empty()) {
+        c.base = m->vertices;
+        c.indices = m->indices;
+    }
     g_meshes_decoded++;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
@@ -153,14 +210,99 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb) {
     return c.id;
 }
 
+// What the EE submitted per frame, for the GS side's P1 check (take_expected).
+struct Expect {
+    uint32_t world = 0, water = 0;
+};
+std::mutex g_expect_mutex;
+std::map<uint64_t, Expect> g_expect;
+
 void roll(uint64_t vb) {
     if (vb == g_frame_vb) return;
-    if (g_frame_vb != ~0ull && log_every() && g_frame_vb / log_every() != vb / log_every())
+    if (g_frame_vb != ~0ull) {
+        std::lock_guard<std::mutex> lk(g_expect_mutex);
+        Expect &e = g_expect[g_frame_vb];
+        e.world += g_wc.leaves;
+        e.water += g_wc.water_draws;
+    }
+    if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr, "[native] ee vb %llu records %u tagged %u meshes decoded %u (failed %u) cached %zu\n",
                      (unsigned long long)g_frame_vb, g_records, g_tagged, g_meshes_decoded, g_mesh_fail, g_cache.size());
+        std::fprintf(stderr,
+                     "[native] ee vb %llu world passes %u leaves %u (camera-facing %u, no sun quad %u, no mesh %u) "
+                     "dropped (no packet space) records %u leaves %u | water draws %u vertices %u triangles %u\n",
+                     (unsigned long long)g_frame_vb, g_wc.passes, g_wc.leaves, g_wc.facing, g_wc.no_quad, g_wc.nomesh,
+                     g_wc.dropped_records, g_wc.dropped_leaves, g_wc.water_draws, g_wc.water_vertices, g_wc.water_tris);
+    }
     g_frame_vb = vb;
     g_serial = g_records = g_tagged = 0;
     g_meshes_decoded = g_mesh_fail = 0;
+    g_wc = WorldCounts();
+}
+
+// The camera packet inputs (0x35B3D0) as they are now.
+void fill_camera(Packet &p) {
+    for (int i = 0; i < 9; i++) p.rotation[i] = rf(kCameraRotation + 4u * (uint32_t)i);
+    for (int i = 0; i < 3; i++) p.position[i] = rf(kCameraPosition + 4u * (uint32_t)i);
+    for (int i = 0; i < 4; i++) p.viewport[i] = rf(kViewport + 4u * (uint32_t)i);
+    p.near_z = rf(kNear);
+    p.far_z = rf(kFar);
+    p.fov_scale = rf(kFovScale);
+    p.aspect = rf(kAspect);
+}
+
+// The model matrix and colours of a matrix packet (0x35CD28; layout as scene_tap::object).
+void read_matrix_packet(uint32_t packet, Packet &p) {
+    std::memset(p.model, 0, sizeof p.model);
+    if (!packet) {
+        p.model[0] = p.model[5] = p.model[10] = 1;
+        return;
+    }
+    for (int row = 0; row < 3; ++row)
+        for (int c = 0; c < 4; ++c) p.model[row * 4 + c] = rf(packet + 0x10 + 16u * (uint32_t)c + 4u * (uint32_t)row);
+    for (int i = 0; i < 4; i++) {
+        p.colour_a[i] = rf(packet + 0x50 + 4u * (uint32_t)i);
+        p.colour_b[i] = rf(packet + 0x60 + 4u * (uint32_t)i);
+        p.light[i] = rf(packet + 0x70 + 4u * (uint32_t)i);
+    }
+}
+
+// Once per mlist (EOD_NATIVE_WORLD_LIST=1): which display objects each pass calls (vtable +0x14).
+void describe_mlist(uint32_t fp) {
+    static std::vector<uint32_t> seen;
+    for (uint32_t s : seen)
+        if (s == fp) return;
+    seen.push_back(fp);
+    const uint32_t list = MEM_LW(fp + 0x90);
+    for (uint32_t pass = 0; pass < 5; pass++) {
+        const uint32_t pr = fp + 0x38 + pass * 16;
+        const int32_t tf = (int32_t)MEM_LW(pr), te = (int32_t)MEM_LW(pr + 4);
+        const int32_t of = (int32_t)MEM_LW(pr + 8), oe = (int32_t)MEM_LW(pr + 12);
+        std::map<uint32_t, uint32_t> fns;
+        for (int32_t k = of; k < oe && k - of < 4096; k++) {
+            const uint32_t obj = MEM_LW(list + 4u * (uint32_t)k);
+            fns[obj ? MEM_LW(MEM_LW(obj) + 0x14) : 0]++;
+        }
+        std::string s;
+        for (auto &f : fns) {
+            char t[32];
+            std::snprintf(t, sizeof t, " %06x:%u", f.first, f.second);
+            s += t;
+        }
+        std::fprintf(stderr, "[native] world mlist %08x pass %u texture records %d..%d objects %d..%d draw fns:%s\n", fp,
+                     pass, tf, te, of, oe, s.c_str());
+        // the texture name of each record's first part (4SPS +8)
+        std::string names;
+        for (int32_t r = tf; r < te && r - tf < 512; r++) {
+            const uint32_t rec = MEM_LW(fp + 0x34) + (uint32_t)r * 0x1C;
+            const uint32_t part = MEM_LW(MEM_LW(fp + 0x2C) + MEM_LW(rec + 0x14) * 12 + 8);
+            char n[17] = {};
+            for (int k = 0; k < 16 && part; k++) n[k] = (char)MEM_LB(part + 8 + (uint32_t)k);
+            names += " ";
+            names += n;
+        }
+        std::fprintf(stderr, "[native] world mlist %08x pass %u textures:%s\n", fp, pass, names.c_str());
+    }
 }
 
 }  // namespace
@@ -235,13 +377,7 @@ void ee_object(uint32_t record) {
     } else {
         p.model[0] = p.model[5] = p.model[10] = 1;
     }
-    for (int i = 0; i < 9; i++) p.rotation[i] = rf(kCameraRotation + 4u * (uint32_t)i);
-    for (int i = 0; i < 3; i++) p.position[i] = rf(kCameraPosition + 4u * (uint32_t)i);
-    for (int i = 0; i < 4; i++) p.viewport[i] = rf(kViewport + 4u * (uint32_t)i);
-    p.near_z = rf(kNear);
-    p.far_z = rf(kFar);
-    p.fov_scale = rf(kFovScale);
-    p.aspect = rf(kAspect);
+    fill_camera(p);
     p.mesh = mesh_for(p.batch, vb);
     g_records++;
     g_in_object = true;
@@ -252,9 +388,10 @@ void ee_object_end() { g_in_object = false; }
 void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     if (!addr) return;
     const bool batch = g_in_object && ra == kBatchPacketRa;
+    const bool water = g_in_water && (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
     const uint32_t end = addr + (qwc ? qwc : 1) * 16;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!batch && g_tags.empty()) return;
+    if (!batch && !water && g_tags.empty()) return;
     // drop older entries this range overlaps
     auto it = g_tags.lower_bound(addr);
     if (it != g_tags.begin()) {
@@ -263,9 +400,212 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     }
     it = g_tags.lower_bound(addr);
     while (it != g_tags.end() && it->first < end) it = g_tags.erase(it);
+    if (water) {  // every VU1 start under this packet's DMA tags draws the water surface
+        g_tags[addr] = Tagged{end, g_water, true};
+        return;
+    }
     if (!batch) return;  // any other packet there replaces a record's tag
-    g_tags[addr] = Tagged{end, g_current};
+    g_tags[addr] = Tagged{end, g_current, false};
     g_tagged++;
+}
+
+// ---- track world (0x358BD0, src/native_world.cpp) --------------------------------------------
+void ee_world_pass(int32_t pass, uint32_t) {
+    if (!enabled()) return;
+    roll(kernel_vblank_count());
+    g_world_pass = pass;
+    g_leaves.clear();
+    g_wc.passes++;
+    static const bool describe = std::getenv("EOD_NATIVE_WORLD_LIST") != nullptr;
+    if (describe && MEM_LW(kMlist)) describe_mlist(MEM_LW(kMlist));
+}
+
+void ee_world_pass_end() {
+    g_leaves.clear();
+    if (g_leaves.capacity() > 4096) g_leaves.shrink_to_fit();  // released when unused
+}
+
+namespace {
+// The sun quad corners (VU1 qwords 0xAC..0xAF) from the material packet 0x35BA10 sends with the
+// world packet (0x34C1F0 -> 0x35CBD8 -> 0x35A810(p, 4, 0x1D, 3, 4): V3-32 x4 to 0x8F + 0x1D).
+bool sun_quad(float c[4][3], uint32_t &alpha) {
+    const uint32_t p = MEM_LW(kMaterialPacket);
+    if (!p || p >= 0x2000000) return false;
+    const uint32_t unpack = MEM_LW(p + 4);
+    if ((unpack & 0x6F0003FFu) != (0x68000000u | ((0x8Fu + 0x1Du) & 0x3FF)) || ((unpack >> 16) & 0xFF) != 4) return false;
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < 3; i++) c[k][i] = rf(p + 8 + 12u * (uint32_t)k + 4u * (uint32_t)i);
+    alpha = MEM_LW(p + 8 + 8) & 0xFF;  // mfir.w of corner a's z: the low byte 0x80 the EE wrote
+    return true;
+}
+
+// A camera-facing part as this view sees it: a transient mesh (released by the GS after use).
+uint32_t facing_mesh(const CacheEntry &c, uint32_t part, uint32_t &alpha) {
+    float q[4][3];
+    if (!sun_quad(q, alpha)) {
+        g_wc.no_quad++;
+        return c.id;
+    }
+    auto *m = new Mesh();
+    m->id = g_next_mesh++;
+    m->replaces = 0;
+    m->batch = part;
+    m->skinned = false;
+    m->transient = true;
+    m->vertices = c.base;
+    m->indices = c.indices;
+    for (const FacingVertex &f : c.facing) {
+        Vertex &v = m->vertices[f.vertex];
+        for (int k = 0; k < 2; k++)
+            if (f.corner[k] < 4)
+                for (int i = 0; i < 3; i++) v.p[i] += f.weight[k] * q[f.corner[k]][i];
+    }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_new_meshes.push_back(m);
+    return m->id;
+}
+}  // namespace
+
+void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop) {
+    if (!enabled()) return;
+    const uint64_t vb = kernel_vblank_count();
+    Packet p;
+    std::memset(&p, 0, sizeof p);
+    read_matrix_packet(matrix_packet, p);
+    p.kind = KIND_WORLD;
+    p.pass = (uint32_t)g_world_pass;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.batch = part;
+    p.itop = itop;  // ITOP the EE wrote in the REF's VIF codes (vertex alpha = its low byte)
+    p.texture_key = -1;
+    p.layer = -1;
+    fill_camera(p);
+    CacheEntry *c = nullptr;
+    p.mesh = mesh_for(part, vb, true, &c);
+    if (!p.mesh) g_wc.nomesh++;
+    if (c && !c->facing.empty() && p.mesh) {
+        uint32_t alpha = 0x80;
+        p.mesh = facing_mesh(*c, part, alpha);
+        p.itop = (itop & ~0xFFu) | alpha;
+        g_wc.facing++;
+    }
+    g_leaves.emplace_back(ref_qword, p);
+}
+
+// The texture record's packet commit: its REFs are what VIF1 will read; tag each with its leaf.
+void ee_world_record(uint32_t, bool committed) {
+    if (!enabled()) return;
+    if (!committed) {
+        g_wc.dropped_records++;
+        g_wc.dropped_leaves += (uint32_t)g_leaves.size();
+        g_leaves.clear();
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (auto &l : g_leaves) {
+        const uint32_t a = l.first;
+        auto it = g_tags.lower_bound(a);
+        if (it != g_tags.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second.end > a) g_tags.erase(prev);
+        }
+        it = g_tags.lower_bound(a);
+        while (it != g_tags.end() && it->first < a + 16) it = g_tags.erase(it);
+        g_tags[a] = Tagged{a + 16, l.second, false};
+        g_wc.leaves++;
+    }
+    g_leaves.clear();
+}
+
+// ---- water surface (0x325728): immediate geometry 0x35DF10 / 0x361708 / 0x361BC8 -------------
+// begin runs before ImmediateBegin, so the packets it reserves are the water's
+void ee_water_begin(uint32_t surface) {
+    if (!enabled()) return;
+    roll(kernel_vblank_count());
+    Packet &p = g_water;
+    std::memset(&p, 0, sizeof p);
+    read_matrix_packet(MEM_LW(0x4D7C48), p);  // the matrix packet in effect (0x35E018)
+    p.kind = KIND_WATER;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.batch = surface;
+    p.itop = 0x200;  // 0x361468 writes ITOP 0x200 (0x04000200) before MSCAL 0x4E
+    p.texture_key = (int32_t)MEM_LW(surface + 0x3C);
+    p.layer = -1;
+    fill_camera(p);
+    delete g_water_mesh;
+    g_water_mesh = new Mesh();
+    g_water_mesh->id = g_next_mesh++;
+    g_water_mesh->replaces = 0;
+    g_water_mesh->batch = surface;
+    g_water_mesh->skinned = false;
+    g_water_mesh->transient = true;
+    p.mesh = g_water_mesh->id;
+    g_in_water = true;
+}
+
+// One vertex as 0x361708 builds it: colour halved to the GS scale with rounding, the packed word's
+// bytes 2, 1, 0 are the R, G, B lanes; ADC (no triangle) for strip 0, so each tile is 2 triangles.
+void ee_water_vertex(uint32_t colour, uint32_t strip, uint32_t at) {
+    if (!g_in_water || !g_water_mesh) return;
+    uint32_t c = (colour >> 1) & 0x7F7F7F7Fu;
+    c += (c & 0x40404040u) >> 6;
+    Vertex v{};
+    for (int i = 0; i < 3; i++) v.p[i] = rf(at + 4u * (uint32_t)i);
+    v.uv[0] = rf(at + 0x18);
+    v.uv[1] = rf(at + 0x1C);
+    v.c[0] = (uint8_t)(c >> 16);
+    v.c[1] = (uint8_t)(c >> 8);
+    v.c[2] = (uint8_t)c;
+    v.c[3] = (uint8_t)(c >> 24);
+    Mesh &m = *g_water_mesh;
+    const uint32_t i = (uint32_t)m.vertices.size();
+    m.vertices.push_back(v);
+    g_wc.water_vertices++;
+    if (strip && i >= 2) {
+        m.indices.push_back(i - 2);
+        m.indices.push_back(i - 1);
+        m.indices.push_back(i);
+        g_wc.water_tris++;
+    }
+}
+
+void ee_water_end(bool drawn) {
+    if (!g_in_water) return;
+    g_in_water = false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    // the tags this draw's packets got stay (they only match VU1 starts inside those packets)
+    if (!drawn) {
+        for (auto it = g_tags.begin(); it != g_tags.end();)
+            it = it->second.range && it->second.packet.mesh == g_water.mesh ? g_tags.erase(it) : std::next(it);
+        delete g_water_mesh;
+        g_water_mesh = nullptr;
+        return;
+    }
+    g_wc.water_draws++;
+    // the guest asks ImmediateBegin for 0x3000 vertices; the native mesh grows with the surface
+    limit_note("water surface vertices (0x35DF10 request 0x3000)", g_water_mesh->vertices.size(), 0, 0x3000);
+    g_new_meshes.push_back(g_water_mesh);
+    g_water_mesh = nullptr;
+}
+
+void take_expected(uint64_t before, std::map<uint64_t, std::pair<uint32_t, uint32_t>> &out) {
+    std::lock_guard<std::mutex> lk(g_expect_mutex);
+    while (!g_expect.empty() && g_expect.begin()->first < before) {
+        out[g_expect.begin()->first] = {g_expect.begin()->second.world, g_expect.begin()->second.water};
+        g_expect.erase(g_expect.begin());
+    }
+}
+
+bool native_only() {
+    static const bool on = [] {
+        const char *e = std::getenv("EOD_NATIVE_ONLY");
+        const bool v = e && *e && *e != '0';
+        if (v) std::fprintf(stderr, "[native] EOD_NATIVE_ONLY: the GS emulator draws nothing\n");
+        return v;
+    }();
+    return on;
 }
 
 // EOD_NATIVE_CHECK=1: the derived model -> screen matrix against the one VU1 uses for the record
@@ -307,7 +647,8 @@ void vu1_start(uint32_t program, uint32_t itop) {
         if (it != g_tags.begin()) {
             --it;
             // the tag VIF1 reads must still be the record's DMA REF to its batch data
-            if (tag < it->second.end && (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38) {
+            if (tag < it->second.end &&
+                (it->second.range || (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38)) {
                 p = it->second.packet;
                 found = true;
             }
@@ -325,7 +666,7 @@ void vu1_start(uint32_t program, uint32_t itop) {
     for (Mesh *m : meshes) post(CMD_MESH, &m, sizeof m);
     const uint64_t key = p.frame << 32 | p.serial;
     if (g_obj_active && key == g_sent_key) return;  // another program of the same record
-    p.itop = itop;
+    if (p.kind == KIND_QUEUE) p.itop = itop;  // world and water carry the ITOP their EE packet sets
     p.program = program;
     check(p);
     post(CMD_OBJ, &p, sizeof p);

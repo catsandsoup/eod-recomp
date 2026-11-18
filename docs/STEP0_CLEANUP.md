@@ -32,3 +32,22 @@ onto its own local branch, then `git worktree remove` on all three.
 **Next decisive test.** R2: write `src/native_world.cpp` wrapping `0x358BD0` / `0x35CBB8` /
 `0x325728`, then run Afton 1P headless with `EOD_NATIVE=1` and check the
 `frames visible==tagged+facing` counter reaches 100%.
+
+## R2 handoff (STAR, 2026-11-18)
+
+**Situation.** R1 drew queued objects natively; the track world, sky and water were still the
+GS's, and `native_feed.cpp` held an unwired R2 feed.
+
+**Task.** Replace the world renderer, sky and water with readable C++ (EOD_DIFF), feed Plume from
+it, fix split-screen water/passes (P8), add `EOD_NATIVE_ONLY`.
+
+**Action.** `src/native_world.cpp` (10 functions + WaterCreate parity wrap), world leaves tagged
+at their DMA REF from the C++, camera-facing parts expanded with the sun quad, water mesh from
+`0x361708`'s inputs, P1 parity counted in-process, `SplitScreenParity`, limit tracker.
+
+**Result.** docs/NATIVE_RENDERER_SUCCESS.md section 7: 0 mismatches (>= 1,024 checks each), P1
+equal on 100% of frames in 5 scenes plus native-only, 0 heap corruptions. Dundas has no water
+body in retail data.
+
+**Next decisive test.** R3: skinned palettes; then R4 removes the remaining GS draws that
+`EOD_NATIVE_ONLY=1` hides (shadows, particles, sprites, immediate geometry, HUD).
