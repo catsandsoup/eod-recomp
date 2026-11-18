@@ -1,6 +1,6 @@
 # Modern hardware: PS2 limits lifted
 
-Rule (AGENTS.md): a PS2-era limit is overcome, adaptively, inside the task that hits it. This page records each
+Rule (docs/MASTER_SPEC.md, section 3): a PS2-era limit is overcome, adaptively, inside the task that hits it. This page records each
 limit that has been lifted, how, and what it costs.
 
 ## Guest main memory: 32 MB -> 128 MB (13 Nov 2026)

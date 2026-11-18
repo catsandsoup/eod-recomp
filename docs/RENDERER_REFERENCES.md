@@ -79,7 +79,7 @@ source exactly matches the 2004 game.
 ## Readback-cost follow-up and standing reuse rule — October 16, 2026
 
 The owner explicitly requires checking existing projects online, Context7 and
-SDK sources before designing replacements. This is now in root `AGENTS.md`.
+SDK sources before designing replacements. This is now in `docs/MASTER_SPEC.md` (section 6).
 Rechecked Road Trip's live third-party listing: PS2Recomp still pins
 `818f279be3f9cdecaa9c7b4a3a7cbe8fe44fd6e4`.
 

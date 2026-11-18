@@ -88,7 +88,7 @@ The app never builds one row per stored value for large files.
 
 ## Product language
 
-Titles, labels, explanations and warnings follow AGENTS.md: identify,
+Titles, labels, explanations and warnings follow docs/MASTER_SPEC.md (section 8): identify,
 explain a consequence, resolve uncertainty or help recovery. Errors state what
 happened, what it means for the modder, and what to do.
 

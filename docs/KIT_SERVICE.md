@@ -106,7 +106,7 @@ the lane processes' caches.
 
 ## Concurrency lanes
 
-No single thread or process does everything (AGENTS.md, "Creation Kit concurrency"). A long
+No single thread or process does everything (docs/MASTER_SPEC.md, section 8). A long
 export, build or model decode never delays the next inspect.
 
 | Lane | Runs | Where | Default size |

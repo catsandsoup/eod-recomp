@@ -177,7 +177,7 @@ five vblanks). The production path keeps the same hook points and emits decoded 
    optional), keyed by the same (entry, ITOP, FRAME) rule.
 6. Off unless the renderer is selected; Original mode keeps today's path untouched.
 
-Reuse check (AGENTS.md): RT64 (N64) gets its 3D from the game's display lists, and its
+Reuse check (docs/MASTER_SPEC.md, section 6): RT64 (N64) gets its 3D from the game's display lists, and its
 extended GBI lets a port tag matrices with group IDs for interpolation; that is the same
 "tag transforms at the source" idea, applied here at the VU1 entry. Road Trip's frame
 generation pairs VU1 per-object matrices with PATH1 packets (`MotionTracker::packetReproject`)

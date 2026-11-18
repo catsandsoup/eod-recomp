@@ -362,10 +362,10 @@ read-only tools (`eod_kit_status`, `eod_catalog`, `eod_entries`, `eod_inspect`,
 "ask", so the human sees each apply even though the server already requires a
 plan id.
 
-## 11. Companion skill / CLAUDE.md snippet
+## 11. Companion skill
 
-Ship `.claude/skills/eod-modding/SKILL.md` (and the short version in
-`CLAUDE.md`). Draft:
+Ship `.claude/skills/eod-modding/SKILL.md` (root `CLAUDE.md` only points to
+`docs/MASTER_SPEC.md`). Draft:
 
 ```markdown
 ---

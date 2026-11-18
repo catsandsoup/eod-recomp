@@ -23,7 +23,7 @@ release's requirements and feature limits before installing.
 - tools/creation_kit/: editor checks.
 - docs/: public build and format references.
 
-Follow AGENTS.md for contribution and validation requirements. Keep runtime
+Follow docs/MASTER_SPEC.md for contribution and validation requirements. Keep runtime
 experiments isolated; do not merge an entire experimental branch to ship an
 editor-only fix. Historical archive tags are recovery references, not supported
 product versions. Private planning and handoff documents are distributed locally.
