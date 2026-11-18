@@ -189,21 +189,3 @@ it with adaptive host memory that grows on demand and releases when unused.
    recorded with numbers in `docs/NATIVE_RENDERER_SUCCESS.md`.
 
 Install target: `<game install dir>\eod.exe`, previous copy backed up first.
-
-## 8. Carried-over rules (from the removed AGENTS.md)
-
-### Product language
-UI copy must identify something, explain a consequence, resolve uncertainty or help
-recovery; otherwise delete it. Applies to UI, help, onboarding, marketing and release
-notes. Do not narrate visible controls, paraphrase labels, reassure about expected
-behaviour or fill space. Test every line: "What would the player misunderstand without
-this text?" No concrete answer means remove it.
-
-### Creation Kit concurrency
-The Kit's UI never waits on work: the main thread only draws and takes input. Asset
-reads/inspection, exports, package build/install, mesh decoding, texture decoding, index
-builds and game runs each run in their own lane; long work is a backend job (queued,
-progress, cancel) in the Jobs panel. No app-wide busy lock: only the asset or project
-being written is locked, and only against writes. The backend serves reads concurrently
-and runs exports, builds and mesh work in separate worker processes. Verify with a long
-export running while browsing and previewing stays responsive.

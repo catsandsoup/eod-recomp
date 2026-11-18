@@ -1,0 +1,4 @@
+ninja: Entering directory `build'
+[1/3] Building CXX object CMakeFiles/eod.dir/runtime/core/log.cpp.obj
+[2/3] Building CXX object CMakeFiles/eod.dir/runtime/platform/win32/platform_win32.cpp.obj
+[3/3] Linking CXX executable eod.exe

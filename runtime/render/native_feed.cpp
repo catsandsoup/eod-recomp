@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -63,14 +64,30 @@ struct FacingVertex {
     uint8_t corner[2];      // bone - 29 (4 = not a corner: no offset)
     float weight[2];        // lane - 32768 = byte / 256
 };
+// A skinned vertex (R3, docs/NATIVE_RENDERER.md "Stage R3"): the skin word the program reads at
+// TOP+149+n-k, bone fields as VU1 qword bases.
+//   offset (0x2E0/0xD48/0x15A8, V4-8 or V1-8): p' = wa D[a] + wb D[b] + p, D = qword bone+143 xyz
+//   matrix (0x318/0x24B0): p' = wa Pa + wb Pb, P = c0 x + c1 y + c2 z + c3 w with the columns at
+//   qwords bone+144..147; the normal turns with c0..c2 the same way
+struct SkinVertex {
+    uint32_t vertex;
+    uint8_t matrix;         // 1 = matrix palette, 0 = dent offsets
+    uint16_t bone[2];
+    float weight[2];        // lane - 32768
+    float w;                // the position qword's w lane
+    int8_t n[3];            // the attribute bytes - 128 (matrix: rotated with the palette)
+    bool has_n;
+};
 struct CacheEntry {
     uint64_t hash = 0;
     uint64_t checked = ~0ull;  // vblank the hash was last compared
     uint32_t id = 0;
-    // camera-facing parts keep their decoded geometry on the EE side and get a transient mesh per draw
+    // camera-facing parts and skinned batches keep their decoded geometry on the EE side and get a
+    // transient mesh per draw
     std::vector<Vertex> base;
     std::vector<uint32_t> indices;
     std::vector<FacingVertex> facing;
+    std::vector<SkinVertex> skin;
 };
 std::unordered_map<uint32_t, CacheEntry> g_cache;
 uint32_t g_next_mesh = 1;
@@ -114,6 +131,31 @@ struct WorldCounts {
 };
 WorldCounts g_wc;
 
+// ---- EE state: VU1 uploads and skinning (stage R3) ----
+constexpr uint32_t kVuQwords = 1024;            // VU1 data memory
+struct Upload {
+    uint32_t qword = 0, comps = 0, count = 0;
+    uint64_t frame = 0;
+    std::vector<uint32_t> data;                 // count * comps words, as the packet carries them
+};
+std::unordered_map<uint32_t, Upload> g_uploads;  // packet -> upload (the latest build of that packet)
+uint32_t g_vu[kVuQwords][4];                     // the bone qwords as the uploads in effect left them
+uint32_t g_vu_from[kVuQwords];                   // packet that wrote each qword (0 = none yet)
+uint32_t g_applied = 0;                          // material packet last applied
+uint64_t g_applied_frame = ~0ull;
+struct SkinCounts {
+    uint32_t records = 0, posed = 0, undented = 0, matrix = 0, offset = 0, facing = 0, no_upload = 0;
+    uint32_t uploads = 0, palettes = 0, dents = 0, quads = 0, uncovered = 0;
+};
+SkinCounts g_sc;
+struct SkinTotals {
+    uint64_t pose_checks = 0, pose_words = 0, pose_mismatch = 0;
+};
+SkinTotals g_st;
+void apply_material();
+uint32_t posed_mesh(const CacheEntry &c, const Packet &p);
+uint32_t facing_queue_mesh(const CacheEntry &c, uint32_t batch);
+
 // ---- VIF1 state ----
 uint64_t g_sent_key = ~0ull;  // (frame << 32 | serial) of the record whose kicks are being sent
 bool g_obj_active = false;
@@ -149,6 +191,7 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     c.base.clear();
     c.indices.clear();
     c.facing.clear();
+    c.skin.clear();
     if (!g_decoder) g_decoder = new vifmesh::Decoder();
     g_scratch.clear();
     vifmesh::Options opt;
@@ -161,7 +204,21 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     m->skinned = false;
     if (st != vifmesh::Status::Ok) g_mesh_fail++;
     for (const vifmesh::Batch &b : g_scratch.batches) {
-        if (b.skin == vifmesh::Skin::Matrix || b.skin == vifmesh::Skin::Offset) m->skinned = true;
+        if (b.skin != vifmesh::Skin::None) {
+            m->skinned = true;
+            for (uint32_t v = b.first_vertex; v < b.first_vertex + b.vertex_count; v++) {
+                const vifmesh::Vertex &s = g_scratch.vertices[v];
+                if (!(s.flags & vifmesh::kHasSkin)) continue;
+                SkinVertex k{};
+                k.vertex = v;
+                k.matrix = b.skin == vifmesh::Skin::Matrix ? 1 : 0;
+                for (int j = 0; j < 2; j++) k.bone[j] = s.bone[j], k.weight[j] = s.weight[j];
+                k.w = s.pos_w;
+                k.has_n = (s.flags & vifmesh::kHasNormal) != 0;
+                for (int j = 0; j < 3; j++) k.n[j] = (int8_t)std::lround(std::fmax(-128.0, std::fmin(127.0, (double)s.normal[j] * 127.0)));
+                c.skin.push_back(k);
+            }
+        }
         if (b.program != 0x6A) continue;
         for (uint32_t v = b.first_vertex; v < b.first_vertex + b.vertex_count; v++) {
             const vifmesh::Vertex &s = g_scratch.vertices[v];
@@ -198,7 +255,7 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
             m->indices.push_back(p.first_vertex + g_scratch.indices[p.first_index + i]);
     c.hash = h;
     c.id = m->id;
-    if (!c.facing.empty()) {
+    if (!c.facing.empty() || !c.skin.empty()) {
         c.base = m->vertices;
         c.indices = m->indices;
     }
@@ -211,9 +268,7 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
 }
 
 // What the EE submitted per frame, for the GS side's P1 check (take_expected).
-struct Expect {
-    uint32_t world = 0, water = 0;
-};
+using Expect = Expected;
 std::mutex g_expect_mutex;
 std::map<uint64_t, Expect> g_expect;
 
@@ -224,6 +279,7 @@ void roll(uint64_t vb) {
         Expect &e = g_expect[g_frame_vb];
         e.world += g_wc.leaves;
         e.water += g_wc.water_draws;
+        e.queue += g_records;
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr, "[native] ee vb %llu records %u tagged %u meshes decoded %u (failed %u) cached %zu\n",
@@ -234,6 +290,23 @@ void roll(uint64_t vb) {
                      (unsigned long long)g_frame_vb, g_wc.passes, g_wc.leaves, g_wc.facing, g_wc.no_quad, g_wc.nomesh,
                      g_wc.dropped_records, g_wc.dropped_leaves, g_wc.water_draws, g_wc.water_vertices, g_wc.water_tris);
     }
+    if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
+        std::fprintf(stderr,
+                     "[native] ee vb %llu skin records %u posed %u (matrix %u, dents %u, undented %u, no upload %u, "
+                     "uncovered refs %u) camera-facing queue records %u | uploads %u (palettes %u, dents %u, sun quads %u) "
+                     "kept %zu | P2 pose checks %llu words %llu mismatched %llu\n",
+                     (unsigned long long)g_frame_vb, g_sc.records, g_sc.posed, g_sc.matrix, g_sc.offset, g_sc.undented,
+                     g_sc.no_upload, g_sc.uncovered, g_sc.facing, g_sc.uploads, g_sc.palettes, g_sc.dents, g_sc.quads,
+                     g_uploads.size(), (unsigned long long)g_st.pose_checks, (unsigned long long)g_st.pose_words,
+                     (unsigned long long)g_st.pose_mismatch);
+    }
+    if (g_frame_vb != ~0ull) {
+        // uploads are rebuilt every frame; packets not rebuilt for 16 vblanks are released
+        for (auto it = g_uploads.begin(); it != g_uploads.end();)
+            it = it->second.frame + 16 < vb ? g_uploads.erase(it) : std::next(it);
+        limit_note("native VU1 upload packets", g_uploads.size(), 0, 0);
+    }
+    g_sc = SkinCounts();
     g_frame_vb = vb;
     g_serial = g_records = g_tagged = 0;
     g_meshes_decoded = g_mesh_fail = 0;
@@ -378,7 +451,10 @@ void ee_object(uint32_t record) {
         p.model[0] = p.model[5] = p.model[10] = 1;
     }
     fill_camera(p);
-    p.mesh = mesh_for(p.batch, vb);
+    CacheEntry *c = nullptr;
+    p.mesh = mesh_for(p.batch, vb, false, &c);
+    if (c && p.mesh && !c->skin.empty()) p.mesh = posed_mesh(*c, p);
+    else if (c && p.mesh && !c->facing.empty()) p.mesh = facing_queue_mesh(*c, p.batch);
     g_records++;
     g_in_object = true;
 }
@@ -466,8 +542,197 @@ uint32_t facing_mesh(const CacheEntry &c, uint32_t part, uint32_t &alpha) {
 }
 }  // namespace
 
+namespace {
+// The material packet in effect (*(0x4D7C54): set by 0x35DDC8 for a queue record, by 0x34C1F0 for
+// the world passes) is the last upload the DMA chain sends VU1 before the next batch (0x35BA10 REFs
+// it). Its words go into the model of the VU1 bone qwords.
+void apply_material() {
+    const uint32_t m = MEM_LW(kMaterialPacket);
+    if (m == g_applied && g_applied_frame == g_frame_vb) return;
+    g_applied = m;
+    g_applied_frame = g_frame_vb;
+    auto it = g_uploads.find(m);
+    if (it == g_uploads.end()) return;
+    const Upload &u = it->second;
+    for (uint32_t i = 0; i < u.count; i++) {
+        const uint32_t q = (u.qword + i) % kVuQwords;
+        for (uint32_t c = 0; c < 4; c++) g_vu[q][c] = c < u.comps ? u.data[i * u.comps + c] : 0;
+        g_vu_from[q] = m;
+    }
+}
+
+inline float vf(uint32_t q, int c) {
+    float f;
+    std::memcpy(&f, &g_vu[q % kVuQwords][c], 4);
+    return f;
+}
+
+// EOD_NATIVE_SKIN_CHECK=1: the bone qwords each posed record used, compared on the VIF1 thread with
+// what VU1 holds when the record's program starts (verification only; the feed never reads VU1).
+bool skin_check() {
+    static const bool on = [] {
+        const char *e = std::getenv("EOD_NATIVE_SKIN_CHECK");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+struct UsedQwords {
+    std::vector<std::pair<uint32_t, std::array<uint32_t, 3>>> q;  // qword, xyz the host used
+};
+std::mutex g_used_mutex;
+std::map<uint64_t, UsedQwords> g_used;  // (frame << 32 | serial) -> qwords
+
+// A skinned batch as this record poses it: a transient mesh, or the bind-pose mesh when every dent
+// it reads is zero (p + 0 = p).
+uint32_t posed_mesh(const CacheEntry &c, const Packet &p) {
+    apply_material();
+    g_sc.records++;
+    if (!g_uploads.count(g_applied)) g_sc.no_upload++;
+    bool any = false, matrix = false;
+    for (const SkinVertex &k : c.skin) {
+        if (k.matrix) {
+            any = matrix = true;
+            break;
+        }
+        for (int j = 0; j < 2; j++) {
+            const uint32_t q = (k.bone[j] + 143u) % kVuQwords;
+            if (!g_vu_from[q]) g_sc.uncovered++;
+            if ((g_vu[q][0] | g_vu[q][1] | g_vu[q][2]) & 0x7FFFFFFFu) any = true;
+        }
+    }
+    if (!any) {
+        g_sc.undented++;
+        return c.id;
+    }
+    auto *m = new Mesh();
+    m->id = g_next_mesh++;
+    m->replaces = 0;
+    m->batch = p.batch;
+    m->skinned = true;
+    m->transient = true;
+    m->posed = true;
+    m->bind = c.id;
+    m->vertices = c.base;
+    m->indices = c.indices;
+    UsedQwords used;
+    auto note = [&](uint32_t q) {
+        if (!skin_check()) return;
+        q %= kVuQwords;
+        for (auto &u : used.q)
+            if (u.first == q) return;
+        used.q.push_back({q, {g_vu[q][0], g_vu[q][1], g_vu[q][2]}});
+    };
+    for (const SkinVertex &k : c.skin) {
+        Vertex &v = m->vertices[k.vertex];
+        const float x = v.p[0], y = v.p[1], z = v.p[2], w = k.w;
+        float out[3];
+        if (k.matrix) {
+            float P[2][3], N[2][3];
+            for (int j = 0; j < 2; j++) {
+                const uint32_t b = k.bone[j] + 144u;
+                for (uint32_t cc = 0; cc < 4; cc++) {
+                    note(b + cc);
+                    if (!g_vu_from[(b + cc) % kVuQwords]) g_sc.uncovered++;
+                }
+                // mulax / madday / maddaz / maddw: c0 x + c1 y + c2 z + c3 w
+                for (int i = 0; i < 3; i++) {
+                    P[j][i] = vf(b, i) * x + vf(b + 1, i) * y + vf(b + 2, i) * z + vf(b + 3, i) * w;
+                    N[j][i] = vf(b, i) * (k.n[0] / 128.0f) + vf(b + 1, i) * (k.n[1] / 128.0f) +
+                              vf(b + 2, i) * (k.n[2] / 128.0f);
+                }
+            }
+            // mulaz / maddw: wa Pa + wb Pb
+            for (int i = 0; i < 3; i++) out[i] = P[0][i] * k.weight[0] + P[1][i] * k.weight[1];
+            if (k.has_n)
+                for (int i = 0; i < 3; i++) {
+                    const float n = (N[0][i] * k.weight[0] + N[1][i] * k.weight[1]) * 128.0f;
+                    v.n[i] = (int8_t)std::lround(std::fmax(-128.0f, std::fmin(127.0f, n)));
+                }
+        } else {
+            const uint32_t a = k.bone[0] + 143u, b = k.bone[1] + 143u;
+            note(a);
+            note(b);
+            // mulaz / maddaw / maddw: wa D[a] + wb D[b] + p * 1
+            for (int i = 0; i < 3; i++) out[i] = vf(a, i) * k.weight[0] + vf(b, i) * k.weight[1] + v.p[i];
+        }
+        // the program projects (x, y, z, w) with the raw w lane: the same point is (x, y, z) / w
+        const float iw = (w != 0.0f && w != 1.0f) ? 1.0f / w : 1.0f;
+        for (int i = 0; i < 3; i++) v.p[i] = out[i] * iw;
+    }
+    if (matrix) g_sc.matrix++;
+    else g_sc.offset++;
+    g_sc.posed++;
+    if (skin_check()) {
+        std::lock_guard<std::mutex> lk(g_used_mutex);
+        g_used[p.frame << 32 | p.serial] = std::move(used);
+        while (g_used.size() > 65536) g_used.erase(g_used.begin());
+    }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_new_meshes.push_back(m);
+    return m->id;
+}
+
+// A camera-facing batch (VU1 0x350) drawn through the queue: corners from the bone qwords in effect.
+uint32_t facing_queue_mesh(const CacheEntry &c, uint32_t batch) {
+    apply_material();
+    auto *m = new Mesh();
+    m->id = g_next_mesh++;
+    m->replaces = 0;
+    m->batch = batch;
+    m->skinned = false;
+    m->transient = true;
+    m->vertices = c.base;
+    m->indices = c.indices;
+    for (const FacingVertex &f : c.facing) {
+        Vertex &v = m->vertices[f.vertex];
+        for (int k = 0; k < 2; k++)
+            if (f.corner[k] < 4)
+                for (int i = 0; i < 3; i++) v.p[i] += f.weight[k] * vf(0xACu + f.corner[k], i);
+    }
+    g_sc.facing++;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_new_meshes.push_back(m);
+    return m->id;
+}
+}  // namespace
+
+void ee_vu1_upload(uint32_t packet, uint32_t qword, uint32_t comps, uint32_t count, uint32_t src) {
+    if (!enabled() || !packet) return;
+    Upload &u = g_uploads[packet];
+    u.qword = qword;
+    u.comps = comps;
+    u.count = count;
+    u.frame = kernel_vblank_count();
+    u.data.resize((size_t)count * comps);
+    for (uint32_t i = 0; i < count * comps; i++) u.data[i] = MEM_LW(src + 4 * i);
+    if (packet == g_applied) g_applied = 0;  // rebuilt: apply it again when it is in effect
+    g_sc.uploads++;
+    if (comps == 4) g_sc.palettes++;
+    else if (qword == 0x90) g_sc.dents++;
+    else if (qword == 0xAC) g_sc.quads++;
+}
+
+void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count) {
+    if (!enabled()) return;
+    auto it = g_uploads.find(packet);
+    if (it == g_uploads.end()) return;
+    const Upload &u = it->second;
+    g_st.pose_checks++;
+    for (uint32_t b = 0; b < count; b++)
+        for (uint32_t r = 0; r < 4; r++)
+            for (uint32_t c = 0; c < 4; c++) {
+                // the fed qword r of bone b against row r of the 3x4 pose matrix (w: 0, 0, 0, 1)
+                const size_t i = ((size_t)b * 4 + r) * 4 + c;
+                const uint32_t fed = i < u.data.size() ? u.data[i] : ~0u;
+                const uint32_t pose = c < 3 ? MEM_LW(bones + b * 0x30 + r * 12 + c * 4) : (r == 3 ? 0x3F800000u : 0u);
+                g_st.pose_words++;
+                if (fed != pose) g_st.pose_mismatch++;
+            }
+}
+
 void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop) {
     if (!enabled()) return;
+    apply_material();  // WorldPacketBegin (0x35BA10) sent the material in effect before these REFs
     const uint64_t vb = kernel_vblank_count();
     Packet p;
     std::memset(&p, 0, sizeof p);
@@ -530,6 +795,7 @@ void ee_water_begin(uint32_t surface) {
     p.frame = g_frame_vb;
     p.serial = g_serial++;
     p.batch = surface;
+    p.pass = g_wc.water_draws;  // the water draw's order in this EE frame: in split screen, the view
     p.itop = 0x200;  // 0x361468 writes ITOP 0x200 (0x04000200) before MSCAL 0x4E
     p.texture_key = (int32_t)MEM_LW(surface + 0x3C);
     p.layer = -1;
@@ -547,14 +813,16 @@ void ee_water_begin(uint32_t surface) {
 
 // One vertex as 0x361708 builds it: colour halved to the GS scale with rounding, the packed word's
 // bytes 2, 1, 0 are the R, G, B lanes; ADC (no triangle) for strip 0, so each tile is 2 triangles.
-void ee_water_vertex(uint32_t colour, uint32_t strip, uint32_t at) {
+bool ee_in_water() { return g_in_water && g_water_mesh; }
+
+void ee_water_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip) {
     if (!g_in_water || !g_water_mesh) return;
     uint32_t c = (colour >> 1) & 0x7F7F7F7Fu;
     c += (c & 0x40404040u) >> 6;
     Vertex v{};
-    for (int i = 0; i < 3; i++) v.p[i] = rf(at + 4u * (uint32_t)i);
-    v.uv[0] = rf(at + 0x18);
-    v.uv[1] = rf(at + 0x1C);
+    for (int i = 0; i < 3; i++) v.p[i] = xyz[i];
+    v.uv[0] = st[0];
+    v.uv[1] = st[1];
     v.c[0] = (uint8_t)(c >> 16);
     v.c[1] = (uint8_t)(c >> 8);
     v.c[2] = (uint8_t)c;
@@ -584,16 +852,28 @@ void ee_water_end(bool drawn) {
         return;
     }
     g_wc.water_draws++;
+    {  // per viewport (split screen: one per view)
+        static std::map<uint32_t, std::array<uint64_t, 3>> views;
+        auto &n = views[g_water.pass];
+        n[0]++;
+        n[1] += g_water_mesh->vertices.size();
+        n[2] += g_water_mesh->indices.size() / 3;
+        if ((n[0] & 127) == 0)
+            for (auto &v : views)
+                std::fprintf(stderr, "[native] water submitted, view %u of the frame: draws %llu vertices %llu triangles %llu\n",
+                             v.first + 1, (unsigned long long)v.second[0], (unsigned long long)v.second[1],
+                             (unsigned long long)v.second[2]);
+    }
     // the guest asks ImmediateBegin for 0x3000 vertices; the native mesh grows with the surface
     limit_note("water surface vertices (0x35DF10 request 0x3000)", g_water_mesh->vertices.size(), 0, 0x3000);
     g_new_meshes.push_back(g_water_mesh);
     g_water_mesh = nullptr;
 }
 
-void take_expected(uint64_t before, std::map<uint64_t, std::pair<uint32_t, uint32_t>> &out) {
+void take_expected(uint64_t before, std::map<uint64_t, Expected> &out) {
     std::lock_guard<std::mutex> lk(g_expect_mutex);
     while (!g_expect.empty() && g_expect.begin()->first < before) {
-        out[g_expect.begin()->first] = {g_expect.begin()->second.world, g_expect.begin()->second.water};
+        out[g_expect.begin()->first] = g_expect.begin()->second;
         g_expect.erase(g_expect.begin());
     }
 }
@@ -635,6 +915,40 @@ void check(const Packet &p) {
     }
 }
 
+// P2 (EOD_NATIVE_SKIN_CHECK=1): the bone qwords a posed record used against VU1 data memory as the
+// record's first program starts (the material packet REF precedes the batch in the DMA chain).
+void vu_check(uint64_t key, uint32_t program) {
+    UsedQwords u;
+    {
+        std::lock_guard<std::mutex> lk(g_used_mutex);
+        auto it = g_used.find(key);
+        if (it == g_used.end()) return;
+        u = std::move(it->second);
+        g_used.erase(it);
+    }
+    static uint64_t records = 0, words = 0, bad = 0, logged = 0, last = 0;
+    records++;
+    for (auto &q : u.q) {
+        const uint8_t *m = g_vu1.mem + (size_t)q.first * 16;
+        for (int c = 0; c < 3; c++) {
+            uint32_t w;
+            std::memcpy(&w, m + 4 * c, 4);
+            words++;
+            if (w != q.second[c]) {
+                bad++;
+                if (logged++ < 16)
+                    std::fprintf(stderr, "[native] P2 vu mismatch frame %llu serial %u prog %04x qword %03x lane %d host %08x vu1 %08x\n",
+                                 (unsigned long long)(key >> 32), (uint32_t)key, program, q.first, c, q.second[c], w);
+            }
+        }
+    }
+    if (records == 1 || records / 4096 != last) {
+        last = records / 4096;
+        std::fprintf(stderr, "[native] P2 bone qwords vs VU1: records %llu words %llu mismatched %llu\n",
+                     (unsigned long long)records, (unsigned long long)words, (unsigned long long)bad);
+    }
+}
+
 void vu1_start(uint32_t program, uint32_t itop) {
     if (!enabled()) return;
     const uint32_t tag = g_vif1_dma_tag;
@@ -666,6 +980,7 @@ void vu1_start(uint32_t program, uint32_t itop) {
     for (Mesh *m : meshes) post(CMD_MESH, &m, sizeof m);
     const uint64_t key = p.frame << 32 | p.serial;
     if (g_obj_active && key == g_sent_key) return;  // another program of the same record
+    if (skin_check() && p.kind == KIND_QUEUE) vu_check(key, program);
     if (p.kind == KIND_QUEUE) p.itop = itop;  // world and water carry the ITOP their EE packet sets
     p.program = program;
     check(p);

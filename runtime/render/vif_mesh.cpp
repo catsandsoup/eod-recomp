@@ -156,6 +156,7 @@ struct BatchEmitter {
             const double px = (double)as_f32(pq[0]) + pox, py = (double)as_f32(pq[1]) + poy,
                          pz = (double)as_f32(pq[2]) + poz;
             v.pos[0] = (float)px, v.pos[1] = (float)py, v.pos[2] = (float)pz;
+            v.pos_w = as_f32(pq[3]);  // the programs add qword 199 to xyz only
             if (!shadow && s.has(at)) {
                 const uint32_t *tq = s.mem[at];
                 v.uv[0] = (float)((double)as_f32(tq[0]) + soff);
@@ -197,7 +198,14 @@ struct BatchEmitter {
                         v.weight[1] = as_f32(w[3]) - 32768.0f;
                         v.flags |= kHasSkin;
                     } else if (b.skin == Skin::Partial) {
-                        v.bone[0] = (uint16_t)(s.mem[aq][0] & 0xFFFF);
+                        // V1-8: the VIF writes the byte to all four lanes, each plus its STROW
+                        // lane, so the program reads a full skin word (bone a = bone b)
+                        const uint32_t *w = s.mem[aq];
+                        v.bone[0] = (uint16_t)(w[0] & 0xFFFF);
+                        v.bone[1] = (uint16_t)(w[1] & 0xFFFF);
+                        v.weight[0] = as_f32(w[2]) - 32768.0f;
+                        v.weight[1] = as_f32(w[3]) - 32768.0f;
+                        v.flags |= kHasSkin;
                     }
                 }
             }
@@ -318,16 +326,24 @@ Status Decoder::decode_vif(const uint8_t *vif, size_t size, Mesh &out, const Opt
                     s.rawmask[a] = 0;
                 }
                 uint32_t *mq = s.mem[a];
+                // The lanes the VIF writes beyond the element's components (runtime/vu/vif.cpp, as
+                // the hardware): V1 (S) repeats x in every lane, V2 writes (x, y, x, y), V3 writes
+                // w = 0; then STMOD / STMASK apply to all four lanes. raw[] keeps only the element's
+                // own components (vif_mesh.py).
+                uint32_t lane[4] = {e[0], e[1], e[2], e[3]};
+                if (vl != 3) {
+                    if (comps == 1) lane[1] = lane[2] = lane[3] = e[0];
+                    else if (comps == 2) lane[2] = e[0], lane[3] = e[1];
+                    else if (comps == 3) lane[3] = 0;
+                }
                 for (uint32_t c = 0; c < 4; c++) {
                     uint32_t m = masked ? (s.mask >> (std::min(cyc, 3u) * 8 + c * 2)) & 3 : 0;
-                    if (c >= comps) {
-                        if (!masked) continue;
-                        m = 1;  // absent lanes of a masked unpack read as the row (vif_mesh.py)
-                    }
                     if (m == 0) {
-                        uint32_t v = e[c];
-                        s.raw[a][c] = v;
-                        s.rawmask[a] |= (uint8_t)(1u << c);
+                        uint32_t v = lane[c];
+                        if (c < comps) {
+                            s.raw[a][c] = v;
+                            s.rawmask[a] |= (uint8_t)(1u << c);
+                        }
                         if (s.mode == 1) v = v + s.row[c];
                         else if (s.mode == 2) {
                             v = v + s.row[c];

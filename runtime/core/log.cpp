@@ -82,5 +82,8 @@ void fatal(const char *fmt, ...) {
     fprintf(stderr, "FATAL: %s\n", buf);
     fflush(stderr);
     platform_fatal_message(buf);
+    // headless (automated) runs exit with no abort dialog or error-reporting window
+    const char *h = getenv("EOD_HEADLESS");
+    if (h && h[0] == '1') _Exit(3);
     abort();
 }

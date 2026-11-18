@@ -1654,7 +1654,7 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     }
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            if (!(modern::g_on && modern::gs_replaced(e, (a0.a + b0.a + c0.a) / 3u)) && !(native::enabled() && native::gs_draw(e, a0))) hw::draw_triangle(e, a0, b0, c0);
+            if (!(modern::g_on && modern::gs_replaced(e, (a0.a + b0.a + c0.a) / 3u)) && !(native::enabled() && native::gs_draw(e, a0, &b0, &c0))) hw::draw_triangle(e, a0, b0, c0);
             note_draw();  // (the display is presented when its pages change)
         }
         return;

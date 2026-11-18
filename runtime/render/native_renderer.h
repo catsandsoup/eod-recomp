@@ -53,11 +53,26 @@ void ee_world_pass_end();
 // address of {xyz, colour, -, st}), end (after ImmediateEnd 0x361BC8; drawn = false when
 // ImmediateBegin had no packet space).
 void ee_water_begin(uint32_t surface);
-void ee_water_vertex(uint32_t colour, uint32_t strip, uint32_t vertex);
+// Every vertex ImmediateVertex 0x361708 accepts while a WaterDraw is open: the tiles 0x325728 draws
+// itself and the subdivided tiles of its 0x324928 subtree (xyz, st, colour word, strip flag).
+bool ee_in_water();
+void ee_water_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
 void ee_water_end(bool drawn);
+// ---- EE thread, VU1 uploads (src/bone_pose.cpp, stage R3) ----------------------------------
+// Every UNPACK + MSCAL 0x24D8 packet the readable 0x35A810 builds: bone palettes (0x35DBD8, V4-32
+// to VU1 0x90 + 4*first), car dent offsets (0x35DD28, V3-32 to 0x90), the sun quad (0x35CBD8,
+// V3-32 to 0xAC). `src` is the guest data the packet copies (count * comps words); the native
+// renderer keeps its own copy (it never reads VU1 memory) and applies it to its model of the VU1
+// bone qwords when the packet becomes the material in effect (*(0x4D7C54)) for a draw.
+void ee_vu1_upload(uint32_t packet, uint32_t qword, uint32_t comps, uint32_t count, uint32_t src);
+// P2: the palette fed for `packet` against the pose array 0x34C9F8 was given (bones[count][12])
+void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count);
 // GS thread: what the EE submitted per EE frame before `before` (world leaves committed, water
 // draws), removed from the EE's list.
-void take_expected(uint64_t before, std::map<uint64_t, std::pair<uint32_t, uint32_t>> &out);
+struct Expected {
+    uint32_t world = 0, water = 0, queue = 0;  // world leaves committed, water draws, queue records
+};
+void take_expected(uint64_t before, std::map<uint64_t, Expected> &out);
 // EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
 bool native_only();
 
@@ -95,8 +110,10 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     uint32_t id;
     uint32_t replaces;         // id of the mesh this batch had before (0 = none)
     uint32_t batch;
-    bool skinned;              // drawn in bind pose (R3)
-    bool transient = false;    // one draw's geometry (water, camera-facing parts): released after use
+    bool skinned;              // the batch has skinned vertices (VU1 0x318/0x24B0 matrices, 0x2E0 dents)
+    bool transient = false;    // one draw's geometry (water, camera-facing parts, posed skins): released after use
+    bool posed = false;        // skinned vertices posed with the palette / dents in effect (R3)
+    uint32_t bind = 0;         // posed: the bind-pose mesh id (P2 check)
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 };
@@ -115,7 +132,8 @@ void post(uint32_t kind, const void *data, uint32_t size);
 // GS thread
 void gs_command(uint32_t kind, const void *data, uint32_t size);
 // a primitive the GS is about to draw: true = it belongs to a native object (do not draw)
-bool gs_draw(const gs::Env &e, const gs::Vertex &first);
+// (b, c: the other vertices of a triangle, for the P2 vertex check EOD_NATIVE_SKIN_CHECK=1)
+bool gs_draw(const gs::Env &e, const gs::Vertex &first, const gs::Vertex *b = nullptr, const gs::Vertex *c = nullptr);
 // a VRAM transfer or other non-draw use of GS memory follows: draw what is pending first
 void gs_barrier();
 void gs_vblank(uint64_t frame);

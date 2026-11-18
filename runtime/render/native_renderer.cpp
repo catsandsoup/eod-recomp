@@ -3,6 +3,7 @@
 #include "native_renderer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -42,7 +43,7 @@ struct FrameStats {
     uint32_t empty = 0;       // drawn, but the batch decoded to no triangles
     uint32_t skipped = 0;     // frame skipped by the GS (FrameSkip): nothing drawn, as the GS
     uint32_t lost = 0;        // not drawn: no mesh, no surface or no renderer
-    uint32_t textured = 0, untextured_rt = 0, skinned = 0, flushes = 0;
+    uint32_t textured = 0, untextured_rt = 0, skinned = 0, posed = 0, flushes = 0;
     uint64_t suppressed = 0;  // GS primitives not drawn because they were a native object's
     // by Packet::kind (draw queue record, world leaf, water surface)
     uint32_t k_objects[3] = {}, k_drawn[3] = {}, k_skipped[3] = {}, k_lost[3] = {};
@@ -54,6 +55,7 @@ uint64_t g_newest_frame = 0;
 struct Parity {
     uint64_t frames = 0, world_equal = 0, water_equal = 0, world_submitted = 0, world_drawn = 0, water_submitted = 0,
              water_drawn = 0, skipped_frames = 0;
+    uint64_t queue_equal = 0, queue_submitted = 0, queue_drawn = 0;  // draw queue records (R1/R3)
 };
 Parity g_parity;
 uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
@@ -465,6 +467,20 @@ plume::RenderTexture *wrapper(uint64_t image, uint32_t w, uint32_t h, bool depth
     return t;
 }
 
+// water surfaces drawn per viewport (split screen: one per view)
+void water_view_drawn(size_t triangles, const int32_t sc[4], float ox, float oy) {
+    // a view is told apart by where the GS puts it: scissor and XYOFFSET
+    static std::map<std::array<int32_t, 6>, std::array<uint64_t, 2>> views;
+    auto &n = views[{sc[0], sc[1], sc[2], sc[3], (int32_t)ox, (int32_t)oy}];
+    n[0]++;
+    n[1] += triangles;
+    if ((n[0] & 127) == 0)
+        for (auto &v : views)
+            std::fprintf(stderr, "[native] water drawn by plume in the view at GS scissor %d,%d-%d,%d XYOFFSET %d,%d: draws %llu triangles %llu\n",
+                         v.first[0], v.first[1], v.first[2], v.first[3], v.first[4], v.first[5],
+                         (unsigned long long)v.second[0], (unsigned long long)v.second[1]);
+}
+
 void flush() {
     if (g_r.pending.empty()) return;
     const Target &tg = g_r.target;
@@ -536,8 +552,10 @@ void flush() {
         cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
         fs.drawn++;
         fs.k_drawn[it.p.kind % 3]++;
+        if (it.p.kind == KIND_WATER) water_view_drawn(m.cpu->indices.size() / 3, it.sc, it.ox, it.oy);
         if (it.tex) fs.textured++;
         if (m.cpu->skinned) fs.skinned++;
+        if (m.cpu->posed) fs.posed++;
     }
     cl->setFramebuffer(nullptr);  // ends the render pass
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
@@ -685,6 +703,119 @@ void end_vblank(uint64_t vb) {
         g_r.transient.pop_front();
     }
 }
+// ---- P2 vertex check (EOD_NATIVE_SKIN_CHECK=1, stage R3) ----
+// For an object whose mesh was posed (skinned palette or dents), every vertex of every triangle the
+// GS receives for it (the VU1 program's output, the GS reference) is compared with the nearest
+// posed vertex projected through the same model -> GS screen matrix: XYZ = ftoi4(X), so the GS
+// window coordinate is X * 16 - XYOFFSET in 1/16 px. The bind-pose mesh is measured the same way to
+// show the pose mattered. Clip-path records (ITOP 0x200) are counted apart: the clipper makes new
+// vertices on the guard band.
+struct VertexCheck {
+    uint64_t objects = 0, vertices = 0, within = 0, bind_off = 0;
+    uint64_t clip_objects = 0, clip_vertices = 0, clip_within = 0;
+    double worst = 0, sum = 0;
+};
+VertexCheck g_vck;
+struct ProjGrid {
+    uint64_t key = ~0ull;           // (frame << 32 | serial) of the object
+    bool on = false, clip = false;
+    std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> posed, bind;
+};
+ProjGrid g_pg;
+
+bool vertex_check_on() {
+    static const bool on = [] {
+        const char *e = std::getenv("EOD_NATIVE_SKIN_CHECK");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+void project_into(const Mesh &m, const double a[4][4], double xo, double yo,
+                  std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid) {
+    grid.clear();
+    for (const Vertex &v : m.vertices) {
+        double s[4];
+        for (int r = 0; r < 4; r++) s[r] = a[r][0] * v.p[0] + a[r][1] * v.p[1] + a[r][2] * v.p[2] + a[r][3];
+        if (!(s[3] > 0)) continue;
+        const double x = s[0] / s[3] * 16.0 - xo, y = s[1] / s[3] * 16.0 - yo;  // window, 1/16 px
+        if (!(std::fabs(x) < 1e7 && std::fabs(y) < 1e7)) continue;
+        const uint64_t k = (uint64_t)(uint32_t)(int32_t)std::floor(x / 16.0) << 32 | (uint32_t)(int32_t)std::floor(y / 16.0);
+        grid[k].push_back({x, y});
+    }
+}
+
+double nearest(const std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid, double x, double y) {
+    const int32_t cx = (int32_t)std::floor(x / 16.0), cy = (int32_t)std::floor(y / 16.0);
+    double best = 1e30;
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++) {
+            const uint64_t k = (uint64_t)(uint32_t)(cx + dx) << 32 | (uint32_t)(cy + dy);
+            auto it = grid.find(k);
+            if (it == grid.end()) continue;
+            // per axis: the GS keeps x and y each in 1/16 px steps (ftoi4)
+            for (auto &p : it->second) best = std::fmin(best, std::fmax(std::fabs(p.first - x), std::fabs(p.second - y)));
+        }
+    return best / 16.0;  // px
+}
+
+void vertex_check(const gs::Vertex *const *vs, int n) {
+    const uint64_t key = g_cur.frame << 32 | g_cur.serial;
+    if (key != g_pg.key) {
+        g_pg.key = key;
+        g_pg.on = false;
+        if (g_cur.kind != KIND_QUEUE || !g_cur.mesh) return;
+        auto it = g_r.meshes.find(g_cur.mesh);
+        if (it == g_r.meshes.end() || !it->second.cpu || !it->second.cpu->posed) return;
+        double a[4][4];
+        screen_matrix(g_cur, a);
+        const double xo = (double)(g_xyoffset & 0xFFFF), yo = (double)((g_xyoffset >> 32) & 0xFFFF);
+        project_into(*it->second.cpu, a, xo, yo, g_pg.posed);
+        g_pg.bind.clear();
+        auto b = g_r.meshes.find(it->second.cpu->bind);
+        if (b != g_r.meshes.end() && b->second.cpu) project_into(*b->second.cpu, a, xo, yo, g_pg.bind);
+        g_pg.clip = (g_cur.itop & 0x200) != 0;
+        g_pg.on = true;
+        (g_pg.clip ? g_vck.clip_objects : g_vck.objects)++;
+    }
+    if (!g_pg.on) return;
+    for (int i = 0; i < n; i++) {
+        const double x = vs[i]->x, y = vs[i]->y;
+        const double d = nearest(g_pg.posed, x, y);
+        const bool ok = d < 1.0 / 16.0 + 1e-9;
+        if (g_pg.clip) {
+            g_vck.clip_vertices++;
+            g_vck.clip_within += ok;
+            continue;
+        }
+        g_vck.vertices++;
+        g_vck.within += ok;
+        g_vck.sum += std::fmin(d, 1e6);
+        g_vck.worst = std::fmax(g_vck.worst, std::fmin(d, 1e6));
+        if (ok && !g_pg.bind.empty() && nearest(g_pg.bind, x, y) > 1.0 / 16.0) g_vck.bind_off++;
+    }
+    static uint64_t last = 0;
+    if (g_vck.vertices / 200000 != last) {
+        last = g_vck.vertices / 200000;
+        std::fprintf(stderr,
+                     "[native] P2 posed vertices vs GS: objects %llu vertices %llu within 1/16 px %llu (worst %.4f px, mean %.4f px; "
+                     "bind pose off by > 1/16 px at %llu of them) | clip-path objects %llu vertices %llu within %llu\n",
+                     (unsigned long long)g_vck.objects, (unsigned long long)g_vck.vertices, (unsigned long long)g_vck.within,
+                     g_vck.worst, g_vck.vertices ? g_vck.sum / (double)g_vck.vertices : 0.0, (unsigned long long)g_vck.bind_off,
+                     (unsigned long long)g_vck.clip_objects, (unsigned long long)g_vck.clip_vertices,
+                     (unsigned long long)g_vck.clip_within);
+    }
+}
+
+void vertex_check_report() {
+    if (!vertex_check_on()) return;
+    std::fprintf(stderr,
+                 "[native] P2 final posed vertices vs GS: objects %llu vertices %llu within 1/16 px %llu (worst %.4f px, mean %.4f px; "
+                 "bind pose off by > 1/16 px at %llu of them) | clip-path objects %llu vertices %llu within %llu\n",
+                 (unsigned long long)g_vck.objects, (unsigned long long)g_vck.vertices, (unsigned long long)g_vck.within,
+                 g_vck.worst, g_vck.vertices ? g_vck.sum / (double)g_vck.vertices : 0.0, (unsigned long long)g_vck.bind_off,
+                 (unsigned long long)g_vck.clip_objects, (unsigned long long)g_vck.clip_vertices, (unsigned long long)g_vck.clip_within);
+}
 #else
 void finalize() {
     if (g_active && !g_finalized) {
@@ -711,7 +842,7 @@ void begin_object(const Packet &p) {
 void report(uint64_t vb) {
     const uint64_t every = log_every();
     // EE frames older than the newest one the GS has seen are complete on both sides
-    std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected;
+    std::map<uint64_t, Expected> expected;
     take_expected(g_newest_frame, expected);
     std::vector<uint64_t> frames;
     for (auto &e : expected) frames.push_back(e.first);
@@ -724,7 +855,8 @@ void report(uint64_t vb) {
         FrameStats none;
         const FrameStats &s = it != g_frames.end() ? it->second : none;
         auto e = expected.find(frame);
-        const uint32_t world = e != expected.end() ? e->second.first : 0, water = e != expected.end() ? e->second.second : 0;
+        const uint32_t world = e != expected.end() ? e->second.world : 0, water = e != expected.end() ? e->second.water : 0;
+        const uint32_t queue = e != expected.end() ? e->second.queue : 0;
         if (s.skipped) {
             g_parity.skipped_frames++;
         } else {
@@ -737,6 +869,14 @@ void report(uint64_t vb) {
             const bool ae = s.k_drawn[KIND_WATER] == water && s.k_objects[KIND_WATER] == water;
             g_parity.world_equal += we;
             g_parity.water_equal += ae;
+            const bool qe = s.k_drawn[KIND_QUEUE] == queue && s.k_objects[KIND_QUEUE] == queue;
+            g_parity.queue_equal += qe;
+            g_parity.queue_submitted += queue;
+            g_parity.queue_drawn += s.k_drawn[KIND_QUEUE];
+            if (log_parity && !qe)
+                std::fprintf(stderr, "[native] parity frame %llu queue records submitted %u objects %u drawn %u lost %u\n",
+                             (unsigned long long)frame, queue, s.k_objects[KIND_QUEUE], s.k_drawn[KIND_QUEUE],
+                             s.k_lost[KIND_QUEUE]);
             if (log_parity && (!we || !ae))
                 std::fprintf(stderr,
                              "[native] parity frame %llu world submitted %u objects %u drawn %u lost %u | water submitted %u "
@@ -746,10 +886,16 @@ void report(uint64_t vb) {
         }
         if (every && (every == 1 || frame % every < 2)) {
             std::fprintf(stderr,
-                         "[native] gs frame %llu objects %u drawn %u (empty %u, textured %u, skinned bind pose %u, "
+                         "[native] gs frame %llu objects %u drawn %u (empty %u, textured %u, skinned %u of them posed %u, "
                          "render-target texture untextured %u) skipped %u lost %u suppressed GS prims %llu render passes %u (gs vb %llu)\n",
-                         (unsigned long long)frame, s.objects, s.drawn, s.empty, s.textured, s.skinned, s.untextured_rt,
+                         (unsigned long long)frame, s.objects, s.drawn, s.empty, s.textured, s.skinned, s.posed, s.untextured_rt,
                          s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb);
+            std::fprintf(stderr,
+                         "[native] gs frame %llu queue records submitted %u drawn %u | P1 frames queue equal %llu/%llu "
+                         "(records drawn %llu of %llu)\n",
+                         (unsigned long long)frame, queue, s.k_drawn[KIND_QUEUE], (unsigned long long)g_parity.queue_equal,
+                         (unsigned long long)g_parity.frames, (unsigned long long)g_parity.queue_drawn,
+                         (unsigned long long)g_parity.queue_submitted);
             std::fprintf(stderr,
                          "[native] gs frame %llu world leaves submitted %u drawn %u (lost %u) water submitted %u drawn %u | "
                          "P1 frames world equal %llu/%llu water equal %llu/%llu (leaves drawn %llu of %llu, water %llu of %llu) "
@@ -809,7 +955,7 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
     }
 }
 
-bool gs_draw(const gs::Env &e, const gs::Vertex &v) {
+bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const gs::Vertex *c) {
     if (!g_active) {
 #ifdef EOD_PLUME
         if (!g_r.pending.empty()) flush();  // before the GS draws something of its own
@@ -841,6 +987,14 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v) {
         g_xyoffset = context_xyoffset();
         g_have_env = true;
     }
+#ifdef EOD_PLUME
+    if (vertex_check_on()) {
+        static const bool hooked = (std::atexit(vertex_check_report), true);
+        (void)hooked;
+        const gs::Vertex *vs[3] = {&v, b, c};
+        vertex_check(vs, b && c ? 3 : 1);
+    }
+#endif
     static const uint64_t dbg = std::getenv("EOD_NATIVE_PASSES") ? std::strtoull(std::getenv("EOD_NATIVE_PASSES"), nullptr, 10) : 0;
     static uint64_t dbg_frame = 0;
     if (dbg && !dbg_frame && g_cur.frame >= dbg) dbg_frame = g_cur.frame;

@@ -7,6 +7,9 @@
 //   0x35A810 VifWriteUnpackMscal(dst, qwc, addr, components, count, src): header word, UNPACK
 //            V<components>-32 of count vectors to VU1 qword 0x8F + addr, the data, then
 //            MSCAL 0x24D8 (the skin setup program) padded to a quadword.
+//   0x35DD28 DentOffsetWrite(addr, offsets, count) (via 0x34CA18): car dent offsets, V3-32 to VU1
+//            qword 0x8F + addr (stage R3, docs/NATIVE_RENDERER.md).
+//   Every packet 0x35A810 builds is also handed to the native renderer (native::ee_vu1_upload).
 //   Callers of 0x34C9F8: 0x20B8D0 (pedestrians, drawn by 0x20DE68) and 0x20C800 (drivers, from
 //   0x1E4610 and 0x235D98); both evaluate the animation inline and pass the pose array.
 //
@@ -16,6 +19,7 @@
 #include "core/diff_harness.h"
 #include "core/memory.h"
 #include "kernel/kernel.h"
+#include "render/native_renderer.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +33,9 @@ void f_0034C9F8_orig(void);
 void f_0035DBD8_orig(void);
 void f_0035A810_orig(void);
 void f_00366C88(void);  // PacketReserve(qwc) -> host-visible guest pointer or 0
+void f_0035DD28_orig(void);
+void f_0034CA18_orig(void);
+void f_0035DD28(void);
 }
 
 namespace {
@@ -41,6 +48,8 @@ constexpr uint32_t kBoneMatrixBytes = 0x30;                 // 3x4 floats in the
 // 0x35A810
 void vif_write_unpack_mscal(uint32_t dst, uint32_t qwc, uint32_t addr, uint32_t components, uint32_t count,
                             uint32_t src) {
+    // the native renderer's copy of what this packet uploads (stage R3: palettes, dents, sun quad)
+    native::ee_vu1_upload(dst, (addr + kVifUnpackBase) & 0x3FF, components, count, src);
     const uint32_t vn = components == 3 ? 0x08000000u : 0x0C000000u;  // V3-32 or V4-32
     MEM_SW(dst, 0x14000000u | (qwc << 16) | (kSkinSetupProgram >> 3));
     MEM_SW(dst + 4, 0x60000000u | vn | ((count & 0xFF) << 16) | 0x4000u | ((addr + kVifUnpackBase) & 0x3FF));
@@ -76,9 +85,48 @@ uint32_t bone_palette_write(uint32_t first, uint32_t bones, int32_t count) {
     if (packet) {
         // 4 components per vector, 4 vectors per bone, to VU1 qword 0x90 + 4*first
         vif_write_unpack_mscal(packet, (uint32_t)qwc, 4 * first + 1, 4, 4 * (uint32_t)count, palette);
+        native::ee_pose_check(packet, bones, (uint32_t)count);
     }
     g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;
     return packet;
+}
+
+// 0x35DD28 DentOffsetWrite(addr, offsets, count): count V3-32 vectors (car dent offsets, 3 floats per
+// bone) appended to the current VU1 DMA packet for VU1 qword 0x8F + addr; returns the packet or 0.
+// Caller 0x34CA18 (VisualCarSubmitModel 0x2189C8: addr 1 = qword 0x90, offsets = the car's deform
+// array + 12 * first bone of the damage zone); also the particle emitter 0x363B98.
+uint32_t dent_offset_write(uint32_t addr, uint32_t offsets, int32_t count) {
+    const uint32_t sp = g_ee.r[29].uw[0];
+    const int32_t n3 = 3 * count;
+    const int32_t qwc = (n3 + 6 > -1 ? n3 + 6 : n3 + 9) >> 2;  // header + data + MSCAL, in qwords
+    g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)(sp - 0x60);
+    g_ee.r[4].sd[0] = qwc;
+    g_ee.r[31].ud[0] = 0x35DD78;
+    f_00366C88();
+    const uint32_t packet = g_ee.r[2].uw[0];
+    if (packet) vif_write_unpack_mscal(packet, (uint32_t)qwc, addr, 3, (uint32_t)count, offsets);
+    g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;
+    return packet;
+}
+
+void f_0035DD28_new() {
+    const uint32_t addr = g_ee.r[4].uw[0], offsets = g_ee.r[5].uw[0];
+    const int32_t count = g_ee.r[6].sw[0];
+    const uint64_t ra = g_ee.r[31].ud[0];
+    const uint32_t packet = dent_offset_write(addr, offsets, count);
+    g_ee.r[31].ud[0] = ra;
+    g_ee.r[2].sd[0] = (int64_t)(int32_t)packet;
+}
+
+// 0x34CA18 DentOffsetUpload(addr, offsets, count): forwards to 0x35DD28 (own 0x10-byte frame).
+void f_0034CA18_new() {
+    const uint32_t sp = g_ee.r[29].uw[0];
+    const uint64_t ra = g_ee.r[31].ud[0];
+    g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)(sp - 0x10);
+    g_ee.r[31].ud[0] = 0x34CA24;
+    f_0035DD28();
+    g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;
+    g_ee.r[31].ud[0] = ra;
 }
 
 void f_0035DBD8_new() {
@@ -119,3 +167,5 @@ extern "C" void f_0034C9F8(void) {
 
 extern "C" void f_0035DBD8(void) { diff_run(0x0035DBD8, f_0035DBD8_new, f_0035DBD8_orig); }
 extern "C" void f_0035A810(void) { diff_run(0x0035A810, f_0035A810_new, f_0035A810_orig); }
+extern "C" void f_0035DD28(void) { diff_run(0x0035DD28, f_0035DD28_new, f_0035DD28_orig); }
+extern "C" void f_0034CA18(void) { diff_run(0x0034CA18, f_0034CA18_new, f_0034CA18_orig); }

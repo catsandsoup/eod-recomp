@@ -250,6 +250,9 @@ void platform_shutdown() {
 }
 
 void platform_fatal_message(const char *msg) {
+    // headless runs (EOD_HEADLESS=1, automated tests) end on stderr; a dialog would wait for a click
+    const char *h = getenv("EOD_HEADLESS");
+    if (h && h[0] == '1') return;
     MessageBoxA(g_hwnd, msg, "Eve of Destruction - fatal error", MB_OK | MB_ICONERROR);
 }
 

@@ -120,6 +120,8 @@
 0034C9F8 wrap     # BonePaletteUpload: skinned pose to VU1 (src/bone_pose.cpp)
 0035DBD8 wrap     # BonePaletteWrite (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)
 0035A810 wrap     # VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)
+0035DD28 wrap     # DentOffsetWrite: car dent offsets to VU1 0x90 (src/bone_pose.cpp, readable C++; EOD_DIFF)
+0034CA18 wrap     # DentOffsetUpload: forwards to 0x35DD28 (src/bone_pose.cpp, readable C++; EOD_DIFF)
 
 # EOD_RENDER_TRACE (diagnostic, src/render_trace.cpp): 3D submission and flush order, observe only.
 0034C9C0 wrap     # FrameBegin: open queue set 1
@@ -152,4 +154,5 @@
 00326168 wrap     # WaterDrawIfPresent
 00325728 wrap     # WaterDraw(surface): tiles through the immediate geometry API
 00325E40 wrap     # WaterSimulate: car splashes
+00361708 wrap     # ImmediateVertex: observed while WaterDraw is open (native water mesh, src/native_world.cpp)
 00326188 wrap     # WaterCreate(pos, axis a, axis b): only with one view; SplitScreenParity creates it in split screen too (P8)

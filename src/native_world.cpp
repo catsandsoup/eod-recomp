@@ -26,6 +26,7 @@
 #include "core/memory.h"
 #include "render/native_renderer.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -43,6 +44,7 @@ void f_00326168_orig(void);
 void f_00325728_orig(void);
 void f_00325E40_orig(void);
 void f_00326188_orig(void);
+void f_00326188(void);
 
 // Called through their public symbols so wrappers (traces, diagnostics, nested diffs) still apply.
 void f_00212DD0(void);  // WorldSunVisible() -> *(0x495D64) in one view, else 0
@@ -243,6 +245,14 @@ void world_frame_render() {
     // P8: every split view gets the single-view sequence (PS2 and Xbox 0x0A8390 skip passes 1, 2, 4
     // and use the coarse mlist there); EOD_SPLIT_PARITY=0 keeps the original.
     const bool split = split_view && !split_parity();
+    {  // coverage of the two branches (EOD_DIFF proves the one the run takes)
+        static uint64_t calls = 0, split_calls = 0;
+        calls++;
+        split_calls += split;
+        if ((calls & 1023) == 0)
+            std::fprintf(stderr, "[world] WorldFrameRender calls %llu split-screen branch %llu\n",
+                         (unsigned long long)calls, (unsigned long long)split_calls);
+    }
     const uint32_t graf = lwu(0x3D1C18);
     set(4, lw(graf + (split ? 8 : 4)));
     set_f(12, lwu(0x3D1B28));
@@ -795,11 +805,8 @@ void water_draw() {
                     set_f(16, lwu(sp + 0x1C));
                     set(4, lw(sp + 0x10));
                     call(f_00361708, kVertexRa[k & 1]);
-                    if (reg(2) != 0) {
-                        full = true;  // no packet space: this tile ends here
-                    } else {
-                        native::ee_water_vertex(lwu(sp + 0x10), strip, sp);  // xyz +0, st +0x18
-                    }
+                    if (reg(2) != 0) full = true;  // no packet space: this tile ends here
+                    // (accepted vertices reach the native water mesh through the 0x361708 wrapper)
                 }
                 tile = lwu(tile + 0x1B8);
                 IRQ_CHECK();
@@ -928,7 +935,68 @@ void water_simulate() {
 
 }  // namespace
 
-extern "C" void f_00214B68(void) { diff_run(0x00214B68, world_frame_render, f_00214B68_orig); }
+// Verification replays for split screen (stage R3, Part 0 of docs/NATIVE_RENDERER_SUCCESS.md
+// section 7). The retail game never sets the split gate *(0x3D1B0C): its only writer,
+// DrawDistanceApplyOption 0x212808, stores 0, so 0x214B68's split branch (coarse mlist +8, passes
+// 1, 2, 4 skipped) is unreachable in a retail session.
+//   EOD_R3_SPLIT_GATE=1: with 2+ views (*(0x439858)), the gate is 1 for the duration of each
+//     WorldFrameRender call (EOD_DIFF then runs the original and the readable branch on it).
+//   EOD_R3_SPLIT_WATER=<vblank>: Dundas (the 2P water track in the spec) has no water body, and Afton
+//     (the only track.grf with one) is not offered in head-to-head. From that vblank, the first
+//     effects pass (0x326168) with 2+ views and a race camera creates an 80 x 80 surface with WaterCreate 0x326188 (the call
+//     Afton's Water display object makes; SplitScreenParity lifts its one-view test) centred 1 unit
+//     below car 0 (both split views start beside it), and keeps it in view (+0x38): each
+//     view's effects pass (0x2E7300 -> 0x326168) then draws it through 0x325728 / 0x361708.
+uint64_t kernel_vblank_count();
+namespace {
+void split_water_replay() {
+    static const uint64_t at = [] {
+        const char *e = std::getenv("EOD_R3_SPLIT_WATER");
+        return e && *e ? std::strtoull(e, nullptr, 10) : ~0ull;
+    }();
+    static bool done = false;
+    // the surface stays in view (+0x38, which Afton's Water display object sets through 0x359198), so
+    // WaterSimulate's step 0x325AD0 keeps the tile window 0x423788 current and 0x325728 draws it
+    if (done && lw(kWater) != 0) sw(lwu(kWater) + 0x38, 1);
+    if (done || at == ~0ull || kernel_vblank_count() < at || lw(0x439858) < 2 || lw(kWater) != 0) return;
+    // car 0 (CarByIndex 0x2E8768: *(0x3D9420) + 0x120 i, or the scratchpad copy when *(0x3D942C)):
+    // 3x3 rotation, then its position at +0x24 (as 0x31BFA0 reads it)
+    const uint32_t car = lw(0x3D942C) == 0 ? lwu(0x3D9420) : 0x70000000u;
+    if (!car || std::fabs(lf(car + 0x24)) + std::fabs(lf(car + 0x2C)) < 1.0f) return;  // no race yet
+    done = true;
+    const EEState saved = g_ee;
+    const uint32_t args = (reg(29) - 0x400) & ~0xFu;
+    float pos[3];
+    for (int i = 0; i < 3; i++) pos[i] = lf(car + 0x24 + 4u * (uint32_t)i);
+    pos[1] -= 1.0f;
+    const float a[3] = {80.0f, 0.0f, 0.0f}, b[3] = {0.0f, 0.0f, 80.0f};
+    for (int i = 0; i < 3; i++) {
+        sw(args + 4u * (uint32_t)i, fbits(pos[i]));
+        sw(args + 0x10 + 4u * (uint32_t)i, fbits(a[i]));
+        sw(args + 0x20 + 4u * (uint32_t)i, fbits(b[i]));
+    }
+    set(29, (int32_t)(args - 0x100));
+    set(4, (int32_t)args);
+    set(5, (int32_t)(args + 0x10));
+    set(6, (int32_t)(args + 0x20));
+    set64(31, 0x222438);  // as from the Water display object 0x2223C0
+    f_00326188();
+    std::fprintf(stderr, "[world] split-screen water replay: views %d, surface %08x at %g %g %g\n", lw(0x439858), lwu(kWater),
+                 pos[0], pos[1], pos[2]);
+    g_ee = saved;
+}
+}  // namespace
+
+extern "C" void f_00214B68(void) {
+    static const bool gate = [] {
+        const char *e = std::getenv("EOD_R3_SPLIT_GATE");
+        return e && *e && *e != '0';
+    }();
+    const bool force = gate && lw(0x439858) >= 2;
+    if (force) sw(0x3D1B0C, 1);
+    diff_run(0x00214B68, world_frame_render, f_00214B68_orig);
+    if (force) sw(0x3D1B0C, 0);
+}
 // 0x3582B8 is reached through src/hle_draw_distance.cpp's wrapper (EOD_CULL_TRACE, frame log).
 extern "C" void (*eod_mlist_calc_impl)(void);
 extern "C" void eod_world_003582B8(void) { diff_run(0x003582B8, mlist_visibility_calc, f_003582B8_orig); }
@@ -986,11 +1054,28 @@ void replay_water() {
 }
 
 extern "C" void f_00326168(void) {
+    split_water_replay();
     replay_sky_destroy();
     diff_run(0x00326168, water_draw_if_present, f_00326168_orig);
     replay_water();
 }
 extern "C" void f_00325728(void) { diff_run(0x00325728, water_draw, f_00325728_orig); }
+
+// 0x361708 ImmediateVertex(f12..f14 xyz, f15 f16 st, a0 colour, a1 strip) -> 0 accepted. Observed
+// (not replaced) while a WaterDraw is open, so the native water mesh has the vertices of the tiles
+// 0x325728 draws and of the subdivided tiles its 0x324928 subtree draws (0x31F4A0, 0x321A90,
+// 0x322828, 0x323550, 0x323E20; recompiled, R4 decompiles the immediate geometry path).
+extern "C" void f_00361708_orig(void);
+extern "C" void f_00361708(void) {
+    if (!native::ee_in_water()) {
+        f_00361708_orig();
+        return;
+    }
+    const float xyz[3] = {g_ee.fpr[12].f, g_ee.fpr[13].f, g_ee.fpr[14].f}, st[2] = {g_ee.fpr[15].f, g_ee.fpr[16].f};
+    const uint32_t colour = reg(4), strip = reg(5);
+    f_00361708_orig();
+    if (reg(2) == 0) native::ee_water_vertex(xyz, st, colour, strip);
+}
 extern "C" void f_00325E40(void) { diff_run(0x00325E40, water_simulate, f_00325E40_orig); }
 
 // 0x326188 WaterCreate(pos, axis a, axis b), from the Water display object (subtype 28, only

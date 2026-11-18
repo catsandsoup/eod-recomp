@@ -46,6 +46,8 @@ enum : uint32_t {
 
 struct Vertex {
     float pos[3];       // model space (world space for track geometry): row + u + qword199 offset
+    float pos_w;        // the position qword's w lane as the VIF wrote it (V3: 0 + STROW w in
+                        // offset mode); the skinned programs use it as the translation weight
     float normal[3];    // (byte - 128) / 127 as tools/vif_mesh.py (the VU itself uses /128)
     float uv[2];        // s, t: row + u + qword198 offset (GS convention, t down)
     uint8_t color[4];   // PS2 scale, not changed: 0x80 = 1.0. RGB from the data; A = 0x80.
@@ -62,7 +64,8 @@ enum class Skin : uint8_t {
     None,
     Offset,   // program 0x2e0 (MSCAL 0x5C, cars): bone = dent slot, p + wa*D[a] + wb*D[b]
     Matrix,   // program 0x318 (MSCAL 0x63, drivers/pedestrians): wa*(Ma p) + wb*(Mb p)
-    Partial,  // program 0x2e0 with a one-byte (V1-8) skin unpack: bone a only, weights not in data
+    Partial,  // program 0x2e0 with a one-byte (V1-8) skin unpack: the VIF repeats the byte in all
+              // four lanes (+ STROW), so bone a = bone b and both weights come from the row
 };
 
 struct Batch {
