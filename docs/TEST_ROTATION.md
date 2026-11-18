@@ -11,9 +11,15 @@ in a row:
    lights (Anoka Night, arena or stadium events), so flares, glows, light sprites and night
    fog run.
 3. **Odd vehicles, cycled:** the bus, the hearse, the limo and every other special or unique
-   vehicle in the `[CATALOG]` list, one per run in rotation. They use different skins, bones,
+   vehicle in the `[CATALOG]` list, one per run in rotation. Every run uses a special
+   vehicle, never the same one twice in a row; the Venom is not used. They use different skins, bones,
    panels and debris than ordinary cars.
-4. **Variety beyond that:** a different event type each run (race, trailer race, arena or
+4. **Every camera view, cycled within each run:** in-car / cockpit, bumper, near chase, far
+   chase, the suspension / wheel view, and replay or cinematic cameras. Each view draws
+   different meshes and LODs (interior, the exposed wheel and suspension assembly, near-camera
+   clipping) and calls different camera code. Switch views via the pad script every few
+   hundred vblanks and log which view is active.
+5. **Variety beyond that:** a different event type each run (race, trailer race, arena or
    demolition, gauntlet, flag, explosive chicken), plus 2P/4P split-screen. Head-to-head
    events pick their event in the native lobby (`src/session_start.cpp:572`).
 
