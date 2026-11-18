@@ -3,6 +3,7 @@
 #include "../vu/scene_capture.h"
 #include "../vu/scene_emit.h"
 #include "modern_scene.h"
+#include "../render/native_renderer.h"
 #include "gs.h"
 #include "gs_hw.h"
 
@@ -460,6 +461,7 @@ void write_reg(uint32_t reg, uint64_t v) {
     case 0x52: st.trxreg = v; break;
     case 0x53:
         st.trxdir = v;
+        if (native::enabled()) native::gs_barrier();  // (native objects drawn before the transfer)
         xfer_start();
         break;
     case 0x54: {  // HWREG
@@ -891,7 +893,7 @@ namespace { void editor_preview_capture(uint64_t frame, bool offscreen, bool sof
 // it when it reads state the worker produces.
 namespace {
 
-enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN };
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN, CMD_NATIVE };
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -967,8 +969,15 @@ void modern::post_draw(Frame *f) {
     push_cmd(CMD_MODERN, 1, 0, &f, sizeof f);
 }
 
+// Native renderer commands from the producer, in GS order (render/native_renderer.h).
+void native::post(uint32_t kind, const void *data, uint32_t size) {
+    if (!g_threaded) return gs_command(kind, data, size);
+    push_cmd(CMD_NATIVE, kind, 0, data, size);
+}
+
 // Publishes the display and does the per-frame bookkeeping (GS side).
 void gs_frame_end(uint64_t frame, int aspect) {
+    if (native::enabled()) native::gs_vblank(frame);
     if (scene_capture::g_on) scene_capture::gs_vblank(frame);
     if (scene_emit::g_on) scene_emit::gs_vblank(frame, st.fogcol);
     presentation::set(aspect);
@@ -1163,12 +1172,12 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
         // Presentation-only markers are not part of the portable GS capture format.
-        if (live && h[0] != CMD_EDITOR_RACE_FRAME && h[0] != CMD_MODERN && g_cold_zip) {
+        if (live && h[0] != CMD_EDITOR_RACE_FRAME && h[0] != CMD_MODERN && h[0] != CMD_NATIVE && g_cold_zip) {
             if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
             else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
                 close_cold_zip("stopped at compressed limit or write error");
         }
-        if (live && g_dump && h[0] != CMD_MODERN) {
+        if (live && g_dump && h[0] != CMD_MODERN && h[0] != CMD_NATIVE) {
             // Never let a diagnostic boot trace grow without a bound. Close at
             // a command boundary so even a size-limited trace stays parseable.
             if (g_cold_dump && g_cold_dump_bytes + len > 256ull * 1024 * 1024) {
@@ -1200,6 +1209,9 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                 memcpy(&f, d, sizeof f);
                 modern::gs_draw(f);
             }
+            break;
+        case CMD_NATIVE:  // live only (never in dumps): h[1] kind, payload in d
+            if (live) native::gs_command(h[1], d, h[3]);
             break;
         case CMD_PRIV: {
             uint64_t v;

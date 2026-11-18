@@ -89,6 +89,12 @@ keeps a PS2-level limit and labels it "next step", "follow-up", "out of scope"
 or "for later". A task that runs into a PS2 limit overcomes it, for the long
 term, inside that same task, before the work is considered finished.
 
+Limits are hunted, not only met: every known fixed-size pool, buffer, budget or
+table is listed in `docs/PS2_LIMITS.md` with its address, size, observed use,
+what happens when it is hit, and its status. Decompiling a function that owns a
+fixed-size structure removes that cap in the same task, and every listed cap is
+watched by the runtime limit tracker so a run that reaches one says so.
+
 ## Creation Kit concurrency — hard rule
 
 The Kit's UI never waits on work. The main thread only draws and takes input.

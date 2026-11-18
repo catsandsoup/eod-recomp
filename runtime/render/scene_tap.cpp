@@ -93,6 +93,8 @@ void object(uint32_t record, int32_t texture_key, int32_t layer) {
     g_building.objects.push_back(o);
 }
 
+const Object *last_object() { return g_on && !g_building.objects.empty() ? &g_building.objects.back() : nullptr; }
+
 void end_frame() {
     if (!g_on) return;
     close_view();

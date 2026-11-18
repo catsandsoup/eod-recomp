@@ -48,7 +48,9 @@ void set_enabled(bool on);
 // Game-side hooks (EE thread).
 void begin_view();                       // RenderQueueBeginFrame (0x34C9C0)
 void object(uint32_t record, int32_t texture_key, int32_t layer);  // per record, as the flush emits it
-void end_frame();                        // publish the frame (begin_view does it when the vblank changes)
+void end_frame();
+// the record object() just added (EE thread), or null
+const Object *last_object();                        // publish the frame (begin_view does it when the vblank changes)
 
 // Renderer side: the most recent complete frame (copy; safe from another thread).
 bool latest(Frame &out);

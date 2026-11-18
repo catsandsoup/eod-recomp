@@ -87,6 +87,22 @@ inline void modern_alpha(int32_t, uint32_t) {}
 inline void modern_texture(int32_t, const Env &) {}
 inline void modern_draw(modern::Frame *f) { delete f; }
 #endif
+#ifdef EOD_PLUME
+// The native renderer (render/native_renderer.h), Vulkan backend only: the frame buffer (and
+// depth buffer) surfaces of e, with the backend's work so far ended, for plume commands recorded
+// into the backend's command buffer at this point of GS order. false: not available (no surface,
+// a skipped frame, another backend). native_end() after recording.
+struct NativeSurfaces {
+    void *cmd;                     // VkCommandBuffer
+    uint64_t color, depth;         // VkImage (depth 0: none); both in VK_IMAGE_LAYOUT_GENERAL
+    uint32_t width, height;        // surface size in pixels
+    uint32_t gs_width, gs_height;  // in GS pixels
+    int scale;                     // RenderScale
+};
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out);
+void native_end();
+bool native_texture_on_cpu(uint32_t first_page, uint32_t count);
+#endif
 #ifdef EOD_HW_SELECT
 // Windows: the Vulkan backend (not Direct3D 11) is the one running
 bool vulkan_active();

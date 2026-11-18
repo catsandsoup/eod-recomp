@@ -17,6 +17,7 @@ namespace {
 // Never destroyed: the GS keeps using the device until the process exits, as it did with
 // its own device (which it never destroyed either).
 std::unique_ptr<plume::RenderInterface> g_interface;
+plume::RenderDevice *g_device = nullptr;
 bool g_tried = false;
 
 struct DeviceRequest {
@@ -116,8 +117,10 @@ bool create_device(VkPhysicalDevice physical, uint32_t family, const std::vector
     queueMutex = q.mutex.get();
     fprintf(stderr, "[vulkan] device owned by plume (queue family %u, %zu queues)\n", family,
             dev->queueFamilies[family].queues.size());
-    created.release(); // lives for the process, like the interface
+    g_device = created.release(); // lives for the process, like the interface
     return true;
 }
+
+plume::RenderDevice *render_device() { return g_device; }
 } // namespace plume_device
 #endif

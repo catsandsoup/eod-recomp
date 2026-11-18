@@ -40,6 +40,11 @@ namespace vulkan {
 EOD_HW_DECLARE
 struct ClutSnapshot;
 void vram_write_complete();
+#ifdef EOD_PLUME
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out);
+void native_end();
+bool native_texture_on_cpu(uint32_t first_page, uint32_t count);
+#endif
 ClutSnapshot *clut_snapshot(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
 const uint8_t *clut_snapshot_page(ClutSnapshot *s, uint32_t page);
 void clut_snapshot_free(ClutSnapshot *s);
@@ -99,6 +104,15 @@ void modern_draw(modern::Frame *f) { EOD_HW_FORWARD(modern_draw(f)); }
 void modern_alpha(int32_t batch, uint32_t alpha) { EOD_HW_FORWARD(modern_alpha(batch, alpha)); }
 
 bool vulkan_active() { return g_on && g_vk; }
+#ifdef EOD_PLUME
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out) { return g_vk && vulkan::native_begin(e, depth, out); }
+void native_end() {
+    if (g_vk) vulkan::native_end();
+}
+bool native_texture_on_cpu(uint32_t first_page, uint32_t count) {
+    return g_vk && vulkan::native_texture_on_cpu(first_page, count);
+}
+#endif
 
 }  // namespace hw
 }  // namespace gs

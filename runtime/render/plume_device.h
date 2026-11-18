@@ -7,6 +7,10 @@
 #include <mutex>
 #include <vector>
 
+namespace plume {
+struct RenderDevice;
+}
+
 namespace plume_device {
 // plume's instance (created on the first call, API 1.3, surface extensions enabled), or
 // VK_NULL_HANDLE when plume cannot create one.
@@ -19,5 +23,8 @@ VkInstance instance();
 // GPU, has no queue in `family`, or device creation fails; the caller then makes its own.
 bool create_device(VkPhysicalDevice physical, uint32_t family, const std::vector<const char *> &extensions,
                    bool core13, VkDevice &device, VkQueue &queue, std::mutex *&queueMutex);
+
+// plume's device once create_device succeeded (the native renderer draws with it), else null.
+plume::RenderDevice *render_device();
 } // namespace plume_device
 #endif

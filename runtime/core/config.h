@@ -40,6 +40,8 @@ struct Config {
     // the modern renderer (Windows, d3d11): switched live in the Graphics panel, F9 or L1+R1+R3;
     // its effects in percent of the default look (docs/SCENE_CAPTURE.md "Modern renderer")
     bool modern_renderer = false;
+    // the native renderer (docs/NATIVE_RENDERER.md, R1): queued 3D objects drawn by plume
+    bool native_renderer = false;
     int modern_shadows = 100;        // sun shadow strength (0: off)
     bool modern_soft_shadows = true; // soft shadows that harden at contact
     int modern_reflections = 100;    // paint clear coat, sky reflections, highlights

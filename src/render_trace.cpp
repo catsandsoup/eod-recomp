@@ -10,6 +10,7 @@
 #include "core/cpu.h"
 #include "core/memory.h"
 #include "kernel/kernel.h"
+#include "render/native_renderer.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -372,13 +373,16 @@ extern "C" void f_0034B140(void) {
     }
 }
 
-// Packet reserves: tag the returned space with the reserving call (VU1 start attribution).
-#define RESERVE_WRAPPER(addr)                                         \
-    extern "C" void f_##addr(void) {                                 \
-        if (!g_on) return f_##addr##_orig();                          \
-        const uint32_t qwc = arg(0), r = ra();                        \
-        f_##addr##_orig();                                            \
-        if (g_ee.r[2].uw[0]) tag_range(g_ee.r[2].uw[0], qwc * 16, r); \
+// Packet reserves: tag the returned space with the reserving call (VU1 start attribution), and tell
+// the native renderer (render/native_renderer.h), which tags the batch packets of queue records.
+#define RESERVE_WRAPPER(addr)                                                     \
+    extern "C" void f_##addr(void) {                                             \
+        const bool nat = native::enabled();                                       \
+        if (!g_on && !nat) return f_##addr##_orig();                              \
+        const uint32_t qwc = arg(0), r = ra();                                    \
+        f_##addr##_orig();                                                        \
+        if (g_on && g_ee.r[2].uw[0]) tag_range(g_ee.r[2].uw[0], qwc * 16, r);     \
+        if (nat) native::ee_packet_reserved(g_ee.r[2].uw[0], qwc, r);             \
     }
 RESERVE_WRAPPER(00366C88)
 RESERVE_WRAPPER(00366D30)

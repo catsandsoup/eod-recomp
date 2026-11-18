@@ -27,6 +27,7 @@
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
+#include "render/native_renderer.h"
 #include "render/scene_tap.h"
 
 #include <cstdint>
@@ -327,6 +328,7 @@ void submit_static() {
 // ---------------------------------------------------------------------------------------------
 // 0x34C9C0 RenderQueueBeginFrame
 void begin_frame() {
+    native::ee_frame_begin();
     scene_tap::begin_view();
     sw(kSetOpen, 1);
     sw(kCachedMaterial, 0xFFFFFFFFu);
@@ -406,10 +408,12 @@ void flush() {
                     sw(kCachedMaterial, (uint32_t)material);
                 }
                 scene_tap::object(rec, key, (int32_t)layer);
+                native::ee_object(rec);
                 set(4, lw(rec + 0x08));
                 call(f_00365288, 0x34B0B4);
                 set(4, lw(rec + 0x00));
                 call(f_0035CB88, 0x34B0BC);
+                native::ee_object_end();
                 IRQ_CHECK();
             }
             call(f_0034F888, 0x34B0D0);

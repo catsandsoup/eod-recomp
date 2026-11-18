@@ -16,6 +16,7 @@
 #include "../kernel/kernel.h"
 #include "vu.h"
 #include "../core/prof.h"
+#include "../render/native_renderer.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
 extern uint8_t *g_ram;
@@ -53,6 +54,7 @@ void start_micro(Vif &v, uint32_t addr) {
         v.tops = v.dbf ? v.base + v.ofst : v.base;
         g_vif1_top = v.top;
         g_vif1_itop = v.itop;
+        if (native::enabled()) native::vu1_start(addr, v.itop);
     } else {
         v.itop = v.itops;
     }

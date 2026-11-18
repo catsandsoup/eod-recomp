@@ -1,0 +1,811 @@
+// native_renderer.cpp - GS-thread side of the native renderer (native_renderer.h): which GS draws
+// belong to native objects, the objects' GS state, and the plume renderer that draws them.
+#include "native_renderer.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
+#include "../gs/gs_env.h"
+#include "../gs/gs_hw.h"
+#include "../gs/gs_mem.h"
+#include "../gs/gs_state.h"
+#include "../gs/modern_scene.h"
+
+#ifdef EOD_PLUME
+#include "plume_device.h"
+#include "plume_vulkan.h"
+#endif
+
+namespace gs {
+extern bool g_skip_frame;  // gs_draw.cpp
+extern uint32_t g_env_serial;
+}
+
+namespace native {
+namespace {
+
+// ---- per EE frame counters (the frame a record was queued in) ----
+struct FrameStats {
+    uint32_t objects = 0;     // records the GS was told about (OBJ)
+    uint32_t drawn = 0;       // drawn by plume
+    uint32_t empty = 0;       // drawn, but the batch decoded to no triangles
+    uint32_t skipped = 0;     // frame skipped by the GS (FrameSkip): nothing drawn, as the GS
+    uint32_t lost = 0;        // not drawn: no mesh, no surface or no renderer
+    uint32_t textured = 0, untextured_rt = 0, skinned = 0, flushes = 0;
+    uint64_t suppressed = 0;  // GS primitives not drawn because they were a native object's
+};
+std::map<uint64_t, FrameStats> g_frames;
+uint64_t g_newest_frame = 0;
+
+uint64_t log_every() {
+    static const uint64_t n = [] {
+        const char *e = std::getenv("EOD_NATIVE_LOG");
+        return e ? std::strtoull(e, nullptr, 10) : 300ull;
+    }();
+    return n;
+}
+
+// ---- the object whose GS commands are arriving ----
+bool g_active = false, g_finalized = false, g_have_env = false;
+Packet g_cur;
+gs::Env g_env;          // its GS state at its first draw
+uint64_t g_xyoffset = 0;
+
+double depth_range(uint32_t zpsm) {
+    switch (zpsm & 0xF) {
+    case 0x0: return 4294967296.0;
+    case 0x1: return 16777216.0;
+    default: return 65536.0;
+    }
+}
+
+uint64_t context_xyoffset() {
+    const uint64_t attr = (gs::st.prmodecont & 1) ? gs::st.prim : gs::st.prmode;
+    return gs::st.ctx[(attr >> 9) & 1].xyoffset;
+}
+
+#ifdef EOD_PLUME
+#include "native_shaders_spv.inc"
+
+struct PushConstants {
+    float cx[4], cy[4], cz[4], cw[4];
+    float light[4], diffuse[4], ambient[4];
+    uint32_t mode[4];
+};
+static_assert(sizeof(PushConstants) == 128, "push constants");
+enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
+                  M_CFIX = 0x200, M_SPEC = 0x400 };
+
+// blend equations (GS ALPHA a, b, d with C in the shader's second output)
+enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_INV_MIX, B_KEEP, B_COUNT };
+
+struct GpuMesh {
+    std::unique_ptr<Mesh> cpu;
+    std::unique_ptr<plume::RenderBuffer> buf;  // vertices, then indices
+    uint64_t index_offset = 0;
+};
+
+struct Texture {
+    std::unique_ptr<plume::RenderTexture> tex;
+    std::unique_ptr<plume::RenderBuffer> staging;  // until the upload is recorded
+    std::unique_ptr<plume::RenderDescriptorSet> sets[8];  // per sampler
+    uint32_t w = 0, h = 0;
+    uint64_t key = 0, last_use = 0;
+    bool pending_upload = false;
+};
+struct AddrEntry {
+    Texture *tex = nullptr;
+    uint32_t stamp = 0;  // g_vram_clock when the pages were last checked
+};
+
+struct Item {
+    Packet p;
+    double a[4][4];        // model -> GS screen
+    float ox, oy, zscale;
+    PushConstants pc;
+    uint32_t pipeline;     // pipeline key
+    Texture *tex;
+    uint32_t sampler;
+    int32_t sc[4];         // scissor, GS pixels (x0, y0, x1, y1 inclusive)
+    GpuMesh *mesh;
+};
+
+struct Target {
+    uint32_t fbp, fbw, fpsm, zbp, zpsm, rows;
+    bool depth;
+    bool operator==(const Target &o) const {
+        return fbp == o.fbp && fbw == o.fbw && fpsm == o.fpsm && zbp == o.zbp && zpsm == o.zpsm && rows == o.rows &&
+               depth == o.depth;
+    }
+};
+
+// Destroyed some vblanks later, when the GPU no longer reads them.
+struct Trash {
+    uint64_t vb;
+    std::unique_ptr<plume::RenderBuffer> buf;
+    std::unique_ptr<plume::RenderTexture> tex;
+    std::unique_ptr<plume::RenderDescriptorSet> sets[8];
+    std::unique_ptr<plume::RenderFramebuffer> fb;
+};
+
+struct Renderer {
+    bool tried = false, ok = false;
+    plume::VulkanDevice *dev = nullptr;
+    std::unique_ptr<plume::RenderCommandQueue> queue;
+    std::unique_ptr<plume::RenderCommandList> list;
+    std::unique_ptr<plume::RenderPipelineLayout> layout;
+    std::unique_ptr<plume::RenderShader> vs, ps;
+    std::unique_ptr<plume::RenderSampler> samplers[8];
+    std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> pipelines;
+    Texture white;
+    std::unordered_map<uint32_t, GpuMesh> meshes;
+    std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures;  // by content
+    std::unordered_map<uint64_t, AddrEntry> by_addr;
+    XXH3_state_t *hash_state = XXH3_createState();
+    uint64_t texture_bytes = 0, decoded = 0;
+    // this vblank's surface wrappers and framebuffers (the backend may recycle its images later)
+    std::unordered_map<uint64_t, std::unique_ptr<plume::RenderTexture>> wrappers;
+    std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
+    std::deque<Trash> trash;
+    uint64_t vb = 0;
+    std::vector<Item> pending;
+    Target target{};
+    std::vector<Texture *> uploads;
+};
+Renderer g_r;
+
+plume::RenderDescriptorSetDesc set_desc() {
+    static plume::RenderDescriptorRange ranges[2] = {
+        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::TEXTURE, 0, 1),
+        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::SAMPLER, 1, 1)};
+    return plume::RenderDescriptorSetDesc(ranges, 2);
+}
+
+bool init() {
+    if (g_r.tried) return g_r.ok;
+    g_r.tried = true;
+#ifdef EOD_HW_SELECT
+    if (!gs::hw::vulkan_active()) {
+        std::fprintf(stderr, "[native] needs the Vulkan renderer: the GS draws everything\n");
+        return false;
+    }
+#endif
+    auto *dev = static_cast<plume::VulkanDevice *>(plume_device::render_device());
+    if (!dev) {
+        std::fprintf(stderr, "[native] no plume device (EOD_PLUME=0?): the GS draws everything\n");
+        return false;
+    }
+    g_r.dev = dev;
+    g_r.queue = dev->createCommandQueue(plume::RenderCommandListType::DIRECT);
+    g_r.list = g_r.queue->createCommandList();
+    const plume::RenderDescriptorSetDesc sd = set_desc();
+    plume::RenderPushConstantRange pcr(0, 0, 0, sizeof(PushConstants),
+                                       plume::RenderShaderStageFlag::VERTEX | plume::RenderShaderStageFlag::PIXEL);
+    plume::RenderPipelineLayoutDesc ld(&pcr, 1, &sd, 1, false, true);
+    g_r.layout = dev->createPipelineLayout(ld);
+    g_r.vs = dev->createShader(k_native_vs_main, sizeof k_native_vs_main, "vs_main", plume::RenderShaderFormat::SPIRV);
+    g_r.ps = dev->createShader(k_native_ps_main, sizeof k_native_ps_main, "ps_main", plume::RenderShaderFormat::SPIRV);
+    for (uint32_t i = 0; i < 8; i++) {
+        plume::RenderSamplerDesc s;
+        s.minFilter = s.magFilter = (i & 1) ? plume::RenderFilter::LINEAR : plume::RenderFilter::NEAREST;
+        s.mipmapMode = plume::RenderMipmapMode::NEAREST;
+        s.addressU = (i & 2) ? plume::RenderTextureAddressMode::CLAMP : plume::RenderTextureAddressMode::WRAP;
+        s.addressV = (i & 4) ? plume::RenderTextureAddressMode::CLAMP : plume::RenderTextureAddressMode::WRAP;
+        s.addressW = plume::RenderTextureAddressMode::CLAMP;
+        s.maxLOD = 0;
+        g_r.samplers[i] = dev->createSampler(s);
+    }
+    if (!g_r.layout || !g_r.vs || !g_r.ps || !g_r.list) {
+        std::fprintf(stderr, "[native] plume setup failed: the GS draws everything\n");
+        return false;
+    }
+    // 1x1 texture for untextured objects (the set layout has a texture)
+    g_r.white.tex = dev->createTexture(plume::RenderTextureDesc::Texture2D(1, 1, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+    g_r.white.staging = dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(256));
+    const uint32_t px = 0x80808080u;
+    std::memcpy(g_r.white.staging->map(), &px, 4);
+    g_r.white.staging->unmap();
+    g_r.white.w = g_r.white.h = 1;
+    g_r.white.pending_upload = true;
+    g_r.uploads.push_back(&g_r.white);
+    g_r.ok = true;
+    std::fprintf(stderr, "[native] plume renderer ready (%s)\n", dev->description.name.c_str());
+    return true;
+}
+
+plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
+    auto &s = t->sets[sampler];
+    if (!s) {
+        s = g_r.dev->createDescriptorSet(set_desc());
+        s->setTexture(0, t->tex.get(), plume::RenderTextureLayout::SHADER_READ);
+        s->setSampler(1, g_r.samplers[sampler].get());
+    }
+    return s.get();
+}
+
+plume::RenderPipeline *pipeline(uint32_t key) {
+    auto &slot = g_r.pipelines[key];
+    if (slot) return slot.get();
+    const uint32_t blend = key & 15, zfunc = (key >> 4) & 3, mask = (key >> 8) & 15;
+    const bool zwrite = (key >> 6) & 1, depth = (key >> 7) & 1;
+    plume::RenderInputSlot in(0, sizeof(Vertex));
+    plume::RenderInputElement el[4] = {
+        plume::RenderInputElement("POSITION", 0, 0, plume::RenderFormat::R32G32B32_FLOAT, 0, 0),
+        plume::RenderInputElement("TEXCOORD", 0, 1, plume::RenderFormat::R32G32_FLOAT, 0, 12),
+        plume::RenderInputElement("NORMAL", 0, 2, plume::RenderFormat::R8G8B8A8_SINT, 0, 20),
+        plume::RenderInputElement("COLOR", 0, 3, plume::RenderFormat::R8G8B8A8_UNORM, 0, 24)};
+    plume::RenderGraphicsPipelineDesc d;
+    d.pipelineLayout = g_r.layout.get();
+    d.vertexShader = g_r.vs.get();
+    d.pixelShader = g_r.ps.get();
+    d.inputSlots = &in;
+    d.inputSlotsCount = 1;
+    d.inputElements = el;
+    d.inputElementsCount = 4;
+    d.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    d.cullMode = plume::RenderCullMode::NONE;
+    d.depthClipEnabled = true;
+    d.renderTargetCount = 1;
+    d.renderTargetFormat[0] = plume::RenderFormat::R8G8B8A8_UNORM;
+    if (depth) {
+        d.depthTargetFormat = plume::RenderFormat::D32_FLOAT;
+        d.depthEnabled = true;
+        d.depthWriteEnabled = zwrite;
+        d.depthFunction = zfunc == 0   ? plume::RenderComparisonFunction::ALWAYS
+                          : zfunc == 1 ? plume::RenderComparisonFunction::GREATER_EQUAL
+                          : zfunc == 2 ? plume::RenderComparisonFunction::GREATER
+                                       : plume::RenderComparisonFunction::NEVER;
+    }
+    using B = plume::RenderBlend;
+    using O = plume::RenderBlendOperation;
+    plume::RenderBlendDesc &b = d.renderTargetBlend[0];
+    b.blendEnabled = blend != B_OPAQUE;
+    b.blendOp = blend == B_REVSUB ? O::REV_SUBTRACT : O::ADD;
+    switch (blend) {
+    case B_MIX: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::INV_SRC1_ALPHA; break;
+    case B_ADD: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
+    case B_REVSUB: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
+    case B_SCALE: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ZERO; break;
+    case B_DST_ADD: b.srcBlend = B::ONE, b.dstBlend = B::SRC1_ALPHA; break;
+    case B_INV_MIX: b.srcBlend = B::INV_SRC1_ALPHA, b.dstBlend = B::SRC1_ALPHA; break;
+    case B_KEEP: b.srcBlend = B::ZERO, b.dstBlend = B::ONE; break;
+    default: b.srcBlend = B::ONE, b.dstBlend = B::ZERO; break;
+    }
+    // the GS writes the source alpha as it is (it does not blend alpha)
+    b.srcBlendAlpha = B::ONE;
+    b.dstBlendAlpha = B::ZERO;
+    b.blendOpAlpha = O::ADD;
+    b.renderTargetWriteMask = (uint8_t)mask;
+    slot = g_r.dev->createGraphicsPipeline(d);
+    return slot.get();
+}
+
+// The object's texture from GS memory (TEX0 as its first draw had it). The texture manager
+// uploads each bucket's texture into one of two shared slots (TEX0 0x2BC4 / 0x2FC8 in races), so
+// textures are cached by content: the bytes of the GS memory pages they occupy plus the TEX0
+// fields that decide the decoding (block offset, width, format, size, CLUT, TEXA). An address
+// whose pages were not written since it was last looked at reuses its entry without hashing.
+// Render-target textures (pages a GPU surface holds newer than the CPU copy) are not decoded.
+Texture *texture(const gs::Env &e, FrameStats &fs) {
+    if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
+    uint32_t first, count;
+    gs::page_range(e.tbp, e.tbw, e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
+    if (!gs::hw::native_texture_on_cpu(first, count)) {
+        fs.untextured_rt++;
+        return nullptr;
+    }
+    const bool indexed = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT4 || e.tpsm == gs::PSMT8H ||
+                         e.tpsm == gs::PSMT4HL || e.tpsm == gs::PSMT4HH;
+    uint64_t k[5] = {(e.tbp & 31) | (uint64_t)e.tbw << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
+                     indexed ? e.pal_hash : 0,
+                     e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
+    k[4] = e.tbp;
+    const uint64_t addr_key = XXH3_64bits(k, sizeof k);
+    AddrEntry &ae = g_r.by_addr[addr_key];
+    if (ae.tex) {
+        bool ok = true;
+        for (uint32_t i = 0; i < count && ok; i++)
+            if (gs::g_page_gen[(first + i) % gs::kPages] > ae.stamp) ok = false;
+        if (ok) {
+            ae.tex->last_use = g_r.vb;
+            return ae.tex;
+        }
+    }
+    // content key
+    XXH3_state_t *st = g_r.hash_state;
+    XXH3_64bits_reset(st);
+    XXH3_64bits_update(st, k, sizeof k - sizeof k[4]);
+    // the 256-byte GS memory blocks the texture covers (pages also hold other textures and CLUTs)
+    {
+        int bw = 8, bh = 8;
+        switch (e.tpsm) {
+        case gs::PSMCT16: case gs::PSMCT16S: bw = 16, bh = 8; break;
+        case gs::PSMT8: bw = 16, bh = 16; break;
+        case gs::PSMT4: bw = 32, bh = 16; break;
+        default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
+        }
+        for (int y = 0; y < (int)e.th; y += bh)
+            for (int x = 0; x < (int)e.tw; x += bw) {
+                uint32_t byte;
+                switch (e.tpsm) {
+                case gs::PSMCT16: byte = gs::addr16(x, y, e.tbp, e.tbw) * 2; break;
+                case gs::PSMCT16S: byte = gs::addr16s(x, y, e.tbp, e.tbw) * 2; break;
+                case gs::PSMT8: byte = gs::addr8(x, y, e.tbp, e.tbw); break;
+                case gs::PSMT4: byte = gs::addr4(x, y, e.tbp, e.tbw) / 2; break;
+                default: byte = gs::addr32(x, y, e.tbp, e.tbw) * 4; break;
+                }
+                XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
+            }
+    }
+    const uint64_t key = XXH3_64bits_digest(st);
+    ae.stamp = gs::g_vram_clock;
+    std::unique_ptr<Texture> &slot = g_r.textures[key];
+    if (slot) {
+        ae.tex = slot.get();
+        slot->last_use = g_r.vb;
+        return slot.get();
+    }
+    slot = std::make_unique<Texture>();
+    Texture &t = *slot;
+    ae.tex = &t;
+    t.key = key;
+    t.last_use = g_r.vb;
+    t.w = e.tw;
+    t.h = e.th;
+    const uint32_t row = (t.w * 4 + 255) & ~255u;
+    t.staging = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer((uint64_t)row * t.h));
+    auto *dst = static_cast<uint8_t *>(t.staging->map());
+    for (uint32_t v = 0; v < t.h; v++) {
+        uint32_t *line = reinterpret_cast<uint32_t *>(dst + (size_t)v * row);
+        for (uint32_t u = 0; u < t.w; u++) line[u] = gs::tex_fetch(e, (int)u, (int)v, 0);
+    }
+    t.staging->unmap();
+    t.tex = g_r.dev->createTexture(plume::RenderTextureDesc::Texture2D(t.w, t.h, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+    t.pending_upload = true;
+    g_r.uploads.push_back(&t);
+    g_r.texture_bytes += (uint64_t)t.w * t.h * 4;
+    g_r.decoded++;
+    return &t;
+}
+
+// Textures unused for a while go once the cache is large (adaptive: it grows with what the
+// loaded tracks and cars use, and releases what they stopped using).
+void evict_textures() {
+    if (g_r.texture_bytes < (256ull << 20)) return;
+    for (auto it = g_r.textures.begin(); it != g_r.textures.end();) {
+        Texture *t = it->second.get();
+        if (t->last_use + 120 < g_r.vb && !t->pending_upload) {
+            for (auto a = g_r.by_addr.begin(); a != g_r.by_addr.end();)
+                a = a->second.tex == t ? g_r.by_addr.erase(a) : std::next(a);
+            Trash tr{g_r.vb};
+            tr.tex = std::move(t->tex);
+            for (int i = 0; i < 8; i++) tr.sets[i] = std::move(t->sets[i]);
+            g_r.trash.push_back(std::move(tr));
+            g_r.texture_bytes -= (uint64_t)t->w * t->h * 4;
+            it = g_r.textures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void record_uploads(plume::RenderCommandList *cl) {
+    for (Texture *t : g_r.uploads) {
+        if (!t->pending_upload || !t->tex) continue;
+        cl->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(t->tex.get(), plume::RenderTextureLayout::COPY_DEST));
+        const uint32_t row = (t->w * 4 + 255) & ~255u;
+        cl->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(t->tex.get()),
+                              plume::RenderTextureCopyLocation::PlacedFootprint(t->staging.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                                                                                t->w, t->h, 1, row / 4));
+        cl->barriers(plume::RenderBarrierStage::GRAPHICS,
+                     plume::RenderTextureBarrier(t->tex.get(), plume::RenderTextureLayout::SHADER_READ));
+        t->pending_upload = false;
+        Trash tr{g_r.vb};  // the staging buffer outlives the copy
+        tr.buf = std::move(t->staging);
+        g_r.trash.push_back(std::move(tr));
+    }
+    g_r.uploads.clear();
+}
+
+GpuMesh *gpu_mesh(uint32_t id) {
+    auto it = g_r.meshes.find(id);
+    if (it == g_r.meshes.end()) return nullptr;
+    GpuMesh &m = it->second;
+    if (!m.buf && !m.cpu->indices.empty()) {
+        const uint64_t vb = m.cpu->vertices.size() * sizeof(Vertex);
+        m.index_offset = (vb + 15) & ~15ull;
+        const uint64_t size = m.index_offset + m.cpu->indices.size() * 4;
+        m.buf = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+            size, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
+        auto *p = static_cast<uint8_t *>(m.buf->map());
+        std::memcpy(p, m.cpu->vertices.data(), vb);
+        std::memcpy(p + m.index_offset, m.cpu->indices.data(), m.cpu->indices.size() * 4);
+        m.buf->unmap();
+    }
+    return &m;
+}
+
+plume::RenderTexture *wrapper(uint64_t image, uint32_t w, uint32_t h, bool depth) {
+    const uint64_t key = image ^ ((uint64_t)w << 48) ^ ((uint64_t)h << 32) ^ (depth ? 1 : 0);
+    auto &slot = g_r.wrappers[key];
+    if (!slot) {
+        auto *t = new plume::VulkanTexture(g_r.dev, (VkImage)image);
+        t->desc = plume::RenderTextureDesc::Texture2D(w, h, 1, depth ? plume::RenderFormat::D32_FLOAT : plume::RenderFormat::R8G8B8A8_UNORM,
+                                                      depth ? plume::RenderTextureFlag::DEPTH_TARGET : plume::RenderTextureFlag::RENDER_TARGET);
+        t->imageFormat = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+        t->fillSubresourceRange();
+        t->createImageView(t->imageFormat);
+        slot.reset(t);
+    }
+    auto *t = static_cast<plume::VulkanTexture *>(slot.get());
+    t->textureLayout = plume::RenderTextureLayout::GENERAL;  // the backend keeps every image there
+    t->barrierStages = plume::RenderBarrierStage::ALL;
+    return t;
+}
+
+void flush() {
+    if (g_r.pending.empty()) return;
+    const Target &tg = g_r.target;
+    gs::Env e{};
+    e.fbp = tg.fbp, e.fbw = tg.fbw, e.fpsm_mem = tg.fpsm, e.zbp = tg.zbp, e.zpsm = tg.zpsm, e.scy1 = (int)tg.rows - 1;
+    gs::hw::NativeSurfaces s{};
+    if (!gs::hw::native_begin(e, tg.depth, s)) {
+        for (const Item &it : g_r.pending) g_frames[it.p.frame].lost++;
+        g_r.pending.clear();
+        return;
+    }
+    g_frames[g_r.pending.front().p.frame].flushes++;
+    auto *vl = static_cast<plume::VulkanCommandList *>(g_r.list.get());
+    plume::RenderCommandList *cl = vl;
+    const VkCommandBuffer own = vl->vk;
+    vl->vk = (VkCommandBuffer)s.cmd;
+    record_uploads(cl);
+    plume::RenderTexture *color = wrapper(s.color, s.width, s.height, false);
+    plume::RenderTexture *depth = s.depth ? wrapper(s.depth, s.width, s.height, true) : nullptr;
+    plume::RenderTextureBarrier in[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
+                                         plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
+    cl->barriers(plume::RenderBarrierStage::GRAPHICS, in, depth ? 2 : 1);
+    auto &fb = g_r.framebuffers[{s.color, s.depth}];
+    if (!fb) {
+        const plume::RenderTexture *ca[1] = {color};
+        fb = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(ca, 1, depth));
+    }
+    cl->setFramebuffer(fb.get());
+    cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
+    cl->setGraphicsPipelineLayout(g_r.layout.get());
+    const double gw = s.gs_width, gh = s.gs_height;
+    const int sc = s.scale;
+    uint32_t bound = ~0u;
+    for (Item &it : g_r.pending) {
+        FrameStats &fs = g_frames[it.p.frame];
+        if (!it.mesh || !it.mesh->buf) {
+            fs.drawn++;
+            fs.empty++;
+            continue;
+        }
+        if (!tg.depth) it.pipeline &= ~0xF0u;
+        // GS screen -> this surface's clip space (the backend's convention: ndc = (p + 0.5) * 2 / size - 1)
+        PushConstants &pc = it.pc;
+        const double kx = (0.5 - it.ox) * 2.0 / gw - 1.0, ky = (0.5 - it.oy) * 2.0 / gh - 1.0;
+        for (int c = 0; c < 4; c++) {
+            pc.cx[c] = (float)(it.a[0][c] * 2.0 / gw + it.a[3][c] * kx);
+            pc.cy[c] = (float)(it.a[1][c] * 2.0 / gh + it.a[3][c] * ky);
+            pc.cz[c] = (float)(it.a[2][c] * it.zscale);
+            pc.cw[c] = (float)it.a[3][c];
+        }
+        if (it.pipeline != bound) {
+            cl->setPipeline(pipeline(it.pipeline));
+            bound = it.pipeline;
+        }
+        Texture *t = it.tex ? it.tex : &g_r.white;
+        cl->setGraphicsDescriptorSet(texture_set(t, it.tex ? it.sampler : 0), 0);
+        cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
+        const int32_t x0 = std::max(0, it.sc[0]) * sc, y0 = std::max(0, it.sc[1]) * sc;
+        const int32_t x1 = std::min((int32_t)gw, it.sc[2] + 1) * sc, y1 = std::min((int32_t)gh, it.sc[3] + 1) * sc;
+        cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
+        const GpuMesh &m = *it.mesh;
+        const plume::RenderVertexBufferView vbv(m.buf->at(0), (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)));
+        const plume::RenderInputSlot slot(0, sizeof(Vertex));
+        cl->setVertexBuffers(0, &vbv, 1, &slot);
+        const plume::RenderIndexBufferView ibv(m.buf->at(m.index_offset), (uint32_t)(m.cpu->indices.size() * 4),
+                                               plume::RenderFormat::R32_UINT);
+        cl->setIndexBuffer(&ibv);
+        cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+        fs.drawn++;
+        if (it.tex) fs.textured++;
+        if (m.cpu->skinned) fs.skinned++;
+    }
+    cl->setFramebuffer(nullptr);  // ends the render pass
+    plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
+                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
+    cl->barriers(plume::RenderBarrierStage::ALL, out, depth ? 2 : 1);
+    vl->vk = own;
+    gs::hw::native_end();
+    g_r.pending.clear();
+}
+
+uint32_t blend_of(const gs::Env &e) {
+    if (!e.abe) return B_OPAQUE;
+    const int a = e.ba, b = e.bb, d = e.bd;  // 0 Cs, 1 Cd, 2 zero
+    if (a == b) return d == 0 ? B_OPAQUE : d == 1 ? B_KEEP : B_OPAQUE;
+    if (a == 0 && b == 1 && d == 1) return B_MIX;
+    if (a == 0 && b == 2 && d == 1) return B_ADD;
+    if (a == 2 && b == 0 && d == 1) return B_REVSUB;
+    if (a == 0 && b == 2 && d == 2) return B_SCALE;
+    if (a == 1 && b == 2 && d == 0) return B_DST_ADD;
+    if (a == 1 && b == 0 && d == 0) return B_INV_MIX;
+    return B_OPAQUE;
+}
+
+// The current object is complete: queue it with the GS state it had.
+void finalize() {
+    if (!g_active || g_finalized) return;
+    g_finalized = true;
+    FrameStats &fs = g_frames[g_cur.frame];
+    if (gs::g_skip_frame) {
+        fs.skipped++;
+        return;
+    }
+    if (!init()) {
+        fs.lost++;
+        return;
+    }
+    if (modern::g_on && modern::live()) {  // the Modern renderer draws these batches itself
+        fs.lost++;
+        return;
+    }
+    const gs::Env &e = g_have_env ? g_env : gs::current_env();
+    const uint64_t xy = g_have_env ? g_xyoffset : context_xyoffset();
+    GpuMesh *mesh = g_cur.mesh ? gpu_mesh(g_cur.mesh) : nullptr;
+    if (g_cur.mesh && !mesh) {
+        fs.lost++;
+        return;
+    }
+    const bool zwrite = !e.zmsk && e.ztst != 0, ztest = e.ztst >= 2;
+    Target tg{e.fbp, e.fbw, e.fpsm_mem, e.zbp, e.zpsm, (uint32_t)e.scy1 + 1, zwrite || ztest};
+    if (!g_r.pending.empty() && !(tg == g_r.target)) flush();
+    g_r.target = tg;
+    Item it{};
+    it.p = g_cur;
+    it.mesh = mesh;
+    screen_matrix(g_cur, it.a);
+    it.ox = (float)(xy & 0xFFFF) / 16.0f;
+    it.oy = (float)((xy >> 32) & 0xFFFF) / 16.0f;
+    it.zscale = (float)(1.0 / depth_range(e.zpsm));
+    PushConstants &pc = it.pc;
+    // model-space light (VU1 vf12): the model axes . light, times light.w
+    for (int c = 0; c < 3; c++) {
+        double l = 0;
+        for (int r = 0; r < 3; r++) l += (double)g_cur.model[r * 4 + c] * g_cur.light[r];
+        pc.light[c] = (float)(l * g_cur.light[3]);
+    }
+    std::memcpy(pc.diffuse, g_cur.colour_a, 16);
+    std::memcpy(pc.ambient, g_cur.colour_b, 16);
+    pc.ambient[3] = (float)(g_cur.itop & 0xFF);
+    // q17 (setup 0x0000): h = -normalize(M^T (camera forward + light)), the car highlight's half vector
+    {
+        double h[3], len = 0;
+        for (int c = 0; c < 3; c++) {
+            h[c] = 0;
+            for (int r = 0; r < 3; r++) h[c] += (double)g_cur.model[r * 4 + c] * ((double)g_cur.rotation[6 + r] + g_cur.light[r]);
+            len += h[c] * h[c];
+        }
+        const double k = len > 0 ? -1.0 / std::sqrt(len) : 0.0;
+        pc.light[3] = (float)(h[0] * k);
+        pc.diffuse[3] = (float)(h[1] * k);
+        const float hz = (float)(h[2] * k);
+        std::memcpy(&pc.mode[3], &hz, 4);
+    }
+    it.tex = texture(e, fs);
+    uint32_t m = 0;
+    if (it.tex) {
+        m |= M_TME | (e.tcc ? M_TCC : 0) | (uint32_t)(e.tfx & 3) << M_TFX_SHIFT;
+        it.sampler = (e.bilinear_mag ? 1u : 0u) | (e.wms != 0 ? 2u : 0u) | (e.wmt != 0 ? 4u : 0u);
+    }
+    if (e.ate) {
+        m |= M_ATE | (uint32_t)(e.atst & 7) << M_ATST_SHIFT;
+        if (e.afail == 0 || e.afail == 2) m |= M_AFAIL_DISCARD;
+    }
+    if (e.bc == 2) m |= M_CFIX;
+    if (g_cur.program == 0x2E0) m |= M_SPEC;  // car bodies: vertex alpha is the highlight
+    pc.mode[0] = m;
+    pc.mode[1] = e.aref & 0xFF;
+    pc.mode[2] = e.bfix & 0xFF;
+    // pipeline key: blend | z function << 4 | z write << 6 | depth << 7 | colour mask << 8
+    const uint32_t zf = !ztest ? (e.ztst == 0 ? 3u : 0u) : e.ztst == 2 ? 1u : 2u;
+    const uint32_t full = (e.fpsm & 0xF) == 0x1 ? 0xFFFFFFu : 0xFFFFFFFFu;
+    uint32_t mask = 0;
+    for (int ch = 0; ch < 4; ch++) {
+        const uint32_t bits = 0xFFu << (ch * 8);
+        if ((full & bits) && (e.fbmsk & bits) != bits) mask |= 1u << ch;
+    }
+    it.pipeline = blend_of(e) | zf << 4 | (zwrite ? 1u : 0u) << 6 | (tg.depth ? 1u : 0u) << 7 | mask << 8;
+    it.sc[0] = e.scx0, it.sc[1] = e.scy0, it.sc[2] = e.scx1, it.sc[3] = e.scy1;
+    g_r.pending.push_back(it);
+}
+
+void end_vblank(uint64_t vb) {
+    g_r.vb = vb;
+    evict_textures();
+    if (log_every() > 1 && vb % log_every() == 0 && g_r.ok)
+        std::fprintf(stderr, "[native] vb %llu textures decoded %llu (total), cached %zu (%llu MB), meshes %zu\n",
+                     (unsigned long long)vb, (unsigned long long)g_r.decoded, g_r.textures.size(),
+                     (unsigned long long)(g_r.texture_bytes >> 20), g_r.meshes.size());
+    for (auto &w : g_r.framebuffers) {
+        Trash t{vb};
+        t.fb = std::move(w.second);
+        g_r.trash.push_back(std::move(t));
+    }
+    g_r.framebuffers.clear();
+    for (auto &w : g_r.wrappers) {
+        Trash t{vb};
+        t.tex = std::move(w.second);
+        g_r.trash.push_back(std::move(t));
+    }
+    g_r.wrappers.clear();
+    while (!g_r.trash.empty() && g_r.trash.front().vb + 8 <= vb) g_r.trash.pop_front();
+}
+#else
+void finalize() {
+    if (g_active && !g_finalized) g_frames[g_cur.frame].lost++;
+    g_finalized = true;
+}
+void flush() {}
+void end_vblank(uint64_t) {}
+#endif
+
+void begin_object(const Packet &p) {
+    finalize();
+    g_cur = p;
+    g_active = true;
+    g_finalized = false;
+    g_have_env = false;
+    g_frames[p.frame].objects++;
+    g_newest_frame = std::max(g_newest_frame, p.frame);
+}
+
+void report(uint64_t vb) {
+    const uint64_t every = log_every();
+    for (auto it = g_frames.begin(); it != g_frames.end() && it->first < g_newest_frame;) {
+        const FrameStats &s = it->second;
+        if (every && (every == 1 || it->first % every < 2))
+            std::fprintf(stderr,
+                         "[native] gs frame %llu objects %u drawn %u (empty %u, textured %u, skinned bind pose %u, "
+                         "render-target texture untextured %u) skipped %u lost %u suppressed GS prims %llu render passes %u (gs vb %llu)\n",
+                         (unsigned long long)it->first, s.objects, s.drawn, s.empty, s.textured, s.skinned,
+                         s.untextured_rt, s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb);
+        it = g_frames.erase(it);
+    }
+}
+
+}  // namespace
+
+void gs_command(uint32_t kind, const void *data, uint32_t size) {
+    switch (kind) {
+    case CMD_OBJ: {
+        Packet p;
+        if (size < sizeof p) return;
+        std::memcpy(&p, data, sizeof p);
+        begin_object(p);
+        break;
+    }
+    case CMD_OFF:
+        finalize();
+        g_active = false;
+        break;
+    case CMD_MESH: {
+        Mesh *m;
+        std::memcpy(&m, data, sizeof m);
+#ifdef EOD_PLUME
+        if (m->replaces) {
+            auto it = g_r.meshes.find(m->replaces);
+            if (it != g_r.meshes.end()) {
+                Trash t{g_r.vb};
+                t.buf = std::move(it->second.buf);
+                g_r.trash.push_back(std::move(t));
+                g_r.meshes.erase(it);
+            }
+        }
+        g_r.meshes[m->id].cpu.reset(m);
+#else
+        delete m;
+#endif
+        break;
+    }
+    default: break;
+    }
+}
+
+bool gs_draw(const gs::Env &e, const gs::Vertex &v) {
+    if (!g_active) {
+#ifdef EOD_PLUME
+        if (!g_r.pending.empty()) flush();  // before the GS draws something of its own
+#endif
+        return false;
+    }
+#ifdef EOD_PLUME
+    if (!g_r.tried) init();
+    if (!g_r.ok) return false;  // no renderer: the GS draws the object
+    if (modern::g_on && modern::live()) return false;
+#else
+    return false;
+#endif
+    if (!g_have_env && !g_finalized) {
+        g_env = e;
+        g_xyoffset = context_xyoffset();
+        g_have_env = true;
+    }
+    static const uint64_t dbg = std::getenv("EOD_NATIVE_PASSES") ? std::strtoull(std::getenv("EOD_NATIVE_PASSES"), nullptr, 10) : 0;
+    static uint64_t dbg_frame = 0;
+    if (dbg && !dbg_frame && g_cur.frame >= dbg) dbg_frame = g_cur.frame;
+    if (dbg && g_cur.frame == dbg_frame) {
+        static uint32_t last_serial = ~0u, last_obj = ~0u, prims = 0;
+        if (gs::g_env_serial != last_serial || g_cur.serial != last_obj) {
+            std::fprintf(stderr, "[native] pass obj %u batch %08x prog %04x mesh %u: tme %d tbp %x tbw %u psm %x %ux%u tfx %d tcc %d abe %d abcd %d%d%d%d fix %u ate %d atst %d ztst %d zmsk %d fbmsk %x fbp %x rgba %u %u %u %u mine %.0f %.0f %.0f itop %x (prev run %u prims)\n",
+                         g_cur.serial, g_cur.batch, g_cur.program, g_cur.mesh, e.tme, e.tbp, e.tbw, e.tpsm, e.tw, e.th, e.tfx, e.tcc,
+                         e.abe, e.ba, e.bb, e.bc, e.bd, e.bfix, e.ate, e.atst, e.ztst, e.zmsk, e.fbmsk, e.fbp, v.r, v.g, v.b, v.a, g_cur.colour_b[0], g_cur.colour_b[1], g_cur.colour_b[2], g_cur.itop, prims);
+            last_serial = gs::g_env_serial;
+            last_obj = g_cur.serial;
+            prims = 0;
+        }
+        prims++;
+    }
+    g_frames[g_cur.frame].suppressed++;
+    return true;
+}
+
+// A GS memory transfer starts (TRXDIR written; BITBLTBUF/TRXPOS/TRXREG are set). Pending objects
+// are drawn first only when it touches their frame or depth buffer: the texture manager's uploads
+// between buckets do not (the objects' textures were decoded when they were queued).
+void gs_barrier() {
+    if (g_active) finalize();
+#ifdef EOD_PLUME
+    if (g_r.pending.empty()) return;
+    const Target &tg = g_r.target;
+    uint32_t ff, fc, zf = 0, zc = 0;
+    gs::page_range(tg.fbp, tg.fbw, tg.fpsm, 0, 0, (int)tg.fbw * 64, (int)tg.rows, ff, fc);
+    if (tg.depth) gs::page_range(tg.zbp, tg.fbw, tg.zpsm, 0, 0, (int)tg.fbw * 64, (int)tg.rows, zf, zc);
+    const uint64_t blt = gs::st.bitbltbuf, pos = gs::st.trxpos, reg = gs::st.trxreg;
+    const uint32_t dir = (uint32_t)(gs::st.trxdir & 3);
+    const int w = (int)(reg & 0xFFF), h = (int)((reg >> 32) & 0xFFF);
+    auto overlaps = [&](uint32_t bp, uint32_t bw, uint32_t psm, int x, int y) {
+        uint32_t f, c;
+        gs::page_range(bp, bw, psm, x, y, w, h, f, c);
+        auto hit = [&](uint32_t a0, uint32_t ac) {
+            for (uint32_t i = 0; i < c; i++)
+                if (((f + i - a0) % gs::kPages) < ac) return true;
+            return false;
+        };
+        return hit(ff, fc) || (zc && hit(zf, zc));
+    };
+    bool touch = false;
+    if (dir != 0)  // local -> host or local -> local: the source is read
+        touch |= overlaps((uint32_t)(blt & 0x3FFF), (uint32_t)((blt >> 16) & 0x3F), (uint32_t)((blt >> 24) & 0x3F),
+                          (int)(pos & 0x7FF), (int)((pos >> 16) & 0x7FF));
+    if (dir != 1)  // host -> local or local -> local: the destination is written
+        touch |= overlaps((uint32_t)((blt >> 32) & 0x3FFF), (uint32_t)((blt >> 48) & 0x3F), (uint32_t)((blt >> 56) & 0x3F),
+                          (int)((pos >> 32) & 0x7FF), (int)((pos >> 48) & 0x7FF));
+    if (touch) flush();
+#endif
+}
+
+void gs_vblank(uint64_t frame) {
+    if (g_active) finalize();
+    g_active = false;
+    flush();
+    end_vblank(frame);
+    report(frame);
+}
+
+}  // namespace native

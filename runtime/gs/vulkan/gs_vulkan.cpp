@@ -3365,6 +3365,7 @@ void stats_line(char *buf, size_t size) {
 }
 
 #include "modern_vk.inc"
+#include "native_bridge.inc"
 
 #ifdef EOD_HW_SELECT
 } // namespace vulkan
