@@ -46,6 +46,7 @@ static int native_damage_calls = 0;
 static int native_collision_damage_calls = 0;
 extern "C" void f_0018AD20_orig() { ++native_damage_calls; }
 extern "C" void f_0018CA98_orig() { ++native_collision_damage_calls; }
+extern "C" void car_apply_collision_damage() { f_0018CA98_orig(); }
 extern "C" void f_0017DA58_orig() {}
 extern "C" void f_0017E000_orig() {}
 extern "C" void f_0017E4D8();

@@ -56,12 +56,73 @@ LOD, passes and effects as single player (P8).
 | R0 | plume owns the device; the game looks and runs exactly as before | Original GS replay md5 unchanged; fullscreen race and menus |
 | R1 | cars, props and characters drawn by plume from the draw queue (PS2 look, textured) in place of the GS's drawing of them (done: section "Stage R1") | every queue record drawn (counts equal); frame comparison against the GS |
 | R2 | track world, sky and water from the world renderer (done: section "Stage R2", evidence in docs/NATIVE_RENDERER_SUCCESS.md section 7) | world leaf counts equal; water visible in 1P and split screen (only Afton.trk has a water body) |
-| R3 | skinned characters and car damage from bone palettes | posed vertices within 1/16 px of the GS |
+| R3 | skinned characters and car damage from bone palettes (Phase A: section "Stage R3") | posed vertices within 1/16 px of the GS |
 | R4 | shadows, particles, sprites, flares, glare | effect counts equal; visual comparison |
 | R5 | PS2 look matches GS replay (P3 thresholds) | comparison tool |
 | R6 | Modern look: PBR, shadows, IBL, reflections, water; live toggle | P4, P5 |
 | R7 | HUD, menus, fonts, movies, render targets native; GS and VU1 out of the frame path | S4 = 0 |
 | R8 | 60 fps at RenderScale 6, max LOD, Modern look on the target box; floors on the minimum box | S1, S2 with Tracy and EOD_GPU_PROF |
+
+## Stage R3: skinned characters and car dents (specification)
+
+Written with the code (rule 6.2). Sources: PS2 Ghidra decompile and `tools/ee_dis.py` of
+SLUS_209.10, the VU1 image `config/vu/vu1_fd0ce30ab0ec263c.bin` (`tools/vudis.py`). The native
+renderer never reads VU1 memory: it keeps its own copy of every upload the readable EE C++ builds
+and poses the vertices on the CPU (runtime/render/native_feed.cpp `posed_mesh`).
+
+### Data path
+
+| What | EE producer (readable C++, EOD_DIFF) | Packet | VU1 | Programs |
+| --- | --- | --- | --- | --- |
+| Driver / pedestrian palettes | 0x34C9F8 BonePaletteUpload -> 0x35DBD8 BonePaletteWrite (src/bone_pose.cpp); pose arrays from 0x20C800 (drivers) and 0x20B8D0 (pedestrians) | 0x35A810 UNPACK V4-32 + MSCAL 0x24D8 | qword 0x90 + 4*first, 3x4 per bone, 20 bones | 0x0318 (MSCAL 0x63), 0x24B0 |
+| Car dent offsets | 0x18CA98 CarApplyCollisionDamage writes car+0x4B8 (src/car_damage.cpp); 0x2189C8 VisualCarSubmitModel -> 0x34CA18 -> 0x35DD28 DentOffsetWrite (src/bone_pose.cpp) | 0x35A810 UNPACK V3-32 + MSCAL 0x24D8 | qword 0x90 + bone (xyz) | 0x02E0 (MSCAL 0x5C), 0x0D48, 0x15A8 |
+| Sun-facing quad | 0x35CBD8 (material packet `*(0x4D7C54)`) | V3-32 | 0xAC..0xAF | 0x350 (MSCAL 0x6A) |
+
+Skin word: the program reads it at TOP+149+n-k (vertices in reverse order); the bone fields are VU1
+qword bases, weights are lane - 32768 (float).
+- Matrix (0x318/0x24B0): p' = wa (Ma p) + wb (Mb p), M = columns at qwords bone+144..147, w lane of
+  the position = translation weight; normals turn with the 3x3.
+- Offset (0x2E0/0xD48/0x15A8, V4-8 skin unpack): p' = p + wa D[a] + wb D[b], D = qword bone+143 xyz.
+- Partial (0x2E0 with a V1-8 skin unpack, 21,817 vertices in the retail cars): the VIF repeats the
+  byte in all four lanes (+ STROW), so bone a = bone b and both weights come from the row.
+- Camera-facing (0x350): p' = p + wa C[a] + wb C[b], C = sun quad corners (bone 29..32).
+The upload in effect for a draw is the one whose packet is the material `*(0x4D7C54)` when the
+record is tagged; P2 (`EOD_NATIVE_SKIN_CHECK=1`) compares the bone qwords used against VU1 data
+memory and the posed vertices against the GS (1/16 px).
+
+### Car damage (0x18CA98, readable C++)
+
+Called by 0x189CD0 after the collision response (f_0018CA98 keeps the invincibility gate,
+src/game_patches.cpp). Contacts come through 0x17B918 ContactRecord (pool 0x3CE3F0, 0x24-byte
+records, 16 per object at obj+0x190).
+1. Nearest bone: free bones (M+0x20+0x34*i, word +0x30 = 0) whose rest + 1.8 x dent lies within
+   1.5 (2.25 squared, 0x40100000) of the contact; 0x18C6B8 dents it along the impulse.
+2. Spread: every bone behind the nearest bone's dent plane moves along -impulse by
+   min(depth, behind) x min(0.2 / max(d^2, 0.1), 1), clamped to its dent box (bone +4..+0x18). The
+   low byte of the dent z is the shade |offset| / length(+0x28) x 128, kept in 0x20..0x80.
+3. Panels: 8 per car (table 0x44AE68, 0x40 bytes; states car+0x13E8, 0x18 bytes). Past the
+   panel's distance (+0x30) a panel hangs loose (2) or comes off (3, 0x1E0DC8 with its box centre).
+4. Damage: impulse > 300 adds min(0.35 car / 0.1 other, |impulse| x 6.6666666e-06) to car+0x1BEC;
+   states 2/3 past 0.6 (or 0.5 with a hit > 0.03), wrecked 10/11/12 past 1.0 with a wheel
+   tossed (0x1B3068) on the side of the hit; 0.9 cap in free roam (0x1741C0).
+
+### Functions replaced (config/hle.txt `wrap`, `diff_run`)
+
+0x34C9F8, 0x35DBD8, 0x35A810, 0x35DD28, 0x34CA18 (src/bone_pose.cpp); 0x18CA98, 0x17B918
+(src/car_damage.cpp).
+
+### PS2 limits (docs/PS2_LIMITS.md)
+
+Contacts per object (16) and the contact pool are tracked by `limit_note`; removing them needs the
+readers of obj+0x190 decompiled. Wheel debris (16, 0x484E68) and panel debris (16, 0x494D60) are
+owned by 0x1B3068 and 0x1E0DC8 / 0x1DF9A0, still recompiled.
+
+### Not done in R3 Phase A (open)
+
+- 0x18AFE0 CarSetupDamageAndPanels and 0x1DF9A0 DeformResetMeshVertices (inside 0x1DF7A8, VU0
+  macro code) are still recompiled; the debris pools above stay at their PS2 size.
+- Phase B: multi-scene suite (P2 within 1/16 px on every posed vertex, crashes, rollovers, 8
+  panels, 16 wheels), split screen, docs/NATIVE_RENDERER_SUCCESS.md.
 
 ## Stage R2: track world, sky and water (specification)
 

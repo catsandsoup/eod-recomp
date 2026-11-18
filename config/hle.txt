@@ -31,7 +31,7 @@
 
 001B5840 wrap     # optional invincibility: suppress inline timed-damage feat during native update
 0018AD20 wrap     # optional invincibility: scalar vehicle damage setter
-0018CA98 wrap     # optional invincibility: collision deformation and damage, after physics response
+0018CA98 wrap     # optional invincibility, then CarApplyCollisionDamage as readable C++ (src/car_damage.cpp; EOD_DIFF): dents, panels, wreck state
 
 # Busy-wait loops on memory set by interrupt handlers: sleep until the next
 # event instead of spinning.
@@ -122,6 +122,7 @@
 0035A810 wrap     # VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)
 0035DD28 wrap     # DentOffsetWrite: car dent offsets to VU1 0x90 (src/bone_pose.cpp, readable C++; EOD_DIFF)
 0034CA18 wrap     # DentOffsetUpload: forwards to 0x35DD28 (src/bone_pose.cpp, readable C++; EOD_DIFF)
+0017B918 wrap     # ContactRecord: contact pool 0x3CE3F0 + 16 per object (src/car_damage.cpp, readable C++; EOD_DIFF)
 
 # EOD_RENDER_TRACE (diagnostic, src/render_trace.cpp): 3D submission and flush order, observe only.
 0034C9C0 wrap     # FrameBegin: open queue set 1

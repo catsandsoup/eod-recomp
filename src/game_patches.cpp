@@ -279,8 +279,9 @@ extern "C" void f_0018CA98_orig(void);
 extern "C" void f_0018AD20(void) {
     if (!invincible_human(g_ee.r[4].uw[0])) f_0018AD20_orig();
 }
+extern "C" void car_apply_collision_damage(void);  // 0x18CA98 as readable C++ (src/car_damage.cpp)
 extern "C" void f_0018CA98(void) {
-    if (!invincible_human(g_ee.r[4].uw[0])) f_0018CA98_orig();
+    if (!invincible_human(g_ee.r[4].uw[0])) car_apply_collision_damage();
 }
 
 // The native world update has one inline damage write for the timed-damage

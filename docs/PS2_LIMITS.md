@@ -16,6 +16,11 @@ yet).
 | Plume texture cache | runtime/render/native_renderer.cpp | 256 MB soft limit | open | |
 | Frame renderer list `0x20F4A0` / `0x3D1C90` | `0x20F4A0` | 20 entries | open | |
 | Engine pools (heap, mip ring, chassis, car pool, debris, weapons) | see docs/MASTER_SPEC.md 3.5 | | open | |
+| Contacts per object, obj+0x190 / count obj+0x1D0 | `0x17B918` ContactRecord (src/car_damage.cpp) | 16 | tracked (`[limit] contacts per object`): every reader of obj+0x190 must be decompiled before the list can move to host storage | docs/NATIVE_RENDERER.md R3 |
+| Contact record pool `0x3CE3F0` (used `0x3CE3EC`, size `0x3CE3E8`) | `0x17B918` (src/car_damage.cpp) | `*(0x3CE3E8)` records of 0x24 bytes | tracked (`[limit] contact records`) | same |
+| Detached wheel debris `0x484E68` | `0x1B3068` DetachedWheelSpawn | 16 | open (R3: owner still recompiled) | |
+| Detached panel debris `0x494D60` | `0x1E0DC8` / `0x1DF9A0` | 16 | open (R3: owners still recompiled) | |
+| Detachable panels per car, table `0x44AE68`, states car+0x13E8 | `0x18AFE0`, `0x18CA98` (src/car_damage.cpp) | 8 (data table, not a pool) | kept: the count is the panel table of the retail data | docs/NATIVE_RENDERER.md R3 |
 | Native world leaf list (one texture record's REFs) | runtime/render/native_feed.cpp `g_leaves` | none on the PS2 (packet space below) | removed: `std::vector`, released when a pass ends with more than 4096 kept | |
 | Native water mesh | runtime/render/native_feed.cpp | ImmediateBegin request `0x3000` vertices, 60-vertex packet chunks | removed: the native mesh grows with the surface (`[limit] water surface vertices`), transient GPU meshes released 8 vblanks after use | docs/NATIVE_RENDERER_SUCCESS.md R2 |
 | Native camera-facing parts (VU1 `0x350`) | runtime/render/native_feed.cpp | VU1 memory (2048 qwords per batch) | removed: expanded on the CPU per draw, transient meshes | |
