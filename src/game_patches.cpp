@@ -253,9 +253,10 @@ static float car_damage_scale(const std::string &model) {
 // event tweak * 4000 lb / mass * the upgrades' factor (+0x2EC); the
 // damage_scale of the car files (which the menu's durability ratings follow)
 // is never used. CarDurability=1 multiplies it in.
+extern "C" void car_setup_damage_and_panels(void);  // 0x18AFE0 as readable C++ (src/car_damage.cpp)
 extern "C" void f_0018AFE0(void) {
     uint32_t car = (uint32_t)g_ee.r[4].sd[0], par = (uint32_t)g_ee.r[5].sd[0];
-    f_0018AFE0_orig();
+    car_setup_damage_and_panels();
     char name[32] = {};
     for (int i = 0; i < 31; i++) name[i] = (char)ee_r8(par + 0xAC + i);
     float damage = ee_rf(car + 0x4B0), scale = netplay_hooks::rule(netplay_hooks::Durability, g_config.car_durability) ? car_damage_scale(name) : 1.0f;

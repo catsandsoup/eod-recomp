@@ -172,6 +172,7 @@ bool config_load(const std::string &path, Config &c) {
         } else if (ieq(section, "Gameplay") || ieq(section, "Cheats")) {
             if (ieq(k, "CarDurability")) c.car_durability = to_bool(v);
             else if (ieq(k, "ManualRecovery")) c.manual_recovery = to_bool(v);
+            else if (ieq(k, "ExpandDebris")) c.expand_debris = to_bool(v);
             else if (ieq(k, "UnlockAll")) c.unlock_all = to_bool(v);
             else if (ieq(k, "CareerCheats")) c.career_cheats = to_bool(v);
             else if (ieq(k, "TurboBoost") || ieq(k, "Turbo")) c.cheat_turbo = to_bool(v);
@@ -302,6 +303,8 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "CarDurability=%d      ; 1: each car's durability from its files (damage_scale) on top of its weight\n",
             c.car_durability ? 1 : 0);
     fprintf(f, "ManualRecovery=%d     ; 1: human countdown recovery disabled; SELECT retained\n", c.manual_recovery ? 1 : 0);
+    fprintf(f, "ExpandDebris=%d       ; 1: detached wheels and panels never take a flying piece (offline; online keeps the PS2 pools)\n",
+            c.expand_debris ? 1 : 0);
     fprintf(f, "\n[Cheats]\n");
     fprintf(f, "UnlockAll=%d          ; 1: unlock all career tracks, vehicles, dares, and feat prizes\n", c.unlock_all ? 1 : 0);
     fprintf(f, "CareerCheats=%d       ; 1: allow cheat feats to function in career mode\n", c.career_cheats ? 1 : 0);

@@ -27,8 +27,11 @@ int eod_presentation_aspect() {
 extern "C" void f_0034E530() {
     static const bool trace=std::getenv("EOD_CAMERA_TRACE") != nullptr;
     static unsigned count;
-    if (trace && count < 16) {
+    static float last[3];
+    const bool changed = g_ee.fpr[12].f != last[0] || g_ee.fpr[13].f != last[1] || g_ee.fpr[14].f != last[2];
+    if (trace && (count < 16 || (changed && count < 512))) {  // every view change (near/far/fov) after the first 16
         ++count;
+        last[0] = g_ee.fpr[12].f, last[1] = g_ee.fpr[13].f, last[2] = g_ee.fpr[14].f;
         float xscale,base;uint32_t xb=ee_r32(0x3dd658),bb=ee_r32(0x3dd65c);
         std::memcpy(&xscale,&xb,sizeof xscale);std::memcpy(&base,&bb,sizeof base);
         std::fprintf(stderr,"[camera] projection ra=%08x near=%.9g far=%.9g fov=%.9g xscale=%.9g base=%.9g mode=%u wide=%u letterbox=%u\n",

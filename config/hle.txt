@@ -27,7 +27,14 @@
 00106338 wrap     # actual gameplay world/HUD callback: editor-only first-race evidence
 0033EC78 wrap     # wait for native race frame publication before editor readiness
 0034D328 wrap     # display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it
-0018AFE0 wrap     # car setup: computes the damage multiplier (car+0x4B0) from the chassis mass - DamageScale
+0018AFE0 wrap     # CarSetupDamageAndPanels as readable C++ (src/car_damage.cpp; EOD_DIFF), then the CarDurability damage_scale
+001B3068 wrap     # DetachedWheelSpawn: wheel debris ring 0x484E68 (src/debris_pool.cpp, readable C++; EOD_DIFF; live use tracked)
+001B3180 wrap     # wheel debris count reset (src/debris_pool.cpp; EOD_DIFF)
+001B3190 wrap     # wheel debris count and ring reset (src/debris_pool.cpp; EOD_DIFF)
+001E1E88 wrap     # 'Panl' ctor: panel debris pool 0x494D60 (src/debris_pool.cpp, readable C++; EOD_DIFF)
+001E29C0 wrap     # panel debris dtor (src/debris_pool.cpp, readable C++; EOD_DIFF)
+001E0DC8 wrap     # DetachedPanelSpawn: live panel debris counted, ExpandDebris window (src/debris_pool.cpp), body still recompiled
+001B2868 wrap     # wheel Init: keeps the WHLP create record for ExpandDebris wheels (src/debris_pool.cpp), body still recompiled
 
 001B5840 wrap     # optional invincibility: suppress inline timed-damage feat during native update
 0018AD20 wrap     # optional invincibility: scalar vehicle damage setter

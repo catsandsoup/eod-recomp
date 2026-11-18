@@ -106,21 +106,102 @@ records, 16 per object at obj+0x190).
    states 2/3 past 0.6 (or 0.5 with a hit > 0.03), wrecked 10/11/12 past 1.0 with a wheel
    tossed (0x1B3068) on the side of the hit; 0.9 cap in free roam (0x1741C0).
 
+### Car setup (0x18AFE0 CarSetupDamageAndPanels, readable C++, Phase A2)
+
+Called once per car by 0x185470 (jal at 0x186174); f_0018AFE0 (src/game_patches.cpp) keeps the
+CarDurability damage_scale patch after it.
+1. memset(car+0x13E8, 0, 0xC0) (0x3A5FD0), then for each of the 8 panels of 0x44AE68 (0x40 bytes):
+   0x205A58(car+0x3D0, name = entry+4, &state[0]) finds the helper node (state = car+0x13E8 +
+   0x18*i). Missing: DebugPrintf 0x3F9FD0 ("car: can't find helper %s"), state stays 0.
+2. Helper point p = R v + T: v = entry+0x24..0x2C, R = node[0..8] (x = v0 m0 + v1 m3 + v2 m6,
+   mula/madda/madd), T = node+0x24..0x2C. state[1] = the bone 1..n-1 (n = M+0x1C) whose rest
+   position (bone+0x1C) is nearest p (sqrt.s distance, strict <, start 1e7 = 0x4B189680, 0 = none).
+3. Node origin o = R (0,0,0) + T (the EE does the 0 x m products, so -0/NaN follow the matrix);
+   state[2] = the bone nearest o, same rule.
+4. car+0x4B4 = M+0x1C; car+0x4B0 = (*M)->vtable[0x28](1.0, "damage_tweak" 0x3FA018) x 1818.0
+   (0x44E34000) / (mass par+8 x 0.4545 0x3EE8B439); then x upgrades car+0x2EC when it is >= -1e-4
+   (0xB8D1B717), else |car+0x2EC|. Human (car+0x1E0 = 0x50): x player_damage_tweak (0x3FA028,
+   through 0x176768 / 0x125388). Human, or 0x56 with 0x1DB330(car+0x1DC) != 0: game rule 0x3CE4F0
+   0 -> 0, 1 -> x0.5 (0x3F000000).
+5. Matrix: car+0x300 ? 0x2DD5B8(car+0x300, car+0x14A8) : 0x2DD448(car+0x14A8); then 0x2AC bytes
+   car+0x14A8 -> car+0x1754 ($v0 = the dword at car+0x1738, as the copy loop leaves it).
+
+### 0x1DF9A0 (not a function)
+
+config/symbols.txt names 0x1DF9A0 DeformResetMeshVertices; it is an address inside 0x1DF7A8, whose
+strings are "+collide_test", "mass_list", "edge_list", "index_list" (0x400B48..0x400B88): a VU0
+mass-spring debug test (256 masses, its own VIF0 DMA kicks at 0x10008030 and its own render loop).
+Its only caller is 0x1E0558, which nothing calls or points to (no jal/j, no data word in the ELF).
+Dead in retail: no EE draw or dent comes from it, so it is not decompiled (0 calls by
+construction; the dent reset the renderer needs is the car+0x4B8 clear of the respawn path).
+
+### Debris phob pools (0x484E68 wheels, 0x494D60 panels)
+
+Owners found from the data xrefs (RefsTo) of 0x484E60..0x484EB4 and 0x494D58..0x494DAC; nothing
+else reads the arrays.
+- Wheels ('WHLP', factory 0x179158 -> ctor 0x1B3028, vtable 0x3FCE48): Init 0x1B2868 appends the
+  phob (array 0x484E68, count 0x484EA8); 0x1B3068 DetachedWheelSpawn takes the ring slot 0x484EAC
+  whether or not it is still flying (0x1B2D58 launches it, +0x1DC = race clock 0x3CDACC, +0x1E0
+  car, +0x1E4 wheel, the hub radius car+0x1A00+0x54 w+0x38 to the model at +0x10); 0x1B2DD8 (vtable
+  +0x10) clears +0x1DC and the ring index; 0x1B3180 / 0x1B3190 zero the count (and index) at scene
+  teardown (0x185378 / 0x185320).
+- Panels ('Panl', ctor 0x1E1E88, vtable 0x400EE0): the ctor allocates 0x264 bytes, appends (array
+  0x494D60, count 0x494DA0) and sets +0x200 = 0x1E6C10(4, 6, 2); dtor 0x1E29C0 decrements the count.
+  0x1E0DC8 (from 0x18CA98 at 0x18D1C8) takes the first phob with +0x1DC = 0 (car), else the one
+  with the oldest +0x204 (spawn clock).
+- Both kinds are scene objects, created by 0x2100C0 through the network create stream (0x1758B8 ->
+  0x1783E0: factory, 0x17AEC0 id, vtable+8 Init, 0x178378 into phob_list 0x447404, which is 0x800
+  bytes = 512 entries). The arrays are 16 words; the scene fills them: 12 'Panl' (4 x 3 creates,
+  0x210444..0x2105A4; measured 12 in Anoka Battle), the wheel ring from its own loop at 0x21014C.
+
+Phase A2: 0x1B3068, 0x1E1E88, 0x1E29C0, 0x1B3180, 0x1B3190 as readable C++ (src/debris_pool.cpp,
+EOD_DIFF); 0x1E0DC8 and 0x1B2868 wrapped (bodies recompiled). The scene makes fewer phobs than the
+16-word arrays: 12 'Panl' (0x210444..0x2105A4) and 5 'WHLP' (generators at 0x2100C0, measured 5),
+so the real PS2 cap is the scene count.
+
+Original behaviour (PS2, and `ExpandDebris=0`, and every online event): the wheel ring 0x484EAC
+takes its next slot even when that wheel still flies; the panel spawn takes the first phob with
++0x1DC = 0, else the oldest +0x204. A taken phob is relaunched: the earlier piece vanishes.
+
+Expanded behaviour (`ExpandDebris=1`, default, offline only; `netplay_hooks::race_rules() >= 0`
+forces the original so all peers simulate the same): the guest array stays a 16-word window that
+the recompiled readers see. Before 0x1B3068 / 0x1E0DC8 run, when the slot they would take holds a
+live phob (wheel: the ring slot; panel: window full, slot 0 is used), the wrapper moves that live
+phob to a host reserve (`std::vector`) and puts a free phob in the slot: a reserve phob whose
++0x1DC is 0, else a new phob made exactly as the scene makes them (0x1783E0): factory (wheel
+0x179158, panel 0x1E1E88), Init through vtable+8 (0x1B2868 with the scene's captured 'WHLP' create
+record / 0x1E28B8 with {'Panl', 8} from 0x2100C0), then 0x178378 into phob_list. The factory and
+Init append at the guest count, so the count is parked on slot 0 and restored; MemAlloc's lock
+panic (0x12E870: 0x3CC458 = 0 and 0x3CC460 != 0) is lifted by 0x3CC458 = 1 for that call only. The
+spawn itself then runs unchanged (and is the code EOD_DIFF checks). Nothing in flight or on the
+ground is taken while phob_list (MemAlloc(0x800) at 0x1769A8 = 512 entries, count 0x447408) has
+room; past that the original steal applies and is counted. Release: reserve phobs that come free
+are reused first; the scene's teardown destroys every phob in phob_list (the STAK heap 0x12DF20 pops
+freed blocks in any order), the panel dtor wrapper gives back the decrement of a phob it made (so
+0x494DA0 returns to 0 as on the PS2), and the host lists are dropped at 0x1B3180 / 0x1B3190 and when
+the panel count reaches 0. Made phobs keep the PhobConstruct id (no create-stream id, 0x17AEC0).
+
+### Dent loop proof (0x18CA98)
+
+`[dent]` counters in src/car_damage.cpp (replacement side only): calls, calls past
+CarCanTakeDamage 0x18AAD0, bones visited by the nearest-bone search, hits with a nearest bone
+(0x18C6B8 called) and bones moved by the spread; printed at 1, 2, 4, ... and every 1024 calls.
+
 ### Functions replaced (config/hle.txt `wrap`, `diff_run`)
 
-0x34C9F8, 0x35DBD8, 0x35A810, 0x35DD28, 0x34CA18 (src/bone_pose.cpp); 0x18CA98, 0x17B918
-(src/car_damage.cpp).
+0x34C9F8, 0x35DBD8, 0x35A810, 0x35DD28, 0x34CA18 (src/bone_pose.cpp); 0x18CA98, 0x17B918,
+0x18AFE0 (src/car_damage.cpp); 0x1B3068, 0x1E1E88, 0x1E29C0, 0x1B3180, 0x1B3190
+(src/debris_pool.cpp).
 
 ### PS2 limits (docs/PS2_LIMITS.md)
 
 Contacts per object (16) and the contact pool are tracked by `limit_note`; removing them needs the
 readers of obj+0x190 decompiled. Wheel debris (16, 0x484E68) and panel debris (16, 0x494D60) are
-owned by 0x1B3068 and 0x1E0DC8 / 0x1DF9A0, still recompiled.
+removed: grow on demand with ExpandDebris (above), `[limit]` with capacity 0.
 
 ### Not done in R3 Phase A (open)
 
-- 0x18AFE0 CarSetupDamageAndPanels and 0x1DF9A0 DeformResetMeshVertices (inside 0x1DF7A8, VU0
-  macro code) are still recompiled; the debris pools above stay at their PS2 size.
+- 0x1E0DC8 body (panel launch) and 0x1B2868 (wheel Init) are still recompiled (wrapped).
 - Phase B: multi-scene suite (P2 within 1/16 px on every posed vertex, crashes, rollovers, 8
   panels, 16 wheels), split screen, docs/NATIVE_RENDERER_SUCCESS.md.
 

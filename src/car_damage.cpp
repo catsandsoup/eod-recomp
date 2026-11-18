@@ -11,6 +11,10 @@
 //            the contact (the dent offsets car+0x4B8 that VisualCarSubmitModel 0x2189C8 uploads
 //            through 0x34CA18 -> 0x35DD28 to VU1 qword 0x90 for Skin::Offset), detaches panels
 //            past their distance (0x44AE68 table, 0x1E0DC8), raises damage and the wreck state.
+//   0x18AFE0 CarSetupDamageAndPanels(car, chassis parameters)
+//            caller 0x185470 (car setup). Finds the 8 panel helpers and their bones (car+0x13E8),
+//            the bone count (car+0x4B4), the damage multiplier (car+0x4B0) and copies the car
+//            matrix block car+0x14A8 to car+0x1754.
 //
 // As src/render_queue.cpp and src/native_world.cpp: every replacement makes the same guest calls in
 // the same order with the same return addresses, stack frame and arguments, the same memory writes
@@ -35,10 +39,19 @@
 #include "core/memory.h"
 
 #include <cstdint>
+#include <cstdio>
 
 extern "C" {
 void f_0017B918_orig(void);
 void f_0018CA98_orig(void);
+void f_0018AFE0_orig(void);
+void f_003A5FD0(void);  // memset
+void f_00205A58(void);  // ModelFindHelper(model, name, out node)
+void f_00176768(void);  // GameGetCurrent
+void f_00125388(void);  // ProfileGet(id)
+void f_001DB330(void);  // CarIsPlayerControlled(car index)
+void f_002DD448(void);  // MatrixIdentity(out)
+void f_002DD5B8(void);  // MatrixCopy(src, out)
 void f_0017B818(void);  // ContactApply(obj, impulse, point)
 void f_0018AAD0(void);  // CarCanTakeDamage(car)
 void f_0018C6B8(void);  // CarDentBone(car, bone, impulse, -1, 0)
@@ -197,15 +210,28 @@ enum : uint32_t {
 };
 
 struct Frame {
-    uint32_t caller_sp;
+    uint32_t caller_sp, size;
     uint64_t ra;
-    Frame() : caller_sp(reg(29)), ra(g_ee.r[31].ud[0]) { set(29, (int32_t)(caller_sp - kFrame)); }
+    explicit Frame(uint32_t frame_size = kFrame) : caller_sp(reg(29)), size(frame_size), ra(g_ee.r[31].ud[0]) {
+        set(29, (int32_t)(caller_sp - size));
+    }
     ~Frame() {
         set(29, (int32_t)caller_sp);
         g_ee.r[31].ud[0] = ra;
     }
-    uint32_t sp() const { return caller_sp - kFrame; }
+    uint32_t sp() const { return caller_sp - size; }
 };
+
+// [dent] counters (replacement side only): proof the dent loop runs (docs/NATIVE_RENDERER.md R3)
+struct DentStats {
+    uint64_t calls = 0, can_damage = 0, bones_searched = 0, nearest = 0, spread = 0;
+} g_dent;
+void dent_report() {
+    std::fprintf(stderr, "[dent] 18ca98: %llu calls, %llu past 18aad0, %llu bones searched, %llu dents (18c6b8), %llu bones spread\n",
+                 (unsigned long long)g_dent.calls, (unsigned long long)g_dent.can_damage,
+                 (unsigned long long)g_dent.bones_searched, (unsigned long long)g_dent.nearest,
+                 (unsigned long long)g_dent.spread);
+}
 
 // Dents every free bone near the hit along the impulse: the nearest bone within 1.5 of the contact
 // (dent offsets weighted 1.8) takes the impulse (0x18C6B8); every other bone moves along the
@@ -219,6 +245,7 @@ uint32_t dent_bones(uint32_t car, uint32_t sp) {
     for (int32_t i = 1; i < count; i++) {
         const uint32_t bone = model + 0x20 + 0x34u * (uint32_t)i;
         if (lw(bone + 0x30) != 0) continue;
+        g_dent.bones_searched++;
         const uint32_t dent = car + 0x4B8 + 12u * (uint32_t)i;
         const float reach = bf(kDentReach);
         const float x = fadd_ps2(lf(bone + 0x1C), fmul_ps2(lf(dent), reach));
@@ -236,6 +263,7 @@ uint32_t dent_bones(uint32_t car, uint32_t sp) {
         }
     }
     if (!nearest) return 0;
+    g_dent.nearest++;
 
     const uint32_t slot = lwu(nearest);
     copy3(sp + kOld, car + 0x4B8 + 12u * slot);
@@ -270,6 +298,7 @@ uint32_t dent_bones(uint32_t car, uint32_t sp) {
         const float r2 = fmax_ps2(madd3(rx, rx, ry, ry, rz, rz), bf(kSpreadMin));
         const float falloff = fmin_ps2(fdiv_ps2(bf(kSpread), r2), bf(kOne));
         int32_t shade = (int32_t)(fb(oz) & 0xFF) > 0x1F ? (int32_t)(fb(oz) & 0xFF) : 0x20;
+        g_dent.spread++;
         const float push = fmul_ps2(fneg(behind), falloff);
         const float z1 = fadd_ps2(oz, fmul_ps2(nz, push));
         const float x1 = fadd_ps2(ox, fmul_ps2(nx, push));
@@ -403,8 +432,14 @@ void apply_collision_damage() {
     const int32_t other = (int32_t)reg(8);
     const uint32_t surface = reg(9);
 
+    const bool report = (++g_dent.calls & (g_dent.calls - 1)) == 0 || g_dent.calls % 1024 == 0;
+    struct Report {
+        bool on;
+        ~Report() { if (on) dent_report(); }
+    } at_end{report};
     call(f_0018AAD0, 0x18CAF0);
     if (g_ee.r[2].ud[0] == 0) return;
+    g_dent.can_damage++;
 
     copy3(sp + kImpulse, impulse);
     if (negate) {
@@ -540,8 +575,133 @@ void apply_collision_damage() {
     sw(car + 0x1BF8, 0);
 }
 
+
+// ---- 0x18AFE0 ----
+// stack frame 0xE0: +0x00 helper point, +0x10 search delta / zero vector, +0x20 search delta
+constexpr uint32_t kSetupFrame = 0xE0;
+constexpr uint32_t kFar = 0x4B189680;          // 1e7: nearest-bone search start (0x18B178)
+constexpr uint32_t kMassScale = 0x3EE8B439;    // 0.4545 (0x18B508)
+constexpr uint32_t kTweakMass = 0x44E34000;    // 1818.0 (0x18B514)
+constexpr uint32_t kUpgradeMin = 0xB8D1B717;   // -1e-4: upgrade factor floor (0x18B52C)
+constexpr uint32_t kMsgNoHelper = 0x3F9FD0;    // "car: can't find helper %s ..." (0x18B4B4)
+constexpr uint32_t kDamageTweak = 0x3FA018;    // "damage_tweak" (0x18B500)
+constexpr uint32_t kPlayerTweak = 0x3FA028;    // "player_damage_tweak" (0x18B598)
+constexpr uint32_t kGameRule = 0x3CE4F0;       // 0: no damage, 1: half damage (0x18B5D4)
+constexpr int32_t kHuman = 0x50, kRemote = 0x56;  // car+0x1E0 driver kinds (0x18B560, 0x18B5B0)
+
+// The bone 1..n-1 whose rest position (bone+0x1C) is nearest the point at `at` (sqrt.s distance,
+// first strict minimum from 1e7), 0 when there is none. The deltas go to the frame as the EE leaves them.
+uint32_t nearest_bone(uint32_t model, uint32_t at, uint32_t delta) {
+    const int32_t n = lw(model + 0x1C);
+    float best = bf(kFar);
+    uint32_t found = 0;
+    for (int32_t i = 1; i < n; i++) {
+        const uint32_t rest = model + 0x20 + 0x34u * (uint32_t)i + 0x1C;
+        const float dx = fsub_ps2(lf(at), lf(rest));
+        sf(delta, dx);
+        const float dy = fsub_ps2(lf(at + 4), lf(rest + 4));
+        sf(delta + 4, dy);
+        const float dz = fsub_ps2(lf(at + 8), lf(rest + 8));
+        const float d = fsqrt_ps2(madd3(dx, dx, dy, dy, dz, dz));
+        sf(delta + 8, dz);
+        if (fcmp_lt(d, best)) best = d, found = (uint32_t)i;
+    }
+    return found;
+}
+
+// p = R v + T with the helper node's 3x3 (node[0..8], columns of the EE mula/madda/madd) and its
+// translation node+0x24.
+void node_point(uint32_t node, float v0, float v1, float v2, uint32_t out) {
+    sf(out, madd3(v0, lf(node), v1, lf(node + 0xC), v2, lf(node + 0x18)));
+    sf(out + 4, madd3(v0, lf(node + 4), v1, lf(node + 0x10), v2, lf(node + 0x1C)));
+    sf(out + 8, madd3(v0, lf(node + 8), v1, lf(node + 0x14), v2, lf(node + 0x20)));
+    sf(out, fadd_ps2(lf(out), lf(node + 0x24)));
+    sf(out + 4, fadd_ps2(lf(out + 4), lf(node + 0x28)));
+    sf(out + 8, fadd_ps2(lf(out + 8), lf(node + 0x2C)));
+}
+
+inline float vcall_tweak(uint32_t obj, uint32_t name, uint32_t ra) {
+    set(4, (int32_t)obj), set(5, (int32_t)name);
+    g_ee.fpr[12].f = bf(kOne);
+    call_at(lwu(lwu(obj) + 0x28), ra);
+    return g_ee.fpr[0].f;
+}
+
+void setup_damage_and_panels() {
+    Frame fr(kSetupFrame);
+    const uint32_t sp = fr.sp();
+    const uint32_t car = reg(4), par = reg(5);
+
+    set(4, (int32_t)(car + 0x13E8)), set(5, 0), set(6, 0xC0);
+    call(f_003A5FD0, 0x18B040);
+    for (uint32_t i = 0; i < 8; i++) {
+        const uint32_t panel = kPanelTable + 0x40 * i, st = car + 0x13E8 + 0x18 * i;
+        set(4, lw(car + 0x3D0)), set(5, lw(panel + 4)), set(6, (int32_t)st);
+        call(f_00205A58, 0x18B074);
+        if (g_ee.r[2].ud[0] == 0) {
+            set(4, (int32_t)kMsgNoHelper), set(5, lw(panel + 4)), set(6, (int32_t)(car + 0x1E4)), set(7, (int32_t)(car + 0x224));
+            call(f_00331E48, 0x18B4C4);
+            continue;
+        }
+        const uint32_t node = lwu(st), model = lwu(car + 0x25C);
+        node_point(node, lf(panel + 0x24), lf(panel + 0x28), lf(panel + 0x2C), sp);
+        sw(st + 4, nearest_bone(model, sp, sp + 0x10));
+        sw(sp + 0x10, 0), sw(sp + 0x14, 0), sw(sp + 0x18, 0);
+        node_point(node, 0.0f, 0.0f, 0.0f, sp);
+        sw(st + 8, nearest_bone(model, sp, sp + 0x20));
+    }
+
+    const uint32_t model = lwu(car + 0x25C);
+    const uint32_t shape = lwu(model);
+    sw(car + 0x4B4, lwu(model + 0x1C));
+    const float tweak = vcall_tweak(shape, kDamageTweak, 0x18B504);
+    const float per_mass = fdiv_ps2(bf(kTweakMass), fmul_ps2(lf(par + 8), bf(kMassScale)));
+    float damage = fmul_ps2(tweak, per_mass);
+    sf(car + 0x4B0, damage);
+    const float upgrade = lf(car + 0x2EC);
+    damage = fcmp_le(bf(kUpgradeMin), upgrade) ? fmul_ps2(damage, upgrade) : bf(fb(upgrade) & 0x7FFFFFFFu);
+    sf(car + 0x4B0, damage);
+
+    int32_t who = lw(car + 0x1E0);
+    bool rule = false;
+    if (who == kHuman) {
+        call(f_00176768, 0x18B574);
+        set(4, lw(reg(2) + 0x40));
+        call(f_00125388, 0x18B57C);
+        const float player = vcall_tweak(lwu(reg(2) + 0x20), kPlayerTweak, 0x18B59C);
+        sf(car + 0x4B0, fmul_ps2(lf(car + 0x4B0), player));
+        who = lw(car + 0x1E0);
+        rule = who == kHuman;
+    }
+    if (!rule && who == kRemote) {
+        set(4, lw(car + 0x1DC));
+        call(f_001DB330, 0x18B5C4);
+        rule = g_ee.r[2].ud[0] != 0;
+    }
+    if (rule) {
+        const int32_t r = lw(kGameRule);
+        if (r == 1)
+            sf(car + 0x4B0, fmul_ps2(lf(car + 0x4B0), bf(kHalf)));
+        else if (r == 0)
+            sw(car + 0x4B0, 0);
+    }
+
+    const uint32_t src = lwu(car + 0x300);
+    if (src == 0) {
+        set(4, (int32_t)(car + 0x14A8));
+        call(f_002DD448, 0x18B634);
+    } else {
+        set(4, (int32_t)src), set(5, (int32_t)(car + 0x14A8));
+        call(f_002DD5B8, 0x18B624);
+    }
+    for (uint32_t off = 0; off < 0x2AC; off += 4) sw(car + 0x1754 + off, lwu(car + 0x14A8 + off));
+    g_ee.r[2].ud[0] = (uint64_t)lwu(car + 0x1738) | (uint64_t)lwu(car + 0x173C) << 32;  // last ld of the copy
+}
+
 }  // namespace
 
 extern "C" void f_0017B918(void) { diff_run(0x0017B918, contact_record, f_0017B918_orig); }
 // called by f_0018CA98 (src/game_patches.cpp) when the invincibility cheat lets the damage through
 extern "C" void car_apply_collision_damage(void) { diff_run(0x0018CA98, apply_collision_damage, f_0018CA98_orig); }
+// called by f_0018AFE0 (src/game_patches.cpp), which applies the CarDurability scale after it
+extern "C" void car_setup_damage_and_panels(void) { diff_run(0x0018AFE0, setup_damage_and_panels, f_0018AFE0_orig); }

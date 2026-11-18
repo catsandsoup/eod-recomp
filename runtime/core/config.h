@@ -81,6 +81,9 @@ struct Config {
     // its menu durability ratings follow it) multiplies the damage it takes
     bool car_durability = false;
     bool manual_recovery = false; // humans: SELECT recovery only, no countdown reset
+    // detached wheel/panel debris pools grow past the scene's PS2 phob count (offline only;
+    // online events keep the PS2 pools so every peer simulates the same; src/debris_pool.cpp)
+    bool expand_debris = true;
     // [Cheats & Gameplay Mods]
     std::string nickname; // empty chooses a new callsign for each online session
     bool unlock_all = true;            // unlock all cars, tracks, dares, and feats out of the box
