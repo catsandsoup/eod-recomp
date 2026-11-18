@@ -260,3 +260,43 @@ input? Findings feed `docs/SCENE_CAPTURE.md`.
 
 Decision: build EOD's capture at its own `vu_execute`/`xgkick` boundary (spike in
 `runtime/vu/scene_capture.cpp`); no third-party code copied.
+
+## Native renderer replacing VU1/GS (checked 2026-11-18)
+
+Prior work on feeding a native renderer from game data instead of emulating VU1 and the GS:
+
+- [OpenGOAL](https://opengoal.dev/docs/porting-info/graphics) (Jak and Daxter): every PS2 VU1
+  renderer was ported to a native OpenGL renderer that reads the game's own DMA/data
+  ([tfrag port notes](https://opengoal.dev/docs/porting-info/drawable_and_tfrag/porting_tfrag)).
+  Closest precedent for this project's plan: one native owner per GS job, decided per renderer.
+- [Celosia](https://raw.githubusercontent.com/henrykun55/celosia/main/README.md) (Shadow of the
+  Colossus, PS2Recomp-based): native Metal/GLES renderer reading the model data directly; VU1 images
+  compiled to C++.
+- [Gitaroo Man Native](https://raw.githubusercontent.com/erinxocon/gitaroo-man-native/HEAD/README.md)
+  (PS2Recomp fork): native C++ VU1 mesh path with a lockstep verify mode against the recompiled
+  microprogram. Same idea as `EOD_DIFF` (runtime/core/diff_harness.h), which this project already
+  uses for EE functions; adopt the same lockstep check for any native VU1 replacement.
+- [PS2Recomp](https://github.com/ran-j/PS2Recomp): upstream lists VU1 microcode as incomplete and the
+  GS as external; nothing to reuse for the native renderer.
+- [Filament](https://github.com/google/filament): v1.71.6 (June 2026) was the newest release found
+  through an aggregator; confirm on the releases page before pinning. `matc` must come from the same
+  release as the runtime library.
+
+Reuse decision: no existing project decompiles this game's render code, so the EE side is done
+here (docs/EE_RENDER_SUBMISSION.md). The OpenGOAL per-renderer ownership model and the Gitaroo
+lockstep verification are adopted as method.
+
+## plume (native renderer interface, stage R0)
+
+- Source: https://github.com/renderbag/plume (MIT), pinned at commit
+  `b619e50125fca1631dddbf8b5d8e8eee8734bcec`; VulkanMemoryAllocator at the revision plume pins
+  (`29b35ea4232688c0f42cdff0c10848290760a417`). Both fetched by CMake (Windows, `EOD_PLUME`).
+- Only `plume_vulkan.cpp` is built; it compiles against the project's volk and Vulkan-Headers
+  (vulkan-sdk-1.4.357.0) and holds the only volk implementation.
+- Local patch `cmake/patches/plume-create-options.patch`: `plume::vulkanCreateOptions` sets the
+  application name, instance API version and a hook that adds device extensions, pNext structs and
+  core-feature edits before `vkCreateDevice`; VMA's API version is clamped to the device's. Chosen
+  over adopting an external device because plume keeps creating and owning the device unchanged.
+- The Vulkan GS borrows plume's instance, device and queue (runtime/render/plume_device.cpp) and
+  holds plume's per-queue mutex for submit, present and wait-idle. `EOD_PLUME=0` restores the GS's
+  own instance and device. macOS and Linux keep the GS's own device until the GS uses volk.

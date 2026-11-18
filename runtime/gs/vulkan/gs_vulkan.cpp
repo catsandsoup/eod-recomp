@@ -2624,8 +2624,10 @@ bool start(bool with_window) {
         WARN("vulkan: %s", e.what());
         // SDL can now recreate the window for software rendering. Detach its
         // Vulkan surface first, including failures partway through initialization.
-        if (g_dev && g_dev->device)
+        if (g_dev && g_dev->device) {
+            vkgs::Context::QueueLock lock(g_dev->queueMutex);
             vkDeviceWaitIdle(g_dev->device);
+        }
         if (g_dev && g_dev->swap)
             vkDestroySwapchainKHR(g_dev->device, g_dev->swap, nullptr);
         if (g_dev && g_dev->surface) {

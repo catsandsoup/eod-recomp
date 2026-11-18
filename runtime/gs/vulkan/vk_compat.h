@@ -25,6 +25,9 @@
 // would collide with it.
 #include <volk.h>
 #include "../../platform/platform.h"
+#ifdef EOD_PLUME
+#include "../../render/plume_device.h"
+#endif
 #else
 #include <vulkan/vulkan.h>
 #endif
@@ -239,6 +242,20 @@ struct Context {
     VkPhysicalDevice physical{};
     VkDevice device{};
     VkQueue queue{};
+    // The device is plume's (runtime/render/plume_device.h): `queue` is shared with plume, and
+    // every host access to it holds `queueMutex`. Null when the GS created its own device.
+    std::mutex *queueMutex = nullptr;
+    struct QueueLock {
+        std::mutex *m;
+        explicit QueueLock(std::mutex *m) : m(m) {
+            if (m)
+                m->lock();
+        }
+        ~QueueLock() {
+            if (m)
+                m->unlock();
+        }
+    };
     uint32_t family{};
     VkCommandPool pool{};
     VkCommandBuffer cmd{};
@@ -597,6 +614,7 @@ struct Context {
         ca.commandBufferCount = 1;
         if (vkAllocateCommandBuffers(device, &ca, &tc) != VK_SUCCESS)
             return;
+        QueueLock lock(queueMutex); // TracyVkContext submits a calibration batch
         tracyVk = TracyVkContext(physical, device, queue, tc);
         TracyVkContextName(tracyVk, "GPU", 3);
     }
@@ -749,7 +767,10 @@ struct Context {
             s.signalSemaphoreCount = 1;
             s.pSignalSemaphores = &complete;
         }
-        require(vkQueueSubmit(queue, 1, &s, fence), "submit");
+        {
+            QueueLock lock(queueMutex);
+            require(vkQueueSubmit(queue, 1, &s, fence), "submit");
+        }
         windowUploaded = false;
         ++submit_count;
         ++cntSubmits;
@@ -1490,6 +1511,11 @@ inline bool Context::init(bool withWindow) {
 #ifdef _WIN32
     if (volkInitialize() != VK_SUCCESS)
         throw std::runtime_error("no Vulkan loader (vulkan-1.dll)");
+#ifdef EOD_PLUME
+    // plume's instance has the surface extensions and API 1.3 this instance asks for.
+    instance = plume_device::instance();
+    const bool plumeInstance = instance != VK_NULL_HANDLE;
+#endif
     if (withWindow) {
         window = platform_native_window();
         exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
@@ -1522,7 +1548,8 @@ inline bool Context::init(bool withWindow) {
     i.flags = portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
     i.enabledExtensionCount = (uint32_t)exts.size();
     i.ppEnabledExtensionNames = exts.data();
-    require(vkCreateInstance(&i, nullptr, &instance), "instance");
+    if (!instance)
+        require(vkCreateInstance(&i, nullptr, &instance), "instance");
 #ifdef _WIN32
     volkLoadInstance(instance);
     if (withWindow) {
@@ -1626,7 +1653,14 @@ inline bool Context::init(bool withWindow) {
     d.pEnabledFeatures = &enabled;
     d.enabledExtensionCount = (uint32_t)dext.size();
     d.ppEnabledExtensionNames = dext.data();
-    require(vkCreateDevice(physical, &d, nullptr, &device), "device");
+#ifdef EOD_PLUME
+    // plume's device: every extension above, dynamic rendering, and every supported core
+    // feature (dual-source blend, depth clamp and anisotropy among them).
+    if (plumeInstance && !plume_device::create_device(physical, family, dext, core13, device, queue, queueMutex))
+        fprintf(stderr, "[vulkan] the GS creates its own device on plume's instance\n");
+#endif
+    if (!device)
+        require(vkCreateDevice(physical, &d, nullptr, &device), "device");
 #ifdef _WIN32
     volkLoadDevice(device);
     if (!core13) {
@@ -1637,7 +1671,8 @@ inline bool Context::init(bool withWindow) {
     if (!core13)
         throw std::runtime_error("Vulkan 1.3 required");
 #endif
-    vkGetDeviceQueue(device, family, 0, &queue);
+    if (!queue)
+        vkGetDeviceQueue(device, family, 0, &queue);
     if (displayTiming) {
         refreshDuration = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
             vkGetDeviceProcAddr(device, "vkGetRefreshCycleDurationGOOGLE"));
@@ -1735,7 +1770,10 @@ inline bool Context::resize() {
     cadence = {};
     refreshQueryCountdown = 0;
     submit();
-    vkQueueWaitIdle(queue);
+    {
+        QueueLock lock(queueMutex);
+        vkQueueWaitIdle(queue);
+    }
     for (auto sem : presentDone)
         vkDestroySemaphore(device, sem, nullptr);
     presentDone.clear();
@@ -1876,7 +1914,11 @@ inline bool Context::present() {
         timing.pTimes = &time;
         p.pNext = &timing;
     }
-    auto r = vkQueuePresentKHR(queue, &p);
+    VkResult r;
+    {
+        QueueLock lock(queueMutex);
+        r = vkQueuePresentKHR(queue, &p);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         resize();
     else

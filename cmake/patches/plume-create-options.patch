@@ -1,0 +1,70 @@
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -448,6 +448,22 @@
+         bool endCapture() override;
+     };
+ 
++    // Application overrides for instance and device creation (patch carried by the embedding
++    // application). Set before CreateVulkanInterface() / createDevice(); defaults keep upstream behaviour.
++    struct VulkanCreateOptions {
++        const char *applicationName = "plume";
++        uint32_t apiVersion = VK_API_VERSION_1_2;
++        // Called once the physical device is chosen, before vkCreateDevice. It may append device
++        // extensions the device supports (no duplicates of `extensions`), push structs onto
++        // `createChain` (the device create pNext chain) and edit `features` (by default every
++        // core feature the device supports is enabled).
++        void (*deviceCreateHook)(VkPhysicalDevice physicalDevice, std::vector<const char *> &extensions,
++                                 void *&createChain, VkPhysicalDeviceFeatures &features, void *userData) = nullptr;
++        void *userData = nullptr;
++    };
++
++    extern VulkanCreateOptions vulkanCreateOptions;
++
+     struct VulkanInterface : RenderInterface {
+         VkInstance instance = VK_NULL_HANDLE;
+         VkApplicationInfo appInfo = {};
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -28,6 +28,8 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++    VulkanCreateOptions vulkanCreateOptions;
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -4075,6 +4077,10 @@
+ 
+         VkDeviceCreateInfo createInfo = {};
+         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
++        if (vulkanCreateOptions.deviceCreateHook != nullptr) {
++            vulkanCreateOptions.deviceCreateHook(physicalDevice, enabledExtensions, createDeviceChain, deviceFeatures.features, vulkanCreateOptions.userData);
++        }
++
+         createInfo.pNext = createDeviceChain;
+         createInfo.pQueueCreateInfos = queueCreateInfos.data();
+         createInfo.queueCreateInfoCount = uint32_t(queueCreateInfos.size());
+@@ -4121,7 +4127,7 @@
+         allocatorInfo.device = vk;
+         allocatorInfo.pVulkanFunctions = &vmaFunctions;
+         allocatorInfo.instance = renderInterface->instance;
+-        allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
++        allocatorInfo.vulkanApiVersion = std::min(renderInterface->appInfo.apiVersion, physicalDeviceProperties.apiVersion);
+ 
+         res = vmaCreateAllocator(&allocatorInfo, &allocator);
+         if (res != VK_SUCCESS) {
+@@ -4504,11 +4510,11 @@
+         }
+ 
+         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+-        appInfo.pApplicationName = "plume";
++        appInfo.pApplicationName = vulkanCreateOptions.applicationName;
+         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+         appInfo.pEngineName = "plume";
+         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+-        appInfo.apiVersion = VK_API_VERSION_1_2;
++        appInfo.apiVersion = vulkanCreateOptions.apiVersion;
+ 
+         VkInstanceCreateInfo createInfo = {};
+         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;

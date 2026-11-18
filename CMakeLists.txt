@@ -74,6 +74,7 @@ file(GLOB_RECURSE RUNTIME_SOURCES
   ${CMAKE_SOURCE_DIR}/runtime/vu/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/iop/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/spu/*.cpp
+  ${CMAKE_SOURCE_DIR}/runtime/render/*.cpp
   ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.c)
 list(APPEND RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/main.cpp)
 if(WIN32)
@@ -174,7 +175,37 @@ if(WIN32)
       DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(eod_vulkan_headers eod_volk)
     file(GLOB VULKAN_GS_SOURCES ${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/*.cpp)
-    list(APPEND PLATFORM_SOURCES ${VULKAN_GS_SOURCES} ${eod_volk_SOURCE_DIR}/volk.c)
+    list(APPEND PLATFORM_SOURCES ${VULKAN_GS_SOURCES})
+    # The native renderer's render interface (docs/NATIVE_RENDERER.md). plume creates the one
+    # Vulkan instance and device; the Vulkan GS borrows them (runtime/render/plume_device.cpp).
+    # Only plume's Vulkan backend is built: its D3D12 backend needs the Windows SDK's DirectX
+    # headers. plume's own volk/Vulkan-Headers submodules are not used: it compiles against the
+    # volk and headers above, and its translation unit holds the only volk implementation.
+    option(EOD_PLUME "plume render interface owns the Vulkan device" ON)
+    if(EOD_PLUME)
+      # GitHub tarballs omit submodules: VMA is fetched at the revision plume pins.
+      FetchContent_Declare(eod_plume
+        URL https://codeload.github.com/renderbag/plume/tar.gz/b619e50125fca1631dddbf8b5d8e8eee8734bcec
+        URL_HASH SHA256=f8367cab0cb2ccdb3804410a501eec3e6df4c3ccd2a86b5b92426e3c27545b45
+        PATCH_COMMAND git apply --whitespace=nowarn ${CMAKE_SOURCE_DIR}/cmake/patches/plume-create-options.patch
+        SOURCE_SUBDIR none
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      FetchContent_Declare(eod_vma
+        URL https://codeload.github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/tar.gz/29b35ea4232688c0f42cdff0c10848290760a417
+        URL_HASH SHA256=c33da36cbb9328129e8c7e482107c2620b19c9a585c861e749884c4c575bf9bd
+        SOURCE_SUBDIR none
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      FetchContent_MakeAvailable(eod_plume eod_vma)
+      add_library(eod_plume STATIC ${eod_plume_SOURCE_DIR}/plume_vulkan.cpp)
+      target_include_directories(eod_plume SYSTEM PUBLIC ${eod_plume_SOURCE_DIR} ${eod_volk_SOURCE_DIR}
+                                 ${eod_vulkan_headers_SOURCE_DIR}/include ${eod_vma_SOURCE_DIR}/include)
+      # NDEBUG always: plume's debug builds turn on the validation layer and require
+      # VK_EXT_debug_utils, which would change the shipped device.
+      target_compile_definitions(eod_plume PRIVATE NDEBUG NOMINMAX WIN32_LEAN_AND_MEAN)
+      target_compile_options(eod_plume PRIVATE -w)
+    else()
+      list(APPEND PLATFORM_SOURCES ${eod_volk_SOURCE_DIR}/volk.c)
+    endif()
   endif()
 else()
   option(EOD_VULKAN "Build the Vulkan GS backend" ON)
@@ -370,7 +401,14 @@ if(EOD_VULKAN)
   if(WIN32)
     target_compile_definitions(eod PRIVATE EOD_HW_SELECT VK_NO_PROTOTYPES)
     target_include_directories(eod PRIVATE ${eod_vulkan_headers_SOURCE_DIR}/include ${eod_volk_SOURCE_DIR})
+    if(EOD_PLUME)
+      target_link_libraries(eod PRIVATE eod_plume)
+      target_compile_definitions(eod PRIVATE EOD_PLUME)
+    endif()
   else()
+    # macOS (MoltenVK) and Linux keep the GS's own device for now: the GS calls the loader's
+    # prototypes there, which clash with plume's volk function pointers of the same names.
+    # Sharing needs the GS on volk first.
     target_link_libraries(eod PRIVATE Vulkan::Vulkan)
   endif()
   include(CTest)
