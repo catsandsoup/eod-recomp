@@ -658,6 +658,8 @@ class ViewportGL(QOpenGLWidget):
     scatterStrokeCompleted = Signal(list)            # list of {"model_key", "pos", "rot_hpr", "scale"}
     dropToGroundRequested = Signal()
     contextMenuRequested = Signal(object)            # QPoint global pos
+    multiObjectTransformed = Signal(list, str)       # [(obj, old_p, old_r, old_s, new_p, new_r, new_s), ...], label
+    selectionChanged = Signal(list)                  # list[WorldObject]
     statsUpdated = Signal(dict)
     statusMessage = Signal(str)
 
@@ -724,6 +726,7 @@ class ViewportGL(QOpenGLWidget):
 
         # Selection
         self.selected_obj: WorldObject | None = None
+        self.selected_objects: list[WorldObject] = []
         self.selected_road_node_id: int | None = None
         self.selected_marker: WorldMarker | None = None
         self.selected_barrier_idx: int = -1
@@ -743,6 +746,7 @@ class ViewportGL(QOpenGLWidget):
         self._gizmo_drag_orig_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._gizmo_drag_orig_rot: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._gizmo_drag_orig_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+        self._gizmo_drag_multi: list[tuple[WorldObject, tuple[float, float, float], tuple[float, float, float], tuple[float, float, float], float]] = []
         self._gizmo_drag_orig_hdg: float = 0.0
         self._dragging_road_node: bool = False
         self._drag_road_orig_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -758,6 +762,7 @@ class ViewportGL(QOpenGLWidget):
         self._vao_empty = 0
         self._gl_textures: dict[str, tuple[int, bool]] = {}  # name -> (tex_id, cutout)
         self._static_batches: list[dict[str, Any]] = []
+        self._blend_batches: list[dict[str, Any]] = []
         self._sel_batches: list[dict[str, Any]] = []
         self._grid_vao = 0
         self._grid_vbo = 0
@@ -817,6 +822,7 @@ class ViewportGL(QOpenGLWidget):
     def set_world(self, world: TrackWorld) -> None:
         self.world = world
         self.selected_obj = None
+        self.selected_objects = []
         self.selected_road_node_id = None
         self.selected_marker = None
         self.road_chain_last_node = None
@@ -947,11 +953,36 @@ class ViewportGL(QOpenGLWidget):
         self.statusMessage.emit(f"Collision Overlay {'ON' if checked else 'OFF'}")
         self.update()
 
+    def set_event_template(self, template_name: str) -> None:
+        """Live-switch the active Event Template filter in <1 ms (rebuilds static batches cleanly)."""
+        if self.world is None:
+            return
+        if self.world.active_event_template == template_name:
+            return
+        self.world.active_event_template = template_name
+        # Drop any selected objects no longer visible in this template
+        vis = [o for o in self.selected_objects if self.world.object_visible_in_event_template(o)]
+        if len(vis) != len(self.selected_objects):
+            self.select_objects(vis, emit=True)
+        self._static_dirty = True
+        self._sel_dirty = True
+        self.update()
+
     def select_object(self, obj: WorldObject | None, emit: bool = True) -> None:
+        self.select_objects([obj] if obj is not None else [], emit=emit)
+
+    def select_objects(self, objs: list[WorldObject], emit: bool = True) -> None:
         prev_road = self.selected_road_node_id
         prev_marker = self.selected_marker
-        self.selected_obj = obj
-        if obj is not None:
+        clean: list[WorldObject] = []
+        seen: set[str] = set()
+        for o in objs:
+            if o is not None and not o.deleted and o.obj_id not in seen:
+                seen.add(o.obj_id)
+                clean.append(o)
+        self.selected_objects = clean
+        self.selected_obj = clean[-1] if clean else None
+        if clean:
             self.selected_road_node_id = None
             self.selected_marker = None
             self.selected_barrier_idx = -1
@@ -962,12 +993,25 @@ class ViewportGL(QOpenGLWidget):
         self._sel_dirty = True
         self.update()
         if emit:
-            self.objectSelected.emit(obj)
+            self.objectSelected.emit(self.selected_obj)
+            self.selectionChanged.emit(list(self.selected_objects))
+
+    def toggle_object_selection(self, obj: WorldObject, emit: bool = True) -> None:
+        """Shift+Click toggle: add/remove `obj` in multi-selection."""
+        if obj is None or obj.deleted:
+            return
+        cur = [o for o in self.selected_objects if not o.deleted]
+        if any(o.obj_id == obj.obj_id for o in cur):
+            cur = [o for o in cur if o.obj_id != obj.obj_id]
+        else:
+            cur.append(obj)
+        self.select_objects(cur, emit=emit)
 
     def select_road_node(self, node_id: int | None, emit: bool = True) -> None:
         self.selected_road_node_id = node_id
         if node_id is not None:
             self.selected_obj = None
+            self.selected_objects = []
             self.selected_marker = None
             self.selected_barrier_idx = -1
             self._sel_dirty = True
@@ -982,6 +1026,7 @@ class ViewportGL(QOpenGLWidget):
         self.selected_marker = marker
         if marker is not None:
             self.selected_obj = None
+            self.selected_objects = []
             self.selected_road_node_id = None
             self.selected_barrier_idx = -1
             self._sel_dirty = True
@@ -995,6 +1040,7 @@ class ViewportGL(QOpenGLWidget):
         self.selected_barrier_idx = int(rec_idx)
         if rec_idx >= 0:
             self.selected_obj = None
+            self.selected_objects = []
             self.selected_road_node_id = None
             self.selected_marker = None
             self._sel_dirty = True

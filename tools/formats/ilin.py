@@ -394,10 +394,54 @@ def decode(data, context):
     return view
 
 
-def encode(data, edits):
+def recalculate_geometry(data):
+    """Recalculate every node's unit tangent (dirX, dirZ), segment_length,
+    cumulative distance along the main loop, and the 3 header lap-length floats.
+
+    Preserves file size, node count, pointer fixup table, and all unknown/side fields.
+    """
+    buf = bytearray(data)
+    layout = _layout(bytes(buf))
+    base = layout["nodes_offset"]
+    count = layout["count"]
+    if count <= 0:
+        return bytes(buf)
+
+    order, closed = main_loop(bytes(buf))
+    # Recompute dirX, dirZ and segment_length for every node that has a valid next pointer
+    seg_lengths = [0.0] * count
+    for i in range(count):
+        o = base + i * NODE_SIZE
+        x, z = struct.unpack_from("<2f", buf, o)
+        nxt_idx = _node_index(layout, _u32(buf, o + 20))
+        if nxt_idx is not None:
+            no = base + nxt_idx * NODE_SIZE
+            nx, nz = struct.unpack_from("<2f", buf, no)
+            dx, dz = nx - x, nz - z
+            seg = math.hypot(dx, dz)
+            seg_lengths[i] = seg
+            if seg > 1e-6:
+                struct.pack_into("<2f", buf, o + 8, dx / seg, dz / seg)
+            struct.pack_into("<f", buf, o + 24, seg)
+
+    # Recompute cumulative distance along main loop and header lap length
+    total_len = 0.0
+    for idx_in_order, node_i in enumerate(order):
+        o = base + node_i * NODE_SIZE
+        struct.pack_into("<f", buf, o + 28, total_len)
+        if closed or idx_in_order < len(order) - 1:
+            total_len += seg_lengths[node_i]
+
+    if order and total_len > 0.0:
+        struct.pack_into("<3f", buf, 12, total_len, total_len, total_len)
+
+    return bytes(buf)
+
+
+def encode(data, edits, *, recalculate=False):
     data = bytearray(data)
     if not edits:
-        return bytes(data)
+        return recalculate_geometry(bytes(data)) if recalculate else bytes(data)
     layout = _layout(bytes(data))
     for fid, value in edits.items():
         match = _NODE_ID.match(str(fid))
@@ -411,4 +455,5 @@ def encode(data, edits):
         if abs(value) > _LIMIT:
             raise ValueError(f"Node {index} {axis.upper()} must be between -{_LIMIT:.0f} and {_LIMIT:.0f} metres.")
         struct.pack_into("<f", data, layout["nodes_offset"] + index * NODE_SIZE + (0 if axis == "x" else 4), float(value))
-    return bytes(data)
+    out = bytes(data)
+    return recalculate_geometry(out) if recalculate else out

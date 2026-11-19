@@ -89,31 +89,227 @@ def discover_cars(game_dir: Path | str) -> list[Path]:
     )
 
 
-def discover_track_events(game_dir: Path | str, display_name: str) -> list[str]:
-    """Read real contest/event names for a track from DATA/RES/COMMON.RES#<track>_eves.val."""
+# Canonical event display names matching src/session_start.cpp canonical_contest_alias()
+_EVENT_TYPE_TO_DISPLAY: dict[str, str] = {
+    "battle": "Battle (Free Roam)",
+    "c_battle": "Battle (Free Roam)",
+    "normal": "No-Rules Race",
+    "normal_race": "No-Rules Race",
+    "c_normal_race": "No-Rules Race",
+    "fig8jump": "Figure-8 Jump Race",
+    "figure8_jump_race": "Figure-8 Jump Race",
+    "c_figure8_jump_race": "Figure-8 Jump Race",
+    "fig8": "Figure-8",
+    "figure8_race": "Figure-8",
+    "c_figure8_race": "Figure-8",
+    "road_race": "Jump Race",
+    "jump_race": "Jump Race",
+    "c_road_race": "Jump Race",
+    "c_jump_race": "Jump Race",
+    "demo_derby_contest": "Demolition Derby",
+    "kill_derby": "Demolition Derby",
+    "c_kill_derby": "Demolition Derby",
+    "knockout_contest": "Knockout",
+    "kill_knock": "Knockout",
+    "c_kill_knock": "Knockout",
+    "pushoff_contest": "Push-Off",
+    "kill_push": "Push-Off",
+    "c_pushoff": "Push-Off",
+    "save_ring": "Suicide Race",
+    "c_save_ring": "Suicide Race",
+    "suicide": "Suicide Race",
+    "suicide_race": "Suicide Race",
+    "c_suicide_race": "Suicide Race",
+    "stop_and_go": "Stop-and-Go",
+    "stop_and_go_race": "Stop-and-Go",
+    "c_stop_and_go_race": "Stop-and-Go",
+    "shortcut": "Shortcut Race",
+    "shortcut_race": "Shortcut Race",
+    "c_shortcut_race": "Shortcut Race",
+    "flag_pole": "Flagpole Race",
+    "flagpole_race": "Flagpole Race",
+    "c_flagpole_race": "Flagpole Race",
+    "whip": "Whip-Around",
+    "whip_around_race": "Whip-Around",
+    "c_whip_around_race": "Whip-Around",
+    "chain_race": "Chain Race",
+    "fwd_bwd_race": "Forward-Backward",
+    "c_fwd_bwd_race": "Forward-Backward",
+    "last_man_race": "Last Man",
+    "c_last_man_race": "Last Man",
+    "school_bus": "School Bus",
+    "c_school_bus": "School Bus",
+    "trailer_race": "Trailer Race",
+    "c_trailer_race": "Trailer Race",
+    "pointtopoint": "Point-to-Point",
+    "c_pointtopoint": "Point-to-Point",
+    "detention": "Detention",
+    "c_detention": "Detention",
+    "gauntlet": "Gauntlet",
+    "c_gauntlet": "Gauntlet",
+    "red_rover": "Red Rover",
+    "c_red_rover": "Red Rover",
+    "wrangle": "Wrangler",
+    "c_wrangle": "Wrangler",
+    "capture": "Downtown",
+    "c_capture": "Downtown",
+    "stuntman": "Daredevil",
+    "c_stuntman": "Daredevil",
+}
+
+
+@dataclass
+class EventTemplateInfo:
+    """Metadata linking a canonical EOD event template to its .TRK props, opt_terrain, and ILIN line."""
+    display_name: str
+    contest_key: str
+    va0_member: str | None = None
+    opt_terrain_modes: tuple[int, ...] = ()
+    ilin_member: str | None = None
+
+
+def _pick_ilin_for_event(event_type: str, line_basename: str, avail_ilds: list[str]) -> str | None:
+    if not avail_ilds:
+        return None
+    by_l = {n.lower(): n for n in avail_ilds}
+    et = (event_type or "").lower()
+    lb = (line_basename or "").lower()
+    candidates: list[str] = []
+    if lb:
+        candidates.extend([f"{lb}oval.ild", f"{lb}track.ild", f"{lb}fig8.ild", f"{lb}.ild"])
+    if "fig8" in et or "figure8" in et:
+        candidates.extend(["fig8.ild", "bw_fig8.ild"])
+    elif "oval" in et or "suicide" in et or "whip" in et:
+        candidates.extend(["oval.ild", "track.ild"])
+    candidates.extend(["track.ild", "oval.ild", "fig8.ild"])
+    for c in candidates:
+        if c in by_l:
+            return by_l[c]
+    return avail_ilds[0]
+
+
+def discover_track_event_templates(
+    game_dir: Path | str,
+    display_name: str,
+    trk_entries: list[dict[str, Any]] | None = None,
+) -> dict[str, EventTemplateInfo]:
+    """Read real contest/event templates from COMMON.RES#<track>_eves.val and match them to .TRK members."""
+    templates: dict[str, EventTemplateInfo] = {}
+    va0_by_l: dict[str, str] = {}
+    avail_ilds: list[str] = []
+    if trk_entries:
+        for e in trk_entries:
+            nl = e["name"].lower()
+            if e["type"] == "VALT" and nl.startswith("c_") and nl.endswith(".va0"):
+                va0_by_l[nl] = e["name"]
+            elif e["type"] == "ILIN" and nl.endswith(".ild") and e["size"] >= 48:
+                avail_ilds.append(e["name"])
+
+    # Always include Battle (Free Roam) first if c_battle.va0 exists or as universal free-roam preset
+    battle_va0 = va0_by_l.get("c_battle.va0")
+    templates["Battle (Free Roam)"] = EventTemplateInfo(
+        display_name="Battle (Free Roam)",
+        contest_key="battle",
+        va0_member=battle_va0,
+        opt_terrain_modes=(),
+        ilin_member=_pick_ilin_for_event("battle", "", avail_ilds),
+    )
+
     common = Path(game_dir) / "DATA" / "RES" / "COMMON.RES"
-    if not common.is_file():
-        return ["No-Rules Race", "Demolition Derby", "Figure-8 Jump", "Battle (8 AI)"]
-    try:
-        entries = mb.directory(common)
-        want = f"{display_name.lower()}_eves.val"
-        hit = next((e for e in entries if e["name"].lower() == want), None)
-        if not hit:
-            return ["No-Rules Race", "Demolition Derby", "Figure-8 Jump", "Battle (8 AI)"]
-        raw, _ = mb.payload(common, hit["name"], entries, verify_crc=False)
-        table = parse_binary_valt(raw)
-        names: list[str] = []
-        for sec in table.get("sections", []):
-            pairs = dict(sec.get("pairs", []))
-            sname = sec.get("name", "")
-            if sname.startswith("$") or sname.lower() in ("contest_defaults", "eve", "header"):
-                continue
-            label = pairs.get("name") or pairs.get("display_name") or sname
-            if label and label not in names:
-                names.append(str(label))
-        return names or ["No-Rules Race", "Demolition Derby", "Figure-8 Jump", "Battle (8 AI)"]
-    except Exception:
-        return ["No-Rules Race", "Demolition Derby", "Figure-8 Jump", "Battle (8 AI)"]
+    default_modes: set[int] = set()
+    if common.is_file():
+        try:
+            entries = mb.directory(common)
+            want = f"{display_name.lower()}_eves.val"
+            hit = next((e for e in entries if e["name"].lower() == want), None)
+            if hit:
+                raw, _ = mb.payload(common, hit["name"], entries, verify_crc=False)
+                table = parse_binary_valt(raw)
+                # First pass: track default terrain_mask bit(s) (e.g. terrain_mask = 1024 -> mode 11)
+                for sec in table.get("sections", []):
+                    pairs = dict(sec.get("pairs", []))
+                    tmask = pairs.get("terrain_mask")
+                    if tmask:
+                        try:
+                            mval = int(str(tmask).strip(), 0)
+                            for bit in range(16):
+                                if mval & (1 << bit):
+                                    default_modes.add(bit + 1)
+                        except ValueError:
+                            pass
+                if default_modes:
+                    templates["Battle (Free Roam)"].opt_terrain_modes = tuple(sorted(default_modes))
+
+                # Second pass: real contest definitions
+                for sec in table.get("sections", []):
+                    sname = sec.get("name", "")
+                    if not sname or sname.startswith("$"):
+                        continue
+                    sl = sname.lower()
+                    if sl in ("contest_defaults", "eve", "header") or sl.endswith("_eve_defaults"):
+                        continue
+                    pairs = dict(sec.get("pairs", []))
+                    et = str(pairs.get("event_type", "")).strip()
+                    if not et and sl not in _EVENT_TYPE_TO_DISPLAY:
+                        continue
+                    canon = (
+                        _EVENT_TYPE_TO_DISPLAY.get(sl)
+                        or _EVENT_TYPE_TO_DISPLAY.get(et.lower())
+                        or str(pairs.get("display_name") or pairs.get("name") or sname)
+                    )
+                    ext_tbl = str(pairs.get("external_table", "")).strip().lower()
+                    va0_cand = None
+                    for cand in (
+                        f"{ext_tbl}.va0" if ext_tbl else "",
+                        f"c_{et.lower()}.va0" if et else "",
+                        f"c_{sl}.va0",
+                    ):
+                        if cand and cand in va0_by_l:
+                            va0_cand = va0_by_l[cand]
+                            break
+                    modes = set(default_modes)
+                    opt_t = pairs.get("opt_terrain")
+                    if opt_t:
+                        for tok in str(opt_t).replace(",", " ").split():
+                            try:
+                                mv = int(tok, 0)
+                                if 1 <= mv <= 16:
+                                    modes.add(mv)
+                            except ValueError:
+                                pass
+                    ilin_m = _pick_ilin_for_event(et or sl, str(pairs.get("line_basename", "")), avail_ilds)
+                    if canon not in templates:
+                        templates[canon] = EventTemplateInfo(
+                            display_name=canon,
+                            contest_key=sname,
+                            va0_member=va0_cand,
+                            opt_terrain_modes=tuple(sorted(modes)),
+                            ilin_member=ilin_m,
+                        )
+        except Exception:
+            pass
+
+    # Add any remaining c_*.va0 tables present in .TRK that weren't explicitly named in _eves.val
+    for vl, vname in sorted(va0_by_l.items()):
+        stem = vl.removesuffix(".va0")
+        canon = _EVENT_TYPE_TO_DISPLAY.get(stem)
+        if canon and canon not in templates:
+            templates[canon] = EventTemplateInfo(
+                display_name=canon,
+                contest_key=stem,
+                va0_member=vname,
+                opt_terrain_modes=tuple(sorted(default_modes)),
+                ilin_member=_pick_ilin_for_event(stem, "", avail_ilds),
+            )
+
+    return templates
+
+
+def discover_track_events(game_dir: Path | str, display_name: str, trk_entries: list[dict[str, Any]] | None = None) -> list[str]:
+    """Return canonical SLUS_209.10 contest/event names for a track."""
+    templates = discover_track_event_templates(game_dir, display_name, trk_entries)
+    names = [k for k in templates.keys() if k != "Battle (Free Roam)"]
+    return names or ["No-Rules Race", "Figure-8 Jump Race", "Jump Race", "Demolition Derby", "Gauntlet"]
 
 
 def normal_to_pitch_roll(normal: tuple[float, float, float], yaw_deg: float = 0.0) -> tuple[float, float, float]:
@@ -374,7 +570,17 @@ class WorldObject:
     retail_initial_rot: tuple[float, float, float] = (0.0, 0.0, 0.0)
     retail_event_member: str | None = None
     retail_event_section: str | None = None
+    retail_event_prop_index: int | None = None
     retail_original_model_key: str | None = None
+    opt_terrain_mode: int | None = None
+
+    def is_transformed(self) -> bool:
+        if self.source != "Retail":
+            return True
+        moved = any(abs(a - b) > 1e-4 for a, b in zip(self.position, self.retail_initial_pos))
+        rotated = any(abs(a - b) > 1e-4 for a, b in zip(self.rotation_hpr, self.retail_initial_rot))
+        scaled = any(abs(s - 1.0) > 1e-4 for s in self.scale)
+        return moved or rotated or scaled
 
     def world_matrix(self) -> np.ndarray:
         return compose_transform(self.position, self.rotation_hpr, self.scale)
@@ -652,6 +858,9 @@ class CustomRaceConfig:
     ai_speed_scale: float = 1.0
     ilin_line: str = "track.ild"
     free_roam_place: str = "home"
+    arcade_mode: str = "free_roam"
+    sync_all_events: bool = True
+    include_lod_twins: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -663,6 +872,9 @@ class CustomRaceConfig:
             "ai_speed_scale": self.ai_speed_scale,
             "ilin_line": self.ilin_line,
             "free_roam_place": self.free_roam_place,
+            "arcade_mode": self.arcade_mode,
+            "sync_all_events": self.sync_all_events,
+            "include_lod_twins": self.include_lod_twins,
         }
 
     @classmethod
@@ -678,7 +890,69 @@ class CustomRaceConfig:
         cfg.ai_speed_scale = float(d.get("ai_speed_scale", cfg.ai_speed_scale))
         cfg.ilin_line = str(d.get("ilin_line", cfg.ilin_line))
         cfg.free_roam_place = str(d.get("free_roam_place", cfg.free_roam_place))
+        cfg.arcade_mode = str(d.get("arcade_mode", cfg.arcade_mode))
+        cfg.sync_all_events = bool(d.get("sync_all_events", cfg.sync_all_events))
+        cfg.include_lod_twins = bool(d.get("include_lod_twins", cfg.include_lod_twins))
         return cfg
+
+
+def parse_bppt(data: bytes) -> dict[int, dict[str, Any]]:
+    """Parse EOD `track.bpp` (`BPPT` v7) optional-terrain 2D BSP collision trees.
+
+    Returns dict mapping 1-based `opt_terrain_mode` (1..16) -> slot metadata
+    (matching SLUS_209.10 `f_00216F60` / `f_00217240` / `f_002176C8`).
+    """
+    slots: dict[int, dict[str, Any]] = {}
+    if not data or len(data) < 68:
+        return slots
+    slot_offs = struct.unpack_from("<16I", data, 4)
+    for k, tree_off in enumerate(slot_offs):
+        if tree_off == 0 or tree_off + 32 > len(data):
+            continue
+        hdr = struct.unpack_from("<8I", data, tree_off)
+        n_planes, n_nodes = hdr[1], hdr[2]
+        planes_off = tree_off + hdr[4]
+        nodes_off = tree_off + hdr[5]
+        root = hdr[7]
+        if (
+            n_planes == 0
+            or n_nodes == 0
+            or planes_off + n_planes * 20 > len(data)
+            or nodes_off + n_nodes * 20 > len(data)
+            or root >= n_nodes
+        ):
+            continue
+        slots[k + 1] = {
+            "mode": k + 1,
+            "slot_index": k,
+            "tree_off": tree_off,
+            "n_planes": n_planes,
+            "n_nodes": n_nodes,
+            "planes_off": planes_off,
+            "nodes_off": nodes_off,
+            "root": root,
+        }
+    return slots
+
+
+def query_bppt_plane(data: bytes, slot: dict[str, Any], x: float, z: float) -> int | None:
+    """Walk a `track.bpp` 2D BSP tree at (x, z) and return the leaf plane index, or None."""
+    nodes_off = slot["nodes_off"]
+    n_nodes = slot["n_nodes"]
+    n_planes = slot["n_planes"]
+    cur = slot["root"]
+    for _ in range(min(n_nodes + 4, 2048)):
+        if cur < 0 or cur >= n_nodes:
+            return None
+        nx, nz, d, left, right = struct.unpack_from("<3f2i", data, nodes_off + cur * 20)
+        child = left if (nx * x + nz * z + d) <= 0.0 else right
+        if child < 0:
+            leaf = child & 0x7FFFFFFF
+            if leaf == 0x7FFFFFFF or leaf >= n_planes:
+                return None
+            return int(leaf)
+        cur = child
+    return None
 
 
 @dataclass
@@ -694,6 +968,58 @@ class CollisionData:
     sobl_records: list[dict[str, Any]] = field(default_factory=list)
     sobl_edits: dict[int, dict[str, Any]] = field(default_factory=dict)  # rec_idx -> {"field", "value", "ry", "centre", ...}
     custom_boxes: list[dict[str, Any]] = field(default_factory=list)
+    bppt_slots: dict[int, dict[str, Any]] = field(default_factory=dict)
+    bppt_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+    scol_base_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+
+    def __post_init__(self) -> None:
+        if len(self.scol_base_line_verts) == 0 and len(self.scol_line_verts) > 0:
+            self.scol_base_line_verts = self.scol_line_verts.copy()
+
+    def rebuild_dynamic_ramp_collision(self, world: "TrackWorld") -> None:
+        """Sync live green collision wireframe for optional-terrain & edited static ramp meshes."""
+        ramp_segs: list[np.ndarray] = []
+        for obj in world.objects:
+            if obj.deleted or not obj.visible:
+                continue
+            is_opt_ramp = obj.category == "optional-terrain"
+            is_edited_static_ramp = (
+                obj.category == "static"
+                and obj.is_transformed()
+                and any(tok in obj.name.lower() for tok in ("ramp", "dirt", "jump", "bridge", "hill"))
+            )
+            if not is_opt_ramp and not is_edited_static_ramp:
+                continue
+            model = world.models.get(obj.model_key)
+            if model is None:
+                continue
+            m4 = obj.world_matrix()
+            for part in model.parts:
+                if len(part.indices) < 3:
+                    continue
+                pts = part.vertices[:, 0:3]
+                ones = np.ones((len(pts), 1), dtype=np.float32)
+                wpts = (np.hstack([pts, ones]) @ m4.T)[:, :3]
+                wpts[:, 1] += 0.11  # lift slightly above visual ramp so green wireframe reads cleanly
+                tris = part.indices.reshape(-1, 3)
+                segs = np.empty((len(tris) * 6, 3), dtype=np.float32)
+                segs[0::6] = wpts[tris[:, 0]]
+                segs[1::6] = wpts[tris[:, 1]]
+                segs[2::6] = wpts[tris[:, 1]]
+                segs[3::6] = wpts[tris[:, 2]]
+                segs[4::6] = wpts[tris[:, 2]]
+                segs[5::6] = wpts[tris[:, 0]]
+                ramp_segs.append(segs)
+
+        if ramp_segs:
+            self.bppt_line_verts = np.vstack(ramp_segs)
+            if len(self.scol_base_line_verts) > 0:
+                self.scol_line_verts = np.vstack([self.scol_base_line_verts, self.bppt_line_verts])
+            else:
+                self.scol_line_verts = self.bppt_line_verts.copy()
+        else:
+            self.bppt_line_verts = np.zeros((0, 3), dtype=np.float32)
+            self.scol_line_verts = self.scol_base_line_verts.copy()
 
     def ground_height(self, x: float, z: float, below: float | None = None) -> float:
         if self.terrain is None:
@@ -827,6 +1153,10 @@ class TrackWorld:
     environment: EnvironmentState = field(default_factory=EnvironmentState)
     custom_race: CustomRaceConfig = field(default_factory=CustomRaceConfig)
     available_events: list[str] = field(default_factory=list)
+    event_templates: dict[str, EventTemplateInfo] = field(default_factory=dict)
+    active_event_template: str = "All Templates (Combined)"
+    sync_all_events: bool = True
+    include_lod_twins: bool = True
     car_catalog_loaded: bool = False
     car_count: int = 0
 
@@ -843,6 +1173,152 @@ class TrackWorld:
             if o.obj_id == obj_id and not o.deleted:
                 return o
         return None
+
+    def object_visible_in_event_template(self, obj: WorldObject, template_name: str | None = None) -> bool:
+        """Return whether `obj` belongs to the active Event Template filter in the 3D viewport."""
+        if obj.deleted or not obj.visible:
+            return False
+        if obj.source != "Retail":
+            return True
+        tpl_name = template_name if template_name is not None else self.active_event_template
+        if not tpl_name or tpl_name.lower().startswith("all templates") or tpl_name.lower().startswith("all ramps"):
+            # In combined view, show all geometry + Battle / primary event props (avoiding 25-way duplicates)
+            if obj.category == "event-prop" and obj.retail_event_member:
+                preferred_va0 = None
+                if "Battle (Free Roam)" in self.event_templates and self.event_templates["Battle (Free Roam)"].va0_member:
+                    preferred_va0 = self.event_templates["Battle (Free Roam)"].va0_member
+                elif self.event_templates:
+                    preferred_va0 = next((t.va0_member for t in self.event_templates.values() if t.va0_member), None)
+                if preferred_va0 and obj.retail_event_member.lower() != preferred_va0.lower():
+                    return obj.is_transformed()
+            return True
+
+        tpl = self.event_templates.get(tpl_name)
+        if tpl is None:
+            return True
+        if obj.category == "event-prop":
+            if not tpl.va0_member:
+                return obj.is_transformed()
+            return (obj.retail_event_member or "").lower() == tpl.va0_member.lower()
+        if obj.category == "optional-terrain":
+            if obj.opt_terrain_mode is None:
+                return True
+            if obj.opt_terrain_mode in tpl.opt_terrain_modes:
+                return True
+            # When Sync All Events is ON, edited optional-terrain ramps stay visible in every template!
+            if self.sync_all_events and obj.is_transformed():
+                return True
+            return False
+        return True
+
+    def find_similar_objects(self, seed: WorldObject) -> list[WorldObject]:
+        """Find all visible active objects sharing the same model, primary texture, or prefix family."""
+        if seed is None or seed.deleted:
+            return []
+        seed_tex = seed.textures[0].lower() if seed.textures else ""
+        seed_prefix = seed.name.split("_")[0].split("(")[0].strip().lower()
+        out: list[WorldObject] = []
+        for obj in self.objects:
+            if not self.object_visible_in_event_template(obj):
+                continue
+            if obj.model_key == seed.model_key:
+                out.append(obj)
+                continue
+            if seed_tex and obj.textures and obj.textures[0].lower() == seed_tex and obj.category == seed.category:
+                out.append(obj)
+                continue
+            if (
+                not seed_tex
+                and seed_prefix
+                and len(seed_prefix) >= 3
+                and obj.category == seed.category
+                and obj.name.split("_")[0].split("(")[0].strip().lower() == seed_prefix
+            ):
+                out.append(obj)
+        return out
+
+    def find_overlapping_lod_twins_and_barriers(
+        self, targets: list[WorldObject]
+    ) -> tuple[list[WorldObject], list[int]]:
+        """Find co-located LOD/billboard twins and overlapping vertical SOBL barriers for `targets`."""
+        target_ids = {o.obj_id for o in targets}
+        target_boxes: list[tuple[np.ndarray, np.ndarray, WorldObject]] = []
+        for o in targets:
+            m = self.models.get(o.model_key)
+            if m is None:
+                continue
+            lo, hi = o.world_aabb(m)
+            target_boxes.append((lo, hi, o))
+
+        twins: list[WorldObject] = []
+        seen_twins: set[str] = set()
+        for other in self.objects:
+            if other.deleted or other.obj_id in target_ids or other.obj_id in seen_twins:
+                continue
+            if other.source != "Retail" or other.category not in ("billboard", "static", "optional-terrain"):
+                continue
+            om = self.models.get(other.model_key)
+            if om is None:
+                continue
+            olo, ohi = other.world_aabb(om)
+            other_low = other.name.lower()
+            is_lod_like = (
+                other.category == "billboard"
+                or other_low.startswith("lod")
+                or other.subtype in ("Point-Facing", "Axis-Facing", "Multi-Facing")
+            )
+            for lo, hi, src in target_boxes:
+                src_low = src.name.lower()
+                # Check tight 3D proximity / overlapping footprint
+                dx = max(0.0, float(olo[0] - hi[0]), float(lo[0] - ohi[0]))
+                dy = max(0.0, float(olo[1] - hi[1]), float(lo[1] - ohi[1]))
+                dz = max(0.0, float(olo[2] - hi[2]), float(lo[2] - ohi[2]))
+                dist_p = math.hypot(other.position[0] - src.position[0], other.position[2] - src.position[2])
+                if is_lod_like and (dist_p <= 4.5 or (dx <= 1.2 and dz <= 1.2 and dy <= 2.5)):
+                    # Only grab LOD/billboard twin if footprint is similar scale (don't grab giant terrain!)
+                    other_span = max(float(ohi[0] - olo[0]), float(ohi[2] - olo[2]))
+                    src_span = max(float(hi[0] - lo[0]), float(hi[2] - lo[2]), 4.0)
+                    if other_span <= src_span * 2.5 + 4.0:
+                        twins.append(other)
+                        seen_twins.add(other.obj_id)
+                        break
+                elif (
+                    (src_low.startswith("lod") or src.category == "billboard")
+                    and dist_p <= 3.5
+                    and abs(other.position[1] - src.position[1]) <= 3.5
+                ):
+                    other_span = max(float(ohi[0] - olo[0]), float(ohi[2] - olo[2]))
+                    if other_span <= 30.0:
+                        twins.append(other)
+                        seen_twins.add(other.obj_id)
+                        break
+
+        barrier_indices: list[int] = []
+        seen_b: set[int] = set()
+        for rec in self.collision.sobl_records:
+            if rec.get("kind") != "box" or not rec.get("vertical"):
+                continue
+            if float(rec.get("above_ground", 0.0)) <= -0.4:
+                continue
+            ridx = int(rec["index"])
+            if ridx in seen_b:
+                continue
+            cx, cy, cz = rec["centre"]
+            fx, fz = wc.footprint(rec)
+            rlo_x, rhi_x = cx - fx, cx + fx
+            rlo_z, rhi_z = cz - fz, cz + fz
+            for lo, hi, _src in target_boxes:
+                if (
+                    rhi_x >= float(lo[0]) - 1.2
+                    and rlo_x <= float(hi[0]) + 1.2
+                    and rhi_z >= float(lo[2]) - 1.2
+                    and rlo_z <= float(hi[2]) + 1.2
+                ):
+                    barrier_indices.append(ridx)
+                    seen_b.add(ridx)
+                    break
+
+        return twins, barrier_indices
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1377,9 @@ def _pack_decoded_parts(
     return mesh_parts, total_tris, lo, hi, sorted(tex_names)
 
 
+_WATER_TEX_TOKENS = ("sween", "water", "h2o", "pond", "puddle", "river", "lake")
+
+
 def _load_textures(track_dict: dict[str, Any], tex_names: set[str]) -> dict[str, TextureAsset]:
     """Decode all referenced EOD textures using tools/world_export + tools/texture_preview."""
     cache: dict[str, tuple[str | None, bytes | None]] = {}
@@ -916,9 +1395,34 @@ def _load_textures(track_dict: dict[str, Any], tex_names: set[str]) -> dict[str,
         except Exception:
             continue
         alphas = rgba[3::4]
-        kind, _zero = we.alpha_treatment(alphas, "cutout")
-        rgba_clean = we.apply_alpha(rgba, kind)
-        arr = np.frombuffer(rgba_clean, dtype=np.uint8).reshape(-1, 4)
+        low_name = name.lower()
+        is_water_tex = any(tok in low_name for tok in _WATER_TEX_TOKENS)
+        max_a = max(alphas) if alphas else 255
+        min_a = min(alphas) if alphas else 255
+        # PS2 water/ripple overlays (e.g. Afton's `sween.tex`, raw alpha 18..73, zero==0%)
+        # carry genuine translucent blend alpha rather than opaque road detail weight.
+        if is_water_tex or (0 < max_a <= 128 and min_a < 120):
+            kind = "blend"
+            arr_w = np.frombuffer(rgba, dtype=np.uint8).reshape(-1, 4).copy()
+            if is_water_tex:
+                # PS2 GS scales alpha by 2x (0..128 -> 0..255); convert monochrome ripple overlays
+                # into clean translucent blue-teal pond water instead of opaque black/white blobs.
+                luma = arr_w[:, :3].mean(axis=1)
+                chroma = np.abs(arr_w[:, 0].astype(np.int16) - arr_w[:, 2].astype(np.int16)).mean()
+                if chroma < 14.0:
+                    norm_l = np.clip(luma / 255.0, 0.0, 1.0)
+                    arr_w[:, 0] = np.clip(38.0 + norm_l * 135.0, 0, 255).astype(np.uint8)
+                    arr_w[:, 1] = np.clip(78.0 + norm_l * 145.0, 0, 255).astype(np.uint8)
+                    arr_w[:, 2] = np.clip(112.0 + norm_l * 135.0, 0, 255).astype(np.uint8)
+                arr_w[:, 3] = np.clip(arr_w[:, 3].astype(np.float32) * 2.1, 45.0, 185.0).astype(np.uint8)
+            else:
+                arr_w[:, 3] = np.clip(arr_w[:, 3].astype(np.float32) * 2.0, 24.0, 225.0).astype(np.uint8)
+            rgba_clean = arr_w.tobytes()
+            arr = arr_w
+        else:
+            kind, _zero = we.alpha_treatment(alphas, "cutout")
+            rgba_clean = we.apply_alpha(rgba, kind)
+            arr = np.frombuffer(rgba_clean, dtype=np.uint8).reshape(-1, 4)
         opaque_mask = arr[:, 3] > 0
         if np.any(opaque_mask):
             avg = tuple(int(v) for v in arr[opaque_mask, :3].mean(axis=0))
@@ -946,6 +1450,7 @@ def _load_collision(raw_trk: bytes, _entries: list[dict[str, Any]]) -> Collision
     sobl_boxes = 0
     sobl_tubes = 0
     terrain = None
+    bppt_slots: dict[int, dict[str, Any]] = {}
 
     try:
         col_entries = wc.read_directory(raw_trk)
@@ -958,6 +1463,13 @@ def _load_collision(raw_trk: bytes, _entries: list[dict[str, Any]]) -> Collision
             scol = wc.parse_scol(bsc_raw)
             scol_tris = scol["tris"]
             terrain = wc.Terrain(scol)
+    except Exception:
+        pass
+
+    try:
+        bpp_raw, bpp_e = wc.member(raw_trk, col_entries, "track.bpp", verify=False)
+        if bpp_e["type"] == "BPPT":
+            bppt_slots = parse_bppt(bpp_raw)
     except Exception:
         pass
 
@@ -1012,6 +1524,7 @@ def _load_collision(raw_trk: bytes, _entries: list[dict[str, Any]]) -> Collision
         scol_line_verts=scol_lines,
         sobl_line_verts=np.zeros((0, 3), dtype=np.float32),
         sobl_records=sobl_records,
+        bppt_slots=bppt_slots,
     )
     col.rebuild_sobl_lines()
     return col
@@ -1367,8 +1880,10 @@ def load_track_world(
 
         # Determine section / mlist tag
         sec_tag = default_mlist
+        opt_mode = None
         if leaf.get("optional_terrain"):
-            sec_tag = f"opt_terrain (mode {leaf['optional_terrain']['mode']})"
+            opt_mode = int(leaf["optional_terrain"]["mode"])
+            sec_tag = f"opt_terrain (mode {opt_mode})"
         elif leaf["path"]:
             spheres = [s["node"] for s in leaf["path"] if s["kind"] == "sphere"]
             if spheres:
@@ -1397,30 +1912,41 @@ def load_track_world(
                 retail_initial_pos=pos,
                 retail_initial_rot=rot_hpr,
                 retail_original_model_key=mkey,
+                opt_terrain_mode=opt_mode,
             )
         )
 
-    # 3. Also load event props from first c_*.va0 event table (if present)
-    va0_entries = [e for e in entries if e["name"].lower().startswith("c_") and e["type"] == "VALT"]
-    if va0_entries:
+    # 3. Load event props from ALL c_*.va0 event tables (c_battle.va0 barriers, jump race props, gauntlet, etc.)
+    va0_entries = sorted(
+        (e for e in entries if e["name"].lower().startswith("c_") and e["type"] == "VALT"),
+        key=lambda e: (e["name"].lower() != "c_battle.va0", e["name"].lower()),
+    )
+    ev_global_idx = 0
+    seen_ev_markers: set[tuple[str, int, int]] = set()
+    for ev_entry in va0_entries:
         try:
-            ev_name = va0_entries[0]["name"]
+            ev_name = ev_entry["name"]
             for k, prop in enumerate(we.event_props(track_dict, ev_name)):
                 rows = we.compose_rows(prop["frame"], prop["localFrame"]) if prop["localFrame"] else prop["frame"]
                 m4 = np.array(we.native_rows_to_matrix(rows), dtype=np.float32).reshape(4, 4)
                 pos, rot_hpr, scl = decompose_matrix_hpr(m4)
                 mod_name = prop.get("model")
                 if not mod_name:
-                    markers.append(
-                        WorldMarker(
-                            marker_id=f"m_ev_{k}",
-                            name=prop["dyno"],
-                            kind="Marker",
-                            position=pos,
-                            heading_deg=rot_hpr[0],
-                            source="Retail",
+                    mk_key = (prop["dyno"].lower(), int(round(pos[0])), int(round(pos[2])))
+                    if mk_key not in seen_ev_markers:
+                        seen_ev_markers.add(mk_key)
+                        markers.append(
+                            WorldMarker(
+                                marker_id=f"m_ev_{ev_global_idx}",
+                                name=prop["dyno"],
+                                kind="Marker",
+                                position=pos,
+                                heading_deg=rot_hpr[0],
+                                source="Retail",
+                                note=ev_name,
+                            )
                         )
-                    )
+                    ev_global_idx += 1
                     continue
                 mkey = f"mod:{mod_name.lower()}"
                 if mkey not in models:
@@ -1454,7 +1980,7 @@ def load_track_world(
                     wm = models[mkey]
                     objects.append(
                         WorldObject(
-                            obj_id=f"e{k:04d}",
+                            obj_id=f"e{ev_global_idx:04d}",
                             name=f"{prop['dyno']} ({wm.name})",
                             model_key=mkey,
                             source="Retail",
@@ -1473,11 +1999,13 @@ def load_track_world(
                             retail_initial_rot=rot_hpr,
                             retail_event_member=prop["member"],
                             retail_event_section=prop["section"],
+                            retail_event_prop_index=k,
                             retail_original_model_key=mkey,
                         )
                     )
+                    ev_global_idx += 1
         except Exception:
-            pass
+            continue
 
     # 4. Discover standalone .mod members inside this .TRK not yet placed (for Explorer catalog)
     for e in entries:
@@ -1560,7 +2088,10 @@ def load_track_world(
         radius = 100.0
 
     display = wc.track_display_name(trk_p)
-    events = discover_track_events(gdir, display)
+    event_templates = discover_track_event_templates(gdir, display, entries)
+    events = [k for k in event_templates.keys() if k != "Battle (Free Roam)"]
+    if not events:
+        events = ["No-Rules Race", "Figure-8 Jump Race", "Jump Race", "Demolition Derby", "Gauntlet"]
     race_cfg = CustomRaceConfig(
         event_name=events[0] if events else "No-Rules Race",
         event_type=events[0] if events else "No-Rules Race",
@@ -1588,7 +2119,12 @@ def load_track_world(
         environment=EnvironmentState(),
         custom_race=race_cfg,
         available_events=events,
+        event_templates=event_templates,
+        active_event_template="All Templates (Combined)",
+        sync_all_events=True,
+        include_lod_twins=True,
     )
+    world.collision.rebuild_dynamic_ramp_collision(world)
 
     if include_cars:
         if progress is not None:

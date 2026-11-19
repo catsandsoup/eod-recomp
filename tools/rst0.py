@@ -54,9 +54,11 @@ STREAM_ALIGN = 0x800  # sector size: streamed (extractable) entries start on one
 
 
 def eod_crc(data: bytes) -> int:
-    """Computes the game's exact CRC32 value."""
+    """Computes the game's exact CRC32 value (SLUS_209.10 f_00135FC8)."""
     if len(data) < 4:
-        c = 0xFFFFFFFF
+        # f_00135FC8 at L_00136018 loads MEM_LW(0x3F2798) == CRC_TABLE[0x80] (0x690CE0EE);
+        # for 0-byte members (e.g. roadrace.ili), ~0x690CE0EE == 0x96F31F11!
+        c = CRC_TABLE[0x80]
         i = 0
     else:
         w = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
