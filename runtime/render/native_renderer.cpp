@@ -1318,6 +1318,9 @@ void finalize() {
                          g_cur.batch, g_cur.program);
     }
     pc.mode[0] = m;
+    // mode.w is the half vector's z only for M_SPEC; otherwise its bit 31 is the shader's shadow
+    // flag (S_ON), so a negative z would send an ordinary draw to shadow_ps
+    if (!(m & M_SPEC)) pc.mode[3] = 0;
     // pipeline key: blend | z function << 4 | z write << 6 | depth << 7 | colour mask << 8
     const uint32_t zf = !ztest ? (e.ztst == 0 ? 3u : 0u) : e.ztst == 2 ? 1u : 2u;
     const uint32_t full = (e.fpsm & 0xF) == 0x1 ? 0xFFFFFFu : 0xFFFFFFFFu;

@@ -712,7 +712,16 @@ The breakdown (`--breakdown`) puts the error on blended pixels covering most of 
 (`noblend` 258,344 px, +26..+49) with the shadow mask under 4,000 px (`nortt` +0.1..+0.9), and the
 same Gilroy scene with the native composite off (`EOD_NATIVE_SHADOW_OFF=1`) is as bad (15.74): a
 regression after A2 (the A3 work-in-progress runs went from 2.11 to 7.2+ on the same 4 windows
-between 18:13 and 21:11 on 2026-11-19), not the shadow. Open.
+between 18:13 and 21:11 on 2026-11-19), not the shadow. Fixed, see below.
+
+**Regression fixed.** Cause: `shadow_ps` is selected by `mode.w` bit 31 (`S_ON`, 3d7c0d6), but every
+draw stored the car-highlight half vector's z in `mode.w` (`native_renderer.cpp`, q17 block), so each
+non-`M_SPEC` draw with a negative z went through the shadow shader. `mode.w` is now 0 unless `M_SPEC`.
+P3, same 24 windows (vb 700..2310 step 70), A2 build (12e7044) vs fixed HEAD: Gilroy night Limo MAE
+3.04 / SSIM 0.9618 vs 2.68 / 0.9545 (was 15.40 / 0.6745); Dundas day Copcar 3.42 / 0.9573 vs 3.88 /
+0.9518 (second run; the first, 4.97, had two more Cockpit windows of the near-plane case above at sky
+MAE 43, as A2 has at vb 1330). EOD_DIFF (Gilroy Hearse, 1,500 frames): `0x3652A8` 287/287,
+`0x3654E0` 403/403, `0x212808` 1/1, `0x21C6E0` 81/81, 0 mismatched.
 
 P10 / EOD_DIFF (Dennison 'Battle (8 AI)', Taxi `508`, 1,500 frames, `Detail=maximum`): `0x212808` 1/1 checked, `0x21C6E0` 9,747/9,747 checked (`EOD_LOD_SELFTEST=1`), 0 mismatched. LOD index histogram (1P, every car of every selection): faithful (`EOD_CAR_LOD_MULTIPLIER=1`) i1 18,090, i2 3,888, i3 4,599, i4 67,869; maximum i1 19,494 of 19,494 (i1 = `+0x550`, level 0 is the parts-only cockpit model). The 2P runs (Dundas 'Demolition Derby', `humans 2`) read view count 1 at `0x3D1A74` in the histogram and are not a split-screen proof; the 2P P10 run was skipped (scope cut). `0x34BF90` (callers
 `0x3067B8`, `0x32DFA8`) and `0x34CC98` (`0x222730..0x232FC8`): **not reached**; the trigger hunt was
