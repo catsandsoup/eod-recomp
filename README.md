@@ -27,9 +27,9 @@
 
 The **EOD World Editor** (`tools/world_editor/`) turns *Test Drive: Eve of Destruction* into a non-destructive creative sandbox inspired by **Unreal Engine**, **Lumion**, and **Twinmotion**. Every edit writes to an isolated mod layer (`mods/<Project>/`) without ever touching a single byte of your retail game files.
 
-![EOD 3D World Editor overview on Woodly at 2.0 ms frame time showing sky dome, dirt ramps, ILIN racing line nodes, and 3D model library thumbnails](docs/img/world_editor/world_editor_overview.jpg)
+![EOD World Editor on Woodly with the Cars & Wrecks library, a placed school bus and wrecks, collision wireframe and a selected racing-line node](docs/img/world_editor/world_editor_overview.jpg)
 
-*Hardware-accelerated 3D World Editor on Woodly (`AFTON.TRK`) rendering at **2.0 ms** with sky dome, dirt jump ramps, interactive `ILIN` spline nodes, and shaded 3D asset thumbnails.*
+*The World Editor on Woodly (`AFTON.TRK`): Cars & Wrecks library, a placed school bus and wrecks, collision wireframe, and a selected `ILIN` racing-line node.*
 
 ### Unreal-Style Play-In-Editor (PIE)
 
