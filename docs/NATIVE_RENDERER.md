@@ -687,3 +687,109 @@ ViewportRenderFinish (0x20F2D8)
 - Therefore, calling `native::ee_flare_begin(texSlot)` immediately after `0x34D9A8` and before `0x35DF10` captures the exact 2D camera & matrix packet via `fill_camera` / `read_matrix_packet`, and uses the exact same `screen_matrix(p)` and `ImmediateVertex (0x361708)` capture mechanism as `KIND_WATER` (`KIND_FLARE = 4`).
 - `0x304D50` sets render flags (`Clear(4, 8, 2)`, `Set(0x80)`), which configure additive blending and Z-test off on the GS; Plume reads the live `gs::Env` state (blend, depth test/write, texture) at `finalize()` just like `KIND_WATER`, so flares render natively in both `EOD_NATIVE=1` and `EOD_NATIVE_ONLY=1` with P1 parity tracking (`flares submitted == drawn`).
 
+---
+
+### Phase A2.1: Particles (`0x363B98`, `0x3639D0`, `0x363B68`, `0x363FF8`, VU1 `0x08E0`)
+
+#### Call graph & VU1 microcode (`vu1_029b295eacf3f666.bin`, base `0x3BD670`)
+
+```
+Particle emitters (0x2F2020, 0x2F2268, 0x2F24B0, 0x2F2AC8, ...)
+  ├─ ParticleBegin (0x363B98)(int32_t count, float scale)
+  │    ├─ DentOffsetWrite (0x35DD28)(1, 0x4D87B4, 0x4F) -> upload 79-entry sin/cos table to VU1 0x90
+  │    ├─ MaterialPacketSet (0x35DDC8)(pkt)
+  │    ├─ Vu1SetParticleMicrocode (0x35CA98)()
+  │    ├─ GsStateFlush (0x3620A8)()
+  │    └─ ParticlePacketReserve (0x363FF8)(0x4D8798) -> PacketReserve(min(rem, 16) + 7) [RA 0x364034]
+  ├─ N x ParticleAdd (0x3639D0)(int32_t col_rgb, int32_t col_alpha, float size, float x, float y, float z, float angle)
+  │    ├─ if (count == cap): ParticlePacketFlush (0x364068) + ParticlePacketReserve (0x363FF8)
+  │    └─ pack 16-byte particle qword at data_ptr + count * 16
+  └─ ParticleEnd (0x363B68)()
+       └─ ParticlePacketFlush (0x364068)(0x4D8798) -> MSCAL 0x08E0 ((0x3BDF50 - 0x3BD670) >> 3), PacketCommit
+```
+
+#### Guest state & struct layout (`0x4D8798` = `0x4E0000 - 30824`, verified from `gen/rec_101.c`, `gen/rec_102.c`)
+
+- `+0x00`: `int32_t active` (return value of `0x363FF8`; cleared to 0 by `0x363B68`).
+- `+0x04`: `int32_t count` (particles written in current VU1 chunk, `0..16`).
+- `+0x08`: `int32_t cap` (capacity of current VU1 chunk, `min(remaining, 16)`).
+- `+0x0C`: `int32_t remaining` (remaining requested particles).
+- `+0x10`: `float scale` (`f12` passed to `0x363B98`; `0x364068` writes `0.5f * scale` into `TOP+3.z` for vertical top-to-bottom lighting gradient).
+- `+0x14`: `uint32_t pkt_base` (DMA packet returned by `0x366D30`).
+- `+0x18`: `uint32_t data_ptr` (`pkt_base + 0x60`, 16 bytes per particle).
+- `+0x1C` (`0x4D87B4`): 79-entry `(cos, sin)` lookup table (`0..2pi` in 78 steps; `0x3E22F983 = 1/(2pi)`, `0x429C0000 = 78.0f`, `0x41800000 = 16.0f` fractional sub-step).
+
+#### Packed particle qword & VU1 `0x08E0` math
+
+- Word 0 (`x`): `(float_bits(x) & ~0xFF) | frac`
+- Word 1 (`y`): `(float_bits(y) & ~0xFF) | idx`
+- Word 2 (`z`): `(float_bits(z) & ~0xFF) | (col_rgb >> 1)` (GS 0..127 brightness)
+- Word 3 (`w`): `(float_bits(size) & ~0xFF) | (col_alpha >> 1)` (GS 0..127 alpha)
+- `0x364068` writes 4 header qwords (`TOP+0` = 4-vertex strip GIFtag `PRIM=0xC02E4000`, `TOP+1` = `cam_up - cam_right`, `TOP+2` = `cam_up + cam_right`, `TOP+3` = `{cam_right.y, cam_up.y, 0.5f * scale, *(0x4D8BB8)}`).
+- **Native Plume feed (`KIND_PARTICLE`):** Builds a single dynamically growing `Mesh` per `ParticleBegin..ParticleEnd` stream (removing the PS2 16-particle VU1 chunk cap, P10). Each particle emits a 4-vertex (2-triangle) camera-aligned rotated quad around `(x, y, z)` using `R' = cos(angle)*R - sin(angle)*U`, `U' = sin(angle)*R + cos(angle)*U`, half-extent `size`, UVs `(0,0)..(1,1)`, and per-corner vertical sky-gradient shading `rgb * (1 - 0.5*scale*(1 - up_dot))`.
+
+---
+
+### Phase A2.2: Effect sprites (`0x363F48`/`0x363DE8`/`0x363F18`/`0x364548` VU1 `0x01B8`, and `0x363D78`/`0x363C18`/`0x363D48`/`0x3642B8` [RA `0x3642F4`] VU1 `0x05E0`)
+
+#### Two parallel sprite emitters (both in `vu1_029b295eacf3f666.bin`, base `0x3BD670`)
+
+1. **Simple sprites (`0x4D8760` = `0x4E0000 - 30880`, VU1 `0x01B8` = `0x3BD828 - 0x3BD670`):**
+   - `0x363F48(count)` -> `0x35CA98()`, `0x3620A8()`, `0x364548(0x4D8760)` (`PacketReserve(min(rem, 33) + 6)` at RA `0x364584`).
+   - `0x363DE8(r128 col, int32_t flip, float size, float x, float y, float z)`: packs `{x, y, z, size}` masked `& ~0xFF` ORed with 128-bit GS-scale RGBA (`col.uw[0..3] & 0xFF`) and `flip` bits (`bit 0` in word 0 selects `U+R` vs `U-R`; `bit 1` in word 1 flips sign). Flushes via `0x3645B8` + `0x364548` every 33 sprites.
+   - `0x363F18()`: calls `0x3645B8`, clears `active = 0`.
+   - `0x3645B8`: emits GS `SPRITE` (`PRIM=0x60AF4000`, `REGS=0x00434312`), `TOP+1 = U - R`, `TOP+2 = U + R`, `MSCAL 0x01B8`.
+2. **Atlas/grid sprites (`0x4D8778` = `0x4E0000 - 30856`, VU1 `0x05E0` = `0x3BDC50 - 0x3BD670`):**
+   - `0x363D78(count, gridSize)` -> `0x35CA98()`, `0x3620A8()`, `0x364500(state, gridSize)` (`gridSize` in `{4, 16, 64}` -> `grid_shift` in `{1, 2, 3}`, `grid_mask = (1 << shift) - 1`), `0x3642B8(0x4D8778)` (`PacketReserve(min(rem, 33) + 5)` at RA `0x3642F4`).
+   - `0x363C18(r128 col, int32_t tile, float size, float x, float y, float z)`: packs `{x, y, z, size}` ORed with 128-bit GS-scale RGBA and atlas tile coords `tx = tile & grid_mask` (word 0), `ty = tile >> grid_shift` (word 2). Flushes via `0x364328` + `0x3642B8` every 33 sprites.
+   - `0x363D48()`: calls `0x364328`, clears `active = 0`.
+   - `0x364328`: emits GS `SPRITE` (`PRIM=0x60AF4000`, `REGS=0x00434132`), `TOP+1 = {U - R, tex_size / (1 << grid_shift)}`, `MSCAL 0x05E0`.
+- **Native Plume feed (`KIND_SPRITE`):** Both simple and atlas sprites emit camera-aligned 4-vertex (2-triangle) quads into a dynamically growing `Mesh` per stream (removing the PS2 33-sprite VU1 chunk cap, P10), applying exact flip UVs for `0x363DE8` and exact `(tx, ty) / (1 << grid_shift)` atlas UVs for `0x363C18`.
+
+---
+
+### Phase A2.3: Immediate geometry (`0x35DF10`, `0x361468`, `0x361708`, `0x361BC8`, `0x364D18`) & sphere-tested immediate (`0x34EE70`, `0x34EEB8`, `0x361ED8`, `0x361C30`)
+
+#### State struct (`0x3E5848` = `0x3E0000 + 0x5848`, VU1 `0x0270` in `vu1_fd0ce30ab0ec263c.bin`)
+
+- `+0x00..+0x17`: saved previous vertex `{x, y, z, u, v_with_strip_lsb, raw_colour}` for 2-vertex strip continuation when splitting across 60-vertex (`0x3C`) PS2 VU1 chunks.
+- `+0x18`: `int32_t active`
+- `+0x1C`: `int32_t total_requested`
+- `+0x20`: `int32_t remaining`
+- `+0x24`: `int32_t chunk_written` (`0..chunk_cap`)
+- `+0x28`: `int32_t chunk_cap` (`min(remaining, 60)`)
+- `+0x2C`: `uint32_t col_ptr` (4 bytes/vert: `(adc << 31) | (B << 16) | (G << 8) | R` in GS 0..128 scale)
+- `+0x30`: `uint32_t vert_ptr` (24 bytes/vert: `float x, y, z, u, v; uint32_t alpha`)
+- `+0x34`: `uint32_t giftag_nloop_ptr` (patched by `0x3651D8` to `chunk_written | 0x8000`)
+- `+0x38`: `uint32_t pkt_qwc` (committed by `0x366CD0` on chunk flush / `0x3651D8`)
+
+#### Functions & native Plume feed (`KIND_IMMEDIATE`)
+
+- `0x35DF10(numVerts)`: calls `0x35BA10()` then `0x361468(numVerts)`. When not already inside `WaterDraw` (`KIND_WATER`), `FlareRender` (`KIND_FLARE`), or `0x219C48` (`KIND_COCKPIT`), opens a `KIND_IMMEDIATE` stream.
+- `0x361468(numVerts)`: reserves first chunk (`<= 60` verts, RA `0x3614CC` to `0x366D30`), writes VIF header + `ITOP 0x200` + `MSCAL 0x4E` (`0x0270 >> 3`).
+- `0x361708(colour, strip, x, y, z, u, v)` & `0x364D18(state*, colour, strip, x, y, z, u, v)`: appends vertex to current chunk (flushing + repeating the last 2 vertices when chunk reaches 60 verts, RA `0x3617E4` / `0x364DF0`). Feeds `ee_water_vertex`, `ee_flare_vertex`, `ee_cockpit_vertex`, or `ee_imm_vertex` (single dynamically growing mesh, removing the PS2 60-vertex chunk cap, P10).
+- `0x361BC8()`: tail-calls `0x3651D8(0x3E5848)` and closes `ee_imm_end()`.
+- **Sphere-tested pre-built immediate geometry:**
+  - `0x34EE70(obj*)`: `FrustumTestSphere(obj + 4, 0, 0, *(float*)(obj + 16))`; if visible, tail-calls `0x361ED8(*(uint32_t*)obj)`.
+  - `0x34EEB8(obj*, mat*)`: transforms `obj + 4` by 3x4 `mat`, calls `FrustumTestSphere`; if visible, calls `0x361ED8(*(uint32_t*)obj)`.
+  - `0x361ED8(bufObj*)`: calls `0x3620A8()` then tail-calls `0x361C30(bufObj)`.
+  - `0x361C30(bufObj*)`: reserves 1 qword (`RA 0x361C48`), writes DMA REF (`0x30000000 | *(int16_t*)(bufObj + 16)`, `addr = *(uint32_t*)bufObj`, `ITOP 0x200`), commits. Native feed decodes the pre-built `0x0270` VIF buffer (`0x361C98` format: `UNPACK V4-8` colours+ADC + `UNPACK V3-32` `{x,y,z,u,v,a}`) into a cached `Mesh` and tags the REF as `KIND_IMMEDIATE`.
+
+---
+
+### Phase A2.4: Cockpit non-queue quad (`0x219C48` -> `0x34DB70` -> `0x35CAA0`)
+
+- Inside `0x219C48` (`gen/rec_046.c:6116-6352`), when `0x2114A8() != -1`, it builds 4 vertices on the stack (32 bytes each: `{x, y, z, pad, colour=0xFFFFFFFF, pad, u, v}`) and 6 `int16_t` triangle indices `{0, 1, 2, 0, 2, 3}` (copied from `0x407008`), binds texture slot `0x2114A8()` via `0x34F928`, and calls `0x34DB70(verts, 4, indices, 6)` (RA `0x21A064`), which tail-calls `0x35CAA0`.
+- `0x35CAA0(verts*, numVerts, indices*, numIndices)` (`gen/rec_100.c:4946-5006`) is `ImmediateDrawIndexedTris`: calls `0x35DF10(numIndices)`, loops `i = 0 .. numIndices - 1` calling `0x361708` on `verts[indices[i]]` with `strip = (i % 3 == 2)`, and calls `0x361BC8()`.
+- Replacing `0x35CAA0` in readable C++ (`diff_run`) and classifying `ra == 0x21A064` as `KIND_COCKPIT` (all other `0x35CAA0` callers go through `KIND_IMMEDIATE`) renders the cockpit rear-view quad natively on Plume with P1 parity tracking (`cockpit submitted == drawn`) and 0 leftover emulated 3D geometry in cockpit view.
+
+---
+
+### Phase A2.5: VU1 program `0x25F0` -> `0x2630` (traced)
+
+- **EE sender of `0x25F0`:** `0x3620A8` (`gen/rec_101.c:4845-4995`), the shared GS/VU1 state flush invoked by `0x35BA10`, `0x35DAD0`, `0x361318`, `0x361ED8`, `0x362E70`, `0x363B98`, `0x363D78`, `0x363F48`, and `0x35D4C8`. Whenever dirty state bits `& 0x109` in `(*(0x4D8BC8) ^ *(0x4D8BCC)) | *(0x4D8B74)` are nonzero (setting internal flag `0x400000`), `0x3620A8` unpacks two 128-bit GIFtag templates (computed from `0x42A190`/`0x42A1A0` and render flags `*(0x4D8BC8)`) to `TOP+0..1` and executes `MSCAL 0x25F0` (`(0x3C2270 - 0x3BFC80) >> 3 = 0x04BE`) followed immediately by `MSCAL 0x24D8` (`0x049B`).
+- **What `0x25F0` does (`vu1_fd0ce30ab0ec263c.bin`):** 5 instructions (`0x25F0..0x2610`): `xtop vi1; lq vf14, 0(vi1); lq vf13, 1(vi1); sq vf14, 19(vi0); sq vf13, 18(vi0) [E]`. It is a **state-setup program** (not a draw program) that stores the two GIFtag PRIM templates into VU1 data memory qwords `18` and `19`.
+- **What `0x2630` is:** Not a standalone VIF/MSCAL entry point (`0x25F0` halts at `0x2610` with the `E` bit). `0x2630` is an internal VU1 subroutine called via `bal` (`0x21`) from four sites inside the existing main mesh microcode (`0x05B8`, `0x1058`, `0x1878`, `0x1B60`), where the caller loads `vf13.xy` before branching.
+- **Native renderer impact:** None needed — `0x25F0` emits zero GS primitives and only updates VU1's GIFtag PRIM state (fog/alpha/AA/prim flags that Plume already reads directly from live `gs::Env` on every native draw).
+
+

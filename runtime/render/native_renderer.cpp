@@ -58,6 +58,10 @@ struct Parity {
     uint64_t queue_equal = 0, queue_submitted = 0, queue_drawn = 0;  // draw queue records (R1/R3)
     uint64_t shadow_equal = 0, shadow_submitted = 0, shadow_drawn = 0;  // projected shadows (R4 A1)
     uint64_t flare_equal = 0, flare_submitted = 0, flare_drawn = 0;     // sun/light flares (R4 A1)
+    uint64_t particle_equal = 0, particle_submitted = 0, particle_drawn = 0;
+    uint64_t sprite_equal = 0, sprite_submitted = 0, sprite_drawn = 0;
+    uint64_t imm_equal = 0, imm_submitted = 0, imm_drawn = 0;
+    uint64_t cockpit_equal = 0, cockpit_submitted = 0, cockpit_drawn = 0;
 };
 Parity g_parity;
 uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
@@ -1124,6 +1128,10 @@ void report(uint64_t vb) {
         const uint32_t world = e != expected.end() ? e->second.world : 0, water = e != expected.end() ? e->second.water : 0;
         const uint32_t queue = e != expected.end() ? e->second.queue : 0;
         const uint32_t shadow = e != expected.end() ? e->second.shadow : 0, flare = e != expected.end() ? e->second.flare : 0;
+        const uint32_t particle = e != expected.end() ? e->second.particle : 0;
+        const uint32_t sprite = e != expected.end() ? e->second.sprite : 0;
+        const uint32_t imm = e != expected.end() ? e->second.immediate : 0;
+        const uint32_t cockpit = e != expected.end() ? e->second.cockpit : 0;
         if (s.skipped) {
             g_parity.skipped_frames++;
         } else {
@@ -1148,6 +1156,22 @@ void report(uint64_t vb) {
             g_parity.flare_equal += fe;
             g_parity.flare_submitted += flare;
             g_parity.flare_drawn += s.k_drawn[KIND_FLARE];
+            const bool pe = s.k_drawn[KIND_PARTICLE] == particle && s.k_objects[KIND_PARTICLE] == particle;
+            const bool spe = s.k_drawn[KIND_SPRITE] == sprite && s.k_objects[KIND_SPRITE] == sprite;
+            const bool ie = s.k_drawn[KIND_IMMEDIATE] == imm && s.k_objects[KIND_IMMEDIATE] == imm;
+            const bool ce = s.k_drawn[KIND_COCKPIT] == cockpit && s.k_objects[KIND_COCKPIT] == cockpit;
+            g_parity.particle_equal += pe;
+            g_parity.particle_submitted += particle;
+            g_parity.particle_drawn += s.k_drawn[KIND_PARTICLE];
+            g_parity.sprite_equal += spe;
+            g_parity.sprite_submitted += sprite;
+            g_parity.sprite_drawn += s.k_drawn[KIND_SPRITE];
+            g_parity.imm_equal += ie;
+            g_parity.imm_submitted += imm;
+            g_parity.imm_drawn += s.k_drawn[KIND_IMMEDIATE];
+            g_parity.cockpit_equal += ce;
+            g_parity.cockpit_submitted += cockpit;
+            g_parity.cockpit_drawn += s.k_drawn[KIND_COCKPIT];
             if (log_parity && !qe)
                 std::fprintf(stderr, "[native] parity frame %llu queue records submitted %u objects %u drawn %u lost %u\n",
                              (unsigned long long)frame, queue, s.k_objects[KIND_QUEUE], s.k_drawn[KIND_QUEUE],
@@ -1164,6 +1188,13 @@ void report(uint64_t vb) {
                              "objects %u drawn %u lost %u\n",
                              (unsigned long long)frame, shadow, s.k_objects[KIND_SHADOW], s.k_drawn[KIND_SHADOW],
                              s.k_lost[KIND_SHADOW], flare, s.k_objects[KIND_FLARE], s.k_drawn[KIND_FLARE], s.k_lost[KIND_FLARE]);
+            if (log_parity && (!pe || !spe || !ie || !ce))
+                std::fprintf(stderr,
+                             "[native] parity frame %llu particle %u/%u/%u sprite %u/%u/%u imm %u/%u/%u cockpit %u/%u/%u\n",
+                             (unsigned long long)frame, particle, s.k_objects[KIND_PARTICLE], s.k_drawn[KIND_PARTICLE],
+                             sprite, s.k_objects[KIND_SPRITE], s.k_drawn[KIND_SPRITE],
+                             imm, s.k_objects[KIND_IMMEDIATE], s.k_drawn[KIND_IMMEDIATE],
+                             cockpit, s.k_objects[KIND_COCKPIT], s.k_drawn[KIND_COCKPIT]);
         }
         if (every && (every == 1 || frame % every < 2)) {
             std::fprintf(stderr,
@@ -1196,6 +1227,20 @@ void report(uint64_t vb) {
                          (unsigned long long)g_parity.frames, (unsigned long long)g_parity.shadow_drawn,
                          (unsigned long long)g_parity.shadow_submitted, (unsigned long long)g_parity.flare_drawn,
                          (unsigned long long)g_parity.flare_submitted);
+            std::fprintf(stderr,
+                         "[native] gs frame %llu particles %u/%u sprites %u/%u imm %u/%u cockpit %u/%u | "
+                         "P1 equal p=%llu/%llu s=%llu/%llu i=%llu/%llu c=%llu/%llu "
+                         "(totals p=%llu/%llu s=%llu/%llu i=%llu/%llu c=%llu/%llu)\n",
+                         (unsigned long long)frame, s.k_drawn[KIND_PARTICLE], particle, s.k_drawn[KIND_SPRITE], sprite,
+                         s.k_drawn[KIND_IMMEDIATE], imm, s.k_drawn[KIND_COCKPIT], cockpit,
+                         (unsigned long long)g_parity.particle_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.sprite_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.imm_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.cockpit_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.particle_drawn, (unsigned long long)g_parity.particle_submitted,
+                         (unsigned long long)g_parity.sprite_drawn, (unsigned long long)g_parity.sprite_submitted,
+                         (unsigned long long)g_parity.imm_drawn, (unsigned long long)g_parity.imm_submitted,
+                         (unsigned long long)g_parity.cockpit_drawn, (unsigned long long)g_parity.cockpit_submitted);
         }
         if (it != g_frames.end()) g_frames.erase(it);
     }

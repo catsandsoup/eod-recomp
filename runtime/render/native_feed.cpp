@@ -117,11 +117,18 @@ uint32_t g_records = 0, g_tagged = 0, g_meshes_decoded = 0, g_mesh_fail = 0;
 constexpr uint32_t kImmBeginRa = 0x3614CC;      // reserve in 0x361468 (immediate geometry begin)
 constexpr uint32_t kImmVertexRa = 0x3617E4;     // reserve in 0x361708 (next chunk)
 constexpr uint32_t kImmMoreRa = 0x364DF0;       // reserve in 0x364D18 (strip continuation)
+constexpr uint32_t kPartReserveRa = 0x364034;   // reserve in 0x363FF8 (particles)
+constexpr uint32_t kSpriteReserveRa = 0x364584; // reserve in 0x364548 (simple effect sprites)
+constexpr uint32_t kAtlasReserveRa = 0x3642F4;  // reserve in 0x3642B8 (atlas effect sprites)
 constexpr uint32_t kMlist = 0x4D6F10;           // the mlist 0x358BD0 draws (set by 0x3582B8)
 constexpr uint32_t kMaterialPacket = 0x4D7C54;  // material packet 0x35BA10 sends (sun quad for 0x6A)
 bool g_in_water = false;
 bool g_in_flare = false;
 bool g_in_shadow = false;
+bool g_in_particle = false;
+bool g_in_sprite = false;
+bool g_in_imm = false;
+bool g_imm_cockpit = false;
 int32_t g_shadow_intensity = 0;
 Packet g_shadow_cam;
 int32_t g_world_pass = 0;
@@ -130,11 +137,25 @@ Packet g_water;
 Mesh *g_water_mesh = nullptr;
 Packet g_flare;
 Mesh *g_flare_mesh = nullptr;
+Packet g_particle;
+Mesh *g_particle_mesh = nullptr;
+float g_particle_scale = 0.0f;
+uint32_t g_particle_count = 0;
+bool g_particle_alpha_set = false;
+Packet g_sprite;
+Mesh *g_sprite_mesh = nullptr;
+uint32_t g_sprite_count = 0;
+bool g_sprite_alpha_set = false;
+Packet g_imm;
+Mesh *g_imm_mesh = nullptr;
+bool g_imm_alpha_set = false;
 // counters (EE frame)
 struct WorldCounts {
     uint32_t passes = 0, leaves = 0, facing = 0, no_quad = 0, nomesh = 0, dropped_records = 0, dropped_leaves = 0;
     uint32_t water_draws = 0, water_vertices = 0, water_tris = 0;
     uint32_t shadow_batches = 0, flare_draws = 0, flare_vertices = 0, flare_tris = 0;
+    uint32_t particle_draws = 0, particle_quads = 0, sprite_draws = 0, sprite_quads = 0;
+    uint32_t imm_draws = 0, imm_verts = 0, imm_tris = 0, cockpit_draws = 0, sphere_imm_draws = 0;
 };
 WorldCounts g_wc;
 
@@ -291,6 +312,10 @@ void roll(uint64_t vb) {
         e.queue += g_records;
         e.shadow += g_wc.shadow_batches;
         e.flare += g_wc.flare_draws;
+        e.particle += g_wc.particle_draws;
+        e.sprite += g_wc.sprite_draws;
+        e.immediate += g_wc.imm_draws + g_wc.sphere_imm_draws;
+        e.cockpit += g_wc.cockpit_draws;
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr, "[native] ee vb %llu records %u tagged %u meshes decoded %u (failed %u) cached %zu\n",
@@ -298,10 +323,12 @@ void roll(uint64_t vb) {
         std::fprintf(stderr,
                      "[native] ee vb %llu world passes %u leaves %u (camera-facing %u, no sun quad %u, no mesh %u) "
                      "dropped (no packet space) records %u leaves %u | water draws %u vertices %u triangles %u | "
-                     "shadows %u flares %u (verts %u tris %u)\n",
+                     "shadows %u flares %u (verts %u tris %u) | particles %u (%u) sprites %u (%u) imm %u+%u cockpit %u\n",
                      (unsigned long long)g_frame_vb, g_wc.passes, g_wc.leaves, g_wc.facing, g_wc.no_quad, g_wc.nomesh,
                      g_wc.dropped_records, g_wc.dropped_leaves, g_wc.water_draws, g_wc.water_vertices, g_wc.water_tris,
-                     g_wc.shadow_batches, g_wc.flare_draws, g_wc.flare_vertices, g_wc.flare_tris);
+                     g_wc.shadow_batches, g_wc.flare_draws, g_wc.flare_vertices, g_wc.flare_tris,
+                     g_wc.particle_draws, g_wc.particle_quads, g_wc.sprite_draws, g_wc.sprite_quads,
+                     g_wc.imm_draws, g_wc.sphere_imm_draws, g_wc.cockpit_draws);
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr,
@@ -477,16 +504,24 @@ void ee_object_end() { g_in_object = false; }
 void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     if (!addr) return;
     const bool batch = g_in_object && ra == kBatchPacketRa;
-    const bool water = g_in_water && (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
-    const bool flare = g_in_flare && (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
+    const bool is_imm_ra = (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
+    const bool water = g_in_water && is_imm_ra;
+    const bool flare = !water && g_in_flare && is_imm_ra;
+    const bool imm = !water && !flare && g_in_imm && is_imm_ra;
+    const bool part = g_in_particle && ra == kPartReserveRa;
+    const bool spr = g_in_sprite && (ra == kSpriteReserveRa || ra == kAtlasReserveRa);
     const uint32_t end = addr + (qwc ? qwc : 1) * 16;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!batch && !water && !flare && g_tags.empty()) return;
-    // drop older entries this range overlaps
+    if (!batch && !water && !flare && !imm && !part && !spr && g_tags.empty()) return;
+    // trim or drop older entries this range overlaps (trimming preserves a committed packet whose
+    // unused reserved tail was reclaimed by the next PacketReserve at `addr > prev->first`)
     auto it = g_tags.lower_bound(addr);
     if (it != g_tags.begin()) {
         auto prev = std::prev(it);
-        if (prev->second.end > addr) g_tags.erase(prev);
+        if (prev->second.end > addr) {
+            if (prev->first < addr) prev->second.end = addr;
+            else g_tags.erase(prev);
+        }
     }
     it = g_tags.lower_bound(addr);
     while (it != g_tags.end() && it->first < end) it = g_tags.erase(it);
@@ -496,6 +531,18 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     }
     if (flare) {  // every VU1 start under this packet's DMA tags draws the flare bucket
         g_tags[addr] = Tagged{end, g_flare, true};
+        return;
+    }
+    if (imm) {  // general immediate geometry or cockpit quad
+        g_tags[addr] = Tagged{end, g_imm, true};
+        return;
+    }
+    if (part) {  // particle stream
+        g_tags[addr] = Tagged{end, g_particle, true};
+        return;
+    }
+    if (spr) {  // simple or atlas effect sprite stream
+        g_tags[addr] = Tagged{end, g_sprite, true};
         return;
     }
     if (!batch) return;  // any other packet there replaces a record's tag
@@ -1053,6 +1100,375 @@ void ee_flare_end(bool drawn) {
     g_flare_mesh = nullptr;
 }
 
+// ---- particles (0x363B98 / 0x3639D0 / 0x363B68, VU1 0x08E0, src/native_effects_imm.cpp) --------
+void ee_particle_begin(float scale) {
+    if (!enabled()) return;
+    roll(kernel_vblank_count());
+    Packet &p = g_particle;
+    std::memset(&p, 0, sizeof p);
+    p.model[0] = p.model[5] = p.model[10] = 1.0f;  // world space (VU1 0x08E0 uses view-proj vf2..vf5)
+    p.kind = KIND_PARTICLE;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.itop = 0x280;
+    p.texture_key = -1;
+    p.layer = -1;
+    fill_camera(p);
+    delete g_particle_mesh;
+    g_particle_mesh = new Mesh();
+    g_particle_mesh->id = g_next_mesh++;
+    g_particle_mesh->replaces = 0;
+    g_particle_mesh->skinned = false;
+    g_particle_mesh->transient = true;
+    p.mesh = g_particle_mesh->id;
+    g_particle_scale = scale;
+    g_particle_count = 0;
+    g_particle_alpha_set = false;
+    g_in_particle = true;
+}
+
+void ee_particle_add(int32_t col_rgb, int32_t col_alpha, float size, float x, float y, float z, float angle) {
+    if (!g_in_particle || !g_particle_mesh) return;
+    const float *rot = g_particle.rotation;
+    const float rx = rot[0], ry = rot[1], rz = rot[2];  // camera right
+    const float ux = rot[3], uy = rot[4], uz = rot[5];  // camera up
+    const float c = std::cos(angle), s = std::sin(angle);
+    // rotated camera right & up axes in world space
+    const float rpx = c * rx - s * ux, rpy = c * ry - s * uy, rpz = c * rz - s * uz;
+    const float upx = s * rx + c * ux, upy = s * ry + c * uy, upz = s * rz + c * uz;
+    const float rgb_base = (float)((uint32_t)(col_rgb >> 1) & 0xFFu);
+    const uint8_t alpha = (uint8_t)std::min(128u, (uint32_t)(col_alpha >> 1) & 0xFFu);
+    if (!g_particle_alpha_set) {
+        g_particle.itop = 0x200u | alpha;
+        g_particle_alpha_set = true;
+    }
+    const float half_scale = 0.5f * g_particle_scale;
+    // 4 corners: (-R'-U'), (+R'-U'), (-R'+U'), (+R'+U')
+    static constexpr float kSx[4] = {-1.0f, 1.0f, -1.0f, 1.0f};
+    static constexpr float kSy[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+    static constexpr float kU[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+    static constexpr float kV[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    Mesh &m = *g_particle_mesh;
+    const uint32_t base = (uint32_t)m.vertices.size();
+    for (int k = 0; k < 4; k++) {
+        const float dx = kSx[k] * rpx + kSy[k] * upx;
+        const float dy = kSx[k] * rpy + kSy[k] * upy;
+        const float dz = kSx[k] * rpz + kSy[k] * upz;
+        Vertex v{};
+        v.p[0] = x + size * dx;
+        v.p[1] = y + size * dy;
+        v.p[2] = z + size * dz;
+        v.uv[0] = kU[k];
+        v.uv[1] = kV[k];
+        float shade = 1.0f - half_scale * (1.0f - std::max(-1.0f, std::min(1.0f, dy)));
+        if (shade < 0.0f) shade = 0.0f;
+        if (shade > 1.0f) shade = 1.0f;
+        const uint8_t rgb = (uint8_t)std::min(128.0f, rgb_base * shade);
+        v.c[0] = v.c[1] = v.c[2] = rgb;
+        v.c[3] = alpha;
+        m.vertices.push_back(v);
+    }
+    m.indices.push_back(base + 0);
+    m.indices.push_back(base + 1);
+    m.indices.push_back(base + 2);
+    m.indices.push_back(base + 1);
+    m.indices.push_back(base + 3);
+    m.indices.push_back(base + 2);
+    g_particle_count++;
+    g_wc.particle_quads++;
+}
+
+void ee_particle_end(bool drawn) {
+    if (!g_in_particle) return;
+    g_in_particle = false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!drawn || !g_particle_mesh || g_particle_mesh->indices.empty()) {
+        for (auto it = g_tags.begin(); it != g_tags.end();)
+            it = it->second.range && it->second.packet.mesh == g_particle.mesh ? g_tags.erase(it) : std::next(it);
+        delete g_particle_mesh;
+        g_particle_mesh = nullptr;
+        return;
+    }
+    for (auto &kv : g_tags)
+        if (kv.second.range && kv.second.packet.mesh == g_particle.mesh)
+            kv.second.packet.itop = g_particle.itop;
+    limit_note("particle stream count (0x363FF8 16/pkt cap)", g_particle_count, 0, 16);
+    g_wc.particle_draws++;
+    g_new_meshes.push_back(g_particle_mesh);
+    g_particle_mesh = nullptr;
+}
+
+// ---- effect sprites (0x363F48/0x363DE8 VU1 0x01B8 & 0x363D78/0x363C18 VU1 0x05E0) --------------
+void ee_sprite_begin(int32_t) {
+    if (!enabled()) return;
+    roll(kernel_vblank_count());
+    Packet &p = g_sprite;
+    std::memset(&p, 0, sizeof p);
+    p.model[0] = p.model[5] = p.model[10] = 1.0f;  // world space (VU1 0x01B8/0x05E0 uses view-proj vf2..vf5)
+    p.kind = KIND_SPRITE;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.itop = 0x280;
+    p.texture_key = -1;
+    p.layer = -1;
+    fill_camera(p);
+    delete g_sprite_mesh;
+    g_sprite_mesh = new Mesh();
+    g_sprite_mesh->id = g_next_mesh++;
+    g_sprite_mesh->replaces = 0;
+    g_sprite_mesh->skinned = false;
+    g_sprite_mesh->transient = true;
+    p.mesh = g_sprite_mesh->id;
+    g_sprite_count = 0;
+    g_sprite_alpha_set = false;
+    g_in_sprite = true;
+}
+
+namespace {
+void emit_sprite_quad(const uint32_t col[4], float x, float y, float z, float size,
+                      float u0, float v0, float u1, float v1) {
+    const float *rot = g_sprite.rotation;
+    const float rx = rot[0], ry = rot[1], rz = rot[2];
+    const float ux = rot[3], uy = rot[4], uz = rot[5];
+    const uint8_t r = (uint8_t)std::min(128u, col[0] & 0xFFu);
+    const uint8_t g = (uint8_t)std::min(128u, col[1] & 0xFFu);
+    const uint8_t b = (uint8_t)std::min(128u, col[2] & 0xFFu);
+    const uint8_t a = (uint8_t)std::min(128u, col[3] & 0xFFu);
+    if (!g_sprite_alpha_set) {
+        g_sprite.itop = 0x200u | a;
+        g_sprite_alpha_set = true;
+    }
+    // 4 corners: top-left (-R+U), top-right (+R+U), bottom-left (-R-U), bottom-right (+R-U)
+    const float sx[4] = {-1.0f, 1.0f, -1.0f, 1.0f};
+    const float sy[4] = {1.0f, 1.0f, -1.0f, -1.0f};
+    const float us[4] = {u0, u1, u0, u1};
+    const float vs[4] = {v0, v0, v1, v1};
+    Mesh &m = *g_sprite_mesh;
+    const uint32_t base = (uint32_t)m.vertices.size();
+    for (int k = 0; k < 4; k++) {
+        Vertex v{};
+        v.p[0] = x + size * (sx[k] * rx + sy[k] * ux);
+        v.p[1] = y + size * (sx[k] * ry + sy[k] * uy);
+        v.p[2] = z + size * (sx[k] * rz + sy[k] * uz);
+        v.uv[0] = us[k];
+        v.uv[1] = vs[k];
+        v.c[0] = r;
+        v.c[1] = g;
+        v.c[2] = b;
+        v.c[3] = a;
+        m.vertices.push_back(v);
+    }
+    m.indices.push_back(base + 0);
+    m.indices.push_back(base + 1);
+    m.indices.push_back(base + 2);
+    m.indices.push_back(base + 1);
+    m.indices.push_back(base + 3);
+    m.indices.push_back(base + 2);
+    g_sprite_count++;
+    g_wc.sprite_quads++;
+}
+}  // namespace
+
+void ee_sprite_add(const uint32_t col[4], int32_t flip, float size, float x, float y, float z) {
+    if (!g_in_sprite || !g_sprite_mesh) return;
+    // flip 0: (0,0)-(1,1), 1: (1,0)-(0,1), 2: (1,1)-(0,0), 3: (0,1)-(1,0)
+    const bool flip_u = (flip == 1 || flip == 2);
+    const bool flip_v = (flip == 2 || flip == 3);
+    emit_sprite_quad(col, x, y, z, size, flip_u ? 1.0f : 0.0f, flip_v ? 1.0f : 0.0f,
+                     flip_u ? 0.0f : 1.0f, flip_v ? 0.0f : 1.0f);
+}
+
+void ee_atlas_sprite_add(const uint32_t col[4], int32_t tile, int32_t grid_shift, int32_t grid_mask,
+                         float size, float x, float y, float z) {
+    if (!g_in_sprite || !g_sprite_mesh) return;
+    const float inv_dim = 1.0f / (float)(1 << (grid_shift & 31));
+    const float u0 = (float)(tile & grid_mask) * inv_dim;
+    const float v0 = (float)(tile >> (grid_shift & 31)) * inv_dim;
+    emit_sprite_quad(col, x, y, z, size, u0, v0, u0 + inv_dim, v0 + inv_dim);
+}
+
+void ee_sprite_end(bool drawn) {
+    if (!g_in_sprite) return;
+    g_in_sprite = false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!drawn || !g_sprite_mesh || g_sprite_mesh->indices.empty()) {
+        for (auto it = g_tags.begin(); it != g_tags.end();)
+            it = it->second.range && it->second.packet.mesh == g_sprite.mesh ? g_tags.erase(it) : std::next(it);
+        delete g_sprite_mesh;
+        g_sprite_mesh = nullptr;
+        return;
+    }
+    for (auto &kv : g_tags)
+        if (kv.second.range && kv.second.packet.mesh == g_sprite.mesh)
+            kv.second.packet.itop = g_sprite.itop;
+    limit_note("sprite stream count (0x364548/0x3642B8 33/pkt cap)", g_sprite_count, 0, 33);
+    g_wc.sprite_draws++;
+    g_new_meshes.push_back(g_sprite_mesh);
+    g_sprite_mesh = nullptr;
+}
+
+// ---- general immediate geometry & cockpit quad (0x35DF10 / 0x361708 / 0x361BC8 / 0x35CAA0) -----
+void ee_imm_begin(bool cockpit) {
+    if (!enabled() || g_in_water || g_in_flare) return;
+    roll(kernel_vblank_count());
+    Packet &p = g_imm;
+    std::memset(&p, 0, sizeof p);
+    read_matrix_packet(MEM_LW(0x4D7C48), p);
+    p.kind = cockpit ? KIND_COCKPIT : KIND_IMMEDIATE;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.itop = 0x280;
+    p.texture_key = -1;
+    p.layer = -1;
+    fill_camera(p);
+    delete g_imm_mesh;
+    g_imm_mesh = new Mesh();
+    g_imm_mesh->id = g_next_mesh++;
+    g_imm_mesh->replaces = 0;
+    g_imm_mesh->skinned = false;
+    g_imm_mesh->transient = true;
+    p.mesh = g_imm_mesh->id;
+    g_imm_cockpit = cockpit;
+    g_imm_alpha_set = false;
+    g_in_imm = true;
+}
+
+bool ee_in_imm() { return g_in_imm && g_imm_mesh; }
+
+void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip) {
+    if (!g_in_imm || !g_imm_mesh) return;
+    uint32_t c = (colour >> 1) & 0x7F7F7F7Fu;
+    c += (c & 0x40404040u) >> 6;
+    const uint8_t a = (uint8_t)((c >> 24) & 0xFFu);
+    if (!g_imm_alpha_set) {
+        g_imm.itop = 0x200u | a;
+        g_imm_alpha_set = true;
+    }
+    Vertex v{};
+    for (int i = 0; i < 3; i++) v.p[i] = xyz[i];
+    v.uv[0] = st[0];
+    v.uv[1] = st[1];
+    v.c[0] = (uint8_t)(c >> 16);
+    v.c[1] = (uint8_t)(c >> 8);
+    v.c[2] = (uint8_t)c;
+    v.c[3] = a;
+    Mesh &m = *g_imm_mesh;
+    const uint32_t idx = (uint32_t)m.vertices.size();
+    m.vertices.push_back(v);
+    g_wc.imm_verts++;
+    if (strip && idx >= 2) {
+        m.indices.push_back(idx - 2);
+        m.indices.push_back(idx - 1);
+        m.indices.push_back(idx);
+        g_wc.imm_tris++;
+    }
+}
+
+void ee_imm_end(bool drawn) {
+    if (!g_in_imm) return;
+    g_in_imm = false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!drawn || !g_imm_mesh || g_imm_mesh->indices.empty()) {
+        for (auto it = g_tags.begin(); it != g_tags.end();)
+            it = it->second.range && it->second.packet.mesh == g_imm.mesh ? g_tags.erase(it) : std::next(it);
+        delete g_imm_mesh;
+        g_imm_mesh = nullptr;
+        return;
+    }
+    for (auto &kv : g_tags)
+        if (kv.second.range && kv.second.packet.mesh == g_imm.mesh)
+            kv.second.packet.itop = g_imm.itop;
+    limit_note("immediate geometry vertices (0x361468 60/chunk cap)", g_imm_mesh->vertices.size(), 0, 60);
+    if (g_imm_cockpit) g_wc.cockpit_draws++;
+    else g_wc.imm_draws++;
+    g_new_meshes.push_back(g_imm_mesh);
+    g_imm_mesh = nullptr;
+}
+
+// ---- sphere-tested pre-built immediate geometry (0x361C30 <- 0x361ED8 <- 0x34EE70/0x34EEB8) ----
+void ee_sphere_imm(uint32_t buf_obj, uint32_t ref_qword) {
+    if (!enabled() || !buf_obj || !ref_qword) return;
+    roll(kernel_vblank_count());
+    const uint32_t buf = MEM_LW(buf_obj);
+    const int32_t qwc = (int16_t)MEM_LH(buf_obj + 16);
+    if (!buf || qwc <= 0) return;
+    const uint32_t end_addr = buf + (uint32_t)qwc * 16u;
+    auto *m = new Mesh();
+    m->id = g_next_mesh++;
+    m->replaces = 0;
+    m->batch = buf;
+    m->skinned = false;
+    m->transient = true;
+    uint8_t first_alpha = 0x80;
+    bool have_alpha = false;
+    // Decode 0x361C98 VIF chunks (VU1 0x0270 format)
+    uint32_t p = buf;
+    while (p + 32u <= end_addr) {
+        // Expect 0x01000202, 0x05000000, 0x6102C0C6, tex, 0x6001C000, nverts|0x8000, 0x01000103, UNPACK V4-8
+        if (MEM_LW(p + 16) != 0x6001C000u) { p += 4; continue; }
+        const uint32_t nverts = MEM_LW(p + 20) & 0x7FFFu;
+        const uint32_t col_base = p + 32u;
+        uint32_t cur = col_base + nverts * 4u;
+        if (cur + 12u > end_addr) break;
+        if (MEM_LW(cur) == 0x20000000u) cur += 28u;  // optional STMASK + STROW (7 words)
+        if (cur + 12u > end_addr) break;
+        const uint32_t vert_base = cur + 12u;
+        if (vert_base + nverts * 24u > end_addr) break;
+        const uint32_t base_v = (uint32_t)m->vertices.size();
+        for (uint32_t i = 0; i < nverts; i++) {
+            const uint32_t cw = MEM_LW(col_base + i * 4u);
+            const uint32_t va = vert_base + i * 24u;
+            Vertex v{};
+            v.p[0] = rf(va + 0);
+            v.p[1] = rf(va + 4);
+            v.p[2] = rf(va + 8);
+            v.uv[0] = rf(va + 12);
+            v.uv[1] = rf(va + 16);
+            const uint8_t a = (uint8_t)(MEM_LW(va + 20) & 0xFFu);
+            if (!have_alpha) { first_alpha = a; have_alpha = true; }
+            v.c[0] = (uint8_t)(cw & 0xFFu);
+            v.c[1] = (uint8_t)((cw >> 8) & 0xFFu);
+            v.c[2] = (uint8_t)((cw >> 16) & 0xFFu);
+            v.c[3] = a;
+            m->vertices.push_back(v);
+            const bool adc = (cw & 0x80000000u) != 0;
+            if (!adc && i >= 2) {
+                m->indices.push_back(base_v + i - 2);
+                m->indices.push_back(base_v + i - 1);
+                m->indices.push_back(base_v + i);
+            }
+        }
+        p = vert_base + nverts * 24u + 4u;  // past MSCAL 0x4E
+        p = (p + 15u) & ~15u;               // 16-byte chunk alignment
+    }
+    if (m->indices.empty()) {
+        delete m;
+        return;
+    }
+    Packet pkt{};
+    read_matrix_packet(MEM_LW(0x4D7C48), pkt);
+    pkt.kind = KIND_IMMEDIATE;
+    pkt.frame = g_frame_vb;
+    pkt.serial = g_serial++;
+    pkt.batch = buf;
+    pkt.itop = 0x200u | first_alpha;
+    pkt.texture_key = -1;
+    pkt.layer = -1;
+    fill_camera(pkt);
+    pkt.mesh = m->id;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_tags.lower_bound(ref_qword);
+    if (it != g_tags.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.end > ref_qword) g_tags.erase(prev);
+    }
+    it = g_tags.lower_bound(ref_qword);
+    while (it != g_tags.end() && it->first < ref_qword + 16) it = g_tags.erase(it);
+    g_tags[ref_qword] = Tagged{ref_qword + 16, pkt, true};
+    g_new_meshes.push_back(m);
+    g_wc.sphere_imm_draws++;
+}
+
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out) {
     std::lock_guard<std::mutex> lk(g_expect_mutex);
     while (!g_expect.empty() && g_expect.begin()->first < before) {
@@ -1166,7 +1582,7 @@ void vu1_start(uint32_t program, uint32_t itop) {
     if (skin_check() && p.kind == KIND_QUEUE) vu_check(key, program);
     if (p.kind == KIND_QUEUE) p.itop = itop;  // world, water, shadow, flare carry the ITOP their EE packet sets
     p.program = program;
-    if (p.kind != KIND_SHADOW) check(p);  // shadow uses main-viewport camera (not 320x512 VU1 shadow RT)
+    if (p.kind != KIND_SHADOW && p.kind != KIND_PARTICLE && p.kind != KIND_SPRITE) check(p);  // shadow uses main-viewport cam; particles/sprites use vf2..vf5
     post(CMD_OBJ, &p, sizeof p);
     g_obj_active = true;
     g_sent_key = key;

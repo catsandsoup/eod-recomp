@@ -167,5 +167,28 @@
 00326168 wrap     # WaterDrawIfPresent
 00325728 wrap     # WaterDraw(surface): tiles through the immediate geometry API
 00325E40 wrap     # WaterSimulate: car splashes
-00361708 wrap     # ImmediateVertex: observed while WaterDraw is open (native water mesh, src/native_world.cpp)
+00361708 wrap     # ImmediateVertex: readable C++ (src/native_effects_imm.cpp, R4 A2; water/flare/cockpit/immediate)
 00326188 wrap     # WaterCreate(pos, axis a, axis b): only with one view; SplitScreenParity creates it in split screen too (P8)
+
+# Stage R4 Phase A2: particles, effect sprites, immediate geometry, sphere-tested immediate, cockpit quad (src/native_effects_imm.cpp)
+00363B98 wrap     # ParticleBegin(count, scale) (VU1 0x08E0)
+003639D0 wrap     # ParticleAdd(col_rgb, col_alpha, size, x, y, z, angle)
+00363B68 wrap     # ParticleEnd()
+00363FF8 wrap     # ParticlePacketReserve(state*)
+00363F48 wrap     # SpriteBegin(count) (VU1 0x01B8)
+00363DE8 wrap     # SpriteAdd(r128 col, flip, size, x, y, z)
+00363F18 wrap     # SpriteEnd()
+00364548 wrap     # SpritePacketReserve(state*)
+00363D78 wrap     # AtlasSpriteBegin(count, gridSize) (VU1 0x05E0)
+00363C18 wrap     # AtlasSpriteAdd(r128 col, tile, size, x, y, z)
+00363D48 wrap     # AtlasSpriteEnd()
+003642B8 wrap     # AtlasSpritePacketReserve(state*) [RA 0x3642F4]
+0035DF10 wrap     # ImmediateBegin(numVerts) (VU1 0x0270)
+00361468 wrap     # ImmediatePacketBegin(numVerts)
+00361BC8 wrap     # ImmediateEnd()
+00364D18 wrap     # ImmediateVertexContinue(state*, colour, strip, x, y, z, u, v)
+0034EE70 wrap     # SphereImmSubmit(obj*)
+0034EEB8 wrap     # SphereImmSubmitTransformed(obj*, mat*)
+00361ED8 wrap     # ImmStaticDraw(bufObj*)
+00361C30 wrap     # ImmStaticEmitRef(bufObj*)
+0035CAA0 wrap     # ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices) + cockpit quad (0x219C48)

@@ -1060,27 +1060,7 @@ extern "C" void f_00326168(void) {
     replay_water();
 }
 extern "C" void f_00325728(void) { diff_run(0x00325728, water_draw, f_00325728_orig); }
-
-// 0x361708 ImmediateVertex(f12..f14 xyz, f15 f16 st, a0 colour, a1 strip) -> 0 accepted. Observed
-// (not replaced) while a WaterDraw is open, so the native water mesh has the vertices of the tiles
-// 0x325728 draws and of the subdivided tiles its 0x324928 subtree draws (0x31F4A0, 0x321A90,
-// 0x322828, 0x323550, 0x323E20; recompiled, R4 decompiles the immediate geometry path).
-extern "C" void f_00361708_orig(void);
-extern "C" void f_00361708(void) {
-    const bool in_water = native::ee_in_water();
-    const bool in_flare = native::ee_in_flare();
-    if (!in_water && !in_flare) {
-        f_00361708_orig();
-        return;
-    }
-    const float xyz[3] = {g_ee.fpr[12].f, g_ee.fpr[13].f, g_ee.fpr[14].f}, st[2] = {g_ee.fpr[15].f, g_ee.fpr[16].f};
-    const uint32_t colour = reg(4), strip = reg(5);
-    f_00361708_orig();
-    if (reg(2) == 0) {
-        if (in_water) native::ee_water_vertex(xyz, st, colour, strip);
-        if (in_flare) native::ee_flare_vertex(xyz, st, colour, strip);
-    }
-}
+// 0x361708 ImmediateVertex is implemented as full readable C++ (diff_run) in src/native_effects_imm.cpp (R4 A2).
 extern "C" void f_00325E40(void) { diff_run(0x00325E40, water_simulate, f_00325E40_orig); }
 
 // 0x326188 WaterCreate(pos, axis a, axis b), from the Water display object (subtype 28, only
