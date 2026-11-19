@@ -46,17 +46,18 @@ struct FrameStats {
     uint32_t lost = 0;        // not drawn: no mesh, no surface or no renderer
     uint32_t textured = 0, untextured_rt = 0, skinned = 0, posed = 0, flushes = 0;
     uint64_t suppressed = 0;  // GS primitives not drawn because they were a native object's
-    // by Packet::kind (draw queue record, world leaf, water surface)
-    uint32_t k_objects[3] = {}, k_drawn[3] = {}, k_skipped[3] = {}, k_lost[3] = {};
+    // by Packet::kind (queue, world, water, shadow, flare)
+    uint32_t k_objects[KIND_COUNT] = {}, k_drawn[KIND_COUNT] = {}, k_skipped[KIND_COUNT] = {}, k_lost[KIND_COUNT] = {};
 };
 std::map<uint64_t, FrameStats> g_frames;
 uint64_t g_newest_frame = 0;
-// P1 (docs/NATIVE_RENDERER_SUCCESS.md): frames whose world leaves / water draws the EE submitted
-// equal what was drawn (frames the GS skips with FrameSkip count separately)
+// P1 (docs/NATIVE_RENDERER_SUCCESS.md): frames whose submitted draws equal what Plume drew
 struct Parity {
     uint64_t frames = 0, world_equal = 0, water_equal = 0, world_submitted = 0, world_drawn = 0, water_submitted = 0,
              water_drawn = 0, skipped_frames = 0;
     uint64_t queue_equal = 0, queue_submitted = 0, queue_drawn = 0;  // draw queue records (R1/R3)
+    uint64_t shadow_equal = 0, shadow_submitted = 0, shadow_drawn = 0;  // projected shadows (R4 A1)
+    uint64_t flare_equal = 0, flare_submitted = 0, flare_drawn = 0;     // sun/light flares (R4 A1)
 };
 Parity g_parity;
 uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
@@ -174,6 +175,16 @@ struct Renderer {
     uint64_t vb = 0;
     std::vector<Item> pending;
     Target target{};
+    // adaptive full-RenderScale shadow accumulation buffer (removes PS2 320x512 cap)
+    std::vector<Item> shadow_pending;
+    Target main_target{};
+    bool has_main_target = false;
+    uint64_t main_xy = 0;
+    int32_t main_sc[4] = {};
+    Texture shadow_mask;
+    std::unique_ptr<plume::RenderFramebuffer> shadow_fb;
+    uint64_t shadow_fb_depth = 0;
+    std::unique_ptr<plume::RenderBuffer> quad_buf;
     std::vector<Texture *> uploads;
     std::deque<std::pair<uint32_t, uint64_t>> transient;  // one-draw meshes (id, vblank they arrived)
 };
@@ -252,7 +263,8 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     auto &slot = g_r.pipelines[key];
     if (slot) return slot.get();
     const uint32_t blend = key & 15, zfunc = (key >> 4) & 3, mask = (key >> 8) & 15;
-    const bool zwrite = (key >> 6) & 1, depth = (key >> 7) & 1;
+    const uint32_t cull = (key >> 12) & 3;
+    const bool zwrite = (key >> 6) & 1, depth = (key >> 7) & 1, blend_alpha = (key >> 14) & 1;
     plume::RenderInputSlot in(0, sizeof(Vertex));
     plume::RenderInputElement el[4] = {
         plume::RenderInputElement("POSITION", 0, 0, plume::RenderFormat::R32G32B32_FLOAT, 0, 0),
@@ -268,7 +280,7 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     d.inputElements = el;
     d.inputElementsCount = 4;
     d.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
-    d.cullMode = plume::RenderCullMode::NONE;
+    d.cullMode = cull == 1 ? plume::RenderCullMode::BACK : cull == 2 ? plume::RenderCullMode::FRONT : plume::RenderCullMode::NONE;
     d.depthClipEnabled = true;
     d.renderTargetCount = 1;
     d.renderTargetFormat[0] = plume::RenderFormat::R8G8B8A8_UNORM;
@@ -296,10 +308,16 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     case B_KEEP: b.srcBlend = B::ZERO, b.dstBlend = B::ONE; break;
     default: b.srcBlend = B::ONE, b.dstBlend = B::ZERO; break;
     }
-    // the GS writes the source alpha as it is (it does not blend alpha)
-    b.srcBlendAlpha = B::ONE;
-    b.dstBlendAlpha = B::ZERO;
-    b.blendOpAlpha = O::ADD;
+    // the GS writes the source alpha as it is; shadow accumulation blends alpha with the same op
+    if (blend_alpha) {
+        b.srcBlendAlpha = B::ONE;
+        b.dstBlendAlpha = B::ONE;
+        b.blendOpAlpha = b.blendOp;
+    } else {
+        b.srcBlendAlpha = B::ONE;
+        b.dstBlendAlpha = B::ZERO;
+        b.blendOpAlpha = O::ADD;
+    }
     b.renderTargetWriteMask = (uint8_t)mask;
     slot = g_r.dev->createGraphicsPipeline(d);
     return slot.get();
@@ -482,7 +500,199 @@ void water_view_drawn(size_t triangles, const int32_t sc[4], float ox, float oy)
                          (unsigned long long)v.second[0], (unsigned long long)v.second[1]);
 }
 
+void ensure_shadow_resources(uint32_t w, uint32_t h) {
+    if (!g_r.quad_buf) {
+        // full-screen NDC quad (vs_main with identity cx..cw maps p.xy directly to NDC)
+        const Vertex qv[4] = {
+            {{-1.0f, -1.0f, 0.0f}, {0.0f, 0.0f}, {0, 0, 0, 0}, {0, 0, 0, 0}},
+            {{ 1.0f, -1.0f, 0.0f}, {1.0f, 0.0f}, {0, 0, 0, 0}, {0, 0, 0, 0}},
+            {{-1.0f,  1.0f, 0.0f}, {0.0f, 1.0f}, {0, 0, 0, 0}, {0, 0, 0, 0}},
+            {{ 1.0f,  1.0f, 0.0f}, {1.0f, 1.0f}, {0, 0, 0, 0}, {0, 0, 0, 0}},
+        };
+        const uint32_t qi[6] = {0, 1, 2, 2, 1, 3};
+        const uint64_t vb = sizeof qv, ib = sizeof qi;
+        g_r.quad_buf = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+            vb + ib, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
+        if (g_r.quad_buf) {
+            uint8_t *p = (uint8_t *)g_r.quad_buf->map();
+            std::memcpy(p, qv, vb);
+            std::memcpy(p + vb, qi, ib);
+            g_r.quad_buf->unmap();
+        }
+    }
+    if (!g_r.shadow_mask.tex || g_r.shadow_mask.w != w || g_r.shadow_mask.h != h) {
+        if (g_r.shadow_mask.tex) {
+            Trash t{g_r.vb};
+            t.tex = std::move(g_r.shadow_mask.tex);
+            for (int i = 0; i < 8; i++) t.sets[i] = std::move(g_r.shadow_mask.sets[i]);
+            g_r.trash.push_back(std::move(t));
+        }
+        if (g_r.shadow_fb) {
+            Trash t{g_r.vb};
+            t.fb = std::move(g_r.shadow_fb);
+            g_r.trash.push_back(std::move(t));
+            g_r.shadow_fb_depth = 0;
+        }
+        g_r.shadow_mask.tex = g_r.dev->createTexture(
+            plume::RenderTextureDesc::ColorTarget(w, h, plume::RenderFormat::R8G8B8A8_UNORM));
+        g_r.shadow_mask.w = w;
+        g_r.shadow_mask.h = h;
+    }
+}
+
+void flush_shadows() {
+    if (g_r.shadow_pending.empty()) return;
+    if (!g_r.has_main_target) {
+        for (const Item &it : g_r.shadow_pending) {
+            g_frames[it.p.frame].lost++;
+            g_frames[it.p.frame].k_lost[KIND_SHADOW]++;
+        }
+        g_r.shadow_pending.clear();
+        return;
+    }
+    const Target &tg = g_r.main_target;
+    gs::Env e{};
+    e.fbp = tg.fbp, e.fbw = tg.fbw, e.fpsm_mem = tg.fpsm, e.zbp = tg.zbp, e.zpsm = tg.zpsm, e.scy1 = (int)tg.rows - 1;
+    gs::hw::NativeSurfaces s{};
+    if (!gs::hw::native_begin(e, true, s) || !s.depth) {
+        if (s.cmd) gs::hw::native_end();
+        for (const Item &it : g_r.shadow_pending) {
+            g_frames[it.p.frame].lost++;
+            g_frames[it.p.frame].k_lost[KIND_SHADOW]++;
+        }
+        g_r.shadow_pending.clear();
+        return;
+    }
+    ensure_shadow_resources(s.width, s.height);
+    if (!g_r.shadow_mask.tex || !g_r.quad_buf) {
+        gs::hw::native_end();
+        for (const Item &it : g_r.shadow_pending) {
+            g_frames[it.p.frame].lost++;
+            g_frames[it.p.frame].k_lost[KIND_SHADOW]++;
+        }
+        g_r.shadow_pending.clear();
+        return;
+    }
+    g_frames[g_r.shadow_pending.front().p.frame].flushes++;
+    auto *vl = static_cast<plume::VulkanCommandList *>(g_r.list.get());
+    plume::RenderCommandList *cl = vl;
+    const VkCommandBuffer own = vl->vk;
+    vl->vk = (VkCommandBuffer)s.cmd;
+    record_uploads(cl);
+
+    plume::RenderTexture *color = wrapper(s.color, s.width, s.height, false);
+    plume::RenderTexture *depth = wrapper(s.depth, s.width, s.height, true);
+    plume::RenderTexture *smask = g_r.shadow_mask.tex.get();
+
+    // Pass 1: accumulate extruded shadow volumes into full-RenderScale shadow_mask against main D32 depth
+    plume::RenderTextureBarrier in1[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::COLOR_WRITE),
+                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
+    cl->barriers(plume::RenderBarrierStage::GRAPHICS, in1, 2);
+    if (!g_r.shadow_fb || g_r.shadow_fb_depth != s.depth) {
+        if (g_r.shadow_fb) {
+            Trash t{g_r.vb};
+            t.fb = std::move(g_r.shadow_fb);
+            g_r.trash.push_back(std::move(t));
+        }
+        const plume::RenderTexture *ca[1] = {smask};
+        g_r.shadow_fb = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(ca, 1, depth));
+        g_r.shadow_fb_depth = s.depth;
+    }
+    cl->setFramebuffer(g_r.shadow_fb.get());
+    cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
+    cl->clearColor(0, plume::RenderColor(0, 0, 0, 0));
+    cl->setGraphicsPipelineLayout(g_r.layout.get());
+    const double gw = s.gs_width, gh = s.gs_height;
+    const int sc = s.scale;
+    uint32_t bound = ~0u;
+    uint32_t intensity = 0;
+    int32_t comp_sc[4] = {g_r.main_sc[0], g_r.main_sc[1], g_r.main_sc[2], g_r.main_sc[3]};
+    for (Item &it : g_r.shadow_pending) {
+        FrameStats &fs = g_frames[it.p.frame];
+        intensity = it.p.pass;
+        if (!it.mesh || !it.mesh->buf) {
+            fs.drawn++;
+            fs.k_drawn[KIND_SHADOW]++;
+            fs.empty++;
+            continue;
+        }
+        PushConstants &pc = it.pc;
+        const double kx = (0.5 - it.ox) * 2.0 / gw - 1.0, ky = (0.5 - it.oy) * 2.0 / gh - 1.0;
+        for (int c = 0; c < 4; c++) {
+            pc.cx[c] = (float)(it.a[0][c] * 2.0 / gw + it.a[3][c] * kx);
+            pc.cy[c] = (float)(it.a[1][c] * 2.0 / gh + it.a[3][c] * ky);
+            pc.cz[c] = (float)(it.a[2][c] * it.zscale);
+            pc.cw[c] = (float)it.a[3][c];
+        }
+        if (it.pipeline != bound) {
+            cl->setPipeline(pipeline(it.pipeline));
+            bound = it.pipeline;
+        }
+        cl->setGraphicsDescriptorSet(texture_set(&g_r.white, 0), 0);
+        cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
+        const int32_t x0 = std::max(0, it.sc[0]) * sc, y0 = std::max(0, it.sc[1]) * sc;
+        const int32_t x1 = std::min((int32_t)gw, it.sc[2] + 1) * sc, y1 = std::min((int32_t)gh, it.sc[3] + 1) * sc;
+        cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
+        const GpuMesh &m = *it.mesh;
+        const plume::RenderVertexBufferView vbv(m.buf->at(0), (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)));
+        const plume::RenderInputSlot slot(0, sizeof(Vertex));
+        cl->setVertexBuffers(0, &vbv, 1, &slot);
+        const plume::RenderIndexBufferView ibv(m.buf->at(m.index_offset), (uint32_t)(m.cpu->indices.size() * 4),
+                                               plume::RenderFormat::R32_UINT);
+        cl->setIndexBuffer(&ibv);
+        cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+        fs.drawn++;
+        fs.k_drawn[KIND_SHADOW]++;
+    }
+    cl->setFramebuffer(nullptr);
+
+    // Pass 2: composite shadow_mask onto main framebuffer color (0x362E70: AEM=1, ALPHA_1=0x44, FIX=intensity)
+    if (intensity > 0) {
+        plume::RenderTextureBarrier in2[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::SHADER_READ),
+                                              plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE)};
+        cl->barriers(plume::RenderBarrierStage::GRAPHICS, in2, 2);
+        auto &cfb = g_r.framebuffers[{s.color, 0}];
+        if (!cfb) {
+            const plume::RenderTexture *ca[1] = {color};
+            cfb = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(ca, 1, nullptr));
+        }
+        cl->setFramebuffer(cfb.get());
+        cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
+        cl->setGraphicsPipelineLayout(g_r.layout.get());
+        // B_MIX, no depth, RGB write mask (0x7), no cull
+        const uint32_t comp_pipe = B_MIX | (0x7u << 8);
+        cl->setPipeline(pipeline(comp_pipe));
+        cl->setGraphicsDescriptorSet(texture_set(&g_r.shadow_mask, 2 | 4), 0);  // nearest + clamp
+        PushConstants cpc{};
+        cpc.cx[0] = 1.0f; cpc.cy[1] = 1.0f; cpc.cz[2] = 1.0f; cpc.cw[3] = 1.0f;
+        cpc.ambient[3] = 128.0f;  // va = 128 -> a = floor(t.a * 128 / 128) = t.a
+        // M_TME | M_TCC | TFX=0(modulate) | M_ATE | ATST=6(GREATER) | M_AFAIL_DISCARD | M_CFIX
+        cpc.mode[0] = M_TME | M_TCC | M_ATE | (6u << M_ATST_SHIFT) | M_AFAIL_DISCARD | M_CFIX;
+        cpc.mode[1] = 0;  // aref = 0 (discard when shadow_mask.a == 0)
+        cpc.mode[2] = intensity & 0xFFu;
+        cl->setGraphicsPushConstants(0, &cpc, 0, sizeof cpc);
+        const int32_t x0 = std::max(0, comp_sc[0]) * sc, y0 = std::max(0, comp_sc[1]) * sc;
+        const int32_t x1 = std::min((int32_t)gw, comp_sc[2] + 1) * sc, y1 = std::min((int32_t)gh, comp_sc[3] + 1) * sc;
+        cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
+        const plume::RenderVertexBufferView qvbv(g_r.quad_buf->at(0), (uint32_t)(4 * sizeof(Vertex)));
+        const plume::RenderInputSlot qslot(0, sizeof(Vertex));
+        cl->setVertexBuffers(0, &qvbv, 1, &qslot);
+        const plume::RenderIndexBufferView qibv(g_r.quad_buf->at(4 * sizeof(Vertex)), 6 * 4, plume::RenderFormat::R32_UINT);
+        cl->setIndexBuffer(&qibv);
+        cl->drawIndexedInstanced(6, 1, 0, 0, 0);
+        cl->setFramebuffer(nullptr);
+    }
+
+    plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
+                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
+    cl->barriers(plume::RenderBarrierStage::ALL, out, 2);
+    vl->vk = own;
+    gs::hw::native_end();
+    g_r.shadow_pending.clear();
+}
+
 void flush() {
+    if (!g_r.shadow_pending.empty()) flush_shadows();
     if (g_r.pending.empty()) return;
     const Target &tg = g_r.target;
     gs::Env e{};
@@ -519,7 +729,7 @@ void flush() {
         FrameStats &fs = g_frames[it.p.frame];
         if (!it.mesh || !it.mesh->buf) {
             fs.drawn++;
-            fs.k_drawn[it.p.kind % 3]++;
+            fs.k_drawn[it.p.kind % KIND_COUNT]++;
             fs.empty++;
             continue;
         }
@@ -552,7 +762,7 @@ void flush() {
         cl->setIndexBuffer(&ibv);
         cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
         fs.drawn++;
-        fs.k_drawn[it.p.kind % 3]++;
+        fs.k_drawn[it.p.kind % KIND_COUNT]++;
         if (it.p.kind == KIND_WATER) water_view_drawn(m.cpu->indices.size() / 3, it.sc, it.ox, it.oy);
         if (it.tex) fs.textured++;
         if (m.cpu->skinned) fs.skinned++;
@@ -585,7 +795,7 @@ void finalize() {
     if (!g_active || g_finalized) return;
     g_finalized = true;
     FrameStats &fs = g_frames[g_cur.frame];
-    const uint32_t kind = g_cur.kind % 3;
+    const uint32_t kind = g_cur.kind % KIND_COUNT;
     if (gs::g_skip_frame) {
         fs.skipped++;
         fs.k_skipped[kind]++;
@@ -609,10 +819,46 @@ void finalize() {
         fs.k_lost[kind]++;
         return;
     }
+    if (kind == KIND_SHADOW) {
+        // Flush any pending opaque world/queue draws so s.depth is populated before shadow volumes
+        if (!g_r.pending.empty()) flush();
+        if (!g_r.has_main_target) {
+            fs.lost++;
+            fs.k_lost[KIND_SHADOW]++;
+            return;
+        }
+        Item it{};
+        it.p = g_cur;
+        it.mesh = mesh;
+        screen_matrix(g_cur, it.a);
+        it.ox = (float)(g_r.main_xy & 0xFFFF) / 16.0f;
+        it.oy = (float)((g_r.main_xy >> 32) & 0xFFFF) / 16.0f;
+        it.zscale = (float)(1.0 / depth_range(g_r.main_target.zpsm));
+        PushConstants &pc = it.pc;
+        pc.ambient[3] = 15.0f;  // va = 15 (accumulated in shadow_mask.a)
+        pc.mode[0] = M_CFIX;
+        pc.mode[2] = 128;       // FIX = 1.0
+        // pass 1 (front faces): cull BACK (1), B_ADD; pass 0 (back faces): cull FRONT (2), B_REVSUB
+        const bool front = (g_cur.itop & 1u) != 0;
+        const uint32_t blend = front ? B_ADD : B_REVSUB;
+        const uint32_t cull = front ? 1u : 2u;
+        // zf = 1 (GEQUAL), zwrite = 0, depth = 1, color mask = 0xF, blend_alpha = 1
+        it.pipeline = blend | (1u << 4) | (0u << 6) | (1u << 7) | (0xFu << 8) | (cull << 12) | (1u << 14);
+        for (int i = 0; i < 4; i++) it.sc[i] = g_r.main_sc[i];
+        g_r.shadow_pending.push_back(it);
+        return;
+    }
+    if (!g_r.shadow_pending.empty()) flush_shadows();
     const bool zwrite = !e.zmsk && e.ztst != 0, ztest = e.ztst >= 2;
     Target tg{e.fbp, e.fbw, e.fpsm_mem, e.zbp, e.zpsm, (uint32_t)e.scy1 + 1, zwrite || ztest};
     if (!g_r.pending.empty() && !(tg == g_r.target)) flush();
     g_r.target = tg;
+    if (tg.depth) {
+        g_r.main_target = tg;
+        g_r.has_main_target = true;
+        g_r.main_xy = xy;
+        g_r.main_sc[0] = e.scx0; g_r.main_sc[1] = e.scy0; g_r.main_sc[2] = e.scx1; g_r.main_sc[3] = e.scy1;
+    }
     Item it{};
     it.p = g_cur;
     it.mesh = mesh;
@@ -679,6 +925,12 @@ void end_vblank(uint64_t vb) {
         std::fprintf(stderr, "[native] vb %llu textures decoded %llu (total), cached %zu (%llu MB), meshes %zu\n",
                      (unsigned long long)vb, (unsigned long long)g_r.decoded, g_r.textures.size(),
                      (unsigned long long)(g_r.texture_bytes >> 20), g_r.meshes.size());
+    if (g_r.shadow_fb) {
+        Trash t{vb};
+        t.fb = std::move(g_r.shadow_fb);
+        g_r.trash.push_back(std::move(t));
+        g_r.shadow_fb_depth = 0;
+    }
     for (auto &w : g_r.framebuffers) {
         Trash t{vb};
         t.fb = std::move(w.second);
@@ -834,7 +1086,7 @@ void vertex_check_report() {
 void finalize() {
     if (g_active && !g_finalized) {
         g_frames[g_cur.frame].lost++;
-        g_frames[g_cur.frame].k_lost[g_cur.kind % 3]++;
+        g_frames[g_cur.frame].k_lost[g_cur.kind % KIND_COUNT]++;
     }
     g_finalized = true;
 }
@@ -849,7 +1101,7 @@ void begin_object(const Packet &p) {
     g_finalized = false;
     g_have_env = false;
     g_frames[p.frame].objects++;
-    g_frames[p.frame].k_objects[p.kind % 3]++;
+    g_frames[p.frame].k_objects[p.kind % KIND_COUNT]++;
     g_newest_frame = std::max(g_newest_frame, p.frame);
 }
 
@@ -871,6 +1123,7 @@ void report(uint64_t vb) {
         auto e = expected.find(frame);
         const uint32_t world = e != expected.end() ? e->second.world : 0, water = e != expected.end() ? e->second.water : 0;
         const uint32_t queue = e != expected.end() ? e->second.queue : 0;
+        const uint32_t shadow = e != expected.end() ? e->second.shadow : 0, flare = e != expected.end() ? e->second.flare : 0;
         if (s.skipped) {
             g_parity.skipped_frames++;
         } else {
@@ -887,6 +1140,14 @@ void report(uint64_t vb) {
             g_parity.queue_equal += qe;
             g_parity.queue_submitted += queue;
             g_parity.queue_drawn += s.k_drawn[KIND_QUEUE];
+            const bool se = s.k_drawn[KIND_SHADOW] == shadow && s.k_objects[KIND_SHADOW] == shadow;
+            const bool fe = s.k_drawn[KIND_FLARE] == flare && s.k_objects[KIND_FLARE] == flare;
+            g_parity.shadow_equal += se;
+            g_parity.shadow_submitted += shadow;
+            g_parity.shadow_drawn += s.k_drawn[KIND_SHADOW];
+            g_parity.flare_equal += fe;
+            g_parity.flare_submitted += flare;
+            g_parity.flare_drawn += s.k_drawn[KIND_FLARE];
             if (log_parity && !qe)
                 std::fprintf(stderr, "[native] parity frame %llu queue records submitted %u objects %u drawn %u lost %u\n",
                              (unsigned long long)frame, queue, s.k_objects[KIND_QUEUE], s.k_drawn[KIND_QUEUE],
@@ -897,6 +1158,12 @@ void report(uint64_t vb) {
                              "objects %u drawn %u lost %u\n",
                              (unsigned long long)frame, world, s.k_objects[KIND_WORLD], s.k_drawn[KIND_WORLD],
                              s.k_lost[KIND_WORLD], water, s.k_objects[KIND_WATER], s.k_drawn[KIND_WATER], s.k_lost[KIND_WATER]);
+            if (log_parity && (!se || !fe))
+                std::fprintf(stderr,
+                             "[native] parity frame %llu shadow submitted %u objects %u drawn %u lost %u | flare submitted %u "
+                             "objects %u drawn %u lost %u\n",
+                             (unsigned long long)frame, shadow, s.k_objects[KIND_SHADOW], s.k_drawn[KIND_SHADOW],
+                             s.k_lost[KIND_SHADOW], flare, s.k_objects[KIND_FLARE], s.k_drawn[KIND_FLARE], s.k_lost[KIND_FLARE]);
         }
         if (every && (every == 1 || frame % every < 2)) {
             std::fprintf(stderr,
@@ -920,6 +1187,15 @@ void report(uint64_t vb) {
                          (unsigned long long)g_parity.world_drawn, (unsigned long long)g_parity.world_submitted,
                          (unsigned long long)g_parity.water_drawn, (unsigned long long)g_parity.water_submitted,
                          (unsigned long long)g_parity.skipped_frames, (unsigned long long)g_only_dropped);
+            std::fprintf(stderr,
+                         "[native] gs frame %llu shadows submitted %u drawn %u (lost %u) flares submitted %u drawn %u (lost %u) | "
+                         "P1 frames shadow equal %llu/%llu flare equal %llu/%llu (shadows %llu of %llu, flares %llu of %llu)\n",
+                         (unsigned long long)frame, shadow, s.k_drawn[KIND_SHADOW], s.k_lost[KIND_SHADOW], flare,
+                         s.k_drawn[KIND_FLARE], s.k_lost[KIND_FLARE], (unsigned long long)g_parity.shadow_equal,
+                         (unsigned long long)g_parity.frames, (unsigned long long)g_parity.flare_equal,
+                         (unsigned long long)g_parity.frames, (unsigned long long)g_parity.shadow_drawn,
+                         (unsigned long long)g_parity.shadow_submitted, (unsigned long long)g_parity.flare_drawn,
+                         (unsigned long long)g_parity.flare_submitted);
         }
         if (it != g_frames.end()) g_frames.erase(it);
     }
@@ -953,6 +1229,11 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
                         flush();  // an object still to be drawn uses the old geometry
                         break;
                     }
+                for (const Item &pi : g_r.shadow_pending)
+                    if (pi.mesh == &it->second) {
+                        flush_shadows();
+                        break;
+                    }
                 Trash t{g_r.vb};
                 t.buf = std::move(it->second.buf);
                 g_r.trash.push_back(std::move(t));
@@ -972,7 +1253,7 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
 bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const gs::Vertex *c) {
     if (!g_active) {
 #ifdef EOD_PLUME
-        if (!g_r.pending.empty()) flush();  // before the GS draws something of its own
+        if (!g_r.pending.empty() || !g_r.shadow_pending.empty()) flush();  // before the GS draws something of its own
 #endif
         if (native_only()) {
             g_only_dropped++;
@@ -1034,6 +1315,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
 void gs_barrier() {
     if (g_active) finalize();
 #ifdef EOD_PLUME
+    if (!g_r.shadow_pending.empty()) flush_shadows();
     if (g_r.pending.empty()) return;
     const Target &tg = g_r.target;
     uint32_t ff, fc, zf = 0, zc = 0;

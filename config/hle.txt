@@ -138,8 +138,13 @@
 0034AF98 wrap     # Flush(layer, set)
 0034BDA8 wrap     # ModelSubmitVu1Packets: queue draw records
 0034BF90 wrap     # queue draw records without material
-0034C208 wrap     # projected shadow submit
-0034C4B0 wrap     # projected shadow submit (layer mask)
+0034C208 wrap     # projected shadow submit (src/native_shadows_flares.cpp + render_trace.cpp)
+0034C4B0 wrap     # projected shadow submit (layer mask, src/native_shadows_flares.cpp + render_trace.cpp)
+0034C7D0 wrap     # ShadowBegin: copy dir, open shadow RT, snapshot main viewport (src/native_shadows_flares.cpp)
+0034C798 wrap     # ShadowEnd: close & composite shadow RT (src/native_shadows_flares.cpp)
+0035D170 wrap     # ShadowEmitBatchPass: emit matrix + shadow batch DMA REF (src/native_shadows_flares.cpp)
+00304D50 wrap     # FlareRender: sun glare & point-light flares (src/native_shadows_flares.cpp)
+0020F2D8 wrap     # ViewportRenderFinish: lift single-viewport flare check for split-screen parity (src/native_shadows_flares.cpp)
 0035CB88 wrap     # emit one queued batch to the VU1 DMA chain
 0035B3D0 wrap     # camera packet (VU1 qwords 1..16)
 0035CD28 wrap     # matrix packet (VU1 TOPS+0..6)

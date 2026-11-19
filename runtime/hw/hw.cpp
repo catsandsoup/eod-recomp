@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "../core/diff_harness.h"
 #include "../core/log.h"
 #include "../core/memory.h"
 #include "../gs/gs.h"
@@ -42,9 +43,14 @@ double timer_rate(const Timer &t) {
     }
 }
 
+static uint64_t timer_now_us() {
+    const uint64_t ft = diff_frozen_time_us();
+    return ft ? ft : platform_time_us();
+}
+
 uint32_t timer_count(const Timer &t) {
     if (!(t.mode & 0x80)) return t.base_count & 0xFFFF;
-    double el = (double)(platform_time_us() - t.base_us) * 1e-6;
+    double el = (double)(timer_now_us() - t.base_us) * 1e-6;
     return (uint32_t)(t.base_count + (uint64_t)(el * timer_rate(t))) & 0xFFFF;
 }
 
@@ -53,11 +59,11 @@ void timer_write(int n, uint32_t reg, uint32_t v) {
     switch (reg) {
     case 0x00:
         t.base_count = v & 0xFFFF;
-        t.base_us = platform_time_us();
+        t.base_us = timer_now_us();
         break;
     case 0x10:
         t.base_count = timer_count(t);
-        t.base_us = platform_time_us();
+        t.base_us = timer_now_us();
         t.mode = v & 0x3FF;
         if (v & 0x300) LOG(LOG_HW, "timer %d interrupts enabled (mode %x) - not emulated", n, v);
         break;

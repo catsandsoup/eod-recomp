@@ -33,7 +33,7 @@ bool enabled() {
         const bool v = (e && *e ? *e != '0' : g_config.native_renderer) || (only && *only && *only != '0');
         if (v) {
             scene_tap::set_enabled(true);
-            std::fprintf(stderr, "[native] renderer on: queued 3D objects, track world and water drawn by plume\n");
+            std::fprintf(stderr, "[native] renderer on: queued 3D objects, track world, water, shadows and flares drawn by plume\n");
         }
         return v;
     }();
@@ -120,14 +120,21 @@ constexpr uint32_t kImmMoreRa = 0x364DF0;       // reserve in 0x364D18 (strip co
 constexpr uint32_t kMlist = 0x4D6F10;           // the mlist 0x358BD0 draws (set by 0x3582B8)
 constexpr uint32_t kMaterialPacket = 0x4D7C54;  // material packet 0x35BA10 sends (sun quad for 0x6A)
 bool g_in_water = false;
+bool g_in_flare = false;
+bool g_in_shadow = false;
+int32_t g_shadow_intensity = 0;
+Packet g_shadow_cam;
 int32_t g_world_pass = 0;
 std::vector<std::pair<uint32_t, Packet>> g_leaves;  // this texture record's REFs, until its commit
 Packet g_water;
 Mesh *g_water_mesh = nullptr;
+Packet g_flare;
+Mesh *g_flare_mesh = nullptr;
 // counters (EE frame)
 struct WorldCounts {
     uint32_t passes = 0, leaves = 0, facing = 0, no_quad = 0, nomesh = 0, dropped_records = 0, dropped_leaves = 0;
     uint32_t water_draws = 0, water_vertices = 0, water_tris = 0;
+    uint32_t shadow_batches = 0, flare_draws = 0, flare_vertices = 0, flare_tris = 0;
 };
 WorldCounts g_wc;
 
@@ -203,7 +210,9 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     m->batch = batch;
     m->skinned = false;
     if (st != vifmesh::Status::Ok) g_mesh_fail++;
+    bool has_shadow = false;
     for (const vifmesh::Batch &b : g_scratch.batches) {
+        if (b.shadow) has_shadow = true;
         if (b.skin != vifmesh::Skin::None) {
             m->skinned = true;
             for (uint32_t v = b.first_vertex; v < b.first_vertex + b.vertex_count; v++) {
@@ -255,7 +264,7 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
             m->indices.push_back(p.first_vertex + g_scratch.indices[p.first_index + i]);
     c.hash = h;
     c.id = m->id;
-    if (!c.facing.empty() || !c.skin.empty()) {
+    if (!c.facing.empty() || !c.skin.empty() || has_shadow) {
         c.base = m->vertices;
         c.indices = m->indices;
     }
@@ -280,15 +289,19 @@ void roll(uint64_t vb) {
         e.world += g_wc.leaves;
         e.water += g_wc.water_draws;
         e.queue += g_records;
+        e.shadow += g_wc.shadow_batches;
+        e.flare += g_wc.flare_draws;
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr, "[native] ee vb %llu records %u tagged %u meshes decoded %u (failed %u) cached %zu\n",
                      (unsigned long long)g_frame_vb, g_records, g_tagged, g_meshes_decoded, g_mesh_fail, g_cache.size());
         std::fprintf(stderr,
                      "[native] ee vb %llu world passes %u leaves %u (camera-facing %u, no sun quad %u, no mesh %u) "
-                     "dropped (no packet space) records %u leaves %u | water draws %u vertices %u triangles %u\n",
+                     "dropped (no packet space) records %u leaves %u | water draws %u vertices %u triangles %u | "
+                     "shadows %u flares %u (verts %u tris %u)\n",
                      (unsigned long long)g_frame_vb, g_wc.passes, g_wc.leaves, g_wc.facing, g_wc.no_quad, g_wc.nomesh,
-                     g_wc.dropped_records, g_wc.dropped_leaves, g_wc.water_draws, g_wc.water_vertices, g_wc.water_tris);
+                     g_wc.dropped_records, g_wc.dropped_leaves, g_wc.water_draws, g_wc.water_vertices, g_wc.water_tris,
+                     g_wc.shadow_batches, g_wc.flare_draws, g_wc.flare_vertices, g_wc.flare_tris);
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr,
@@ -465,9 +478,10 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     if (!addr) return;
     const bool batch = g_in_object && ra == kBatchPacketRa;
     const bool water = g_in_water && (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
+    const bool flare = g_in_flare && (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
     const uint32_t end = addr + (qwc ? qwc : 1) * 16;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!batch && !water && g_tags.empty()) return;
+    if (!batch && !water && !flare && g_tags.empty()) return;
     // drop older entries this range overlaps
     auto it = g_tags.lower_bound(addr);
     if (it != g_tags.begin()) {
@@ -478,6 +492,10 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     while (it != g_tags.end() && it->first < end) it = g_tags.erase(it);
     if (water) {  // every VU1 start under this packet's DMA tags draws the water surface
         g_tags[addr] = Tagged{end, g_water, true};
+        return;
+    }
+    if (flare) {  // every VU1 start under this packet's DMA tags draws the flare bucket
+        g_tags[addr] = Tagged{end, g_flare, true};
         return;
     }
     if (!batch) return;  // any other packet there replaces a record's tag
@@ -870,6 +888,171 @@ void ee_water_end(bool drawn) {
     g_water_mesh = nullptr;
 }
 
+// ---- projected shadows (0x34C7D0 / 0x35D170 / 0x34C798, src/native_shadows_flares.cpp) ---------
+// Snapshots the main-viewport camera/projection before 0x363218 overwrites 0x4D7C20 with the PS2
+// 320x512 shadow RT viewport. Each shadow batch is extruded on the EE using the exact VU1 0x0020
+// formula (0x3BE4C0) and rendered by Plume into an adaptive full-RenderScale host shadow buffer.
+void ee_shadow_begin(int32_t alpha) {
+    if (!enabled()) return;
+    roll(kernel_vblank_count());
+    std::memset(&g_shadow_cam, 0, sizeof g_shadow_cam);
+    fill_camera(g_shadow_cam);
+    // 0x363480: intensity = (alpha >> 1) + (alpha >> 7) in GS 0..128 alpha units
+    const int32_t half = (alpha - (alpha >> 31)) >> 1;
+    const int32_t adj = (alpha < 0 ? alpha + 0x7F : alpha) >> 7;
+    g_shadow_intensity = half + adj;
+    // record the PS2 320x512 cap vs the un-clamped main viewport size
+    const uint32_t vw = (uint32_t)std::max(0.0f, g_shadow_cam.viewport[2]);
+    const uint32_t vh = (uint32_t)std::max(0.0f, g_shadow_cam.viewport[3]);
+    limit_note("shadow RT width (0x35DA30 320 cap)", vw, 0, 320);
+    limit_note("shadow RT height (0x35DA30 512 cap)", vh, 0, 512);
+    g_in_shadow = true;
+}
+
+void ee_shadow_opened(bool opened) {
+    if (!opened) g_in_shadow = false;
+}
+
+namespace {
+uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
+    if (c.base.empty() || c.indices.empty()) return 0;
+    // VU1 0x3BE4C0 0x16f8..0x17b8: vf1 = -M^T * (light.xyz * light.w)
+    double vf1[3];
+    for (int col = 0; col < 3; col++) {
+        double s = 0.0;
+        for (int row = 0; row < 3; row++) s += (double)p.model[row * 4 + col] * (double)p.light[row];
+        vf1[col] = -s * (double)p.light[3];
+    }
+    const double extrude = (double)p.colour_b[3];  // 0x35CD28 q[5].w = *(float*)0x4D7D18
+    auto *m = new Mesh();
+    m->id = g_next_mesh++;
+    m->replaces = 0;
+    m->batch = p.batch;
+    m->skinned = false;
+    m->transient = true;
+    m->vertices = c.base;
+    m->indices = c.indices;
+    for (Vertex &v : m->vertices) {
+        // VU1 0x3BE4C0 0x0130..0x0170: d = dot(n, vf1), e = min(max(0, d) * 65535, extrude)
+        const double d = (double)v.n[0] * vf1[0] + (double)v.n[1] * vf1[1] + (double)v.n[2] * vf1[2];
+        if (d > 0.0) {
+            const double e = std::fmin(d * 65535.0, extrude);
+            v.p[0] += (float)(vf1[0] * e);
+            v.p[1] += (float)(vf1[1] * e);
+            v.p[2] += (float)(vf1[2] * e);
+        }
+        v.n[3] = 0;  // prelit
+        v.c[0] = v.c[1] = v.c[2] = v.c[3] = 15;  // 0x363708 RGB=15 (+A=15 for Plume shadow mask)
+    }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_new_meshes.push_back(m);
+    return m->id;
+}
+}  // namespace
+
+void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword) {
+    if (!enabled() || !g_in_shadow || !ref_qword) return;
+    roll(kernel_vblank_count());
+    Packet p = g_shadow_cam;  // main-viewport camera/projection (not the 320x512 clamped RT!)
+    const uint32_t mp = (mat_pkt == 0xFFFFFFFFu) ? MEM_LW(0x4D7C48) : mat_pkt;
+    read_matrix_packet(mp, p);
+    p.kind = KIND_SHADOW;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.batch = batch;
+    p.pass = (uint32_t)g_shadow_intensity;
+    p.itop = (pass & 1u) | (clip_flag ? 0x200u : 0u);
+    p.texture_key = -1;
+    p.layer = -1;
+    CacheEntry *c = nullptr;
+    const uint32_t base_id = mesh_for(batch, g_frame_vb, false, &c);
+    p.mesh = (c && base_id) ? shadow_extruded_mesh(*c, p) : 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_tags.lower_bound(ref_qword);
+    if (it != g_tags.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.end > ref_qword) g_tags.erase(prev);
+    }
+    it = g_tags.lower_bound(ref_qword);
+    while (it != g_tags.end() && it->first < ref_qword + 16) it = g_tags.erase(it);
+    g_tags[ref_qword] = Tagged{ref_qword + 16, p, false};
+    g_wc.shadow_batches++;
+}
+
+void ee_shadow_end() {
+    g_in_shadow = false;
+}
+
+// ---- sun glare & light flares (0x304D50, src/native_shadows_flares.cpp) ------------------------
+void ee_flare_begin(uint32_t tex_slot) {
+    if (!enabled()) return;
+    roll(kernel_vblank_count());
+    Packet &p = g_flare;
+    std::memset(&p, 0, sizeof p);
+    read_matrix_packet(MEM_LW(0x4D7C48), p);
+    p.kind = KIND_FLARE;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.batch = tex_slot;
+    p.pass = g_wc.flare_draws;
+    p.itop = 0x280;  // 0x361468 clip flag 0x200 + va=0x80 (1.0); per-flare alpha folded into additive RGB
+    p.texture_key = (int32_t)tex_slot;
+    p.layer = -1;
+    fill_camera(p);  // 0x34D9A8 already installed the 2D screen camera
+    delete g_flare_mesh;
+    g_flare_mesh = new Mesh();
+    g_flare_mesh->id = g_next_mesh++;
+    g_flare_mesh->replaces = 0;
+    g_flare_mesh->batch = tex_slot;
+    g_flare_mesh->skinned = false;
+    g_flare_mesh->transient = true;
+    p.mesh = g_flare_mesh->id;
+    g_in_flare = true;
+}
+
+bool ee_in_flare() { return g_in_flare && g_flare_mesh; }
+
+void ee_flare_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip) {
+    if (!g_in_flare || !g_flare_mesh) return;
+    uint32_t c = (colour >> 1) & 0x7F7F7F7Fu;
+    c += (c & 0x40404040u) >> 6;
+    Vertex v{};
+    for (int i = 0; i < 3; i++) v.p[i] = xyz[i];
+    v.uv[0] = st[0];
+    v.uv[1] = st[1];
+    const uint32_t a = (c >> 24) & 0xFFu;
+    v.c[0] = (uint8_t)std::min(128u, (((c >> 16) & 0xFFu) * a + 64u) >> 7);
+    v.c[1] = (uint8_t)std::min(128u, (((c >> 8) & 0xFFu) * a + 64u) >> 7);
+    v.c[2] = (uint8_t)std::min(128u, ((c & 0xFFu) * a + 64u) >> 7);
+    v.c[3] = (uint8_t)a;
+    Mesh &m = *g_flare_mesh;
+    const uint32_t i = (uint32_t)m.vertices.size();
+    m.vertices.push_back(v);
+    g_wc.flare_vertices++;
+    if (strip && i >= 2) {
+        m.indices.push_back(i - 2);
+        m.indices.push_back(i - 1);
+        m.indices.push_back(i);
+        g_wc.flare_tris++;
+    }
+}
+
+void ee_flare_end(bool drawn) {
+    if (!g_in_flare) return;
+    g_in_flare = false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!drawn) {
+        for (auto it = g_tags.begin(); it != g_tags.end();)
+            it = it->second.range && it->second.packet.mesh == g_flare.mesh ? g_tags.erase(it) : std::next(it);
+        delete g_flare_mesh;
+        g_flare_mesh = nullptr;
+        return;
+    }
+    g_wc.flare_draws++;
+    g_new_meshes.push_back(g_flare_mesh);
+    g_flare_mesh = nullptr;
+}
+
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out) {
     std::lock_guard<std::mutex> lk(g_expect_mutex);
     while (!g_expect.empty() && g_expect.begin()->first < before) {
@@ -981,9 +1164,9 @@ void vu1_start(uint32_t program, uint32_t itop) {
     const uint64_t key = p.frame << 32 | p.serial;
     if (g_obj_active && key == g_sent_key) return;  // another program of the same record
     if (skin_check() && p.kind == KIND_QUEUE) vu_check(key, program);
-    if (p.kind == KIND_QUEUE) p.itop = itop;  // world and water carry the ITOP their EE packet sets
+    if (p.kind == KIND_QUEUE) p.itop = itop;  // world, water, shadow, flare carry the ITOP their EE packet sets
     p.program = program;
-    check(p);
+    if (p.kind != KIND_SHADOW) check(p);  // shadow uses main-viewport camera (not 320x512 VU1 shadow RT)
     post(CMD_OBJ, &p, sizeof p);
     g_obj_active = true;
     g_sent_key = key;

@@ -517,3 +517,173 @@ it was queued). Race: 4 render passes for about 965 objects per frame.
   (approximated by As), AFAIL FB_ONLY / RGB_ONLY (drawn as pass).
 - The world, sky, projected shadows, particles and HUD are still the GS's (R2, R4, R7); the VU1
   programs of queue batches still run (their GS output is dropped), so S4 is unchanged.
+
+---
+
+## Stage R4: shadows, particles, sprites, flares and immediate geometry
+
+Stage R4 moves the remaining non-queue 3D/effect GS draws to readable C++ (verified by `EOD_DIFF`)
+and native Plume rendering. R4 is split into two implementation micro-sprints:
+
+- **Phase A1 (this spec & implementation):** Projected shadows (`0x34C7D0`, `0x34C798`, `0x34C208`,
+  `0x34C4B0`, `0x35D170`, `0x35D298`) and sun glare / light flares (`0x304D50`, plus the
+  single-viewport gate in `0x20F2D8`).
+- **Phase A2 (next):** Particles (`0x3639D0`, `0x363B98`, `0x363FF8`, VU1 `0x08E0`), effect
+  sprites (`0x363DE8`, `0x363F48`, `0x364548`, `0x3642F4`, VU1 `0x01B8`), general immediate
+  geometry (`0x35DF10`, `0x361468`, `0x361708`, `0x361BC8`, `0x364D18`, sphere-tested `0x361ED8` /
+  `0x361C30` <- `0x34EE70`, `0x34EEB8`), the non-queue cockpit quad (`0x219C48` -> `0x35CAA0`),
+  and the sender of VU1 UV/screen-offset program `0x25F0` -> `0x2630`.
+
+### Full R4 function inventory (`SLUS_209.10`)
+
+| Subsystem | Address | Role | VU1 program | Phase |
+|---|---|---|---|---|
+| Shadows | `0x30A580` | Per-viewport shadow pass driver (`0x34C7D0` -> `0x30A608` -> `0x30A910` -> `0x34C798`) | — | A1 |
+| Shadows | `0x34C7D0` | `ShadowBegin(dir*, alpha)`: copy shadow dir to `0x4C96A8`, open RT via `0x35DA30` | — | A1 |
+| Shadows | `0x34C798` | `ShadowEnd()`: close & composite shadow RT via `0x35D9F0`, unbind slots 0/1, clear `0x4C96B4` | — | A1 |
+| Shadows | `0x35DA30` | `GsShadowBegin(alpha)`: clamp viewport to `320x512`, call `0x363218`, upload shadow VU1 (`0x35A5D8(1)`) | — | A1 |
+| Shadows | `0x35D9F0` | `GsShadowEnd()`: restore main VU1 (`0x35A5D8(0)`), composite & restore via `0x363640` | — | A1 |
+| Shadows | `0x363218` | `GsShadowTargetOpen(w, h, alpha)`: allocate VRAM target (`0x4D8BD8`), copy Z & clear (`0x362968`) | — | A1 |
+| Shadows | `0x363640` | `GsShadowTargetClose()`: restore aspect/viewport, composite onto main FB (`0x362E70`) | — | A1 |
+| Shadows | `0x34C208` | `ShadowSubmit(modelId, mat*, extrudeLen)`: sphere-cull extruded volume, emit front/back batches | `0x0020` | A1 |
+| Shadows | `0x34C4B0` | `ShadowSubmitMasked(modelId, mat*, mask, extrudeLen)`: same with temporary layer mask override | `0x0020` | A1 |
+| Shadows | `0x35D9C8` | `ShadowSetExtrude(len)`: store extrude length at `0x4D7D18`, set dirty bit `0x4` in `0x4D7D10` | — | A1 |
+| Shadows | `0x35D148` | `ShadowSetPass(pass)`: store pass (`1`=front/+ , `0`=back/-) at `0x4D7D14`, emit GS state (`0x363708`) | — | A1 |
+| Shadows | `0x35D298` | `ShadowEmitBatch(batch, clipFlag, matPkt)`: forward with `pass = *(0x4D7D14)` to `0x35D170` | `0x0020` | A1 |
+| Shadows | `0x35D170` | `ShadowEmitBatchPass(batch, pass, clipFlag, matPkt)`: emit matrix REF + batch DMA REF (`ITOP`) | `0x0020` | A1 |
+| Flares | `0x20F2D8` | Per-viewport render finish; gates `0x304D50` on `*(0x3D1A74) == 1` (single-viewport check) | — | A1 |
+| Flares | `0x304D50` | `FlareRender()`: update sun (`0x304608`/`0x304970`) & lights (`0x304818`/`0x304B18`), flush buckets | `0x0270` | A1 |
+| Flares | `0x303CB8` | Emit one rotated 2D flare quad (4 vertices) through `0x361708` (`ImmediateVertex`) | `0x0270` | A1 |
+| Particles | `0x3639D0`, `0x363B98`, `0x363FF8` | Particle stream submission & VU1 packet build | `0x08E0` | A2 |
+| Sprites | `0x363DE8`, `0x363F48`, `0x364548`, `0x3642F4` | Effect sprite submission & VU1 packet build | `0x01B8` | A2 |
+| Immediate | `0x35DF10`, `0x361468`, `0x361708`, `0x361BC8`, `0x364D18` | General immediate geometry API | `0x0270` | A2 |
+| Sphere-imm | `0x361ED8`, `0x361C30` (`0x34EE70`, `0x34EEB8`) | Sphere-tested immediate geometry | `0x0270` | A2 |
+| Cockpit quad | `0x219C48` -> `0x35CAA0` | Non-queue cockpit quad | `0x0270` | A2 |
+| UV-offset | `0x25F0` -> `0x2630` | Trace EE sender & move to Plume | `0x25F0` | A2 |
+
+---
+
+### Phase A1.1: Projected shadows (`0x34C7D0`, `0x34C798`, `0x34C208`, `0x34C4B0`, `0x35D170`, `0x35D298`)
+
+#### Call graph
+
+```
+WorldFrameRender (0x214B68)
+  └─ ShadowPassRun (0x30A580)
+       ├─ ShadowBegin (0x34C7D0)(dir = 0x4AE970, alpha = *(int*)0x3DC064)
+       │    └─ GsShadowBegin (0x35DA30)(alpha)
+       │         ├─ GsShadowTargetOpen (0x363218)(min(w,320), min(h,512), alpha)
+       │         │    └─ GsShadowClearAndCopyZ (0x362968)()
+       │         └─ Vu1LoadMicrocode (0x35A5D8)(1)   // 0x3BE4C0..0x3BFC80
+       ├─ ShadowDrawWorldProps (0x30A608)()  ─┐
+       ├─ ShadowDrawDynamicCars (0x30A910)() ─┴─> ShadowSubmit (0x34C208) / ShadowSubmitMasked (0x34C4B0)
+       │                                            ├─ FrustumCullSphere (0x34F650)
+       │                                            ├─ ShadowSetExtrude (0x35D9C8)(extrudeLen)
+       │                                            ├─ MatrixPacketBuild (0x35CD28)(mat) -> matPkt
+       │                                            ├─ ModelGetBatchList (0x34D060)(modelId)
+       │                                            └─ for each layer-visible batch:
+       │                                                 ├─ ShadowSetPass(1) -> 0x363708(1)
+       │                                                 ├─ ShadowEmitBatch (0x35D298) -> 0x35D170(batch, 1, clip, matPkt)
+       │                                                 ├─ ShadowSetPass(0) -> 0x363708(0)
+       │                                                 └─ ShadowEmitBatch (0x35D298) -> 0x35D170(batch, 0, clip, matPkt)
+       └─ ShadowEnd (0x34C798)()
+            ├─ GsShadowEnd (0x35D9F0)()
+            │    ├─ Vu1LoadMicrocode (0x35A5D8)(0)   // restore main microcode 0x3BFC80..0x3C3450
+            │    └─ GsShadowTargetClose (0x363640)()
+            │         └─ GsShadowComposite (0x362E70)()
+            └─ TextureBind(0), TextureBind(1)
+```
+
+#### Guest state & struct layouts (verified from `gen/rec_098.c`, `gen/rec_100.c`, `gen/rec_101.c`)
+
+- **`0x4C96A8`** (`0x4D0000 - 26968`): `float shadowDir[3]` — world-space extrusion direction copied by `0x34C7D0`.
+- **`0x4C96B4`** (`0x4C96A8 + 12`): `int32_t shadowOpen` — return value of `0x35DA30` (1 while shadow target is active, cleared to 0 by `0x34C798`).
+- **`0x4C96C0`** (`0x4D0000 - 26944`): pointer to model descriptor table (entry stride `0x14` bytes; `entry + 8` -> model header `hdr`, where `hdr + 0x18` = `float radius`, `hdr + 0x1C` = `float center[3]`).
+- **`0x3DD634`** (`0x3E0000 - 10700`): `uint32_t g_LayerMask` — bitmask of visible model layers; batch `b` is drawn when `(g_LayerMask & (1 << *(int16_t*)(b + 0x18))) != 0`. `0x34C4B0` saves, overrides, and restores this word around its batch loop.
+- **`0x4D7C48`** / **`0x4D7C4C`** (`0x4D0000 + 31816 / 31820`): current / last-emitted matrix packet pointer. `0x35D170` emits a 9-qword DMA REF (`0x30000009`) to `matPkt` whenever `matPkt != -1`, then caches it at `0x4D7C4C`.
+- **`0x4D7D10`** (`0x4D0000 + 32016`): shadow dirty flags (`bit 0` = active, `bit 1` = pass set, `bit 2` = extrude set).
+- **`0x4D7D14`** (`0x4D7D10 + 4`): `int32_t shadowPass` (`1` = front faces / increment, `0` = back faces / decrement).
+- **`0x4D7D18`** (`0x4D7D10 + 8`): `float shadowExtrudeLen` — copied into matrix packet `q[5].w` (`colour_b[3]`) by `0x35CD28` (lines 5195-5206 of `gen/rec_100.c`).
+- **`0x4D8BD8`** (`0x4E0000 - 29736`): GS shadow render-target descriptor written by `0x363218`:
+  - `+0x00`: `int32_t width` (PS2 clamped `<= 320`), `+0x04`: `int32_t height` (PS2 clamped `<= 512`)
+  - `+0x08`: `int32_t tw` (`ceil(log2(width))`), `+0x0C`: `int32_t th` (`ceil(log2(height))`)
+  - `+0x10`: `uint32_t fbp`, `+0x14`: `uint32_t psm = 2` (`PSMCT16`)
+  - `+0x18`: `uint32_t zbp`, `+0x1C`: `uint32_t zpsm = 0x32` (`PSMZ16`)
+  - `+0x20`: `int32_t intensity = (alpha >> 1) + (alpha >> 7)` (0..128 GS alpha units; `0x363480`)
+  - `+0x24`: `int32_t active` (`1` when open)
+  - `+0x28..+0x34`: saved main viewport `{x, y, w, h}` from `0x35E300`
+  - `+0x38`: saved aspect float from `0x34F498`, `+0x3C`: saved fog enable from `0x4D8B7C`
+
+#### VU1 shadow extrusion & GS blend state (verified from `0x3BE4C0` and `0x363708` / `0x362E70`)
+
+- **VU1 setup (`0x3BE4C0 + 0x1568..0x17B8`, `MSCAL 0`):**
+  Reads the 7-qword matrix packet at `xtop`: `q[0..3]` = model matrix `M`, `q[5].w` = `extrudeLen` (`vf2.w`), `q[6]` = `light` (`vf24`). Computes model-space extrusion vector `vf1 = -M^T * (light.xyz * light.w)`.
+- **VU1 extrusion (`0x3BE4C0 + 0x0020..0x02F8`, `MSCAL 4`, `kProgShadow`):**
+  Each batch vertex (`vif_mesh.cpp` `kProgShadow`, 2-qword stride: `q0` = V4-8 normal + ADC in `w`, `q1` = position + `q199` offset) is extruded in model space:
+  - `n = (normal_byte - 128)`
+  - `d = dot(n, vf1.xyz)`
+  - `e = min(max(0.0, d) * 65535.0, extrudeLen)`
+  - `p' = p + vf1.xyz * e`
+  Face culling uses the triangle normal against camera position `vf7` and `pass = ITOP & 1`: `pass == 1` keeps front faces (culls back faces), `pass == 0` keeps back faces (culls front faces).
+- **GS blend state per pass (`0x363708`, `gen/rec_101.c:5911-5934`):**
+  - Depth test `GEQUAL` (`TEST_1 = 0x50000`), depth writes disabled (`ZBUF_1.ZMSK = 1`, set by `0x362968`).
+  - `pass == 1` (front faces): `ALPHA_1 = (0x80 << 32) | 0x29` -> `(Cd - 0) * FIX(1.0) + Cs = Cd + Cs` (**additive**), `RGBAQ = (15, 15, 15, 0)`.
+  - `pass == 0` (back faces): `ALPHA_1 = (0x80 << 32) | 0xA1` -> `(Cd - Cs) * FIX(1.0) + 0 = Cd - Cs` (**subtractive**), `RGBAQ = (7, 7, 7, 0)`.
+- **GS composite (`0x362E70`, `gen/rec_101.c:5440-5496`):**
+  - `ALPHA_1 = 0x44` (`(Cs - Cd) * As + Cd`, standard alpha blend), `ZMSK = 1`, `TEST_1 = 0x30000` (depth always, no Z write).
+  - `TEXA = TA0(0) | AEM(1) | TA1(intensity)` (`0x8000` sets `AEM = 1`: texels with `RGB == 0` become alpha 0; non-zero shadow texels get alpha `intensity` from `0x4D8BD8 + 0x20`).
+  - Draws a full-viewport quad with `RGBAQ = (0, 0, 0, 0x80)` over the main framebuffer, darkening pixels inside any shadow volume by `intensity / 128.0`.
+
+#### PS2 limits removed in Plume (P10 / adaptive host target)
+
+- **PS2 `320x512` shadow RT cap (`0x35DA30`):** On PS2, `0x35DA30` clamps shadow buffer dimensions to `min(w, 320) x min(h, 512)` in `PSMCT16`/`PSMZ16` to fit 4 MB GS VRAM, causing blocky shadows and 16-bit depth quantization artifacts.
+- **Native Plume implementation:** Plume allocates a dedicated host shadow accumulation texture (`R8G8B8A8_UNORM`) at the **main framebuffer's full scaled resolution** (`s.width x s.height`, scaling dynamically with `RenderScale` — e.g. `3840x2688` at 6x) and depth-tests directly against the main framebuffer's full-resolution `D32` depth buffer (`s.depth`). `ee_shadow_begin()` snapshots the main-viewport camera/projection before `0x363218` overwrites `0x4D7C20` with the clamped `320x512` viewport. Each `KIND_SHADOW` batch is extruded in `vs_main` (`M_SHADOW`) and rendered into the host shadow buffer (pass 1 additive with back-face cull, pass 0 subtractive with front-face cull). On `CMD_SHADOW_COMPOSITE` (`0x34C798`), Plume composites the full-resolution shadow mask onto `s.color` using `intensity / 128.0` (`ALPHA_1 = 0x44`, `AEM = 1`). Meanwhile, because `KIND_SHADOW` suppresses the GS emulator's shadow volume draws, the GS VRAM shadow RT stays all-zero so `0x362E70` (`AEM = 1`) is a transparent no-op in hybrid mode and `EOD_NATIVE_ONLY=1` renders full shadows natively.
+
+---
+
+### Phase A1.2: Sun glare and point-light flares (`0x304D50`, `0x20F2D8`)
+
+#### Call graph
+
+```
+ViewportRenderFinish (0x20F2D8)
+  ├─ RenderQueueFlush (0x34C860)
+  ├─ EffectsPostFlush (0x2E7368)(0)
+  ├─ [PS2 gate: if (*(int*)0x3D1A74 == 1)] -> lifted under SplitScreenParity (P8)
+  └─ FlareRender (0x304D50)()
+       ├─ if (0x11F9A0() != 0) return    // menu/pause gate (*(int*)0x3C4BDC)
+       ├─ dt = clamp(TimerGetMs() - *(0x3DBF6C), 1, 100) * 0.001f
+       ├─ RenderStatePush (0x34F760); Clear(4, 8, 2); Set(0x80)
+       ├─ if (*(0x3DBB40) != 0): SunUpdate (0x304608)(dt); SunEmit (0x304970)()
+       ├─ for i in 0 .. *(0x3DBF68)-1: LightUpdate (0x304818)(light[i], dt); LightEmit (0x304B18)(light[i])
+       ├─ for b in 0 .. *(0x3D94F0)-1:
+       │    if (bucket[b].count > 0):
+       │      Begin2DTexture (0x34D9A8)(bucket[b].texSlot)
+       │      if (ImmediateBegin (0x35DF10)(bucket[b].count * 4)):
+       │        for j in 0 .. bucket[b].count-1:
+       │          FlareEmitQuad (0x303CB8)(&entry[j].x, entry[j].rgb, entry[j].size, entry[j].intensity)
+       │            └─ 4x ImmediateVertex (0x361708)(sx, sy, 0.0f, u, v, argb, strip = k >= 2)
+       │        ImmediateEnd (0x361BC8)()
+       │      TextureSlotEnd (0x34F888)()
+       │      bucket[b].count = 0
+       └─ RenderStatePop (0x34F710)
+```
+
+#### Guest state & struct layouts (verified from `gen/rec_045.c`, `gen/rec_085.c`, `gen/rec_086.c`)
+
+- **`0x3D1A74`** (`0x3D0000 + 6772`): `int32_t g_ViewCount` (`1` = 1P, `2` = 2P, `4` = 4P). `0x20F2D8` skips `0x304D50` when `g_ViewCount != 1`. Under `SplitScreenParity` (P8, disabled during `EOD_DIFF` to keep bit-identical parity checks), `0x304D50` runs for every viewport.
+- **`0x3C4BDC`** (`0x3C0000 + 19420`): read by `0x11F9A0()`; nonzero suppresses flare rendering.
+- **`0x3DBF6C`** (`0x3E0000 - 16532`): `uint32_t g_FlareLastMs` (previous `TimerGetMs()` timestamp).
+- **`0x3DBB40`** (`0x3E0000 - 17600`): `int32_t g_SunFlareEnabled`.
+- **`0x3DBF68`** (`0x3E0000 - 16536`): `int32_t g_PointLightFlareCount`; entries at `0x3DBB48` (stride `0x2C` bytes).
+- **`0x3D94F0`** (`0x3E0000 - 27408`): `int32_t g_FlareBucketCount`; buckets at `0x3D94F4` (stride `0x308` bytes):
+  - `+0x000`: `int32_t count` (max 32 entries per bucket)
+  - `+0x004`: `FlareEntry entries[32]` (stride `0x18` = 24 bytes: `float x, y, z, size, intensity; uint32_t rgb`)
+  - `+0x304`: `uint32_t texSlot`
+
+#### Native Plume feed
+
+- `0x34D9A8(texSlot)` saves the 3D camera (`0x4CD2F8` -> `0x4CD328`), installs an orthographic-equivalent 2D camera at `z = -halfW / (fov * aspect)` + identity model matrix (`0x34CC38`), and binds `texSlot` (`0x3514F0`).
+- Therefore, calling `native::ee_flare_begin(texSlot)` immediately after `0x34D9A8` and before `0x35DF10` captures the exact 2D camera & matrix packet via `fill_camera` / `read_matrix_packet`, and uses the exact same `screen_matrix(p)` and `ImmediateVertex (0x361708)` capture mechanism as `KIND_WATER` (`KIND_FLARE = 4`).
+- `0x304D50` sets render flags (`Clear(4, 8, 2)`, `Set(0x80)`), which configure additive blending and Z-test off on the GS; Plume reads the live `gs::Env` state (blend, depth test/write, texture) at `finalize()` just like `KIND_WATER`, so flares render natively in both `EOD_NATIVE=1` and `EOD_NATIVE_ONLY=1` with P1 parity tracking (`flares submitted == drawn`).
+

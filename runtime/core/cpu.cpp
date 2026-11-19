@@ -196,9 +196,12 @@ void cpu_init() {
 #endif
 }
 
+#include "diff_harness.h"
+
 uint32_t cpu_cycles() {
-    // 294.912 MHz derived from host time
-    return (uint32_t)(platform_time_us() * 294912ull / 1000ull);
+    // 294.912 MHz derived from host time (frozen during EOD_DIFF comparisons)
+    const uint64_t ft = diff_frozen_time_us();
+    return (uint32_t)((ft ? ft : platform_time_us()) * 294912ull / 1000ull);
 }
 
 extern "C" uint32_t ee_mfc0(int reg) {

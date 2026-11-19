@@ -58,6 +58,19 @@ void ee_water_begin(uint32_t surface);
 bool ee_in_water();
 void ee_water_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
 void ee_water_end(bool drawn);
+// ---- EE thread, projected shadows & flares (src/native_shadows_flares.cpp, stage R4 Phase A1) ----
+// ShadowBegin 0x34C7D0 (before 0x35DA30 overwrites viewport/aspect with the PS2 320x512 cap):
+// snapshots main-viewport camera/projection and shadow intensity; ShadowEmitBatchPass 0x35D170
+// tags each shadow batch DMA REF; ShadowEnd 0x34C798 closes the pass.
+void ee_shadow_begin(int32_t alpha);
+void ee_shadow_opened(bool opened);
+void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword);
+void ee_shadow_end();
+// FlareRender 0x304D50: each texture bucket emits 2D quads through 0x35DF10 / 0x361708 / 0x361BC8.
+void ee_flare_begin(uint32_t tex_slot);
+bool ee_in_flare();
+void ee_flare_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
+void ee_flare_end(bool drawn);
 // ---- EE thread, VU1 uploads (src/bone_pose.cpp, stage R3) ----------------------------------
 // Every UNPACK + MSCAL 0x24D8 packet the readable 0x35A810 builds: bone palettes (0x35DBD8, V4-32
 // to VU1 0x90 + 4*first), car dent offsets (0x35DD28, V3-32 to 0x90), the sun quad (0x35CBD8,
@@ -70,7 +83,7 @@ void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count);
 // GS thread: what the EE submitted per EE frame before `before` (world leaves committed, water
 // draws), removed from the EE's list.
 struct Expected {
-    uint32_t world = 0, water = 0, queue = 0;  // world leaves committed, water draws, queue records
+    uint32_t world = 0, water = 0, queue = 0, shadow = 0, flare = 0;  // per EE frame P1 counters
 };
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out);
 // EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
@@ -81,7 +94,7 @@ void vu1_start(uint32_t program, uint32_t itop);
 
 // ---- GS command stream ----------------------------------------------------------------------
 // One queue record as the GS receives it.
-enum : uint32_t { KIND_QUEUE = 0, KIND_WORLD = 1, KIND_WATER = 2 };
+enum : uint32_t { KIND_QUEUE = 0, KIND_WORLD = 1, KIND_WATER = 2, KIND_SHADOW = 3, KIND_FLARE = 4, KIND_COUNT = 5 };
 struct Packet {
     uint64_t frame;            // EE vblank of the frame it was queued in
     uint32_t kind;             // KIND_*: draw-queue record, track world leaf, water surface

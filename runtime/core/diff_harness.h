@@ -26,6 +26,9 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
 // True while the original side of a comparison runs (its guest results are kept, but the
 // replacement side repeats every nested call): host-side bookkeeping done there is undone.
 bool diff_in_original_side();
+// Frozen host timestamp (microseconds) while a diff comparison runs (0 outside comparison),
+// so functions calling TimerGetMs (0x337718) see identical hardware timer reads on both sides.
+uint64_t diff_frozen_time_us();
 // Prints the [diff] totals (called at exit: app_exit leaves through _exit, so atexit never runs).
 void diff_report();
 // Another exit report to print with diff_report (test counters that would otherwise need atexit).

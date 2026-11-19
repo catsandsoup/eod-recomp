@@ -10,6 +10,7 @@
 
 #include "ee.h"
 #include "memory.h"
+#include "platform/platform.h"
 
 namespace {
 
@@ -173,8 +174,10 @@ int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned fl
 
 // Inside a comparison, nested wrapped calls follow the side being run.
 static enum class Side { kNone, kOriginal, kReplacement } g_side = Side::kNone;
+static uint64_t g_frozen_time_us = 0;
 
 bool diff_in_original_side() { return g_side == Side::kOriginal; }
+uint64_t diff_frozen_time_us() { return g_frozen_time_us; }
 static std::vector<void (*)()> &exit_reports() {
     static std::vector<void (*)()> v;
     return v;
@@ -210,6 +213,7 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
     // Interrupts wait until both runs are done: the recompiled code delivers them at loop
     // back-edges, the replacement at other points, and a handler would make the runs differ.
     g_ee_irq_hold++;
+    g_frozen_time_us = platform_time_us();
     before.take(config().ram_low, sp);
     // EOD_DIFF_REPLAY: the recorded entry state (registers, RAM, scratchpad, VU0) is run again through
     // both sides `n` more times; every run is compared like the live one. Host-side state of the
@@ -237,5 +241,6 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
                          (unsigned long long)s.mismatched);
     }
     after_orig.restore();  // the game continues from the original's results
+    g_frozen_time_us = 0;
     g_ee_irq_hold--;
 }

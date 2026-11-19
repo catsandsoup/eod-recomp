@@ -32,12 +32,12 @@ void f_0034C860_orig(void);  // flush layer 9 and reset the pool
 void f_0034AF98_orig(void);  // Flush(layer, set)
 void f_0034BDA8_orig(void);  // queue (model, m, material, flags)
 void f_0034BF90_orig(void);  // queue without material (model, m, layer)
-void f_0034C208_orig(void);  // projected shadow
-void f_0034C4B0_orig(void);  // projected shadow (layer mask)
+void eod_r4_0034C208(void);  // projected shadow (src/native_shadows_flares.cpp)
+void eod_r4_0034C4B0(void);  // projected shadow (layer mask, src/native_shadows_flares.cpp)
 void f_0035CB88_orig(void);  // emit one batch
 void f_0035B3D0_orig(void);  // camera packet (VU1 q1..16)
 void f_0035CD28_orig(void);  // matrix packet (TOPS+0..6)
-void f_0035D298_orig(void);  // shadow batch emit
+void eod_r4_0035D298(void);  // shadow batch emit (src/native_shadows_flares.cpp)
 void f_0034B140_orig(void);  // append a model's batches to the queue (from 0x34BDA8 and 0x34CC98)
 void f_00366C88_orig(void);  // PacketReserveTop(qwc), packet manager *(0x3E5978)
 void f_00366D30_orig(void);  // PacketReserve(qwc), packet manager *(0x3E5978); 0x366CD0 commits
@@ -304,19 +304,19 @@ extern "C" void f_0034BF90(void) {
 }
 
 extern "C" void f_0034C208(void) {
-    if (!g_on) return f_0034C208_orig();
+    if (!g_on) return eod_r4_0034C208();
     const bool log = tick();
     g_c.shadow++;
     EV("Shadow34C208 ra %08x model %u\n", VB, ra(), arg(1));
-    f_0034C208_orig();
+    eod_r4_0034C208();
 }
 
 extern "C" void f_0034C4B0(void) {
-    if (!g_on) return f_0034C4B0_orig();
+    if (!g_on) return eod_r4_0034C4B0();
     const bool log = tick();
     g_c.shadow++;
     EV("Shadow34C4B0 ra %08x model %u mask %08x\n", VB, ra(), arg(1), arg(3));
-    f_0034C4B0_orig();
+    eod_r4_0034C4B0();
 }
 
 extern "C" void f_0035CB88(void) {
@@ -351,11 +351,11 @@ extern "C" void f_0035CD28(void) {
 }
 
 extern "C" void f_0035D298(void) {
-    if (!g_on) return f_0035D298_orig();
+    if (!g_on) return eod_r4_0035D298();
     tick();
     g_c.shadow_batch++;
     const Ctx ctx("shadow");
-    f_0035D298_orig();
+    eod_r4_0035D298();
 }
 
 extern "C" void f_0034B140(void) {
