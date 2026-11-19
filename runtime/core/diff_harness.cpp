@@ -19,6 +19,7 @@ struct Config {
     uint64_t every = 1;
     uint32_t ram_low = 64u << 20;
     bool on = false;
+    std::map<uint32_t, uint32_t> replay;  // EOD_DIFF_REPLAY=<hex addr>:<n>,...: extra checks per checked call
 };
 
 const Config &config() {
@@ -37,6 +38,17 @@ const Config &config() {
             }
         }
         if (const char *n = std::getenv("EOD_DIFF_EVERY")) c.every = std::strtoull(n, nullptr, 10) ? std::strtoull(n, nullptr, 10) : 1;
+        if (const char *r = std::getenv("EOD_DIFF_REPLAY")) {
+            for (const char *p = r; *p;) {
+                char *end;
+                const uint32_t a = (uint32_t)std::strtoul(p, &end, 16);
+                uint32_t n = 0;
+                if (*end == ':') n = (uint32_t)std::strtoul(end + 1, &end, 10);
+                if (n) c.replay[a] = n;
+                while (*end && *end != ',') end++;
+                p = *end ? end + 1 : end;
+            }
+        }
         if (const char *m = std::getenv("EOD_DIFF_RAM_MB")) {
             const uint64_t mb = std::strtoull(m, nullptr, 10);
             if (mb && (mb << 20) <= EE_RAM_SIZE) c.ram_low = (uint32_t)(mb << 20);
@@ -89,7 +101,7 @@ struct Snapshot {
 };
 
 struct Stats {
-    uint64_t calls = 0, checked = 0, mismatched = 0;
+    uint64_t calls = 0, checked = 0, mismatched = 0, replayed = 0;
 };
 std::map<uint32_t, Stats> &stats() {
     static std::map<uint32_t, Stats> s;
@@ -98,8 +110,9 @@ std::map<uint32_t, Stats> &stats() {
 
 void report_at_exit() {
     for (const auto &[a, s] : stats())
-        std::fprintf(stderr, "[diff] %08x: %llu calls, %llu checked, %llu mismatched\n", a, (unsigned long long)s.calls,
-                     (unsigned long long)s.checked, (unsigned long long)s.mismatched);
+        std::fprintf(stderr, "[diff] %08x: %llu calls, %llu checked (%llu replayed), %llu mismatched\n", a,
+                     (unsigned long long)s.calls, (unsigned long long)s.checked, (unsigned long long)s.replayed,
+                     (unsigned long long)s.mismatched);
 }
 
 int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned flags) {
@@ -161,6 +174,9 @@ int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned fl
 // Inside a comparison, nested wrapped calls follow the side being run.
 static enum class Side { kNone, kOriginal, kReplacement } g_side = Side::kNone;
 
+bool diff_in_original_side() { return g_side == Side::kOriginal; }
+void diff_report() { report_at_exit(); }
+
 void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), unsigned flags) {
     if (g_side == Side::kOriginal) {
         original();
@@ -183,21 +199,31 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
     // back-edges, the replacement at other points, and a handler would make the runs differ.
     g_ee_irq_hold++;
     before.take(config().ram_low, sp);
-    g_side = Side::kOriginal;
-    original();
-    g_side = Side::kNone;
-    after_orig.take(config().ram_low, sp);
-    after_orig.stack_from = before.stack_from;
-    after_orig.stack.assign(g_ram + before.stack_from, g_ram + EE_RAM_SIZE);
-    before.restore();
-    g_side = Side::kReplacement;
-    replacement();
-    g_side = Side::kNone;
-    s.checked++;
-    if (compare(addr, after_orig, sp, flags)) s.mismatched++;
-    if ((s.checked & (s.checked - 1)) == 0 || s.checked % 1024 == 0)  // 1, 2, 4, ... then every 1024 (the game may exit without atexit)
-        std::fprintf(stderr, "[diff] %08x: %llu calls, %llu checked, %llu mismatched\n", addr, (unsigned long long)s.calls,
-                     (unsigned long long)s.checked, (unsigned long long)s.mismatched);
+    // EOD_DIFF_REPLAY: the recorded entry state (registers, RAM, scratchpad, VU0) is run again through
+    // both sides `n` more times; every run is compared like the live one. Host-side state of the
+    // replacement (counters, limit notes) advances once per run.
+    const auto rp = config().replay.find(addr);
+    const uint32_t runs = 1 + (rp == config().replay.end() ? 0 : rp->second);
+    for (uint32_t run = 0; run < runs; run++) {
+        if (run) before.restore();
+        g_side = Side::kOriginal;
+        original();
+        g_side = Side::kNone;
+        after_orig.take(config().ram_low, sp);
+        after_orig.stack_from = before.stack_from;
+        after_orig.stack.assign(g_ram + before.stack_from, g_ram + EE_RAM_SIZE);
+        before.restore();
+        g_side = Side::kReplacement;
+        replacement();
+        g_side = Side::kNone;
+        s.checked++;
+        if (run) s.replayed++;
+        if (compare(addr, after_orig, sp, flags)) s.mismatched++;
+        if ((s.checked & (s.checked - 1)) == 0 || s.checked % 1024 == 0)  // 1, 2, 4, ... then every 1024 (the game may exit without atexit)
+            std::fprintf(stderr, "[diff] %08x: %llu calls, %llu checked (%llu replayed), %llu mismatched\n", addr,
+                         (unsigned long long)s.calls, (unsigned long long)s.checked, (unsigned long long)s.replayed,
+                         (unsigned long long)s.mismatched);
+    }
     after_orig.restore();  // the game continues from the original's results
     g_ee_irq_hold--;
 }

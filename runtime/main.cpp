@@ -7,6 +7,7 @@
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
 #include "core/trace.h"
+#include "core/diff_harness.h"
 #include "core/host_file.h"
 #include <csignal>
 #ifdef _WIN32
@@ -158,6 +159,7 @@ static int save_edit(int argc, char **argv) {
         }
     }
     platform_shutdown();
+    diff_report();
     fflush(nullptr);
     _exit(code);
 }

@@ -11,6 +11,9 @@
 extern "C" void f_0021ABF8_orig();
 extern "C" void f_0021C6E0_orig();
 extern "C" void f_00218E68_orig();
+// read by src/hle_camera.cpp (EOD_CAMERA_TRACE)
+struct LodViewCounts { unsigned long long frames, cars, low0, records; };
+LodViewCounts g_lod_view{};
 extern "C" void f_0034E308_orig();
 extern "C" void f_00212B58_orig();
 float eod_draw_distance();
@@ -110,8 +113,20 @@ extern "C" void f_00218E68() {
     const bool log=trace() && lines<64 && (++calls<=2 || calls%120==0);
     uint32_t objects[20]{};
     if (log) for (unsigned i=0;i<20;++i) { objects[i]=ee_r32(0x3d1c90+i*4); if (!objects[i]) break; selected("batch-before",objects[i],ra); }
+    const uint32_t pool_before=ee_r32(0x4C96C8);  // draw record count (0x34B140 pool, 0x4C96C8)
     f_00218E68_orig(); // native selection AND submission take place inside
     if (log) { ++lines; for (auto object:objects) { if (!object) break; selected("batch-after",object,ra); } }
+    // per-view counts for EOD_CAMERA_TRACE (src/hle_camera.cpp): visual cars drawing Low0 (+0x54C = 0,
+    // the parts-only cockpit model) and the draw records this batch added through 0x34BDA8
+    g_lod_view.frames++;
+    const uint32_t pool_after=ee_r32(0x4C96C8);
+    if (pool_after>pool_before) g_lod_view.records+=pool_after-pool_before;
+    for (unsigned i=0;i<20;++i) {
+        const uint32_t object=ee_r32(0x3d1c90+i*4);
+        if (!object) break;
+        g_lod_view.cars++;
+        if (ram(object,0x554) && ee_r32(object+0x54c)==0) g_lod_view.low0++;
+    }
 }
 extern "C" void f_0034E308() {
     static unsigned calls,lines;

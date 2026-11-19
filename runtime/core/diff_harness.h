@@ -12,6 +12,8 @@
 //     $sp), the scratchpad and VU0 registers and memory
 // Dead stack below the caller's $sp and caller-saved registers are not compared (callers never
 // read them). The original's results are kept, so a mismatch never changes the game.
+// EOD_DIFF_REPLAY=<hex addr>:<n>,... checks each checked call of those functions n more times from
+// the same recorded entry state (deterministic replay; counted as "replayed").
 // Interrupt delivery is held during a checked call (the recompiled code delivers pending
 // interrupts at loop back-edges; a replacement moves those points, see docs/DECOMPILATION.md).
 // Limits: the function must not touch hardware (DMA kicks, GS/VIF registers, IOP), and host-side
@@ -21,3 +23,8 @@
 
 enum : unsigned { kDiffRet64 = 1, kDiffFloatRet = 2 };
 void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), unsigned flags = 0);
+// True while the original side of a comparison runs (its guest results are kept, but the
+// replacement side repeats every nested call): host-side bookkeeping done there is undone.
+bool diff_in_original_side();
+// Prints the [diff] totals (called at exit: app_exit leaves through _exit, so atexit never runs).
+void diff_report();

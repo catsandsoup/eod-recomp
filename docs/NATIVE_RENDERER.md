@@ -199,8 +199,127 @@ Contacts per object (16) and the contact pool are tracked by `limit_note`; remov
 readers of obj+0x190 decompiled. Wheel debris (16, 0x484E68) and panel debris (16, 0x494D60) are
 removed: grow on demand with ExpandDebris (above), `[limit]` with capacity 0.
 
+### Phase A3: coverage of the wheel paths, teardown, camera views, night
+
+**What makes a wheel come off.** Only 0x18CA98 calls 0x1B3068 (0x18D680, `toss_wheel` in
+src/car_damage.cpp): a car in damage state 1..4 whose damage (car+0x1BEC) passes 1.0 on a hit with
+|impulse| > 300 is wrecked (state 10/11/12 from rng(3)), and with rng(4) = 0 (one wreck in four) the
+wheel on the side of the hit (`hit_side` in src/car_damage.cpp) comes off unless its flag (wheel+0x50 & 0x80) is
+set already. Free roam caps damage at 0.9 (0x1741C0(4)), so no wheel comes off there; the one-hit
+cheat (0x101) sets 1.0 without this path. A wheel stays live (+0x1DC = spawn clock) until its vtable
++0x10 (0x1B2DD8) parks it at y = -500; nothing in a race calls that, so every tossed wheel stays live
+until the scene ends.
+
+**Replay tools (test only).**
+- `EOD_DIFF_REPLAY=<hex addr>:<n>,...` (runtime/core/diff_harness.cpp): each checked call of those
+  functions is checked n more times from the same recorded entry state (registers, RAM, scratchpad,
+  VU0); counted as "replayed". The game keeps the original's results of the live run.
+- `EOD_WHEEL_REPLAY=<n>` (src/debris_pool.cpp): after each real wheel toss, the same toss (car,
+  matrix, velocity, hub position the caller built) runs n more times on the car's wheels in turn,
+  through the wrapper (expansion and EOD_DIFF), so the pool goes past 16.
+- 0x18CA98 calls 0x1B3068 and 0x1E0DC8 inside its own comparison; nested calls are not checked, and
+  the wrappers' host bookkeeping on the original side is now undone (`HostUndo`, using
+  `diff_in_original_side()`), so a run with 0x18CA98 under EOD_DIFF no longer counts a reserve or a
+  made phob twice. 0x1B3068 is therefore checked in runs without 0x18CA98 in EOD_DIFF.
+- `diff_report()` prints the [diff] totals at app_exit (it leaves through `_exit`, so atexit never ran).
+
+**Measured (headless, muted, EOD_NATIVE=1, Detail=maximum, DrawDistance=8).**
+
+| run | event | vehicle | result |
+| --- | --- | --- | --- |
+| r3a3_night | Gilroy 'Battle (8 AI)' (night, fog 0 0 0), chickens | Ambulance | 5 real wheel tosses + 100 replayed: wheel pool live peak **105** (scene phobs 5, PS2 array 16), 100 made, 0 live wheels taken; panels peak 34, 22 made, 0 taken |
+| r3a3_ps2pool | Dundas 'Battle (8 AI)', `ExpandDebris=0` | Taxi | 2 real tosses + 40 replayed: at most 5 live wheels (the scene's 5 'WHLP'; demand 6), 37 live wheels taken by the ring, as on the PS2 |
+| r3a3_derby | Eagan 'Demolition Derby' | Copcar | player wrecked, results, a second round: real teardown (0x1B3180 1, 0x1E29C0 12, 0x1B3190 2) |
+| r3a3_views | Mankato 'Demolition Derby' | Postal | camera views (below), 0x18CA98 live calls |
+
+EOD_DIFF totals (0 mismatches in every run):
+
+| function | r3a3_night | r3a3_ps2pool | r3a3_derby | r3a3_views | checked in all |
+| --- | --- | --- | --- | --- | --- |
+| 0x18CA98 CarApplyCollisionDamage | not watched | not watched | >= 512 live (log at powers of two) | 862 live | >= 1374 live, 0 mismatched |
+| 0x18AFE0 CarSetupDamageAndPanels | 9 live, >= 1024 checked (replay 120) | | 16 live | 28 live | >= 1068, 0 mismatched |
+| 0x1E1E88 'Panl' ctor | 23 live (scene and made phobs), >= 2048 checked (replay 90) | | 16 live | 24 live | >= 2088, 0 mismatched |
+| 0x1E29C0 'Panl' dtor | | | 12 live, 1092 checked (replay 90) | 20 live | 1112, 0 mismatched |
+| 0x1B3190 wheel pool reset (scene) | 1 live, 1001 checked (replay 1000) | | 2 live, 2002 checked | 2 live | 3005, 0 mismatched |
+| 0x1B3180 wheel count reset (teardown) | | | 1 live, 1001 checked (replay 1000) | 1 live | 1002, 0 mismatched |
+| 0x1B3068 DetachedWheelSpawn | 105 spawns (5 real + 100 wheel replay), >= 5120 checked (replay 48) | 42 spawns (2 real + 40 wheel replay), >= 32 logged | nested in 0x18CA98 | nested | >= 5152, 0 mismatched |
+
+The night and ps2pool runs predate `diff_report()`: their totals are the last power-of-two line.
+Every run printed 0 mismatched.
+
+**Camera views.** View-change input: the human driver's "view" input (binding name 0x3F97F0, pad
+Triangle in the default layout, not Circle) raises pad event 0 (0x184280: 0x1AA070 edge of the input
+at controller+0x248 -> 0x179608 writes event word 0x4473D8 + 8p); 0x177400 copies it into the frame
+record, 0x1136C0 reads it (0x211258) and, unless an override is pending (0x3C4118 + 0x1C p != 0x20),
+calls 0x1151B0(p, 0, 0x3C411C + 0x1C p), which steps through 0x3EDC30 = {1, 0, 4, 5, 2} (a view not in
+the table goes to 5). 0x113D90 applies 0x3C411C each frame through 0x1D41B0 (requested view at
+0x48CB90 + 0x1B8 p); 0x1C31A0 copies it to +0xC, the view in effect, and 0x1D10C0 switches on it.
+The race start view is the setting "race_camera%d" (0x115760: 0..3 and 7..9 kept, 4..6 or >9 become
+4, or 5 with flags 0x8800). FarChase (6), Rear (3), RearChase (7), Overhead (8) and TV (9) are not in
+the pad cycle: the game reaches them only through 0x1151B0's development-keyboard keys (0x374..0x37A,
+0x170..0x173; no retail code queues them) and the replay viewers (0x10FE90 / 0x10FE6C cycle 0..9,
+0x10C8D8 / 0x374698 the TV cameras 9..13). `EOD_CAMERA_KEYS` queues those keys through the game's own
+KeyPush 0x33C168, so the game's own handler sets the view. `EOD_CAMERA_TRACE` logs every change of
+the view in effect by the game's names (0x108D28 / 0x109288 "CameraNames:*").
+
+r3a3_views (Mankato 'Demolition Derby', Postal), `EOD_CAMERA_TRACE` lines, view in effect = 0x48CB8C:
+
+| vblank | view (value) | how |
+| --- | --- | --- |
+| 384 | NearChase (4) | race start: race_camera0 default 4 (0x115760) |
+| 902 | FarChase (6) | key 0x376 (0x1151B0) |
+| 1103 | Rear (3) | key 0x374 |
+| 1316 | RearChase (7) | key 0x377 |
+| 1512 | Overhead (8) | key 0x378 |
+| 1700 | TV (9), the trackside cinematic cameras (0x1CC380), also the replay viewers' start view | key 0x37A |
+| 2103 | Chase (5) | Triangle (pad event 0): 9 is not in 0x3EDC30, so 5 |
+| 2319 | Chassis (2), the under-car suspension / wheel view | Triangle |
+| 2501 | Bumper (1) | Triangle |
+| 2703 | Cockpit (0) | Triangle |
+| 2911 | NearChase (4) | Triangle |
+| 3257 | physcam type 30 (0x1E, 0x1CAB50) | the player's car wrecked (event over) |
+| 5670 | physcam type 19 (0x13) | results screen frame (0x36E568 sets 0x13) |
+| 5979 | NearChase (4) | second round (race_camera0) |
+
+The same sequence ran in r3a3_derby (Triangle cycle) and r3a3_cockpit (all views). The replay
+viewers (0x10C8D8 after an event, 0x10D338 from the menu) were not opened: their views are the
+same physcam types (0..9 and the TV cameras 9..13).
+
+**Interior, bumper and chassis views on the native renderer** (r3a3_cockpit, Mankato derby, Bus,
+`ModernRenderer=0`, `EOD_NATIVE_LOG=1`; r3a3_cockpit_tr adds `EOD_RENDER_TRACE` on one frame per view;
+r3a3_cockpit_only runs `EOD_NATIVE_ONLY=1`):
+
+| view | frames | queue records submitted / drawn natively (P1 frames equal) | records tagged | 0x218E68 car batch: Low0 cars, records | extra draw-queue callers in a traced frame | native-only dropped GS prims (per frame) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Chase (5) | 89 | 11362 / 11362 (89/89) | 11543 of 11543 | 0, 7929 | (reference) | 157120 (1181) |
+| Chassis (2) | 81 | 3380 / 3380 (81/81) | 3376 of 3376 | 0, 1632 | ra 0x21D684 x2 (0x21D1C0 via 0x34BF78), ra 0x21DECC x1 (0x21DC18, from 0x21A378): suspension and wheel assembly | 97584 (781) |
+| Bumper (1) | 49 | 1744 / 1744 (49/49) | 1762 of 1762 | 0, 0 (own car not drawn) | none | 72351 (872) |
+| Cockpit (0) | 43 | 2442 / 2442 (43/43) | 2439 of 2439 | 0, 0 | ra 0x21A248 and ra 0x21A270 (0x219C48, from 0x219560): the cockpit model car+0x228 (0x34BDA8 flags 5) and, when 0x3D1C84 != 0, the posed gauge/steering model (0x34CA18 bones then 0x34BDA8) | 40989 (932) |
+
+So the interior and the exposed suspension / wheel assembly go through the draw queue (0x34BDA8)
+and are drawn natively (every queue record of every frame in these views drawn, all tagged). The
+cockpit model is not a Low0 LOD selection: 0x218E68 picks no Low0 (+0x54C = 0) in any view (Detail
+maximum keeps the loader minimum, 1), and in Cockpit and Bumper it submits nothing for the player's
+car. The GS primitives that `EOD_NATIVE_ONLY=1` drops are in every view (Chase drops more than
+Cockpit), so they are the 2D/effects paths still drawn by the emulator, not the interior; which
+paths they are is R4 work. 0x219C48 has one non-queue draw: when 0x2114A8() != -1 it builds a quad on
+the stack and sends it through 0x35CAA0 (between 0x34F928 / 0x34F888), outside the draw queue: open
+(below).
+
+
+**Night events (data).** The Eve records (COMMON.RES `*_eves.val`, field `time`) put Anoka (17:00 to
+18:00), Baxter, Gilroy, Hampton (Bemidji), Hastings and Kenyon (17:00 to 18:30) in the evening; those
+runs measure fog 0 0 0 (`[modern] ... fog`), the day Eves (Dundas 10:00 to 12:30, Dennison, Eagan,
+Mankato, Woodly) 0.35 to 0.79. Gilroy carries the stadium light textures gglights/light/light2/
+redlight (GILROY.TRK). Night run: Gilroy 'Battle (8 AI)', Ambulance.
+
 ### Not done in R3 Phase A (open)
 
+- 0x219C48 (cockpit draw, from 0x219560): the stack quad through 0x35CAA0 when 0x2114A8() != -1 is
+  not a draw-queue record; decompile 0x219C48 / 0x35CAA0 and feed it to plume (R3/R4).
+- Name the GS primitives `EOD_NATIVE_ONLY=1` still drops in a race (about 780 to 1180 per frame in
+  every view) and move each producer to plume (R4).
+- 18CA98 reached >= 1000 live checks over two runs (512+, 862), not in one run.
 - 0x1E0DC8 body (panel launch) and 0x1B2868 (wheel Init) are still recompiled (wrapped).
 - Phase B: multi-scene suite (P2 within 1/16 px on every posed vertex, crashes, rollovers, 8
   panels, 16 wheels), split screen, docs/NATIVE_RENDERER_SUCCESS.md.

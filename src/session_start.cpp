@@ -217,6 +217,9 @@ void dump() {
         for (uint32_t o = 0; o < 0x54; o += 4) std::fprintf(stderr, " %08x", ee_r32(v.record + o));
         std::fprintf(stderr, "\n");
     }
+    std::fprintf(stderr, "[CATALOG] vehicles:");
+    for (auto &v : g_vehicles) std::fprintf(stderr, " #%u '%s'", v.number, v.name.c_str());
+    std::fprintf(stderr, "\n");
     std::fprintf(stderr, "[CATALOG] %zu models\n", models().size());
 }
 }  // namespace session_catalog

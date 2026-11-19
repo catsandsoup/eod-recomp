@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 #include <vector>
 
@@ -206,8 +207,6 @@ void wheel_spawn() {
         return;
     }
     const uint32_t phob = lwu(kWheels + 4 * (uint32_t)lw(kWheelNext));
-    const bool stole = lwu(phob + 0x1DC) != 0;
-    note_use(g_wheel_use, live_in(g_wheel_use) + 1, stole);
 
     call(f_00179A08, 0x1B30D8);  // a0 is still the car index
     const uint32_t car = reg(2);
@@ -281,23 +280,78 @@ void panel_destroy() {
     f_0017DA48();
 }
 
-}  // namespace
+// Host bookkeeping (reserve, made phobs, counters) done while the original side of an enclosing
+// EOD_DIFF comparison runs (0x18CA98 calls 0x1B3068 and 0x1E0DC8) is undone: the replacement side
+// repeats the same guest work from the same state, and the guest keeps the original's results.
+struct HostUndo {
+    Pool &p;
+    const bool active;
+    std::vector<uint32_t> reserve;
+    std::unordered_set<uint32_t> ours;
+    uint64_t spawns, steals, peak, made;
+    explicit HostUndo(Pool &pool)
+        : p(pool), active(diff_in_original_side()), reserve(pool.reserve), ours(pool.ours), spawns(pool.spawns),
+          steals(pool.steals), peak(pool.peak), made(pool.made) {}
+    ~HostUndo() {
+        if (!active) return;
+        p.reserve = reserve, p.ours = ours;
+        p.spawns = spawns, p.steals = steals, p.peak = peak, p.made = made;
+    }
+};
 
 // The expansion runs before diff_run (outside any EOD_DIFF comparison), so both sides of a checked
 // call see the same window and the replacement is still proven against the recompiled original.
-extern "C" void f_001B3068(void) {
+void wheel_spawn_expanded() {
     if (expanded() && lw(kWheelCount) > 0) {
         const uint32_t slot = (uint32_t)lw(kWheelNext);  // the ring slot 0x1B3068 takes
         const uint32_t phob = lwu(kWheels + 4 * slot);
         if (phob && lwu(phob + 0x1DC) != 0) make_room(g_wheel_use, slot, true, 0x1B3068);
     }
+    // live use, counted once per spawn here (not in the replacement, which EOD_DIFF_REPLAY reruns)
+    if (lw(kWheelCount) > 0) {
+        const uint32_t phob = lwu(kWheels + 4 * (uint32_t)lw(kWheelNext));
+        note_use(g_wheel_use, live_in(g_wheel_use) + 1, lwu(phob + 0x1DC) != 0);
+    }
     diff_run(0x001B3068, wheel_spawn, f_001B3068_orig);
 }
+}  // namespace
+
+// EOD_WHEEL_REPLAY=<n> (test only): after each real wheel toss, the same toss (car index, matrix,
+// velocity and hub position the caller built) is repeated n times on the car's wheels in turn, as
+// a deterministic replay of 0x1B3068 that fills the pool past the PS2 array (16) and the scene's
+// wheel phobs. Each replayed spawn goes through the wrapper (expansion, EOD_DIFF) like a real one.
+extern "C" void f_001B3068(void) {
+    HostUndo undo(g_wheel_use);
+    static const uint32_t replays = [] {
+        const char *e = std::getenv("EOD_WHEEL_REPLAY");
+        return e ? (uint32_t)std::strtoul(e, nullptr, 10) : 0u;
+    }();
+    if (!replays) {
+        wheel_spawn_expanded();
+        return;
+    }
+    const EEState entry = g_ee;
+    wheel_spawn_expanded();
+    const EEState done = g_ee;
+    for (uint32_t k = 1; k <= replays; k++) {
+        g_ee = entry;
+        g_ee.r[5].sd[0] = (int32_t)((entry.r[5].uw[0] + k) & 3u);  // wheel 0..3 (car+0x1A00 + 0x54 w)
+        wheel_spawn_expanded();
+    }
+    g_ee = done;
+    if (diff_in_original_side()) return;
+    static uint64_t replayed = 0;
+    replayed += replays;
+    std::fprintf(stderr, "[debris] wheel toss replay: car %d wheel %d, %u more tosses (%llu replayed in all)\n",
+                 (int32_t)entry.r[4].uw[0], (int32_t)entry.r[5].uw[0], replays, (unsigned long long)replayed);
+}
 extern "C" void f_001B3180(void) {
+    HostUndo undo(g_wheel_use);
     diff_run(0x001B3180, wheel_count_reset, f_001B3180_orig);
     release(g_wheel_use);
 }
 extern "C" void f_001B3190(void) {
+    HostUndo undo(g_wheel_use);
     diff_run(0x001B3190, wheel_pool_reset, f_001B3190_orig);
     release(g_wheel_use);
 }
@@ -305,6 +359,7 @@ extern "C" void f_001E1E88(void) { diff_run(0x001E1E88, panel_create, f_001E1E88
 // A panel this file made was never counted by the guest: give its decrement back, so the count
 // returns to 0 when the scene's 'Panl' phobs are gone, as on the PS2.
 extern "C" void f_001E29C0(void) {
+    HostUndo undo(g_panel_use);
     const uint32_t phob = reg(4);
     diff_run(0x001E29C0, panel_destroy, f_001E29C0_orig);
     Pool &p = g_panel_use;
@@ -331,8 +386,8 @@ extern "C" void f_001B2868(void) {
     f_001B2868_orig();
 }
 
-// 0x1E0DC8 stays recompiled; counted here (through diff_run, so a nested call on the original side
-// of an EOD_DIFF comparison is not counted twice). It spawns unless the panel box is flat on every
+// 0x1E0DC8 stays recompiled; counted here (HostUndo drops the count made on the original side of
+// an enclosing EOD_DIFF comparison, so a nested call is not counted twice). It spawns unless the panel box is flat on every
 // axis (|min - max| <= FLT_EPSILON 0x34000000, the first test of 0x1E0DC8), into the first free
 // phob of the window, else the one with the oldest spawn clock (+0x204). With ExpandDebris a full
 // window gets a free phob in slot 0 first, so nothing live is taken.
@@ -358,15 +413,10 @@ bool window_full(const Pool &p) {
     }
     return count > 0;
 }
-void panel_spawn_counted() {
-    if (panel_spawns() && lw(kPanelCount) > 0) {
-        const bool stole = window_full(g_panel_use);
-        note_use(g_panel_use, live_in(g_panel_use) + 1, stole);
-    }
-    f_001E0DC8_orig();
-}
 }  // namespace
 extern "C" void f_001E0DC8(void) {
+    HostUndo undo(g_panel_use);
     if (expanded() && panel_spawns() && window_full(g_panel_use)) make_room(g_panel_use, 0, false, 0x1E0DC8);
-    diff_run(0x001E0DC8, panel_spawn_counted, f_001E0DC8_orig);
+    if (panel_spawns() && lw(kPanelCount) > 0) note_use(g_panel_use, live_in(g_panel_use) + 1, window_full(g_panel_use));
+    f_001E0DC8_orig();
 }
