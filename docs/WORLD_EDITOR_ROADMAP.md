@@ -258,3 +258,35 @@ To guarantee zero UI hangs and rock-solid 60 FPS OpenGL rendering on Windows 11,
 | **Phase 2 (Next)** | `VALT` schema-driven live inspector dock (`physics.val`, `track.val`, `shadow.val`), `ILIN` tangent/length recalculator & full node add/remove pointer rebuild, `SOBL` quadtree rebuild for adding/growing custom collision walls, multi-object marquee selection & grouping, Blender live-reload bridge (`vif_patch.py`). | Planned |
 | **Phase 3** | Full Creation Kit unification: `LANG` string editor, `IMAG`/`LAYT` 640×480 UI editor, `SFX0`/`ESFX` audio WAV studio, `.eodmod` package builder & conflict resolver (`mod_package.py`/`mod_install.py`). | Planned |
 | **Phase 4** | Custom track registration & arbitrary new geometry compiler (new `track.grf` + `track.bsc` + `track.sol` synthesis from Blender/glTF scenes). | Research |
+
+---
+
+## 8. Halo 3 / Steam Workshop-Style `.eodmod` Lobby Streaming Architecture
+
+To enable effortless **Forge-style multiplayer custom games** (Tag / Infected, Cat & Mouse, Fat Kid / Juggernaut, custom stunt parks, and NASCAR tracks) without manual file copying, custom worlds package into deterministic, content-addressed **`.eodmod`** archives that stream automatically when players join a lobby:
+
+```mermaid
+sequenceDiagram
+    participant Host as Lobby Host (eod.exe)
+    participant Relay as Workshop / P2P Relay
+    participant Client as Joining Client (eod.exe)
+    participant Cache as Local Mod Cache (%LOCALAPPDATA%/TDEODRecomp/lobby_cache)
+
+    Host->>Relay: Publish lobby header (track, event, arcade_mode, mod_sha256, chunk_list)
+    Client->>Host: Join lobby request
+    Host-->>Client: Lobby manifest (mod_id, mod_sha256, size, peer/CDN URLs)
+    Client->>Cache: Check cached <mod_sha256>.eodmod
+    alt Cache Miss
+        Client->>Relay: Stream compressed delta chunks (zstd / HTTP range / WebRTC)
+        Relay-->>Client: Chunks + SHA-256 verification
+        Client->>Cache: Verify manifest & unpack to sandboxed EOD_MOD_DIR
+    end
+    Client->>Client: Mount EOD_MOD_DIR (overlay .TRK / .CAR / HOSTTEX) -> Ready
+    Host->>Client: Synchronized session start (track, event, arcade_mode, seed)
+```
+
+### Package Layout & Bandwidth Efficiency
+- **Delta-First `.eodmod` Container (ZIP/zstd):** Contains `eodmod.json` (schema version, author, title, `retail_trk_sha256`, `mod_sha256`, arcade ruleset, Workshop item ID), the lightweight `.eodworld.json` overlay (tens of KB), optional binary patches (`bsdiff`/member-level `track.grf`/`track.bsc`/`track.bpp`/`track.sol`/`*.ild`/`c_*.va0`), any custom `DATA/CAR/*.CAR` drops, and `HOSTTEX/*.eodhtx` + `replacements.tsv`.
+- **Sub-Second Lobby Joins:** Because retail disc assets (`DATA/TRACKS/*.TRK`, `DATA/CAR/*.CAR`) are already installed on every client, streaming only the `.eodworld.json` delta + modified `.eodhtx` textures keeps typical Forge-style maps under **50 KB–2 MB** (recompiling the local patched `.TRK` deterministically on join or applying verified member patches in < 1 second).
+- **Strict Security & Retail Isolation:** Joining a modded lobby extracts strictly into a sandboxed, hash-keyed cache folder (`%LOCALAPPDATA%/TDEODRecomp/lobby_cache/<sha256>/`), rejects path traversal or executable payloads, never touches `D:\Test Drive - Eve of Destruction (USA)\DATA\`, and unmounts cleanly the instant the player returns to the main menu.
+- **Steam Workshop / Community Hub Integration:** Each `.eodmod` manifest carries a stable `mod_id`, preview thumbnail (rendered by `thumbnails.py`), tags (`Stunt`, `Derby`, `Figure-8`, `Tag`, `NASCAR`), and `min_recomp_version` so players can subscribe, rate, auto-update, or host directly from the World Editor's **Publish `.eodmod`** action.

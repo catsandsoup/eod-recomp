@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, Callable
+
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -19,15 +24,19 @@ from PySide6.QtWidgets import (
     QListView,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from pie_host import ARCADE_MODES
 from theme import TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, enable_windows_dark_titlebar, svg_icon
 from thumbnails import THUMB_H, THUMB_W, ThumbnailCache
-from world_loader import CustomRaceConfig, TrackWorld
+from world_loader import CustomRaceConfig, REPO_ROOT, TrackWorld, discover_cars
 
 
 class ReplaceModelDialog(QDialog):
@@ -242,6 +251,18 @@ class CustomRaceDialog(QDialog):
             self.cmb_place.setCurrentIndex(idx_p)
         form.addRow("Career Free-Roam Place:", self.cmb_place)
 
+        self.cmb_arcade = QComboBox()
+        for key, title in ARCADE_MODES:
+            self.cmb_arcade.addItem(title, key)
+        idx_a = self.cmb_arcade.findData(cfg.arcade_mode)
+        if idx_a >= 0:
+            self.cmb_arcade.setCurrentIndex(idx_a)
+        form.addRow("Arcade Game Mode:", self.cmb_arcade)
+
+        self.chk_sync_events = QCheckBox("Sync Modded Ramps && Props to All Events / Free Roam")
+        self.chk_sync_events.setChecked(bool(world.sync_all_events))
+        form.addRow("Event Layout Sync:", self.chk_sync_events)
+
         grid_cnt = sum(1 for m in world.markers if m.kind in ("Spawn", "Start Grid", "Car"))
         lbl_grid = QLabel(f"{grid_cnt} Start Grid / Spawn / Car markers placed on track")
         lbl_grid.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 8.5pt;")
@@ -269,6 +290,8 @@ class CustomRaceDialog(QDialog):
         root.addLayout(btn_row)
 
     def build_config(self) -> CustomRaceConfig:
+        sync_on = self.chk_sync_events.isChecked()
+        self.world.sync_all_events = sync_on
         return CustomRaceConfig(
             event_name=self.ed_name.text().strip() or self.cmb_event.currentText().strip() or "No-Rules Race",
             event_type=self.cmb_event.currentText().strip() or "No-Rules Race",
@@ -278,6 +301,9 @@ class CustomRaceDialog(QDialog):
             ai_speed_scale=float(self.spn_speed.value()),
             ilin_line=str(self.cmb_ilin.currentData() or self.world.road_graph.line_name),
             free_roam_place=self.cmb_place.currentText().strip() or "home",
+            arcade_mode=str(self.cmb_arcade.currentData() or "free_roam"),
+            sync_all_events=sync_on,
+            include_lod_twins=bool(self.world.include_lod_twins),
         )
 
     def _save_only(self) -> None:
@@ -289,3 +315,89 @@ class CustomRaceDialog(QDialog):
         self.world.custom_race = self.build_config()
         self.launch_pie_after = True
         self.accept()
+
+
+class VehicleTunerDialog(QDialog):
+    """Live PIE Vehicle Boost / Handling Tuner & NASCAR / Custom Car Tooling Hub."""
+
+    def __init__(
+        self,
+        game_dir: Path,
+        on_live_boost_changed: Callable[[float], None] | None = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.game_dir = Path(game_dir)
+        self._on_live_boost = on_live_boost_changed
+        self.setWindowTitle("Vehicles — Live PIE Car Tuner & NASCAR / Custom Car Tools")
+        self.resize(520, 380)
+        enable_windows_dark_titlebar(self)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        tabs = QTabWidget()
+
+        # Tab 1: Live PIE Car Tuner
+        t_live = QWidget()
+        l_lay = QFormLayout(t_live)
+        l_lay.setSpacing(10)
+
+        info = QLabel(
+            "Adjust live PIE vehicle power/boost immediately while driving inside Play-In-Editor. "
+            "Permanent car handling edits live in <code>DATA/CAR/&lt;CAR&gt;.CAR#physics.val</code> "
+            "(legacy <code>SETU</code> <code>.gar</code> sheets are verified unused by SLUS_209.10)."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt;")
+        l_lay.addRow(info)
+
+        self.sld_boost = QSlider(Qt.Orientation.Horizontal)
+        self.sld_boost.setRange(50, 250)
+        self.sld_boost.setValue(100)
+        self.lbl_boost = QLabel("1.00 x")
+        self.sld_boost.valueChanged.connect(self._on_boost_slider)
+        b_row = QHBoxLayout()
+        b_row.addWidget(self.sld_boost, 1)
+        b_row.addWidget(self.lbl_boost)
+        l_lay.addRow("Live PIE Speed Boost:", b_row)
+
+        self.cmb_car = QComboBox()
+        for cp in discover_cars(self.game_dir):
+            self.cmb_car.addItem(cp.stem.replace("_1", "").title(), str(cp))
+        l_lay.addRow("Inspect Retail Car:", self.cmb_car)
+
+        tabs.addTab(t_live, "Live PIE Car Tuner")
+
+        # Tab 2: NASCAR & Custom Car CLI Bridge
+        t_nascar = QWidget()
+        n_lay = QVBoxLayout(t_nascar)
+        n_lay.setSpacing(8)
+        nascar_script = REPO_ROOT / "tools" / "import_nascar_cars.py"
+        custom_script = REPO_ROOT / "tools" / "create_custom_car.py"
+        lbl_n = QLabel(
+            f"<b>NASCAR: Dirt to Daytona &amp; Custom Car Pipelines</b><br>"
+            f"• NASCAR importer: <code>{nascar_script.name}</code> ({'available' if nascar_script.is_file() else 'not found'})<br>"
+            f"• Custom car cloner: <code>{custom_script.name}</code> ({'available' if custom_script.is_file() else 'not found'})<br><br>"
+            f"All imported/cloned <code>.CAR</code> archives placed under <code>mods/&lt;Project&gt;/DATA/CAR/</code> "
+            f"appear automatically in Explorer's Cars &amp; Wrecks catalog and PIE vehicle picker."
+        )
+        lbl_n.setWordWrap(True)
+        lbl_n.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt;")
+        n_lay.addWidget(lbl_n)
+        n_lay.addStretch(1)
+        tabs.addTab(t_nascar, "NASCAR & Custom Cars")
+
+        root.addWidget(tabs, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.accept)
+        btns.accepted.connect(self.accept)
+        root.addWidget(btns)
+
+    def _on_boost_slider(self, val: int) -> None:
+        mult = val / 100.0
+        self.lbl_boost.setText(f"{mult:.2f} x")
+        if self._on_live_boost is not None:
+            self._on_live_boost(mult)

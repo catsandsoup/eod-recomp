@@ -1335,6 +1335,7 @@ class ViewportGL(QOpenGLWidget):
         self._sobl_vao = self._sobl_vbo = self._sobl_count = 0
         if self.world is None:
             return
+        self.world.collision.rebuild_dynamic_ramp_collision(self.world)
 
         def upload_lines(verts3: np.ndarray, rgba: Any) -> tuple[int, int, int]:
             if len(verts3) == 0:
@@ -1391,6 +1392,7 @@ class ViewportGL(QOpenGLWidget):
     def _rebuild_static_batches(self) -> None:
         self._static_dirty = False
         self._delete_batches(self._static_batches)
+        self._delete_batches(self._blend_batches)
         if self.world is None:
             return
 
@@ -1398,8 +1400,12 @@ class ViewportGL(QOpenGLWidget):
         grouped_i: dict[str, list[np.ndarray]] = {}
         grouped_base: dict[str, int] = {}
 
+        blend_v: dict[str, list[np.ndarray]] = {}
+        blend_i: dict[str, list[np.ndarray]] = {}
+        blend_base: dict[str, int] = {}
+
         for obj in self.world.objects:
-            if obj.deleted or not obj.visible:
+            if not self.world.object_visible_in_event_template(obj):
                 continue
             if not self.layer_visibility.get(obj.category, True):
                 continue
@@ -1420,28 +1426,76 @@ class ViewportGL(QOpenGLWidget):
                     v[:, 0:3] = v[:, 0:3] @ rot3.T + t3
                     v[:, 3:6] = v[:, 3:6] @ rot3.T
                 tex = part.texture
-                base = grouped_base.get(tex, 0)
-                grouped_v.setdefault(tex, []).append(v)
-                grouped_i.setdefault(tex, []).append(part.indices + base)
-                grouped_base[tex] = base + len(v)
+                ta = self.world.textures.get(tex)
+                if ta is not None and ta.alpha_kind == "blend":
+                    base = blend_base.get(tex, 0)
+                    blend_v.setdefault(tex, []).append(v)
+                    blend_i.setdefault(tex, []).append(part.indices + base)
+                    blend_base[tex] = base + len(v)
+                else:
+                    base = grouped_base.get(tex, 0)
+                    grouped_v.setdefault(tex, []).append(v)
+                    grouped_i.setdefault(tex, []).append(part.indices + base)
+                    grouped_base[tex] = base + len(v)
 
         for tex, vlist in grouped_v.items():
             verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
             inds = np.ascontiguousarray(np.concatenate(grouped_i[tex], axis=0), dtype=np.uint32)
             self._static_batches.append(self._upload_mesh_batch(verts, inds, tex))
 
+        for tex, vlist in blend_v.items():
+            verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
+            inds = np.ascontiguousarray(np.concatenate(blend_i[tex], axis=0), dtype=np.uint32)
+            self._blend_batches.append(self._upload_mesh_batch(verts, inds, tex))
+
     def _rebuild_selection_batches(self) -> None:
         self._sel_dirty = False
         self._delete_batches(self._sel_batches)
-        if self.world is None or self.selected_obj is None or self.selected_obj.deleted:
+        if self.world is None:
             return
-        model = self.world.models.get(self.selected_obj.model_key)
-        if not model:
+        active_sel = [o for o in self.selected_objects if not o.deleted]
+        if not active_sel and self.selected_obj is not None and not self.selected_obj.deleted:
+            active_sel = [self.selected_obj]
+        if not active_sel:
             return
-        for part in model.parts:
-            verts = np.ascontiguousarray(part.vertices, dtype=np.float32)
-            inds = np.ascontiguousarray(part.indices, dtype=np.uint32)
-            self._sel_batches.append(self._upload_mesh_batch(verts, inds, part.texture))
+        # When single object selected, keep local coords so gizmo drag doesn't rebuild VBOs every frame!
+        if len(active_sel) == 1:
+            model = self.world.models.get(active_sel[0].model_key)
+            if not model:
+                return
+            for part in model.parts:
+                verts = np.ascontiguousarray(part.vertices, dtype=np.float32)
+                inds = np.ascontiguousarray(part.indices, dtype=np.uint32)
+                b = self._upload_mesh_batch(verts, inds, part.texture)
+                b["world_baked"] = False
+                self._sel_batches.append(b)
+            return
+        # Multi-selection: bake world-space batches grouped by texture so all selected objects glow green!
+        gv: dict[str, list[np.ndarray]] = {}
+        gi: dict[str, list[np.ndarray]] = {}
+        gb: dict[str, int] = {}
+        for obj in active_sel:
+            model = self.world.models.get(obj.model_key)
+            if not model:
+                continue
+            m4 = obj.world_matrix()
+            rot3 = m4[:3, :3]
+            t3 = m4[:3, 3]
+            for part in model.parts:
+                v = part.vertices.copy()
+                v[:, 0:3] = v[:, 0:3] @ rot3.T + t3
+                v[:, 3:6] = v[:, 3:6] @ rot3.T
+                tex = part.texture
+                base = gb.get(tex, 0)
+                gv.setdefault(tex, []).append(v)
+                gi.setdefault(tex, []).append(part.indices + base)
+                gb[tex] = base + len(v)
+        for tex, vlist in gv.items():
+            verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
+            inds = np.ascontiguousarray(np.concatenate(gi[tex], axis=0), dtype=np.uint32)
+            b = self._upload_mesh_batch(verts, inds, tex)
+            b["world_baked"] = True
+            self._sel_batches.append(b)
 
     def _rebuild_ghost_batches(self) -> None:
         self._ghost_dirty = False
@@ -1968,9 +2022,31 @@ class ViewportGL(QOpenGLWidget):
             draws += 1
             tris_drawn += b["tris"]
 
-        # 4. Selected object with bright translucent green highlight (polygon-offset so static VBOs never rebuild on click!)
+        # 3b. Translucent water / blend surfaces (e.g. Afton pond `sween.tex`)
+        if self._blend_batches:
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            GL.glDepthMask(GL.GL_FALSE)
+            for b in self._blend_batches:
+                tex_entry = self._gl_textures.get(b["tex"])
+                if tex_entry is not None:
+                    GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
+                    GL.glUniform1i(loc_has, 1)
+                    GL.glUniform1i(loc_cut, 0)
+                else:
+                    GL.glUniform1i(loc_has, 0)
+                    GL.glUniform1i(loc_cut, 0)
+                GL.glBindVertexArray(b["vao"])
+                GL.glDrawElements(GL.GL_TRIANGLES, b["count"], GL.GL_UNSIGNED_INT, None)
+                draws += 1
+                tris_drawn += b["tris"]
+            GL.glDepthMask(GL.GL_TRUE)
+            GL.glDisable(GL.GL_BLEND)
+
+        # 4. Selected object(s) with bright translucent green highlight
         if self.selected_obj is not None and not self.selected_obj.deleted and self._sel_batches:
-            m4 = self.selected_obj.world_matrix()
+            is_world_baked = bool(self._sel_batches[0].get("world_baked", False))
+            m4 = ident if is_world_baked else self.selected_obj.world_matrix()
             GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
             GL.glPolygonOffset(-1.0, -1.0)
             GL.glUniformMatrix4fv(loc_mod, 1, GL.GL_TRUE, m4)
@@ -2285,7 +2361,7 @@ class ViewportGL(QOpenGLWidget):
         inv_d = np.where(np.abs(ray_d) > 1e-8, 1.0 / ray_d, 1e12).astype(np.float32)
         candidates: list[tuple[float, WorldObject]] = []
         for obj in self.world.objects:
-            if obj.deleted or not obj.visible:
+            if not self.world.object_visible_in_event_template(obj):
                 continue
             if not self.layer_visibility.get(obj.category, True):
                 continue
@@ -2411,6 +2487,16 @@ class ViewportGL(QOpenGLWidget):
                         self._gizmo_drag_orig_pos = self.selected_obj.position
                         self._gizmo_drag_orig_rot = self.selected_obj.rotation_hpr
                         self._gizmo_drag_orig_scale = self.selected_obj.scale
+                        active_sel = [o for o in self.selected_objects if not o.deleted] or [self.selected_obj]
+                        self._gizmo_drag_multi = []
+                        for so in active_sel:
+                            base_min_y = so.position[1]
+                            if self.world is not None and so.model_key in self.world.models:
+                                lo, _hi = so.world_aabb(self.world.models[so.model_key])
+                                base_min_y = float(lo[1])
+                            self._gizmo_drag_multi.append(
+                                (so, so.position, so.rotation_hpr, so.scale, base_min_y)
+                            )
                     elif gkind == "marker" and self.selected_marker is not None:
                         self._gizmo_drag_orig_pos = self.selected_marker.position
                         self._gizmo_drag_orig_hdg = self.selected_marker.heading_deg
@@ -2469,12 +2555,22 @@ class ViewportGL(QOpenGLWidget):
             origin = np.array(self._gizmo_drag_orig_pos, dtype=np.float32)
 
             if self._gizmo_drag_target == "obj" and self.selected_obj is not None:
+                drag_list = self._gizmo_drag_multi or [
+                    (
+                        self.selected_obj,
+                        self._gizmo_drag_orig_pos,
+                        self._gizmo_drag_orig_rot,
+                        self._gizmo_drag_orig_scale,
+                        self._gizmo_drag_orig_pos[1],
+                    )
+                ]
                 if self.active_tool in ("move", "select"):
                     t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
                     delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
-                    new_p = list(self._gizmo_drag_orig_pos)
-                    new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
-                    self.selected_obj.position = (new_p[0], new_p[1], new_p[2])
+                    for so, sop, _sor, _sos, _bmy in drag_list:
+                        new_p = list(sop)
+                        new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
+                        so.position = (new_p[0], new_p[1], new_p[2])
                 elif self.active_tool == "rotate":
                     hit = ray_plane_intersect(ray_o, ray_d, origin, ax)
                     if hit is not None:
@@ -2484,19 +2580,30 @@ class ViewportGL(QOpenGLWidget):
                         ang = math.atan2(float(np.dot(rel, v)), float(np.dot(rel, u)))
                         da_deg = self._snap_val(math.degrees(ang - self._gizmo_drag_start_angle), self.angle_snap_step, self.angle_snap_enabled)
                         hpr_idx = {1: 0, 0: 1, 2: 2}[ax_idx]
-                        new_r = list(self._gizmo_drag_orig_rot)
-                        new_r[hpr_idx] = (new_r[hpr_idx] + da_deg) % 360.0
-                        self.selected_obj.rotation_hpr = (new_r[0], new_r[1], new_r[2])
+                        for so, _sop, sor, _sos, _bmy in drag_list:
+                            new_r = list(sor)
+                            new_r[hpr_idx] = (new_r[hpr_idx] + da_deg) % 360.0
+                            so.rotation_hpr = (new_r[0], new_r[1], new_r[2])
                 elif self.active_tool == "scale":
                     t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
                     s_ref = max(1.0, self._gizmo_scale(origin))
                     factor = max(0.05, 1.0 + (t_now - self._gizmo_drag_start_t) / s_ref)
-                    new_s = list(self._gizmo_drag_orig_scale)
-                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                        new_s = [v * factor for v in self._gizmo_drag_orig_scale]
-                    else:
-                        new_s[ax_idx] = self._gizmo_drag_orig_scale[ax_idx] * factor
-                    self.selected_obj.scale = (new_s[0], new_s[1], new_s[2])
+                    uniform = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                    for so, sop, _sor, sos, base_min_y in drag_list:
+                        new_s = [v * factor for v in sos] if uniform else list(sos)
+                        if not uniform:
+                            new_s[ax_idx] = sos[ax_idx] * factor
+                        so.scale = (new_s[0], new_s[1], new_s[2])
+                        # Anchor bottom base on ground during Y-scale so ramps grow UP instead of sinking!
+                        if (uniform or ax_idx == 1) and self.world is not None and so.model_key in self.world.models:
+                            so.position = sop
+                            lo, _hi = so.world_aabb(self.world.models[so.model_key])
+                            dy_anchor = base_min_y - float(lo[1])
+                            so.position = (sop[0], sop[1] + dy_anchor, sop[2])
+                if len(drag_list) > 1:
+                    self._sel_dirty = True
+                if self.show_collision:
+                    self._col_dirty = True
                 self.objectSelected.emit(self.selected_obj)
                 self.update()
                 return
@@ -2585,16 +2692,28 @@ class ViewportGL(QOpenGLWidget):
                 target = self._gizmo_drag_target
                 self._gizmo_drag_axis = -1
                 self._gizmo_drag_target = ""
+                drag_list = list(self._gizmo_drag_multi)
+                self._gizmo_drag_multi = []
                 if target == "obj" and self.selected_obj is not None:
-                    obj = self.selected_obj
-                    op, orot, oscl = self._gizmo_drag_orig_pos, self._gizmo_drag_orig_rot, self._gizmo_drag_orig_scale
-                    np_, nrot, nscl = obj.position, obj.rotation_hpr, obj.scale
-                    if op != np_ or orot != nrot or oscl != nscl:
-                        obj.position, obj.rotation_hpr, obj.scale = op, orot, oscl
-                        label = {"move": "Move object", "rotate": "Rotate object", "scale": "Scale object"}.get(
-                            self.active_tool, "Transform object"
-                        )
-                        self.objectTransformed.emit(obj, op, orot, oscl, np_, nrot, nscl, label)
+                    label = {"move": "Move object", "rotate": "Rotate object", "scale": "Scale object"}.get(
+                        self.active_tool, "Transform object"
+                    )
+                    if len(drag_list) > 1:
+                        changes = []
+                        for so, op, orot, oscl, _bmy in drag_list:
+                            np_, nrot, nscl = so.position, so.rotation_hpr, so.scale
+                            if op != np_ or orot != nrot or oscl != nscl:
+                                so.position, so.rotation_hpr, so.scale = op, orot, oscl
+                                changes.append((so, op, orot, oscl, np_, nrot, nscl))
+                        if changes:
+                            self.multiObjectTransformed.emit(changes, f"{label} ({len(changes)} items)")
+                    else:
+                        obj = self.selected_obj
+                        op, orot, oscl = self._gizmo_drag_orig_pos, self._gizmo_drag_orig_rot, self._gizmo_drag_orig_scale
+                        np_, nrot, nscl = obj.position, obj.rotation_hpr, obj.scale
+                        if op != np_ or orot != nrot or oscl != nscl:
+                            obj.position, obj.rotation_hpr, obj.scale = op, orot, oscl
+                            self.objectTransformed.emit(obj, op, orot, oscl, np_, nrot, nscl, label)
                 elif target == "marker" and self.selected_marker is not None:
                     mk = self.selected_marker
                     op, oh = self._gizmo_drag_orig_pos, self._gizmo_drag_orig_hdg
@@ -2695,8 +2814,11 @@ class ViewportGL(QOpenGLWidget):
 
             hit_obj = self._pick_object(ray_o, ray_d)
             if hit_obj is not None:
-                self.select_object(hit_obj)
-            else:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.toggle_object_selection(hit_obj)
+                else:
+                    self.select_object(hit_obj)
+            elif not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
                 self.select_object(None)
                 self.select_road_node(None)
                 self.select_marker(None)

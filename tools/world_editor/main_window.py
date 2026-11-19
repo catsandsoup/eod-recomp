@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from dialogs import CustomRaceDialog, ReplaceModelDialog
+from dialogs import CustomRaceDialog, ReplaceModelDialog, VehicleTunerDialog
 from explorer_panel import ExplorerPanel
 from pie_host import PieHostWidget, build_pie_launch_spec
 from project_state import (
@@ -43,6 +43,8 @@ from project_state import (
     ModifyBarrierCommand,
     ModifyRoadLanesCommand,
     MoveRoadNodeCommand,
+    MultiDeleteObjectsCommand,
+    MultiTransformObjectsCommand,
     PlaceObjectCommand,
     ReplaceObjectModelCommand,
     ReplaceTextureCommand,
@@ -100,6 +102,7 @@ class EodWorldEditorWindow(QMainWindow):
         self._placed_counter = 1
         self._marker_counter = 1
         self._last_pie_mode = "free_roam"
+        self._vehicle_tuner_dlg: VehicleTunerDialog | None = None
 
         # Non-blocking background job state
         self._job_gen = 0
@@ -254,6 +257,8 @@ class EodWorldEditorWindow(QMainWindow):
         m_obj.addAction(svg_icon("scatter"), "Scatter / Paint Brush", lambda: self.select_tool("scatter"), QKeySequence("B"))
         m_obj.addSeparator()
         m_obj.addAction(svg_icon("replace", "#93c5fd"), "Replace Selection With...", self.replace_selected_with_dialog)
+        m_obj.addAction("Select All Similar", self.select_similar_objects)
+        m_obj.addAction(svg_icon("trash", "#ff99a2"), "Delete All Similar", self.delete_similar_objects)
         m_obj.addAction(svg_icon("ground"), "Snap Selected to Ground", self.snap_selected_to_ground, QKeySequence("Ctrl+G"))
         m_obj.addAction("Duplicate Selected", self.duplicate_selected_object, QKeySequence("Ctrl+D"))
         m_obj.addAction(svg_icon("blender"), "Edit Selected in Blender (OBJ)...", self.edit_selected_in_blender, QKeySequence("F2"))
@@ -273,6 +278,7 @@ class EodWorldEditorWindow(QMainWindow):
         # 7. Cars
         m_cars = mb.addMenu("Ca&rs")
         m_cars.addAction(svg_icon("car", "#ff8a8a"), "Browse Cars && Wrecks Library (DATA/CAR)", lambda: self._filter_explorer_category("car-wreck"))
+        m_cars.addAction(svg_icon("car", "#fbbf24"), "Vehicle / NASCAR Tuner (Live PIE)...", self.open_vehicle_tuner_dialog)
         m_cars.addSeparator()
         m_cars.addAction(svg_icon("car"), "Place Car Spawn at View Target", lambda: self.add_marker_at_camera("Car"))
         m_cars.addAction("Place AI Opponent Car Slot", lambda: self.add_marker_at_camera("Car", prefix="AI_Car"))
@@ -303,6 +309,14 @@ class EodWorldEditorWindow(QMainWindow):
         # 12. Races
         m_races = mb.addMenu("Ra&ces")
         m_races.addAction(svg_icon("race", "#60a5fa"), "Custom Race && AI Pathfinding (ILIN) Editor...", self.open_custom_race_dialog)
+        self.act_sync_events = QAction(svg_icon("race", "#4ade80"), "Sync All Events", self)
+        self.act_sync_events.setCheckable(True)
+        self.act_sync_events.setChecked(True)
+        self.act_sync_events.setToolTip(
+            "When ON, modded optional-terrain ramps & props sync across all events and Free Roam (opt_terrain kind=0 + EOD_OPT_TERRAIN_MASK=0xFFFF)"
+        )
+        self.act_sync_events.toggled.connect(self._toggle_sync_all_events)
+        m_races.addAction(self.act_sync_events)
         m_races.addSeparator()
         m_races.addAction("Jump Camera to Start / Finish Grid", self._jump_to_start_grid)
         m_races.addAction("Show Track ILIN Racing Lines Summary...", self._show_races_summary)
@@ -358,10 +372,14 @@ class EodWorldEditorWindow(QMainWindow):
 
         from PySide6.QtWidgets import QComboBox, QSpinBox
         self.cmb_pie_event = QComboBox()
-        self.cmb_pie_event.setToolTip("Choose Event / Race mode to spawn into on Play Event")
-        self.cmb_pie_event.setMinimumWidth(135)
+        self.cmb_pie_event.setToolTip(
+            "Event Template / Race Mode — live-filters viewport ramps & props, switches active ILIN line, and targets PIE"
+        )
+        self.cmb_pie_event.setMinimumWidth(155)
         self.cmb_pie_event.setFixedHeight(24)
-        self.cmb_pie_event.addItems(["Battle (Free Roam)", "No-Rules Race", "Demolition Derby", "Career Overworld (Free Roam)"])
+        self.cmb_pie_event.addItems(
+            ["All Templates (Combined)", "Battle (Free Roam)", "No-Rules Race", "Demolition Derby", "Career Overworld (Free Roam)"]
+        )
         self.cmb_pie_event.currentTextChanged.connect(self._on_pie_picker_changed)
         tb.addWidget(self.cmb_pie_event)
 
@@ -389,7 +407,10 @@ class EodWorldEditorWindow(QMainWindow):
         self.spn_pie_ai.valueChanged.connect(self._on_pie_picker_changed)
         tb.addWidget(self.spn_pie_ai)
 
+        tb.addAction(self.act_sync_events)
         tb.addAction(svg_icon("race", "#fbbf24"), "Race Setup", self.open_custom_race_dialog)
+        self.act_vehicle_tuner = tb.addAction(svg_icon("car", "#fbbf24"), "Car Tuner", self.open_vehicle_tuner_dialog)
+        self.act_vehicle_tuner.setToolTip("Open Live PIE Vehicle Boost / Handling Tuner & NASCAR / Custom Car Tools")
 
         # Renderer Quality Selector (PS2 Fast Performance vs Plume Vulkan High-Quality)
         self.cmb_renderer_mode = QComboBox()
@@ -531,16 +552,16 @@ class EodWorldEditorWindow(QMainWindow):
         hdr.setSpacing(8)
         self.chk_log_verbose = QCheckBox("Verbose Output")
         self.chk_log_verbose.setChecked(True)
-        btn_copy = QPushButton("Copy Log")
-        btn_copy.setFixedHeight(22)
-        btn_copy.clicked.connect(self._copy_output_log)
-        btn_clear = QPushButton("Clear")
-        btn_clear.setFixedHeight(22)
-        btn_clear.clicked.connect(lambda: self.log_text.clear())
+        self.btn_copy_log = QPushButton("Copy Log")
+        self.btn_copy_log.setFixedHeight(22)
+        self.btn_copy_log.clicked.connect(self._copy_output_log)
+        self.btn_clear_log = QPushButton("Clear")
+        self.btn_clear_log.setFixedHeight(22)
+        self.btn_clear_log.clicked.connect(lambda: self.log_text.clear())
         hdr.addWidget(self.chk_log_verbose)
         hdr.addStretch(1)
-        hdr.addWidget(btn_copy)
-        hdr.addWidget(btn_clear)
+        hdr.addWidget(self.btn_copy_log)
+        hdr.addWidget(self.btn_clear_log)
         lay.addLayout(hdr)
 
         self.log_text = QPlainTextEdit()
@@ -618,10 +639,12 @@ class EodWorldEditorWindow(QMainWindow):
 
         # Viewport -> MainWindow & Properties
         self.viewport.objectSelected.connect(self._on_viewport_obj_selected)
+        self.viewport.selectionChanged.connect(self._on_viewport_selection_changed)
         self.viewport.roadNodeSelected.connect(self._on_viewport_road_selected)
         self.viewport.markerSelected.connect(self._on_viewport_marker_selected)
         self.viewport.barrierSelected.connect(self._on_viewport_barrier_selected)
         self.viewport.objectTransformed.connect(self._on_viewport_obj_transformed)
+        self.viewport.multiObjectTransformed.connect(self._on_viewport_multi_obj_transformed)
         self.viewport.markerTransformed.connect(self._on_viewport_marker_transformed)
         self.viewport.roadNodeMoved.connect(self._on_viewport_road_moved)
         self.viewport.roadActionRequested.connect(self._on_road_action)
@@ -643,7 +666,10 @@ class EodWorldEditorWindow(QMainWindow):
         # Properties -> MainWindow
         self.properties.objectTransformEdited.connect(self._on_prop_obj_transform)
         self.properties.snapObjectToGround.connect(self.snap_object_to_ground)
-        self.properties.deleteObjectRequested.connect(self.delete_object)
+        self.properties.deleteObjectRequested.connect(self._on_prop_delete_object)
+        self.properties.selectSimilarRequested.connect(self.select_similar_objects)
+        self.properties.deleteSimilarRequested.connect(self.delete_similar_objects)
+        self.properties.includeLodTwinsChanged.connect(self._on_include_lod_twins_changed)
         self.properties.editInBlenderRequested.connect(self.edit_object_in_blender)
         self.properties.makeCollisionRequested.connect(self.make_collision_for_object)
         self.properties.replaceObjectRequested.connect(self.replace_object_with_dialog)
@@ -913,12 +939,49 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     # Unreal Engine 4/5 Play-In-Editor (PIE) Embedded Viewport
     # -----------------------------------------------------------------------
+    def build_current_pie_spec(self, mod_dir: Path, mode: str) -> dict[str, Any]:
+        """Build a live PIE launch spec directly from the toolbar pickers, Sync All Events, and Arcade Mode."""
+        assert self.world is not None
+        cfg = self.world.custom_race
+        ev = self.cmb_pie_event.currentText().strip() or cfg.event_type
+        car = self.cmb_pie_car.currentText().strip() or cfg.player_car or "Algar"
+        ai = int(self.spn_pie_ai.value())
+        sync_all = bool(self.act_sync_events.isChecked())
+        self.world.sync_all_events = sync_all
+        cfg.sync_all_events = sync_all
+        cfg.event_type = ev
+        cfg.event_name = ev
+        cfg.player_car = car
+        cfg.ai_count = ai
+        rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
+        arcade_mode = str(cfg.arcade_mode or "free_roam")
+        return build_pie_launch_spec(
+            self.game_dir,
+            mod_dir,
+            self.world.display_name,
+            mode=mode,
+            event_name=ev,
+            car_name=car,
+            ai_count=ai,
+            free_roam_place=cfg.free_roam_place,
+            renderer_mode=rmode,
+            sync_all_events=sync_all,
+            arcade_mode=arcade_mode,
+            ai_autodrive=self.pie_host.btn_ai_drive.isChecked(),
+            free_cam=self.pie_host.btn_free_cam.isChecked(),
+        )
+
     def start_pie(self, mode: str = "free_roam") -> None:
         """Compile mod layer on QThreadPool worker, then embed live `eod.exe` inside central viewport."""
         if self.world is None:
             return
         self._last_pie_mode = mode
         mod_dir = self._default_mod_dir()
+
+        # Sync live toolbar pickers + Sync All Events into TrackWorld before compiling mod layer
+        self._on_pie_picker_changed()
+        self.world.sync_all_events = bool(self.act_sync_events.isChecked())
+        self.world.custom_race.sync_all_events = self.world.sync_all_events
 
         # Pause background thumbnail & car-scan workers so PIE compile & eod.exe get full CPU/GPU
         if getattr(self.explorer, "_thumb_token", None) is not None:
@@ -958,21 +1021,10 @@ class EodWorldEditorWindow(QMainWindow):
         self._active_token = None
         self._hide_progress()
 
-        cfg = self.world.custom_race
-        rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
-        spec = build_pie_launch_spec(
-            self.game_dir,
-            mod_dir,
-            self.world.display_name,
-            mode=mode,
-            event_name=cfg.event_type,
-            car_name=cfg.player_car,
-            ai_count=cfg.ai_count,
-            free_roam_place=cfg.free_roam_place,
-            renderer_mode=rmode,
-        )
+        spec = self.build_current_pie_spec(mod_dir, mode)
         self.append_log(
             f"[PIE] Compile finished. Launching {spec['exe']} | {spec['direct_start']} "
+            f"| sync_all={self.world.sync_all_events} arcade={spec.get('arcade_mode')} "
             f"| EOD_NATIVE={spec['env'].get('EOD_NATIVE')} EOD_MODERN={spec['env'].get('EOD_MODERN')}",
             verbose=True,
         )
@@ -1023,7 +1075,7 @@ class EodWorldEditorWindow(QMainWindow):
     def _on_pie_picker_changed(self, *_args: Any) -> None:
         if self.world is None:
             return
-        ev = self.cmb_pie_event.currentText().strip()
+        ev = self.cmb_pie_event.currentText().strip() or "All Templates (Combined)"
         car = self.cmb_pie_car.currentText().strip() or "Algar"
         ai = int(self.spn_pie_ai.value())
         self.world.custom_race.event_type = ev
@@ -1031,20 +1083,44 @@ class EodWorldEditorWindow(QMainWindow):
         self.world.custom_race.player_car = car
         self.world.custom_race.ai_count = ai
 
+        # Live Event Template viewport filter + synchronized active .ild racing line
+        self.viewport.set_event_template(ev)
+        tpl = self.world.event_templates.get(ev)
+        if tpl is not None and tpl.ilin_member and tpl.ilin_member in self.world.all_road_graphs:
+            if self.world.road_graph.line_name != tpl.ilin_member:
+                self._switch_road_line(tpl.ilin_member)
+
+    def _toggle_sync_all_events(self, checked: bool) -> None:
+        if self.world is not None:
+            self.world.sync_all_events = bool(checked)
+            self.world.custom_race.sync_all_events = bool(checked)
+            self.viewport.mark_scene_dirty()
+        self.set_action_status(
+            f"Sync All Events: {'ON (modded ramps & props sync across all events)' if checked else 'OFF (event-specific)'}"
+        )
+
     def _sync_pie_pickers_from_world(self) -> None:
         if self.world is None or not hasattr(self, "cmb_pie_event"):
             return
         self.cmb_pie_event.blockSignals(True)
         self.cmb_pie_event.clear()
-        events = ["Battle (Free Roam)"]
+        events = ["All Templates (Combined)"]
+        for ev in self.world.event_templates.keys():
+            if ev not in events:
+                events.append(ev)
         for ev in self.world.available_events:
             if ev not in events:
                 events.append(ev)
+        if "Battle (Free Roam)" not in events:
+            events.insert(1, "Battle (Free Roam)")
         if "Career Overworld (Free Roam)" not in events:
             events.append("Career Overworld (Free Roam)")
         self.cmb_pie_event.addItems(events)
-        cur_ev = self.world.custom_race.event_type
-        idx = self.cmb_pie_event.findText(cur_ev, Qt.MatchFlag.MatchFixedString)
+
+        want_ev = self.world.active_event_template or self.world.custom_race.event_type
+        idx = self.cmb_pie_event.findText(want_ev, Qt.MatchFlag.MatchFixedString)
+        if idx < 0 and self.world.custom_race.event_type:
+            idx = self.cmb_pie_event.findText(self.world.custom_race.event_type, Qt.MatchFlag.MatchFixedString)
         self.cmb_pie_event.setCurrentIndex(idx if idx >= 0 else 0)
         self.cmb_pie_event.blockSignals(False)
 
@@ -1057,6 +1133,16 @@ class EodWorldEditorWindow(QMainWindow):
         self.spn_pie_ai.blockSignals(True)
         self.spn_pie_ai.setValue(max(0, min(12, int(self.world.custom_race.ai_count))))
         self.spn_pie_ai.blockSignals(False)
+
+        if hasattr(self, "act_sync_events"):
+            self.act_sync_events.blockSignals(True)
+            self.act_sync_events.setChecked(bool(self.world.sync_all_events))
+            self.act_sync_events.blockSignals(False)
+
+        if hasattr(self.properties, "chk_lod_twins"):
+            self.properties.chk_lod_twins.blockSignals(True)
+            self.properties.chk_lod_twins.setChecked(bool(self.world.include_lod_twins))
+            self.properties.chk_lod_twins.blockSignals(False)
 
     def _on_renderer_mode_changed(self, _index: int) -> None:
         rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
@@ -1141,7 +1227,8 @@ class EodWorldEditorWindow(QMainWindow):
         self.viewport.mark_collision_dirty()
         self.explorer.refresh_counts()
         if self.viewport.selected_obj is not None and self.world is not None:
-            self.properties.show_object(self.viewport.selected_obj, self.world.textures)
+            sel_cnt = max(1, len([o for o in self.viewport.selected_objects if not o.deleted]))
+            self.properties.show_object(self.viewport.selected_obj, self.world.textures, selected_count=sel_cnt)
         elif self.viewport.selected_road_node_id is not None and self.world is not None:
             node = self.world.road_graph.nodes.get(self.viewport.selected_road_node_id)
             self.properties.show_road_node(node, self.world.road_graph)
@@ -1154,9 +1241,24 @@ class EodWorldEditorWindow(QMainWindow):
             self.properties.show_nothing()
 
     def _on_viewport_obj_selected(self, obj: WorldObject | None) -> None:
-        self.properties.show_object(obj, self.world.textures if self.world else None)
-        if obj is not None:
+        sel_cnt = max(1, len([o for o in self.viewport.selected_objects if not o.deleted]))
+        self.properties.show_object(obj, self.world.textures if self.world else None, selected_count=sel_cnt)
+        if obj is not None and sel_cnt <= 1:
             self.set_action_status(f"Selected {obj.name} ({obj.source}, {obj.tri_count} tris)")
+
+    def _on_viewport_selection_changed(self, objs: list[WorldObject]) -> None:
+        active = [o for o in objs if o is not None and not o.deleted]
+        if active:
+            self.properties.show_object(active[-1], self.world.textures if self.world else None, selected_count=len(active))
+            if len(active) > 1:
+                self.set_action_status(f"Selected {len(active)} objects (primary: {active[-1].name})")
+        elif (
+            self.viewport.selected_road_node_id is None
+            and self.viewport.selected_marker is None
+            and self.viewport.selected_barrier_idx < 0
+            and self.properties.stack.currentIndex() == 1
+        ):
+            self.properties.show_nothing()
 
     def _on_viewport_road_selected(self, node: RoadNode | None) -> None:
         if self.world is None:
@@ -1184,15 +1286,19 @@ class EodWorldEditorWindow(QMainWindow):
         obj = self.viewport.selected_obj
         if obj is None or obj.deleted:
             return
+        sel_cnt = len([o for o in self.viewport.selected_objects if not o.deleted])
         menu = QMenu(self)
         menu.addAction(svg_icon("replace", "#93c5fd"), "Replace Selection With...", lambda: self.replace_object_with_dialog(obj))
+        menu.addAction("Select All Similar", lambda: self.select_similar_objects(obj))
+        menu.addAction(svg_icon("trash", "#ff99a2"), "Delete All Similar", lambda: self.delete_similar_objects(obj))
         menu.addAction(svg_icon("ground"), "Snap to Ground (End / Ctrl+G)", lambda: self.snap_object_to_ground(obj))
         menu.addAction("Duplicate (Ctrl+D)", self.duplicate_selected_object)
         menu.addSeparator()
         menu.addAction(svg_icon("blender"), "Edit in Blender (OBJ)...", lambda: self.edit_object_in_blender(obj))
         menu.addAction(svg_icon("shield"), "Make Collision Box", lambda: self.make_collision_for_object(obj))
         menu.addSeparator()
-        menu.addAction(svg_icon("trash", "#ff99a2"), "Delete (Del)", lambda: self.delete_object(obj))
+        del_lbl = f"Delete Selected ({sel_cnt}) (Del)" if sel_cnt > 1 else "Delete (Del)"
+        menu.addAction(svg_icon("trash", "#ff99a2"), del_lbl, self.delete_selected_item)
         menu.exec(global_pos)
 
     def _select_object_by_id(self, obj_id: str) -> None:
@@ -1221,7 +1327,14 @@ class EodWorldEditorWindow(QMainWindow):
         self.world.custom_race.ilin_line = line_name
         self.viewport.selected_road_node_id = None
         self.viewport.road_chain_last_node = None
+        self.viewport._roads_dirty = True
         self.viewport.update()
+        if hasattr(self.explorer, "road_line_combo"):
+            idx = self.explorer.road_line_combo.findData(line_name)
+            if idx >= 0:
+                self.explorer.road_line_combo.blockSignals(True)
+                self.explorer.road_line_combo.setCurrentIndex(idx)
+                self.explorer.road_line_combo.blockSignals(False)
         self.explorer.refresh_counts()
         self.set_action_status(f"Switched active ILIN line to {line_name} ({len(self.world.road_graph.nodes)} nodes)")
 
@@ -1253,6 +1366,12 @@ class EodWorldEditorWindow(QMainWindow):
             TransformObjectCommand(obj, old_p, old_r, old_s, new_p, new_r, new_s, self._refresh_after_edit, label)
         )
         self.set_action_status(f"{label}: {obj.name}")
+
+    def _on_viewport_multi_obj_transformed(self, entries: list[Any], label: str) -> None:
+        if not entries:
+            return
+        self.undo_stack.push(MultiTransformObjectsCommand(entries, self._refresh_after_edit, label))
+        self.set_action_status(f"{label}")
 
     def _on_prop_obj_transform(self, obj: WorldObject, new_p, new_r, new_s) -> None:
         if obj.position == new_p and obj.rotation_hpr == new_r and obj.scale == new_s:
@@ -1309,14 +1428,90 @@ class EodWorldEditorWindow(QMainWindow):
         elif self.viewport.selected_marker is not None:
             self._snap_marker_to_ground(self.viewport.selected_marker)
 
+    def _on_include_lod_twins_changed(self, checked: bool) -> None:
+        if self.world is not None:
+            self.world.include_lod_twins = bool(checked)
+            self.world.custom_race.include_lod_twins = bool(checked)
+        self.set_action_status(
+            f"Include Overlapping LOD Twins & SOBL Barriers on delete: {'ON' if checked else 'OFF'}"
+        )
+
+    def select_similar_objects(self, seed: WorldObject | None = None) -> list[WorldObject]:
+        if self.world is None:
+            return []
+        target = seed if isinstance(seed, WorldObject) else self.viewport.selected_obj
+        if target is None or target.deleted:
+            self.set_action_status("Select an object first to Select All Similar")
+            return []
+        matches = self.world.find_similar_objects(target)
+        if matches:
+            self.viewport.select_objects(matches)
+            self.set_action_status(f"Selected {len(matches)} similar object(s) matching {target.name}")
+        return matches
+
+    def delete_objects_with_cleanup(
+        self,
+        targets: list[WorldObject],
+        label: str | None = None,
+    ) -> tuple[int, int]:
+        """Undoably delete `targets` via MultiDeleteObjectsCommand + optional LOD twins & SOBL barriers."""
+        if self.world is None:
+            return (0, 0)
+        clean = [o for o in targets if o is not None and not o.deleted]
+        if not clean:
+            return (0, 0)
+        all_objs = list(clean)
+        barrier_indices: list[int] = []
+        if self.world.include_lod_twins:
+            twins, barrier_indices = self.world.find_overlapping_lod_twins_and_barriers(clean)
+            all_objs.extend(twins)
+        cmd = MultiDeleteObjectsCommand(
+            self.world,
+            all_objs,
+            barrier_indices=barrier_indices,
+            on_change=self._refresh_after_edit,
+            label=label,
+        )
+        self.undo_stack.push(cmd)
+        self.viewport.select_object(None)
+        del_cnt = len(cmd.objects)
+        bar_cnt = len(cmd.barrier_indices)
+        extra = f" + flattened {bar_cnt} overlapping SOBL barrier(s)" if bar_cnt else ""
+        msg = f"Deleted {del_cnt} object(s){extra}"
+        self.set_action_status(msg)
+        self.append_log(f"[Edit] {msg}", verbose=True)
+        return (del_cnt, bar_cnt)
+
+    def delete_similar_objects(self, seed: WorldObject | None = None) -> tuple[int, int]:
+        if self.world is None:
+            return (0, 0)
+        target = seed if isinstance(seed, WorldObject) else self.viewport.selected_obj
+        if target is None or target.deleted:
+            self.set_action_status("Select an object first to Delete All Similar")
+            return (0, 0)
+        matches = self.world.find_similar_objects(target) or [target]
+        return self.delete_objects_with_cleanup(
+            matches, label=f"Delete {len(matches)} similar ({target.name})"
+        )
+
+    def _on_prop_delete_object(self, obj: WorldObject) -> None:
+        sel = [o for o in self.viewport.selected_objects if not o.deleted]
+        if len(sel) > 1 and any(o.obj_id == obj.obj_id for o in sel):
+            self.delete_objects_with_cleanup(sel)
+        else:
+            self.delete_objects_with_cleanup([obj])
+
     def delete_object(self, obj: WorldObject) -> None:
         self.undo_stack.push(DeleteObjectCommand(obj, self._refresh_after_edit))
         self.viewport.select_object(None)
         self.set_action_status(f"Deleted {obj.name}")
 
     def delete_selected_item(self) -> None:
-        if self.viewport.selected_obj is not None:
-            self.delete_object(self.viewport.selected_obj)
+        sel = [o for o in self.viewport.selected_objects if not o.deleted]
+        if sel:
+            self.delete_objects_with_cleanup(sel)
+        elif self.viewport.selected_obj is not None and not self.viewport.selected_obj.deleted:
+            self.delete_objects_with_cleanup([self.viewport.selected_obj])
         elif self.viewport.selected_road_node_id is not None:
             self._road_delete_node(self.viewport.selected_road_node_id)
         elif self.viewport.selected_marker is not None:
@@ -1559,7 +1754,7 @@ class EodWorldEditorWindow(QMainWindow):
         )
 
     # -----------------------------------------------------------------------
-    # Custom Race & AI Pathfinding (ILIN) Dialog
+    # Custom Race & AI Pathfinding (ILIN) + Vehicle / NASCAR Tuner Dialogs
     # -----------------------------------------------------------------------
     def open_custom_race_dialog(self) -> None:
         if self.world is None:
@@ -1569,11 +1764,35 @@ class EodWorldEditorWindow(QMainWindow):
             cfg = self.world.custom_race
             if cfg.ilin_line in self.world.all_road_graphs and cfg.ilin_line != self.world.road_graph.line_name:
                 self._switch_road_line(cfg.ilin_line)
+            if cfg.event_type in self.world.event_templates:
+                self.viewport.set_event_template(cfg.event_type)
+            self._sync_pie_pickers_from_world()
             self.set_action_status(
-                f"Custom Race saved: {cfg.event_name} ({cfg.event_type}, {cfg.laps} laps, {cfg.ai_count} AI, car={cfg.player_car})"
+                f"Custom Race saved: {cfg.event_name} ({cfg.event_type}, {cfg.laps} laps, {cfg.ai_count} AI, "
+                f"car={cfg.player_car}, arcade={cfg.arcade_mode}, sync_all={self.world.sync_all_events})"
             )
             if dlg.launch_pie_after:
                 self.start_pie("event")
+
+    def open_vehicle_tuner_dialog(self) -> VehicleTunerDialog:
+        """Open Live PIE Vehicle Boost / Handling Tuner & NASCAR / Custom Car Tools dialog."""
+        if self._vehicle_tuner_dlg is not None:
+            try:
+                self._vehicle_tuner_dlg.close()
+            except Exception:
+                pass
+
+        def _on_boost(mult: float) -> None:
+            self.pie_host.write_live_control(speed_boost=round(float(mult), 3))
+            self.set_action_status(f"Live PIE Speed Boost: {mult:.2f}x")
+            self.append_log(f"[VehicleTuner] Live PIE speed_boost={mult:.2f}x", verbose=True)
+
+        dlg = VehicleTunerDialog(self.game_dir, on_live_boost_changed=_on_boost, parent=self)
+        self._vehicle_tuner_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        return dlg
 
     # -----------------------------------------------------------------------
     # Road Tool / ILIN Node Operations (Undoable)

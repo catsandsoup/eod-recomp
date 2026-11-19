@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "../../core/config.h"
-#include "../../core/eodsave.h"
+#include "../../core/memory.h"
 #include "../../ui/overlay.h"
 #include "../platform.h"
 #include "../keyboard_input.h"
@@ -357,14 +357,22 @@ static inline bool key(int vk) {
 }
 
 namespace {
-struct KeyBind {
-    int vk;
-    uint16_t btn;
-};
-std::vector<KeyBind> g_key_map;
+std::vector<keyboard_input::Binding> g_key_map;
+keyboard_input::Mapper g_keyboard;
 const uint16_t kPadBits[KEY_COUNT] = {PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_CROSS, PAD_CIRCLE, PAD_SQUARE,
                                       PAD_TRIANGLE, PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_L3, PAD_R3, PAD_START,
                                       PAD_SELECT};
+
+keyboard_input::Context win32_keyboard_context() {
+    auto word = [](uint32_t address) {
+        uint32_t v = 0;
+        if (g_ram) memcpy(&v, g_ram + address, sizeof v);
+        return v;
+    };
+    const uint32_t title = word(0x003D7BB8), alternate = word(0x003D7BBC);
+    const uint32_t race = word(0x00437BB8), modal = word(0x004A1AD4);
+    return keyboard_input::context(title, alternate, race, modal);
+}
 }  // namespace
 
 // keyboard bindings from eod.ini ([Input], comma separated key names)
@@ -383,32 +391,26 @@ void build_key_map() {
     }
 }
 
-// The racing keyboard context (eod::save::keyboard_context, keyboard_input::KeyState) this file was
-// written against is not in the tree; until it is, the keyboard and triggers keep the menu mapping.
-namespace { struct Win32KeyboardContext { bool racing; }; Win32KeyboardContext win32_keyboard_context() { return {false}; } }
-
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
-    const auto kb_ctx = win32_keyboard_context();
+    const keyboard_input::Context ctx = win32_keyboard_context();
     if (port == 0) {
         // keyboard (always available on port 0)
-        out->connected = true;
-        for (const KeyBind &m : g_key_map) {
-            if (!key(m.vk)) continue;
-            // In racing mode, WASD and Arrow keys use modern driving bindings below
-            // rather than menu D-pad / L2-R2 bindings.
-            if (kb_ctx.racing && (m.vk == 'A' || m.vk == 'D' || m.vk == 'W' || m.vk == 'S' ||
-                                  m.vk == VK_UP || m.vk == VK_DOWN || m.vk == VK_LEFT || m.vk == VK_RIGHT)) {
-                continue;
-            }
-            out->buttons |= m.btn;
-        }
-        // the direction keys also move the left stick (steering)
-        if (!kb_ctx.racing) {
-            if (out->buttons & PAD_LEFT) out->lx = 0;
-            if (out->buttons & PAD_RIGHT) out->lx = 255;
-            if (out->buttons & PAD_UP) out->ly = 0;
-            if (out->buttons & PAD_DOWN) out->ly = 255;
+        keyboard_input::Keys snap{};
+        for (int vk = 1; vk < 256; ++vk) snap[vk] = key(vk);
+        const bool racing_layout = true;
+        const bool focused = window_has_input_focus() || [&]() {
+            for (int vk = 1; vk < 256; ++vk) if (g_keys[vk]) return true;
+            return false;
+        }();
+        *out = g_keyboard.read(snap, ctx, racing_layout, g_key_map, focused);
+        // When driving in racing layout, also allow Q/F for weapon (L2) and R/Shift for reverse (R2)
+        if (focused && racing_layout && ctx == keyboard_input::Context::Driving) {
+            if (snap['Q'] || snap['F']) out->buttons |= PAD_L2;
+            if (snap['R'] || snap[VK_SHIFT] || snap[VK_LSHIFT]) out->buttons |= PAD_R2;
+            if (snap['E']) out->buttons |= PAD_R1;
+            if (snap['C']) out->buttons |= PAD_TRIANGLE;
+            if (snap['V']) out->buttons |= PAD_SELECT;
         }
     }
     HostPadState c;
@@ -470,17 +472,20 @@ void platform_get_controller(int port, HostPadState *out) {
             };
             for (const XMap &m : xm)
                 if (b & m.x) out->buttons |= m.btn;
-            const auto kb_ctx = win32_keyboard_context();
-            if (kb_ctx.racing) {
+            const bool driving = win32_keyboard_context() == keyboard_input::Context::Driving;
+            const bool modern_pad = driving;
+            if (modern_pad) {
                 // Modern analog triggers for driving: RT = Gas (PAD_CROSS), LT = Brake (PAD_SQUARE)
-                if (xs.Gamepad.bRightTrigger > 30) {
-                    out->buttons |= PAD_CROSS;
-                    out->pressure[6] = xs.Gamepad.bRightTrigger;
-                }
-                if (xs.Gamepad.bLeftTrigger > 30) {
-                    out->buttons |= PAD_SQUARE;
-                    out->pressure[7] = xs.Gamepad.bLeftTrigger;
-                }
+                if (out->buttons & PAD_CROSS) out->pressure[6] = 255;
+                if (out->buttons & PAD_SQUARE) out->pressure[7] = 255;
+                const uint16_t clicks = out->buttons & (PAD_L3 | PAD_R3);
+                out->buttons &= ~(PAD_L3 | PAD_R3);
+                if (clicks & PAD_R3) { out->buttons |= PAD_L2; out->pressure[10] = 255; }
+                if (clicks & PAD_L3) { out->buttons |= PAD_R2; out->pressure[11] = 255; }
+                if (xs.Gamepad.bRightTrigger > 30) out->buttons |= PAD_CROSS;
+                if (xs.Gamepad.bLeftTrigger > 30) out->buttons |= PAD_SQUARE;
+                if (xs.Gamepad.bRightTrigger > out->pressure[6]) out->pressure[6] = xs.Gamepad.bRightTrigger;
+                if (xs.Gamepad.bLeftTrigger > out->pressure[7]) out->pressure[7] = xs.Gamepad.bLeftTrigger;
             } else {
                 if (xs.Gamepad.bLeftTrigger > 30) out->buttons |= PAD_L2;
                 if (xs.Gamepad.bRightTrigger > 30) out->buttons |= PAD_R2;

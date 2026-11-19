@@ -467,14 +467,262 @@ class TestEodWorldEditor(unittest.TestCase):
         arr_lbl = np.frombuffer(img_lbl.constBits(), dtype=np.uint8).reshape(img_lbl.height(), img_lbl.width(), 4)
         self.assertGreater(float(arr_lbl[:, :, :3].mean()), 60.0, "QPainter labels clobbered OpenGL lighting state")
 
-        # 3. Verify Output Log drawer + Verbose + append_log
+        # 3. Verify Output Log drawer + Verbose + Copy Log + append_log
         win.append_log("[TEST] PIE diagnostic line", verbose=True)
         self.assertIn("[TEST] PIE diagnostic line", win.log_text.toPlainText())
+        win.chk_log_verbose.setChecked(False)
+        win.append_log("[TEST] hidden verbose line", verbose=True)
+        self.assertNotIn("[TEST] hidden verbose line", win.log_text.toPlainText())
+        win._copy_output_log()
+        cb = self.app.clipboard()
+        if cb is not None:
+            self.assertIn("[TEST] PIE diagnostic line", cb.text())
         print(
             f"[VERIFIED] Lighting + Perf + Dual-Renderer + Output Log: "
             f"frame={vp._last_frame_ms:.2f}ms | idle_timer={vp._timer.isActive()} | lit_luma={arr_lbl[:,:,:3].mean():.1f}"
         )
 
+        win.close()
+        self.app.processEvents()
+
+    def test_09_pie_canonical_event_templates_and_ilin_sync(self) -> None:
+        # 1. Canonical PIE event & car name mapping
+        self.assertEqual(pie_host.canonicalize_event_name("c_figure8_jump_race"), "Figure-8 Jump Race")
+        self.assertEqual(pie_host.canonicalize_event_name("Battle (Free Roam)"), "Battle")
+        self.assertEqual(pie_host.canonicalize_event_name("All Templates (Combined)"), "Battle")
+        self.assertEqual(pie_host.canonicalize_event_name("gauntlet"), "Gauntlet")
+        self.assertEqual(pie_host.canonicalize_car_name("bulldo_1"), "Bulldog")
+        self.assertEqual(pie_host.canonicalize_car_name("COPCAR.CAR"), "COPCAR")
+
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        win._attach_loaded_world(wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=True))
+
+        # 2. Event Template dropdown populated with All Templates + canonical track templates
+        items = [win.cmb_pie_event.itemText(i) for i in range(win.cmb_pie_event.count())]
+        self.assertEqual(items[0], "All Templates (Combined)")
+        self.assertIn("Battle (Free Roam)", items)
+        self.assertIn("Figure-8 Jump Race", items)
+        self.assertIn("Gauntlet", items)
+
+        # 3. Switching Event Template updates viewport filter AND switches active .ild racing line
+        fig8_tpl = win.world.event_templates["Figure-8 Jump Race"]
+        win.cmb_pie_event.setCurrentText("Figure-8 Jump Race")
+        self.assertEqual(win.world.active_event_template, "Figure-8 Jump Race")
+        if fig8_tpl.ilin_member and fig8_tpl.ilin_member in win.world.all_road_graphs:
+            self.assertEqual(win.world.road_graph.line_name, fig8_tpl.ilin_member)
+
+        # 4. Sync All Events toggle (default ON) + live toolbar -> build_current_pie_spec wiring
+        self.assertTrue(win.act_sync_events.isChecked())
+        self.assertTrue(win.world.sync_all_events)
+        win.cmb_pie_car.setCurrentText("Bus")
+        win.spn_pie_ai.setValue(6)
+        win.world.custom_race.arcade_mode = "tag"
+
+        # Free Roam on a specific template forces solo ai=0 on that template
+        spec_roam = win.build_current_pie_spec(self.game_dir / "mods" / "TestSpec", "free_roam")
+        self.assertIn("event=Figure-8 Jump Race", spec_roam["direct_start"])
+        self.assertIn("car=Bus", spec_roam["direct_start"])
+        self.assertIn("ai=0", spec_roam["direct_start"])
+        self.assertIn("--windowed", spec_roam["args"])
+        self.assertEqual(spec_roam["env"]["EOD_OPT_TERRAIN_MASK"], "0xFFFF")
+        self.assertEqual(spec_roam["env"]["EOD_ARCADE_MODE"], "tag")
+
+        # Play Event honors live AI count & Sync All Events OFF removes mask
+        win.act_sync_events.setChecked(False)
+        self.assertFalse(win.world.sync_all_events)
+        spec_ev = win.build_current_pie_spec(self.game_dir / "mods" / "TestSpec", "event")
+        self.assertIn("event=Figure-8 Jump Race", spec_ev["direct_start"])
+        self.assertIn("ai=6", spec_ev["direct_start"])
+        self.assertNotIn("EOD_OPT_TERRAIN_MASK", spec_ev["env"])
+
+        print(
+            f"[VERIFIED] PIE Canonical + Event Template + ILIN Sync: "
+            f"templates={len(items)}, fig8_ilin={win.world.road_graph.line_name}, direct='{spec_ev['direct_start']}'"
+        )
+        win.close()
+        self.app.processEvents()
+
+    def test_10_ramp_scaling_bake_ilin_recalc_and_car_injection(self) -> None:
+        from formats import ilin as ilin_fmt
+        import rst0
+
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=True)
+        world.sync_all_events = True
+
+        # 1. Scale an optional-terrain ramp (Item 2: VIF + opt_terrain promotion + BPPT + SCOL baking)
+        ramp = next(
+            (o for o in world.objects if o.category == "optional-terrain" and o.opt_terrain_mode is not None and o.retail_instance_id),
+            None,
+        )
+        self.assertIsNotNone(ramp, "Expected an optional-terrain ramp in AFTON.TRK")
+        assert ramp is not None
+        ramp.scale = (1.0, 2.25, 1.0)
+        ramp.written = False
+
+        # 2. Edit an ILIN racing line node (Item 4: tangent/segLen recalculation)
+        g = world.road_graph
+        node_ids = sorted(g.nodes.keys())
+        n_edit = g.nodes[node_ids[5]]
+        n_edit.x += 4.5
+        n_edit.z -= 3.0
+        g.dirty = True
+
+        # 3. Place a retail .CAR wreck onto the track (Item 5: live .TRK injection + CRC)
+        cx, _cy, cz = world.world_center
+        gy = world.collision.ground_height(cx, cz)
+        cop_model = world.models["car:COPCAR.CAR"]
+        placed_car = wl.WorldObject(
+            obj_id="ed_test_copcar",
+            name=cop_model.name,
+            model_key="car:COPCAR.CAR",
+            source="Placed by the editor",
+            category="car-wreck",
+            subtype="car",
+            section_mlist="editor_layer",
+            model_store=cop_model.model_store,
+            hash_hex=cop_model.hash_hex,
+            tri_count=cop_model.tri_count,
+            textures=list(cop_model.textures),
+            position=(cx, gy - float(cop_model.bbox_min[1]), cz),
+            rotation_hpr=(30.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
+            written=False,
+        )
+        world.objects.append(placed_car)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod_out = Path(tmp) / "mods" / "RampCarTest"
+            report = ps.export_mod_layer(world, "RampCarTest", mod_out)
+
+            # Verify ramp VIF + opt_terrain + BPPT/SCOL bake
+            self.assertGreaterEqual(report["vif_models_baked"], 1)
+            self.assertGreater(report["vif_vertices_baked"], 0)
+            self.assertGreaterEqual(report["opt_terrain_promoted"], 1)
+            self.assertGreater(report["bppt_planes_patched"] + report["scol_planes_patched"], 0)
+
+            # Verify placed .CAR compiled into modded .TRK
+            self.assertGreaterEqual(report["custom_objects_compiled"], 1)
+            mod_trk = Path(report["mod_trk"])
+            self.assertTrue(mod_trk.is_file())
+            import world_collision as wc
+
+            orig_entries = wc.read_directory(self.afton_world.trk_path.read_bytes())
+            mod_trk_bytes = mod_trk.read_bytes()
+            entries = wc.read_directory(mod_trk_bytes)
+            self.assertGreater(len(entries), len(orig_entries), "Injected .CAR members missing from repacked .TRK")
+
+            # Verify ILIN recalculation produced exact moved X/Z, unit tangent, and recalculated seg_len
+            ild_entry = next(e for e in entries if e["name"] == g.line_name)
+            ild_bytes = mod_trk_bytes[ild_entry["offset"] : ild_entry["offset"] + ild_entry["size"]]
+            layout = ilin_fmt._layout(ild_bytes)
+            o = layout["nodes_offset"] + n_edit.retail_index * ilin_fmt.NODE_SIZE
+            rx, rz, dir_x, dir_z = struct.unpack_from("<4f", ild_bytes, o)
+            seg_len = struct.unpack_from("<f", ild_bytes, o + 24)[0]
+            self.assertAlmostEqual(rx, n_edit.x, places=2)
+            self.assertAlmostEqual(rz, n_edit.z, places=2)
+            norm = (dir_x ** 2 + dir_z ** 2) ** 0.5
+            self.assertAlmostEqual(norm, 1.0, places=3)
+            self.assertGreater(seg_len, 0.0)
+            # Verify CRC-32 of repacked ILIN matches directory entry
+            self.assertEqual(rst0.eod_crc(ild_bytes), ild_entry["crc"])
+
+            # Verify injected custom car model/texture exists in repacked .TRK
+            orig_names = {e["name"].lower() for e in orig_entries}
+            added_names = [e["name"] for e in entries if e["name"].lower() not in orig_names]
+            self.assertGreaterEqual(len(added_names), 1, f"Expected injected car members, got {added_names}")
+
+            print(
+                f"[VERIFIED] Ramp Bake + ILIN Recalc + Car Injection: "
+                f"vif_verts={report['vif_vertices_baked']}, opt_promoted={report['opt_terrain_promoted']}, "
+                f"bppt={report['bppt_planes_patched']}, scol={report['scol_planes_patched']}, "
+                f"custom_compiled={report['custom_objects_compiled']}"
+            )
+
+        # Retail disc still 100% untouched
+        self.assertEqual(_sha256_file(self.afton_world.trk_path), self.afton_hash_before)
+
+    def test_11_multiselect_similar_lod_twins_vehicle_tuner_and_live_ini(self) -> None:
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        win._attach_loaded_world(wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=True))
+
+        # 1. Select All Similar + multi-select badge + atomic MultiTransformObjectsCommand undo/redo
+        seed = next(
+            (o for o in win.world.objects if o.source == "Retail" and len(win.world.find_similar_objects(o)) >= 3),
+            None,
+        )
+        self.assertIsNotNone(seed)
+        assert seed is not None
+        matches = win.select_similar_objects(seed)
+        self.assertGreaterEqual(len(matches), 3)
+        self.assertEqual(len(win.viewport.selected_objects), len(matches))
+        self.assertFalse(win.properties.lbl_multi_sel.isHidden())
+
+        orig_positions = [o.position for o in matches[:3]]
+        entries = [
+            (
+                o,
+                o.position,
+                o.rotation_hpr,
+                o.scale,
+                (o.position[0] + 3.0, o.position[1], o.position[2] - 2.0),
+                o.rotation_hpr,
+                o.scale,
+            )
+            for o in matches[:3]
+        ]
+        win._on_viewport_multi_obj_transformed(entries, "Move selection")
+        for o, op in zip(matches[:3], orig_positions):
+            self.assertAlmostEqual(o.position[0], op[0] + 3.0, places=3)
+        win.undo_stack.undo()
+        for o, op in zip(matches[:3], orig_positions):
+            self.assertEqual(o.position, op)
+
+        # 2. Delete Selected with Include Overlapping LOD Twins & SOBL Barrier (single undo restores both!)
+        static_objs = [o for o in win.world.objects if o.source == "Retail" and o.category == "static" and o.retail_instance_id]
+        target_with_bar = next(
+            (o for o in static_objs if win.world.find_overlapping_lod_twins_and_barriers([o])[1]),
+            None,
+        )
+        self.assertIsNotNone(target_with_bar, "Expected a static object with overlapping SOBL barrier")
+        assert target_with_bar is not None
+        win.properties.chk_lod_twins.setChecked(True)
+        self.assertTrue(win.world.include_lod_twins)
+        win.viewport.select_object(target_with_bar)
+        self.assertEqual(len(win.world.collision.sobl_edits), 0)
+        win.delete_selected_item()
+        self.assertTrue(target_with_bar.deleted)
+        self.assertGreater(len(win.world.collision.sobl_edits), 0)
+        win.undo_stack.undo()
+        self.assertFalse(target_with_bar.deleted)
+        self.assertEqual(len(win.world.collision.sobl_edits), 0)
+
+        # 3. Delete All Similar + single undo
+        del_cnt, _bar_cnt = win.delete_similar_objects(seed)
+        self.assertGreaterEqual(del_cnt, len(matches))
+        self.assertTrue(all(m.deleted for m in matches))
+        win.undo_stack.undo()
+        self.assertTrue(all(not m.deleted for m in matches))
+
+        # 4. VehicleTunerDialog + PieHostWidget live control INI
+        with tempfile.TemporaryDirectory() as tmp:
+            ctrl_ini = Path(tmp) / "pie_live_control.ini"
+            win.pie_host._control_file = ctrl_ini
+            dlg = win.open_vehicle_tuner_dialog()
+            dlg.sld_boost.setValue(165)
+            self.assertTrue(ctrl_ini.is_file())
+            txt = ctrl_ini.read_text(encoding="utf-8")
+            self.assertIn("speed_boost=1.65", txt)
+
+            win.pie_host.write_live_control(free_cam=1, ai_autodrive=1, arcade_mode="juggernaut")
+            txt2 = ctrl_ini.read_text(encoding="utf-8")
+            self.assertIn("free_cam=1", txt2)
+            self.assertIn("ai_autodrive=1", txt2)
+            self.assertIn("arcade_mode=juggernaut", txt2)
+            dlg.close()
+
+        print(
+            f"[VERIFIED] Multi-Select + Similar ({len(matches)}) + LOD/SOBL Cleanup + VehicleTuner Live INI"
+        )
         win.close()
         self.app.processEvents()
 

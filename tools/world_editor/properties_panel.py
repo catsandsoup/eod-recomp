@@ -20,6 +20,7 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
@@ -99,6 +100,9 @@ class PropertiesPanel(QWidget):
     replaceObjectRequested = Signal(object)
     replaceTextureRequested = Signal(str)    # tex_name
     resetTextureRequested = Signal(str)      # tex_name
+    selectSimilarRequested = Signal(object)  # WorldObject
+    deleteSimilarRequested = Signal(object)  # WorldObject
+    includeLodTwinsChanged = Signal(bool)
 
     # Road node signals
     roadNodePosEdited = Signal(object, tuple)      # node, (x, y, z)
@@ -224,9 +228,15 @@ class PropertiesPanel(QWidget):
         self.obj_title = QLabel("Model")
         self.obj_title.setStyleSheet("font-size: 11pt; font-weight: 700; color: #ffffff; background: transparent;")
         self.obj_title.setWordWrap(True)
+        self.lbl_multi_sel = QLabel("")
+        self.lbl_multi_sel.setStyleSheet(
+            "color: #4ade80; font-size: 8.2pt; font-weight: 600; background: transparent;"
+        )
+        self.lbl_multi_sel.hide()
         self.obj_written_lbl = QLabel("Written: No — Ctrl+Shift+S writes it")
         self.obj_written_lbl.setStyleSheet(f"color: {ACCENT_AMBER}; font-size: 8.5pt; font-weight: 600; background: transparent;")
         h_lay.addWidget(self.obj_title)
+        h_lay.addWidget(self.lbl_multi_sel)
         h_lay.addWidget(self.obj_written_lbl)
         lay.addWidget(h_card)
 
@@ -306,6 +316,16 @@ class PropertiesPanel(QWidget):
         self.btn_replace.setProperty("primary", True)
         self.btn_replace.clicked.connect(lambda: self._current_obj and self.replaceObjectRequested.emit(self._current_obj))
 
+        self.btn_select_similar = QPushButton(" Select All Similar")
+        self.btn_select_similar.setToolTip("Select every visible object sharing this model or primary texture (Shift+Click to multi-select)")
+        self.btn_select_similar.clicked.connect(lambda: self._current_obj and self.selectSimilarRequested.emit(self._current_obj))
+
+        self.btn_delete_similar = QPushButton(" Delete All Similar")
+        self.btn_delete_similar.setIcon(svg_icon("trash", "#ff99a2"))
+        self.btn_delete_similar.setProperty("danger", True)
+        self.btn_delete_similar.setToolTip("Delete all similar objects (e.g. entire fence line) in one undoable step")
+        self.btn_delete_similar.clicked.connect(lambda: self._current_obj and self.deleteSimilarRequested.emit(self._current_obj))
+
         self.btn_snap = QPushButton(" Snap to ground")
         self.btn_snap.setIcon(svg_icon("ground"))
         self.btn_snap.clicked.connect(lambda: self._current_obj and self.snapObjectToGround.emit(self._current_obj))
@@ -323,12 +343,24 @@ class PropertiesPanel(QWidget):
         self.btn_collision.setIcon(svg_icon("shield"))
         self.btn_collision.clicked.connect(lambda: self._current_obj and self.makeCollisionRequested.emit(self._current_obj))
 
+        self.chk_lod_twins = QCheckBox("Include Overlapping LOD Twins && SOBL Barrier")
+        self.chk_lod_twins.setChecked(True)
+        self.chk_lod_twins.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 7.8pt; background: transparent;")
+        self.chk_lod_twins.setToolTip(
+            "When deleting a fence/wall/prop, automatically delete its co-located LOD/billboard twin "
+            "and flatten overlapping SOBL invisible barriers in one undoable step."
+        )
+        self.chk_lod_twins.toggled.connect(self.includeLodTwinsChanged.emit)
+
         act_grid.addWidget(self.btn_replace, 0, 0, 1, 2)
-        act_grid.addWidget(self.btn_snap, 1, 0)
-        act_grid.addWidget(self.btn_delete, 1, 1)
-        act_grid.addWidget(self.btn_blender, 2, 0)
-        act_grid.addWidget(self.btn_collision, 2, 1)
+        act_grid.addWidget(self.btn_select_similar, 1, 0)
+        act_grid.addWidget(self.btn_delete_similar, 1, 1)
+        act_grid.addWidget(self.btn_snap, 2, 0)
+        act_grid.addWidget(self.btn_delete, 2, 1)
+        act_grid.addWidget(self.btn_blender, 3, 0)
+        act_grid.addWidget(self.btn_collision, 3, 1)
         d_lay.addLayout(act_grid)
+        d_lay.addWidget(self.chk_lod_twins)
         page_lay.addWidget(dock)
 
         self.stack.addWidget(page)
@@ -776,7 +808,12 @@ class PropertiesPanel(QWidget):
         self._current_barrier_idx = -1
         self.stack.setCurrentIndex(0)
 
-    def show_object(self, obj: WorldObject | None, textures: dict[str, TextureAsset] | None = None) -> None:
+    def show_object(
+        self,
+        obj: WorldObject | None,
+        textures: dict[str, TextureAsset] | None = None,
+        selected_count: int = 1,
+    ) -> None:
         if obj is None or obj.deleted:
             self.show_nothing()
             return
@@ -789,6 +826,13 @@ class PropertiesPanel(QWidget):
         self._current_barrier_idx = -1
 
         self.obj_title.setText(obj.name)
+        if selected_count > 1:
+            self.lbl_multi_sel.setText(f"{selected_count} objects selected (Shift+Click to add/remove)")
+            self.lbl_multi_sel.show()
+            self.btn_delete.setText(f" Delete ({selected_count})")
+        else:
+            self.lbl_multi_sel.hide()
+            self.btn_delete.setText(" Delete")
         if obj.written:
             self.obj_written_lbl.setText("Written: Yes (matches retail / exported layer)")
             self.obj_written_lbl.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 8.5pt; font-weight: 600; background: transparent;")

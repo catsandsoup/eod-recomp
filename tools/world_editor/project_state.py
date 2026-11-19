@@ -1829,7 +1829,7 @@ def _compile_custom_objects_into_trk(
                         {
                             "name": tname,
                             "fourcc": "TEX",
-                            "version": 4,
+                            "version": 10,
                             "is_extractable": False,
                         }
                     )
