@@ -101,9 +101,36 @@ extern "C" void f_0021ABF8() {
     }
     if (!valid && factor!=1 && errors++<64) std::fprintf(stderr,"[lod] multiplier rejected object=%08x (layout/count/min/handles/thresholds)\n",object);
 }
+void eod_visual_car_select_lod_index();  // src/native_lod.cpp (0x21C6E0, readable)
+#include "core/diff_harness.h"
+namespace {
+// LOD index histograms per view count (EOD_LOD_HIST=1): every car of every batch selection
+// (0x218E68) and every single selection (0x21C6E0), printed every 600 frames and at exit
+unsigned long long g_hist[5][eod_lod::max_levels + 1];
+bool hist_on() { static const bool on = std::getenv("EOD_LOD_HIST") != nullptr; return on; }
+void hist_add(uint32_t object) {
+    if (!ram(object,0x554)) return;
+    unsigned views=ee_r32(0x3d1a74); if (views>4) views=0;
+    const uint32_t idx=ee_r32(object+0x54c);
+    ++g_hist[views][idx<eod_lod::max_levels ? idx : eod_lod::max_levels];
+}
+void hist_print() {
+    for (unsigned v=0;v<5;++v) {
+        unsigned long long total=0; for (auto n:g_hist[v]) total+=n;
+        if (!total) continue;
+        std::fprintf(stderr,"[lod] histogram views=%u detail=%s total=%llu:",v,g_config.detail.c_str(),total);
+        for (unsigned i=0;i<=eod_lod::max_levels;++i) if (g_hist[v][i]) std::fprintf(stderr," i%u=%llu",i,g_hist[v][i]);
+        std::fprintf(stderr,"\n");
+    }
+}
+}
 extern "C" void f_0021C6E0() {
     const uint32_t object=arg_u32(0),ra=g_ee.r[31].uw[0];
-    f_0021C6E0_orig();
+    diff_run(0x0021C6E0, eod_visual_car_select_lod_index, f_0021C6E0_orig);
+    // P10: Detail=maximum draws the highest level at every visible distance (the minimum index
+    // +0x550; level 0 is the parts-only cockpit model). Original and Classic keep 0x21C6E0's value.
+    if (maximum() && ram(object,0x554)) ee_w32(object+0x54c, ee_r32(object+0x550));
+    if (hist_on()) hist_add(object);
     static unsigned calls,lines;
     if (trace() && lines<128 && (++calls<=16 || calls%120==0)) { ++lines; selected("single",object,ra); }
 }
@@ -119,6 +146,29 @@ extern "C" void f_00218E68() {
     // per-view counts for EOD_CAMERA_TRACE (src/hle_camera.cpp): visual cars drawing Low0 (+0x54C = 0,
     // the parts-only cockpit model) and the draw records this batch added through 0x34BDA8
     g_lod_view.frames++;
+    // 0x21C6E0 has no caller in SLUS_209.10 (no jal, no pointer: the batch path 0x218E68 inlines it).
+    // EOD_LOD_SELFTEST=1 runs it, through its EOD_DIFF wrapper, on each car 0x218E68 just selected
+    // (a deterministic replay on live objects); the car's +0x548 / +0x54C are put back afterwards.
+    static const bool selftest = std::getenv("EOD_LOD_SELFTEST") != nullptr;
+    if (selftest) {
+        const uint64_t a0 = g_ee.r[4].ud[0], ra = g_ee.r[31].ud[0], v0 = g_ee.r[2].ud[0];
+        for (unsigned i=0;i<20;++i) {
+            const uint32_t o=ee_r32(0x3d1c90+i*4);
+            if (!o) break;
+            if (!ram(o,0x554)) continue;
+            const uint32_t d=ee_r32(o+0x548), idx=ee_r32(o+0x54c);
+            g_ee.r[4].ud[0]=o; g_ee.r[31].ud[0]=0x218F00;
+            f_0021C6E0();
+            ee_w32(o+0x548,d); ee_w32(o+0x54c,idx);
+        }
+        g_ee.r[4].ud[0]=a0; g_ee.r[31].ud[0]=ra; g_ee.r[2].ud[0]=v0;
+    }
+    if (hist_on()) {
+        static bool hooked = (diff_add_exit_report(hist_print), true);
+        (void)hooked;
+        for (unsigned i=0;i<20;++i) { const uint32_t o=ee_r32(0x3d1c90+i*4); if (!o) break; hist_add(o); }
+        if (g_lod_view.frames % 600 == 0) hist_print();
+    }
     const uint32_t pool_after=ee_r32(0x4C96C8);
     if (pool_after>pool_before) g_lod_view.records+=pool_after-pool_before;
     for (unsigned i=0;i<20;++i) {

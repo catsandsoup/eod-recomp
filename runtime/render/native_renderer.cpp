@@ -156,7 +156,7 @@ enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_
 enum : uint32_t { S_ON = 1u << 31, S_COMPOSITE = 1u << 30 };
 // pipeline key bit 15: generic GS blend (bits 16..17 src factor, 18..19 dst factor, 20..21 op,
 // bit 22 C = destination alpha), see blend_classes
-enum : uint32_t { K_GENERIC = 1u << 15, K_CDST = 1u << 22 };
+enum : uint32_t { K_GENERIC = 1u << 15, K_CDST = 1u << 22, K_NOCLIP = 1u << 23 };  // K_NOCLIP: depth clamp, no z clipping (GS)
 
 struct GpuMesh {
     std::unique_ptr<Mesh> cpu;
@@ -339,7 +339,7 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     d.inputElementsCount = 4;
     d.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
     d.cullMode = cull == 1 ? plume::RenderCullMode::BACK : cull == 2 ? plume::RenderCullMode::FRONT : plume::RenderCullMode::NONE;
-    d.depthClipEnabled = true;
+    d.depthClipEnabled = (key & K_NOCLIP) == 0;
     d.renderTargetCount = 1;
     d.renderTargetFormat[0] = plume::RenderFormat::R8G8B8A8_UNORM;
     if (depth) {
@@ -798,7 +798,7 @@ void flush_shadows() {
     }
 
     // Pass 2: composite onto the main colour (0x362E70)
-    // diagnostic: EOD_NATIVE_SHADOW_OFF=1 no composite (A/B against the GS replay's nortt mask)
+    // diagnostic: EOD_NATIVE_SHADOW_OFF=1 no composite, =2 white mask (A/B against the replay's nortt mask)
     static const int shadow_off = std::getenv("EOD_NATIVE_SHADOW_OFF") ? std::atoi(std::getenv("EOD_NATIVE_SHADOW_OFF")) : 0;
     if (intensity > 0 && shadow_off != 1) {
         plume::RenderTextureBarrier in2[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::SHADER_READ),
@@ -813,11 +813,12 @@ void flush_shadows() {
         cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
         cl->setGraphicsPipelineLayout(g_r.layout.get());
         // no depth, RGB write mask (0x7), no cull
-        cl->setPipeline(pipeline(B_SHADOW | (0x7u << 8)));
+        cl->setPipeline(pipeline((shadow_off == 2 ? B_OPAQUE : B_SHADOW) | (0x7u << 8)));
         cl->setGraphicsDescriptorSet(texture_set(&g_r.shadow_mask, 2 | 4), 0);
         PushConstants cpc{};
         cpc.cx[0] = 1.0f; cpc.cy[1] = 1.0f; cpc.cz[2] = 1.0f; cpc.cw[3] = 1.0f;
         cpc.light[0] = (float)intensity;  // TEXA.TA0 = *0x4D8BF8
+        cpc.mode[0] = shadow_off == 2 ? 1u : 0u;  // =2: shadow pixels painted white (diagnostic)
         cpc.mode[1] = view_xy;
         cpc.mode[2] = view_wh;
         cpc.mode[3] = geo | S_COMPOSITE;
@@ -1209,13 +1210,16 @@ void finalize() {
         it.ox = (float)(g_r.main_xy & 0xFFFF) / 16.0f;
         it.oy = (float)((g_r.main_xy >> 32) & 0xFFFF) / 16.0f;
         it.zscale = (float)(1.0 / depth_range(g_r.main_target.zpsm));
-        // pass 1: cull BACK (1), one 5-bit step added; pass 0: cull FRONT (2), one step subtracted
-        // (0x363708). The depth test is the shader's (0x362968 Z copy, GEQUAL on the complement).
+        // pass 1: one 5-bit step added, pass 0: one step subtracted (0x363708). The depth test is
+        // the shader's (0x362968 Z copy, GEQUAL on the complement).
         const bool front = (g_cur.itop & 1u) != 0;
         const uint32_t blend = front ? B_ADD : B_REVSUB;
+        // the decoder's shadow strips are wound so that culling BACK keeps one side and FRONT the
+        // other (EOD_NATIVE_SHADOW_TEST=1, no depth test: the two passes cancel to 55 px of 307,200)
         const uint32_t cull = front ? 1u : 2u;
         // no depth attachment, color mask = 0xF, blend_alpha = 1
-        it.pipeline = blend | (0xFu << 8) | (cull << 12) | (1u << 14);
+        // the GS clips nothing in z (VU1 guard-band clip only): the extruded far side stays (K_NOCLIP)
+        it.pipeline = blend | (0xFu << 8) | (cull << 12) | (1u << 14) | K_NOCLIP;
         for (int i = 0; i < 4; i++) it.sc[i] = g_r.main_sc[i];
         g_r.shadow_pending.push_back(it);
         return;

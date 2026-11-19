@@ -1064,7 +1064,6 @@ uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
     m->transient = true;
     m->vertices = c.base;
     copy_k(m, c);
-    m->indices = c.indices;
     for (Vertex &v : m->vertices) {
         // VU1 0x3BE4C0 0x0130..0x0170: d = dot(n, vf1), e = min(max(0, d) * 65535, extrude)
         const double d = (double)v.n[0] * vf1[0] + (double)v.n[1] * vf1[1] + (double)v.n[2] * vf1[2];
@@ -1075,8 +1074,9 @@ uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
             v.p[2] += (float)(vf1[2] * e);
         }
         v.n[3] = 0;  // prelit
-        v.c[0] = v.c[1] = v.c[2] = v.c[3] = 15;  // 0x363708 RGB=15 (+A=15 for Plume shadow mask)
+        v.c[0] = v.c[1] = v.c[2] = v.c[3] = 15;  // 0x363708 RGB 15 (the shader writes one 5-bit step)
     }
+    m->indices = c.indices;
     std::lock_guard<std::mutex> lk(g_mutex);
     g_new_meshes.push_back(m);
     return m->id;

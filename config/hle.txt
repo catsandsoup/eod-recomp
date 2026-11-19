@@ -12,7 +12,8 @@
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
 00212B58 wrap     # optional Maximum: matched 1P projection/fog range in 2P
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
-0021C6E0 wrap     # bounded single-car selection trace
+0021C6E0 wrap     # VisualCarSelectLodIndex as readable C++ (src/native_lod.cpp; EOD_DIFF), Detail=maximum policy, trace
+00212808 wrap     # DrawDistanceApplyOption as readable C++ (src/native_lod.cpp; EOD_DIFF)
 00218E68 wrap     # bounded batch selection/submission trace
 0034E308 wrap     # bounded actual CPU sphere visibility trace
 00214678 wrap     # GRAF load: optional DrawDistance scales each mlist LOD group final cutoff

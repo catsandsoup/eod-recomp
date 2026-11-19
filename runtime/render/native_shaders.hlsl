@@ -173,13 +173,14 @@ POut shadow_ps(VOut i) {
     POut o;
     if (!(obj.mode.w & S_COMPOSITE)) {
         // 0x362968: the target's Z is the main Z16S through a nearest UV sprite (u = vx + (x + 0.9375)
-        // vw / w), complemented ((Cd - Cs), Cd = 0xFFFF); the VU1 shadow program writes 0xFFFF - z, and
-        // 0x363708 tests GEQUAL: a face is counted where it is behind or on the scene (z <= scene z)
+        // vw / w), complemented ((Cd - Cs), Cd = 0xFFFF); 0x363708 tests GEQUAL: a face is counted
+        // where it is behind or on the scene
         const int mx = (int)floor(vx * fs + (px + 0.9375) * vw / ws);
         const int my = (int)floor(vy * fs + (py + 0.9375) * vh / hs);
         const float d = tex.Load(int3(mx, my, 0)).r;
         const uint variant = obj.mode.x & 3;  // diagnostic EOD_NATIVE_SHADOW_TEST: 1 no test, 2 z-pass
-        if (variant == 0 && i.pos.z > d + 0.5 / 65536.0) discard;
+        // the VU1 writes 65537 - z (I = 65537 at 0x00B0, 0x0218): counted when z <= scene z + 2
+        if (variant == 0 && i.pos.z > d + 2.5 / 65536.0) discard;
         if (variant == 2 && i.pos.z < d - 0.5 / 65536.0) discard;
         // 0x363708: RGB 15 added / 7 subtracted on PSMCT16 = one 5-bit step either way
         o.color = float4(8.0, 8.0, 8.0, 8.0) / 255.0;
@@ -200,7 +201,7 @@ POut shadow_ps(VOut i) {
     if (as == 0) discard;
     // blend B_SHADOW: dst (1 - As / 128) - src; src just under half a step makes the unorm rounding a
     // floor, as the GS's arithmetic shift of the negative product is
-    o.color = float4(0.49, 0.49, 0.49, 0.0) / 255.0;
+    o.color = (obj.mode.x & 1) ? float4(1, 1, 1, 1) : float4(0.49, 0.49, 0.49, 0.0) / 255.0;  // 1: diagnostic mask
     o.factor = float4(0, 0, 0, (float)as / 128.0);
     return o;
 }
