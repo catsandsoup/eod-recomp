@@ -383,9 +383,13 @@ void build_key_map() {
     }
 }
 
+// The racing keyboard context (eod::save::keyboard_context, keyboard_input::KeyState) this file was
+// written against is not in the tree; until it is, the keyboard and triggers keep the menu mapping.
+namespace { struct Win32KeyboardContext { bool racing; }; Win32KeyboardContext win32_keyboard_context() { return {false}; } }
+
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
-    const auto kb_ctx = eod::save::keyboard_context();
+    const auto kb_ctx = win32_keyboard_context();
     if (port == 0) {
         // keyboard (always available on port 0)
         out->connected = true;
@@ -398,42 +402,6 @@ void platform_get_pad(int port, HostPadState *out) {
                 continue;
             }
             out->buttons |= m.btn;
-        }
-        static keyboard_input::Mapper s_kb_mapper;
-        keyboard_input::KeyState ks{};
-        ks.w = key('W');
-        ks.a = key('A');
-        ks.s = key('S');
-        ks.d = key('D');
-        ks.up = key(VK_UP);
-        ks.down = key(VK_DOWN);
-        ks.left = key(VK_LEFT);
-        ks.right = key(VK_RIGHT);
-        ks.space = key(VK_SPACE);
-        ks.enter = key(VK_RETURN);
-        ks.escape = key(VK_ESCAPE);
-        ks.backspace = key(VK_BACK);
-        ks.tab = key(VK_TAB);
-        ks.lshift = key(VK_LSHIFT) || key(VK_SHIFT);
-        ks.rshift = key(VK_RSHIFT);
-        ks.q = key('Q');
-        ks.e = key('E');
-        ks.c = key('C');
-        ks.v = key('V');
-        ks.r = key('R');
-        ks.f = key('F');
-        ks.i = key('I');
-        ks.j = key('J');
-        ks.k = key('K');
-        ks.l = key('L');
-        const HostPadState mapped = s_kb_mapper.poll(ks, kb_ctx.racing, false);
-        out->buttons |= mapped.buttons;
-        if (mapped.lx != 128) out->lx = mapped.lx;
-        if (mapped.ly != 128) out->ly = mapped.ly;
-        if (mapped.rx != 128) out->rx = mapped.rx;
-        if (mapped.ry != 128) out->ry = mapped.ry;
-        for (int i = 0; i < 12; ++i) {
-            if (mapped.pressure[i] > out->pressure[i]) out->pressure[i] = mapped.pressure[i];
         }
         // the direction keys also move the left stick (steering)
         if (!kb_ctx.racing) {
@@ -502,7 +470,7 @@ void platform_get_controller(int port, HostPadState *out) {
             };
             for (const XMap &m : xm)
                 if (b & m.x) out->buttons |= m.btn;
-            const auto kb_ctx = eod::save::keyboard_context();
+            const auto kb_ctx = win32_keyboard_context();
             if (kb_ctx.racing) {
                 // Modern analog triggers for driving: RT = Gas (PAD_CROSS), LT = Brake (PAD_SQUARE)
                 if (xs.Gamepad.bRightTrigger > 30) {

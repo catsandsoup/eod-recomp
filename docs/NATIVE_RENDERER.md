@@ -672,6 +672,52 @@ then the Cockpit/Bumper frames (Dundas vb 1402 Cockpit 18.81, vb 2104 Bumper 14.
 no-blend replay by 4.32, i.e. a blended surface near the camera, see "camera inside another car").
 P3 still fails.
 
+### Phase A3: projected-shadow composite and P10 maximum LOD (spec)
+
+| item | PS2 source | native |
+| --- | --- | --- |
+| shadow target | `0x35DA30` / `0x363218`: `min(view w, 320) x min(view h, 512)` PSMCT16 + PSMZ16 (`0x4D8BD8`, view `0x4D8C00..0x4D8C0C`) | same size times RenderScale (`Packet::shadow_rt`) |
+| Z copy | `0x362968`: main Z16S through a nearest UV sprite, complemented, target cleared to 0 | shader reads the main D32 at `vx + (x + 0.9375) vw / w` |
+| volume passes | `0x363708`: pass 1 RGB 15 added, pass 0 RGB 7 subtracted (one 5-bit step), `TEST_1 0x50000` GEQUAL, `ZMSK 1`, COLCLAMP 1 (GS census of the replay: `clamp=1`) | `B_ADD` / `B_REVSUB` 8/255, test in the shader (`z <= scene z + 2`, VU1 writes `65537 - z`, `0x3BE4C0` 0x00B0 / 0x0218) |
+| z clipping | the VU1 clips only the guard band; the GS has no z clip | `K_NOCLIP` (depth clamp) on volume pipelines |
+| extrusion | VU1 `0x3BE4C0` 0x0130..0x0170: `e = min(max(0, n . vf1) 65535, extrude)`, colour `0x363708` RGB 15 | `native_feed.cpp` `shadow_extruded_mesh` |
+| composite | `0x362E70`: strips over the view, TEX1 0x60 bilinear, `TEXA` TA0 = intensity (`*0x4D8BF8`, `0x363480`), AEM 1, `ALPHA 0x44` with RGBAQ (0, 0, 0, 0x80) | `B_SHADOW`: `dst (1 - As / 128)` |
+| draw distance | `0x212808` DrawDistanceApplyOption: `*0x495D58 = {0, 0.25, 0.5}[draw_distance option 0x4064D8] * 1700 + 300`, `0x495D5C = 4`, `0x34E530(1.0, far, 0x3F278D37)` | `src/native_lod.cpp`, EOD_DIFF |
+| car LOD | `0x21C6E0` VisualCarSelectLodIndex: distance (`0x34FA98`) times `*0x3DD638` (`0x34F620`) times `g_ViewCountLodFactors 0x4062A8 = {1, 1, 2, 2}[views - 1]` (`0x211318`); first threshold (`+0x220`, stride 16) above it, clamped to `[+0x550, count - 1]` | `src/native_lod.cpp`, EOD_DIFF; `Detail=maximum` then sets `+0x54C = +0x550` (the highest level, `src/hle_lod.cpp`); Original/Classic keep the value |
+
+`0x21C6E0` has no caller in SLUS_209.10 (0x218E68 inlines it): `EOD_LOD_SELFTEST=1` runs the readable
+function through its EOD_DIFF wrapper on every car 0x218E68 selected and restores `+0x548/+0x54C`.
+
+### Phase A3 results (headless, RenderScale 1, Classic, `EOD_NATIVE_ONLY=2`)
+
+Shadow parity (`tools/p3_compare.py --shadow`, new: MAE on the pixels the GS composite decides, i.e.
+replay vs `EOD_GS_REPLAY_FORCE=nortt`) and `EOD_NATIVE_SHADOW_OFF=2` (native shadow pixels white)
+on Gilroy 'Battle (8 AI)' Limo, vb 700/770/840: GS 3,093..10,247 / 1,812 / 1,419 shadow pixels,
+native 2,142 / 5,354 / 5,436, overlap 2,142 / 0 / 0. The native shadow lands below the GS one (GS y
+211..320, native y 238..436). Variants, same frames: depth test z-pass (`EOD_NATIVE_SHADOW_TEST=2`)
+0 native pixels; volume cull swapped 0..136 px, overlap 0; extrusion sign flipped 0 px. Both
+combinations that would make a shadow on a valid scene depth draw nothing, so the volume pass most
+likely reads no scene depth (the sampled main D32 behaves as cleared; only depth-clamped far faces
+pass the z-fail test). **Not fixed: the shadow composite does not match the GS yet.**
+
+P3 (24 windows each, live vs GS replay of the same frame) fails far beyond the shadow pixels:
+
+| scene | vehicle | MAE all | SSIM all | Chase/NearChase/FarChase MAE / SSIM | A2 |
+| --- | --- | --- | --- | --- | --- |
+| Gilroy 'Battle (8 AI)' night | Bus (`790`) | 10.07 | 0.7768 | 12.79 / 0.7136 (15 windows) | 2.44 / 0.956 (Limo) |
+| Gilroy 'Battle (8 AI)' night (A2 scene) | Limo (`136`) | 15.40 | 0.6745 | | 2.44 / 0.956 |
+| Dundas 'Battle (8 AI)' day | Hearse (`502`) | 44.57 | 0.5113 | 55.00 / 0.4849 (12 windows) | 3.89 / 0.956 (Copcar) |
+
+The breakdown (`--breakdown`) puts the error on blended pixels covering most of the screen
+(`noblend` 258,344 px, +26..+49) with the shadow mask under 4,000 px (`nortt` +0.1..+0.9), and the
+same Gilroy scene with the native composite off (`EOD_NATIVE_SHADOW_OFF=1`) is as bad (15.74): a
+regression after A2 (the A3 work-in-progress runs went from 2.11 to 7.2+ on the same 4 windows
+between 18:13 and 21:11 on 2026-11-19), not the shadow. Open.
+
+P10 / EOD_DIFF (Dennison 'Battle (8 AI)', Taxi `508`, 1,500 frames, `Detail=maximum`): `0x212808` 1/1 checked, `0x21C6E0` 9,747/9,747 checked (`EOD_LOD_SELFTEST=1`), 0 mismatched. LOD index histogram (1P, every car of every selection): faithful (`EOD_CAR_LOD_MULTIPLIER=1`) i1 18,090, i2 3,888, i3 4,599, i4 67,869; maximum i1 19,494 of 19,494 (i1 = `+0x550`, level 0 is the parts-only cockpit model). The 2P runs (Dundas 'Demolition Derby', `humans 2`) read view count 1 at `0x3D1A74` in the histogram and are not a split-screen proof; the 2P P10 run was skipped (scope cut). `0x34BF90` (callers
+`0x3067B8`, `0x32DFA8`) and `0x34CC98` (`0x222730..0x232FC8`): **not reached**; the trigger hunt was
+dropped by the owner (scope cut 2026-11-19), the existing `diff_run` wrappers stay unverified.
+
 ### Open (R5)
 
 - Yellow-and-black wedge over the grandstand on an oval track: not investigated.
