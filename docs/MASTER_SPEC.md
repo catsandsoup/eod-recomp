@@ -43,7 +43,7 @@ recompiled into `eod`. Quality bar: Halo 2 Anniversary (MCC).
 - **P7 determinism:** solo replay and 2-instance netplay give identical lap times,
   physics and results, 0 desyncs.
 - **P8 split-screen parity:** 2P/4P views have the 1P object lists, world passes, draw
-  distance, LOD, sun glare/flares (`0x304D50`) and Dundas water (`0x325728`).
+  distance, LOD, sun glare/flares (`0x304D50`) and Woodly (`AFTON.TRK`) water (`0x325728`).
 - **P9:** 6x and 8x Modern captures: shadows, reflections, sky IBL with no shimmer/pop-in.
 - **P10:** `Detail=maximum` forces highest LOD at every visible distance, 1P and split.
 - **P11:** Photo Mode exports `7680x4320` PNG in `< 2 s` (free camera, roll, FOV, DOF, no HUD).
@@ -111,8 +111,8 @@ it with adaptive host memory that grows on demand and releases when unused.
   setup `0x3582B8`, track data `0x3D1B28`/`0x3D1B2C`, builder `0x35DEE0`, VU1
   `0x0270`/`0x0618`/`0x0920`/`0x0350`), sky (`0x223858`/`0x223800`), water (`0x325728`,
   surface `*(0x3DC134)`, sim `0x325E40`). `track.grf` uses prelit `V4-5` colours
-  (1,367,745 verts): decode with `fix_winding = false` and no backface culling. Fix Dundas
-  water in 1P and 2P/4P (P8).
+  (1,367,745 verts): decode with `fix_winding = false` and no backface culling. Fix Woodly
+  (`AFTON.TRK`) water in 1P and 2P/4P (P8).
 - **R3 skinned characters and car deformation:** character palettes (`0x34C9F8`, 20 bones at
   VU1 `0x90 + 4*first`, programs `0x0318`/`0x24B0`, weights `float - 32768`, reverse vertex
   order `TOP+149+n-k`). Car dents (`0x005BF288` -> VU1 `0x90`, `Skin::Offset` programs
@@ -134,10 +134,16 @@ it with adaptive host memory that grows on demand and releases when unused.
   `DrawDistanceApplyOption` (`0x00212808`), `VisualCarSelectLodIndex` (`0x0021C6E0`),
   `g_ViewCountLodFactors` (`0x004062A8`), `g_DrawDistanceFar` (`0x00495D58`). Trigger and
   verify `0x34BF90` (`0x3067B8`, `0x32DFA8`) and `0x34CC98` (`0x222730..0x232FC8`).
-- **R6 Modern PBR:** connect the 2,728 `material_table.json` records
+- **R6 Modern PBR & VFX:** connect the 2,728 `material_table.json` records
   (`docs/MATERIAL_TAGGING.md`). The table has no blend field: blend equations always come
   from the game's render state, so `fx` / `emissive_light` cards never render as solid
   walls. Resolve the 318 low-confidence (`< 0.6`) textures with in-context renders.
+  **Modern VFX (R&D first before coding):** replace flat 2004 billboard cards (exhaust
+  flames, exploding-chicken fireballs, smoke, dust, sparks) in the Modern look with genuine
+  modern GPU particle/VFX implementations — soft depth-faded particles, multi-layered /
+  volumetric-style fire & smoke simulation, GPU embers/sparks, HDR emissive + bloom, and
+  dynamic point-light flashes on nearby cars and terrain (Classic look keeps the original
+  PS2 quads for P3 parity).
 - **R7 native 2D and emulator removal:** PATH2/PATH3 GS transfers (`MenuRun 0x00270C10`,
   `HudDrawLeftRaceRows 0x00119888`, `HudDrawRightSpeedRows 0x00119F40`, HUD queues
   `0x003C4370`/`0x003C4600`, widescreen edge shift, `GTEX` v4 fonts, `CANV` v1 canvases,
@@ -165,6 +171,23 @@ it with adaptive host memory that grows on demand and releases when unused.
    the scene needs; fullscreen (never windowed) once per milestone for speed and pacing.
 7. **STAR handoffs on disk** (Situation, Task, Action, Result, Next decisive test). Never
    commit disc assets, captures, binaries, personal paths or names.
+
+### Subagent and context-budget rules (mandatory)
+
+8. **No upfront bulk reads.** Never pre-read a long list of docs or sources at the start of
+   a task. Run `git status --short` and `git diff --stat` first, then read only the specific
+   section lines (`sed -n` / `grep -n`) of the 2–4 files the current micro-task modifies.
+9. **Two-phase micro-sprints per stage.** Never pack spec, multi-subsystem decompilation,
+   pool expansion and 5-scene verification into one continuous agent run. Split every stage:
+   - **Phase A (spec and implementation):** decompile the target functions, wire the Plume
+     feed, compile (`ninja -C build eod > build.log 2>&1` + `grep -E "error:|warning:"`), pass
+     one fast headless `EOD_DIFF` smoke test. Persist findings to disk immediately.
+   - **Phase B (multi-scene verification and install):** run the multi-scene headless suite,
+     update `docs/NATIVE_RENDERER_SUCCESS.md` and `docs/STEP0_CLEANUP.md`, commit to `main`,
+     install to `<game install dir>\eod.exe` with backup.
+10. **Delta-only resumes.** After a usage limit, never re-verify or re-read passing work.
+    Check `git diff` and `docs/`, list only the unfinished delta in <= 5 bullets, and do
+    strictly what remains.
 
 ## 7. Failure guardrails (revert immediately)
 
