@@ -77,3 +77,39 @@ water) remain deferred.
 **Next decisive test.** R4: move the remaining GS draws that `EOD_NATIVE_ONLY=1` drops (133,823
 primitives in 1,200 vb Dundas Battle: projected shadows, particles, effect sprites, immediate
 geometry, HUD, plus the non-queue cockpit quad in `0x219C48` via `0x35CAA0`) to native Plume.
+
+## R4 handoff (STAR, 2026-11-19)
+
+**Situation.** After R3, queued 3D objects, track world, sky, water, car damage/panels, and debris
+pools ran natively on Plume, but projected shadows, flares, particles, effect sprites, immediate
+geometry, and the non-queue cockpit quad (`0x219C48` -> `0x35CAA0`) were still drawn by the GS
+(`133,823` dropped GS primitives in 1,200 vb Dundas Battle under `EOD_NATIVE_ONLY=1`), and VU1
+`0x25F0` -> `0x2630` was untraced.
+
+**Task.** Replace all R4 shadow, flare, particle, sprite, immediate, sphere-immediate, and indexed
+immediate / cockpit quad functions with readable C++ (`EOD_DIFF`), feed them natively to Plume
+(removing the PS2 `320x512` shadow RT cap and VU1 chunk caps), trace `0x25F0` -> `0x2630`, verify
+D2 (`>= 1,000` checks, 0 mismatches) and P1 across the multi-scene suite, and document Section 9 of
+`docs/NATIVE_RENDERER_SUCCESS.md`.
+
+**Action.** Phase A1 (`d72b320`) moved projected shadows (`0x34C7D0`, `0x34C798`, `0x34C208`,
+`0x34C4B0`, `0x35D170`, `0x35D298`) onto an adaptive full-RenderScale host shadow buffer
+(`R8G8B8A8_UNORM` + main `D32` depth) and sun/point-light flares (`0x304D50`, plus `0x20F2D8`
+split-screen parity lift) in `src/native_shadows_flares.cpp`. Phase A2 (`6734733`) moved 22
+functions in `src/native_effects_imm.cpp` (particles `0x08E0`, simple/atlas sprites `0x01B8`/
+`0x05E0`, immediate & sphere-imm geometry `0x0270`, indexed immediate / cockpit quad `0x35CAA0`)
+and traced `0x25F0` -> `0x2630` (state-setup program sent by `0x3620A8`, 0 GS primitives). Phase B
+ran the 7-scene headless suite with rotated special vehicles (Hearse, Bus, Ambulance, Career car,
+Taxi 2P split, Copcar `EOD_NATIVE_ONLY=1`, plus Postal for `EOD_DIFF_REPLAY`), cycled all 10 camera
+views including Cockpit/Bumper/Chassis, and proved `--scale 2` (`1280x896`) adaptive shadows.
+
+**Result.** All 28 live-reachable R4 functions (of 29; `0x34EEB8` has 0 callers in retail
+`SLUS_209.10`) passed D2 with `>= 1,001` checked calls and `0` mismatches. Every scene achieved
+100% P1 frame equality across all 9 native kinds (`queue`, `world`, `water`, `shadow`, `flare`,
+`particle`, `sprite`, `immediate`, `cockpit`), `0` heap corruptions, and clean exit (`0`).
+`EOD_NATIVE_ONLY=1` dropped GS primitives fell 90.8% from `133,823` (R3) to `12,337` (R4, ~35/frame
+in race — 2D/HUD/menus).
+
+**Next decisive test.** R5 (fog, mipmaps, GS blend/alpha-test parity), R6 (skip redundant VU1
+execution for native batches), and R7 (move the remaining ~35/frame 2D/HUD/menu GS draws to Plume
+to reach 0 dropped primitives under `EOD_NATIVE_ONLY=1`).

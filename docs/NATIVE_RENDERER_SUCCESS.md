@@ -255,3 +255,108 @@ Demolition Derby: 81/81 Chassis frames and 49/49 Bumper frames P1 equal; see doc
   geometry, and 2D/HUD still drawn by the GS emulator.
 - **Deferred from R2:** `0x214B68` split-screen parity-off gate and split-screen water verification on
   Woodly (AFTON.TRK) 2P Battle.
+
+## 9. Stage R4: shadows, particles, sprites, flares, immediate geometry (2026-11-19)
+
+Build `ninja -C build eod`, headless and muted (`EOD_HEADLESS=1 EOD_MUTE=1 --headless`),
+`Detail=maximum`, `DrawDistance=8`, `FrameSkip=0`, RenderScale 1 (and RenderScale 2 for adaptive
+shadow RT proof), Radeon Pro 580. Code: `src/native_shadows_flares.cpp` (Phase A1, `d72b320`),
+`src/native_effects_imm.cpp` (Phase A2, `6734733`), `runtime/render/native_feed.cpp`,
+`runtime/render/native_renderer.cpp`; spec in `docs/NATIVE_RENDERER.md` "Stage R4".
+
+### D2: EOD_DIFF (0 mismatches across all 28 live-reachable R4 functions; `>= 1,000` checked each)
+
+Live multi-scene runs (`EOD_DIFF_EVERY=64` across Dundas Battle, Gilroy Night, Woodly Jump Race,
+Career free roam, Car dealer) plus deterministic `EOD_DIFF_REPLAY` (`1,000` replays/function on
+Woodly Jump Race Postal `503` and `0x363C18` on Gilroy Night Bus `790`):
+
+| function | role (phase) | multi-scene live calls / checked | D2 replay checked | mismatched | notes |
+| --- | --- | --- | --- | --- | --- |
+| `0x34C7D0` | ShadowBegin (A1) | 135 / 5 | 1,001 (368 live) | 0 | all 5 diff scenes + replay |
+| `0x34C798` | ShadowEnd (A1) | 135 / 5 | 1,001 (368 live) | 0 | same |
+| `0x34C208` | ShadowSubmit (A1) | 1,951 / 34 | 1,001 (13,208 live) | 0 | same |
+| `0x34C4B0` | ShadowSubmitMasked (A1) | 131 / 3 | 1,001 (2,347 live) | 0 | Gilroy Night, Woodly + replay |
+| `0x35D170` | ShadowEmitBatchPass (A1) | 1,741 / 30 | 1,001 (20,085 live) | 0 | all 5 diff scenes + replay |
+| `0x35D298` | ShadowEmitBatch (A1) | 1,772 / 31 | 1,001 (20,086 live) | 0 | same |
+| `0x304D50` | FlareRender (A1) | 135 / 5 | 1,001 (368 live) | 0 | same (`0x20F2D8` lifts 2P gate under `SplitScreenParity`) |
+| `0x363B98` | ParticleBegin (A2) | 105 / 3 | 1,001 (1,232 live) | 0 | Dundas, Gilroy, Woodly + replay |
+| `0x3639D0` | ParticleAdd (A2) | 814 / 14 | 1,001 (18,612 live) | 0 | same |
+| `0x363B68` | ParticleEnd (A2) | 105 / 3 | 1,001 (1,232 live) | 0 | same |
+| `0x363FF8` | ParticlePacketReserve (A2) | 131 / 3 | 1,001 (2,073 live) | 0 | same |
+| `0x363F48` | SpriteBegin (A2) | 441 / 11 | 1,001 (2,507 live) | 0 | all 5 diff scenes + replay |
+| `0x363DE8` | SpriteAdd (A2) | 1,569 / 26 | 1,001 (49,641 live) | 0 | same |
+| `0x363F18` | SpriteEnd (A2) | 441 / 11 | 1,001 (2,507 live) | 0 | same |
+| `0x364548` | SpritePacketReserve (A2) | 430 / 10 | 1,001 (3,236 live) | 0 | same |
+| `0x363D78` | AtlasSpriteBegin (A2) | 42 / 2 | 1,001 (360 live) | 0 | Gilroy, Woodly + replay |
+| `0x363C18` | AtlasSpriteAdd (A2) | 454 / 8 | 1,001 (2,268 live) | 0 | Gilroy, Woodly + Gilroy replay |
+| `0x363D48` | AtlasSpriteEnd (A2) | 42 / 2 | 1,001 (360 live) | 0 | Gilroy, Woodly + replay |
+| `0x3642B8` | AtlasSpritePacketReserve (A2) | 40 / 2 | 1,001 (359 live) | 0 | same |
+| `0x35DF10` | ImmediateBegin (A2) | 16,553 / 262 | 1,001 (13,837 live) | 0 | all 5 diff scenes + replay |
+| `0x361468` | ImmediatePacketBegin (A2) | 16,291 / 258 | 1,001 (13,836 live) | 0 | same |
+| `0x361708` | ImmediateVertex (A2) | 104,956 / 1,642 | (1,642 live) | 0 | `>= 1,000` live checks directly |
+| `0x361BC8` | ImmediateEnd (A2) | 16,553 / 262 | 1,001 (13,837 live) | 0 | all 5 diff scenes + replay |
+| `0x364D18` | ImmediateVertexContinue (A2) | 138 / 4 | 1,001 (3,088 live) | 0 | Dundas, Gilroy, Woodly + replay |
+| `0x34EE70` | SphereImmSubmit (A2) | 18 / 1 | 1,001 (368 live) | 0 | Woodly + replay |
+| `0x34EEB8` | SphereImmSubmitTransformed (A2) | 0 / 0 | — | 0 | unreferenced in retail `SLUS_209.10` (0 callers in `gen/`) |
+| `0x361ED8` | ImmStaticDraw (A2) | 13 / 1 | 1,001 (367 live) | 0 | Woodly + replay |
+| `0x361C30` | ImmStaticEmitRef (A2) | 12 / 1 | 1,001 (366 live) | 0 | Woodly + replay |
+| `0x35CAA0` | ImmediateDrawIndexedTris (A2) | 16,323 / 257 | 1,001 (11,761 live) | 0 | all 5 diff scenes + replay (incl. cockpit quad path) |
+
+### P1: multi-scene suite (`EOD_NATIVE=1 EOD_HEAP_CHECK=1`, all 9 native kinds)
+
+Special vehicles rotated without Venom or back-to-back repeats (Hearse `502`, Bus `790`, Ambulance
+`601`, Career car, Taxi `508`, Copcar `504`, plus Postal `503` for D2 replay); camera views cycled
+via `EOD_CAMERA_KEYS` (`KeyPush 0x33C168`) and Triangle pad events, covering all 10 gameplay views
+including Cockpit (`0`), Bumper (`1`), and Chassis (`2`). Every frame in every scene was 100% P1
+equal across all 9 kinds (`queue`, `world`, `water`, `shadow`, `flare`, `particle`, `sprite`,
+`immediate`, `cockpit`), with 0 `EOD_DIFF` mismatches, 0 heap corruptions, and clean exit (`0`).
+
+| scene | vehicle | P1 frames equal (all 9 kinds) | queue / world / water | shadows / flares | particles / sprites / imm / cockpit | diff / heap / exit | camera views covered |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Dundas 'Battle (8 AI)', max cars, `DrawDistance=8`, `EOD_CHICKENS=1` (L2/30 vb), 2150 vb | Hearse (`502`) | 1,112 / 1,112 | 8,192 / 56,969 / 0 | 358 / 49 | 13 / 104 / 3,164 / 0 | 0 / 0 / clean | Cockpit, Bumper, Chassis, NearChase, Chase, FarChase, Rear, RearChase, Overhead, TV |
+| Gilroy 'Battle (8 AI)' night, `EOD_CHICKENS=1` (L2/30 vb), 2150 vb | Bus (`790`) | 933 / 933 | 9,895 / 72,654 / 0 | 288 / 0 | 14 / 113 / 2,747 / 0 | 0 / 0 / clean | Cockpit, Bumper, Chassis, NearChase, Chase, FarChase, Rear, RearChase, Overhead, TV |
+| Woodly 'Jump Race' 1P, 2150 vb | Ambulance (`601`) | 913 / 913 | 12,656 / 13,642 / 10 | 496 / 10 | 18 / 24 / 2,896 / 0 | 0 / 0 / clean | Cockpit, NearChase, FarChase, Rear, RearChase, Overhead, TV |
+| Career free roam (`mode=career;place=home`), 1800 vb | Career car | 426 / 426 | 5,954 / 28,157 / 0 | 160 / 74 | 0 / 10 / 27,566 / 0 | 0 / 0 / clean | Cockpit, NearChase, physcam 31 |
+| Car dealer (`mode=career;place=dealer`), 1800 vb | Career car | 873 / 873 | 4,230 / 21,577 / 0 | 168 / 9 | 0 / 6 / 2,877 / 0 | 0 / 0 / clean | Cockpit, NearChase, physcam 31 |
+| Dundas 'No-Rules Race' 2P split-screen (`humans=2`, `SplitScreenParity=1`), 1800 vb | Taxi (`508`) | 514 / 514 | 18,887 / 41,461 / 0 | 3,078 / 0 | 50 / 153 / 53,604 / 0 | — / 0 / clean | Cockpit, 2P lobby physcam 19 |
+| `EOD_NATIVE_ONLY=1` Dundas 'Battle (8 AI)', `EOD_CHICKENS=1`, 1500 vb | Copcar (`504`) | 352 / 352 | 9,501 / 57,966 / 0 | 406 / 53 | 0 / 167 / 14,742 / 0 | — / 0 / clean | Cockpit, Bumper, NearChase, Chase, FarChase, TV; **12,337** GS prims dropped |
+
+Notes on specific paths:
+- **Cockpit quad (`0x219C48` -> `0x34DB70` -> `0x35CAA0`):** `0x35CAA0` is replaced in readable C++
+  and diff-verified (`16,323` live calls + `1,001` replay checks, `0` mismatches) with `KIND_COCKPIT`
+  wired for `ra == 0x21A064`. In these runs `0x2114A8()` returned `-1` (no active overlay texture
+  slot), so `0x219C48` skipped the optional quad (`cockpit = 0/0`) while all cockpit interior and
+  gauge meshes drew via the queue.
+- **2P split-screen flares (`0x20F2D8`/`0x304D50`):** `0x20F2D8` lifts the single-viewport gate
+  (`*(0x3D1A74) == 1`) under `SplitScreenParity=1` (when `EOD_DIFF` is off). In the Dundas 2P native
+  lobby (`physcam 19`), both split viewports render shadows (`3,078/3,078`), world, queue, particles,
+  and sprites natively, while `0x304D50` returns early on `0x11F9A0() != 0` (menu/lobby overlay).
+
+### PS2 limits removed & `0x25F0` -> `0x2630` finding
+
+- **PS2 `320x512` shadow RT cap removed (`0x35DA30`):** Verified on Dundas 'Battle (8 AI)' (Hearse
+  `502`, 2150 vb) at `--scale 2` (`1280x896`, exceeding PS2's `320x512` cap on both axes): Plume
+  allocated its host shadow accumulation buffer (`R8G8B8A8_UNORM`) at full scaled resolution
+  depth-tested against the full-resolution `D32` depth buffer and rendered `224 / 224` shadows
+  (`865/865` frames P1 equal, `0` diff mismatches, `0` heap corruptions).
+- **PS2 VU1 chunk caps removed (P10):** Particles (`16`/chunk in `0x363FF8`), sprites (`33`/chunk in
+  `0x364548`/`0x3642B8`), and immediate geometry (`60` vertices/chunk in `0x361468`; high-water `96`
+  observed in Dundas Battle) each stream into a single dynamically growing Plume mesh per pass.
+- **VU1 `0x25F0` -> `0x2630` resolved:** Sent by `0x3620A8` (shared GS/VU1 state flush). `0x25F0` is
+  a 5-instruction state-setup program storing two GIFtag PRIM templates into VU1 data memory qwords
+  `18` and `19` (0 GS primitives emitted); `0x2630` is an internal `bal` subroutine called from the
+  existing main mesh microcode (`0x05B8`, `0x1058`, `0x1878`, `0x1B60`), not a standalone VIF entry.
+- **`EOD_NATIVE_ONLY=1` remaining 2D count:** `12,337` dropped GS primitives over 1,500 vb (352
+  frames, ~35 prims/frame) in Dundas 'Battle (8 AI)' vs `133,823` in R3 (1,200 vb, 363 frames,
+  ~369 prims/frame) — a **90.8% reduction**, leaving only 2D/HUD/menus for R7.
+
+### Open items for R5–R7 (and deferred R2 items)
+
+- **R5 (visual parity & shading):** Per-vertex fog (`FGE`), mipmap levels (`TEX1`), region
+  clamp/repeat, destination-alpha blend factor, `AFAIL FB_ONLY/RGB_ONLY`.
+- **R6 (performance / VU1 bypass):** Skip redundant VU1 microcode execution for native-drawn
+  batches once GS-free parity is complete.
+- **R7 (2D, HUD & menus):** Move the remaining `12,337` dropped GS primitives (~35/frame in race)
+  to Plume so `EOD_NATIVE_ONLY=1` reaches 0 dropped primitives.
+- **Deferred from R2:** `0x214B68` split-screen parity-off gate and split-screen water verification
+  on Woodly (AFTON.TRK) 2P Battle.
