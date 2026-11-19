@@ -155,6 +155,31 @@ it with adaptive host memory that grows on demand and releases when unused.
   loop (S4 = 0), removing all 58 synchronous VRAM readbacks per frame.
 - **R8 macOS, speed sign-off, photo mode, Creation Kit:** `plume_metal.cpp` on macOS; P11,
   P13; sign off S1–S3 and P12 with fullscreen Tracy + `EOD_GPU_PROF`.
+- **R9 Creation Kit world editor (clean-room, workflow modelled on modern community map
+  editors; no third-party code, assets or names):** per-track editing in the Kit, with
+  the viewport drawn by the Plume renderer (depends on R4 only, so it may run in parallel
+  with R5–R8 in its own worktree when the owner allows). Edits are saved as a named project
+  layered over the retail `.TRK`; a separate "write" step builds the game files.
+  - **R9a viewport and objects:** fly camera; model browser with thumbnails from
+    `vif_mesh` (filter "only models this track places"); select / move / rotate (heading,
+    pitch, roll) / scale gizmos; snap to ground; delete; per-object properties (model,
+    archive member, placement record, triangles, textures, retail vs editor-placed, written
+    or not); status bar with camera position, instances, triangles, draws, frame ms;
+    Launch game (START string). Writer: `tools/world_export.py place`, proven in a real run.
+  - **R9b gameplay markers:** spawn points, event triggers, chicken spawns, checkpoints,
+    breakable props (hay bales, cones, barrels) with their physics and debris data.
+  - **R9c new content:** place new objects and models (archive rebuild; per-track object
+    pools grow adaptively, `docs/PS2_LIMITS.md`); "Make collision" compiles collision
+    from a mesh (`tools/world_collision.py` read side exists).
+  - **R9d racing lines and events:** ILIN racing-line editor (the Roads tool: nodes,
+    branches, lanes, width, direction), AI start grids, event and race definitions for
+    the 26 event types.
+  - **R9e terrain and mesh:** ground-mesh sculpting (decode the GRAF ground first) and a
+    Blender round trip (OBJ export plus `tools/vif_patch.py` / import pipeline).
+  - **Gates:** each edit type survives save, reopen and write. Unedited archive members
+    stay byte-identical. The edited track loads and plays in the real game (headless run
+    plus one owner session). Edited objects have collision and AI drives the edited lines.
+    No PS2 cap limits object count.
 
 ## 6. Engineering rules
 
