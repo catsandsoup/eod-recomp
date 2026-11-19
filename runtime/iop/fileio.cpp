@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "../core/eod_tracy.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "iop.h"
@@ -107,6 +108,7 @@ void complete(const uint8_t *req, uint32_t slot, uint32_t cmd, int32_t result, c
 }
 
 int file_open(const char *name, uint32_t flags) {
+    EOD_ZONE_SCOPED_N("fileio.open");
     int fd = -1;
     for (int i = 0; i < kMaxFiles; i++)
         if (!g_files[i]) {
@@ -184,6 +186,7 @@ void iop_fileio_init() {
             break;
         }
         case CMD_READ: {
+            EOD_ZONE_SCOPED_N("fileio.read");
             int32_t fd = (int32_t)rd32(buf + 0xC);
             uint32_t dst = rd32(buf + 0x10), size = rd32(buf + 0x14);
             FILE *f = file_get(fd);

@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "core/config.h"
 #include "core/cpu.h"
+#include "core/eod_tracy.h"
 #include "core/log.h"
 #include "core/memory.h"
 #include "platform/platform.h"
@@ -26,13 +28,24 @@ void f_0039AFB0(void) {
 }
 
 void f_003670C8(void) {
-    static bool skip = (getenv("EOD_SKIP_MOVIES") && atoi(getenv("EOD_SKIP_MOVIES"))) ||
-                       editor_test_startup::state().enabled();
+    EOD_ZONE_SCOPED_N("movie.play");
+    const uint64_t prof_t0 = eod_profile::enabled() ? eod_profile::now_ns() : 0;
+    const char *env_skip = getenv("EOD_SKIP_MOVIES");
+    const char *pad_script = getenv("EOD_PAD_SCRIPT");
+    bool skip = false;
+    if (env_skip && env_skip[0] != '\0') {
+        skip = atoi(env_skip) != 0;
+    } else if (editor_test_startup::state().enabled()) {
+        skip = true;
+    } else if (!(pad_script && pad_script[0])) {
+        skip = g_config.fast_boot && g_config.skip_intros;
+    }
     char name[256];
     ee_read_string(arg_u32(0), name, sizeof name);
     if (skip) {
         LOG(LOG_CORE, "skipping movie %s", name);
         g_ee.r[2].sd[0] = 0;
+        if (prof_t0) eod_profile::record_movie(true, eod_profile::now_ns() - prof_t0);
         return;
     }
     LOG(LOG_CORE, "playing movie %s", name);
@@ -41,6 +54,7 @@ void f_003670C8(void) {
     f_003670C8_orig();
     g_movie_playing = false;
     LOG(LOG_CORE, "movie %s ended after %.1f s", name, (platform_time_us() - t0) / 1e6);
+    if (prof_t0) eod_profile::record_movie(false, eod_profile::now_ns() - prof_t0);
 }
 
 // SLUS_209.10: 113FF8 dispatches ALL session UI states (including loading).
@@ -59,15 +73,20 @@ void f_00113FF8(void) {
 void f_00106338_orig(void);
 void f_00106338(void) {
     const bool enabled = editor_test_startup::state().enabled();
-    const uint32_t views = enabled ? ee_r32(0x003D1A74) : 0;
-    const bool gameplay = enabled && views >= 1 && views <= 4 && ee_r32(0x003C3CE8) == 0;
-    const uint32_t world = enabled ? ee_r32(0x00495C48) : 0;
+    const bool prof = eod_profile::enabled();
+    const bool inspect = enabled || prof;
+    const uint32_t views = inspect ? ee_r32(0x003D1A74) : 0;
+    const bool gameplay = inspect && views >= 1 && views <= 4 && ee_r32(0x003C3CE8) == 0;
+    const uint32_t world = inspect ? ee_r32(0x00495C48) : 0;
     const bool valid_world = world && !(world & 3) && world <= EE_RAM_SIZE - 0x1968;
     // 175960 stores FadeGetAlpha(176278) at world+1964; 210FB8 reads it.
     // 113EE8 draws a full-screen rectangle with that alpha when it is nonzero.
     // Zero is the native loading transition's cleared overlay, not a delay.
     const uint32_t fade_alpha = valid_world ? ee_r32(world + 0x1964) : 255;
     f_00106338_orig();
+    if (prof && gameplay) {
+        eod_profile::mark_first_gameplay_frame(fade_alpha == 0);
+    }
     if (enabled) {
         g_editor_native_frame.gameplay_drawn(gameplay, fade_alpha);
         static bool logged = false;
@@ -96,6 +115,7 @@ static void editor_trace_native_publication(unsigned call, const char *where) {
 
 void f_0033EC78_orig(void);
 void f_0033EC78(void) {
+    EOD_ZONE_SCOPED_N("ee.frame_wait");
     const bool race_loop = g_ee.r[31].uw[0] == 0x0011412C;
     static const bool trace = editor_test_startup::state().enabled() && std::getenv("EOD_EDITOR_TRACE");
     static unsigned traced_calls = 0;

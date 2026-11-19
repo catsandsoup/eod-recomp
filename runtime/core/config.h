@@ -77,6 +77,9 @@ struct Config {
     std::string memcard_dir;  // empty: <game folder>/memcard
     std::string data_dir;     // empty: the executable's folder
     bool pause_in_menu = true;  // the game stops while the in-game menu (F1) is open
+    bool fast_boot = true;      // instant PC boot: skip intros, title screen, memcard & loading holds
+    bool skip_intros = true;    // skip startup .PSS intro movies (Atari / Infogrames / Monster Games)
+    bool skip_memcard = true;   // skip PS2 memory card boot hold/prompt delays (save still loads)
     // [Gameplay] each car's damage_scale (from its file; the game ignores it,
     // its menu durability ratings follow it) multiplies the damage it takes
     bool car_durability = false;

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../core/config.h"
+#include "../core/eod_tracy.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "iop.h"
@@ -124,6 +125,8 @@ std::string mc_port_dir(int port) { return port_root(port & 1); }
 
 void iop_mc_init() {
     iop_register_server(0x80000400, "mcserv", [](const RpcCall &c, uint8_t *buf) -> uint32_t {
+        EOD_ZONE_SCOPED_N("mc.rpc");
+        eod_profile::PhaseScope mc_prof(eod_profile::PHASE_MEMCARD_CHECK);
         int32_t r = 0;
         switch (c.fno) {
         case 0xFE: {  // init: result, mcserv version, mcman version

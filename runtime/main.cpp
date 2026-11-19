@@ -6,7 +6,7 @@
 // DIR is the root of the game disc (the directory that contains
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
-#include "core/trace.h"
+#include "core/eod_tracy.h"
 #include "core/diff_harness.h"
 #include "core/host_file.h"
 #include <csignal>
@@ -160,6 +160,7 @@ static int save_edit(int argc, char **argv) {
     }
     platform_shutdown();
     diff_report();
+    eod_profile::report("exit");
     fflush(nullptr);
     _exit(code);
 }
@@ -287,6 +288,7 @@ static int run_setup_screen(PlatformConfig cfg, const std::string &config_path, 
 #endif
 
 int main(int argc, char **argv) {
+    eod_profile::init();
 #ifdef _WIN32
     windows_utf8_arguments(argc, argv);
 #endif
@@ -474,19 +476,24 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!platform_init(cfg)) fatal("platform initialisation failed");
-    platform_thread_fast();  // the EE runs on this thread
-    EOD_THREAD_NAME("EE");
-    mem_init();
-    cpu_init();
-    hw_init();
-    vu_init();
-    vif_init();
-    ipu_init();
-    gs_init();
-    sif_init();
-    kernel_init(argc, argv);
-    uint32_t entry = load_elf(elf);
+    uint32_t entry = 0;
+    {
+        EOD_ZONE_SCOPED_N("eod.boot_init");
+        if (!platform_init(cfg)) fatal("platform initialisation failed");
+        platform_thread_fast();  // the EE runs on this thread
+        EOD_THREAD_NAME("EE");
+        mem_init();
+        cpu_init();
+        hw_init();
+        vu_init();
+        vif_init();
+        ipu_init();
+        gs_init();
+        sif_init();
+        kernel_init(argc, argv);
+        entry = load_elf(elf);
+        eod_profile::mark_boot_init_done();
+    }
     LOG(LOG_CORE, "starting at %08x", entry);
 #ifndef _WIN32
     void debug_watch_init();

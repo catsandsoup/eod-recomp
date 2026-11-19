@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "../core/eod_tracy.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
 #include "custom_music.h"
@@ -200,6 +201,7 @@ static void apply_mod_overlays(Node &root) {
 
 void build_disc() {
     if (g_built) return;
+    EOD_ZONE_SCOPED_N("stream.build_disc");
     g_built = true;
     Node root;
     root.name = "";
@@ -237,22 +239,34 @@ void build_disc() {
 
 // Reads `bytes` starting at sector `lsn` (may span files; gaps read as zero).
 void disc_read(uint32_t lsn, uint8_t *out, uint32_t bytes) {
+    EOD_ZONE_SCOPED_N("stream.disc_read");
+    EOD_PLOT("stream.read_kb", bytes / 1024);
     memset(out, 0, bytes);
     uint64_t pos = (uint64_t)lsn * kSector, end = pos + bytes;
+    const bool prof = eod_profile::enabled();
     for (const DiscFile &f : g_files) {
         uint64_t fs = (uint64_t)f.lsn * kSector, fe = fs + f.size;
         if (fe <= pos || fs >= end) continue;
         uint64_t a = std::max(pos, fs), b = std::min(end, fe);
+        const size_t chunk = (size_t)(b - a);
+        const bool is_trk = eod_profile::has_suffix_ci(f.host_path.c_str(), ".trk");
+        const bool is_car = !is_trk && eod_profile::has_suffix_ci(f.host_path.c_str(), ".car");
+        const uint64_t t0 = (prof && (is_trk || is_car)) ? eod_profile::now_ns() : 0;
         if (!f.synthetic.empty()) {
-            memcpy(out + (a - pos), f.synthetic.data() + (a - fs), (size_t)(b - a));
-            continue;
+            memcpy(out + (a - pos), f.synthetic.data() + (a - fs), chunk);
+        } else {
+            FILE *h = host_fopen(f.host_path.c_str(), "rb");
+            if (!h) continue;
+            fseek(h, (long)(a - fs), SEEK_SET);
+            size_t got = fread(out + (a - pos), 1, chunk, h);
+            (void)got;
+            fclose(h);
         }
-        FILE *h = host_fopen(f.host_path.c_str(), "rb");
-        if (!h) continue;
-        fseek(h, (long)(a - fs), SEEK_SET);
-        size_t got = fread(out + (a - pos), 1, (size_t)(b - a), h);
-        (void)got;
-        fclose(h);
+        if (t0) {
+            const eod_profile::Phase ph = is_trk ? eod_profile::PHASE_TRK_LOAD : eod_profile::PHASE_CAR_LOAD;
+            eod_profile::add_phase_ns(ph, eod_profile::now_ns() - t0);
+            eod_profile::add_io_bytes(ph, chunk);
+        }
     }
 }
 

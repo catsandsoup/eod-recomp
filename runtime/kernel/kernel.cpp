@@ -16,6 +16,7 @@
 
 #include "../core/cpu.h"
 #include "../core/config.h"
+#include "../core/eod_tracy.h"
 #include "../core/timing_trace.h"
 #include "../core/log.h"
 #include "../core/memory.h"
@@ -350,6 +351,7 @@ void service_events(bool run_alarms) {
         intc_raise(INTC_VBLANK_E);
     }
     if (now >= g_next_vblank_us && !g_vblank_end_pending) {
+        EOD_ZONE_SCOPED_N("kernel.vblank");
         if (timing_trace) {
             auto &s = eod_timing::state();
             s.vblank_debt_max = std::max(s.vblank_debt_max, now - g_next_vblank_us);
@@ -357,6 +359,7 @@ void service_events(bool run_alarms) {
             if (g_next_vblank_us + (uint64_t)kVblankPeriodUs <= now) ++s.catchups;
         }
         g_vblank_count++;
+        EOD_PLOT("kernel.vblank", g_vblank_count);
         // Vblanks missed while the EE was busy are delivered back to back (the
         // game counts them as time), up to a few frames; beyond that, resync.
         g_next_vblank_us += (uint64_t)kVblankPeriodUs;

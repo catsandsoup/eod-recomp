@@ -207,6 +207,9 @@ bool config_load(const std::string &path, Config &c) {
             if (ieq(k, "MemoryCard")) c.memcard_dir = v;
             else if (ieq(k, "DataPath")) c.data_dir = v;
             else if (ieq(k, "PauseInMenu")) c.pause_in_menu = to_bool(v);
+            else if (ieq(k, "FastBoot")) c.fast_boot = to_bool(v);
+            else if (ieq(k, "SkipIntros")) c.skip_intros = to_bool(v);
+            else if (ieq(k, "SkipMemcard")) c.skip_memcard = to_bool(v);
         }
     }
     if (f) fclose(f);
@@ -237,6 +240,10 @@ bool config_load(const std::string &path, Config &c) {
     if (const char *e = getenv("EOD_UNIVERSAL_PARTS")) c.career_universal_parts = to_bool(e);
     if (const char *e = getenv("EOD_MULTISTAGE_UPGRADES")) c.career_multistage_upgrades = to_bool(e);
     if (const char *e = getenv("EOD_GARAGE_EXPANSION")) c.career_garage_expansion = to_bool(e);
+    if (const char *e = getenv("EOD_FAST_BOOT")) c.fast_boot = to_bool(e);
+    if (const char *e = getenv("EOD_SKIP_INTROS")) c.skip_intros = to_bool(e);
+    if (const char *e = getenv("EOD_SKIP_MOVIES")) c.skip_intros = to_bool(e);
+    if (const char *e = getenv("EOD_SKIP_MEMCARD")) c.skip_memcard = to_bool(e);
 
     return file_loaded;
 }
@@ -339,6 +346,9 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
     fprintf(f, "DataPath=%s\n", c.data_dir.c_str());
     fprintf(f, "PauseInMenu=%d        ; the game stops while the in-game menu (F1) is open\n", c.pause_in_menu ? 1 : 0);
+    fprintf(f, "FastBoot=%d           ; 1: skip intros, title screen, memcard & loading screen hold delays\n", c.fast_boot ? 1 : 0);
+    fprintf(f, "SkipIntros=%d         ; 1: skip startup .PSS intro movies\n", c.skip_intros ? 1 : 0);
+    fprintf(f, "SkipMemcard=%d        ; 1: skip PS2 memory card boot hold/prompt delays (save still loads)\n", c.skip_memcard ? 1 : 0);
     fclose(f);
     return true;
 }

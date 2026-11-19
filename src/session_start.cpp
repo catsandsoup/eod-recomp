@@ -15,7 +15,9 @@
 #include "battle_layout.h"
 #include "netplay_hooks.h"
 
+#include "core/config.h"
 #include "core/cpu.h"
+#include "core/eod_tracy.h"
 #include "core/log.h"
 #include "core/memory.h"
 
@@ -556,7 +558,7 @@ int session_ai_override() {
 }
 
 // Title screen ("press the START button", start.lyt): returns 1 once the player passed it.
-// A direct start is a request already made, so it is treated as passed.
+// A direct start or FastBoot (default ON in eod.ini) jumps straight to the Main Menu.
 extern "C" void f_002BEC08(void) {
     // Developer: EOD_FATAL_TEST=1 raises a game panic at the title screen, to check the in-game
     // error screen and crash.log (a windowed run; headless runs just log and abort).
@@ -567,12 +569,21 @@ extern "C" void f_002BEC08(void) {
         ret_s32(1);
         return;
     }
+    static bool fast_boot_skipped_title = false;
+    const char *pad_script = std::getenv("EOD_PAD_SCRIPT");
+    if (!fast_boot_skipped_title && g_config.fast_boot && !(pad_script && pad_script[0])) {
+        fast_boot_skipped_title = true;
+        std::fprintf(stderr, "[BOOT] title screen skipped (FastBoot=1)\n");
+        ret_s32(1);
+        return;
+    }
     netplay_hooks::title_screen = true;
     f_002BEC08_orig();
     netplay_hooks::title_screen = false;
 }
 
 extern "C" void f_002A1298(void) {
+    eod_profile::mark_main_menu();
     static bool tried = false;
     if (!tried) { tried = true; start(); if (std::getenv("EOD_CATALOG_DUMP") && session_catalog::refresh()) session_catalog::dump(); }
     if (P.career && !P.career_entered) {
@@ -601,6 +612,22 @@ bool head_to_head_menu();  // below: answers the head-to-head join screen
 
 extern "C" void f_00270C10(void) {
     const uint32_t caller = g_ee.r[31].uw[0];
+    // FastBoot (default ON): bypass artificial 1-second pre-load transition cards
+    // (f_002C18B8 / 0x2C1A0C, 0x2C2018, f_002C2058 / 0x2C2178, f_002C2420 / 0x2C26F4)
+    // and the 4-second boot memory card notice (f_002C6068 / 0x2C6118).
+    {
+        const char *slow = std::getenv("EOD_SLOW_LOAD");
+        const char *pad_script = std::getenv("EOD_PAD_SCRIPT");
+        const bool fast = g_config.fast_boot && !(slow && slow[0] == '1') && !(pad_script && pad_script[0]);
+        if (fast && (caller == 0x002C1A0C || caller == 0x002C2018 || caller == 0x002C2178 || caller == 0x002C26F4)) {
+            ret_s32(-2);
+            return;
+        }
+        if (fast && g_config.skip_memcard && caller == 0x002C6118) {
+            ret_s32(-2);
+            return;
+        }
+    }
     if (caller == 0x002A16D8) {
         f_00270C10_orig();
         // The main dispatcher maps result 16 to Arcade. Preserve MenuRun cleanup.
