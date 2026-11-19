@@ -1,5 +1,6 @@
 // modern_scene.cpp - GS-thread side of EOD_MODERN (modern_scene.h).
 #include "modern_scene.h"
+#include "../render/native_renderer.h"
 #include "core/trace.h"
 
 #include <atomic>
@@ -48,6 +49,10 @@ void disable() {
     if (!g_failed.exchange(true)) fprintf(stderr, "[modern] renderer unavailable: original\n");
 }
 void toggle() {
+    if (native::enabled()) {  // stage R6: the native renderer's Classic / Modern look
+        native::toggle_look();
+        return;
+    }
     if (!available()) return;
     env_start();
     g_config.modern_renderer = !g_config.modern_renderer;

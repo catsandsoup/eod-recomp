@@ -32,6 +32,10 @@ struct Vertex;
 namespace native {
 
 bool enabled();
+// stage R6 (docs/NATIVE_RENDERER.md "Stage R6"): Classic (R5 shaders, default) or Modern look;
+// EOD_LOOK=modern at start, F9 / L1+R1+R3 through modern::toggle; takes effect at the next flush
+void toggle_look();
+bool look_modern();
 
 // ---- EE thread (src/render_queue.cpp) -------------------------------------------------------
 void ee_frame_begin();                // RenderQueueBeginFrame

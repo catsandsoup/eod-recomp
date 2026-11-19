@@ -739,6 +739,74 @@ dropped by the owner (scope cut 2026-11-19), the existing `diff_run` wrappers st
   and adds a geometric triangle match: Dundas Bus run, 0 GS triangles missing from the native meshes;
   native draws triangles the GS never receives for `0x318` batches (51%, likely VU1 back-face culling).
 
+## Stage R6: Modern look materials (Phase A1, specification)
+
+Built on the native Plume path only (never the old `ModernRenderer=1` GS-traffic pass, see
+`docs/MODERN_RENDERER_RCA.md` and the rules in `docs/MODERN_LOOK_GUARDRAILS.md`).
+
+### Look switch
+
+| Item | Rule |
+|---|---|
+| `Look=Classic` (default) | the R5 shaders (`native_shaders.hlsl` `vs_main` / `ps_main`, SPIR-V unchanged) and the same pipeline keys: byte-identical to R5 |
+| `Look=Modern` | `native_modern.hlsl` `vs_modern` / `ps_modern` (own SPIR-V file); pipeline key bit 24 (`K_MODERN`) selects them; every other key bit (blend, z, mask, cull) is the Classic item's |
+| Switch | `EOD_LOOK=modern` at start; F9 / L1+R1+R3 (`modern::toggle`, routed to `native::toggle_look` when the native renderer runs); read once per flush, so the next frame is fully in the new look |
+| No stall on toggle | every pipeline is created with its twin (Classic and Modern) and every texture descriptor set with its Modern sampler set, so a toggle creates nothing |
+| Test hook | `EOD_LOOK_TOGGLE_EVERY=N` toggles every N vblanks and logs `[look]` frame times (P5) |
+
+### Material record -> shader inputs
+
+`tools/material_runtime.py` binds each of the 2,728 `material_table.json` records to the runtime
+texture identity of the disc TEX it was tagged from (indexKey, paletteKey, w, h;
+`docs/CREATION_KIT_TEXTURE_CONTRACTS.md` section 2) and writes `runtime/render/material_table.inc`
+(2,694 records bound; the 34 left are direct-colour car paint and tyre TEX, which have no runtime key).
+At startup the renderer loads every record. A native texture computes its indexKey / paletteKey once,
+when it is decoded (`texture()`), and takes the record with the same keys and size (else the same
+indexKey and size).
+
+| Record field | Shader input (Modern only) |
+|---|---|
+| `metalness`, `roughness` | 4-bit each in `mode.z` 16..23: Filament standard model `f0 = mix(0.04, albedo, metal)`, `D_GGX`, `V_SmithGGXCorrelated`, `F_Schlick`, Lambert diffuse `(1 - metal) albedo` |
+| `surface` class | `mode.z` 27..30: unlit (`fx`, `emissive_light`, `sky`, `backdrop`, `crowd_sprite`, `fake_shadow`, `ui`), car paint (Filament clear-coat lobe, roughness 0.1, f0 0.04), glass / water (f0 0.02..0.04, low roughness), chrome / metal, generic |
+| `emissive` | `mode.z` bit 24: the Classic colour is kept as it is (no lighting added) |
+| `detail != none` (relief material named) | `mode.z` bit 25: normal from height (texture luminance, screen-space surface gradient) |
+| no record / no texture | generic dielectric, roughness 0.8 |
+
+### What stays from the game's render state (never from the table)
+
+| State | Source |
+|---|---|
+| Blend equation, alpha test, AFAIL, colour mask, z test / write, cull, scissor | the item's Classic pipeline key and `mode.x` / `mode.y` (GS state of the native draw, R5 A2) |
+| Alpha value | the Classic texture function (TCC, TFX, vertex alpha) |
+| Fog | the Classic GS fog after shading (`mode.y` FOGCOL, F) |
+| Light direction and colours | VU1 light (`light`, `diffuse`, `ambient`) of lit objects; prelit world keeps its baked vertex light as the irradiance (multiplies albedo once, never relit) |
+| Sun for prelit draws | the last lit queue object's world light direction and colour of this frame |
+| Sky IBL | the texture the table tags `sky`: its mean upper and lower colours, decoded once; a hemisphere irradiance plus a roughness-blurred specular term (Filament `Fd_Lambert` irradiance, Karis analytic DFG in place of the DFG LUT); before a sky is seen, FOGCOL ; daylight: the sky colours and the prelit sun are scaled by FOGCOL / sky-horizon luminance (at most 1), because a night sky texture's mean is far brighter than the sky the game draws |
+
+So `fx` / `emissive_light` cards keep the game's additive / mix blend and are drawn unlit: they
+never become solid walls. Modern adds no vignette, grade, tone curve or haze.
+
+### Results (R6 Phase A1)
+
+Headless, muted, `RenderScale=1`, `Detail=maximum`, Battle (8 AI) unless named.
+
+| Check | Result |
+|---|---|
+| Materials attached | 2,694 of 2,728 records keyed; draws with a record: Dundas day 69.9%, Gilroy night 72.1..74.0%, Career free roam 71.8%, Dennison 96.2..97.9% (the rest: untagged textures, generic dielectric) |
+| Classic unchanged | Classic keeps the R5 SPIR-V, pipeline keys and push constants (`modern_patch` runs only when Look=Modern). P3 Gilroy night, 24 windows vb 700..2310: MAE 2.73 / SSIM 0.9533 vs R5 2.68 / 0.9545 (run-to-run noise) |
+| P5 toggle | Look read once per flush: the next frame is fully in the new look. 100 toggles (every vblank, Dundas / Gilroy / Career): pipelines 19 -> 19, 17 -> 17, texture sets made late 0; texture memory grows only with textures streamed in while driving (no set or pipeline is made by a toggle). Frames > 33 ms: toggle frames 1 of 61 (1.6%) vs 23 of 1,740 (1.3%) without a toggle (Dundas, toggle every 60); the headless runs have the same paced-host hitches in Classic-only stretches (up to 142 ms), so the toggle adds none |
+| Guardrails 4..7 (`tools/modern_guardrails.py`) | Dundas day (5 pairs, +-5 vblanks of a toggle): whole M/C 1.042 worst, region 1.085 worst; Gilroy night: 1.011 / 1.081 (was 1.045 / 1.165, FAIL, before the daylight scale); Career free roam: 1.017 / 1.058. New pixels at 1.0: 0. Opaque card blocks: 0. PASS |
+| Guardrail 8 | Same items and draw count as Classic (one item list, two pipelines); paced frame mean Dundas Modern 16.60 ms vs Classic 16.76 ms (toggle every 60). No GPU timer on the native path: the unpaced GPU delta is not measured |
+| Guardrails 1, 2, 3, 9 | 1: Modern draws only native items (no GS 3D, no classification from GS traffic); 2: classes come from the material table by texture identity, checked on Career free roam + 2 tracks; 3: Modern adds no shadow or AO (the shadow pipeline has no Modern twin); 9: the native path has no MSAA |
+| EOD_DIFF | Gilroy Taxi 508, `EOD_DIFF=all`, Look=Modern toggling every 97 vblanks, 1,500 frames: 9 functions, 1,223 checked, 0 mismatched |
+
+### Open (R6 A1)
+
+- Guardrail 1 check with `EOD_NATIVE_ONLY=1`: headless screenshots read the GS frame buffer, which is empty in that mode (black frames), so no native-only capture exists yet.
+- Guardrail 8 needs GPU timestamps on the native path (`EOD_GPU_PROF` does not exist there).
+- Headless captures every vblank lag the look by a few frames (identical Classic / Modern halves); the checker skips such pairs.
+- Camera views were not cycled in the guardrail runs (default chase view only).
+
 ---
 
 ## Stage R4: shadows, particles, sprites, flares and immediate geometry

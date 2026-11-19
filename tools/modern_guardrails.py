@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""R6 Modern look guardrails (docs/MODERN_LOOK_GUARDRAILS.md), numbers only.
+
+usage: modern_guardrails.py DIR [DIR ...]
+
+Each DIR holds side-by-side captures named *_classic_left_modern_right.png (left half Classic,
+right half Modern of the same or the next frame). Per scene prefix (text before the first '_')
+it prints (pairs whose halves are identical are skipped):
+  row 4/5  mean luminance Modern/Classic for the whole frame and the worst of a 3x3 grid of regions
+           (pass: every ratio within 0.85..1.15; regions darker than 8/255 in both are skipped)
+  row 6    pixels at luminance 1.0 in Modern that are below 1.0 in Classic (% of the frame;
+           pass: <= 0.05%)
+  row 7    16x16 blocks that are flat in Modern (std < 2) but textured in Classic (std > 8) and
+           brighter by more than 40 (an opaque card): pass when 0.1% of blocks or fewer
+"""
+import sys, glob, os
+from collections import defaultdict
+import numpy as np
+from PIL import Image
+
+
+def lum(a):
+    return 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+
+
+def check(path):
+    a = np.asarray(Image.open(path).convert('RGB'), dtype=np.float32)
+    w = a.shape[1] // 2
+    c, m = lum(a[:, :w]), lum(a[:, w:2 * w])
+    if np.abs(a[:, :w] - a[:, w:2 * w]).mean() < 0.05:
+        return None  # both halves are the same image (the capture missed the toggle): not a pair
+    h = c.shape[0]
+    whole = m.mean() / max(c.mean(), 1e-3)
+    worst = 1.0
+    for i in range(3):
+        for j in range(3):
+            rc = c[i * h // 3:(i + 1) * h // 3, j * w // 3:(j + 1) * w // 3].mean()
+            rm = m[i * h // 3:(i + 1) * h // 3, j * w // 3:(j + 1) * w // 3].mean()
+            if rc < 8 and rm < 8:
+                continue
+            r = rm / max(rc, 1e-3)
+            if abs(r - 1) > abs(worst - 1):
+                worst = r
+    sat = float(((m >= 254.5) & (c < 254.5)).mean() * 100)
+    bh, bw = h // 16, w // 16
+    cb = c[:bh * 16, :bw * 16].reshape(bh, 16, bw, 16)
+    mb = m[:bh * 16, :bw * 16].reshape(bh, 16, bw, 16)
+    flat = (mb.std(axis=(1, 3)) < 2) & (cb.std(axis=(1, 3)) > 8) & (mb.mean(axis=(1, 3)) - cb.mean(axis=(1, 3)) > 40)
+    return whole, worst, sat, float(flat.mean() * 100)
+
+
+def main():
+    scenes = defaultdict(list)
+    for d in sys.argv[1:]:
+        for p in sorted(glob.glob(os.path.join(d, '*_classic_left_modern_right.png'))):
+            r = check(p)
+            if r is not None:
+                scenes[os.path.basename(p).split('_')[0]].append(r)
+    ok_all = True
+    for s, rows in sorted(scenes.items()):
+        r = np.array(rows)
+        wl = r[np.argmax(np.abs(r[:, 0] - 1)), 0]
+        wr = r[np.argmax(np.abs(r[:, 1] - 1)), 1]
+        ok = (abs(wl - 1) <= .15, abs(wr - 1) <= .15, r[:, 2].max() <= .05, r[:, 3].max() <= .1)
+        ok_all &= all(ok)
+        print(f'{s}: {len(rows)} pairs | lum M/C whole worst {wl:.3f} mean {r[:, 0].mean():.3f} | region worst {wr:.3f} '
+              f'| new 1.0 px max {r[:, 2].max():.4f}% | opaque blocks max {r[:, 3].max():.3f}% | '
+              + ' '.join('PASS' if o else 'FAIL' for o in ok))
+    print('ALL PASS' if ok_all else 'SOME FAIL')
+    return 0 if ok_all else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
