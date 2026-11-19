@@ -1,0 +1,2 @@
+---
+**Test Drive: Eve of Destruction (`SLUS_209.10`) Static Recompilation & Creation Kit** · Target ELF SHA-256: `4f60053dc141365f5ae50737622f8408be30ced513b4c109427c926461f2e2ae` · [Repository](https://github.com/catsandsoup/eod-recomp) · [Tutorials](Modding-Tutorials) · [Architecture](Architecture-Overview) · [Plume Renderer](Native-Plume-Renderer) · [File Formats](File-Formats-Encyclopedia) · [Symbols](Decompiled-Subsystems-and-Symbols) · [World Editor](World-Editor-and-Creation-Kit)

@@ -1,0 +1,1871 @@
+"""Main Window for EOD World Editor (Native Windows 11 Qt 6 + OpenGL 3.3 Core + Embedded PIE)."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QUndoStack
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QStackedWidget,
+    QStatusBar,
+    QToolBar,
+    QWidget,
+)
+
+from dialogs import CustomRaceDialog, ReplaceModelDialog
+from explorer_panel import ExplorerPanel
+from pie_host import PieHostWidget, build_pie_launch_spec
+from project_state import (
+    AddMarkerCommand,
+    AddRoadNodeCommand,
+    DeleteMarkerCommand,
+    DeleteObjectCommand,
+    DeleteRoadNodeCommand,
+    JoinRoadNodesCommand,
+    MakeCollisionCommand,
+    ModifyBarrierCommand,
+    ModifyRoadLanesCommand,
+    MoveRoadNodeCommand,
+    PlaceObjectCommand,
+    ReplaceObjectModelCommand,
+    ReplaceTextureCommand,
+    ScatterPlaceCommand,
+    SplitRoadEdgeCommand,
+    TransformMarkerCommand,
+    TransformObjectCommand,
+    apply_project_overlay,
+    export_mod_layer,
+    export_object_obj,
+    load_png_rgba,
+    save_project_overlay,
+)
+from properties_panel import PropertiesPanel
+from theme import (
+    BORDER,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
+    enable_windows_dark_titlebar,
+    svg_icon,
+)
+from viewport_gl import ViewportGL
+from workers import CancelToken, FunctionWorker, start_worker
+from world_loader import (
+    RoadNode,
+    TrackWorld,
+    WorldMarker,
+    WorldObject,
+    default_game_dir,
+    discover_cars,
+    discover_tracks,
+    load_car_catalog,
+    load_track_world,
+    merge_car_catalog_into_world,
+)
+
+
+class EodWorldEditorWindow(QMainWindow):
+    """Commercial-grade Qt 6 Windows 11 World Editor for Test Drive: Eve of Destruction."""
+
+    def __init__(
+        self,
+        game_dir: Path | None = None,
+        initial_track: str | None = None,
+        project_file: Path | None = None,
+        auto_load: bool = True,
+    ):
+        super().__init__()
+        self.game_dir = Path(game_dir) if game_dir else default_game_dir()
+        self.project_name = "Untitled World"
+        self.project_path: Path | None = None
+        self.world: TrackWorld | None = None
+        self.undo_stack = QUndoStack(self)
+        self._placed_counter = 1
+        self._marker_counter = 1
+        self._last_pie_mode = "free_roam"
+
+        # Non-blocking background job state
+        self._job_gen = 0
+        self._active_token: CancelToken | None = None
+        self._car_job_gen = 0
+        self._car_token: CancelToken | None = None
+
+        self.resize(1540, 930)
+        self.setMinimumSize(1120, 680)
+
+        # Core panels: Left Explorer | Center Stacked (OpenGL Viewport / Embedded PIE) | Right Properties
+        self.explorer = ExplorerPanel()
+        self.viewport = ViewportGL()
+        self.pie_host = PieHostWidget()
+        self.center_stack = QStackedWidget()
+        self.center_stack.addWidget(self.viewport)  # Page 0: OpenGL 3.3 Core Editor
+        self.center_stack.addWidget(self.pie_host)  # Page 1: Embedded Vulkan eod.exe PIE
+        self.properties = PropertiesPanel()
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self.explorer)
+        self.splitter.addWidget(self.center_stack)
+        self.splitter.addWidget(self.properties)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([308, 902, 330])
+        self.setCentralWidget(self.splitter)
+
+        self._build_menu_bar()
+        self._build_toolbar()
+        self._build_status_bar()
+        self._connect_signals()
+        self._update_window_chrome()
+        self._sync_pie_pickers_from_world()
+
+        enable_windows_dark_titlebar(self)
+
+        # Discover retail .TRK files
+        self.available_tracks = discover_tracks(self.game_dir)
+        self.explorer.set_available_tracks(self.available_tracks)
+
+        if auto_load:
+            if project_file and Path(project_file).is_file():
+                self.open_project_file(Path(project_file))
+            elif self.available_tracks:
+                target = self.available_tracks[0]
+                if initial_track:
+                    want = initial_track.upper().removesuffix(".TRK")
+                    for tp in self.available_tracks:
+                        if tp.stem.upper() == want:
+                            target = tp
+                            break
+                self.load_track_async(target)
+            else:
+                self.set_action_status(
+                    f"No .TRK files found in {self.game_dir / 'DATA' / 'TRACKS'} — use File -> Set Game Data Directory"
+                )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        enable_windows_dark_titlebar(self)
+
+    def closeEvent(self, event) -> None:
+        self._cancel_active_job()
+        if self._car_token is not None:
+            self._car_token.cancel()
+        self.explorer._cancel_thumb_worker()
+        self.pie_host.stop_pie(emit_signal=False)
+        super().closeEvent(event)
+
+    # -----------------------------------------------------------------------
+    # Window Title & Right-Aligned World Badge
+    # -----------------------------------------------------------------------
+    def _update_window_chrome(self) -> None:
+        trk = self.world.track_name if self.world else "NO TRACK"
+        self.setWindowTitle(f"EOD World Editor \u2013 Test Drive: Eve of Destruction \u2013 {trk} [{self.project_name}]")
+        self.world_badge.setText(f"World: {self.project_name}")
+        if self.world:
+            self.lbl_zone.setText(f"Track: {self.world.display_name} ({self.world.track_name})")
+
+    # -----------------------------------------------------------------------
+    # Full 14-Item Menu Bar
+    # -----------------------------------------------------------------------
+    def _build_menu_bar(self) -> None:
+        mb = self.menuBar()
+
+        self.world_badge = QLabel(f"World: {self.project_name}")
+        self.world_badge.setProperty("badge", "world")
+        mb.setCornerWidget(self.world_badge, Qt.Corner.TopRightCorner)
+
+        # 1. File
+        m_file = mb.addMenu("&File")
+        self.act_new = m_file.addAction(svg_icon("new_world"), "New World Project...", self.new_project, QKeySequence.StandardKey.New)
+        self.act_open = m_file.addAction(svg_icon("open_world"), "Open Project...", self.open_project_dialog, QKeySequence.StandardKey.Open)
+        self.act_save = m_file.addAction(svg_icon("save"), "Save Project", self.save_project, QKeySequence.StandardKey.Save)
+        m_file.addAction("Save Project As...", self.save_project_as)
+        m_file.addSeparator()
+        self.act_export_mod = m_file.addAction(
+            svg_icon("save", "#2ecc71"), "Write to Mod Layer (eod.exe)...", self.write_mod_layer_dialog, QKeySequence("Ctrl+Shift+S")
+        )
+        m_file.addSeparator()
+        m_file.addAction("Set Game Data Directory...", self.choose_game_dir)
+        m_file.addSeparator()
+        m_file.addAction("Exit", self.close, QKeySequence("Alt+F4"))
+
+        # 2. World
+        m_world = mb.addMenu("&World")
+        act_undo = self.undo_stack.createUndoAction(self, "Undo")
+        act_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        act_undo.setIcon(svg_icon("undo"))
+        act_redo = self.undo_stack.createRedoAction(self, "Redo")
+        act_redo.setShortcut(QKeySequence.StandardKey.Redo)
+        act_redo.setIcon(svg_icon("redo"))
+        m_world.addAction(act_undo)
+        m_world.addAction(act_redo)
+        m_world.addSeparator()
+        m_world.addAction(svg_icon("sky", "#fbbf24"), "Environment / Skybox...", self.open_environment_panel)
+        m_world.addAction("Reload Track from Retail Disc", self.reload_current_track)
+        m_world.addAction("Open DATA/TRACKS Folder", self.open_tracks_folder)
+        m_world.addSeparator()
+        m_world.addAction(svg_icon("launch", "#2ecc71"), "Play Free Roam (PIE)", lambda: self.start_pie("free_roam"), QKeySequence("F5"))
+        m_world.addAction(svg_icon("race", "#60a5fa"), "Play Event / Race (PIE)", lambda: self.start_pie("event"), QKeySequence("Shift+F5"))
+        m_world.addAction(svg_icon("stop", "#ff99a2"), "Stop PIE", self.stop_pie)
+
+        # 3. View
+        m_view = mb.addMenu("&View")
+        self.act_v_wire = self._add_toggle_action(m_view, "Wireframe", False, self._toggle_wireframe)
+        self.act_v_col = self._add_toggle_action(m_view, "Collision Overlay (SCOL + SOBL)", False, self._toggle_collision)
+        self.act_v_markers = self._add_toggle_action(m_view, "Markers & Start Grid", True, self._toggle_markers)
+        self.act_v_light = self._add_toggle_action(m_view, "Lighting", True, self._toggle_lighting)
+        self.act_v_labels = self._add_toggle_action(m_view, "Model Labels", False, self._toggle_labels)
+        self.act_v_roads = self._add_toggle_action(m_view, "Racing Lines (ILIN)", True, self._toggle_roads)
+        self.act_v_grid = self._add_toggle_action(m_view, "Grid", True, self._toggle_grid)
+
+        # 4. Camera
+        m_cam = mb.addMenu("&Camera")
+        m_cam.addAction("Frame Selection", self.viewport.frame_selection, QKeySequence("F"))
+        m_cam.addAction("Reset Track Overview", self._reset_camera_overview)
+        m_cam.addAction("Top-Down Map View", self._camera_top_down)
+        m_cam.addSeparator()
+        m_cam.addAction("Fly Speed: Slow (15)", lambda: self._set_fly_speed(15.0))
+        m_cam.addAction("Fly Speed: Normal (45)", lambda: self._set_fly_speed(45.0))
+        m_cam.addAction("Fly Speed: Fast (120)", lambda: self._set_fly_speed(120.0))
+
+        # 5. Objects
+        m_obj = mb.addMenu("&Objects")
+        m_obj.addAction(svg_icon("move"), "Move Tool", lambda: self.select_tool("move"), QKeySequence("G"))
+        m_obj.addAction(svg_icon("rotate"), "Rotate Tool", lambda: self.select_tool("rotate"), QKeySequence("R"))
+        m_obj.addAction(svg_icon("scale"), "Scale Tool", lambda: self.select_tool("scale"))
+        m_obj.addAction(svg_icon("place"), "Place Mode (Ghost Preview)", lambda: self.select_tool("place"), QKeySequence("P"))
+        m_obj.addAction(svg_icon("scatter"), "Scatter / Paint Brush", lambda: self.select_tool("scatter"), QKeySequence("B"))
+        m_obj.addSeparator()
+        m_obj.addAction(svg_icon("replace", "#93c5fd"), "Replace Selection With...", self.replace_selected_with_dialog)
+        m_obj.addAction(svg_icon("ground"), "Snap Selected to Ground", self.snap_selected_to_ground, QKeySequence("Ctrl+G"))
+        m_obj.addAction("Duplicate Selected", self.duplicate_selected_object, QKeySequence("Ctrl+D"))
+        m_obj.addAction(svg_icon("blender"), "Edit Selected in Blender (OBJ)...", self.edit_selected_in_blender, QKeySequence("F2"))
+        m_obj.addAction(svg_icon("shield"), "Make Collision for Selected", self.make_collision_for_selected)
+        m_obj.addSeparator()
+        m_obj.addAction(svg_icon("trash", "#ff99a2"), "Delete Selected", self.delete_selected_item, QKeySequence("Del"))
+
+        # 6. Markers
+        m_mk = mb.addMenu("&Markers")
+        m_mk.addAction(svg_icon("marker"), "Place Marker at View Target", lambda: self.add_marker_at_camera("Marker"))
+        m_mk.addAction("Place Start Grid Slot", lambda: self.add_marker_at_camera("Start Grid", prefix="StartGrid"))
+        m_mk.addAction("Place Spawn Point", lambda: self.add_marker_at_camera("Spawn"))
+        m_mk.addAction("Place Chicken Marker", lambda: self.add_marker_at_camera("Chicken"))
+        m_mk.addAction("Place Event Trigger", lambda: self.add_marker_at_camera("Trigger"))
+        m_mk.addAction("Toggle Markers Visibility", lambda: self.act_v_markers.trigger())
+
+        # 7. Cars
+        m_cars = mb.addMenu("Ca&rs")
+        m_cars.addAction(svg_icon("car", "#ff8a8a"), "Browse Cars && Wrecks Library (DATA/CAR)", lambda: self._filter_explorer_category("car-wreck"))
+        m_cars.addSeparator()
+        m_cars.addAction(svg_icon("car"), "Place Car Spawn at View Target", lambda: self.add_marker_at_camera("Car"))
+        m_cars.addAction("Place AI Opponent Car Slot", lambda: self.add_marker_at_camera("Car", prefix="AI_Car"))
+
+        # 8. Breakers
+        m_brk = mb.addMenu("&Breakers")
+        m_brk.addAction("Place Destructible Breaker Marker", lambda: self.add_marker_at_camera("Breaker"))
+        m_brk.addAction("Filter Models: Dyno / Props", lambda: self._filter_explorer_category("dyno"))
+
+        # 9. Roads
+        m_roads = mb.addMenu("R&oads")
+        m_roads.addAction(svg_icon("road"), "Toggle Road Tool (ILIN)", lambda: self.select_tool("road"))
+        m_roads.addAction("End Current Road Chain", self.viewport.end_current_road_chain)
+        m_roads.addAction("Show / Hide Racing Lines (ILIN)", lambda: self.act_v_roads.trigger())
+
+        # 10. Terrain
+        m_terr = mb.addMenu("&Terrain")
+        m_terr.addAction("Toggle Static Terrain Layer", lambda: self._toggle_layer_by_key("static"))
+        m_terr.addAction("Toggle Optional Terrain Layer", lambda: self._toggle_layer_by_key("optional-terrain"))
+        m_terr.addAction("Sample Ground Height Under Camera", self._sample_ground_under_camera)
+
+        # 11. Mesh
+        m_mesh = mb.addMenu("&Mesh")
+        m_mesh.addAction("Toggle Wireframe Overlay", lambda: self.act_v_wire.trigger())
+        m_mesh.addAction("Export Selected Object to OBJ...", self.edit_selected_in_blender)
+        m_mesh.addAction("Show Track Mesh Statistics...", self._show_mesh_stats)
+
+        # 12. Races
+        m_races = mb.addMenu("Ra&ces")
+        m_races.addAction(svg_icon("race", "#60a5fa"), "Custom Race && AI Pathfinding (ILIN) Editor...", self.open_custom_race_dialog)
+        m_races.addSeparator()
+        m_races.addAction("Jump Camera to Start / Finish Grid", self._jump_to_start_grid)
+        m_races.addAction("Show Track ILIN Racing Lines Summary...", self._show_races_summary)
+
+        # 13. Collision
+        m_col = mb.addMenu("C&ollision")
+        m_col.addAction(svg_icon("shield"), "Toggle Collision Wireframe (SCOL + SOBL)", lambda: self.act_v_col.trigger())
+        m_col.addAction(svg_icon("shield", "#f97316"), "Remove / Flatten Track Barriers (SOBL)", self.flatten_all_track_barriers)
+        m_col.addAction("Inspect Tallest Barriers...", self._show_tallest_barriers)
+        m_col.addSeparator()
+        m_col.addAction("Make Collision Volume for Selected", self.make_collision_for_selected)
+        m_col.addAction("Show Collision Statistics...", self._show_collision_stats)
+
+        # 14. Help
+        m_help = mb.addMenu("&Help")
+        m_help.addAction("Controls && Keybindings...", self._show_controls_dialog)
+        m_help.addAction("About EOD World Editor...", self._show_about_dialog)
+
+    def _add_toggle_action(self, menu, label: str, initial: bool, slot) -> QAction:
+        act = QAction(label, self)
+        act.setCheckable(True)
+        act.setChecked(initial)
+        act.toggled.connect(slot)
+        menu.addAction(act)
+        return act
+
+    # -----------------------------------------------------------------------
+    # Commercial Toolbar (UE PIE Group + Lumion/Twinmotion Tools + Snap)
+    # -----------------------------------------------------------------------
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("Main Toolbar")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(15, 15))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(tb)
+
+        tb.addAction(svg_icon("new_world"), "New", self.new_project)
+        tb.addAction(svg_icon("open_world"), "Open", self.open_project_dialog)
+        tb.addAction(svg_icon("save"), "Save", self.save_project)
+        tb.addAction(svg_icon("save", "#2ecc71"), "Write Mod", self.write_mod_layer_dialog)
+        tb.addSeparator()
+
+        # Unreal Engine 4/5 Style Play-In-Editor (PIE) Group + Instant On-Demand Mode/Car/AI Pickers
+        self.act_pie_roam = tb.addAction(svg_icon("launch", "#2ecc71"), "Free Roam", lambda: self.start_pie("free_roam"))
+        self.act_pie_roam.setToolTip("Compile mod layer and launch Open-Track Free Roam (Battle, Solo/AI) directly inside the viewport (F5)")
+
+        self.act_pie_event = tb.addAction(svg_icon("race", "#60a5fa"), "Play Event", lambda: self.start_pie("event"))
+        self.act_pie_event.setToolTip("Compile mod layer and launch the selected Event / Race & Car directly inside the viewport (Shift+F5)")
+
+        self.act_pie_stop = tb.addAction(svg_icon("stop", "#ff7b86"), "Stop", self.stop_pie)
+        self.act_pie_stop.setEnabled(False)
+        self.act_pie_stop.setToolTip("Stop Play-In-Editor and return to 3D Editor (Esc)")
+
+        from PySide6.QtWidgets import QComboBox, QSpinBox
+        self.cmb_pie_event = QComboBox()
+        self.cmb_pie_event.setToolTip("Choose Event / Race mode to spawn into on Play Event")
+        self.cmb_pie_event.setMinimumWidth(135)
+        self.cmb_pie_event.setFixedHeight(24)
+        self.cmb_pie_event.addItems(["Battle (Free Roam)", "No-Rules Race", "Demolition Derby", "Career Overworld (Free Roam)"])
+        self.cmb_pie_event.currentTextChanged.connect(self._on_pie_picker_changed)
+        tb.addWidget(self.cmb_pie_event)
+
+        self.cmb_pie_car = QComboBox()
+        self.cmb_pie_car.setEditable(True)
+        self.cmb_pie_car.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.cmb_pie_car.setToolTip("Choose any retail vehicle to spawn in (type to filter)")
+        self.cmb_pie_car.setMinimumWidth(110)
+        self.cmb_pie_car.setFixedHeight(24)
+        car_names = [p.stem.replace("_1", "").title() for p in discover_cars(self.game_dir)]
+        self.cmb_pie_car.addItems(car_names or ["Algar", "Bus", "Copcar", "Taxi", "Detonator"])
+        idx_algar = self.cmb_pie_car.findText("Algar", Qt.MatchFlag.MatchFixedString)
+        if idx_algar >= 0:
+            self.cmb_pie_car.setCurrentIndex(idx_algar)
+        self.cmb_pie_car.currentTextChanged.connect(self._on_pie_picker_changed)
+        tb.addWidget(self.cmb_pie_car)
+
+        self.spn_pie_ai = QSpinBox()
+        self.spn_pie_ai.setRange(0, 12)
+        self.spn_pie_ai.setValue(0)
+        self.spn_pie_ai.setPrefix("AI: ")
+        self.spn_pie_ai.setToolTip("AI opponent count (0 = solo open-track Free Roam)")
+        self.spn_pie_ai.setFixedWidth(64)
+        self.spn_pie_ai.setFixedHeight(24)
+        self.spn_pie_ai.valueChanged.connect(self._on_pie_picker_changed)
+        tb.addWidget(self.spn_pie_ai)
+
+        tb.addAction(svg_icon("race", "#fbbf24"), "Race Setup", self.open_custom_race_dialog)
+
+        # Renderer Quality Selector (PS2 Fast Performance vs Plume Vulkan High-Quality)
+        self.cmb_renderer_mode = QComboBox()
+        self.cmb_renderer_mode.addItem("PS2 Fast", "ps2")
+        self.cmb_renderer_mode.addItem("Plume HQ", "plume")
+        self.cmb_renderer_mode.setToolTip(
+            "Renderer Quality for Viewport & Play-In-Editor (PIE):\n"
+            "• PS2 Fast: Low-power PS2-style preview + EOD_NATIVE=0, EOD_MODERN=0\n"
+            "• Plume HQ: Enhanced shading preview + EOD_MODERN=1 (Modern Plume Vulkan)"
+        )
+        self.cmb_renderer_mode.setFixedHeight(24)
+        self.cmb_renderer_mode.currentIndexChanged.connect(self._on_renderer_mode_changed)
+        tb.addWidget(self.cmb_renderer_mode)
+        tb.addSeparator()
+
+        # Transform & Lumion/Twinmotion Placement Tools
+        self.tool_group = QActionGroup(self)
+        self.tool_group.setExclusive(True)
+
+        self.act_tool_move = QAction(svg_icon("move"), "Move", self)
+        self.act_tool_move.setCheckable(True)
+        self.act_tool_move.setChecked(True)
+        self.act_tool_move.setToolTip("Move tool (G)")
+        self.act_tool_move.triggered.connect(lambda: self.select_tool("move"))
+
+        self.act_tool_rotate = QAction(svg_icon("rotate"), "Rotate", self)
+        self.act_tool_rotate.setCheckable(True)
+        self.act_tool_rotate.setToolTip("Rotate tool (R)")
+        self.act_tool_rotate.triggered.connect(lambda: self.select_tool("rotate"))
+
+        self.act_tool_scale = QAction(svg_icon("scale"), "Scale", self)
+        self.act_tool_scale.setCheckable(True)
+        self.act_tool_scale.setToolTip("Scale tool")
+        self.act_tool_scale.triggered.connect(lambda: self.select_tool("scale"))
+
+        self.act_tool_place = QAction(svg_icon("place", "#67e8f9"), "Place", self)
+        self.act_tool_place.setCheckable(True)
+        self.act_tool_place.setToolTip("Ghost Placement Preview snapped to SCOL terrain + normal (P)")
+        self.act_tool_place.triggered.connect(lambda: self.select_tool("place"))
+
+        self.act_tool_scatter = QAction(svg_icon("scatter", "#4ade80"), "Scatter", self)
+        self.act_tool_scatter.setCheckable(True)
+        self.act_tool_scatter.setToolTip("Lumion/Twinmotion Scatter & Paint Brush (B)")
+        self.act_tool_scatter.triggered.connect(lambda: self.select_tool("scatter"))
+
+        self.act_tool_road = QAction(svg_icon("road"), "Road", self)
+        self.act_tool_road.setCheckable(True)
+        self.act_tool_road.setToolTip("ILIN Road / Racing Line tool")
+        self.act_tool_road.triggered.connect(lambda: self.select_tool("road"))
+
+        for act in (
+            self.act_tool_move,
+            self.act_tool_rotate,
+            self.act_tool_scale,
+            self.act_tool_place,
+            self.act_tool_scatter,
+            self.act_tool_road,
+        ):
+            self.tool_group.addAction(act)
+            tb.addAction(act)
+
+        tb.addSeparator()
+
+        # Grid & Angle Snap toggles + Environment / Skybox
+        self.act_grid_snap = QAction(svg_icon("snap_grid"), "Grid", self)
+        self.act_grid_snap.setCheckable(True)
+        self.act_grid_snap.setToolTip("Toggle 1.0 m Grid Snap for Move & Ghost Placement")
+        self.act_grid_snap.toggled.connect(self._toggle_grid_snap)
+        tb.addAction(self.act_grid_snap)
+
+        self.act_angle_snap = QAction(svg_icon("snap_angle"), "15°", self)
+        self.act_angle_snap.setCheckable(True)
+        self.act_angle_snap.setToolTip("Toggle 15° Angle Snap for Rotate & Ghost Placement")
+        self.act_angle_snap.toggled.connect(self._toggle_angle_snap)
+        tb.addAction(self.act_angle_snap)
+
+        tb.addSeparator()
+        tb.addAction(svg_icon("sky", "#fbbf24"), "Env/Sky", self.open_environment_panel)
+
+    # -----------------------------------------------------------------------
+    # Bottom Status Bar (with Non-Blocking Background Progress + Cancel)
+    # -----------------------------------------------------------------------
+    def _build_status_bar(self) -> None:
+        sb = QStatusBar()
+        self.setStatusBar(sb)
+
+        self.lbl_status = QLabel("Ready  |  G move  R rotate  P place  B scatter  End/Ctrl+G ground  F5 PIE")
+        self.lbl_status.setStyleSheet(f"color: {TEXT_PRIMARY}; padding: 0 6px;")
+        sb.addWidget(self.lbl_status, 1)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedWidth(130)
+        self.progress_bar.setFixedHeight(14)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
+        sb.addPermanentWidget(self.progress_bar)
+
+        self.btn_cancel_job = QPushButton("Cancel")
+        self.btn_cancel_job.setFixedHeight(18)
+        self.btn_cancel_job.setStyleSheet("font-size: 7.5pt; padding: 0px 6px;")
+        self.btn_cancel_job.clicked.connect(self._cancel_active_job)
+        self.btn_cancel_job.hide()
+        sb.addPermanentWidget(self.btn_cancel_job)
+
+        def perm_lbl(text: str, color: str = TEXT_SECONDARY) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"color: {color}; padding: 0 8px; border-left: 1px solid {BORDER};")
+            sb.addPermanentWidget(lbl)
+            return lbl
+
+        self.lbl_zone = perm_lbl("Track: —", TEXT_PRIMARY)
+        self.lbl_cam = perm_lbl("Cam 0.0, 0.0, 0.0  speed 45")
+        self.lbl_prof = perm_lbl("mlists 0  objs 0  inst 0  tris 0  draws 0  0.0 ms")
+        self.lbl_hints = perm_lbl("RMB look · WASD fly · Q/E vert · Wheel speed", TEXT_MUTED)
+
+        # UE5-style collapsible Output Log toggle button in status bar
+        self.btn_output_log = QPushButton("Output Log")
+        self.btn_output_log.setCheckable(True)
+        self.btn_output_log.setFixedHeight(18)
+        self.btn_output_log.setStyleSheet("font-size: 7.5pt; padding: 0px 8px;")
+        self.btn_output_log.toggled.connect(self._toggle_output_log)
+        sb.addPermanentWidget(self.btn_output_log)
+
+        self._build_output_log_dock()
+
+    def _build_output_log_dock(self) -> None:
+        from PySide6.QtWidgets import QCheckBox, QDockWidget, QHBoxLayout, QPlainTextEdit, QVBoxLayout
+
+        self.log_dock = QDockWidget("Output Log", self)
+        self.log_dock.setObjectName("EodOutputLogDock")
+        self.log_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea)
+        container = QWidget(self.log_dock)
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+        self.chk_log_verbose = QCheckBox("Verbose Output")
+        self.chk_log_verbose.setChecked(True)
+        btn_copy = QPushButton("Copy Log")
+        btn_copy.setFixedHeight(22)
+        btn_copy.clicked.connect(self._copy_output_log)
+        btn_clear = QPushButton("Clear")
+        btn_clear.setFixedHeight(22)
+        btn_clear.clicked.connect(lambda: self.log_text.clear())
+        hdr.addWidget(self.chk_log_verbose)
+        hdr.addStretch(1)
+        hdr.addWidget(btn_copy)
+        hdr.addWidget(btn_clear)
+        lay.addLayout(hdr)
+
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(4000)
+        self.log_text.setStyleSheet(
+            "QPlainTextEdit { background: #0f1116; color: #d6dce8; "
+            "font-family: Consolas, 'Cascadia Mono', monospace; font-size: 8.5pt; border: 1px solid #2a2f3a; }"
+        )
+        lay.addWidget(self.log_text, 1)
+        self.log_dock.setWidget(container)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+        self.log_dock.visibilityChanged.connect(lambda vis: self.btn_output_log.setChecked(vis))
+
+    def _toggle_output_log(self, checked: bool) -> None:
+        if hasattr(self, "log_dock"):
+            self.log_dock.setVisible(checked)
+
+    def _copy_output_log(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(self.log_text.toPlainText())
+            self.set_action_status("Copied Output Log to clipboard")
+
+    def append_log(self, msg: str, *, verbose: bool = False, force_open: bool = False) -> None:
+        if not hasattr(self, "log_text"):
+            return
+        if verbose and not self.chk_log_verbose.isChecked():
+            return
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_text.appendPlainText(f"[{ts}] {msg}")
+        if force_open and not self.log_dock.isVisible():
+            self.log_dock.show()
+
+    def set_action_status(self, msg: str) -> None:
+        self.lbl_status.setText(f"{msg}  |  G move  R rotate  P place  B scatter  End ground  F5 PIE")
+
+    def _show_progress(self, pct: int, msg: str) -> None:
+        self.progress_bar.setValue(pct)
+        self.progress_bar.show()
+        self.btn_cancel_job.show()
+        if msg:
+            self.set_action_status(msg)
+            self.append_log(f"[{pct:3d}%] {msg}", verbose=True)
+
+    def _hide_progress(self) -> None:
+        self.progress_bar.hide()
+        self.btn_cancel_job.hide()
+
+    def _cancel_active_job(self) -> None:
+        if self._active_token is not None:
+            self._active_token.cancel()
+            self._active_token = None
+        self._hide_progress()
+        self.set_action_status("Background task cancelled")
+
+    # -----------------------------------------------------------------------
+    # Signal Wiring
+    # -----------------------------------------------------------------------
+    def _connect_signals(self) -> None:
+        # Explorer -> MainWindow
+        self.explorer.trackSelected.connect(lambda p: self.load_track_async(Path(p)))
+        self.explorer.objectPicked.connect(self._select_object_by_id)
+        self.explorer.markerPicked.connect(self._select_marker_by_id)
+        self.explorer.roadLineSelected.connect(self._switch_road_line)
+        self.explorer.modelPlaceRequested.connect(self._place_model_in_front_of_camera)
+        self.explorer.modelSelected.connect(self._on_explorer_model_selected)
+        self.explorer.ghostPlaceRequested.connect(self._activate_ghost_place_for)
+        self.explorer.scatterModeRequested.connect(self._activate_scatter_for)
+        self.explorer.replaceSelectedRequested.connect(self._replace_selected_with_key)
+        self.explorer.layerToggled.connect(self._on_layer_toggled)
+
+        # Viewport -> MainWindow & Properties
+        self.viewport.objectSelected.connect(self._on_viewport_obj_selected)
+        self.viewport.roadNodeSelected.connect(self._on_viewport_road_selected)
+        self.viewport.markerSelected.connect(self._on_viewport_marker_selected)
+        self.viewport.barrierSelected.connect(self._on_viewport_barrier_selected)
+        self.viewport.objectTransformed.connect(self._on_viewport_obj_transformed)
+        self.viewport.markerTransformed.connect(self._on_viewport_marker_transformed)
+        self.viewport.roadNodeMoved.connect(self._on_viewport_road_moved)
+        self.viewport.roadActionRequested.connect(self._on_road_action)
+        self.viewport.modelDropped.connect(self._place_model_at)
+        self.viewport.modelStamped.connect(self._on_ghost_stamped)
+        self.viewport.scatterStrokeCompleted.connect(self._on_scatter_stroke)
+        self.viewport.dropToGroundRequested.connect(self.snap_selected_to_ground)
+        self.viewport.contextMenuRequested.connect(self._show_viewport_context_menu)
+        self.viewport.statsUpdated.connect(self._on_viewport_stats)
+        self.viewport.statusMessage.connect(self.set_action_status)
+        self.viewport.mode_pill.shieldToggled.connect(self._sync_collision_toggles)
+
+        # PIE Host -> MainWindow
+        self.pie_host.pieStopped.connect(self._on_pie_stopped)
+        self.pie_host.pieStatusChanged.connect(self.set_action_status)
+        self.pie_host.pieLogLine.connect(lambda line: self.append_log(line))
+        self.pie_host.pieRestartRequested.connect(lambda: self.start_pie(self._last_pie_mode))
+
+        # Properties -> MainWindow
+        self.properties.objectTransformEdited.connect(self._on_prop_obj_transform)
+        self.properties.snapObjectToGround.connect(self.snap_object_to_ground)
+        self.properties.deleteObjectRequested.connect(self.delete_object)
+        self.properties.editInBlenderRequested.connect(self.edit_object_in_blender)
+        self.properties.makeCollisionRequested.connect(self.make_collision_for_object)
+        self.properties.replaceObjectRequested.connect(self.replace_object_with_dialog)
+        self.properties.replaceTextureRequested.connect(self.replace_texture_dialog)
+        self.properties.resetTextureRequested.connect(self.reset_texture_to_retail)
+
+        self.properties.roadNodePosEdited.connect(self._on_prop_road_pos)
+        self.properties.roadPullOutRequested.connect(self._road_pull_out)
+        self.properties.roadDeleteNodeRequested.connect(self._road_delete_node)
+        self.properties.roadDrawFromHereRequested.connect(self._road_draw_from_here)
+        self.properties.roadDrawRoadsRequested.connect(lambda: self.select_tool("road"))
+        self.properties.roadLaneDeltaRequested.connect(self._road_lane_delta)
+        self.properties.roadSplitExitRequested.connect(self._road_split_exit)
+        self.properties.roadSplitTwoWayRequested.connect(self._road_split_two_way)
+
+        self.properties.markerTransformEdited.connect(self._on_prop_marker_edited)
+        self.properties.markerMetaEdited.connect(self._on_prop_marker_meta_edited)
+        self.properties.snapMarkerToGround.connect(self._snap_marker_to_ground)
+        self.properties.deleteMarkerRequested.connect(self._delete_marker)
+
+        self.properties.environmentChanged.connect(self._on_environment_changed)
+        self.properties.openEnvironmentRequested.connect(self.open_environment_panel)
+
+        self.properties.barrierHeightApplyRequested.connect(self.apply_barrier_height)
+        self.properties.flattenAllBarriersRequested.connect(self.flatten_all_track_barriers)
+
+    # -----------------------------------------------------------------------
+    # Track Loading (Synchronous + Non-Blocking QThreadPool Background Worker)
+    # -----------------------------------------------------------------------
+    def _attach_loaded_world(self, world: TrackWorld) -> None:
+        self.world = world
+        self.undo_stack.clear()
+        self.viewport.set_world(world)
+        self.explorer.set_world(world)
+        self.explorer.set_available_tracks(self.available_tracks, world.trk_path)
+        self.properties.show_nothing()
+        self._update_window_chrome()
+        self._sync_pie_pickers_from_world()
+        self.set_action_status(
+            f"Loaded {world.track_name}: {len(world.models)} models ({world.car_count} cars/wrecks), "
+            f"{len(world.objects)} instances, {world.total_triangles:,} tris, {len(world.road_graph.nodes)} ILIN nodes"
+        )
+        if not world.car_catalog_loaded:
+            self._start_background_car_scan()
+
+    def load_track(self, trk_path: Path, include_cars: bool = True) -> None:
+        """Synchronous track load (used by CLI/project-open/tests)."""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.set_action_status(f"Loading {trk_path.name}...")
+            QApplication.processEvents()
+            world = load_track_world(trk_path, self.game_dir, include_cars=include_cars)
+            self._attach_loaded_world(world)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Track Failed", f"Could not load {trk_path}:\n{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def load_track_async(self, trk_path: Path) -> None:
+        """Non-blocking background track load on QThreadPool so UI/OpenGL never freeze."""
+        if self.pie_host.is_running:
+            self.stop_pie()
+        self._cancel_active_job()
+        self._job_gen += 1
+        token = CancelToken(self._job_gen)
+        self._active_token = token
+        self._show_progress(5, f"Loading {trk_path.name} in background...")
+
+        worker = FunctionWorker(
+            load_track_world,
+            trk_path,
+            self.game_dir,
+            include_cars=False,
+            token=token,
+            label=f"Loading {trk_path.name}",
+        )
+        worker.signals.progress.connect(self._on_bg_progress)
+        worker.signals.finished.connect(self._on_track_loaded_bg)
+        worker.signals.failed.connect(self._on_bg_failed)
+        worker.signals.cancelled.connect(self._on_bg_cancelled)
+        start_worker(worker, priority=10)
+
+    def _on_bg_cancelled(self, gen: int) -> None:
+        if gen == self._job_gen:
+            self._active_token = None
+            self._hide_progress()
+
+    def _on_bg_progress(self, gen: int, pct: int, msg: str) -> None:
+        if gen == self._job_gen:
+            self._show_progress(pct, msg)
+
+    def _on_track_loaded_bg(self, gen: int, world: TrackWorld) -> None:
+        if gen != self._job_gen:
+            return
+        self._active_token = None
+        self._hide_progress()
+        self._attach_loaded_world(world)
+
+    def _on_bg_failed(self, gen: int, err: str) -> None:
+        if gen != self._job_gen:
+            return
+        self._active_token = None
+        self._hide_progress()
+        self.append_log(f"[ERROR] Background task failed:\n{err}", force_open=True)
+        QMessageBox.critical(self, "Background Task Failed", err)
+
+    def _start_background_car_scan(self) -> None:
+        """Scan all 37 retail DATA/CAR/*.CAR files asynchronously on QThreadPool."""
+        if self._car_token is not None:
+            self._car_token.cancel()
+        self._car_job_gen += 1
+        token = CancelToken(self._car_job_gen)
+        self._car_token = token
+        worker = FunctionWorker(
+            load_car_catalog,
+            self.game_dir,
+            token=token,
+            label="Scanning DATA/CAR",
+        )
+        worker.signals.finished.connect(self._on_cars_loaded_bg)
+        start_worker(worker, priority=0)
+
+    def _on_cars_loaded_bg(self, gen: int, res: tuple[dict[str, Any], dict[str, Any]]) -> None:
+        if gen != self._car_job_gen or self.world is None:
+            return
+        c_models, c_tex = res
+        merge_car_catalog_into_world(self.world, c_models, c_tex)
+        self.viewport.ensure_gl_textures()
+        self.explorer.refresh_model_categories()
+        self.explorer.refresh_counts()
+        self.explorer._rebuild_model_grid()
+        self.set_action_status(f"Loaded {self.world.car_count} retail Cars & Wrecks from DATA/CAR/")
+
+    def reload_current_track(self) -> None:
+        if self.world is not None:
+            self.load_track_async(self.world.trk_path)
+
+    # -----------------------------------------------------------------------
+    # Project & Non-Destructive Mod Layer Management
+    # -----------------------------------------------------------------------
+    def _default_mod_dir(self) -> Path:
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.project_name).strip("_") or "world_mod"
+        return self.game_dir / "mods" / slug
+
+    def new_project(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "New World Project", "Project name:", text=f"{self.world.display_name if self.world else 'EOD'} Mod"
+        )
+        if not ok or not name.strip():
+            return
+        self.project_name = name.strip()
+        self.project_path = None
+        if self.world is not None:
+            self.load_track_async(self.world.trk_path)
+        self._update_window_chrome()
+        self._sync_pie_pickers_from_world()
+        self.set_action_status(f"Started new world project '{self.project_name}'")
+
+    def open_project_dialog(self) -> None:
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Open World Project", str(self.game_dir), "EOD World Project (*.eodworld.json);;JSON (*.json)"
+        )
+        if fn:
+            self.open_project_file(Path(fn))
+
+    def open_project_file(self, path: Path) -> None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            trk_rel = raw.get("trk_rel", "")
+            trk_path = (self.game_dir / trk_rel) if trk_rel else None
+            if not trk_path or not trk_path.is_file():
+                want = str(raw.get("track", "")).upper()
+                trk_path = next((p for p in self.available_tracks if p.stem.upper() == want), None)
+            if trk_path is None:
+                raise FileNotFoundError(f"Track {raw.get('track')} not found in {self.game_dir}")
+            self.load_track(trk_path, include_cars=True)
+            assert self.world is not None
+            doc = apply_project_overlay(self.world, path)
+            self.project_name = doc.get("project_name", path.stem)
+            self.project_path = path
+            if doc.get("camera"):
+                self.viewport.apply_camera_state(doc["camera"])
+            for tname, ta in self.world.textures.items():
+                if ta.is_replaced:
+                    self.viewport.update_gl_texture(tname)
+            self.viewport.mark_collision_dirty()
+            self.viewport.mark_scene_dirty()
+            self.explorer.refresh_counts()
+            self._update_window_chrome()
+            self._sync_pie_pickers_from_world()
+            self.set_action_status(f"Opened project '{self.project_name}' from {path.name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Project Failed", str(exc))
+
+    def save_project(self) -> None:
+        if self.world is None:
+            return
+        if self.project_path is None:
+            self.save_project_as()
+            return
+        saved = save_project_overlay(self.project_path, self.project_name, self.world, self.viewport.camera_state())
+        self.project_path = saved
+        self.set_action_status(f"Saved project overlay -> {saved.name}")
+
+    def save_project_as(self) -> None:
+        if self.world is None:
+            return
+        default_dir = self._default_mod_dir()
+        default_file = default_dir / f"{default_dir.name}.eodworld.json"
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Save World Project Overlay", str(default_file), "EOD World Project (*.eodworld.json)"
+        )
+        if not fn:
+            return
+        saved = save_project_overlay(Path(fn), self.project_name, self.world, self.viewport.camera_state())
+        self.project_path = saved
+        self.set_action_status(f"Saved project overlay -> {saved.name}")
+
+    def write_mod_layer_dialog(self) -> None:
+        if self.world is None:
+            return
+        default_out = self._default_mod_dir()
+        default_out.parent.mkdir(parents=True, exist_ok=True)
+        dest = QFileDialog.getExistingDirectory(self, "Select Output Directory for Mod Layer", str(default_out.parent))
+        if not dest:
+            return
+        slug = default_out.name
+        out_dir = Path(dest) / slug if Path(dest).name != slug else Path(dest)
+        try:
+            report = export_mod_layer(self.world, self.project_name, out_dir)
+            self._refresh_after_edit()
+            self.set_action_status(f"Wrote mod layer to {out_dir}")
+            QMessageBox.information(
+                self,
+                "Mod Layer Written",
+                f"Non-destructive mod layer exported successfully!\n\n"
+                f"Output folder: {out_dir}\n"
+                f"Mod TRK copy: {report['mod_trk']}\n"
+                f"Retail placement edits: {report['retail_placement_edits']} "
+                f"({report['changed_payload_bytes']:,} bytes patched, {report['deleted_retail_objects']} deleted)\n"
+                f"SOBL barriers patched: {report['sobl_barriers_patched']}\n"
+                f"ILIN lines patched: {len(report['ilin_patched_lines'])}\n"
+                f"HOSTTEX textures exported: {report['host_textures_exported']}\n"
+                f"Editor-placed objects: {report['editor_placed_objects']}\n\n"
+                f"Retail .TRK SHA-256 verified UNTOUCHED.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Mod Layer Failed", str(exc))
+
+    def choose_game_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select EOD Game Data Directory", str(self.game_dir))
+        if not d:
+            return
+        self.game_dir = Path(d)
+        self.available_tracks = discover_tracks(self.game_dir)
+        self.explorer.set_available_tracks(self.available_tracks)
+        if self.available_tracks:
+            self.load_track_async(self.available_tracks[0])
+        else:
+            self.set_action_status(f"No .TRK files found under {self.game_dir / 'DATA' / 'TRACKS'}")
+
+    def open_tracks_folder(self) -> None:
+        tracks_dir = self.game_dir / "DATA" / "TRACKS"
+        if tracks_dir.is_dir() and sys.platform == "win32":
+            os.startfile(str(tracks_dir))
+
+    # -----------------------------------------------------------------------
+    # Unreal Engine 4/5 Play-In-Editor (PIE) Embedded Viewport
+    # -----------------------------------------------------------------------
+    def start_pie(self, mode: str = "free_roam") -> None:
+        """Compile mod layer on QThreadPool worker, then embed live `eod.exe` inside central viewport."""
+        if self.world is None:
+            return
+        self._last_pie_mode = mode
+        mod_dir = self._default_mod_dir()
+
+        # Pause background thumbnail & car-scan workers so PIE compile & eod.exe get full CPU/GPU
+        if getattr(self.explorer, "_thumb_token", None) is not None:
+            self.explorer._thumb_token.cancel()
+        if self._car_token is not None:
+            self._car_token.cancel()
+            self._car_token = None
+
+        self._cancel_active_job()
+        self._job_gen += 1
+        token = CancelToken(self._job_gen)
+        self._active_token = token
+        self._pending_pie_mod_dir = mod_dir
+        self._pending_pie_mode = mode
+        self._show_progress(10, f"Compiling mod layer for PIE ({mode})...")
+
+        worker = FunctionWorker(
+            export_mod_layer,
+            self.world,
+            self.project_name,
+            mod_dir,
+            token=token,
+            label="Compiling Mod Layer for PIE",
+        )
+        worker.signals.progress.connect(self._on_bg_progress)
+        worker.signals.finished.connect(self._on_pie_compile_done_slot)
+        worker.signals.failed.connect(self._on_bg_failed)
+        worker.signals.cancelled.connect(self._on_bg_cancelled)
+        start_worker(worker, priority=10)
+
+    def _on_pie_compile_done_slot(self, gen: int, report: dict[str, Any]) -> None:
+        self._on_pie_compile_done(gen, report, self._pending_pie_mod_dir, self._pending_pie_mode)
+
+    def _on_pie_compile_done(self, gen: int, _report: dict[str, Any], mod_dir: Path, mode: str) -> None:
+        if gen != self._job_gen or self.world is None:
+            return
+        self._active_token = None
+        self._hide_progress()
+
+        cfg = self.world.custom_race
+        rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
+        spec = build_pie_launch_spec(
+            self.game_dir,
+            mod_dir,
+            self.world.display_name,
+            mode=mode,
+            event_name=cfg.event_type,
+            car_name=cfg.player_car,
+            ai_count=cfg.ai_count,
+            free_roam_place=cfg.free_roam_place,
+            renderer_mode=rmode,
+        )
+        self.append_log(
+            f"[PIE] Compile finished. Launching {spec['exe']} | {spec['direct_start']} "
+            f"| EOD_NATIVE={spec['env'].get('EOD_NATIVE')} EOD_MODERN={spec['env'].get('EOD_MODERN')}",
+            verbose=True,
+        )
+        self.center_stack.setCurrentWidget(self.pie_host)
+        self.act_pie_stop.setEnabled(True)
+        ok = self.pie_host.start_pie(spec)
+        if not ok:
+            self.act_pie_stop.setEnabled(False)
+            self.center_stack.setCurrentWidget(self.viewport)
+            self.append_log(f"[PIE][ERROR] Could not launch eod.exe at: {spec['exe']}", force_open=True)
+            QMessageBox.warning(self, "Play In Editor (PIE)", f"Could not launch eod.exe at:\n{spec['exe']}")
+
+    def stop_pie(self) -> None:
+        self.pie_host.stop_pie(emit_signal=True)
+
+    def _on_pie_stopped(self) -> None:
+        self.act_pie_stop.setEnabled(False)
+        self.center_stack.setCurrentWidget(self.viewport)
+        self.viewport.setFocus()
+        self.viewport.update()
+
+    def launch_game(self) -> None:
+        """Alias for backward compatibility: runs PIE Free Roam."""
+        self.start_pie("free_roam")
+
+    # -----------------------------------------------------------------------
+    # Tools, Snapping & View Toggles
+    # -----------------------------------------------------------------------
+    def select_tool(self, tool: str) -> None:
+        if tool in ("place", "scatter") and not self.viewport.ghost_model_key:
+            cur = self.explorer.current_model_key()
+            if cur:
+                self.viewport.set_ghost_model(cur)
+            elif self.world and self.world.models:
+                # Prefer a car/wreck if available, else first model
+                car_k = next((k for k, m in self.world.models.items() if m.category == "car-wreck"), None)
+                self.viewport.set_ghost_model(car_k or next(iter(self.world.models.keys())))
+        self.viewport.set_tool(tool)
+        self.act_tool_move.setChecked(tool == "move")
+        self.act_tool_rotate.setChecked(tool == "rotate")
+        self.act_tool_scale.setChecked(tool == "scale")
+        self.act_tool_place.setChecked(tool == "place")
+        self.act_tool_scatter.setChecked(tool == "scatter")
+        self.act_tool_road.setChecked(tool == "road")
+        if tool == "road":
+            self.act_v_roads.setChecked(True)
+
+    def _on_pie_picker_changed(self, *_args: Any) -> None:
+        if self.world is None:
+            return
+        ev = self.cmb_pie_event.currentText().strip()
+        car = self.cmb_pie_car.currentText().strip() or "Algar"
+        ai = int(self.spn_pie_ai.value())
+        self.world.custom_race.event_type = ev
+        self.world.custom_race.event_name = ev
+        self.world.custom_race.player_car = car
+        self.world.custom_race.ai_count = ai
+
+    def _sync_pie_pickers_from_world(self) -> None:
+        if self.world is None or not hasattr(self, "cmb_pie_event"):
+            return
+        self.cmb_pie_event.blockSignals(True)
+        self.cmb_pie_event.clear()
+        events = ["Battle (Free Roam)"]
+        for ev in self.world.available_events:
+            if ev not in events:
+                events.append(ev)
+        if "Career Overworld (Free Roam)" not in events:
+            events.append("Career Overworld (Free Roam)")
+        self.cmb_pie_event.addItems(events)
+        cur_ev = self.world.custom_race.event_type
+        idx = self.cmb_pie_event.findText(cur_ev, Qt.MatchFlag.MatchFixedString)
+        self.cmb_pie_event.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_pie_event.blockSignals(False)
+
+        self.cmb_pie_car.blockSignals(True)
+        cidx = self.cmb_pie_car.findText(self.world.custom_race.player_car, Qt.MatchFlag.MatchFixedString)
+        if cidx >= 0:
+            self.cmb_pie_car.setCurrentIndex(cidx)
+        self.cmb_pie_car.blockSignals(False)
+
+        self.spn_pie_ai.blockSignals(True)
+        self.spn_pie_ai.setValue(max(0, min(12, int(self.world.custom_race.ai_count))))
+        self.spn_pie_ai.blockSignals(False)
+
+    def _on_renderer_mode_changed(self, _index: int) -> None:
+        rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
+        self.viewport.set_render_mode(rmode)
+        label = "Plume HQ (EOD_MODERN=1)" if rmode == "plume" else "PS2 Fast (EOD_NATIVE=0, EOD_MODERN=0)"
+        self.append_log(f"[Renderer] Switched to {label}", verbose=True)
+        self.set_action_status(f"Renderer mode: {label}")
+
+    def _toggle_grid_snap(self, on: bool) -> None:
+        self.viewport.grid_snap_enabled = on
+        self.set_action_status(f"Grid Snap ({self.viewport.grid_snap_step:.1f} m): {'ON' if on else 'OFF'}")
+
+    def _toggle_angle_snap(self, on: bool) -> None:
+        self.viewport.angle_snap_enabled = on
+        self.set_action_status(f"Angle Snap ({self.viewport.angle_snap_step:.0f}°): {'ON' if on else 'OFF'}")
+
+    def _toggle_wireframe(self, on: bool) -> None:
+        self.viewport.show_wireframe = on
+        self.viewport.update()
+
+    def _toggle_collision(self, on: bool) -> None:
+        self.viewport.show_collision = on
+        self.viewport.mode_pill.btn_shield.blockSignals(True)
+        self.viewport.mode_pill.btn_shield.setChecked(on)
+        self.viewport.mode_pill.btn_shield.blockSignals(False)
+        if "collision" in self.explorer.layer_checks:
+            self.explorer.layer_checks["collision"].blockSignals(True)
+            self.explorer.layer_checks["collision"].setChecked(on)
+            self.explorer.layer_checks["collision"].blockSignals(False)
+        self.viewport.update()
+
+    def _sync_collision_toggles(self, on: bool) -> None:
+        self.act_v_col.blockSignals(True)
+        self.act_v_col.setChecked(on)
+        self.act_v_col.blockSignals(False)
+        if "collision" in self.explorer.layer_checks:
+            self.explorer.layer_checks["collision"].blockSignals(True)
+            self.explorer.layer_checks["collision"].setChecked(on)
+            self.explorer.layer_checks["collision"].blockSignals(False)
+
+    def _toggle_markers(self, on: bool) -> None:
+        self.viewport.show_markers = on
+        self.viewport.update()
+
+    def _toggle_lighting(self, on: bool) -> None:
+        self.viewport.show_lighting = on
+        self.viewport.update()
+
+    def _toggle_labels(self, on: bool) -> None:
+        self.viewport.show_labels = on
+        self.viewport.update()
+
+    def _toggle_roads(self, on: bool) -> None:
+        self.viewport.show_roads = on
+        self.viewport.update()
+
+    def _toggle_grid(self, on: bool) -> None:
+        self.viewport.show_grid = on
+        self.viewport.update()
+
+    def _on_layer_toggled(self, key: str, visible: bool) -> None:
+        if key == "roads":
+            self.act_v_roads.setChecked(visible)
+        elif key == "collision":
+            self.act_v_col.setChecked(visible)
+        elif key == "markers":
+            self.act_v_markers.setChecked(visible)
+        else:
+            self.viewport.layer_visibility[key] = visible
+            self.viewport.mark_scene_dirty()
+
+    def _toggle_layer_by_key(self, key: str) -> None:
+        cb = self.explorer.layer_checks.get(key)
+        if cb is not None:
+            cb.setChecked(not cb.isChecked())
+
+    # -----------------------------------------------------------------------
+    # Selection, Context Menu & Refresh
+    # -----------------------------------------------------------------------
+    def _refresh_after_edit(self) -> None:
+        self.viewport.mark_scene_dirty()
+        self.viewport.mark_collision_dirty()
+        self.explorer.refresh_counts()
+        if self.viewport.selected_obj is not None and self.world is not None:
+            self.properties.show_object(self.viewport.selected_obj, self.world.textures)
+        elif self.viewport.selected_road_node_id is not None and self.world is not None:
+            node = self.world.road_graph.nodes.get(self.viewport.selected_road_node_id)
+            self.properties.show_road_node(node, self.world.road_graph)
+        elif self.viewport.selected_marker is not None:
+            self.properties.show_marker(self.viewport.selected_marker)
+        elif self.viewport.selected_barrier_idx >= 0 and self.world is not None:
+            rec = self.world.collision.sobl_records[self.viewport.selected_barrier_idx]
+            self.properties.show_barrier(rec)
+        elif self.properties.stack.currentIndex() != 4:
+            self.properties.show_nothing()
+
+    def _on_viewport_obj_selected(self, obj: WorldObject | None) -> None:
+        self.properties.show_object(obj, self.world.textures if self.world else None)
+        if obj is not None:
+            self.set_action_status(f"Selected {obj.name} ({obj.source}, {obj.tri_count} tris)")
+
+    def _on_viewport_road_selected(self, node: RoadNode | None) -> None:
+        if self.world is None:
+            return
+        self.properties.show_road_node(node, self.world.road_graph)
+        if node is not None:
+            kind = self.world.road_graph.node_kind(node.node_id)
+            self.set_action_status(f"Selected Road node {node.node_id} ({kind})")
+
+    def _on_viewport_marker_selected(self, marker: WorldMarker | None) -> None:
+        self.properties.show_marker(marker)
+        if marker is not None:
+            self.set_action_status(f"Selected {marker.kind}: {marker.name}")
+
+    def _on_viewport_barrier_selected(self, rec_idx: int) -> None:
+        if self.world is None or rec_idx < 0 or rec_idx >= len(self.world.collision.sobl_records):
+            return
+        rec = self.world.collision.sobl_records[rec_idx]
+        self.properties.show_barrier(rec)
+        self.set_action_status(
+            f"Selected SOBL Barrier #{rec_idx} ({rec['surface_name']}, +{rec['above_ground']:.1f} m above ground)"
+        )
+
+    def _show_viewport_context_menu(self, global_pos: QPoint) -> None:
+        obj = self.viewport.selected_obj
+        if obj is None or obj.deleted:
+            return
+        menu = QMenu(self)
+        menu.addAction(svg_icon("replace", "#93c5fd"), "Replace Selection With...", lambda: self.replace_object_with_dialog(obj))
+        menu.addAction(svg_icon("ground"), "Snap to Ground (End / Ctrl+G)", lambda: self.snap_object_to_ground(obj))
+        menu.addAction("Duplicate (Ctrl+D)", self.duplicate_selected_object)
+        menu.addSeparator()
+        menu.addAction(svg_icon("blender"), "Edit in Blender (OBJ)...", lambda: self.edit_object_in_blender(obj))
+        menu.addAction(svg_icon("shield"), "Make Collision Box", lambda: self.make_collision_for_object(obj))
+        menu.addSeparator()
+        menu.addAction(svg_icon("trash", "#ff99a2"), "Delete (Del)", lambda: self.delete_object(obj))
+        menu.exec(global_pos)
+
+    def _select_object_by_id(self, obj_id: str) -> None:
+        if self.world is None:
+            return
+        obj = self.world.object_by_id(obj_id)
+        if obj is not None:
+            self.viewport.select_object(obj)
+            self.viewport.frame_selection()
+
+    def _select_marker_by_id(self, marker_id: str) -> None:
+        if self.world is None:
+            return
+        mk = next((m for m in self.world.markers if m.marker_id == marker_id), None)
+        if mk is not None:
+            self.viewport.select_marker(mk)
+            c = np.array(mk.position, dtype=np.float32)
+            self.viewport.cam_pos = c + np.array([-22.0, 16.0, -22.0], dtype=np.float32)
+            self.viewport.look_at(c)
+            self.viewport.update()
+
+    def _switch_road_line(self, line_name: str) -> None:
+        if self.world is None or line_name not in self.world.all_road_graphs:
+            return
+        self.world.road_graph = self.world.all_road_graphs[line_name]
+        self.world.custom_race.ilin_line = line_name
+        self.viewport.selected_road_node_id = None
+        self.viewport.road_chain_last_node = None
+        self.viewport.update()
+        self.explorer.refresh_counts()
+        self.set_action_status(f"Switched active ILIN line to {line_name} ({len(self.world.road_graph.nodes)} nodes)")
+
+    # -----------------------------------------------------------------------
+    # Explorer -> Ghost Place / Scatter / Replace Wiring
+    # -----------------------------------------------------------------------
+    def _on_explorer_model_selected(self, model_key: str) -> None:
+        self.viewport.set_ghost_model(model_key)
+
+    def _activate_ghost_place_for(self, model_key: str) -> None:
+        self.viewport.set_ghost_model(model_key)
+        self.select_tool("place")
+
+    def _activate_scatter_for(self, model_key: str) -> None:
+        self.viewport.set_ghost_model(model_key)
+        self.select_tool("scatter")
+
+    def _replace_selected_with_key(self, model_key: str) -> None:
+        if self.viewport.selected_obj is None:
+            self.set_action_status("Select an object in the 3D viewport first to swap it")
+            return
+        self.replace_object_model(self.viewport.selected_obj, model_key)
+
+    # -----------------------------------------------------------------------
+    # Object Operations (Move, Rotate, Scale, Replace With, Ghost, Scatter)
+    # -----------------------------------------------------------------------
+    def _on_viewport_obj_transformed(self, obj, old_p, old_r, old_s, new_p, new_r, new_s, label: str) -> None:
+        self.undo_stack.push(
+            TransformObjectCommand(obj, old_p, old_r, old_s, new_p, new_r, new_s, self._refresh_after_edit, label)
+        )
+        self.set_action_status(f"{label}: {obj.name}")
+
+    def _on_prop_obj_transform(self, obj: WorldObject, new_p, new_r, new_s) -> None:
+        if obj.position == new_p and obj.rotation_hpr == new_r and obj.scale == new_s:
+            return
+        self.undo_stack.push(
+            TransformObjectCommand(
+                obj, obj.position, obj.rotation_hpr, obj.scale, new_p, new_r, new_s, self._refresh_after_edit, "Edit transform"
+            )
+        )
+        self.set_action_status(f"Updated transform for {obj.name}")
+
+    def replace_object_model(self, obj: WorldObject, new_model_key: str) -> bool:
+        """Undoably swap `obj`'s model with any other model or Car/Wreck."""
+        if self.world is None or new_model_key not in self.world.models or obj.deleted:
+            return False
+        self.viewport.ensure_gl_textures()
+        self.undo_stack.push(ReplaceObjectModelCommand(self.world, obj, new_model_key, self._refresh_after_edit))
+        self.set_action_status(f"Replaced object with {self.world.models[new_model_key].name}")
+        return True
+
+    def replace_object_with_dialog(self, obj: WorldObject) -> None:
+        if self.world is None:
+            return
+        dlg = ReplaceModelDialog(self.world, self.explorer.thumb_cache, obj.name, parent=self)
+        if dlg.exec() and dlg.selected_model_key:
+            self.replace_object_model(obj, dlg.selected_model_key)
+
+    def replace_selected_with_dialog(self) -> None:
+        if self.viewport.selected_obj is not None:
+            self.replace_object_with_dialog(self.viewport.selected_obj)
+
+    def snap_object_to_ground(self, obj: WorldObject) -> None:
+        if self.world is None or obj.deleted:
+            return
+        model = self.world.models.get(obj.model_key)
+        if not model:
+            return
+        gx, gz = obj.position[0], obj.position[2]
+        gy = self.world.collision.ground_height(gx, gz, below=obj.position[1] + 5.0)
+        lo, _hi = obj.world_aabb(model)
+        bottom_offset = obj.position[1] - float(lo[1])
+        new_pos = (gx, gy + bottom_offset, gz)
+        self.undo_stack.push(
+            TransformObjectCommand(
+                obj, obj.position, obj.rotation_hpr, obj.scale, new_pos, obj.rotation_hpr, obj.scale,
+                self._refresh_after_edit, "Snap to ground",
+            )
+        )
+        self.set_action_status(f"Snapped {obj.name} to ground (Y={new_pos[1]:.2f} m)")
+
+    def snap_selected_to_ground(self) -> None:
+        if self.viewport.selected_obj is not None:
+            self.snap_object_to_ground(self.viewport.selected_obj)
+        elif self.viewport.selected_marker is not None:
+            self._snap_marker_to_ground(self.viewport.selected_marker)
+
+    def delete_object(self, obj: WorldObject) -> None:
+        self.undo_stack.push(DeleteObjectCommand(obj, self._refresh_after_edit))
+        self.viewport.select_object(None)
+        self.set_action_status(f"Deleted {obj.name}")
+
+    def delete_selected_item(self) -> None:
+        if self.viewport.selected_obj is not None:
+            self.delete_object(self.viewport.selected_obj)
+        elif self.viewport.selected_road_node_id is not None:
+            self._road_delete_node(self.viewport.selected_road_node_id)
+        elif self.viewport.selected_marker is not None:
+            self._delete_marker(self.viewport.selected_marker)
+
+    def duplicate_selected_object(self) -> None:
+        if self.world is None or self.viewport.selected_obj is None:
+            return
+        src = self.viewport.selected_obj
+        pos = (src.position[0] + 4.0, src.position[1], src.position[2] + 4.0)
+        self._place_model_at(src.model_key, pos[0], pos[1], pos[2], rot=src.rotation_hpr, scale=src.scale)
+
+    def _build_placed_object(
+        self,
+        model_key: str,
+        x: float,
+        y: float,
+        z: float,
+        rot: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> WorldObject | None:
+        if self.world is None or model_key not in self.world.models:
+            return None
+        wm = self.world.models[model_key]
+        obj_id = f"ed_{self._placed_counter:04d}"
+        self._placed_counter += 1
+        y_adj = y - float(wm.bbox_min[1]) * scale[1]
+        cat = wm.category if wm.category != "prop-catalog" else "dyno"
+        return WorldObject(
+            obj_id=obj_id,
+            name=wm.name,
+            model_key=model_key,
+            source="Placed by the editor",
+            category=cat,
+            subtype=wm.subtype,
+            section_mlist="editor_layer",
+            model_store=wm.model_store,
+            hash_hex=wm.hash_hex,
+            tri_count=wm.tri_count,
+            textures=list(wm.textures),
+            position=(x, y_adj, z),
+            rotation_hpr=rot,
+            scale=scale,
+            written=False,
+        )
+
+    def _place_model_in_front_of_camera(self, model_key: str) -> None:
+        if self.world is None:
+            return
+        fwd, _, _ = self.viewport.camera_vectors()
+        p = self.viewport.cam_pos + fwd * 28.0
+        gy = self.world.collision.ground_height(float(p[0]), float(p[2]))
+        self._place_model_at(model_key, float(p[0]), gy, float(p[2]))
+
+    def _place_model_at(
+        self,
+        model_key: str,
+        x: float,
+        y: float,
+        z: float,
+        rot: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> WorldObject | None:
+        obj = self._build_placed_object(model_key, x, y, z, rot=rot, scale=scale)
+        if obj is None or self.world is None:
+            return None
+        self.viewport.ensure_gl_textures()
+        self.undo_stack.push(PlaceObjectCommand(self.world, obj, self._refresh_after_edit))
+        self.viewport.select_object(obj)
+        self.set_action_status(f"Placed {obj.name} at ({obj.position[0]:.1f}, {obj.position[1]:.1f}, {obj.position[2]:.1f})")
+        return obj
+
+    def _on_ghost_stamped(self, model_key: str, pos: tuple[float, float, float], rot: tuple[float, float, float], scale: tuple[float, float, float]) -> None:
+        obj = self._build_placed_object(model_key, pos[0], pos[1], pos[2], rot=rot, scale=scale)
+        if obj is None or self.world is None:
+            return
+        self.viewport.ensure_gl_textures()
+        self.undo_stack.push(PlaceObjectCommand(self.world, obj, self._refresh_after_edit))
+        self.set_action_status(f"Stamped {obj.name} at ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
+
+    def _on_scatter_stroke(self, items: list[dict[str, Any]]) -> list[WorldObject]:
+        if self.world is None or not items:
+            return []
+        objs: list[WorldObject] = []
+        for it in items:
+            px, py, pz = it["pos"]
+            o = self._build_placed_object(it["model_key"], px, py, pz, rot=tuple(it["rot_hpr"]), scale=tuple(it["scale"]))
+            if o is not None:
+                objs.append(o)
+        if objs:
+            self.viewport.ensure_gl_textures()
+            self.undo_stack.push(ScatterPlaceCommand(self.world, objs, self._refresh_after_edit))
+            self.set_action_status(f"Scattered {len(objs)} instances of {objs[0].name}")
+        return objs
+
+    def make_collision_for_object(self, obj: WorldObject) -> None:
+        if self.world is None:
+            return
+        self.undo_stack.push(MakeCollisionCommand(self.world, obj, self._refresh_after_edit))
+        self.act_v_col.setChecked(True)
+        self.set_action_status(f"Generated collision box for {obj.name}")
+
+    def make_collision_for_selected(self) -> None:
+        if self.viewport.selected_obj is not None:
+            self.make_collision_for_object(self.viewport.selected_obj)
+
+    def edit_object_in_blender(self, obj: WorldObject) -> None:
+        if self.world is None:
+            return
+        export_dir = self.game_dir / "mods" / "blender_exports" / self.world.track_name.lower()
+        try:
+            obj_path = export_object_obj(self.world, obj, export_dir)
+            self.set_action_status(f"Exported Blender OBJ -> {obj_path}")
+            QMessageBox.information(
+                self,
+                "Edit in Blender",
+                f"Exported mesh + MTL + textures (Blender RH Z-up):\n\n{obj_path}\n\n"
+                f"Open this OBJ directly in Blender to inspect or edit geometry.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Blender Export Failed", str(exc))
+
+    def edit_selected_in_blender(self) -> None:
+        if self.viewport.selected_obj is not None:
+            self.edit_object_in_blender(self.viewport.selected_obj)
+
+    # -----------------------------------------------------------------------
+    # Live Texture Replacement (OpenGL 3.3 + Vulkan HOSTTEX Export)
+    # -----------------------------------------------------------------------
+    def _on_texture_swapped(self, tex_name: str) -> None:
+        self.viewport.update_gl_texture(tex_name)
+        if self.viewport.selected_obj is not None and self.world is not None:
+            self.properties.show_object(self.viewport.selected_obj, self.world.textures)
+
+    def replace_texture_from_png(self, tex_name: str, png_path: Path | str) -> bool:
+        """Load `png_path` and undoably replace `tex_name` live in OpenGL + HOSTTEX queue."""
+        if self.world is None or tex_name not in self.world.textures:
+            return False
+        w, h, rgba = load_png_rgba(png_path)
+        self.undo_stack.push(
+            ReplaceTextureCommand(
+                self.world, tex_name, rgba, w, h, str(Path(png_path).resolve()), self._on_texture_swapped
+            )
+        )
+        self.set_action_status(f"Replaced texture {tex_name} with {Path(png_path).name} ({w}x{h}) — Ctrl+Shift+S exports HOSTTEX")
+        return True
+
+    def replace_texture_dialog(self, tex_name: str) -> None:
+        if self.world is None or tex_name not in self.world.textures:
+            return
+        fn, _ = QFileDialog.getOpenFileName(
+            self, f"Replace Texture '{tex_name}' with PNG", str(self.game_dir), "Images (*.png *.jpg *.bmp *.tga)"
+        )
+        if not fn:
+            return
+        try:
+            self.replace_texture_from_png(tex_name, fn)
+        except Exception as exc:
+            QMessageBox.critical(self, "Replace Texture Failed", str(exc))
+
+    def reset_texture_to_retail(self, tex_name: str) -> None:
+        if self.world is None or tex_name not in self.world.textures:
+            return
+        ta = self.world.textures[tex_name]
+        if not ta.is_replaced:
+            return
+        self.undo_stack.push(
+            ReplaceTextureCommand(
+                self.world, tex_name, ta.orig_rgba, ta.orig_width, ta.orig_height, None, self._on_texture_swapped
+            )
+        )
+        self.set_action_status(f"Reset texture {tex_name} back to retail")
+
+    # -----------------------------------------------------------------------
+    # Environment / Skybox & SOBL Barrier Removal
+    # -----------------------------------------------------------------------
+    def open_environment_panel(self) -> None:
+        if self.world is None:
+            return
+        stems = [p.stem.upper() for p in self.available_tracks]
+        self.properties.show_environment(self.world.environment, stems)
+        self.set_action_status(f"Environment / Skybox inspector active ({self.world.environment.preset_name})")
+
+    def _on_environment_changed(self) -> None:
+        if self.world is None:
+            return
+        self.viewport.update()
+        b = self.world.environment.borrowed_sky_track
+        extra = f" · Borrowed sky: {b}" if b else ""
+        self.set_action_status(f"Atmosphere updated: {self.world.environment.preset_name}{extra}")
+
+    def apply_barrier_height(self, rec_idx: int, target_top: float) -> None:
+        if self.world is None or not (0 <= rec_idx < len(self.world.collision.sobl_records)):
+            return
+        self.undo_stack.push(
+            ModifyBarrierCommand(
+                self.world, {rec_idx: float(target_top)}, self._refresh_after_edit, f"Set barrier #{rec_idx} height"
+            )
+        )
+        self.act_v_col.setChecked(True)
+        self.set_action_status(f"Updated SOBL barrier #{rec_idx} top to {target_top:+.2f} m above ground")
+
+    def flatten_all_track_barriers(self, target_top: float = -0.5) -> int:
+        """One-click undoable removal/flattening of all vertical SOBL invisible walls on the track."""
+        if self.world is None:
+            return 0
+        targets: dict[int, float] = {}
+        for rec in self.world.collision.sobl_records:
+            if rec.get("kind") == "box" and rec.get("vertical") and float(rec.get("above_ground", 0.0)) > target_top:
+                targets[int(rec["index"])] = float(target_top)
+        if not targets:
+            self.set_action_status("No vertical SOBL barriers above ground to flatten")
+            return 0
+        self.undo_stack.push(
+            ModifyBarrierCommand(
+                self.world, targets, self._refresh_after_edit, f"Flatten {len(targets)} track barriers"
+            )
+        )
+        self.act_v_col.setChecked(True)
+        self.set_action_status(f"Flattened {len(targets)} SOBL track barriers (invisible walls removed — Ctrl+Shift+S writes track.sol)")
+        return len(targets)
+
+    def _show_tallest_barriers(self) -> None:
+        if self.world is None:
+            return
+        boxes = [r for r in self.world.collision.sobl_records if r.get("kind") == "box"]
+        tall = sorted(boxes, key=lambda r: -float(r.get("above_ground", 0.0)))[:12]
+        lines = [
+            f"  • Barrier #{r['index']:4d} ({r['surface_name']}): +{r['above_ground']:.2f} m above ground (ry={r['half_extents'][1]:.2f} m)"
+            for r in tall
+        ]
+        tall10 = sum(1 for r in boxes if float(r.get("above_ground", 0.0)) >= 10.0)
+        QMessageBox.information(
+            self,
+            "Tallest SOBL Track Barriers",
+            f"Track: {self.world.display_name}\n"
+            f"Total SOBL boxes: {len(boxes)}  |  Tall invisible walls (>=10 m): {tall10}\n\n"
+            + ("\n".join(lines) if lines else "No SOBL boxes found.")
+            + "\n\nTip: Toggle Collision Overlay and click any barrier to edit it, or use Collision -> Remove / Flatten Track Barriers.",
+        )
+
+    # -----------------------------------------------------------------------
+    # Custom Race & AI Pathfinding (ILIN) Dialog
+    # -----------------------------------------------------------------------
+    def open_custom_race_dialog(self) -> None:
+        if self.world is None:
+            return
+        dlg = CustomRaceDialog(self.world, parent=self)
+        if dlg.exec():
+            cfg = self.world.custom_race
+            if cfg.ilin_line in self.world.all_road_graphs and cfg.ilin_line != self.world.road_graph.line_name:
+                self._switch_road_line(cfg.ilin_line)
+            self.set_action_status(
+                f"Custom Race saved: {cfg.event_name} ({cfg.event_type}, {cfg.laps} laps, {cfg.ai_count} AI, car={cfg.player_car})"
+            )
+            if dlg.launch_pie_after:
+                self.start_pie("event")
+
+    # -----------------------------------------------------------------------
+    # Road Tool / ILIN Node Operations (Undoable)
+    # -----------------------------------------------------------------------
+    def _on_viewport_road_moved(self, node: RoadNode, old_pos, new_pos) -> None:
+        if self.world is None:
+            return
+        self.undo_stack.push(MoveRoadNodeCommand(self.world.road_graph, node, old_pos, new_pos, self._refresh_after_edit))
+        self.set_action_status(f"Moved Road node {node.node_id} to ({new_pos[0]:.1f}, {new_pos[1]:.1f}, {new_pos[2]:.1f})")
+
+    def _on_prop_road_pos(self, node: RoadNode, new_pos) -> None:
+        if self.world is None:
+            return
+        old_pos = (node.x, node.y, node.z)
+        if old_pos == new_pos:
+            return
+        self.undo_stack.push(MoveRoadNodeCommand(self.world.road_graph, node, old_pos, new_pos, self._refresh_after_edit))
+        self.set_action_status(f"Moved Road node {node.node_id}")
+
+    def _on_road_action(self, action: str, data: dict[str, Any]) -> None:
+        if self.world is None:
+            return
+        g = self.world.road_graph
+        if action == "add":
+            x, y, z = data["pos"]
+            cmd = AddRoadNodeCommand(
+                g, x, y, z, data.get("connect_from"),
+                lanes=int(data.get("lanes", 2)),
+                width=float(data.get("width", 14.0)),
+                two_way=False,
+                on_change=self._refresh_after_edit,
+            )
+            self.undo_stack.push(cmd)
+            self.viewport.road_chain_last_node = cmd.node.node_id
+            self.viewport.select_road_node(cmd.node.node_id)
+            self.set_action_status(f"Added Road node {cmd.node.node_id}")
+        elif action == "split":
+            edge_idx = int(data["edge_index"])
+            if 0 <= edge_idx < len(g.edges):
+                x, y, z = data["pos"]
+                cmd = SplitRoadEdgeCommand(g, edge_idx, x, y, z, self._refresh_after_edit)
+                self.undo_stack.push(cmd)
+                self.viewport.road_chain_last_node = cmd.node.node_id
+                self.viewport.select_road_node(cmd.node.node_id)
+                self.set_action_status(f"Split road segment -> Road node {cmd.node.node_id}")
+        elif action == "join":
+            a, b = int(data["a"]), int(data["b"])
+            cmd = JoinRoadNodesCommand(
+                g, a, b, int(data.get("lanes", 2)), float(data.get("width", 14.0)), False, self._refresh_after_edit
+            )
+            self.undo_stack.push(cmd)
+            self.set_action_status(f"Joined Road node {a} -> {b}")
+
+    def _road_pull_out(self, node_id: int) -> None:
+        if self.world is None or node_id not in self.world.road_graph.nodes:
+            return
+        g = self.world.road_graph
+        n = g.nodes[node_id]
+        dx, _dy, dz = g.node_direction(node_id)
+        nx = n.x + (dx * 0.7 - dz * 0.7) * 18.0
+        nz = n.z + (dz * 0.7 + dx * 0.7) * 18.0
+        ny = self.world.collision.ground_height(nx, nz) + 0.35
+        cmd = AddRoadNodeCommand(g, nx, ny, nz, node_id, n.lanes, n.width, n.two_way, self._refresh_after_edit)
+        self.undo_stack.push(cmd)
+        self.viewport.road_chain_last_node = cmd.node.node_id
+        self.viewport.select_road_node(cmd.node.node_id)
+        self.set_action_status(f"Pulled new road branch -> Road node {cmd.node.node_id}")
+
+    def _road_delete_node(self, node_id: int) -> None:
+        if self.world is None or node_id not in self.world.road_graph.nodes:
+            return
+        self.undo_stack.push(DeleteRoadNodeCommand(self.world.road_graph, node_id, self._refresh_after_edit))
+        if self.viewport.road_chain_last_node == node_id:
+            self.viewport.road_chain_last_node = None
+        self.viewport.select_road_node(None)
+        self.set_action_status(f"Deleted Road node {node_id}")
+
+    def _road_draw_from_here(self, node_id: int) -> None:
+        self.select_tool("road")
+        self.viewport.road_chain_last_node = node_id
+        self.set_action_status(f"Drawing road from node {node_id} — click terrain to extend")
+
+    def _road_lane_delta(self, node_id: int, delta: int) -> None:
+        if self.world is None or node_id not in self.world.road_graph.nodes:
+            return
+        self.undo_stack.push(
+            ModifyRoadLanesCommand(self.world.road_graph, node_id, delta_lanes=delta, on_change=self._refresh_after_edit)
+        )
+        self.set_action_status(f"Adjusted lanes at Road node {node_id}")
+
+    def _road_split_exit(self, node_id: int) -> None:
+        if self.world is None or node_id not in self.world.road_graph.nodes:
+            return
+        g = self.world.road_graph
+        n = g.nodes[node_id]
+        dx, _dy, dz = g.node_direction(node_id)
+        nx = n.x + (dx * 0.8 + dz * 0.6) * 20.0
+        nz = n.z + (dz * 0.8 - dx * 0.6) * 20.0
+        ny = self.world.collision.ground_height(nx, nz) + 0.35
+        cmd = AddRoadNodeCommand(g, nx, ny, nz, node_id, max(1, n.lanes - 1), 8.5, False, self._refresh_after_edit)
+        self.undo_stack.push(cmd)
+        self.viewport.select_road_node(cmd.node.node_id)
+        self.set_action_status(f"Split exit ramp from Road node {node_id} -> {cmd.node.node_id}")
+
+    def _road_split_two_way(self, node_id: int) -> None:
+        if self.world is None or node_id not in self.world.road_graph.nodes:
+            return
+        n = self.world.road_graph.nodes[node_id]
+        self.undo_stack.push(
+            ModifyRoadLanesCommand(
+                self.world.road_graph, node_id, delta_lanes=0, two_way=not n.two_way, on_change=self._refresh_after_edit
+            )
+        )
+        self.set_action_status(f"Toggled two-way traffic at Road node {node_id}")
+
+    # -----------------------------------------------------------------------
+    # Marker / Spawn / Start Grid / Trigger Operations (Undoable + 3D Gizmos)
+    # -----------------------------------------------------------------------
+    def add_marker_at_camera(self, kind: str, prefix: str | None = None) -> WorldMarker | None:
+        if self.world is None:
+            return None
+        fwd, _, _ = self.viewport.camera_vectors()
+        p = self.viewport.cam_pos + fwd * 22.0
+        gy = self.world.collision.ground_height(float(p[0]), float(p[2]))
+        mid = f"mk_{self._marker_counter:04d}"
+        self._marker_counter += 1
+        mk = WorldMarker(
+            marker_id=mid,
+            name=f"{prefix or kind}_{self._marker_counter - 1}",
+            kind=kind,
+            position=(float(p[0]), gy, float(p[2])),
+            heading_deg=float(self.viewport.cam_yaw),
+            source="Placed by the editor",
+        )
+        self.undo_stack.push(AddMarkerCommand(self.world, mk, self._refresh_after_edit))
+        self.act_v_markers.setChecked(True)
+        self.viewport.select_marker(mk)
+        self.set_action_status(f"Placed {kind} '{mk.name}' at ({p[0]:.1f}, {gy:.1f}, {p[2]:.1f})")
+        return mk
+
+    def _on_viewport_marker_transformed(self, mk: WorldMarker, old_p, old_h: float, new_p, new_h: float, label: str) -> None:
+        self.undo_stack.push(TransformMarkerCommand(mk, old_p, old_h, new_p, new_h, self._refresh_after_edit, label))
+        self.set_action_status(f"{label}: {mk.name}")
+
+    def _on_prop_marker_edited(self, mk: WorldMarker, pos, heading: float) -> None:
+        if mk.position == pos and abs(mk.heading_deg - heading) < 1e-4:
+            return
+        self.undo_stack.push(
+            TransformMarkerCommand(mk, mk.position, mk.heading_deg, pos, heading, self._refresh_after_edit, "Edit marker")
+        )
+
+    def _on_prop_marker_meta_edited(self, mk: WorldMarker, name: str, kind: str) -> None:
+        mk.name = name
+        mk.kind = kind
+        self._refresh_after_edit()
+        self.set_action_status(f"Updated marker '{mk.name}' ({mk.kind})")
+
+    def _snap_marker_to_ground(self, mk: WorldMarker) -> None:
+        if self.world is None:
+            return
+        gy = self.world.collision.ground_height(mk.position[0], mk.position[2])
+        new_p = (mk.position[0], gy, mk.position[2])
+        self.undo_stack.push(
+            TransformMarkerCommand(mk, mk.position, mk.heading_deg, new_p, mk.heading_deg, self._refresh_after_edit, "Snap marker")
+        )
+        self.set_action_status(f"Snapped {mk.name} to ground (Y={gy:.2f} m)")
+
+    def _delete_marker(self, mk: WorldMarker) -> None:
+        if self.world is None:
+            return
+        self.undo_stack.push(DeleteMarkerCommand(self.world, mk, self._refresh_after_edit))
+        self.viewport.select_marker(None)
+        self.set_action_status(f"Deleted {mk.name}")
+
+    # -----------------------------------------------------------------------
+    # Camera / Info Helpers
+    # -----------------------------------------------------------------------
+    def _on_viewport_stats(self, st: dict[str, Any]) -> None:
+        cx, cy, cz = st["cam"]
+        self.lbl_cam.setText(f"Cam {cx:.1f}, {cy:.1f}, {cz:.1f}   speed {st['speed']:.0f}")
+        self.lbl_prof.setText(
+            f"mlists {st['mlists']}  objs {st['objs']}  inst {st['inst']}  "
+            f"tris {st['tris']:,}  draws {st['draws']}  {st['ms']:.1f} ms"
+        )
+
+    def _reset_camera_overview(self) -> None:
+        self.viewport.select_object(None)
+        self.viewport.select_road_node(None)
+        self.viewport.frame_selection()
+
+    def _camera_top_down(self) -> None:
+        if self.world is None:
+            return
+        cx, cy, cz = self.world.world_center
+        self.viewport.cam_pos = np.array([cx, cy + max(180.0, self.world.world_radius * 1.4), cz - 1.0], dtype=np.float32)
+        self.viewport.cam_yaw = 0.0
+        self.viewport.cam_pitch = -87.0
+        self.viewport.update()
+
+    def _set_fly_speed(self, spd: float) -> None:
+        self.viewport.fly_speed = spd
+        self.set_action_status(f"Camera fly speed set to {spd:.0f} m/s")
+
+    def _filter_explorer_category(self, cat: str) -> None:
+        self.explorer.tabs.setCurrentIndex(1)
+        idx = self.explorer.model_filter.findData(cat)
+        if idx >= 0:
+            self.explorer.model_filter.setCurrentIndex(idx)
+
+    def _sample_ground_under_camera(self) -> None:
+        if self.world is None:
+            return
+        cx, cz = float(self.viewport.cam_pos[0]), float(self.viewport.cam_pos[2])
+        gy, nrm = self.world.collision.ground_sample(cx, cz)
+        self.set_action_status(f"SCOL terrain at ({cx:.1f}, {cz:.1f}): Y={gy:.2f} m, normal=({nrm[0]:+.2f}, {nrm[1]:+.2f}, {nrm[2]:+.2f})")
+
+    def _jump_to_start_grid(self) -> None:
+        if self.world is None or not self.world.road_graph.nodes:
+            return
+        n0 = next(iter(self.world.road_graph.nodes.values()))
+        c = np.array([n0.x, n0.y, n0.z], dtype=np.float32)
+        self.viewport.cam_pos = c + np.array([-20.0, 14.0, -25.0], dtype=np.float32)
+        self.viewport.look_at(c)
+        self.viewport.update()
+        self.set_action_status(f"Jumped to Start/Finish ({n0.x:.1f}, {n0.y:.1f}, {n0.z:.1f})")
+
+    def _show_mesh_stats(self) -> None:
+        if self.world is None:
+            return
+        QMessageBox.information(
+            self,
+            "Track Mesh Statistics",
+            f"Track: {self.world.display_name} ({self.world.trk_path.name})\n"
+            f"Unique Models: {len(self.world.models):,} ({self.world.car_count} retail Cars & Wrecks)\n"
+            f"Placed Instances: {len(self.world.active_objects):,}\n"
+            f"Total Triangles: {self.world.total_triangles:,}\n"
+            f"Decoded Textures: {len(self.world.textures)}\n"
+            f"GRAF Leaves: {self.world.graf_summary.get('leaves', 0):,}",
+        )
+
+    def _show_races_summary(self) -> None:
+        if self.world is None:
+            return
+        lines = [f"  • {k}: {len(v.nodes)} nodes, {len(v.edges)} segments" for k, v in self.world.all_road_graphs.items()]
+        QMessageBox.information(
+            self,
+            "ILIN Racing Lines",
+            f"Track: {self.world.display_name}\nActive line: {self.world.road_graph.line_name}\n"
+            f"Custom Race: {self.world.custom_race.event_name} ({self.world.custom_race.laps} laps, {self.world.custom_race.ai_count} AI)\n\n"
+            + ("\n".join(lines) if lines else "No ILIN lines found."),
+        )
+
+    def _show_collision_stats(self) -> None:
+        if self.world is None:
+            return
+        c = self.world.collision
+        QMessageBox.information(
+            self,
+            "Collision Statistics",
+            f"Track: {self.world.display_name}\n"
+            f"SCOL Terrain Triangles: {c.scol_count:,}\n"
+            f"SOBL Static Solids: {c.sobl_count:,} ({c.sobl_boxes:,} boxes, {c.sobl_tubes:,} tubes)\n"
+            f"Modified / Flattened Barriers: {len(c.sobl_edits)}\n"
+            f"Custom Editor Collision Boxes: {len(c.custom_boxes)}",
+        )
+
+    def _show_controls_dialog(self) -> None:
+        QMessageBox.information(
+            self,
+            "Controls & Keybindings",
+            "Camera Navigation:\n"
+            "  • Right-Mouse Drag: Look around\n"
+            "  • Right-Click Selected Object: Quick Context Menu (Replace With, Ground, Delete)\n"
+            "  • W / A / S / D: Fly horizontally  |  Q / E: Down / Up\n"
+            "  • Mouse Wheel: Fly speed  |  Shift: 2.8x boost  |  F: Frame selection\n\n"
+            "Lumion / Twinmotion / Unreal Editing:\n"
+            "  • G: Move  |  R: Rotate (or +15° in Place Mode)  |  P: Ghost Place  |  B: Scatter Brush\n"
+            "  • End / Ctrl+G: Drop selected object or marker to SCOL ground\n"
+            "  • Ctrl+D: Duplicate  |  F2: Export to Blender OBJ  |  Del: Delete\n"
+            "  • Ctrl+Z / Ctrl+Y: Undo / Redo\n"
+            "  • Ctrl+S: Save project overlay  |  Ctrl+Shift+S: Write real Mod Layer\n"
+            "  • F5: Play Free Roam (PIE)  |  Shift+F5: Play Event (PIE)  |  Esc: Stop PIE / Exit tool",
+        )
+
+    def _show_about_dialog(self) -> None:
+        from PySide6 import __version__ as pyside_ver
+        QMessageBox.about(
+            self,
+            "About EOD World Editor",
+            f"<h3>EOD World Editor</h3>"
+            f"<p>Native Windows 11 Qt 6 (PySide6 {pyside_ver}) + OpenGL 3.3 Core "
+            f"world editor with Unreal-style Play-In-Editor (PIE) for <b>Test Drive: Eve of Destruction</b>.</p>"
+            f"<p>Non-destructively edits retail 0TSR .TRK / .CAR archives (GRAF v18, 4SPS VIF meshes, "
+            f"37 retail Cars &amp; Wrecks, Vulkan HOSTTEX PNG swaps, SCOL/SOBL barriers, and ILIN racing lines).</p>",
+        )
