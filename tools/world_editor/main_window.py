@@ -6,15 +6,18 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
@@ -26,11 +29,18 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
 from dialogs import CustomRaceDialog, ReplaceModelDialog, VehicleTunerDialog
 from explorer_panel import ExplorerPanel
+from home_hub import (
+    HomeHubDialog,
+    record_recent_project,
+    thumbnail_path_for_project,
+)
+from perf_profiler import get_profiler
 from pie_host import PieHostWidget, build_pie_launch_spec
 from project_state import (
     AddMarkerCommand,
@@ -53,9 +63,14 @@ from project_state import (
     TransformMarkerCommand,
     TransformObjectCommand,
     apply_project_overlay,
+    autosave_path_for,
+    build_project_overlay_dict,
+    clear_autosave,
     export_mod_layer,
     export_object_obj,
+    find_newer_autosave,
     load_png_rgba,
+    save_autosave_snapshot,
     save_project_overlay,
 )
 from properties_panel import PropertiesPanel
@@ -92,8 +107,11 @@ class EodWorldEditorWindow(QMainWindow):
         initial_track: str | None = None,
         project_file: Path | None = None,
         auto_load: bool = True,
+        show_home_hub: bool = False,
     ):
         super().__init__()
+        self.profiler = get_profiler()
+        t_init_ns = time.perf_counter_ns()
         self.game_dir = Path(game_dir) if game_dir else default_game_dir()
         self.project_name = "Untitled World"
         self.project_path: Path | None = None
@@ -103,6 +121,15 @@ class EodWorldEditorWindow(QMainWindow):
         self._marker_counter = 1
         self._last_pie_mode = "free_roam"
         self._vehicle_tuner_dlg: VehicleTunerDialog | None = None
+        self._pending_event_template: str | None = None
+        self._pending_open_vehicle_tuner: bool = False
+        self._pending_quick_free_roam: bool = False
+
+        # Silent crash-safe autosave state (60s timer, zero UI hitch)
+        self._autosave_dirty = False
+        self._autosave_gen = 0
+        self._autosave_token: CancelToken | None = None
+        self._pending_recovery_path: Path | None = None
 
         # Non-blocking background job state
         self._job_gen = 0
@@ -113,18 +140,52 @@ class EodWorldEditorWindow(QMainWindow):
         self.resize(1540, 930)
         self.setMinimumSize(1120, 680)
 
-        # Core panels: Left Explorer | Center Stacked (OpenGL Viewport / Embedded PIE) | Right Properties
+        # Core panels: Left Explorer | Center (Autosave Banner + OpenGL Viewport / Embedded PIE) | Right Properties
         self.explorer = ExplorerPanel()
         self.viewport = ViewportGL()
         self.pie_host = PieHostWidget()
         self.center_stack = QStackedWidget()
         self.center_stack.addWidget(self.viewport)  # Page 0: OpenGL 3.3 Core Editor
         self.center_stack.addWidget(self.pie_host)  # Page 1: Embedded Vulkan eod.exe PIE
+
+        # Non-intrusive inline autosave recovery banner (hidden until a newer autosave is detected)
+        self.autosave_banner = QFrame()
+        self.autosave_banner.setObjectName("AutosaveRecoveryBanner")
+        self.autosave_banner.setStyleSheet(
+            "QFrame#AutosaveRecoveryBanner { background: #1e293b; border-bottom: 1px solid #38bdf8; }"
+            "QFrame#AutosaveRecoveryBanner QLabel { color: #e2e8f0; border: none; }"
+        )
+        ab_lay = QHBoxLayout(self.autosave_banner)
+        ab_lay.setContentsMargins(10, 5, 10, 5)
+        ab_lay.setSpacing(8)
+        self.lbl_autosave_msg = QLabel("A newer crash-recovery autosave was found.")
+        self.btn_recover_autosave = QPushButton("Recover Autosave")
+        self.btn_recover_autosave.setFixedHeight(22)
+        self.btn_recover_autosave.setStyleSheet(
+            "QPushButton { background: #2563eb; color: white; border: none; border-radius: 4px; padding: 2px 10px; font-weight: 600; }"
+            "QPushButton:hover { background: #3b82f6; }"
+        )
+        self.btn_recover_autosave.clicked.connect(self.recover_pending_autosave)
+        self.btn_discard_autosave = QPushButton("Discard")
+        self.btn_discard_autosave.setFixedHeight(22)
+        self.btn_discard_autosave.clicked.connect(self.discard_pending_autosave)
+        ab_lay.addWidget(self.lbl_autosave_msg, 1)
+        ab_lay.addWidget(self.btn_recover_autosave)
+        ab_lay.addWidget(self.btn_discard_autosave)
+        self.autosave_banner.hide()
+
+        self._center_container = QWidget()
+        c_lay = QVBoxLayout(self._center_container)
+        c_lay.setContentsMargins(0, 0, 0, 0)
+        c_lay.setSpacing(0)
+        c_lay.addWidget(self.autosave_banner)
+        c_lay.addWidget(self.center_stack, 1)
+
         self.properties = PropertiesPanel()
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.addWidget(self.explorer)
-        self.splitter.addWidget(self.center_stack)
+        self.splitter.addWidget(self._center_container)
         self.splitter.addWidget(self.properties)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -139,15 +200,32 @@ class EodWorldEditorWindow(QMainWindow):
         self._update_window_chrome()
         self._sync_pie_pickers_from_world()
 
+        # Silent 60-second crash-safe autosave timer (runs only when dirty)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)
+        self._autosave_timer.timeout.connect(self.trigger_background_autosave)
+        self._autosave_timer.start()
+        self.undo_stack.indexChanged.connect(self._on_undo_index_changed)
+
         enable_windows_dark_titlebar(self)
 
         # Discover retail .TRK files
         self.available_tracks = discover_tracks(self.game_dir)
         self.explorer.set_available_tracks(self.available_tracks)
 
+        # Finish high-res app_startup phase timer
+        if "app_startup" in self.profiler._active_starts:
+            startup_ms = self.profiler.end_phase("app_startup")
+        else:
+            startup_ms = (time.perf_counter_ns() - t_init_ns) / 1_000_000.0
+            self.profiler.record_phase("app_startup", startup_ms)
+        self.append_log(f"[Perf] Editor UI ready in {startup_ms:.1f} ms", verbose=True)
+
         if auto_load:
             if project_file and Path(project_file).is_file():
                 self.open_project_file(Path(project_file))
+            elif show_home_hub:
+                QTimer.singleShot(0, self.open_home_hub)
             elif self.available_tracks:
                 target = self.available_tracks[0]
                 if initial_track:
@@ -167,6 +245,10 @@ class EodWorldEditorWindow(QMainWindow):
         enable_windows_dark_titlebar(self)
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, "_autosave_timer"):
+            self._autosave_timer.stop()
+        if self._autosave_token is not None:
+            self._autosave_token.cancel()
         self._cancel_active_job()
         if self._car_token is not None:
             self._car_token.cancel()
@@ -196,6 +278,8 @@ class EodWorldEditorWindow(QMainWindow):
 
         # 1. File
         m_file = mb.addMenu("&File")
+        self.act_home_hub = m_file.addAction(svg_icon("new_world", "#60a5fa"), "Home Hub...", self.open_home_hub)
+        m_file.addSeparator()
         self.act_new = m_file.addAction(svg_icon("new_world"), "New World Project...", self.new_project, QKeySequence.StandardKey.New)
         self.act_open = m_file.addAction(svg_icon("open_world"), "Open Project...", self.open_project_dialog, QKeySequence.StandardKey.Open)
         self.act_save = m_file.addAction(svg_icon("save"), "Save Project", self.save_project, QKeySequence.StandardKey.Save)
@@ -237,6 +321,11 @@ class EodWorldEditorWindow(QMainWindow):
         self.act_v_labels = self._add_toggle_action(m_view, "Model Labels", False, self._toggle_labels)
         self.act_v_roads = self._add_toggle_action(m_view, "Racing Lines (ILIN)", True, self._toggle_roads)
         self.act_v_grid = self._add_toggle_action(m_view, "Grid", True, self._toggle_grid)
+        m_view.addSeparator()
+        self.act_v_perf_hud = self._add_toggle_action(
+            m_view, "Performance Profiler / HUD", False, self._toggle_perf_hud
+        )
+        self.act_v_perf_hud.setShortcut(QKeySequence("F3"))
 
         # 4. Camera
         m_cam = mb.addMenu("&Camera")
@@ -552,6 +641,10 @@ class EodWorldEditorWindow(QMainWindow):
         hdr.setSpacing(8)
         self.chk_log_verbose = QCheckBox("Verbose Output")
         self.chk_log_verbose.setChecked(True)
+        self.btn_dump_cprofile = QPushButton("Dump cProfile Trace")
+        self.btn_dump_cprofile.setFixedHeight(22)
+        self.btn_dump_cprofile.setToolTip("Capture & save a Python cProfile trace + GPU/CPU phase report to Output Log")
+        self.btn_dump_cprofile.clicked.connect(self.dump_cprofile_trace)
         self.btn_copy_log = QPushButton("Copy Log")
         self.btn_copy_log.setFixedHeight(22)
         self.btn_copy_log.clicked.connect(self._copy_output_log)
@@ -560,6 +653,7 @@ class EodWorldEditorWindow(QMainWindow):
         self.btn_clear_log.clicked.connect(lambda: self.log_text.clear())
         hdr.addWidget(self.chk_log_verbose)
         hdr.addStretch(1)
+        hdr.addWidget(self.btn_dump_cprofile)
         hdr.addWidget(self.btn_copy_log)
         hdr.addWidget(self.btn_clear_log)
         lay.addLayout(hdr)
@@ -587,6 +681,18 @@ class EodWorldEditorWindow(QMainWindow):
         if cb is not None:
             cb.setText(self.log_text.toPlainText())
             self.set_action_status("Copied Output Log to clipboard")
+
+    def dump_cprofile_trace(self, out_dir: Path | None = None) -> tuple[Path, str]:
+        """Capture and dump a cProfile trace + phase breakdown to disk and Output Log."""
+        def _sample_editor_tick() -> None:
+            self.profiler.snapshot()
+            if self.world is not None:
+                _ = len(self.world.active_objects)
+
+        txt_path, summary = self.profiler.dump_cprofile_trace(out_dir=out_dir, sample_fn=_sample_editor_tick)
+        self.append_log(f"[Profiler] Saved cProfile trace -> {txt_path}\n{summary}", force_open=True)
+        self.set_action_status(f"Dumped cProfile trace -> {txt_path.name}")
+        return txt_path, summary
 
     def append_log(self, msg: str, *, verbose: bool = False, force_open: bool = False) -> None:
         if not hasattr(self, "log_text"):
@@ -702,18 +808,48 @@ class EodWorldEditorWindow(QMainWindow):
     def _attach_loaded_world(self, world: TrackWorld) -> None:
         self.world = world
         self.undo_stack.clear()
+        self._autosave_dirty = False
+        self.autosave_banner.hide()
+        self._pending_recovery_path = None
+        if self._pending_event_template:
+            world.active_event_template = self._pending_event_template
+            world.custom_race.event_type = self._pending_event_template
+            world.custom_race.event_name = self._pending_event_template
+            self._pending_event_template = None
         self.viewport.set_world(world)
         self.explorer.set_world(world)
         self.explorer.set_available_tracks(self.available_tracks, world.trk_path)
         self.properties.show_nothing()
         self._update_window_chrome()
         self._sync_pie_pickers_from_world()
+
+        cache_tag = "CACHE HIT" if world.loaded_from_cache else "COLD"
+        if world.load_ms > 0.0:
+            self.profiler.record_phase("track_load", world.load_ms, detail=cache_tag)
+        self.append_log(
+            f"[Track] Loaded {world.track_name} ({cache_tag}) in {world.load_ms:.1f} ms | "
+            f"{len(world.models)} models, {len(world.objects)} instances, {world.total_triangles:,} tris",
+            verbose=True,
+        )
         self.set_action_status(
-            f"Loaded {world.track_name}: {len(world.models)} models ({world.car_count} cars/wrecks), "
+            f"Loaded {world.track_name} [{cache_tag} {world.load_ms:.1f} ms]: "
+            f"{len(world.models)} models ({world.car_count} cars/wrecks), "
             f"{len(world.objects)} instances, {world.total_triangles:,} tris, {len(world.road_graph.nodes)} ILIN nodes"
         )
+        if self.viewport.show_perf_hud:
+            self.viewport.perf_hud.refresh(self.profiler.snapshot())
+
         if not world.car_catalog_loaded:
             self._start_background_car_scan()
+
+        if self._pending_open_vehicle_tuner:
+            self._pending_open_vehicle_tuner = False
+            QTimer.singleShot(50, self.open_vehicle_tuner_dialog)
+        if self._pending_quick_free_roam:
+            self._pending_quick_free_roam = False
+            QTimer.singleShot(50, lambda: self.start_pie("free_roam"))
+        else:
+            self.check_autosave_recovery()
 
     def load_track(self, trk_path: Path, include_cars: bool = True) -> None:
         """Synchronous track load (used by CLI/project-open/tests)."""
@@ -808,6 +944,156 @@ class EodWorldEditorWindow(QMainWindow):
             self.load_track_async(self.world.trk_path)
 
     # -----------------------------------------------------------------------
+    # Adobe / Lumion-Style Home Hub, Viewport Thumbnails & Crash-Safe Autosave
+    # -----------------------------------------------------------------------
+    def open_home_hub(self) -> None:
+        """Open the dark Windows-11 Home Hub dialog for New Project / Recent Projects / Quick Launch."""
+        hub = HomeHubDialog(self.game_dir, parent=self)
+        if hub.exec() == HomeHubDialog.DialogCode.Accepted:
+            self.apply_home_hub_result(hub)
+        elif self.world is None and self.available_tracks:
+            self.load_track_async(self.available_tracks[0])
+
+    def apply_home_hub_result(self, hub: HomeHubDialog, *, sync_load: bool = False) -> None:
+        """Execute the chosen Home Hub action (also directly callable from headless tests)."""
+        action = hub.result_action
+        if action == "open_project" and hub.selected_project_file and hub.selected_project_file.is_file():
+            self.open_project_file(hub.selected_project_file)
+            return
+
+        if action in ("new_project", "quick_free_roam", "vehicle_importer"):
+            self.project_name = hub.selected_project_name or "Untitled World"
+            self.project_path = None
+            self._pending_event_template = hub.selected_event_template
+            self._pending_quick_free_roam = action == "quick_free_roam"
+            self._pending_open_vehicle_tuner = action == "vehicle_importer"
+            self._update_window_chrome()
+            target = hub.selected_track_path or (self.available_tracks[0] if self.available_tracks else None)
+            if target is not None and target.is_file():
+                if sync_load:
+                    self.load_track(target, include_cars=False)
+                else:
+                    self.load_track_async(target)
+
+    def capture_project_thumbnail(self, project_path: Path) -> Path | None:
+        """Save a crisp 384x216 viewport thumbnail PNG right beside `.eodworld.json`."""
+        try:
+            thumb_path = thumbnail_path_for_project(project_path)
+            img = None
+            if getattr(self.viewport, "_gl_ready", False) and self.viewport.isVisible():
+                try:
+                    img = self.viewport.grabFramebuffer()
+                except Exception:
+                    img = None
+            if img is None or img.isNull():
+                pm = self.viewport.grab()
+                img = pm.toImage() if not pm.isNull() else None
+            if img is None or img.isNull():
+                return None
+            scaled = img.scaled(
+                384,
+                216,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            thumb_path.parent.mkdir(parents=True, exist_ok=True)
+            if scaled.save(str(thumb_path), "PNG"):
+                return thumb_path
+        except Exception:
+            pass
+        return None
+
+    def _on_undo_index_changed(self, _idx: int) -> None:
+        if self.world is not None:
+            self._autosave_dirty = True
+
+    def trigger_background_autosave(self, *, force: bool = False, synchronous: bool = False) -> Path | None:
+        """Silently write atomic crash-safe autosave (`<project>.autosave.tmp` -> `os.replace`) off the UI thread."""
+        if self.world is None:
+            return None
+        if not force and not self._autosave_dirty:
+            return None
+        if self.pie_host.is_running and not force:
+            return None
+        target = autosave_path_for(self.project_path, self.world.track_name, self.project_name)
+        doc = build_project_overlay_dict(self.project_name, self.world, self.viewport.camera_state())
+        self._autosave_dirty = False
+        if synchronous:
+            saved = save_autosave_snapshot(target, doc)
+            self.append_log(f"[Autosave] Saved crash-safe snapshot -> {saved.name}", verbose=True)
+            return saved
+        if self._autosave_token is not None:
+            self._autosave_token.cancel()
+        self._autosave_gen += 1
+        token = CancelToken(self._autosave_gen)
+        self._autosave_token = token
+        worker = FunctionWorker(
+            save_autosave_snapshot,
+            target,
+            doc,
+            token=token,
+            label="Autosaving project",
+        )
+        worker.signals.finished.connect(self._on_autosave_done)
+        start_worker(worker, priority=-1)
+        return target
+
+    def _on_autosave_done(self, gen: int, saved_path: Path) -> None:
+        if gen == self._autosave_gen:
+            self._autosave_token = None
+            self.append_log(f"[Autosave] Crash-safe snapshot updated -> {Path(saved_path).name}", verbose=True)
+
+    def check_autosave_recovery(self, project_path: Path | None = None) -> Path | None:
+        """Check if a newer crash-recovery autosave exists and surface non-intrusive banner."""
+        if self.world is None:
+            return None
+        p_ref = project_path if project_path is not None else self.project_path
+        newer = find_newer_autosave(p_ref, self.world.track_name, self.project_name)
+        if newer is not None:
+            self._pending_recovery_path = newer
+            self.lbl_autosave_msg.setText(
+                f"Crash-recovery autosave detected ({newer.name}) — newer than last manual save."
+            )
+            self.autosave_banner.show()
+            self.append_log(f"[Autosave] Newer autosave available: {newer}", verbose=True)
+        else:
+            self._pending_recovery_path = None
+            self.autosave_banner.hide()
+        return newer
+
+    def recover_pending_autosave(self) -> bool:
+        """Apply pending crash-recovery autosave onto the loaded world."""
+        if self.world is None or self._pending_recovery_path is None or not self._pending_recovery_path.is_file():
+            self.autosave_banner.hide()
+            return False
+        path = self._pending_recovery_path
+        doc = apply_project_overlay(self.world, path)
+        if doc.get("project_name"):
+            self.project_name = str(doc["project_name"])
+        if doc.get("camera"):
+            self.viewport.apply_camera_state(doc["camera"])
+        for tname, ta in self.world.textures.items():
+            if ta.is_replaced:
+                self.viewport.update_gl_texture(tname)
+        self.viewport.mark_collision_dirty()
+        self.viewport.mark_scene_dirty()
+        self.explorer.refresh_counts()
+        self._update_window_chrome()
+        self._sync_pie_pickers_from_world()
+        self._autosave_dirty = True
+        self._pending_recovery_path = None
+        self.autosave_banner.hide()
+        self.set_action_status(f"Recovered autosave -> {path.name}")
+        return True
+
+    def discard_pending_autosave(self) -> None:
+        if self.world is not None:
+            clear_autosave(self.project_path, self.world.track_name, self.project_name)
+        self._pending_recovery_path = None
+        self.autosave_banner.hide()
+        self.set_action_status("Discarded crash-recovery autosave")
+
+    # -----------------------------------------------------------------------
     # Project & Non-Destructive Mod Layer Management
     # -----------------------------------------------------------------------
     def _default_mod_dir(self) -> Path:
@@ -860,6 +1146,15 @@ class EodWorldEditorWindow(QMainWindow):
             self.explorer.refresh_counts()
             self._update_window_chrome()
             self._sync_pie_pickers_from_world()
+            self._autosave_dirty = False
+            record_recent_project(
+                path,
+                self.project_name,
+                self.world.track_name,
+                display_name=self.world.display_name,
+                event_template=self.world.active_event_template,
+            )
+            self.check_autosave_recovery(path)
             self.set_action_status(f"Opened project '{self.project_name}' from {path.name}")
         except Exception as exc:
             QMessageBox.critical(self, "Open Project Failed", str(exc))
@@ -872,6 +1167,18 @@ class EodWorldEditorWindow(QMainWindow):
             return
         saved = save_project_overlay(self.project_path, self.project_name, self.world, self.viewport.camera_state())
         self.project_path = saved
+        thumb = self.capture_project_thumbnail(saved)
+        record_recent_project(
+            saved,
+            self.project_name,
+            self.world.track_name,
+            display_name=self.world.display_name,
+            event_template=self.world.active_event_template,
+            thumbnail_path=thumb,
+        )
+        clear_autosave(saved, self.world.track_name, self.project_name)
+        self._autosave_dirty = False
+        self.autosave_banner.hide()
         self.set_action_status(f"Saved project overlay -> {saved.name}")
 
     def save_project_as(self) -> None:
@@ -886,6 +1193,18 @@ class EodWorldEditorWindow(QMainWindow):
             return
         saved = save_project_overlay(Path(fn), self.project_name, self.world, self.viewport.camera_state())
         self.project_path = saved
+        thumb = self.capture_project_thumbnail(saved)
+        record_recent_project(
+            saved,
+            self.project_name,
+            self.world.track_name,
+            display_name=self.world.display_name,
+            event_template=self.world.active_event_template,
+            thumbnail_path=thumb,
+        )
+        clear_autosave(saved, self.world.track_name, self.project_name)
+        self._autosave_dirty = False
+        self.autosave_banner.hide()
         self.set_action_status(f"Saved project overlay -> {saved.name}")
 
     def write_mod_layer_dialog(self) -> None:
@@ -900,12 +1219,18 @@ class EodWorldEditorWindow(QMainWindow):
         out_dir = Path(dest) / slug if Path(dest).name != slug else Path(dest)
         try:
             report = export_mod_layer(self.world, self.project_name, out_dir)
+            cms = float(report.get("compile_ms", 0.0))
+            bmode = str(report.get("bake_mode", "full")).upper()
+            self.profiler.record_phase("mod_compile", cms, detail=bmode)
             self._refresh_after_edit()
-            self.set_action_status(f"Wrote mod layer to {out_dir}")
+            self.append_log(
+                f"[Mod Baker] {bmode} compile finished in {cms:.2f} ms -> {out_dir}",
+            )
+            self.set_action_status(f"Wrote mod layer ({bmode} {cms:.2f} ms) -> {out_dir}")
             QMessageBox.information(
                 self,
                 "Mod Layer Written",
-                f"Non-destructive mod layer exported successfully!\n\n"
+                f"Non-destructive mod layer exported successfully ({bmode} bake in {cms:.2f} ms)!\n\n"
                 f"Output folder: {out_dir}\n"
                 f"Mod TRK copy: {report['mod_trk']}\n"
                 f"Retail placement edits: {report['retail_placement_edits']} "
@@ -1015,22 +1340,30 @@ class EodWorldEditorWindow(QMainWindow):
     def _on_pie_compile_done_slot(self, gen: int, report: dict[str, Any]) -> None:
         self._on_pie_compile_done(gen, report, self._pending_pie_mod_dir, self._pending_pie_mode)
 
-    def _on_pie_compile_done(self, gen: int, _report: dict[str, Any], mod_dir: Path, mode: str) -> None:
+    def _on_pie_compile_done(self, gen: int, report: dict[str, Any], mod_dir: Path, mode: str) -> None:
         if gen != self._job_gen or self.world is None:
             return
         self._active_token = None
         self._hide_progress()
 
+        cms = float(report.get("compile_ms", 0.0)) if isinstance(report, dict) else 0.0
+        bmode = str(report.get("bake_mode", "full")).upper() if isinstance(report, dict) else "FULL"
+        self.profiler.record_phase("mod_compile", cms, detail=bmode)
+        self.set_action_status(f"Mod compiled ({bmode} {cms:.2f} ms) — launching PIE...")
+
         spec = self.build_current_pie_spec(mod_dir, mode)
         self.append_log(
-            f"[PIE] Compile finished. Launching {spec['exe']} | {spec['direct_start']} "
+            f"[PIE] {bmode} compile finished in {cms:.2f} ms. Launching {spec['exe']} | {spec['direct_start']} "
             f"| sync_all={self.world.sync_all_events} arcade={spec.get('arcade_mode')} "
             f"| EOD_NATIVE={spec['env'].get('EOD_NATIVE')} EOD_MODERN={spec['env'].get('EOD_MODERN')}",
             verbose=True,
         )
         self.center_stack.setCurrentWidget(self.pie_host)
         self.act_pie_stop.setEnabled(True)
+        self.profiler.begin_phase("pie_launch")
         ok = self.pie_host.start_pie(spec)
+        pie_ms = self.profiler.end_phase("pie_launch", detail=mode)
+        self.append_log(f"[PIE] Process spawn handed off in {pie_ms:.1f} ms", verbose=True)
         if not ok:
             self.act_pie_stop.setEnabled(False)
             self.center_stack.setCurrentWidget(self.viewport)
@@ -1203,6 +1536,10 @@ class EodWorldEditorWindow(QMainWindow):
         self.viewport.show_grid = on
         self.viewport.update()
 
+    def _toggle_perf_hud(self, on: bool) -> None:
+        self.viewport.set_perf_hud_visible(on)
+        self.set_action_status(f"Performance Profiler HUD (F3): {'ON' if on else 'OFF'}")
+
     def _on_layer_toggled(self, key: str, visible: bool) -> None:
         if key == "roads":
             self.act_v_roads.setChecked(visible)
@@ -1223,6 +1560,8 @@ class EodWorldEditorWindow(QMainWindow):
     # Selection, Context Menu & Refresh
     # -----------------------------------------------------------------------
     def _refresh_after_edit(self) -> None:
+        if self.world is not None:
+            self._autosave_dirty = True
         self.viewport.mark_scene_dirty()
         self.viewport.mark_collision_dirty()
         self.explorer.refresh_counts()

@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from perf_profiler import GpuPassTimer, PerfHudOverlay, get_profiler
 from theme import (
     ACCENT_BLUE,
     ACCENT_BLUE_HOVER,
@@ -761,6 +762,8 @@ class ViewportGL(QOpenGLWidget):
         self._u_flat: dict[str, int] = {}
         self._vao_empty = 0
         self._gl_textures: dict[str, tuple[int, bool]] = {}  # name -> (tex_id, cutout)
+        self._terrain_batches: list[dict[str, Any]] = []
+        self._prop_batches: list[dict[str, Any]] = []
         self._static_batches: list[dict[str, Any]] = []
         self._blend_batches: list[dict[str, Any]] = []
         self._sel_batches: list[dict[str, Any]] = []
@@ -784,7 +787,9 @@ class ViewportGL(QOpenGLWidget):
         self._markers_dirty = True
         self._pending_tex_updates: set[str] = set()
 
-        # Profiler metrics
+        # Profiler metrics & GL_TIME_ELAPSED GPU pass timer
+        self.profiler = get_profiler()
+        self.gpu_timer = GpuPassTimer()
         self._last_frame_ms = 0.0
         self._last_draw_calls = 0
         self._last_tris_drawn = 0
@@ -806,6 +811,9 @@ class ViewportGL(QOpenGLWidget):
         self.place_hud = PlaceHudOverlay(self)
         self.place_hud.closeToolClicked.connect(self._close_road_tool)
 
+        self.perf_hud = PerfHudOverlay(self)
+        self.show_perf_hud = False
+
         # Demand-driven flight timer: ONLY runs while WASD/QE keys are held (0% idle CPU/GPU!)
         self._timer = QTimer(self)
         self._timer.setInterval(16)
@@ -814,6 +822,15 @@ class ViewportGL(QOpenGLWidget):
     def set_render_mode(self, mode: str) -> None:
         """Switch viewport shading mode: 'ps2' (fast power-sipping) or 'plume' (high quality)."""
         self.render_mode = "plume" if mode == "plume" else "ps2"
+        self.update()
+
+    def set_perf_hud_visible(self, visible: bool) -> None:
+        """Show or hide the live GPU + CPU Performance Profiler HUD overlay (F3)."""
+        self.show_perf_hud = bool(visible)
+        self.perf_hud.setVisible(self.show_perf_hud)
+        if self.show_perf_hud:
+            self.perf_hud.refresh(self.profiler.snapshot())
+            self._position_overlays()
         self.update()
 
     # -----------------------------------------------------------------------
@@ -1213,6 +1230,7 @@ class ViewportGL(QOpenGLWidget):
         GL.glBindVertexArray(0)
 
         self._build_grid_vbo()
+        self.gpu_timer.initialize(GL)
         self._gl_ready = True
 
         if self.world is not None:
@@ -1239,6 +1257,10 @@ class ViewportGL(QOpenGLWidget):
                 hud.adjustSize()
                 centered_x = (self.width() - hud.width()) // 2
                 hud.move(max(min_x, centered_x), 12)
+        if self.perf_hud.isVisible():
+            self.perf_hud.adjustSize()
+            px = max(12, self.width() - self.perf_hud.width() - 12)
+            self.perf_hud.move(px, 12)
 
     # -----------------------------------------------------------------------
     # GPU Resource Management
@@ -1391,14 +1413,20 @@ class ViewportGL(QOpenGLWidget):
 
     def _rebuild_static_batches(self) -> None:
         self._static_dirty = False
-        self._delete_batches(self._static_batches)
+        self._delete_batches(self._terrain_batches)
+        self._delete_batches(self._prop_batches)
+        self._static_batches.clear()
         self._delete_batches(self._blend_batches)
         if self.world is None:
             return
 
-        grouped_v: dict[str, list[np.ndarray]] = {}
-        grouped_i: dict[str, list[np.ndarray]] = {}
-        grouped_base: dict[str, int] = {}
+        terr_v: dict[str, list[np.ndarray]] = {}
+        terr_i: dict[str, list[np.ndarray]] = {}
+        terr_base: dict[str, int] = {}
+
+        prop_v: dict[str, list[np.ndarray]] = {}
+        prop_i: dict[str, list[np.ndarray]] = {}
+        prop_base: dict[str, int] = {}
 
         blend_v: dict[str, list[np.ndarray]] = {}
         blend_i: dict[str, list[np.ndarray]] = {}
@@ -1418,6 +1446,7 @@ class ViewportGL(QOpenGLWidget):
             is_ident_rot = (
                 obj.rotation_hpr == (0.0, 0.0, 0.0) and obj.scale == (1.0, 1.0, 1.0)
             )
+            is_terrain = obj.category in ("static", "optional-terrain")
             for part in model.parts:
                 v = part.vertices.copy()
                 if is_ident_rot:
@@ -1432,16 +1461,28 @@ class ViewportGL(QOpenGLWidget):
                     blend_v.setdefault(tex, []).append(v)
                     blend_i.setdefault(tex, []).append(part.indices + base)
                     blend_base[tex] = base + len(v)
+                elif is_terrain:
+                    base = terr_base.get(tex, 0)
+                    terr_v.setdefault(tex, []).append(v)
+                    terr_i.setdefault(tex, []).append(part.indices + base)
+                    terr_base[tex] = base + len(v)
                 else:
-                    base = grouped_base.get(tex, 0)
-                    grouped_v.setdefault(tex, []).append(v)
-                    grouped_i.setdefault(tex, []).append(part.indices + base)
-                    grouped_base[tex] = base + len(v)
+                    base = prop_base.get(tex, 0)
+                    prop_v.setdefault(tex, []).append(v)
+                    prop_i.setdefault(tex, []).append(part.indices + base)
+                    prop_base[tex] = base + len(v)
 
-        for tex, vlist in grouped_v.items():
+        for tex, vlist in terr_v.items():
             verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
-            inds = np.ascontiguousarray(np.concatenate(grouped_i[tex], axis=0), dtype=np.uint32)
-            self._static_batches.append(self._upload_mesh_batch(verts, inds, tex))
+            inds = np.ascontiguousarray(np.concatenate(terr_i[tex], axis=0), dtype=np.uint32)
+            self._terrain_batches.append(self._upload_mesh_batch(verts, inds, tex))
+
+        for tex, vlist in prop_v.items():
+            verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
+            inds = np.ascontiguousarray(np.concatenate(prop_i[tex], axis=0), dtype=np.uint32)
+            self._prop_batches.append(self._upload_mesh_batch(verts, inds, tex))
+
+        self._static_batches = self._terrain_batches + self._prop_batches
 
         for tex, vlist in blend_v.items():
             verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
@@ -1899,7 +1940,8 @@ class ViewportGL(QOpenGLWidget):
     # Paint Frame
     # -----------------------------------------------------------------------
     def paintGL(self) -> None:
-        t0 = time.perf_counter()
+        t0 = time.perf_counter_ns()
+        self.gpu_timer.begin_frame()
         if self._pending_tex_updates:
             self._flush_pending_textures()
         if self._static_dirty:
@@ -2008,7 +2050,10 @@ class ViewportGL(QOpenGLWidget):
             GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
 
         GL.glActiveTexture(GL.GL_TEXTURE0)
-        for b in self._static_batches:
+
+        # 3a. Terrain pass (static + optional-terrain)
+        self.gpu_timer.begin_pass("terrain")
+        for b in self._terrain_batches:
             tex_entry = self._gl_textures.get(b["tex"])
             if tex_entry is not None:
                 GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
@@ -2021,8 +2066,27 @@ class ViewportGL(QOpenGLWidget):
             GL.glDrawElements(GL.GL_TRIANGLES, b["count"], GL.GL_UNSIGNED_INT, None)
             draws += 1
             tris_drawn += b["tris"]
+        self.gpu_timer.end_pass("terrain")
 
-        # 3b. Translucent water / blend surfaces (e.g. Afton pond `sween.tex`)
+        # 3b. Props pass (dyno, event props, cars/wrecks, billboards, selection & ghost preview)
+        self.gpu_timer.begin_pass("props")
+        for b in self._prop_batches:
+            tex_entry = self._gl_textures.get(b["tex"])
+            if tex_entry is not None:
+                GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
+                GL.glUniform1i(loc_has, 1)
+                GL.glUniform1i(loc_cut, 1 if tex_entry[1] else 0)
+            else:
+                GL.glUniform1i(loc_has, 0)
+                GL.glUniform1i(loc_cut, 0)
+            GL.glBindVertexArray(b["vao"])
+            GL.glDrawElements(GL.GL_TRIANGLES, b["count"], GL.GL_UNSIGNED_INT, None)
+            draws += 1
+            tris_drawn += b["tris"]
+        self.gpu_timer.end_pass("props")
+
+        # 3c. Translucent water / blend surfaces (e.g. Afton pond `sween.tex`)
+        self.gpu_timer.begin_pass("water")
         if self._blend_batches:
             GL.glEnable(GL.GL_BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
@@ -2042,6 +2106,7 @@ class ViewportGL(QOpenGLWidget):
                 tris_drawn += b["tris"]
             GL.glDepthMask(GL.GL_TRUE)
             GL.glDisable(GL.GL_BLEND)
+        self.gpu_timer.end_pass("water")
 
         # 4. Selected object(s) with bright translucent green highlight
         if self.selected_obj is not None and not self.selected_obj.deleted and self._sel_batches:
@@ -2128,7 +2193,8 @@ class ViewportGL(QOpenGLWidget):
         GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
         GL.glBindVertexArray(0)
 
-        # 5. Collision overlay (SCOL terrain + height-coded SOBL barriers + custom boxes)
+        # 5. Overlays pass (Collision SCOL+SOBL, ILIN roads, markers, scatter brush, 3D gizmo)
+        self.gpu_timer.begin_pass("overlays")
         if self.show_collision:
             GL.glEnable(GL.GL_BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
@@ -2170,10 +2236,16 @@ class ViewportGL(QOpenGLWidget):
             GL.glClear(GL.GL_DEPTH_BUFFER_BIT)
             draws += self._draw_flat_verts(glines, GL.GL_LINES, view_proj)
             draws += self._draw_flat_verts(gtris, GL.GL_TRIANGLES, view_proj)
+        self.gpu_timer.end_pass("overlays")
 
+        gpu_timings = self.gpu_timer.end_frame()
         self._last_draw_calls = draws
         self._last_tris_drawn = tris_drawn
-        self._last_frame_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_frame_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+        self.profiler.record_frame(self._last_frame_ms, gpu_timings, draws, tris_drawn)
+        if self.show_perf_hud:
+            self.perf_hud.refresh(self.profiler.snapshot())
+            self._position_overlays()
         self._emit_stats()
 
         # Optional 2D screen-space labels overlay (isolate GL state before QPainter!)
@@ -2953,6 +3025,7 @@ class ViewportGL(QOpenGLWidget):
             mlists = sum(1 for m in self.world.mlist_info if m is not None)
             objs = len(self.world.models)
             inst = sum(1 for o in self.world.objects if not o.deleted)
+        gt = self.gpu_timer.last_timings
         self.statsUpdated.emit(
             {
                 "cam": (float(self.cam_pos[0]), float(self.cam_pos[1]), float(self.cam_pos[2])),
@@ -2963,6 +3036,11 @@ class ViewportGL(QOpenGLWidget):
                 "tris": self._last_tris_drawn,
                 "draws": self._last_draw_calls,
                 "ms": self._last_frame_ms,
+                "gpu_ms": gt.total_gpu_ms,
+                "terrain_ms": gt.terrain_ms,
+                "props_ms": gt.props_ms,
+                "water_ms": gt.water_ms,
+                "overlays_ms": gt.overlays_ms,
                 "mode": self.render_mode,
             }
         )

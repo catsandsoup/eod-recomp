@@ -726,6 +726,249 @@ class TestEodWorldEditor(unittest.TestCase):
         win.close()
         self.app.processEvents()
 
+    def test_12_perf_profiler_gpu_queries_hud_and_cprofile_dump(self) -> None:
+        from OpenGL import GL
+        import perf_profiler as pp
+
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        win._attach_loaded_world(wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False))
+        win.resize(960, 600)
+        win.show()
+        self.app.processEvents()
+
+        # Verify View -> Performance Profiler / HUD (F3) toggle + live GL_TIME_ELAPSED pass queries
+        self.assertEqual(win.act_v_perf_hud.shortcut().toString(), "F3")
+        self.assertTrue(win.viewport.perf_hud.isHidden())
+        win.act_v_perf_hud.setChecked(True)
+        self.assertFalse(win.viewport.perf_hud.isHidden())
+
+        # Render 3 frames so ping-pong GL_TIME_ELAPSED queries harvest results cleanly with glError == 0
+        for _ in range(3):
+            win.viewport.makeCurrent()
+            win.viewport.paintGL()
+            gl_err = int(GL.glGetError())
+            win.viewport.doneCurrent()
+            self.assertEqual(gl_err, 0, f"Unexpected GL error with GL_TIME_ELAPSED queries: {gl_err}")
+            self.app.processEvents()
+
+        # Verify high-res perf_counter_ns phase timers
+        prof = pp.get_profiler()
+        with prof.phase("pie_launch", detail="free_roam"):
+            time.sleep(0.002)
+        snap = prof.snapshot()
+        self.assertGreater(snap["phases"]["app_startup"]["count"], 0)
+        self.assertGreater(snap["phases"]["track_load"]["count"], 0)
+        self.assertGreater(snap["phases"]["pie_launch"]["last_ms"], 0.5)
+        self.assertGreaterEqual(snap["total_gpu_ms"], 0.0)
+        self.assertGreaterEqual(snap["terrain_ms"], 0.0)
+        self.assertGreaterEqual(snap["props_ms"], 0.0)
+        self.assertGreaterEqual(snap["water_ms"], 0.0)
+        self.assertGreaterEqual(snap["overlays_ms"], 0.0)
+
+        # Verify "Dump cProfile Trace" button & trace output
+        with tempfile.TemporaryDirectory() as tmp:
+            txt_path, summary = win.dump_cprofile_trace(out_dir=Path(tmp))
+            self.assertTrue(txt_path.is_file())
+            self.assertTrue(txt_path.with_suffix(".prof").is_file())
+            self.assertIn("Top Functions", summary)
+            self.assertIn("Saved cProfile trace", win.log_text.toPlainText())
+
+        print(
+            f"[VERIFIED] Perf Profiler & F3 HUD: glErr=0 | gpu_queries={snap['gpu_queries_active']} "
+            f"| total_gpu={snap['total_gpu_ms']:.2f}ms (terr={snap['terrain_ms']:.2f}, props={snap['props_ms']:.2f}, "
+            f"water={snap['water_ms']:.2f}, ov={snap['overlays_ms']:.2f}) | startup={snap['phases']['app_startup']['last_ms']:.1f}ms"
+        )
+        win.close()
+        self.app.processEvents()
+
+    def test_13_home_hub_recent_projects_thumbnail_and_autosave_recovery(self) -> None:
+        import os
+        import home_hub as hh
+
+        old_appdata = os.environ.get("EOD_EDITOR_APPDATA")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_p = Path(tmp)
+                os.environ["EOD_EDITOR_APPDATA"] = str(tmp_p / "appdata")
+
+                win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+                win._attach_loaded_world(wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False))
+                win.project_name = "Afton Turbo Derby"
+                proj_file = tmp_p / "projects" / "afton_turbo.eodworld.json"
+                win.project_path = proj_file
+                win.resize(900, 560)
+                win.show()
+                self.app.processEvents()
+
+                # 1. Save project -> writes overlay + viewport PNG thumbnail beside .eodworld.json + recents.json
+                win.save_project()
+                self.assertTrue(proj_file.is_file())
+                thumb_file = hh.thumbnail_path_for_project(proj_file)
+                self.assertTrue(thumb_file.is_file(), f"Missing viewport thumbnail: {thumb_file}")
+                recents = hh.load_recent_projects()
+                self.assertEqual(len(recents), 1)
+                self.assertEqual(recents[0]["project_name"], "Afton Turbo Derby")
+                self.assertEqual(recents[0]["track_name"], "AFTON")
+                self.assertEqual(Path(recents[0]["thumbnail_path"]).resolve(), thumb_file.resolve())
+
+                # 2. Home Hub dialog: tracks, event template, recent cards, Skip preference, New World action
+                hub = hh.HomeHubDialog(self.game_dir)
+                self.assertGreaterEqual(hub.lst_tracks.count(), 15)
+                self.assertEqual(len(hub.recent_cards), 1)
+                hub.chk_skip_hub.setChecked(True)
+                self.assertTrue(hh.load_editor_prefs()["skip_home_hub"])
+                hub.chk_skip_hub.setChecked(False)
+                self.assertFalse(hh.load_editor_prefs()["skip_home_hub"])
+
+                hub.txt_project_name.setText("Dundas Night Jump")
+                idx_ev = hub.cmb_event_template.findText("Demolition Derby")
+                self.assertGreaterEqual(idx_ev, 0)
+                hub.cmb_event_template.setCurrentIndex(idx_ev)
+                hub._on_create_project()
+                self.assertEqual(hub.result_action, "new_project")
+                self.assertEqual(hub.selected_project_name, "Dundas Night Jump")
+                self.assertEqual(hub.selected_event_template, "Demolition Derby")
+
+                win.apply_home_hub_result(hub, sync_load=True)
+                self.assertEqual(win.project_name, "Dundas Night Jump")
+                self.assertEqual(win.world.active_event_template, "Demolition Derby")
+                hub.close()
+
+                # 3. Silent crash-safe atomic autosave + recovery banner
+                win.project_path = proj_file
+                win.project_name = "Afton Turbo Derby"
+                win.world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+                target_obj = next(o for o in win.world.objects if o.source == "Retail" and o.category == "static")
+                orig_x = target_obj.position[0]
+                target_obj.position = (orig_x + 12.5, target_obj.position[1], target_obj.position[2])
+                win._autosave_dirty = True
+                saved_auto = win.trigger_background_autosave(synchronous=True)
+                self.assertIsNotNone(saved_auto)
+                assert saved_auto is not None
+                self.assertTrue(saved_auto.is_file())
+                self.assertFalse(saved_auto.with_name(saved_auto.name + ".autosave.tmp").exists())
+                # Ensure autosave mtime is strictly newer than manual save
+                t_future = proj_file.stat().st_mtime + 5.0
+                os.utime(saved_auto, (t_future, t_future))
+
+                # Reload clean project -> recovery banner appears -> Recover restores +12.5m edit!
+                win.world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+                ps.apply_project_overlay(win.world, proj_file)
+                found = win.check_autosave_recovery(proj_file)
+                self.assertEqual(found, saved_auto)
+                self.assertFalse(win.autosave_banner.isHidden())
+                self.assertTrue(win.recover_pending_autosave())
+                recovered_obj = win.world.object_by_id(target_obj.obj_id)
+                self.assertIsNotNone(recovered_obj)
+                assert recovered_obj is not None
+                self.assertAlmostEqual(recovered_obj.position[0], orig_x + 12.5, places=3)
+                self.assertTrue(win.autosave_banner.isHidden())
+
+                # Manual save clears autosave cleanly
+                win.save_project()
+                self.assertFalse(saved_auto.exists())
+
+                print(
+                    f"[VERIFIED] Home Hub + Recent Projects + Viewport Thumb ({thumb_file.stat().st_size:,} B) + Crash-Safe Autosave Recovery"
+                )
+                win.close()
+                self.app.processEvents()
+        finally:
+            if old_appdata is None:
+                os.environ.pop("EOD_EDITOR_APPDATA", None)
+            else:
+                os.environ["EOD_EDITOR_APPDATA"] = old_appdata
+
+    def test_14_binary_track_cache_and_sub10ms_delta_mod_baker(self) -> None:
+        import os
+        import rst0
+        import world_collision as wc
+
+        old_appdata = os.environ.get("EOD_EDITOR_APPDATA")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_p = Path(tmp)
+                os.environ["EOD_EDITOR_APPDATA"] = str(tmp_p / "cache_root")
+
+                # 1. Binary Track Cache: cold parse vs warm cache hit
+                afton_path = self.afton_world.trk_path
+                w_cold = wl.load_track_world(afton_path, self.game_dir, include_cars=False, use_cache=True)
+                self.assertFalse(w_cold.loaded_from_cache)
+                self.assertTrue(wl.track_cache_exists(afton_path))
+
+                w_warm = wl.load_track_world(afton_path, self.game_dir, include_cars=False, use_cache=True)
+                self.assertTrue(w_warm.loaded_from_cache)
+                self.assertTrue(str(w_warm.cache_path).endswith(".eodcache"))
+                speedup = w_cold.load_ms / max(0.1, w_warm.load_ms)
+                self.assertGreater(speedup, 10.0, f"Expected >10x cache speedup, got {speedup:.1f}x")
+                self.assertEqual(len(w_cold.models), len(w_warm.models))
+                self.assertEqual(len(w_cold.objects), len(w_warm.objects))
+                self.assertEqual(w_cold.total_triangles, w_warm.total_triangles)
+                self.assertEqual(len(w_cold.textures), len(w_warm.textures))
+                self.assertEqual(w_cold.collision.scol_count, w_warm.collision.scol_count)
+                self.assertEqual(w_cold.collision.sobl_boxes, w_warm.collision.sobl_boxes)
+
+                # 2. Fast Delta-Only Mod Baker (<10 ms transform delta, bit-exact 0TSR CRCs)
+                static_obj = next(
+                    o for o in w_warm.objects if o.source == "Retail" and o.category == "static" and o.retail_instance_id
+                )
+                static_obj.position = (static_obj.position[0] + 2.0, static_obj.position[1], static_obj.position[2] - 1.0)
+                n0 = next(iter(w_warm.road_graph.nodes.values()))
+                n0.x += 1.5
+                w_warm.road_graph.dirty = True
+                tall = next(r for r in w_warm.collision.sobl_records if r.get("kind") == "box" and r.get("vertical"))
+                w_warm.collision.apply_barrier_height_in_memory(tall["index"], 1.5)
+
+                mod_out = tmp_p / "mods" / "DeltaSpeedTest"
+                rep_full = ps.export_mod_layer(w_warm, "DeltaSpeedTest", mod_out)
+                self.assertEqual(rep_full["bake_mode"], "full")
+
+                # Delta #1: GRAF transform + SOBL + ILIN
+                static_obj.position = (static_obj.position[0] + 1.0, static_obj.position[1], static_obj.position[2])
+                n0.x += 0.5
+                w_warm.road_graph.dirty = True
+                tall2 = [r for r in w_warm.collision.sobl_records if r.get("kind") == "box" and r.get("vertical")][1]
+                w_warm.collision.apply_barrier_height_in_memory(tall2["index"], 2.0)
+                rep_delta_all = ps.export_mod_layer(w_warm, "DeltaSpeedTest", mod_out)
+                self.assertEqual(rep_delta_all["bake_mode"], "delta")
+                self.assertIn("track.grf", rep_delta_all["delta_patched_members"])
+                self.assertIn("track.sol", rep_delta_all["delta_patched_members"])
+                self.assertIn("track.ild", rep_delta_all["delta_patched_members"])
+
+                # Delta #2..#4: transform-only delta bakes (take best of 3 to avoid transient AV scan spikes)
+                best_delta_ms = 1e9
+                rep_delta = rep_delta_all
+                for _ in range(3):
+                    static_obj.position = (static_obj.position[0] + 0.5, static_obj.position[1], static_obj.position[2])
+                    rep_delta = ps.export_mod_layer(w_warm, "DeltaSpeedTest", mod_out)
+                    self.assertEqual(rep_delta["bake_mode"], "delta")
+                    best_delta_ms = min(best_delta_ms, float(rep_delta["compile_ms"]))
+
+                self.assertLess(best_delta_ms, 10.0, f"Expected <10 ms delta bake, got {best_delta_ms:.2f} ms")
+                self.assertTrue(rep_delta["mod_trk_differs_from_retail"])
+
+                # Verify bit-exact 0TSR CRCs for all 3 delta-patched members!
+                mod_raw = Path(rep_delta["mod_trk"]).read_bytes()
+                mod_entries = wc.read_directory(mod_raw)
+                for mname in ("track.grf", "track.sol", "track.ild"):
+                    ent = next(x for x in mod_entries if x["name"].lower() == mname)
+                    sub = mod_raw[ent["offset"] : ent["offset"] + ent["size"]]
+                    self.assertEqual(rst0.eod_crc(sub), ent["crc"], f"Bit-exact CRC mismatch on {mname}")
+
+                # Retail disc 100% untouched
+                self.assertEqual(_sha256_file(afton_path), self.afton_hash_before)
+
+                print(
+                    f"[VERIFIED] Binary Track Cache: cold={w_cold.load_ms:.1f}ms -> warm={w_warm.load_ms:.1f}ms ({speedup:.1f}x) | "
+                    f"Delta Mod Baker: full={rep_full['compile_ms']:.1f}ms -> delta_all3={rep_delta_all['compile_ms']:.2f}ms, "
+                    f"delta_xform={best_delta_ms:.2f}ms (all CRCs bit-exact!)"
+                )
+        finally:
+            if old_appdata is None:
+                os.environ.pop("EOD_EDITOR_APPDATA", None)
+            else:
+                os.environ["EOD_EDITOR_APPDATA"] = old_appdata
+
 
 if __name__ == "__main__":
     print(f"Running EOD World Editor tests (PySide6 {PYSIDE6_VERSION}, Python {sys.version.split()[0]})...")

@@ -15,10 +15,12 @@ Never modifies retail .TRK files on disk.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import struct
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -471,6 +473,12 @@ def decompose_matrix_hpr(m4: np.ndarray) -> tuple[tuple[float, float, float], tu
     sy = float(np.linalg.norm(c1)) or 1.0
     sz = float(np.linalg.norm(c2)) or 1.0
     r = np.column_stack((c0 / sx, c1 / sy, c2 / sz))
+    if abs(sx - 1.0) < 1e-4:
+        sx = 1.0
+    if abs(sy - 1.0) < 1e-4:
+        sy = 1.0
+    if abs(sz - 1.0) < 1e-4:
+        sz = 1.0
     # Ry(h) Rx(p) Rz(r):
     # r[1, 2] = -sin(p)
     sp = max(-1.0, min(1.0, float(-r[1, 2])))
@@ -955,15 +963,32 @@ def query_bppt_plane(data: bytes, slot: dict[str, Any], x: float, z: float) -> i
     return None
 
 
+class _LazyTerrainDescriptor:
+    """Descriptor that lazily builds wc.Terrain from raw SCOL bytes on first access."""
+
+    def __get__(self, obj: Any, objtype: Any = None) -> wc.Terrain | None:
+        if obj is None:
+            return None
+        if obj._terrain is None and obj._scol_raw:
+            try:
+                obj._terrain = wc.Terrain(wc.parse_scol(obj._scol_raw))
+            except Exception:
+                obj._terrain = None
+        return obj._terrain
+
+    def __set__(self, obj: Any, val: wc.Terrain | None) -> None:
+        obj._terrain = val
+
+
 @dataclass
 class CollisionData:
     scol_count: int
     sobl_count: int
     sobl_boxes: int
     sobl_tubes: int
-    terrain: wc.Terrain | None
-    scol_line_verts: np.ndarray  # shape (M, 3), float32 line segments for GL_LINES
-    sobl_line_verts: np.ndarray  # shape (K, 3), float32 line segments for GL_LINES
+    terrain: wc.Terrain | None = _LazyTerrainDescriptor()  # type: ignore[assignment]
+    scol_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+    sobl_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
     sobl_line_colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 4), dtype=np.float32))
     sobl_records: list[dict[str, Any]] = field(default_factory=list)
     sobl_edits: dict[int, dict[str, Any]] = field(default_factory=dict)  # rec_idx -> {"field", "value", "ry", "centre", ...}
@@ -971,6 +996,8 @@ class CollisionData:
     bppt_slots: dict[int, dict[str, Any]] = field(default_factory=dict)
     bppt_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
     scol_base_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+    _scol_raw: bytes | None = field(default=None, repr=False)
+    _terrain: wc.Terrain | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if len(self.scol_base_line_verts) == 0 and len(self.scol_line_verts) > 0:
@@ -1159,6 +1186,10 @@ class TrackWorld:
     include_lod_twins: bool = True
     car_catalog_loaded: bool = False
     car_count: int = 0
+    loaded_from_cache: bool = False
+    load_ms: float = 0.0
+    cache_path: str | None = None
+    _cache_backing: bytes | None = field(default=None, repr=False)
 
     @property
     def total_triangles(self) -> int:
@@ -1457,9 +1488,11 @@ def _load_collision(raw_trk: bytes, _entries: list[dict[str, Any]]) -> Collision
     except Exception:
         col_entries = []
 
+    bsc_raw_saved: bytes | None = None
     try:
         bsc_raw, bsc_e = wc.member(raw_trk, col_entries, "track.bsc", verify=False)
         if bsc_e["type"] == "SCOL" and bsc_e["version"] == wc.SCOL_VERSION:
+            bsc_raw_saved = bytes(bsc_raw)
             scol = wc.parse_scol(bsc_raw)
             scol_tris = scol["tris"]
             terrain = wc.Terrain(scol)
@@ -1525,6 +1558,7 @@ def _load_collision(raw_trk: bytes, _entries: list[dict[str, Any]]) -> Collision
         sobl_line_verts=np.zeros((0, 3), dtype=np.float32),
         sobl_records=sobl_records,
         bppt_slots=bppt_slots,
+        _scol_raw=bsc_raw_saved,
     )
     col.rebuild_sobl_lines()
     return col
@@ -1764,6 +1798,497 @@ def _load_road_graphs(
 
 
 # ---------------------------------------------------------------------------
+# Turbo Binary Track Cache (%LOCALAPPDATA%\EODWorldEditor\cache\<track>_<sha256>.eodcache)
+# Uncompressed numpy + struct buffers for ~50-100x faster repeat track opens.
+# ---------------------------------------------------------------------------
+_CACHE_MAGIC = b"EODCACHE"
+_CACHE_VERSION = 3
+_CACHE_HEADER_FMT = "<8sIIIQQ"
+_CACHE_HEADER_SIZE = struct.calcsize(_CACHE_HEADER_FMT)
+_TRK_SHA_STAT_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
+def track_cache_dir() -> Path:
+    """Return local binary track cache directory (respects EOD_EDITOR_APPDATA override)."""
+    override = os.environ.get("EOD_EDITOR_APPDATA")
+    if override:
+        base = Path(override)
+    else:
+        local = os.environ.get("LOCALAPPDATA")
+        base = (Path(local) / "EODWorldEditor") if local else (Path.home() / ".eod_world_editor")
+    cdir = base / "cache"
+    cdir.mkdir(parents=True, exist_ok=True)
+    return cdir
+
+
+def _trk_sha256_prefix(trk_path: Path, prefix_len: int = 16) -> str:
+    """Fast stat-memoized SHA-256 prefix for retail .TRK files."""
+    p = Path(trk_path).resolve()
+    st = p.stat()
+    key = str(p)
+    cached = _TRK_SHA_STAT_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+        return cached[2][:prefix_len]
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    _TRK_SHA_STAT_CACHE[key] = (st.st_size, st.st_mtime_ns, digest)
+    return digest[:prefix_len]
+
+
+def track_cache_path(trk_path: Path | str, lod: int = 0, include_sky: bool = False) -> Path:
+    p = Path(trk_path).resolve()
+    sha = _trk_sha256_prefix(p, 16)
+    stem = p.stem.upper()
+    if lod == 0 and not include_sky:
+        return track_cache_dir() / f"{stem}_{sha}.eodcache"
+    return track_cache_dir() / f"{stem}_{sha}_lod{lod}_sky{int(include_sky)}.eodcache"
+
+
+def track_cache_exists(trk_path: Path | str, lod: int = 0, include_sky: bool = False) -> bool:
+    try:
+        return track_cache_path(trk_path, lod=lod, include_sky=include_sky).is_file()
+    except Exception:
+        return False
+
+
+def _save_track_cache(world: TrackWorld, cache_file: Path, lod: int = 0, include_sky: bool = False) -> Path:
+    """Serialize TrackWorld into uncompressed numpy/struct binary cache atomically."""
+    blob = bytearray()
+
+    def _append_bytes(raw: bytes | bytearray | memoryview, align: int = 4) -> tuple[int, int]:
+        if not raw:
+            return 0, 0
+        rem = len(blob) % align
+        if rem:
+            blob.extend(b"\x00" * (align - rem))
+        off = len(blob)
+        blob.extend(raw)
+        return off, len(raw)
+
+    def _append_arr(arr: np.ndarray, align: int = 4) -> tuple[int, list[int]]:
+        if arr.size == 0:
+            return 0, list(arr.shape)
+        c_arr = np.ascontiguousarray(arr)
+        off, _ = _append_bytes(memoryview(c_arr).cast("B"), align=align)
+        return off, list(c_arr.shape)
+
+    models_meta: list[list[Any]] = []
+    for m in world.models.values():
+        if m.category == "car-wreck":
+            continue  # car catalog is merged dynamically via in-memory _CAR_CATALOG_CACHE
+        parts_meta: list[list[Any]] = []
+        for part in m.parts:
+            v_off, v_shape = _append_arr(part.vertices.astype(np.float32, copy=False))
+            i_off, i_shape = _append_arr(part.indices.astype(np.uint32, copy=False))
+            parts_meta.append([part.texture, v_off, v_shape, i_off, i_shape, int(part.tri_count)])
+        models_meta.append(
+            [
+                m.key,
+                m.name,
+                m.category,
+                m.model_store,
+                m.hash_hex,
+                parts_meta,
+                int(m.tri_count),
+                list(m.textures),
+                [float(x) for x in m.bbox_min],
+                [float(x) for x in m.bbox_max],
+                list(m.pivot),
+                bool(m.placed_by_map),
+                m.model_offset,
+                m.subtype,
+            ]
+        )
+
+    # Pack all WorldObject float transforms into a single contiguous (N, 15) float32 numpy table
+    n_objs = len(world.objects)
+    obj_xforms = np.empty((n_objs, 15), dtype=np.float32)
+    objects_meta: list[list[Any]] = []
+    for idx_o, o in enumerate(world.objects):
+        obj_xforms[idx_o, 0:3] = o.position
+        obj_xforms[idx_o, 3:6] = o.rotation_hpr
+        obj_xforms[idx_o, 6:9] = o.scale
+        obj_xforms[idx_o, 9:12] = o.retail_initial_pos
+        obj_xforms[idx_o, 12:15] = o.retail_initial_rot
+        wm = world.models.get(o.model_key)
+        # Omit name/subtype when identical to WorldModel (saves ~2 MB of metadata JSON!)
+        name_override = None if (wm is not None and o.name == wm.name) else o.name
+        sub_override = None if (wm is not None and o.subtype == wm.subtype) else o.subtype
+        orig_mk_override = None if (o.retail_original_model_key == o.model_key) else o.retail_original_model_key
+        flags = (
+            (1 if o.written else 0)
+            | (2 if o.visible else 0)
+            | (4 if o.deleted else 0)
+            | (8 if o.has_custom_collision else 0)
+            | (16 if o.source == "Retail" else 0)
+        )
+        objects_meta.append(
+            [
+                o.obj_id,
+                o.model_key,
+                o.category,
+                o.section_mlist,
+                flags,
+                name_override,
+                sub_override,
+                o.retail_instance_id,
+                o.retail_record_offset,
+                o.retail_model_offset,
+                o.retail_event_member,
+                o.retail_event_section,
+                o.retail_event_prop_index,
+                orig_mk_override,
+                o.opt_terrain_mode,
+            ]
+        )
+    obj_xforms_off, obj_xforms_shape = _append_arr(obj_xforms)
+
+    textures_meta: list[list[Any]] = []
+    for name, ta in world.textures.items():
+        if name.startswith("car/"):
+            continue
+        rgba_off, rgba_len = _append_bytes(ta.rgba, align=4)
+        raw_off, raw_len = _append_bytes(ta.raw_tex_bytes or b"", align=4)
+        textures_meta.append(
+            [
+                ta.name,
+                int(ta.width),
+                int(ta.height),
+                rgba_off,
+                rgba_len,
+                ta.alpha_kind,
+                list(ta.average_rgb),
+                ta.asset_id,
+                raw_off,
+                raw_len,
+            ]
+        )
+
+    col = world.collision
+    scol_line_off, scol_line_shape = _append_arr(col.scol_line_verts.astype(np.float32, copy=False))
+    scol_base_off, scol_base_shape = _append_arr(col.scol_base_line_verts.astype(np.float32, copy=False))
+    bppt_line_off, bppt_line_shape = _append_arr(col.bppt_line_verts.astype(np.float32, copy=False))
+    sobl_line_off, sobl_line_shape = _append_arr(col.sobl_line_verts.astype(np.float32, copy=False))
+    sobl_col_off, sobl_col_shape = _append_arr(col.sobl_line_colors.astype(np.float32, copy=False))
+    scol_raw_off, scol_raw_len = _append_bytes(col._scol_raw or b"", align=4)
+
+    col_meta = {
+        "scol_count": int(col.scol_count),
+        "sobl_count": int(col.sobl_count),
+        "sobl_boxes": int(col.sobl_boxes),
+        "sobl_tubes": int(col.sobl_tubes),
+        "sobl_records": col.sobl_records,
+        "bppt_slots": {str(k): v for k, v in col.bppt_slots.items()},
+        "scol_line": [scol_line_off, scol_line_shape],
+        "scol_base": [scol_base_off, scol_base_shape],
+        "bppt_line": [bppt_line_off, bppt_line_shape],
+        "sobl_line": [sobl_line_off, sobl_line_shape],
+        "sobl_col": [sobl_col_off, sobl_col_shape],
+        "scol_raw": [scol_raw_off, scol_raw_len],
+    }
+
+    roads_meta: dict[str, Any] = {}
+    for lname, g in world.all_road_graphs.items():
+        roads_meta[lname] = {
+            "line_name": g.line_name,
+            "available_lines": list(g.available_lines),
+            "next_id": int(g.next_id),
+            "nodes": [
+                [n.node_id, n.x, n.y, n.z, n.line_name, n.is_side, n.retail_index, n.lanes, n.width, n.two_way]
+                for n in g.nodes.values()
+            ],
+            "edges": [[e.a, e.b, e.lanes, e.width, e.two_way] for e in g.edges],
+        }
+
+    markers_meta = [
+        [m.marker_id, m.name, m.kind, list(m.position), float(m.heading_deg), m.source, m.note]
+        for m in world.markers
+    ]
+
+    templates_meta = {
+        k: [t.display_name, t.contest_key, t.va0_member, list(t.opt_terrain_modes), t.ilin_member]
+        for k, t in world.event_templates.items()
+    }
+
+    meta_doc = {
+        "trk_rel": world.trk_rel,
+        "track_name": world.track_name,
+        "display_name": world.display_name,
+        "entries": world.entries,
+        "graf_summary": world.graf_summary,
+        "mlist_info": world.mlist_info,
+        "models": models_meta,
+        "objects": objects_meta,
+        "obj_xforms": [obj_xforms_off, obj_xforms_shape],
+        "textures": textures_meta,
+        "collision": col_meta,
+        "active_road_line": world.road_graph.line_name,
+        "roads": roads_meta,
+        "markers": markers_meta,
+        "world_center": list(world.world_center),
+        "world_radius": float(world.world_radius),
+        "available_events": list(world.available_events),
+        "event_templates": templates_meta,
+        "custom_race": world.custom_race.to_dict(),
+    }
+    meta_bytes = json.dumps(meta_doc, separators=(",", ":")).encode("utf-8")
+    header = struct.pack(
+        _CACHE_HEADER_FMT,
+        _CACHE_MAGIC,
+        _CACHE_VERSION,
+        int(lod),
+        int(include_sky),
+        len(meta_bytes),
+        len(blob),
+    )
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_file.with_name(cache_file.name + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(header)
+        f.write(meta_bytes)
+        f.write(blob)
+    os.replace(tmp, cache_file)
+    return cache_file
+
+
+def _load_track_cache(
+    cache_file: Path,
+    trk_p: Path,
+    gdir: Path,
+    lod: int = 0,
+    include_sky: bool = False,
+) -> TrackWorld | None:
+    """Fast binary deserialization of TrackWorld from an uncompressed .eodcache file."""
+    if not cache_file.is_file():
+        return None
+    try:
+        raw = cache_file.read_bytes()
+        if len(raw) < _CACHE_HEADER_SIZE:
+            return None
+        magic, ver, c_lod, c_sky, meta_len, blob_len = struct.unpack_from(_CACHE_HEADER_FMT, raw, 0)
+        if (
+            magic != _CACHE_MAGIC
+            or ver != _CACHE_VERSION
+            or c_lod != int(lod)
+            or c_sky != int(include_sky)
+            or _CACHE_HEADER_SIZE + meta_len + blob_len != len(raw)
+        ):
+            return None
+
+        meta_start = _CACHE_HEADER_SIZE
+        blob_start = meta_start + meta_len
+        meta = json.loads(raw[meta_start:blob_start])
+        mv = memoryview(raw)[blob_start:]
+
+        def _read_arr(spec: list[Any], dtype: Any) -> np.ndarray:
+            off, shape = int(spec[0]), tuple(int(s) for s in spec[1])
+            count = 1
+            for s in shape:
+                count *= s
+            if count == 0:
+                return np.zeros(shape, dtype=dtype)
+            return np.frombuffer(mv, dtype=dtype, count=count, offset=off).reshape(shape).copy()
+
+        models: dict[str, WorldModel] = {}
+        for m in meta["models"]:
+            parts: list[MeshPart] = []
+            for p in m[5]:
+                v_off, v_shape = int(p[1]), tuple(p[2])
+                i_off, i_shape = int(p[3]), tuple(p[4])
+                v_cnt = v_shape[0] * v_shape[1]
+                i_cnt = i_shape[0]
+                verts = np.frombuffer(mv, dtype=np.float32, count=v_cnt, offset=v_off).reshape(v_shape)
+                inds = np.frombuffer(mv, dtype=np.uint32, count=i_cnt, offset=i_off)
+                parts.append(MeshPart(texture=p[0], vertices=verts, indices=inds, tri_count=int(p[5])))
+            models[m[0]] = WorldModel(
+                key=m[0],
+                name=m[1],
+                category=m[2],
+                model_store=m[3],
+                hash_hex=m[4],
+                parts=parts,
+                tri_count=int(m[6]),
+                textures=m[7],
+                bbox_min=np.array(m[8], dtype=np.float32),
+                bbox_max=np.array(m[9], dtype=np.float32),
+                pivot=(float(m[10][0]), float(m[10][1]), float(m[10][2])),
+                placed_by_map=bool(m[11]),
+                model_offset=m[12],
+                subtype=m[13],
+            )
+
+        obj_xforms = _read_arr(meta["obj_xforms"], np.float32).tolist()
+        objects: list[WorldObject] = []
+        for o, xf in zip(meta["objects"], obj_xforms):
+            mk = o[1]
+            wm = models.get(mk)
+            flags = int(o[4])
+            objects.append(
+                WorldObject(
+                    obj_id=o[0],
+                    name=o[5] if o[5] is not None else (wm.name if wm else mk),
+                    model_key=mk,
+                    source="Retail" if (flags & 16) else "Placed by the editor",
+                    category=o[2],
+                    subtype=o[6] if o[6] is not None else (wm.subtype if wm else "Simple Model"),
+                    section_mlist=o[3],
+                    model_store=wm.model_store if wm else "",
+                    hash_hex=wm.hash_hex if wm else "",
+                    tri_count=wm.tri_count if wm else 0,
+                    textures=list(wm.textures) if wm else [],
+                    position=(xf[0], xf[1], xf[2]),
+                    rotation_hpr=(xf[3], xf[4], xf[5]),
+                    scale=(xf[6], xf[7], xf[8]),
+                    written=bool(flags & 1),
+                    visible=bool(flags & 2),
+                    deleted=bool(flags & 4),
+                    has_custom_collision=bool(flags & 8),
+                    retail_instance_id=o[7],
+                    retail_record_offset=o[8],
+                    retail_model_offset=o[9],
+                    retail_initial_pos=(xf[9], xf[10], xf[11]),
+                    retail_initial_rot=(xf[12], xf[13], xf[14]),
+                    retail_event_member=o[10],
+                    retail_event_section=o[11],
+                    retail_event_prop_index=o[12],
+                    retail_original_model_key=o[13] if o[13] is not None else mk,
+                    opt_terrain_mode=o[14],
+                )
+            )
+
+        textures: dict[str, TextureAsset] = {}
+        for t in meta["textures"]:
+            rgba = bytes(mv[int(t[3]) : int(t[3]) + int(t[4])]) if int(t[4]) > 0 else b""
+            raw_b = bytes(mv[int(t[8]) : int(t[8]) + int(t[9])]) if int(t[9]) > 0 else None
+            textures[t[0]] = TextureAsset(
+                name=t[0],
+                width=int(t[1]),
+                height=int(t[2]),
+                rgba=rgba,
+                alpha_kind=t[5],
+                average_rgb=(int(t[6][0]), int(t[6][1]), int(t[6][2])),
+                asset_id=t[7],
+                orig_width=int(t[1]),
+                orig_height=int(t[2]),
+                orig_rgba=rgba,
+                raw_tex_bytes=raw_b,
+            )
+
+        cm = meta["collision"]
+        scol_raw_off, scol_raw_len = int(cm["scol_raw"][0]), int(cm["scol_raw"][1])
+        scol_raw = bytes(mv[scol_raw_off : scol_raw_off + scol_raw_len]) if scol_raw_len > 0 else None
+        collision = CollisionData(
+            scol_count=int(cm["scol_count"]),
+            sobl_count=int(cm["sobl_count"]),
+            sobl_boxes=int(cm["sobl_boxes"]),
+            sobl_tubes=int(cm["sobl_tubes"]),
+            terrain=None,
+            scol_line_verts=_read_arr(cm["scol_line"], np.float32),
+            sobl_line_verts=_read_arr(cm["sobl_line"], np.float32),
+            sobl_line_colors=_read_arr(cm["sobl_col"], np.float32),
+            sobl_records=cm["sobl_records"],
+            bppt_slots={int(k): v for k, v in cm.get("bppt_slots", {}).items()},
+            bppt_line_verts=_read_arr(cm["bppt_line"], np.float32),
+            scol_base_line_verts=_read_arr(cm["scol_base"], np.float32),
+            _scol_raw=scol_raw,
+        )
+
+        all_road_graphs: dict[str, RoadGraph] = {}
+        for lname, rd in meta["roads"].items():
+            nodes_d: dict[int, RoadNode] = {}
+            for nd in rd["nodes"]:
+                rn = RoadNode(
+                    node_id=int(nd[0]),
+                    x=float(nd[1]),
+                    y=float(nd[2]),
+                    z=float(nd[3]),
+                    line_name=nd[4],
+                    is_side=bool(nd[5]),
+                    retail_index=nd[6],
+                    lanes=int(nd[7]),
+                    width=float(nd[8]),
+                    two_way=bool(nd[9]),
+                )
+                nodes_d[rn.node_id] = rn
+            edges_l = [RoadEdge(a=int(e[0]), b=int(e[1]), lanes=int(e[2]), width=float(e[3]), two_way=bool(e[4])) for e in rd["edges"]]
+            all_road_graphs[lname] = RoadGraph(
+                line_name=rd["line_name"],
+                available_lines=rd["available_lines"],
+                nodes=nodes_d,
+                edges=edges_l,
+                next_id=int(rd["next_id"]),
+                dirty=False,
+            )
+
+        active_line = meta.get("active_road_line")
+        road_graph = (
+            all_road_graphs.get(active_line)
+            or next(iter(all_road_graphs.values()), RoadGraph(line_name="track.ild"))
+        )
+
+        markers = [
+            WorldMarker(
+                marker_id=m[0],
+                name=m[1],
+                kind=m[2],
+                position=(float(m[3][0]), float(m[3][1]), float(m[3][2])),
+                heading_deg=float(m[4]),
+                source=m[5],
+                note=m[6],
+            )
+            for m in meta["markers"]
+        ]
+
+        event_templates = {
+            k: EventTemplateInfo(
+                display_name=v[0],
+                contest_key=v[1],
+                va0_member=v[2],
+                opt_terrain_modes=tuple(int(x) for x in v[3]),
+                ilin_member=v[4],
+            )
+            for k, v in meta.get("event_templates", {}).items()
+        }
+
+        wc_pt = meta["world_center"]
+        return TrackWorld(
+            game_dir=gdir,
+            trk_path=trk_p,
+            trk_rel=meta["trk_rel"],
+            track_name=meta["track_name"],
+            display_name=meta["display_name"],
+            entries=meta["entries"],
+            graf_summary=meta["graf_summary"],
+            mlist_info=meta["mlist_info"],
+            models=models,
+            objects=objects,
+            textures=textures,
+            collision=collision,
+            road_graph=road_graph,
+            all_road_graphs=all_road_graphs,
+            markers=markers,
+            world_center=(float(wc_pt[0]), float(wc_pt[1]), float(wc_pt[2])),
+            world_radius=float(meta["world_radius"]),
+            environment=EnvironmentState(),
+            custom_race=CustomRaceConfig.from_dict(meta.get("custom_race", {})),
+            available_events=meta.get("available_events", []),
+            event_templates=event_templates,
+            active_event_template="All Templates (Combined)",
+            sync_all_events=True,
+            include_lod_twins=True,
+            loaded_from_cache=True,
+            cache_path=str(cache_file),
+            _cache_backing=raw,
+        )
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main Track World Loader
 # ---------------------------------------------------------------------------
 def load_track_world(
@@ -1774,14 +2299,34 @@ def load_track_world(
     include_cars: bool = True,
     token: Any = None,
     progress: Any = None,
+    use_cache: bool = True,
 ) -> TrackWorld:
-    """Load an EOD retail .TRK archive into an interactive TrackWorld."""
+    """Load an EOD retail .TRK archive into an interactive TrackWorld (with Turbo Binary Cache)."""
+    t_start_ns = time.perf_counter_ns()
     trk_p = Path(trk_path).resolve()
     gdir = Path(game_dir).resolve() if game_dir else trk_p.parents[2]
     try:
         trk_rel = trk_p.relative_to(gdir).as_posix()
     except ValueError:
         trk_rel = f"DATA/TRACKS/{trk_p.name}"
+
+    cpath: Path | None = None
+    if use_cache:
+        try:
+            cpath = track_cache_path(trk_p, lod=lod, include_sky=include_sky)
+            cached_world = _load_track_cache(cpath, trk_p, gdir, lod=lod, include_sky=include_sky)
+            if cached_world is not None:
+                if include_cars:
+                    if progress is not None:
+                        progress(75, "Loading retail DATA/CAR vehicle library...")
+                    c_models, c_tex = load_car_catalog(gdir, token=token)
+                    merge_car_catalog_into_world(cached_world, c_models, c_tex)
+                cached_world.load_ms = (time.perf_counter_ns() - t_start_ns) / 1_000_000.0
+                if progress is not None:
+                    progress(100, f"Loaded {cached_world.display_name} from Turbo Cache ({cached_world.load_ms:.1f} ms)")
+                return cached_world
+        except Exception:
+            pass
 
     track_dict = we.load_track(gdir, trk_rel)
     graf_data = track_dict["graf"]
@@ -2126,12 +2671,20 @@ def load_track_world(
     )
     world.collision.rebuild_dynamic_ramp_collision(world)
 
+    if use_cache and cpath is not None:
+        try:
+            _save_track_cache(world, cpath, lod=lod, include_sky=include_sky)
+            world.cache_path = str(cpath)
+        except Exception:
+            pass
+
     if include_cars:
         if progress is not None:
             progress(75, "Loading retail DATA/CAR vehicle library...")
         c_models, c_tex = load_car_catalog(gdir, token=token)
         merge_car_catalog_into_world(world, c_models, c_tex)
 
+    world.load_ms = (time.perf_counter_ns() - t_start_ns) / 1_000_000.0
     if progress is not None:
-        progress(100, f"Loaded {world.display_name}")
+        progress(100, f"Loaded {world.display_name} ({world.load_ms:.1f} ms)")
     return world

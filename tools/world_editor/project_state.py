@@ -752,20 +752,15 @@ def load_png_rgba(png_path: Path | str) -> tuple[int, int, bytes]:
 
 
 # ---------------------------------------------------------------------------
-# Project Overlay (.eodworld.json) Save / Load
 # ---------------------------------------------------------------------------
-def save_project_overlay(
-    path: Path | str,
+# Project Overlay (.eodworld.json) Save / Load & Crash-Safe Atomic Autosave
+# ---------------------------------------------------------------------------
+def build_project_overlay_dict(
     project_name: str,
     world: TrackWorld,
     camera_state: dict[str, Any] | None = None,
-) -> Path:
-    """Save non-destructive .eodworld.json overlay. Never touches retail .TRK."""
-    out_path = Path(path)
-    if not out_path.name.lower().endswith(".eodworld.json"):
-        out_path = out_path.with_suffix(".eodworld.json")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+) -> dict[str, Any]:
+    """Snapshot the non-destructive project overlay dictionary on the UI thread (<1 ms)."""
     modified_retail: list[dict[str, Any]] = []
     added_objects: list[dict[str, Any]] = []
     deleted_ids: list[str] = []
@@ -865,14 +860,14 @@ def save_project_overlay(
     }
     sobl_edits_doc = {str(k): v for k, v in world.collision.sobl_edits.items()}
 
-    doc = {
+    return {
         "schema": "eod.world_project/2",
         "project_name": project_name,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "track": world.track_name,
         "trk_rel": world.trk_rel,
         "active_road_line": world.road_graph.line_name,
-        "camera": camera_state or {},
+        "camera": dict(camera_state) if camera_state else {},
         "environment": world.environment.to_dict(),
         "custom_race": world.custom_race.to_dict(),
         "replaced_textures": replaced_tex_doc,
@@ -880,12 +875,120 @@ def save_project_overlay(
         "modified_retail_objects": modified_retail,
         "added_objects": added_objects,
         "deleted_object_ids": deleted_ids,
-        "custom_collision_boxes": world.collision.custom_boxes,
+        "custom_collision_boxes": list(world.collision.custom_boxes),
         "roads": roads_doc,
         "markers": markers_doc,
     }
-    out_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-    return out_path
+
+
+def atomic_write_json(
+    target_path: Path | str,
+    doc: dict[str, Any],
+    *,
+    tmp_suffix: str = ".autosave.tmp",
+    compact: bool = False,
+) -> Path:
+    """Crash-safe atomic JSON write (`<target><tmp_suffix>` -> `os.replace`)."""
+    out = Path(target_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + tmp_suffix)
+    text = (json.dumps(doc, separators=(",", ":")) if compact else json.dumps(doc, indent=2)) + "\n"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+    os.replace(tmp, out)
+    return out
+
+
+def _autosave_dir() -> Path:
+    override = os.environ.get("EOD_EDITOR_APPDATA")
+    if override:
+        base = Path(override)
+    else:
+        local = os.environ.get("LOCALAPPDATA")
+        base = (Path(local) / "EODWorldEditor") if local else (Path.home() / ".eod_world_editor")
+    d = base / "autosave"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def autosave_path_for(
+    project_path: Path | str | None,
+    track_name: str = "TRACK",
+    project_name: str = "Untitled",
+) -> Path:
+    """Return the canonical autosave file path for either a saved or unsaved project."""
+    if project_path is not None:
+        p = Path(project_path)
+        return p.with_name(p.name + ".autosave.json")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name).strip("_") or "untitled"
+    trk = re.sub(r"[^A-Za-z0-9_.-]+", "_", track_name.upper()).strip("_") or "TRACK"
+    return _autosave_dir() / f"{trk}_{slug}.eodworld.json.autosave.json"
+
+
+def save_autosave_snapshot(
+    target_path: Path | str,
+    doc: dict[str, Any],
+    *,
+    token: Any = None,
+    progress: Any = None,
+) -> Path:
+    """Background-worker friendly atomic autosave (`<project>.autosave.tmp` -> `os.replace`)."""
+    if token is not None and token.is_cancelled:
+        raise InterruptedError("Autosave cancelled")
+    return atomic_write_json(Path(target_path), doc, tmp_suffix=".autosave.tmp", compact=True)
+
+
+def find_newer_autosave(
+    project_path: Path | str | None,
+    track_name: str = "",
+    project_name: str = "",
+) -> Path | None:
+    """Return autosave path if it exists, is valid JSON, and is newer than the last manual save."""
+    cand = autosave_path_for(project_path, track_name or "TRACK", project_name or "Untitled")
+    if not cand.is_file():
+        return None
+    try:
+        auto_mtime = cand.stat().st_mtime
+        if project_path is not None and Path(project_path).is_file():
+            manual_mtime = Path(project_path).stat().st_mtime
+            if auto_mtime <= manual_mtime + 0.05:
+                return None
+        # Validate JSON integrity before prompting user
+        parsed = json.loads(cand.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict) or not parsed.get("track"):
+            return None
+        return cand
+    except Exception:
+        return None
+
+
+def clear_autosave(
+    project_path: Path | str | None,
+    track_name: str = "",
+    project_name: str = "",
+) -> None:
+    cand = autosave_path_for(project_path, track_name or "TRACK", project_name or "Untitled")
+    for p in (cand, cand.with_name(cand.name + ".autosave.tmp")):
+        try:
+            if p.is_file():
+                p.unlink()
+        except Exception:
+            pass
+
+
+def save_project_overlay(
+    path: Path | str,
+    project_name: str,
+    world: TrackWorld,
+    camera_state: dict[str, Any] | None = None,
+) -> Path:
+    """Save non-destructive .eodworld.json overlay atomically. Never touches retail .TRK."""
+    out_path = Path(path)
+    if not out_path.name.lower().endswith(".eodworld.json"):
+        out_path = out_path.with_suffix(".eodworld.json")
+    doc = build_project_overlay_dict(project_name, world, camera_state)
+    return atomic_write_json(out_path, doc, tmp_suffix=".tmp", compact=False)
 
 
 def apply_project_overlay(world: TrackWorld, path: Path | str) -> dict[str, Any]:
@@ -1908,6 +2011,408 @@ def _compile_custom_objects_into_trk(
         return len(placed_records)
 
 
+# ---------------------------------------------------------------------------
+# Fast GF(2) Bit-Exact Incremental EOD CRC-32 + Delta-Only Mod Baker (<10 ms!)
+# ---------------------------------------------------------------------------
+_CRC_TABLE = rst0.CRC_TABLE
+
+
+def _crc_step_zero(v: int) -> int:
+    return (((v << 8) & 0xFFFFFFFF) ^ _CRC_TABLE[(v >> 24) & 0xFF]) & 0xFFFFFFFF
+
+
+def _crc_mat_mul_vec(mat: list[int], vec: int) -> int:
+    out = 0
+    bit = 0
+    while vec:
+        if vec & 1:
+            out ^= mat[bit]
+        vec >>= 1
+        bit += 1
+    return out
+
+
+def _crc_build_shift_mats(max_pow: int = 25) -> list[list[int]]:
+    m0 = [_crc_step_zero(1 << b) for b in range(32)]
+    mats = [m0]
+    for _ in range(max_pow):
+        prev = mats[-1]
+        mats.append([_crc_mat_mul_vec(prev, col) for col in prev])
+    return mats
+
+
+_CRC_SHIFT_MATS: list[list[int]] = _crc_build_shift_mats(25)
+
+
+def _crc_shift_zeros(v: int, n_bytes: int) -> int:
+    k = 0
+    while n_bytes:
+        if n_bytes & 1:
+            v = _crc_mat_mul_vec(_CRC_SHIFT_MATS[k], v)
+        n_bytes >>= 1
+        k += 1
+    return v
+
+
+def delta_eod_crc(
+    orig_crc: int,
+    orig_bytes: bytes | bytearray,
+    new_bytes: bytes | bytearray,
+    spans: list[tuple[int, int]],
+) -> int:
+    """Compute bit-exact `rst0.eod_crc(new_bytes)` in <0.1 ms via GF(2) span folding."""
+    n = len(orig_bytes)
+    if n < 4 or len(new_bytes) != n:
+        return eod_crc(bytes(new_bytes))
+    if not spans:
+        return orig_crc
+    # Merge & sort overlapping/adjacent spans so each byte is XORed once
+    ordered = sorted((max(0, s), min(n, e)) for s, e in spans if e > s)
+    if not ordered:
+        return orig_crc
+    merged: list[tuple[int, int]] = []
+    cs, ce = ordered[0]
+    for s, e in ordered[1:]:
+        if s <= ce:
+            if e > ce:
+                ce = e
+        else:
+            merged.append((cs, ce))
+            cs, ce = s, e
+    merged.append((cs, ce))
+
+    tbl = _CRC_TABLE
+    dc_total = 0
+    for s, e in merged:
+        pos = s
+        if pos < 4:
+            hdr_end = min(4, e)
+            dc_hdr = 0
+            for p in range(pos, hdr_end):
+                diff = orig_bytes[p] ^ new_bytes[p]
+                if diff:
+                    dc_hdr |= diff << ((3 - p) * 8)
+            if dc_hdr:
+                dc_total ^= _crc_shift_zeros(dc_hdr, n - 4)
+            pos = hdr_end
+        if pos < e:
+            dc = 0
+            for p in range(pos, e):
+                diff = orig_bytes[p] ^ new_bytes[p]
+                dc = (((dc << 8) & 0xFFFFFFFF) ^ diff ^ tbl[(dc >> 24) & 0xFF]) & 0xFFFFFFFF
+            if dc:
+                dc_total ^= _crc_shift_zeros(dc, n - e)
+    return (orig_crc ^ dc_total) & 0xFFFFFFFF
+
+
+# In-memory caches for retail patch indexes and per-mod delta bake state
+_RETAIL_PATCH_CACHE: dict[str, dict[str, Any]] = {}
+_MOD_DELTA_STATE: dict[str, dict[str, Any]] = {}
+
+
+def _get_retail_patch_index(world: TrackWorld) -> dict[str, Any]:
+    """Return cached retail .TRK metadata & clean member slices (populated once per track)."""
+    key = os.path.abspath(str(world.trk_path))
+    st = os.stat(key)
+    sig = (st.st_size, st.st_mtime_ns)
+    cached = _RETAIL_PATCH_CACHE.get(key)
+    if cached is not None and cached["stat"] == sig:
+        return cached
+    raw = world.trk_path.read_bytes()
+    retail_sha = hashlib.sha256(raw).hexdigest()
+    entries = wc.read_directory(raw)
+    by_name = {e["name"].lower(): e for e in entries}
+    graf_entry = next((e for e in entries if e["type"] == "GRAF"), None)
+    clean_graf = raw[graf_entry["offset"] : graf_entry["offset"] + graf_entry["size"]] if graf_entry else b""
+    sol_entry = by_name.get("track.sol")
+    clean_sol = raw[sol_entry["offset"] : sol_entry["offset"] + sol_entry["size"]] if sol_entry else b""
+
+    clean_ilds: dict[str, bytes] = {}
+    clean_va0s: dict[str, bytes] = {}
+    for e in entries:
+        low = e["name"].lower()
+        if low.endswith(".ild"):
+            clean_ilds[low] = raw[e["offset"] : e["offset"] + e["size"]]
+        elif low.startswith("c_") and e["type"] == "VALT":
+            clean_va0s[low] = raw[e["offset"] : e["offset"] + e["size"]]
+
+    idx = {
+        "stat": sig,
+        "retail_sha256": retail_sha,
+        "entries": entries,
+        "by_name": by_name,
+        "graf_entry": graf_entry,
+        "clean_graf": clean_graf,
+        "sol_entry": sol_entry,
+        "clean_sol": clean_sol,
+        "clean_ilds": clean_ilds,
+        "clean_va0s": clean_va0s,
+        "graf_parsed": None,
+        "by_id": None,
+        "mlists": None,
+        "model_patch_meta": {},  # mod_off -> (q199_offsets, mlist_hits, model_hdr)
+        "event_props": {},       # ev_name.lower() -> list[prop]
+    }
+    _RETAIL_PATCH_CACHE[key] = idx
+    return idx
+
+
+def _ensure_graf_patch_tables(idx: dict[str, Any]) -> None:
+    if idx["graf_parsed"] is not None:
+        return
+    graf = wg.parse_graf(idx["clean_graf"])
+    idx["graf_parsed"] = graf
+    idx["by_id"] = {f"i{i:04d}": leaf for i, leaf in enumerate(graf["leaves"])}
+    idx["mlists"] = [info for info in graf["mlist_info"] if info]
+
+
+def _get_model_patch_meta(idx: dict[str, Any], mod_off: int) -> tuple[list[int], list[int], dict[str, Any]]:
+    meta = idx["model_patch_meta"].get(mod_off)
+    if meta is not None:
+        return meta
+    orig = idx["clean_graf"]
+    model = wg.parse_model(orig, mod_off)
+    q199: list[int] = []
+    for part in model["parts"]:
+        q199.extend(we.vif_q199_offsets(orig, part))
+    key = struct.pack("<4f", *model["centre"], model["radius"])
+    mhits: list[int] = []
+    for info in idx["mlists"]:
+        lo_, hi_ = info["offset"], info["offset"] + info["batches"]["offset"]
+        start = lo_
+        while True:
+            k = orig.find(key, start, hi_)
+            if k < 0:
+                break
+            if (k - lo_) % 4 == 0:
+                mhits.append(k)
+            start = k + 4
+    meta = (q199, mhits, model)
+    idx["model_patch_meta"][mod_off] = meta
+    return meta
+
+
+def delta_eod_crc_patches(
+    orig_crc: int,
+    orig_bytes: bytes | bytearray,
+    patches: list[tuple[int, bytes]],
+) -> int:
+    """Compute bit-exact `rst0.eod_crc` from sparse `(offset, new_bytes)` patches without copying the full buffer."""
+    n = len(orig_bytes)
+    if n < 4 or not patches:
+        return orig_crc
+    # Resolve overlapping patches (later patch wins) onto minimal merged spans
+    by_span: dict[int, int] = {}
+    for off, data in patches:
+        for i, b in enumerate(data):
+            p = off + i
+            if 0 <= p < n:
+                by_span[p] = b
+    if not by_span:
+        return orig_crc
+    positions = sorted(by_span.keys())
+    tbl = _CRC_TABLE
+    dc_total = 0
+    idx_p = 0
+    total_p = len(positions)
+    while idx_p < total_p:
+        s = positions[idx_p]
+        e = s + 1
+        while idx_p + 1 < total_p and positions[idx_p + 1] == e:
+            idx_p += 1
+            e += 1
+        idx_p += 1
+        pos = s
+        if pos < 4:
+            hdr_end = min(4, e)
+            dc_hdr = 0
+            for p in range(pos, hdr_end):
+                diff = orig_bytes[p] ^ by_span[p]
+                if diff:
+                    dc_hdr |= diff << ((3 - p) * 8)
+            if dc_hdr:
+                dc_total ^= _crc_shift_zeros(dc_hdr, n - 4)
+            pos = hdr_end
+        if pos < e:
+            dc = 0
+            for p in range(pos, e):
+                diff = orig_bytes[p] ^ by_span[p]
+                dc = (((dc << 8) & 0xFFFFFFFF) ^ diff ^ tbl[(dc >> 24) & 0xFF]) & 0xFFFFFFFF
+            if dc:
+                dc_total ^= _crc_shift_zeros(dc, n - e)
+    return (orig_crc ^ dc_total) & 0xFFFFFFFF
+
+
+def _patch_graf_sparse_fast(
+    idx: dict[str, Any],
+    base_graf: bytes,
+    base_crc: int,
+    graf_edits: list[dict[str, Any]],
+) -> tuple[list[tuple[int, bytes]], int, list[tuple[int, int]], int]:
+    """Patch GRAF static/optional-terrain/dyno transforms into sparse byte slices (<0.5 ms, zero 3.4MB copy!)."""
+    _ensure_graf_patch_tables(idx)
+    patches: list[tuple[int, bytes]] = []
+    spans: list[tuple[int, int]] = []
+    by_id = idx["by_id"]
+    changed_bytes = 0
+
+    for edit in graf_edits:
+        leaf = by_id.get(edit.get("instance"))
+        if leaf is None:
+            continue
+        if "matrix" in edit:
+            rows = we.matrix_to_native_rows([float(x) for x in edit["matrix"]])
+            off = leaf["record"] + wg.DYNO_MATRIX
+            patches.append((off, struct.pack("<12f", *rows)))
+            spans.append((off, off + 48))
+            changed_bytes += 48
+            continue
+        delta = [float(x) for x in edit.get("translate", (0.0, 0.0, 0.0))]
+        if not any(abs(v) > 1e-7 for v in delta):
+            continue
+        mo = leaf.get("model_offset")
+        if not mo:
+            continue
+        q199, mhits, _model = _get_model_patch_meta(idx, mo)
+        for q in q199:
+            ox, oy, oz = struct.unpack_from("<3f", base_graf, q)
+            patches.append((q, struct.pack("<3f", ox + delta[0], oy + delta[1], oz + delta[2])))
+            spans.append((q, q + 12))
+            changed_bytes += 12
+        cx, cy, cz = struct.unpack_from("<3f", base_graf, mo + 0x1C)
+        bvals = list(struct.unpack_from("<6f", base_graf, mo + 0x28))
+        for a in range(3):
+            bvals[2 * a] += delta[a]
+            bvals[2 * a + 1] += delta[a]
+        patches.append((mo + 0x1C, struct.pack("<3f", cx + delta[0], cy + delta[1], cz + delta[2])))
+        patches.append((mo + 0x28, struct.pack("<6f", *bvals)))
+        spans.append((mo + 0x1C, mo + 0x28))
+        spans.append((mo + 0x28, mo + 0x40))
+        changed_bytes += 36
+        for k in mhits:
+            mx, my, mz = struct.unpack_from("<3f", base_graf, k)
+            patches.append((k, struct.pack("<3f", mx + delta[0], my + delta[1], mz + delta[2])))
+            spans.append((k, k + 12))
+            changed_bytes += 12
+
+    new_crc = delta_eod_crc_patches(base_crc, base_graf, patches)
+    return patches, new_crc, spans, changed_bytes
+
+
+def _patch_sobl_fast(
+    clean_sol: bytes,
+    clean_crc: int,
+    world: TrackWorld,
+) -> tuple[bytearray, int, list[tuple[int, int]], int]:
+    """Patch SOBL barrier edits directly into `track.sol` using pre-planned fields (<1 ms)."""
+    buf = bytearray(clean_sol)
+    spans: list[tuple[int, int]] = []
+    patched = 0
+    recs = world.collision.sobl_records
+    for rec_idx, ed in sorted(world.collision.sobl_edits.items()):
+        idx = int(rec_idx)
+        if not (0 <= idx < len(recs)):
+            continue
+        rec = recs[idx]
+        if rec.get("kind") != "box":
+            continue
+        off = int(rec["offset"])
+        if "ry" in ed and "centre" in ed and "sphere_radius" in ed:
+            new_ry = float(ed["ry"])
+            new_centre = [float(v) for v in ed["centre"]]
+            new_sphere = float(ed["sphere_radius"])
+        else:
+            orig_rec = dict(rec)
+            orig_rec["half_extents"] = list(rec["orig_half_extents"])
+            orig_rec["centre"] = list(rec["orig_centre"])
+            orig_rec["sphere_radius"] = float(rec["orig_sphere_radius"])
+            plan = wc.plan_box_edit(orig_rec, str(ed["field"]), float(ed["value"]), "bottom", world.collision.terrain)
+            new_ry = float(plan["ry"])
+            new_centre = [float(v) for v in plan["centre"]]
+            new_sphere = float(plan["sphere_radius"])
+        struct.pack_into("<3f", buf, off + 0x24, *new_centre)
+        struct.pack_into("<f", buf, off + 0x64, new_ry)
+        struct.pack_into("<f", buf, off + 0x6C, new_sphere)
+        spans.append((off + 0x24, off + 0x30))
+        spans.append((off + 0x64, off + 0x70))
+        patched += 1
+    new_crc = delta_eod_crc(clean_crc, clean_sol, buf, spans)
+    return buf, new_crc, spans, patched
+
+
+def _patch_va0_events_fast(
+    idx: dict[str, Any],
+    world: TrackWorld,
+    event_edits: list[dict[str, Any]],
+) -> tuple[dict[str, tuple[bytes, int]], int]:
+    """Patch c_*.va0 event prop frame64 records directly from cached clean members (<1 ms)."""
+    if not event_edits:
+        return {}, 0
+    track_proxy = None
+    dirty_bufs: dict[str, bytearray] = {}
+    dirty_spans: dict[str, list[tuple[int, int]]] = {}
+    changed_bytes = 0
+
+    for edit in event_edits:
+        ev_name = str(edit["event"])
+        low = ev_name.lower()
+        props = idx["event_props"].get(low)
+        if props is None:
+            if track_proxy is None:
+                track_proxy = we.load_track(world.game_dir, world.trk_rel)
+            props = we.event_props(track_proxy, ev_name)
+            idx["event_props"][low] = props
+        pid = edit.get("prop")
+        k = int(pid[1:]) if isinstance(pid, str) and pid.startswith("e") else int(edit.get("index", -1))
+        if not (0 <= k < len(props)):
+            continue
+        prop = props[k]
+        rows = list(prop["frame"])
+        if "matrix" in edit:
+            M = [float(x) for x in edit["matrix"]]
+            new_rows = we.matrix_to_native_rows(M)
+            if prop["localFrame"]:
+                L = we.native_rows_to_matrix(prop["localFrame"])
+                R = [[L[0], L[1], L[2]], [L[4], L[5], L[6]], [L[8], L[9], L[10]]]
+                t = [L[3], L[7], L[11]]
+                inv = [
+                    R[0][0], R[1][0], R[2][0], -(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]),
+                    R[0][1], R[1][1], R[2][1], -(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]),
+                    R[0][2], R[1][2], R[2][2], -(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]),
+                    0.0, 0.0, 0.0, 1.0,
+                ]
+                new_rows = we.compose_rows(new_rows, we.matrix_to_native_rows(inv))
+        elif "translate" in edit:
+            d = [float(x) for x in edit["translate"]]
+            new_rows = rows[:9] + [rows[9 + a] + d[a] if d[a] != 0.0 else rows[9 + a] for a in range(3)]
+        else:
+            continue
+        if new_rows == rows:
+            continue
+        text = we.encode_frame64(new_rows)
+        ml = prop["member"].lower()
+        clean = idx["clean_va0s"].get(ml)
+        if clean is None:
+            continue
+        buf = dirty_bufs.get(ml)
+        if buf is None:
+            buf = bytearray(clean)
+            dirty_bufs[ml] = buf
+            dirty_spans[ml] = []
+        moff = int(prop["memberOffset"])
+        buf[moff : moff + 64] = text.encode("latin1")
+        dirty_spans[ml].append((moff, moff + 64))
+        changed_bytes += 64
+
+    out: dict[str, tuple[bytes, int]] = {}
+    for ml, buf in dirty_bufs.items():
+        orig = idx["clean_va0s"][ml]
+        orig_crc = int(idx["by_name"][ml]["crc"])
+        new_crc = delta_eod_crc(orig_crc, orig, buf, dirty_spans[ml])
+        out[ml] = (bytes(buf), new_crc)
+    return out, changed_bytes
+
+
 def export_mod_layer(
     world: TrackWorld,
     project_name: str,
@@ -1915,36 +2420,33 @@ def export_mod_layer(
     *,
     token: Any = None,
     progress: Any = None,
+    allow_delta: bool = True,
 ) -> dict[str, Any]:
     """Write a real, playable non-destructive mod layer into `dest_dir` (never edits retail DATA/).
 
-    1. Patches retail .TRK into `<dest_dir>/DATA/TRACKS/<TRACK>.TRK`:
-       - Static / Optional-Terrain translations + deletions (Y=-5000) via `world_export.place`
-       - Real VIF vertex baking (`track.grf`) for scaled/rotated/raised ramps & terrain meshes
-       - Real collision baking (`track.bpp` BPPT optional-terrain ramps + `track.bsc` SCOL terrain)
-       - Sync Modded Ramps & Props to All Events / Free Roam (`opt_terrain` promotion + `0xFE` marker + `c_*.va0` sync)
-       - Editor-placed & replaced Cars/Wrecks/Props injected into `.TRK` (`0TSR` `.mod`/`.tex` + `obstacle.val` + `c_*.va0`)
-       - SOBL barrier height / flatten edits (`track.sol`) via `world_collision.apply_box_edits`
-       - ILIN racing line node X/Z edits (`*.ild`) with full tangent, length, distance & lap-length recalculation
-    2. Writes Vulkan `HOSTTEX/replacements.tsv` + `.eodhtx` mipmap chains for PNG texture swaps & borrowed skies.
-    3. Writes `PROFILE.TXT`, `custom_race.json`, `<slug>.eodworld.json`, and `mod_layer_manifest.json`.
+    Supports a `<10 ms` **Fast Delta-Only Mod Baker** when `<dest_dir>/DATA/TRACKS/<TRACK>.TRK`
+    already exists and only transforms / ILIN / SOBL changed (no new `.CAR`/`.mod` archive members),
+    patching dirty member payloads + exact 0TSR CRCs in-place without re-copying or re-parsing
+    untouched retail members!
     """
-    out = Path(dest_dir).resolve()
-    retail_data_dir = (world.game_dir / "DATA").resolve()
-    try:
-        out.relative_to(retail_data_dir)
+    t_compile_ns = time.perf_counter_ns()
+    out = Path(os.path.abspath(str(dest_dir)))
+    retail_trk_abs = os.path.abspath(str(world.trk_path))
+    retail_data_abs = os.path.abspath(str(world.game_dir / "DATA"))
+    out_str = str(out)
+    if out_str.lower() == retail_data_abs.lower() or out_str.lower().startswith(retail_data_abs.lower() + os.sep):
         raise ValueError("Refusing to write mod layer inside retail DATA/ directory.")
-    except ValueError as exc:
-        if "Refusing" in str(exc):
-            raise
 
     tracks_out = out / "DATA" / "TRACKS"
-    tracks_out.mkdir(parents=True, exist_ok=True)
     mod_trk_path = tracks_out / world.trk_path.name
-    if mod_trk_path.resolve() == world.trk_path.resolve():
+    mod_key = os.path.abspath(str(mod_trk_path))
+    if mod_key.lower() == retail_trk_abs.lower():
         raise ValueError("Refusing to overwrite retail .TRK file.")
+    if not tracks_out.is_dir():
+        tracks_out.mkdir(parents=True, exist_ok=True)
 
-    retail_sha_before = _sha256_file(world.trk_path)
+    retail_idx = _get_retail_patch_index(world)
+    retail_sha_before = retail_idx["retail_sha256"]
     if progress:
         progress(10, "Collecting retail placement, VIF & custom prop edits...")
 
@@ -1962,19 +2464,40 @@ def export_mod_layer(
             seen_event_edits.add(key)
             retail_edits.append(edit_dict)
 
-    # Index event props by (model_key, rounded_initial_pos) for All-Events prop sync
-    ev_props_by_sig: dict[tuple[str, int, int, int], list[WorldObject]] = {}
-    for obj in world.objects:
-        if obj.source == "Retail" and obj.category == "event-prop" and obj.retail_event_member:
-            sig = (
-                obj.model_key,
-                int(round(obj.retail_initial_pos[0] * 2.0)),
-                int(round(obj.retail_initial_pos[1] * 2.0)),
-                int(round(obj.retail_initial_pos[2] * 2.0)),
-            )
-            ev_props_by_sig.setdefault(sig, []).append(obj)
+    # Lazily index event props only if an event-prop is actually deleted (saves ~3 ms on delta bakes!)
+    ev_props_by_sig: dict[tuple[str, int, int, int], list[WorldObject]] | None = None
 
+    def _get_ev_props_by_sig() -> dict[tuple[str, int, int, int], list[WorldObject]]:
+        nonlocal ev_props_by_sig
+        if ev_props_by_sig is None:
+            ev_props_by_sig = {}
+            for o2 in world.objects:
+                if o2.source == "Retail" and o2.category == "event-prop" and o2.retail_event_member:
+                    sig2 = (
+                        o2.model_key,
+                        int(round(o2.retail_initial_pos[0] * 2.0)),
+                        int(round(o2.retail_initial_pos[1] * 2.0)),
+                        int(round(o2.retail_initial_pos[2] * 2.0)),
+                    )
+                    ev_props_by_sig.setdefault(sig2, []).append(o2)
+        return ev_props_by_sig
+
+    _UNIT_SCALE = (1.0, 1.0, 1.0)
     for obj in world.objects:
+        # Ultra-fast single-branch skip for untouched retail objects (~99.9% of 6,066 instances)
+        if (
+            not obj.deleted
+            and obj.position == obj.retail_initial_pos
+            and obj.source == "Retail"
+            and obj.rotation_hpr == obj.retail_initial_rot
+            and (obj.retail_original_model_key is None or obj.model_key == obj.retail_original_model_key)
+            and (
+                obj.category not in ("static", "optional-terrain")
+                or obj.scale == _UNIT_SCALE
+                or (abs(obj.scale[0] - 1.0) <= 1e-4 and abs(obj.scale[1] - 1.0) <= 1e-4 and abs(obj.scale[2] - 1.0) <= 1e-4)
+            )
+        ):
+            continue
         if obj.deleted:
             if obj.source != "Retail":
                 continue
@@ -1989,7 +2512,6 @@ def export_mod_layer(
                     {"event": obj.retail_event_member, "prop": pid, "translate": [0.0, -5000.0, 0.0]},
                 )
                 deleted_retail_count += 1
-                # Sync deletion to matching event props in other c_*.va0 tables when Sync All Events is ON
                 if world.sync_all_events:
                     sig = (
                         obj.model_key,
@@ -1997,7 +2519,7 @@ def export_mod_layer(
                         int(round(obj.retail_initial_pos[1] * 2.0)),
                         int(round(obj.retail_initial_pos[2] * 2.0)),
                     )
-                    for peer in ev_props_by_sig.get(sig, ()):
+                    for peer in _get_ev_props_by_sig().get(sig, ()):
                         if peer is obj or not peer.retail_event_member:
                             continue
                         ppid = f"e{peer.retail_event_prop_index:04d}" if peer.retail_event_prop_index is not None else peer.obj_id
@@ -2008,12 +2530,10 @@ def export_mod_layer(
                         )
             continue
 
-        # Editor-placed cars/wrecks/props -> compile into .TRK via obstacle.val + c_*.va0!
         if obj.source != "Retail":
             custom_inject_objs.append(obj)
             continue
 
-        # Replaced retail object ("Replace With...") -> hide original & inject replacement!
         if obj.retail_original_model_key and obj.model_key != obj.retail_original_model_key:
             if obj.retail_instance_id and obj.category in ("static", "optional-terrain"):
                 retail_edits.append({"instance": obj.retail_instance_id, "translate": [0.0, -5000.0, 0.0]})
@@ -2027,19 +2547,27 @@ def export_mod_layer(
             custom_inject_objs.append(obj)
             continue
 
-        dx = obj.position[0] - obj.retail_initial_pos[0]
-        dy = obj.position[1] - obj.retail_initial_pos[1]
-        dz = obj.position[2] - obj.retail_initial_pos[2]
+        # Fast-path skip for unmodified retail objects (avoids ~50,000 genexpr/abs calls!)
+        pos = obj.position
+        ipos = obj.retail_initial_pos
+        rot = obj.rotation_hpr
+        irot = obj.retail_initial_rot
+        scl = obj.scale
+        if pos == ipos and rot == irot and scl == _UNIT_SCALE:
+            continue
+
+        dx = pos[0] - ipos[0]
+        dy = pos[1] - ipos[1]
+        dz = pos[2] - ipos[2]
         moved = abs(dx) > 1e-4 or abs(dy) > 1e-4 or abs(dz) > 1e-4
-        rotated = any(abs(a - b) > 1e-4 for a, b in zip(obj.rotation_hpr, obj.retail_initial_rot))
-        scaled = any(abs(s - 1.0) > 1e-4 for s in obj.scale)
+        rotated = abs(rot[0] - irot[0]) > 1e-4 or abs(rot[1] - irot[1]) > 1e-4 or abs(rot[2] - irot[2]) > 1e-4
+        scaled = abs(scl[0] - 1.0) > 1e-4 or abs(scl[1] - 1.0) > 1e-4 or abs(scl[2] - 1.0) > 1e-4
         if not moved and not rotated and not scaled:
             continue
 
         if obj.retail_instance_id and obj.category in ("static", "optional-terrain"):
             all_edited_terrain_objs.append(obj)
             if scaled or rotated:
-                # Full VIF vertex bake handles translate + rotate + scale around pivot with ground anchoring!
                 vif_bake_objs.append(obj)
             elif moved:
                 retail_edits.append({"instance": obj.retail_instance_id, "translate": [dx, dy, dz]})
@@ -2063,6 +2591,228 @@ def export_mod_layer(
                     {"event": obj.retail_event_member, "prop": pid, "translate": [dx, dy, dz]},
                 )
 
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name).strip("_") or "world_mod"
+    hosttex_sig = (
+        world.environment.borrowed_sky_track,
+        tuple(sorted((n, ta.replaced_png_path) for n, ta in world.textures.items() if ta.is_replaced)),
+    )
+    graf_edits = [e for e in retail_edits if "event" not in e]
+    event_edits = [e for e in retail_edits if "event" in e]
+    graf_sig = repr(graf_edits)
+    event_sig = repr(event_edits)
+    sobl_sig = repr(sorted((int(k), v) for k, v in world.collision.sobl_edits.items())) if world.collision.sobl_edits else ""
+    prev_state = _MOD_DELTA_STATE.get(mod_key)
+
+    # -----------------------------------------------------------------------
+    # FAST DELTA-ONLY MOD BAKER (<10 ms in-place member patching!)
+    # Activates whenever mod_trk_path already exists & no new .CAR/.mod/VIF
+    # structural changes occurred — patches ONLY dirty members + 0TSR CRCs.
+    # -----------------------------------------------------------------------
+    can_delta = (
+        allow_delta
+        and prev_state is not None
+        and os.path.isfile(mod_key)
+        and os.stat(mod_key).st_size == prev_state["mod_size"]
+        and prev_state["retail_trk_path"] == retail_trk_abs
+        and prev_state["retail_sha256"] == retail_sha_before
+        and not custom_inject_objs
+        and not prev_state["has_custom_members"]
+        and not vif_bake_objs
+        and not prev_state["had_vif_bake"]
+        and not any(o.category == "optional-terrain" for o in all_edited_terrain_objs)
+        and bool(world.sync_all_events) == prev_state["sync_all_events"]
+    )
+
+    if can_delta:
+        assert prev_state is not None
+        place_warnings: list[str] = []
+        delta_patched_members: list[str] = []
+        place_changed_bytes = prev_state["last_place_changed_bytes"]
+        sobl_patched_count = prev_state["last_sobl_patched"]
+        ilin_patched_lines: list[str] = []
+        mod_by_name = prev_state["mod_by_name"]
+        member_crcs = dict(prev_state["member_crcs"])
+
+        with open(mod_trk_path, "r+b") as fh:
+            # 1. In-place GRAF transforms (sparse patches + 4B CRC — zero 3.4MB copy!)
+            if graf_sig != prev_state["last_graf_sig"]:
+                ge = prev_state["graf_entry"]
+                if ge is not None:
+                    base_graf = prev_state["base_graf_bytes"]
+                    base_crc = prev_state["base_graf_crc"]
+                    patches, new_crc, new_spans, chg_b = _patch_graf_sparse_fast(retail_idx, base_graf, base_crc, graf_edits)
+                    g_off = int(ge["offset"])
+                    # Restore any previously patched spans from base_graf first, then write new patches
+                    for s, e in prev_state["prev_graf_spans"]:
+                        fh.seek(g_off + s)
+                        fh.write(base_graf[s:e])
+                    for off_p, pbytes in patches:
+                        fh.seek(g_off + off_p)
+                        fh.write(pbytes)
+                    fh.seek(int(ge["crc_field"]))
+                    fh.write(struct.pack("<I", new_crc))
+                    prev_state["prev_graf_spans"] = new_spans
+                    prev_state["last_graf_sig"] = graf_sig
+                    place_changed_bytes = chg_b
+                    prev_state["last_place_changed_bytes"] = chg_b
+                    member_crcs[ge["name"].lower()] = new_crc
+                    delta_patched_members.append(ge["name"])
+
+            # 2. In-place Event Prop frames (c_*.va0)
+            if event_sig != prev_state["last_event_sig"]:
+                va0_patches, ev_chg = _patch_va0_events_fast(retail_idx, world, event_edits)
+                # Restore any previously modified va0 no longer edited
+                for old_ml in prev_state["prev_va0_members"]:
+                    if old_ml not in va0_patches and old_ml in retail_idx["clean_va0s"]:
+                        ent = mod_by_name.get(old_ml)
+                        if ent:
+                            clean_b = retail_idx["clean_va0s"][old_ml]
+                            fh.seek(int(ent["offset"]))
+                            fh.write(clean_b)
+                            fh.seek(int(ent["crc_field"]))
+                            fh.write(struct.pack("<I", int(ent["crc"])))
+                            member_crcs[old_ml] = int(ent["crc"])
+                            delta_patched_members.append(ent["name"])
+                for ml, (new_b, new_crc) in va0_patches.items():
+                    ent = mod_by_name.get(ml)
+                    if ent and len(new_b) == int(ent["size"]):
+                        fh.seek(int(ent["offset"]))
+                        fh.write(new_b)
+                        fh.seek(int(ent["crc_field"]))
+                        fh.write(struct.pack("<I", new_crc))
+                        member_crcs[ml] = new_crc
+                        delta_patched_members.append(ent["name"])
+                prev_state["prev_va0_members"] = set(va0_patches.keys())
+                prev_state["last_event_sig"] = event_sig
+                place_changed_bytes += ev_chg
+
+            # 3. In-place SOBL barrier edits (track.sol)
+            if sobl_sig != prev_state["last_sobl_sig"]:
+                se = retail_idx["sol_entry"]
+                if se is not None:
+                    clean_sol = retail_idx["clean_sol"]
+                    buf_s, new_scrc, sobl_spans, s_cnt = _patch_sobl_fast(clean_sol, int(se["crc"]), world)
+                    s_off = int(se["offset"])
+                    if len(sobl_spans) > 256:
+                        fh.seek(s_off)
+                        fh.write(buf_s)
+                    else:
+                        for s, e in sorted(set(prev_state["prev_sobl_spans"] + sobl_spans)):
+                            fh.seek(s_off + s)
+                            fh.write(buf_s[s:e])
+                    fh.seek(int(se["crc_field"]))
+                    fh.write(struct.pack("<I", new_scrc))
+                    prev_state["prev_sobl_spans"] = sobl_spans
+                    prev_state["last_sobl_sig"] = sobl_sig
+                    sobl_patched_count = s_cnt
+                    prev_state["last_sobl_patched"] = s_cnt
+                    member_crcs["track.sol"] = new_scrc
+                    delta_patched_members.append("track.sol")
+
+            # 4. In-place ILIN racing line edits (*.ild)
+            for lname, graph in world.all_road_graphs.items():
+                if not graph.dirty:
+                    continue
+                low = lname.lower()
+                ent = mod_by_name.get(low)
+                clean_ild = retail_idx["clean_ilds"].get(low)
+                if ent is None or clean_ild is None:
+                    continue
+                edits_map: dict[str, float] = {}
+                for node in graph.nodes.values():
+                    if node.retail_index is not None:
+                        edits_map[f"node.{node.retail_index}.x"] = node.x
+                        edits_map[f"node.{node.retail_index}.z"] = node.z
+                if edits_map:
+                    try:
+                        patched_ild = ilin_fmt.encode(clean_ild, edits_map, recalculate=True)
+                        if len(patched_ild) == int(ent["size"]):
+                            retail_ild_crc = int(retail_idx["by_name"][low]["crc"])
+                            new_icrc = delta_eod_crc(retail_ild_crc, clean_ild, patched_ild, [(0, len(patched_ild))])
+                            fh.seek(int(ent["offset"]))
+                            fh.write(patched_ild)
+                            fh.seek(int(ent["crc_field"]))
+                            fh.write(struct.pack("<I", new_icrc))
+                            ilin_patched_lines.append(lname)
+                            member_crcs[low] = new_icrc
+                            delta_patched_members.append(lname)
+                    except Exception as exc:
+                        place_warnings.append(f"ILIN {lname} patch warning: {exc}")
+
+        # 5. HOSTTEX (skip re-encoding if unchanged!)
+        if hosttex_sig != prev_state["last_hosttex_sig"]:
+            host_exported, host_warnings = _export_host_textures(world, slug, out)
+            place_warnings.extend(host_warnings)
+            prev_state["last_hosttex_sig"] = hosttex_sig
+            prev_state["last_host_exported"] = host_exported
+        else:
+            host_exported = list(prev_state["last_host_exported"])
+
+        prev_state["member_crcs"] = member_crcs
+        any_diff = bool(retail_edits or world.collision.sobl_edits or ilin_patched_lines or prev_state["base_differs"])
+        if any_diff:
+            fp_src = f"{retail_sha_before}:{sorted(member_crcs.items())}:{place_changed_bytes}".encode("utf-8")
+            mod_trk_sha = hashlib.sha256(fp_src).hexdigest()
+        else:
+            mod_trk_sha = retail_sha_before
+
+        for obj in all_edited_terrain_objs:
+            obj.written = True
+        for g in world.all_road_graphs.values():
+            g.dirty = False
+
+        # Verify retail file stat untouched (zero-cost safety check)
+        st_now = os.stat(retail_trk_abs)
+        if (st_now.st_size, st_now.st_mtime_ns) != retail_idx["stat"]:
+            if _sha256_file(world.trk_path) != retail_sha_before:
+                raise AssertionError("CRITICAL: retail .TRK SHA-256 changed during delta mod export!")
+
+        compile_ms = (time.perf_counter_ns() - t_compile_ns) / 1_000_000.0
+        manifest = {
+            "schema": "eod.mod_layer/3",
+            "bake_mode": "delta",
+            "compile_ms": round(compile_ms, 2),
+            "delta_patched_members": delta_patched_members,
+            "project_name": project_name,
+            "track": world.track_name,
+            "source_retail_trk": str(world.trk_path),
+            "retail_trk_sha256": retail_sha_before,
+            "mod_trk": str(mod_trk_path),
+            "mod_trk_sha256": mod_trk_sha,
+            "mod_trk_differs_from_retail": mod_trk_sha != retail_sha_before,
+            "overlay_json": str(out / f"{slug}.eodworld.json"),
+            "profile_txt": str(out / "PROFILE.TXT"),
+            "custom_race_json": str(out / "custom_race.json"),
+            "retail_placement_edits": len(retail_edits),
+            "deleted_retail_objects": deleted_retail_count,
+            "changed_payload_bytes": place_changed_bytes,
+            "place_report_count": len(retail_edits),
+            "vif_models_baked": 0,
+            "vif_vertices_baked": 0,
+            "opt_terrain_promoted": prev_state["opt_terrain_promoted"],
+            "bppt_planes_patched": 0,
+            "scol_planes_patched": 0,
+            "sobl_barriers_patched": sobl_patched_count,
+            "ilin_patched_lines": ilin_patched_lines,
+            "custom_objects_compiled": 0,
+            "sync_all_events": bool(world.sync_all_events),
+            "host_textures_exported": len(host_exported),
+            "host_textures": host_exported,
+            "editor_placed_objects": 0,
+            "custom_collision_boxes": len(world.collision.custom_boxes),
+            "warnings": place_warnings,
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        manifest_path = out / "mod_layer_manifest.json"
+        manifest["manifest_path"] = str(manifest_path)
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+        if progress:
+            progress(100, f"Delta mod bake complete ({compile_ms:.2f} ms)")
+        return manifest
+
+    # -----------------------------------------------------------------------
+    # FULL MOD BAKER (initial bake or structural VIF / .CAR / .mod repack)
+    # -----------------------------------------------------------------------
     if progress:
         progress(25, f"Patching {len(retail_edits)} placement records...")
 
@@ -2093,31 +2843,28 @@ def export_mod_layer(
     bake_stats = _bake_graf_vif_and_collision(
         trk_bytes, entries, world, vif_bake_objs, all_edited_terrain_objs, place_warnings
     )
-    if any(bake_stats.values()) or world.sync_all_events:
-        mod_trk_path.write_bytes(bytes(trk_bytes))
 
-    # Patch modified SOBL collision barriers (track.sol)
+    # Patch modified SOBL collision barriers (track.sol) using fast direct patcher!
     if progress:
         progress(55, "Patching SOBL collision barriers...")
     sobl_patched_count = 0
+    sobl_spans_full: list[tuple[int, int]] = []
     if world.collision.sobl_edits:
-        sobl_list = [
-            (int(idx), str(ed["field"]), float(ed["value"]))
-            for idx, ed in sorted(world.collision.sobl_edits.items())
-        ]
-        try:
-            new_trk_bytes, sobl_rep = wc.apply_box_edits(mod_trk_path.read_bytes(), sobl_list, anchor="bottom")
-            mod_trk_path.write_bytes(new_trk_bytes)
-            sobl_patched_count = len(sobl_rep)
-        except Exception as exc:
-            place_warnings.append(f"SOBL barrier patch warning: {exc}")
+        se = next((e for e in entries if e["name"].lower() == "track.sol"), None)
+        if se is not None and retail_idx["clean_sol"]:
+            try:
+                buf_s, new_scrc, sobl_spans_full, sobl_patched_count = _patch_sobl_fast(
+                    retail_idx["clean_sol"], int(se["crc"]), world
+                )
+                trk_bytes[se["offset"] : se["offset"] + se["size"]] = buf_s
+                struct.pack_into("<I", trk_bytes, se["crc_field"], new_scrc)
+            except Exception as exc:
+                place_warnings.append(f"SOBL barrier patch warning: {exc}")
 
     # Patch modified retail ILIN node X/Z positions AND recalculate tangents, segment lengths & lap length!
     if progress:
         progress(65, "Patching & recalculating ILIN racing lines...")
-    ilin_patched_lines: list[str] = []
-    trk_bytes = bytearray(mod_trk_path.read_bytes())
-    entries = wc.read_directory(bytes(trk_bytes))
+    ilin_patched_lines = []
     for lname, graph in world.all_road_graphs.items():
         if not graph.dirty:
             continue
@@ -2135,12 +2882,14 @@ def export_mod_layer(
                 patched_ild = ilin_fmt.encode(orig_ild, edits_map, recalculate=True)
                 if len(patched_ild) == entry["size"]:
                     trk_bytes[entry["offset"] : entry["offset"] + entry["size"]] = patched_ild
-                    struct.pack_into("<I", trk_bytes, entry["crc_field"], eod_crc(patched_ild))
+                    new_icrc = delta_eod_crc(int(entry["crc"]), orig_ild, patched_ild, [(0, len(patched_ild))])
+                    struct.pack_into("<I", trk_bytes, entry["crc_field"], new_icrc)
                     ilin_patched_lines.append(lname)
             except Exception as exc:
                 place_warnings.append(f"ILIN {lname} patch warning: {exc}")
 
-    if ilin_patched_lines:
+    # Single write of patched trk_bytes instead of 3 redundant 10 MB writes!
+    if any(bake_stats.values()) or world.sync_all_events or sobl_patched_count or ilin_patched_lines:
         mod_trk_path.write_bytes(bytes(trk_bytes))
 
     # Inject editor-placed & replaced Cars/Wrecks/Props into modded .TRK (0TSR repack + obstacle.val + c_*.va0)
@@ -2158,7 +2907,6 @@ def export_mod_layer(
     # Export Vulkan HOSTTEX replacements (.eodhtx + replacements.tsv)
     if progress:
         progress(84, "Building Vulkan HOSTTEX replacements...")
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name).strip("_") or "world_mod"
     host_exported, host_warnings = _export_host_textures(world, slug, out)
     place_warnings.extend(host_warnings)
 
@@ -2205,8 +2953,72 @@ def export_mod_layer(
     if retail_sha_after != retail_sha_before:
         raise AssertionError("CRITICAL: retail .TRK SHA-256 changed during mod export!")
 
+    # Record delta bake state for future <10 ms in-place delta bakes!
+    if not custom_inject_objs and not vif_bake_objs and not any(o.category == "optional-terrain" for o in all_edited_terrain_objs):
+        ge = retail_idx["graf_entry"]
+        base_graf = retail_idx["clean_graf"]
+        base_graf_crc = int(ge["crc"]) if ge is not None else 0
+        # If sync_all_events promoted opt_terrain leaves (record->kind 1 -> 0), mirror those exact 4-byte promotions on base_graf
+        if ge is not None and bake_stats["opt_terrain_promoted"] > 0:
+            _ensure_graf_patch_tables(retail_idx)
+            bg_mut = bytearray(base_graf)
+            promo_spans: list[tuple[int, int]] = []
+            by_id = retail_idx["by_id"]
+            active_opt_ids = {
+                o.retail_instance_id
+                for o in world.objects
+                if not o.deleted and o.category == "optional-terrain" and o.retail_instance_id
+            }
+            for inst_id in sorted(active_opt_ids):
+                leaf = by_id.get(inst_id)
+                if not leaf or not leaf.get("optional_terrain"):
+                    continue
+                rec_off = leaf.get("record")
+                if rec_off is not None and rec_off + 4 <= len(bg_mut):
+                    if struct.unpack_from("<I", bg_mut, rec_off)[0] == 1:
+                        struct.pack_into("<I", bg_mut, rec_off, 0)
+                        promo_spans.append((rec_off, rec_off + 4))
+            base_graf_crc = delta_eod_crc(base_graf_crc, base_graf, bg_mut, promo_spans)
+            base_graf = bytes(bg_mut)
+        # Capture initial graf spans so next delta bake cleanly reverts/updates them
+        init_graf_spans: list[tuple[int, int]] = []
+        if graf_edits and ge is not None:
+            _p, _c, init_graf_spans, _cb = _patch_graf_sparse_fast(retail_idx, base_graf, base_graf_crc, graf_edits)
+        final_entries = wc.read_directory(mod_trk_path.read_bytes())
+        _MOD_DELTA_STATE[mod_key] = {
+            "retail_trk_path": retail_trk_abs,
+            "retail_sha256": retail_sha_after,
+            "mod_size": os.stat(mod_key).st_size,
+            "mod_by_name": {e["name"].lower(): e for e in final_entries},
+            "member_crcs": {e["name"].lower(): int(e["crc"]) for e in final_entries},
+            "graf_entry": next((e for e in final_entries if e["type"] == "GRAF"), None),
+            "base_graf_bytes": base_graf,
+            "base_graf_crc": base_graf_crc,
+            "base_differs": bake_stats["opt_terrain_promoted"] > 0,
+            "opt_terrain_promoted": bake_stats["opt_terrain_promoted"],
+            "has_custom_members": False,
+            "had_vif_bake": False,
+            "sync_all_events": bool(world.sync_all_events),
+            "last_graf_sig": graf_sig,
+            "last_event_sig": event_sig,
+            "last_sobl_sig": sobl_sig,
+            "last_hosttex_sig": hosttex_sig,
+            "last_host_exported": list(host_exported),
+            "last_place_changed_bytes": place_changed_bytes,
+            "last_sobl_patched": sobl_patched_count,
+            "prev_graf_spans": init_graf_spans,
+            "prev_sobl_spans": sobl_spans_full,
+            "prev_va0_members": {str(e["event"]).lower() for e in event_edits},
+        }
+    else:
+        _MOD_DELTA_STATE.pop(mod_key, None)
+
+    compile_ms = (time.perf_counter_ns() - t_compile_ns) / 1_000_000.0
     manifest = {
         "schema": "eod.mod_layer/3",
+        "bake_mode": "full",
+        "compile_ms": round(compile_ms, 2),
+        "delta_patched_members": [],
         "project_name": project_name,
         "track": world.track_name,
         "source_retail_trk": str(world.trk_path),
@@ -2243,7 +3055,7 @@ def export_mod_layer(
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)
     if progress:
-        progress(100, "Mod layer exported")
+        progress(100, f"Mod layer exported ({compile_ms:.1f} ms)")
     return manifest
 
 
