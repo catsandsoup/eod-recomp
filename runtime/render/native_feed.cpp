@@ -1094,6 +1094,10 @@ void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t
     p.serial = g_serial++;
     p.batch = batch;
     p.pass = (uint32_t)g_shadow_intensity;
+    // 0x363218: target size and the saved main view (0x35E300), read by 0x362968 and 0x362E70
+    p.shadow_rt[0] = (int32_t)MEM_LW(0x4D8BD8);
+    p.shadow_rt[1] = (int32_t)MEM_LW(0x4D8BDC);
+    for (int i = 0; i < 4; i++) p.shadow_rt[2 + i] = (int32_t)MEM_LW(0x4D8C00 + 4 * i);
     p.itop = (pass & 1u) | (clip_flag ? 0x200u : 0u);
     p.texture_key = -1;
     p.layer = -1;

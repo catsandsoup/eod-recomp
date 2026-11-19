@@ -159,6 +159,9 @@ struct Packet {
     // 1 / (fov * width / 2) (0x35B3D0 fVar7): the native screen w times this is the VU1 w, i.e.
     // the GS 1 / Q the texture LOD uses (EOD_NATIVE_QCHECK)
     float w_scale;
+    // projected shadow target (stage R5 A3), as 0x363218 left it: width *0x4D8BD8, height *0x4D8BDC
+    // (0x35DA30: min(view w, 320), min(view h, 512)) and the main view *0x4D8C00..0x4D8C0C (x, y, w, h)
+    int32_t shadow_rt[6];
 };
 
 struct Vertex {                // GPU vertex (28 bytes)

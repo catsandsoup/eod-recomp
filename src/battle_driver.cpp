@@ -172,11 +172,193 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
 }
 } // namespace
 void battle_driver_reset(){states={};navigation.reset();}
+
+namespace {
+struct PieLiveControl {
+    bool ai_autodrive = false;
+    int camera_view = -1;
+    float speed_boost = 1.0f;
+    float grip_boost = 1.0f;
+    float ride_height_delta = 0.0f;
+    int arcade_mode = 0; // 0=none, 1=tag, 2=cat_mouse, 3=juggernaut
+    uint32_t it_slot = 0;
+    float last_tag_time = 0.0f;
+};
+PieLiveControl g_pie_ctrl{};
+uint32_t g_pie_poll_counter = 0;
+
+void poll_pie_live_control() {
+    static bool init_done = false;
+    if (!init_done) {
+        init_done = true;
+        if (const char *ad = std::getenv("EOD_AI_AUTODRIVE")) g_pie_ctrl.ai_autodrive = (ad[0] == '1');
+        if (const char *fc = std::getenv("EOD_FREE_CAM")) {
+            if (fc[0] == '1') g_pie_ctrl.camera_view = 9; // TV / Free overview cam
+        }
+        if (const char *am = std::getenv("EOD_ARCADE_MODE")) {
+            if (std::strcmp(am, "tag") == 0) g_pie_ctrl.arcade_mode = 1;
+            else if (std::strcmp(am, "cat_mouse") == 0) g_pie_ctrl.arcade_mode = 2;
+            else if (std::strcmp(am, "juggernaut") == 0) g_pie_ctrl.arcade_mode = 3;
+        }
+    }
+    const char *ctrl_path = std::getenv("EOD_PIE_CONTROL_FILE");
+    if (!ctrl_path || !*ctrl_path) return;
+    if ((++g_pie_poll_counter & 15) != 0) return;
+    FILE *fp = std::fopen(ctrl_path, "rb");
+    if (!fp) return;
+    char buf[512] = {};
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, fp);
+    std::fclose(fp);
+    if (!n) return;
+    auto parse_kv = [&](const char *key) -> const char * {
+        const char *p = std::strstr(buf, key);
+        if (!p) return nullptr;
+        p += std::strlen(key);
+        while (*p == ' ' || *p == '=') ++p;
+        return p;
+    };
+    if (const char *v = parse_kv("ai_autodrive")) g_pie_ctrl.ai_autodrive = (std::atoi(v) != 0);
+    if (const char *v = parse_kv("camera_view")) g_pie_ctrl.camera_view = std::atoi(v);
+    if (const char *v = parse_kv("speed_boost")) g_pie_ctrl.speed_boost = std::clamp((float)std::atof(v), 0.3f, 3.0f);
+    if (const char *v = parse_kv("grip_boost")) g_pie_ctrl.grip_boost = std::clamp((float)std::atof(v), 0.3f, 3.0f);
+    if (const char *v = parse_kv("ride_height_delta")) g_pie_ctrl.ride_height_delta = std::clamp((float)std::atof(v), -1.5f, 2.5f);
+    if (const char *v = parse_kv("arcade_mode")) g_pie_ctrl.arcade_mode = std::atoi(v);
+}
+
+void sync_opt_terrain_mask() {
+    static int env_mask = -2;
+    if (env_mask == -2) {
+        const char *e = std::getenv("EOD_OPT_TERRAIN_MASK");
+        env_mask = (e && *e) ? (int)std::strtol(e, nullptr, 0) : -1;
+    }
+    if (env_mask >= 0) {
+        ee_w32(0x003D1C70, (uint32_t)env_mask);
+        return;
+    }
+    // Check if modded track.bsc has the All-Events optional terrain sync marker (table2[0].aux[1] == 0xFE)
+    const uint32_t scol = ee_r32(0x003D2098);
+    if (valid(scol, 12)) {
+        const uint32_t t2 = ee_r32(scol + 8);
+        if (valid(t2, 20) && ee_r8(t2 + 19) == 0xFE) {
+            ee_w32(0x003D1C70, 0xFFFFu);
+        }
+    }
+}
+
+void drive_player_along_ilin(uint32_t car) {
+    const float x = rf(car + 0x88), z = rf(car + 0x90);
+    const float vx = rf(car + 0x104), vz = rf(car + 0x10C), speed = std::hypot(vx, vz);
+    const float rx = rf(car + 0x64), rz = rf(car + 0x6C), fx = rf(car + 0x7C), fz = rf(car + 0x84);
+    if (!std::isfinite(x) || !std::isfinite(z) || !std::isfinite(fx) || !std::isfinite(fz)) return;
+
+    // Locate active ILIN resource in cache table 0x3CD190..0x3CD1B4
+    const uint32_t entries = ee_r32(0x3CD1B4);
+    uint32_t resource = 0;
+    if (entries >= 1 && entries <= 8) {
+        for (uint32_t i = 0; i < entries; ++i) {
+            const uint32_t p = 0x3CD190 + i * 12;
+            const uint32_t cand = ee_r32(p);
+            if (valid(cand, 48) && ee_r32(cand) == 0x104F128B && ee_r32(cand + 8) == 60) {
+                resource = cand;
+                if (ee_r32(p + 4) == 0x101) break;
+            }
+        }
+    }
+    float tx = x + fx * 25.0f, tz = z + fz * 25.0f;
+    if (resource) {
+        const uint32_t count = ee_r32(resource + 28) >> 16;
+        const uint32_t root = ee_r32(resource + 32);
+        if (count >= 3 && count <= 4096 && valid(root, count * 60)) {
+            uint32_t best_idx = 0;
+            float best_score = 1e30f;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t np = root + i * 60;
+                const float nx = rf(np), nz = rf(np + 4);
+                const float d2 = (nx - x) * (nx - x) + (nz - z) * (nz - z);
+                if (d2 < best_score) {
+                    best_score = d2;
+                    best_idx = i;
+                }
+            }
+            const uint32_t target_idx = (best_idx + 2) % count;
+            const uint32_t tp = root + target_idx * 60;
+            tx = rf(tp);
+            tz = rf(tp + 4);
+        }
+    }
+    const float dx = tx - x, dz = tz - z;
+    const float dist = std::max(std::hypot(dx, dz), 0.01f);
+    const float lateral = (dx * rx + dz * rz) / dist;
+    const float front = (dx * fx + dz * fz) / dist;
+    const float angle = std::atan2(lateral, front);
+    const float steer = std::clamp(angle * 1.35f, -1.0f, 1.0f);
+    const float desired = front > 0.85f ? 32.0f : (front > 0.35f ? 18.0f : 9.0f);
+    const float gas = (speed > desired) ? 0.15f : 1.0f;
+    const float brake = (speed > desired + 4.0f) ? 0.45f : 0.0f;
+    const float handbrake = (front < 0.1f && speed > 10.0f) ? 0.35f : 0.0f;
+    controls(car, steer, gas, brake, handbrake, -10);
+}
+
+void apply_live_car_tuner_and_arcade(uint32_t player_car) {
+    if (g_pie_ctrl.camera_view >= 0 && g_pie_ctrl.camera_view <= 18) {
+        ee_w32(0x3C411C, (uint32_t)g_pie_ctrl.camera_view);
+        ee_w32(0x48CB90, (uint32_t)g_pie_ctrl.camera_view);
+    }
+    const bool is_it = (g_pie_ctrl.arcade_mode == 1 && g_pie_ctrl.it_slot == 0);
+    const bool is_juggernaut = (g_pie_ctrl.arcade_mode == 3);
+    const float boost = g_pie_ctrl.speed_boost * (is_it ? 1.18f : (is_juggernaut ? 1.10f : 1.0f));
+    if (std::fabs(boost - 1.0f) > 0.02f) {
+        const float gas = rf(player_car + 0x1B70);
+        if (gas > 0.2f) {
+            const float fx = rf(player_car + 0x7C), fz = rf(player_car + 0x84);
+            const float vx = rf(player_car + 0x104), vz = rf(player_car + 0x10C);
+            const float spd = std::hypot(vx, vz);
+            if (spd < 45.0f * boost && std::isfinite(fx) && std::isfinite(fz)) {
+                const float accel = (boost - 1.0f) * 0.18f * gas;
+                wf(player_car + 0x104, vx + fx * accel);
+                wf(player_car + 0x10C, vz + fz * accel);
+            }
+        }
+    }
+    // Tag / Infected contact check across active cars
+    if (g_pie_ctrl.arcade_mode == 1) {
+        const float now = rf(0x3CDACC);
+        if (now - g_pie_ctrl.last_tag_time > 2.0f) {
+            const uint32_t it_car = ee_r32(0x447458 + g_pie_ctrl.it_slot * 4);
+            if (valid(it_car, 0x1C34)) {
+                const float ix = rf(it_car + 0x88), iz = rf(it_car + 0x90);
+                for (uint32_t s = 0; s < battle_layout::kCapacity; ++s) {
+                    if (s == g_pie_ctrl.it_slot) continue;
+                    const uint32_t oc = ee_r32(0x447458 + s * 4);
+                    if (!valid(oc, 0x1C34)) continue;
+                    const float d = std::hypot(rf(oc + 0x88) - ix, rf(oc + 0x90) - iz);
+                    if (d > 0.1f && d < 5.2f) {
+                        g_pie_ctrl.it_slot = s;
+                        g_pie_ctrl.last_tag_time = now;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+} // namespace
+
 extern "C" void f_001A2D20(){
     uint32_t updated_car=g_ee.r[4].uw[0];
     if(netplay_car::is_puppet(updated_car)) return;  // remote player's car: state comes from the network
     f_001A2D20_orig();
-    if(ee_r32(0x3CF19C)!=0x18000224 || !valid(updated_car,0x1C34)) return;
+    if(!valid(updated_car,0x1C34)) return;
+    sync_opt_terrain_mask();
+    const uint32_t player0_car = ee_r32(0x447458);
+    if (updated_car == player0_car) {
+        poll_pie_live_control();
+        apply_live_car_tuner_and_arcade(updated_car);
+        if (g_pie_ctrl.ai_autodrive) {
+            drive_player_along_ilin(updated_car);
+        }
+    }
+    if(ee_r32(0x3CF19C)!=0x18000224) return;
     uint32_t master=ee_r32(0x3CF194);
     if(!valid(master,battle_layout::kMasterSize) || ee_r32(master)!=battle_layout::kMasterVtable) return;
     uint32_t count=ee_r32(master+battle_layout::kCount);

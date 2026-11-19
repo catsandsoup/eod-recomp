@@ -21,8 +21,10 @@
 #include <vector>
 
 #include "../../core/config.h"
+#include "../../core/eodsave.h"
 #include "../../ui/overlay.h"
 #include "../platform.h"
+#include "../keyboard_input.h"
 #include "../pad_script.h"
 #include "../../gs/modern_scene.h"
 
@@ -161,6 +163,13 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYUP:
         g_keys[wp & 255] = false;
         return 0;
+    case WM_MOUSEACTIVATE:
+        if (GetFocus() != h) SetFocus(h);
+        return MA_ACTIVATE;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        if (GetFocus() != h) SetFocus(h);
+        break;
     case WM_KILLFOCUS:
         memset(g_keys, 0, sizeof g_keys);
         return 0;
@@ -332,7 +341,20 @@ void platform_sleep_us(uint32_t us) {
 }
 
 // ------------------------------------------------------------------ input
-static inline bool key(int vk) { return g_keys[vk & 255]; }
+static bool window_has_input_focus() {
+    if (!g_hwnd) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    if (fg == g_hwnd || IsChild(fg, g_hwnd)) return true;
+    HWND root = GetAncestor(g_hwnd, GA_ROOT);
+    return root && fg == root;
+}
+
+static inline bool key(int vk) {
+    if (g_keys[vk & 255]) return true;
+    if (window_has_input_focus()) return (GetAsyncKeyState(vk & 255) & 0x8000) != 0;
+    return false;
+}
 
 namespace {
 struct KeyBind {
@@ -363,16 +385,63 @@ void build_key_map() {
 
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
+    const auto kb_ctx = eod::save::keyboard_context();
     if (port == 0) {
         // keyboard (always available on port 0)
         out->connected = true;
-        for (const KeyBind &m : g_key_map)
-            if (key(m.vk)) out->buttons |= m.btn;
+        for (const KeyBind &m : g_key_map) {
+            if (!key(m.vk)) continue;
+            // In racing mode, WASD and Arrow keys use modern driving bindings below
+            // rather than menu D-pad / L2-R2 bindings.
+            if (kb_ctx.racing && (m.vk == 'A' || m.vk == 'D' || m.vk == 'W' || m.vk == 'S' ||
+                                  m.vk == VK_UP || m.vk == VK_DOWN || m.vk == VK_LEFT || m.vk == VK_RIGHT)) {
+                continue;
+            }
+            out->buttons |= m.btn;
+        }
+        static keyboard_input::Mapper s_kb_mapper;
+        keyboard_input::KeyState ks{};
+        ks.w = key('W');
+        ks.a = key('A');
+        ks.s = key('S');
+        ks.d = key('D');
+        ks.up = key(VK_UP);
+        ks.down = key(VK_DOWN);
+        ks.left = key(VK_LEFT);
+        ks.right = key(VK_RIGHT);
+        ks.space = key(VK_SPACE);
+        ks.enter = key(VK_RETURN);
+        ks.escape = key(VK_ESCAPE);
+        ks.backspace = key(VK_BACK);
+        ks.tab = key(VK_TAB);
+        ks.lshift = key(VK_LSHIFT) || key(VK_SHIFT);
+        ks.rshift = key(VK_RSHIFT);
+        ks.q = key('Q');
+        ks.e = key('E');
+        ks.c = key('C');
+        ks.v = key('V');
+        ks.r = key('R');
+        ks.f = key('F');
+        ks.i = key('I');
+        ks.j = key('J');
+        ks.k = key('K');
+        ks.l = key('L');
+        const HostPadState mapped = s_kb_mapper.poll(ks, kb_ctx.racing, false);
+        out->buttons |= mapped.buttons;
+        if (mapped.lx != 128) out->lx = mapped.lx;
+        if (mapped.ly != 128) out->ly = mapped.ly;
+        if (mapped.rx != 128) out->rx = mapped.rx;
+        if (mapped.ry != 128) out->ry = mapped.ry;
+        for (int i = 0; i < 12; ++i) {
+            if (mapped.pressure[i] > out->pressure[i]) out->pressure[i] = mapped.pressure[i];
+        }
         // the direction keys also move the left stick (steering)
-        if (out->buttons & PAD_LEFT) out->lx = 0;
-        if (out->buttons & PAD_RIGHT) out->lx = 255;
-        if (out->buttons & PAD_UP) out->ly = 0;
-        if (out->buttons & PAD_DOWN) out->ly = 255;
+        if (!kb_ctx.racing) {
+            if (out->buttons & PAD_LEFT) out->lx = 0;
+            if (out->buttons & PAD_RIGHT) out->lx = 255;
+            if (out->buttons & PAD_UP) out->ly = 0;
+            if (out->buttons & PAD_DOWN) out->ly = 255;
+        }
     }
     HostPadState c;
     platform_get_controller(port, &c);
@@ -383,8 +452,9 @@ void platform_get_pad(int port, HostPadState *out) {
         if (c.ly != 128) out->ly = c.ly;
         out->rx = c.rx;
         out->ry = c.ry;
-        out->pressure[10] = c.pressure[10];
-        out->pressure[11] = c.pressure[11];
+        for (int i = 0; i < 12; ++i) {
+            if (c.pressure[i] > out->pressure[i]) out->pressure[i] = c.pressure[i];
+        }
     }
     // the in-game menu has the input
     if (overlay_captures_input()) {
@@ -432,8 +502,23 @@ void platform_get_controller(int port, HostPadState *out) {
             };
             for (const XMap &m : xm)
                 if (b & m.x) out->buttons |= m.btn;
-            if (xs.Gamepad.bLeftTrigger > 30) out->buttons |= PAD_L2;
-            if (xs.Gamepad.bRightTrigger > 30) out->buttons |= PAD_R2;
+            const auto kb_ctx = eod::save::keyboard_context();
+            if (kb_ctx.racing) {
+                // Modern analog triggers for driving: RT = Gas (PAD_CROSS), LT = Brake (PAD_SQUARE)
+                if (xs.Gamepad.bRightTrigger > 30) {
+                    out->buttons |= PAD_CROSS;
+                    out->pressure[6] = xs.Gamepad.bRightTrigger;
+                }
+                if (xs.Gamepad.bLeftTrigger > 30) {
+                    out->buttons |= PAD_SQUARE;
+                    out->pressure[7] = xs.Gamepad.bLeftTrigger;
+                }
+            } else {
+                if (xs.Gamepad.bLeftTrigger > 30) out->buttons |= PAD_L2;
+                if (xs.Gamepad.bRightTrigger > 30) out->buttons |= PAD_R2;
+                out->pressure[10] = xs.Gamepad.bLeftTrigger;
+                out->pressure[11] = xs.Gamepad.bRightTrigger;
+            }
             auto axis = [](SHORT v, bool invert) {
                 int a = (v + 32768) >> 8;
                 if (invert) a = 255 - a;
@@ -444,8 +529,6 @@ void platform_get_controller(int port, HostPadState *out) {
             if (ly < 112 || ly > 144) out->ly = ly;
             out->rx = axis(xs.Gamepad.sThumbRX, false);
             out->ry = axis(xs.Gamepad.sThumbRY, true);
-            out->pressure[10] = xs.Gamepad.bLeftTrigger;
-            out->pressure[11] = xs.Gamepad.bRightTrigger;
         }
     }
     if (port >= 0 && port < 4) {

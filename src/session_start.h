@@ -44,6 +44,8 @@ const SessionRequest *career_warp_request();
 bool session_parse(const char *text, SessionRequest &out, std::string &err);
 // Canonical contest name for the request ("Battle (8 AI)" for event=Battle;ai=8).
 std::string session_event_name(const SessionRequest &r);
+// Explicit AI count override from EOD_DIRECT_START (0..12), or -1 if unspecified.
+int session_ai_override();
 
 // Catalog of what a direct start can pick, read from the guest's tables (Eves 0x3C4D08, vehicle
 // records 0x3CBEE4). refresh() calls guest code, so it must run in guest context (the pad-read hook

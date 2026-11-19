@@ -5,6 +5,7 @@
 #include "battle_driver.h"
 #include "battle_events.h"
 #include "battle_layout.h"
+#include "session_start.h"
 
 #include "core/config.h"
 #include "core/cpu.h"
@@ -78,7 +79,17 @@ extern "C" void f_0012C158(void) {
     // records fit the enlarged BattleMaster (battle_layout.h).
     const uint32_t ai = battle ? battle_events_ai_for_contest(contest) : 0;
     const bool fill = !ai && battle && g_config.battle_bots;
+    const int override_ai = session_ai_override();
     f_0012C158_orig();
+    // Explicit EOD_DIRECT_START ai=<0..12> override: works on Battle AND any Race/Derby/Gauntlet
+    // template so "Force Free Roam" (ai=0) spawns only the player car on that exact map variation,
+    // and ai=1..12 spawns the requested AI count.
+    if (override_ai >= 0 && humans >= 1 && humans <= 4) {
+        const uint32_t remote = netplay_hooks::remote_humans ? netplay_hooks::remote_humans() : 0;
+        const uint32_t total = std::min(humans + remote + static_cast<uint32_t>(override_ai), battle_layout::kMaxCars);
+        ret_s32(static_cast<int32_t>(total));
+        return;
+    }
     // This is before 12AEF0 fills the DAVMap and 111E10/1116E0 resolve
     // driver/vehicle IDs and Human/AI types. Do not append blank car records.
     // Variant 1 is "Battle (1v1)": the humans only, never AI.
@@ -102,8 +113,9 @@ extern "C" void f_0020FD48(void) {
     // contest; native two-car Battle has none. BattleMaster holds kCapacity.
     if (!count || count > battle_layout::kCapacity) return;
     // More than four cars only arise from an added Battle (N AI) contest; four or
-    // fewer keep the optional BattleBots gate (native Battle AI stay unarmed).
-    if (!g_config.battle_bots && count <= 4) return;
+    // fewer keep the optional BattleBots gate (native Battle AI stay unarmed) unless
+    // EOD_DIRECT_START explicitly requested AI bots.
+    if (!g_config.battle_bots && count <= 4 && session_ai_override() <= 0) return;
 
     // Keep the original function's complete return context. Constructor calls
     // use its restored stack and preserve their native memory side effects.
@@ -310,9 +322,11 @@ extern "C" void f_0012AEF0(void) {
     mix_seed ^= ee_r32(0x003CDACC) ^ (contest * 0x9E3779B9u);
     // The description for this roster is resolved next (0x112D48 -> 0x111E10 ->
     // 0x1116E0); any other roster build cancels a pending mix.
-    const uint32_t variant = contest < battle_layout::kContestCapacity
-        ? battle_events_ai_for_contest(battle_layout::kContestTable + contest * battle_layout::kContestStride) : 0;
-    pending_mix = variant > 1 ? variant : 0;
+    const uint32_t cp = contest < battle_layout::kContestCapacity
+        ? battle_layout::kContestTable + contest * battle_layout::kContestStride : 0;
+    const uint32_t variant = cp ? battle_events_ai_for_contest(cp) : 0;
+    const bool is_battle_cp = cp && ram_object(cp, 0x14) && ee_r32(cp + 8) == kBattle;
+    pending_mix = (variant > 1 || (is_battle_cp && session_ai_override() > 0)) ? 1 : 0;
 }
 
 extern "C" void f_001116E0(void) {

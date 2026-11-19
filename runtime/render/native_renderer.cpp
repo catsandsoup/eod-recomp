@@ -151,7 +151,9 @@ enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATS
 enum : uint32_t { Z_K_SHIFT = 16, Z_L_SHIFT = 28, Z_LCM = 1u << 30 };
 
 // blend equations (GS ALPHA a, b, d with C in the shader's second output)
-enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_INV_MIX, B_KEEP, B_COUNT };
+enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_INV_MIX, B_KEEP, B_SHADOW, B_COUNT };
+// mode.w of a projected-shadow draw (native_shaders.hlsl shadow_ps, stage R5 A3)
+enum : uint32_t { S_ON = 1u << 31, S_COMPOSITE = 1u << 30 };
 // pipeline key bit 15: generic GS blend (bits 16..17 src factor, 18..19 dst factor, 20..21 op,
 // bit 22 C = destination alpha), see blend_classes
 enum : uint32_t { K_GENERIC = 1u << 15, K_CDST = 1u << 22 };
@@ -353,7 +355,7 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     using O = plume::RenderBlendOperation;
     plume::RenderBlendDesc &b = d.renderTargetBlend[0];
     b.blendEnabled = blend != B_OPAQUE;
-    b.blendOp = blend == B_REVSUB ? O::REV_SUBTRACT : O::ADD;
+    b.blendOp = (blend == B_REVSUB || blend == B_SHADOW) ? O::REV_SUBTRACT : O::ADD;
     if (key & K_GENERIC) {
         // GS (A - B) C + D as src * F(src) op dst * F(dst) (blend_classes): F 0 zero, 1 one, 2 C, 3 1 - C;
         // C is the shader's second output (As or FIX), or the destination alpha when K_CDST
@@ -380,6 +382,7 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     case B_DST_ADD: b.srcBlend = B::ONE, b.dstBlend = B::SRC1_ALPHA; break;
     case B_INV_MIX: b.srcBlend = B::INV_SRC1_ALPHA, b.dstBlend = B::SRC1_ALPHA; break;
     case B_KEEP: b.srcBlend = B::ZERO, b.dstBlend = B::ONE; break;
+    case B_SHADOW: b.srcBlend = B::ONE, b.dstBlend = B::INV_SRC1_ALPHA; break;  // dst (1 - As/128) - src
     default: b.srcBlend = B::ONE, b.dstBlend = B::ZERO; break;
     }
     // the GS writes the source alpha as it is; shadow accumulation blends alpha with the same op
@@ -681,7 +684,25 @@ void flush_shadows() {
         g_r.shadow_pending.clear();
         return;
     }
-    ensure_shadow_resources(s.width, s.height);
+    // Stage R5 A3: the GS's own shadow target, w x h = min(view w, 320) x min(view h, 512) (0x35DA30,
+    // 0x363218) times RenderScale. At 1x it is the PS2 target pixel for pixel; higher scales give the
+    // adaptive finer target with the same mapping.
+    const int sc = s.scale;
+    const Packet &p0 = g_r.shadow_pending.front().p;
+    int32_t rt_w = p0.shadow_rt[0], rt_h = p0.shadow_rt[1];
+    int32_t vx = p0.shadow_rt[2], vy = p0.shadow_rt[3], vw = p0.shadow_rt[4], vh = p0.shadow_rt[5];
+    if (rt_w <= 0 || rt_h <= 0 || vw <= 0 || vh <= 0 || rt_w > 4095 || rt_h > 4095) {
+        rt_w = (int32_t)std::min<uint32_t>(s.gs_width, 320u), rt_h = (int32_t)std::min<uint32_t>(s.gs_height, 512u);
+        vx = 0, vy = 0, vw = (int32_t)s.gs_width, vh = (int32_t)s.gs_height;
+    }
+    {
+        static unsigned logged;
+        if (logged++ < 8)
+            std::fprintf(stderr, "[native] shadow target %dx%d view %d,%d %dx%d scale %d gs %ux%u items %zu frame %llu sc %d,%d-%d,%d\n", rt_w, rt_h,
+                         vx, vy, vw, vh, sc, s.gs_width, s.gs_height, g_r.shadow_pending.size(),
+                         (unsigned long long)p0.frame, g_r.main_sc[0], g_r.main_sc[1], g_r.main_sc[2], g_r.main_sc[3]);
+    }
+    ensure_shadow_resources((uint32_t)(rt_w * sc), (uint32_t)(rt_h * sc));
     if (!g_r.shadow_mask.tex || !g_r.quad_buf) {
         gs::hw::native_end();
         for (const Item &it : g_r.shadow_pending) {
@@ -701,27 +722,33 @@ void flush_shadows() {
     plume::RenderTexture *color = wrapper(s.color, s.width, s.height, false);
     plume::RenderTexture *depth = wrapper(s.depth, s.width, s.height, true);
     plume::RenderTexture *smask = g_r.shadow_mask.tex.get();
+    // the main depth, read by the volume pass as 0x362968's Z copy
+    std::unique_ptr<plume::RenderDescriptorSet> zset = g_r.dev->createDescriptorSet(set_desc());
+    zset->setTexture(0, depth, plume::RenderTextureLayout::SHADER_READ);
+    zset->setSampler(1, g_r.samplers[2 | 4].get());
+    const uint32_t geo = S_ON | (uint32_t)(sc & 63) << 24 | (uint32_t)(rt_h & 0xFFF) << 12 | (uint32_t)(rt_w & 0xFFF);
+    const uint32_t view_xy = (uint32_t)(vx & 0xFFFF) | (uint32_t)(vy & 0xFFFF) << 16;
+    const uint32_t view_wh = (uint32_t)(vw & 0xFFFF) | (uint32_t)(vh & 0xFFFF) << 16;
 
-    // Pass 1: accumulate extruded shadow volumes into full-RenderScale shadow_mask against main D32 depth
+    // Pass 1: shadow volumes into the target (0x363708 counts, z test against the main depth)
     plume::RenderTextureBarrier in1[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::COLOR_WRITE),
-                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
+                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::SHADER_READ)};
     cl->barriers(plume::RenderBarrierStage::GRAPHICS, in1, 2);
-    if (!g_r.shadow_fb || g_r.shadow_fb_depth != s.depth) {
-        if (g_r.shadow_fb) {
-            Trash t{g_r.vb};
-            t.fb = std::move(g_r.shadow_fb);
-            g_r.trash.push_back(std::move(t));
-        }
+    if (!g_r.shadow_fb) {
         const plume::RenderTexture *ca[1] = {smask};
-        g_r.shadow_fb = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(ca, 1, depth));
-        g_r.shadow_fb_depth = s.depth;
+        g_r.shadow_fb = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(ca, 1, nullptr));
+        g_r.shadow_fb_depth = 0;
     }
     cl->setFramebuffer(g_r.shadow_fb.get());
-    cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
-    cl->clearColor(0, plume::RenderColor(0, 0, 0, 0));
-    cl->setGraphicsPipelineLayout(g_r.layout.get());
+    // main GS pixel x -> target pixel (x - vx) w / vw (0x363218 aspect and 0x35E200 viewport)
+    const double kx = (double)rt_w / vw, ky = (double)rt_h / vh;
     const double gw = s.gs_width, gh = s.gs_height;
-    const int sc = s.scale;
+    cl->setViewports(plume::RenderViewport((float)(-vx * kx * sc), (float)(-vy * ky * sc), (float)(gw * kx * sc),
+                                           (float)(gh * ky * sc)));
+    cl->setScissors(plume::RenderRect(0, 0, rt_w * sc, rt_h * sc));
+    cl->clearColor(0, plume::RenderColor(0, 0, 0, 0));  // 0x362968's Z write clears the target to 0
+    cl->setGraphicsPipelineLayout(g_r.layout.get());
+    cl->setGraphicsDescriptorSet(zset.get(), 0);
     uint32_t bound = ~0u;
     uint32_t intensity = 0;
     int32_t comp_sc[4] = {g_r.main_sc[0], g_r.main_sc[1], g_r.main_sc[2], g_r.main_sc[3]};
@@ -735,22 +762,23 @@ void flush_shadows() {
             continue;
         }
         PushConstants &pc = it.pc;
-        const double kx = (0.5 - it.ox) * 2.0 / gw - 1.0, ky = (0.5 - it.oy) * 2.0 / gh - 1.0;
+        const double ox = (0.5 - it.ox) * 2.0 / gw - 1.0, oy = (0.5 - it.oy) * 2.0 / gh - 1.0;
         for (int c = 0; c < 4; c++) {
-            pc.cx[c] = (float)(it.a[0][c] * 2.0 / gw + it.a[3][c] * kx);
-            pc.cy[c] = (float)(it.a[1][c] * 2.0 / gh + it.a[3][c] * ky);
+            pc.cx[c] = (float)(it.a[0][c] * 2.0 / gw + it.a[3][c] * ox);
+            pc.cy[c] = (float)(it.a[1][c] * 2.0 / gh + it.a[3][c] * oy);
             pc.cz[c] = (float)(it.a[2][c] * it.zscale);
             pc.cw[c] = (float)it.a[3][c];
         }
+        static const uint32_t test_variant = std::getenv("EOD_NATIVE_SHADOW_TEST") ? (uint32_t)std::atoi(std::getenv("EOD_NATIVE_SHADOW_TEST")) & 3u : 0u;
+        pc.mode[0] = test_variant;  // diagnostic only (native_shaders.hlsl shadow_ps)
+        pc.mode[1] = view_xy;
+        pc.mode[2] = view_wh;
+        pc.mode[3] = geo;
         if (it.pipeline != bound) {
             cl->setPipeline(pipeline(it.pipeline));
             bound = it.pipeline;
         }
-        cl->setGraphicsDescriptorSet(texture_set(&g_r.white, 0), 0);
         cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
-        const int32_t x0 = std::max(0, it.sc[0]) * sc, y0 = std::max(0, it.sc[1]) * sc;
-        const int32_t x1 = std::min((int32_t)gw, it.sc[2] + 1) * sc, y1 = std::min((int32_t)gh, it.sc[3] + 1) * sc;
-        cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
         const GpuMesh &m = *it.mesh;
         const plume::RenderVertexBufferView vbv(m.buf->at(0), (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)));
         const plume::RenderInputSlot slot(0, sizeof(Vertex));
@@ -763,9 +791,16 @@ void flush_shadows() {
         fs.k_drawn[KIND_SHADOW]++;
     }
     cl->setFramebuffer(nullptr);
+    {
+        Trash t{g_r.vb};
+        t.sets[0] = std::move(zset);
+        g_r.trash.push_back(std::move(t));
+    }
 
-    // Pass 2: composite shadow_mask onto main framebuffer color (0x362E70: AEM=1, ALPHA_1=0x44, FIX=intensity)
-    if (intensity > 0) {
+    // Pass 2: composite onto the main colour (0x362E70)
+    // diagnostic: EOD_NATIVE_SHADOW_OFF=1 no composite (A/B against the GS replay's nortt mask)
+    static const int shadow_off = std::getenv("EOD_NATIVE_SHADOW_OFF") ? std::atoi(std::getenv("EOD_NATIVE_SHADOW_OFF")) : 0;
+    if (intensity > 0 && shadow_off != 1) {
         plume::RenderTextureBarrier in2[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::SHADER_READ),
                                               plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE)};
         cl->barriers(plume::RenderBarrierStage::GRAPHICS, in2, 2);
@@ -777,20 +812,20 @@ void flush_shadows() {
         cl->setFramebuffer(cfb.get());
         cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
         cl->setGraphicsPipelineLayout(g_r.layout.get());
-        // B_MIX, no depth, RGB write mask (0x7), no cull
-        const uint32_t comp_pipe = B_MIX | (0x7u << 8);
-        cl->setPipeline(pipeline(comp_pipe));
-        cl->setGraphicsDescriptorSet(texture_set(&g_r.shadow_mask, 2 | 4), 0);  // nearest + clamp
+        // no depth, RGB write mask (0x7), no cull
+        cl->setPipeline(pipeline(B_SHADOW | (0x7u << 8)));
+        cl->setGraphicsDescriptorSet(texture_set(&g_r.shadow_mask, 2 | 4), 0);
         PushConstants cpc{};
         cpc.cx[0] = 1.0f; cpc.cy[1] = 1.0f; cpc.cz[2] = 1.0f; cpc.cw[3] = 1.0f;
-        cpc.ambient[3] = 128.0f;  // va = 128 -> a = floor(t.a * 128 / 128) = t.a
-        // M_TME | M_TCC | TFX=0(modulate) | M_ATE | ATST=6(GREATER) | M_AFAIL_DISCARD | M_CFIX
-        cpc.mode[0] = M_TME | M_TCC | M_ATE | (6u << M_ATST_SHIFT) | M_AFAIL_DISCARD | M_CFIX;
-        cpc.mode[1] = 0;  // aref = 0 (discard when shadow_mask.a == 0)
-        cpc.mode[2] = (intensity & 0xFFu) | 0x80000000u;  // the sampler (nearest + clamp), not the GS texture unit
+        cpc.light[0] = (float)intensity;  // TEXA.TA0 = *0x4D8BF8
+        cpc.mode[1] = view_xy;
+        cpc.mode[2] = view_wh;
+        cpc.mode[3] = geo | S_COMPOSITE;
         cl->setGraphicsPushConstants(0, &cpc, 0, sizeof cpc);
-        const int32_t x0 = std::max(0, comp_sc[0]) * sc, y0 = std::max(0, comp_sc[1]) * sc;
-        const int32_t x1 = std::min((int32_t)gw, comp_sc[2] + 1) * sc, y1 = std::min((int32_t)gh, comp_sc[3] + 1) * sc;
+        // the strips cover the view (0x362E70: x from vx - 0.9375, 32 pixels each)
+        const int32_t x0 = std::max({0, comp_sc[0], vx}) * sc, y0 = std::max({0, comp_sc[1], vy}) * sc;
+        const int32_t x1 = std::min({(int32_t)gw, comp_sc[2] + 1, vx + vw}) * sc;
+        const int32_t y1 = std::min({(int32_t)gh, comp_sc[3] + 1, vy + vh}) * sc;
         cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
         const plume::RenderVertexBufferView qvbv(g_r.quad_buf->at(0), (uint32_t)(4 * sizeof(Vertex)));
         const plume::RenderInputSlot qslot(0, sizeof(Vertex));
@@ -800,7 +835,6 @@ void flush_shadows() {
         cl->drawIndexedInstanced(6, 1, 0, 0, 0);
         cl->setFramebuffer(nullptr);
     }
-
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
     cl->barriers(plume::RenderBarrierStage::ALL, out, 2);
@@ -1175,16 +1209,13 @@ void finalize() {
         it.ox = (float)(g_r.main_xy & 0xFFFF) / 16.0f;
         it.oy = (float)((g_r.main_xy >> 32) & 0xFFFF) / 16.0f;
         it.zscale = (float)(1.0 / depth_range(g_r.main_target.zpsm));
-        PushConstants &pc = it.pc;
-        pc.ambient[3] = 15.0f;  // va = 15 (accumulated in shadow_mask.a)
-        pc.mode[0] = M_CFIX;
-        pc.mode[2] = 128;       // FIX = 1.0
-        // pass 1 (front faces): cull BACK (1), B_ADD; pass 0 (back faces): cull FRONT (2), B_REVSUB
+        // pass 1: cull BACK (1), one 5-bit step added; pass 0: cull FRONT (2), one step subtracted
+        // (0x363708). The depth test is the shader's (0x362968 Z copy, GEQUAL on the complement).
         const bool front = (g_cur.itop & 1u) != 0;
         const uint32_t blend = front ? B_ADD : B_REVSUB;
         const uint32_t cull = front ? 1u : 2u;
-        // zf = 1 (GEQUAL), zwrite = 0, depth = 1, color mask = 0xF, blend_alpha = 1
-        it.pipeline = blend | (1u << 4) | (0u << 6) | (1u << 7) | (0xFu << 8) | (cull << 12) | (1u << 14);
+        // no depth attachment, color mask = 0xF, blend_alpha = 1
+        it.pipeline = blend | (0xFu << 8) | (cull << 12) | (1u << 14);
         for (int i = 0; i < 4; i++) it.sc[i] = g_r.main_sc[i];
         g_r.shadow_pending.push_back(it);
         return;

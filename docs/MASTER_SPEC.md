@@ -20,7 +20,8 @@ recompiled into `eod`. Quality bar: Halo 2 Anniversary (MCC).
   any frame rate the display supports, maximum car/world LOD at every visible distance,
   no PS2 culling, identical visuals across 1P, 2P and 4P split-screen.
 - **JTBD 4 — modding:** 4K/8K textures and higher-poly cars/tracks load in both looks
-  without PS2 memory, pool or streaming ceilings.
+  without PS2 memory, pool or streaming ceilings; Single & Multiplayer Arcade rosters
+  display a clean `[MOD]` badge on any track or vehicle overridden by an active mod.
 - **JTBD 5 — instant PC boot (default for all installations):** once the native pipeline is
   complete, every installation skips intro/boot `.PSS` movies, splash/loading delays, and the
   PS2 memory-card check by default, booting straight to the main menu (keep an opt-in

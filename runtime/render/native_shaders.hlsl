@@ -149,8 +149,65 @@ float4 gs_sample(float2 uv, float w) {
     return (float4)(((c00 * gu + c10 * fu) * gv + (c01 * gu + c11 * fu) * fv) >> 8);
 }
 
+// Projected shadows (stage R5 A3, docs/NATIVE_RENDERER.md "Stage R5"): mode.w bit 31 (never with
+// M_SPEC), bit 30 composite, bits 24..29 RenderScale, 12..23 target height, 0..11 target width
+// (0x363218); mode.y view x | y << 16, mode.z view w | h << 16 (0x35E300); light.x intensity.
+#define S_ON 0x80000000u
+#define S_COMPOSITE 0x40000000u
+
+// 0x362E70 TEXA (TA0 = intensity, AEM 1, TA1 0x80) on the PSMCT16 target: a texel whose 5-bit count
+// is not 0 has alpha TA0 (its A bit is never set: both passes write A = 0), else 0
+uint shadow_texel(int x, int y, int2 size, uint s, uint intensity) {
+    x = clamp(x, 0, size.x - 1);
+    y = clamp(y, 0, size.y - 1);
+    return round(tex.Load(int3(x, y, 0)).a * 255.0) >= 8.0 ? intensity : 0u;
+}
+
+POut shadow_ps(VOut i) {
+    const uint s = (obj.mode.w >> 24) & 63;
+    const float fs = (float)s;
+    const float ws = (float)(obj.mode.w & 0xFFF), hs = (float)((obj.mode.w >> 12) & 0xFFF);
+    const float vx = (float)(obj.mode.y & 0xFFFF), vy = (float)(obj.mode.y >> 16);
+    const float vw = (float)(obj.mode.z & 0xFFFF), vh = (float)(obj.mode.z >> 16);
+    const float px = i.pos.x - 0.5, py = i.pos.y - 0.5;  // pixel (RenderScale units)
+    POut o;
+    if (!(obj.mode.w & S_COMPOSITE)) {
+        // 0x362968: the target's Z is the main Z16S through a nearest UV sprite (u = vx + (x + 0.9375)
+        // vw / w), complemented ((Cd - Cs), Cd = 0xFFFF); the VU1 shadow program writes 0xFFFF - z, and
+        // 0x363708 tests GEQUAL: a face is counted where it is behind or on the scene (z <= scene z)
+        const int mx = (int)floor(vx * fs + (px + 0.9375) * vw / ws);
+        const int my = (int)floor(vy * fs + (py + 0.9375) * vh / hs);
+        const float d = tex.Load(int3(mx, my, 0)).r;
+        const uint variant = obj.mode.x & 3;  // diagnostic EOD_NATIVE_SHADOW_TEST: 1 no test, 2 z-pass
+        if (variant == 0 && i.pos.z > d + 0.5 / 65536.0) discard;
+        if (variant == 2 && i.pos.z < d - 0.5 / 65536.0) discard;
+        // 0x363708: RGB 15 added / 7 subtracted on PSMCT16 = one 5-bit step either way
+        o.color = float4(8.0, 8.0, 8.0, 8.0) / 255.0;
+        o.factor = float4(0, 0, 0, 1);
+        return o;
+    }
+    // 0x362E70: sprite strips, UV 0..w over the view (u = (x - vx + 0.9375) 16 w / vw), TEX1 0x60
+    // (bilinear), TFX modulate with RGBAQ (0, 0, 0, 0x80), ALPHA 0x44: Cd + ((0 - Cd) As >> 7)
+    const uint intensity = (uint)obj.light.x;
+    const int2 size = int2((int)(ws * fs), (int)(hs * fs));
+    const int u = (int)floor((px - vx * fs + 0.9375) * 16.0 * ws / vw) - 8;
+    const int v = (int)floor((py - vy * fs + 0.9375) * 16.0 * hs / vh) - 8;
+    const int x0 = u >> 4, y0 = v >> 4;
+    const uint fu = (uint)(u & 15), fv = (uint)(v & 15), gu = 16 - fu, gv = 16 - fv;
+    const uint a00 = shadow_texel(x0, y0, size, s, intensity), a10 = shadow_texel(x0 + 1, y0, size, s, intensity);
+    const uint a01 = shadow_texel(x0, y0 + 1, size, s, intensity), a11 = shadow_texel(x0 + 1, y0 + 1, size, s, intensity);
+    const uint as = ((a00 * gu + a10 * fu) * gv + (a01 * gu + a11 * fu) * fv) >> 8;
+    if (as == 0) discard;
+    // blend B_SHADOW: dst (1 - As / 128) - src; src just under half a step makes the unorm rounding a
+    // floor, as the GS's arithmetic shift of the negative product is
+    o.color = float4(0.49, 0.49, 0.49, 0.0) / 255.0;
+    o.factor = float4(0, 0, 0, (float)as / 128.0);
+    return o;
+}
+
 POut ps_main(VOut i) {
     const uint m = obj.mode.x;
+    if ((obj.mode.w & S_ON) && !(m & M_SPEC)) return shadow_ps(i);
     float3 v = i.c.rgb;
     float va = i.c.a;
     float3 rgb;

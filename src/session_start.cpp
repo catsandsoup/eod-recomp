@@ -115,13 +115,153 @@ void log(const char *fmt, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
 // Eve (track meet) by track: display name first (it is what the player sees), then the
 // internal id; this keeps "Welch" on the real Welch Eve rather than "test: Welch Dirt".
 int find_eve(const std::string &track) {
+    std::string t = trim(track);
+    const size_t slash = t.find_last_of("/\\");
+    if (slash != std::string::npos) t = t.substr(slash + 1);
+    if (t.size() > 4 && ieq(t.substr(t.size() - 4), ".trk")) t = t.substr(0, t.size() - 4);
+    static const struct { const char *alias; const char *canonical; } kTrackAliases[] = {
+        {"afton", "Woodly"}, {"woodly", "Woodly"},
+        {"emptyt_1", "EmptyTrack"}, {"emptytrack", "EmptyTrack"},
+        {"homeba_1", "HomeBase"}, {"homebase", "HomeBase"},
+        {"spring_1", "Springfield"}, {"springfield", "Springfield"},
+        {"dennis_1", "Dennison"}, {"dennison", "Dennison"},
+        {"hastin_1", "Hastings"}, {"hastings", "Hastings"},
+        {"mankat_1", "Mankato"}, {"mankato", "Mankato"},
+        {"bemidj_1", "Bemidji"}, {"bemidji", "Bemidji"},
+    };
+    std::string canonical = t;
+    for (const auto &a : kTrackAliases) {
+        if (ieq(t, a.alias)) { canonical = a.canonical; break; }
+    }
     const uint32_t n = ee_r32(kEveCount);
-    for (int pass = 0; pass < 2; ++pass)
-        for (uint32_t i = 0; i < n && i < 64; ++i) {
-            const uint32_t e = kEves + i * kEveStride;
-            if (ieq(guest_text(e + (pass ? 8 : 0x28), 63), track)) return (int)i;
-        }
+    for (const std::string & query : {canonical, t}) {
+        for (int pass = 0; pass < 2; ++pass)
+            for (uint32_t i = 0; i < n && i < 64; ++i) {
+                const uint32_t e = kEves + i * kEveStride;
+                if (ieq(guest_text(e + (pass ? 8 : 0x28), 63), query)) return (int)i;
+            }
+    }
     return -1;
+}
+
+std::string canonical_contest_alias(const std::string &name) {
+    const std::string n = lower(trim(name));
+    static const struct { const char *alias; const char *canonical; } kAliases[] = {
+        {"normal", "No-Rules Race"},
+        {"normal_race", "No-Rules Race"},
+        {"c_normal_race", "No-Rules Race"},
+        {"no rules race", "No-Rules Race"},
+        {"no-rules race", "No-Rules Race"},
+        {"fig8jump", "Figure-8 Jump Race"},
+        {"figure8_jump_race", "Figure-8 Jump Race"},
+        {"c_figure8_jump_race", "Figure-8 Jump Race"},
+        {"figure 8 jump race", "Figure-8 Jump Race"},
+        {"figure-8 jump race", "Figure-8 Jump Race"},
+        {"fig8", "Figure-8"},
+        {"figure8_race", "Figure-8"},
+        {"c_figure8_race", "Figure-8"},
+        {"figure 8", "Figure-8"},
+        {"figure-8", "Figure-8"},
+        {"figure 8 race", "Figure-8"},
+        {"figure-8 race", "Figure-8"},
+        {"road_race", "Jump Race"},
+        {"jump_race", "Jump Race"},
+        {"c_road_race", "Jump Race"},
+        {"c_jump_race", "Jump Race"},
+        {"jump race", "Jump Race"},
+        {"demo_derby_contest", "Demolition Derby"},
+        {"demo_derby", "Demolition Derby"},
+        {"kill_derby", "Demolition Derby"},
+        {"c_kill_derby", "Demolition Derby"},
+        {"demolition derby", "Demolition Derby"},
+        {"knockout_contest", "Knockout"},
+        {"kill_knock", "Knockout"},
+        {"c_kill_knock", "Knockout"},
+        {"knockout", "Knockout"},
+        {"pushoff_contest", "Push-Off"},
+        {"kill_push", "Push-Off"},
+        {"pushoff", "Push-Off"},
+        {"c_pushoff", "Push-Off"},
+        {"push-off", "Push-Off"},
+        {"save_ring", "Suicide Race"},
+        {"c_save_ring", "Suicide Race"},
+        {"suicide", "Suicide Race"},
+        {"suicide_race", "Suicide Race"},
+        {"c_suicide_race", "Suicide Race"},
+        {"suicide race", "Suicide Race"},
+        {"stop_and_go", "Stop-and-Go"},
+        {"stop_and_go_race", "Stop-and-Go"},
+        {"c_stop_and_go_race", "Stop-and-Go"},
+        {"stop and go", "Stop-and-Go"},
+        {"stop-and-go", "Stop-and-Go"},
+        {"stop & go", "Stop-and-Go"},
+        {"shortcut", "Shortcut Race"},
+        {"shortcut_race", "Shortcut Race"},
+        {"c_shortcut_race", "Shortcut Race"},
+        {"shortcut race", "Shortcut Race"},
+        {"flag_pole", "Flagpole Race"},
+        {"flagpole_race", "Flagpole Race"},
+        {"c_flagpole_race", "Flagpole Race"},
+        {"flagpole race", "Flagpole Race"},
+        {"flag pole", "Flagpole Race"},
+        {"whip", "Whip-Around"},
+        {"whip_around_race", "Whip-Around"},
+        {"c_whip_around_race", "Whip-Around"},
+        {"whip-around", "Whip-Around"},
+        {"whip around", "Whip-Around"},
+        {"chain_race", "Chain Race"},
+        {"chain race", "Chain Race"},
+        {"fwd_bwd_race", "Forward-Backward"},
+        {"c_fwd_bwd_race", "Forward-Backward"},
+        {"forward-backward", "Forward-Backward"},
+        {"forward backward", "Forward-Backward"},
+        {"last_man_race", "Last Man"},
+        {"c_last_man_race", "Last Man"},
+        {"last man", "Last Man"},
+        {"last man race", "Last Man"},
+        {"school_bus", "School Bus"},
+        {"c_school_bus", "School Bus"},
+        {"school bus", "School Bus"},
+        {"school bus race", "School Bus"},
+        {"trailer_race", "Trailer Race"},
+        {"c_trailer_race", "Trailer Race"},
+        {"trailer race", "Trailer Race"},
+        {"pointtopoint", "Point-to-Point"},
+        {"c_pointtopoint", "Point-to-Point"},
+        {"point-to-point", "Point-to-Point"},
+        {"point to point", "Point-to-Point"},
+        {"detention", "Detention"},
+        {"c_detention", "Detention"},
+        {"gauntlet", "Gauntlet"},
+        {"c_gauntlet", "Gauntlet"},
+        {"red_rover", "Red Rover"},
+        {"c_red_rover", "Red Rover"},
+        {"red rover", "Red Rover"},
+        {"wrangle", "Wrangler"},
+        {"c_wrangle", "Wrangler"},
+        {"wrangler", "Wrangler"},
+        {"capture", "Downtown"},
+        {"c_capture", "Downtown"},
+        {"downtown", "Downtown"},
+        {"stuntman", "Daredevil"},
+        {"c_stuntman", "Daredevil"},
+        {"daredevil", "Daredevil"},
+        {"battle", "Battle"},
+        {"c_battle", "Battle"},
+        {"battle (free roam)", "Battle"},
+        {"free roam (battle solo)", "Battle"},
+        {"free roam", "Battle"},
+    };
+    for (const auto &a : kAliases) {
+        if (n == a.alias) return a.canonical;
+    }
+    return name;
+}
+
+bool is_battle_request_name(const std::string &name) {
+    const std::string n = lower(trim(name));
+    return n == "battle" || n == "c_battle" || n == "free roam" ||
+           n.rfind("battle (", 0) == 0 || n.rfind("free roam", 0) == 0;
 }
 
 // Contest (event) of an Eve by name or "#<position>"; position is the order of the Eve's
@@ -130,14 +270,28 @@ int find_contest(uint32_t eve, const std::string &name) {
     const uint32_t n = ee_r32(kContestCount);
     long want = -1;
     if (!name.empty() && name[0] == '#') number(name.substr(1), want);
+    const std::string canonical = canonical_contest_alias(name);
     long pos = 0;
+    int first_battle = -1;
+    int battle_8 = -1;
+    int battle_4 = -1;
+    int first_contest = -1;
     for (uint32_t c = 0; c < n && c < battle_layout::kContestCapacity; ++c) {
         const uint32_t cp = battle_layout::kContestTable + c * battle_layout::kContestStride;
         if (ee_r32(cp + 4) != eve) continue;
+        if (first_contest < 0) first_contest = (int)c;
         if (want >= 0) { if (pos++ == want) return (int)c; continue; }
         const std::string have = guest_text(native(f_001252C0, {c}), 40);
-        if (ieq(have, name)) return (int)c;
+        if (ieq(have, name) || ieq(have, canonical)) return (int)c;
+        if (ieq(have, "Battle (8 AI)")) battle_8 = (int)c;
+        else if (ieq(have, "Battle (4 AI)")) battle_4 = (int)c;
+        else if (ieq(have, "Battle") && first_battle < 0) first_battle = (int)c;
         ++pos;
+    }
+    if (is_battle_request_name(name) || is_battle_request_name(canonical)) {
+        if (battle_8 >= 0) return battle_8;
+        if (battle_4 >= 0) return battle_4;
+        if (first_battle >= 0) return first_battle;
     }
     return -1;
 }
@@ -146,18 +300,40 @@ int find_contest(uint32_t eve, const std::string &name) {
 long find_car(const std::string &car, int paint) {
     const uint32_t table = ee_r32(kVehicleTable), n = ee_r32(kVehicleCount);
     if (!table || n == 0 || n > 4096) return -1;
+    std::string c = trim(car);
+    if (c.size() > 4 && ieq(c.substr(c.size() - 4), ".car")) c = c.substr(0, c.size() - 4);
+    static const struct { const char *alias; const char *canonical; } kCarAliases[] = {
+        {"ambula", "Ambulance"}, {"ambula_1", "Ambulance"},
+        {"bulldo", "Bulldog"},   {"bulldo_1", "Bulldog"},
+        {"carrer", "Carrere"},   {"carrer_1", "Carrere"},
+        {"fillmo", "Fillmore"},  {"fillmo_1", "Fillmore"},
+        {"gladia", "Gladiator"}, {"gladia_1", "Gladiator"},
+        {"gueril", "Guerilla"},  {"gueril_1", "Guerilla"},
+        {"hurric", "Hurricane"}, {"hurric_1", "Hurricane"},
+        {"mongoo", "Mongoose"},  {"mongoo_1", "Mongoose"},
+        {"orbita", "Orbital"},   {"orbita_1", "Orbital"},
+        {"school bus", "Bus"},   {"police", "Copcar"},
+    };
+    for (const auto &a : kCarAliases) {
+        if (ieq(c, a.alias)) { c = a.canonical; break; }
+    }
     long want = -1;
-    if (number(car, want)) {
+    if (number(c, want)) {
         for (uint32_t i = 0; i < n; ++i)
             if ((long)ee_r32(table + i * kVehicleStride + 4) == want) return want;
         return -1;
     }
     int seen = 0;
+    long first_match = -1;
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t v = table + i * kVehicleStride;
-        if (ieq(guest_text(v + 8, 32), car) && seen++ == paint) return (long)ee_r32(v + 4);
+        const std::string vname = guest_text(v + 8, 32);
+        if (ieq(vname, c) || ieq(vname, car)) {
+            if (first_match < 0) first_match = (long)ee_r32(v + 4);
+            if (seen++ == paint) return (long)ee_r32(v + 4);
+        }
     }
-    return -1;
+    return first_match;
 }
 
 
@@ -373,6 +549,10 @@ const SessionRequest *career_warp_request() { return P.career ? &P.req : nullptr
 std::string session_event_name(const SessionRequest &r) {
     if (r.ai >= 0 && ieq(r.event, "battle")) return r.ai == 1 ? "Battle (1v1)" : "Battle (" + std::to_string(r.ai) + " AI)";
     return r.event;
+}
+
+int session_ai_override() {
+    return (P.requested && P.req.mode == "action") ? P.req.ai : -1;
 }
 
 // Title screen ("press the START button", start.lyt): returns 1 once the player passed it.

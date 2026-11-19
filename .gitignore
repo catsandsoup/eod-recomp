@@ -24,3 +24,8 @@ imgui.ini
 .build/
 tools/editor_macos/.build/
 build.log
+
+# release packages (built by tools/package_windows_release.py)
+dist/EOD-Recomp-*/
+dist/EOD-Recomp-*.zip
+dist/SHA256SUMS-*.txt
