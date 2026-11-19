@@ -175,7 +175,19 @@ int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned fl
 static enum class Side { kNone, kOriginal, kReplacement } g_side = Side::kNone;
 
 bool diff_in_original_side() { return g_side == Side::kOriginal; }
-void diff_report() { report_at_exit(); }
+static std::vector<void (*)()> &exit_reports() {
+    static std::vector<void (*)()> v;
+    return v;
+}
+void diff_add_exit_report(void (*fn)()) {
+    for (auto f : exit_reports())
+        if (f == fn) return;
+    exit_reports().push_back(fn);
+}
+void diff_report() {
+    report_at_exit();
+    for (auto f : exit_reports()) f();
+}
 
 void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), unsigned flags) {
     if (g_side == Side::kOriginal) {

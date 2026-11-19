@@ -28,3 +28,5 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
 bool diff_in_original_side();
 // Prints the [diff] totals (called at exit: app_exit leaves through _exit, so atexit never runs).
 void diff_report();
+// Another exit report to print with diff_report (test counters that would otherwise need atexit).
+void diff_add_exit_report(void (*fn)());

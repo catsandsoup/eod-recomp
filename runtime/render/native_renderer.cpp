@@ -1,5 +1,6 @@
 // native_renderer.cpp - GS-thread side of the native renderer (native_renderer.h): which GS draws
 // belong to native objects, the objects' GS state, and the plume renderer that draws them.
+#include "core/diff_harness.h"
 #include "native_renderer.h"
 
 #include <algorithm>
@@ -714,8 +715,20 @@ struct VertexCheck {
     uint64_t objects = 0, vertices = 0, within = 0, bind_off = 0;
     uint64_t clip_objects = 0, clip_vertices = 0, clip_within = 0;
     double worst = 0, sum = 0;
+    uint64_t hist[4097] = {};  // |error| in 1/1024 px bins (0..4 px), last bin: above 4 px
 };
 VertexCheck g_vck;
+// p-th percentile of the non-clip vertex errors, px (upper edge of the bin it falls in)
+double vertex_check_percentile(double p) {
+    if (!g_vck.vertices) return 0.0;
+    const uint64_t want = (uint64_t)std::ceil(p * (double)g_vck.vertices);
+    uint64_t acc = 0;
+    for (int i = 0; i < 4097; i++) {
+        acc += g_vck.hist[i];
+        if (acc >= want) return i == 4096 ? g_vck.worst : (i + 1) / 1024.0;
+    }
+    return g_vck.worst;
+}
 struct ProjGrid {
     uint64_t key = ~0ull;           // (frame << 32 | serial) of the object
     bool on = false, clip = false;
@@ -792,6 +805,7 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
         g_vck.within += ok;
         g_vck.sum += std::fmin(d, 1e6);
         g_vck.worst = std::fmax(g_vck.worst, std::fmin(d, 1e6));
+        g_vck.hist[d < 4.0 ? (int)(d * 1024.0) : 4096]++;
         if (ok && !g_pg.bind.empty() && nearest(g_pg.bind, x, y) > 1.0 / 16.0) g_vck.bind_off++;
     }
     static uint64_t last = 0;
@@ -810,10 +824,10 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
 void vertex_check_report() {
     if (!vertex_check_on()) return;
     std::fprintf(stderr,
-                 "[native] P2 final posed vertices vs GS: objects %llu vertices %llu within 1/16 px %llu (worst %.4f px, mean %.4f px; "
+                 "[native] P2 final posed vertices vs GS: objects %llu vertices %llu within 1/16 px %llu (worst %.4f px, p99 %.4f px, mean %.4f px; "
                  "bind pose off by > 1/16 px at %llu of them) | clip-path objects %llu vertices %llu within %llu\n",
                  (unsigned long long)g_vck.objects, (unsigned long long)g_vck.vertices, (unsigned long long)g_vck.within,
-                 g_vck.worst, g_vck.vertices ? g_vck.sum / (double)g_vck.vertices : 0.0, (unsigned long long)g_vck.bind_off,
+                 g_vck.worst, vertex_check_percentile(0.99), g_vck.vertices ? g_vck.sum / (double)g_vck.vertices : 0.0, (unsigned long long)g_vck.bind_off,
                  (unsigned long long)g_vck.clip_objects, (unsigned long long)g_vck.clip_vertices, (unsigned long long)g_vck.clip_within);
 }
 #else
@@ -989,7 +1003,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
     }
 #ifdef EOD_PLUME
     if (vertex_check_on()) {
-        static const bool hooked = (std::atexit(vertex_check_report), true);
+        static const bool hooked = (diff_add_exit_report(vertex_check_report), true);
         (void)hooked;
         const gs::Vertex *vs[3] = {&v, b, c};
         vertex_check(vs, b && c ? 3 : 1);

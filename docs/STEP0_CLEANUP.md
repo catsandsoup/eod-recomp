@@ -51,3 +51,29 @@ body in retail data.
 
 **Next decisive test.** R3: skinned palettes; then R4 removes the remaining GS draws that
 `EOD_NATIVE_ONLY=1` hides (shadows, particles, sprites, immediate geometry, HUD).
+
+## R3 handoff (STAR, 2026-11-19)
+
+**Situation.** R2 moved track world, sky and water to Plume; skinned characters, car damage dents,
+detached wheel/panel debris pools, and per-view cockpit/chassis verification remained.
+
+**Task.** Replace car damage/setup and debris pool functions with readable C++ (`EOD_DIFF`), add
+`p99` P2 vertex reporting on `_exit`, pass the P2 bone/vertex gate, and run the 6-scene R3 suite
+with rotated special vehicles, cycled camera views, `EOD_DIFF`, and `EOD_HEAP_CHECK=1`.
+
+**Action.** Phase A (`41742a1`, `5e7319f`, `6c875f7`) moved car damage/panels (`src/car_damage.cpp`),
+debris pool expansion (`src/debris_pool.cpp`), and camera view tracing/keys (`src/hle_camera.cpp`).
+Phase B wired `p99` + `diff_add_exit_report` in `runtime/core/diff_harness.{h,cpp}` and
+`runtime/render/native_renderer.cpp`, ran the P2 gate (`p2_gate2`, Dundas Battle, Hearse), ran all
+6 scenes (Bus, Taxi, Career free roam, Car dealer, Copcar, Postal 2P split) plus `EOD_NATIVE_ONLY=1`
+(Ambulance), and documented Section 8 of `docs/NATIVE_RENDERER_SUCCESS.md`.
+
+**Result.** P2 bit-identical on 241,920 EE pose words and 581,652 VU1 bone/dent words (0 mismatched);
+4,667,998 / 4,672,296 posed vertices within `1/16 px` (99.91%, p99 `0.0625 px`, max `0.0672 px`).
+All 6 scenes + native-only: 100% P1 frame equality (queue and world), 0 `EOD_DIFF` mismatches, 0
+heap corruptions, clean exits. R2 split-screen leftovers (`0x214B68` parity-off gate, Woodly 2P Battle
+water) remain deferred.
+
+**Next decisive test.** R4: move the remaining GS draws that `EOD_NATIVE_ONLY=1` drops (133,823
+primitives in 1,200 vb Dundas Battle: projected shadows, particles, effect sprites, immediate
+geometry, HUD, plus the non-queue cockpit quad in `0x219C48` via `0x35CAA0`) to native Plume.

@@ -33,7 +33,7 @@ GPU can carry. The player judges it by what they can capture and share. Rows P9-
 | P4 | Modern look adds only what is wanted | Modern frame: lit materials, shadows, IBL. No vignette, colour grade, tone curve or haze. Fog colour, fog distances and night levels come from the game's values | review of every scene-suite frame, plus fog/sky sample pixels within 4/255 of the PS2 look |
 | P5 | The look switch is instant | Toggle Modern <-> PS2 in the menu during a race | next frame shows the new look; no frame over 33 ms; GPU memory flat after 100 toggles |
 | P6 | Original mode is unchanged | GS replay of a recorded race dump with the current build | VRAM md5 equal to the reference build (`f30d64c0...`, docs/SCENE_CAPTURE.md) |
-| P8 | Split screen looks like single player | 2-player frame vs 1-player frame of the same track and camera position: same track passes (water, reflections, detail), same LOD and draw distance, no extra culling, every look and renderer | identical object and pass lists per view (render trace); water visible on Dundas in both views |
+| P8 | Split screen looks like single player | 2-player frame vs 1-player frame of the same track and camera position: same track passes (water, reflections, detail), same LOD and draw distance, no extra culling, every look and renderer | identical object and pass lists per view (render trace); water visible on Woodly (AFTON.TRK) in both views |
 | P7 | Simulation and netplay are unchanged | Two-instance netplay race plus a solo race with recorded input | no desync; race result and lap times identical to the reference build |
 
 ## 2. Speed (borderless or exclusive fullscreen only)
@@ -181,11 +181,77 @@ natively with the sun quad found every time (`no sun quad 0`).
 - Split screen: both the PS2 (`0x214B68`) and the Xbox (`FUN_000a8390`) skip world passes 1, 2, 4
   and use the coarse mlist, and `0x326188` creates the water surface only for one view
   (`*(0x439858) < 2`). `SplitScreenParity=1` (default) gives split views the single-view
-  sequence, mlist and water. Woodly is not offered in head-to-head (the head-to-head contest
-  table has no Eve 16 entry), so water in split screen could not be shown with a retail session.
+  sequence, mlist and water. 2-player Battle on Woodly (AFTON.TRK) is available in retail; split-screen
+  water verification on Woodly Battle is deferred/pending.
 
 ### Still open after R2
 
 Per-vertex fog and mip levels (R5); the projected-shadow, particle and immediate-geometry passes
 that `0x214B68` calls are still drawn by the GS (R4); PS2 caps owned here are tracked, not
 removed (docs/PS2_LIMITS.md).
+
+## 8. Stage R3: skinned characters and car deformation (2026-11-19)
+
+Build `ninja -C build eod`, headless and muted (`EOD_HEADLESS=1 EOD_MUTE=1 --headless`),
+`Detail=maximum`, `DrawDistance=8`, `FrameSkip=0`, RenderScale 1, Radeon Pro 580. Code:
+`src/bone_pose.cpp`, `src/car_damage.cpp`, `src/debris_pool.cpp`, `src/hle_camera.cpp`,
+`runtime/render/native_feed.cpp`, `runtime/render/native_renderer.cpp`; spec in
+docs/NATIVE_RENDERER.md "Stage R3".
+
+### D2: EOD_DIFF (0 mismatches across Phase A3 and Phase B)
+
+| function | Phase A3 checked | Phase B checked (`EOD_DIFF_EVERY=32`) | mismatched | notes |
+| --- | --- | --- | --- | --- |
+| `0x35DBD8` BonePaletteWrite | (R1/M0) | 184 (5,535 live calls) | 0 | 6 scenes + P2 gate |
+| `0x35A810` BonePaletteUpload | (R1/M0) | 28 (752 live calls) | 0 | same |
+| `0x35DD28` PoseWrite | (R1/M0) | 264 (7,388 live calls) | 0 | same |
+| `0x34CA18` PoseSubmit | (R1/M0) | 267 (7,422 live calls) | 0 | same |
+| `0x17B918` ContactRecord | — | 25 (699 live calls) | 0 | collisions in Battle / Derby / 2P |
+| `0x18CA98` CarApplyCollisionDamage | >= 1,374 | 3 (19 live calls) | 0 | Phase A3 + Dundas/Derby |
+| `0x18AFE0` CarSetupDamageAndPanels | >= 1,068 | 7 (65 live calls) | 0 | Phase A3 + all 6 scenes |
+| `0x1E1E88` 'Panl' ctor | >= 2,088 | 6 (72 live calls) | 0 | Phase A3 + all 6 scenes |
+| `0x1E29C0` 'Panl' dtor | 1,112 | — | 0 | Phase A3 Eagan derby teardown |
+| `0x1B3190` wheel pool reset | 3,005 | 6 (6 live calls) | 0 | Phase A3 + all 6 scenes |
+| `0x1B3180` wheel count reset | 1,002 | — | 0 | Phase A3 teardown |
+| `0x1B3068` DetachedWheelSpawn | >= 5,152 | — | 0 | Phase A3 Gilroy night / Dundas wheel replay (nested under `0x18CA98` when both watched) |
+
+### P2: bone palettes, dent offsets, and posed vertices vs GS reference (1x)
+
+Run: Dundas 'Battle (8 AI)', Hearse (`vehicle 502`), `EOD_CHICKENS=1` (L2 every 30 vb), 1,800 vb,
+`EOD_NATIVE=1 EOD_NATIVE_SKIN_CHECK=1`.
+
+| check | compared | pass / matched | error / detail |
+| --- | --- | --- | --- |
+| EE bone palette vs `0x34C9F8` input | 756 checks (241,920 words) | 241,920 / 241,920 (0 mismatched) | bit-identical |
+| VU1 bone & dent words vs VU1 data memory | 8,192 records (581,652 words) | 581,652 / 581,652 (0 mismatched) | bit-identical |
+| Posed vertices vs GS (1x, non-clip) | 9,364 objects (4,672,296 vertices) | 4,667,998 within `1/16 px` (99.91%) | p99 `0.0625 px`, max `0.0672 px`, mean `0.0386 px` (bind pose off > `1/16 px` at 3,277,330 vertices) |
+| Posed vertices vs GS (1x, clip path) | 764 objects (247,134 vertices) | 232,170 within `1/16 px` (93.94%) | CPU frustum re-clip vs VU1 clipper |
+
+### P1: multi-scene suite (`EOD_NATIVE=1 EOD_DIFF=... EOD_HEAP_CHECK=1`)
+
+Special vehicles rotated without Venom or back-to-back repeats; camera views cycled via Triangle
+(pad event 0) and `EOD_CAMERA_KEYS` (`KeyPush 0x33C168`).
+
+| scene | vehicle | frames equal (queue / world) | queue drawn / submitted | world drawn / submitted | `EOD_DIFF` / heap / exit | camera views covered |
+| --- | --- | --- | --- | --- | --- | --- |
+| Dundas 'Battle (8 AI)', max cars, `DrawDistance=8`, `EOD_CHICKENS=1` (L2/30 vb), 2200 vb | Bus (`790`) | 448/448 / 448/448 | 11,970 / 11,970 | 73,490 / 73,490 | 0 / 0 / clean | Cockpit, NearChase, Chase, FarChase, Rear, RearChase, Overhead, TV |
+| Gilroy 'Battle (8 AI)' night, `EOD_CHICKENS=1` (L2/30 vb), 2200 vb | Taxi (`508`) | 399/399 / 399/399 | 21,607 / 21,607 | 134,980 / 134,980 | 0 / 0 / clean | Cockpit, NearChase, FarChase, Rear, RearChase, Overhead, TV |
+| Career free roam (`mode=career;place=home`), 2000 vb | Career car | 371/371 / 371/371 | 5,330 / 5,330 | 28,001 / 28,001 | 0 / 0 / clean | Cockpit, NearChase (plus front-end physcam 31) |
+| Car dealer (`mode=career;place=dealer`), 1500 vb | Career car | 217/217 / 217/217 | 11,423 / 11,423 | 28,231 / 28,231 | 0 / 0 / clean | Cockpit, NearChase (plus front-end physcam 31) |
+| Eagan 'Demolition Derby', 2200 vb | Copcar (`504`) | 434/434 / 434/434 | 21,673 / 21,673 | 26,293 / 26,293 | 0 / 0 / clean | Cockpit, NearChase, Chase, FarChase, Rear, RearChase, Overhead, TV |
+| Dundas 'No-Rules Race' 2P split-screen (`humans=2`), 2200 vb | Postal (`503`) | 490/490 / 490/490 | 28,279 / 28,279 | 58,380 / 58,380 | 0 / 0 / clean | Cockpit (plus lobby physcam 19) |
+| `EOD_NATIVE_ONLY=1` Dundas 'Battle (8 AI)', 1200 vb | Ambulance (`601`) | 363/363 / 363/363 | 11,644 / 11,644 | 76,726 / 76,726 | — / 0 / clean | 133,823 GS primitives dropped |
+
+Chassis (2) and Bumper (1) views were additionally verified in Phase A3 (`r3a3_cockpit`, Bus, Mankato
+Demolition Derby: 81/81 Chassis frames and 49/49 Bumper frames P1 equal; see docs/NATIVE_RENDERER.md).
+
+### Open items for R4 (and deferred R2 items)
+
+- **R4 — non-queue cockpit quad:** `non-queue quad in 0x219C48 via 0x35CAA0` (built on the stack when
+  `0x2114A8() != -1`, between `0x34F928` / `0x34F888`, outside the draw queue).
+- **R4 — `EOD_NATIVE_ONLY=1` dropped GS primitives:** 133,823 GS primitives dropped in 1,200 vb of
+  Dundas 'Battle (8 AI)' (and in Phase A3 `r3a3_cockpit_only`: Chase 1,181/frame, Chassis 781/frame,
+  Bumper 872/frame, Cockpit 932/frame) — projected shadows, particles, effect sprites, immediate
+  geometry, and 2D/HUD still drawn by the GS emulator.
+- **Deferred from R2:** `0x214B68` split-screen parity-off gate and split-screen water verification on
+  Woodly (AFTON.TRK) 2P Battle.
