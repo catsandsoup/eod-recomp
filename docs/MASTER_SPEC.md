@@ -169,7 +169,10 @@ it with adaptive host memory that grows on demand and releases when unused.
   - **R9b gameplay markers:** spawn points, event triggers, chicken spawns, checkpoints,
     breakable props (hay bales, cones, barrels) with their physics and debris data.
   - **R9c new content:** place new objects and models (archive rebuild; per-track object
-    pools grow adaptively, `docs/PS2_LIMITS.md`); "Make collision" compiles collision
+    pools grow adaptively, `docs/PS2_LIMITS.md`). The model browser lists every model from
+    every retail track, not just the open one: any geometry from any map can be inserted
+    into any other, with its textures, materials, LODs and collision copied into the edited
+    track (owner rule, 2026-11-19); "Make collision" compiles collision
     from a mesh (`tools/world_collision.py` read side exists).
   - **R9d racing lines and events:** ILIN racing-line editor (the Roads tool: nodes,
     branches, lanes, width, direction), AI start grids, event and race definitions for
