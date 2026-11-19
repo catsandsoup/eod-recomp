@@ -27,6 +27,10 @@ void f_00365540_orig(void);
 void f_00360E18_orig(void);
 }
 
+namespace native_texstate {
+void publish_init();
+}
+
 namespace {
 
 inline uint32_t reg(int r) { return g_ee.r[r].uw[0]; }
@@ -109,4 +113,5 @@ extern "C" void f_00360E18(void) {
     float f[3];
     std::memcpy(f, u, sizeof f);
     native::ee_fog_range(f[0], f[1], f[2]);
+    native_texstate::publish_init();  // its TEX1 K / MXL / blend select / LOD bias (src/native_texstate.cpp)
 }

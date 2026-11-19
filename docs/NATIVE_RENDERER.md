@@ -520,7 +520,7 @@ it was queued). Race: 4 render passes for about 965 objects per frame.
 
 ---
 
-## Stage R5: Classic parity (Phase A1: P3 tool and fog)
+## Stage R5: Classic parity (Phase A1: P3 tool and fog; Phase A2: texture LOD, alpha test, blend)
 
 Phase A1 builds the P3 comparison tool and moves fog onto Plume from decompiled EE code. Mipmaps,
 region clamp/repeat, destination-alpha blend and AFAIL modes follow in Phase A2.
@@ -593,6 +593,84 @@ inside the `0x33ECB8` check). FGE draws 0 in every run.
 
 P3 fails as expected before mip levels, blend and the remaining A2 items. Fog contributes nothing:
 no retail pixel is fogged.
+
+### Phase A2: what the GS state of a native draw is (spec before code)
+
+Census of the Gilroy night and Dundas day replays (`EOD_GS_CENSUS`, now with TEX1 L/K/LCM): every
+3D triangle has TEX1 `MMAG 1, MMIN 4` (LINEAR_MIPMAP_NEAREST), `MXL 0..6`, `L 0`, `LCM 0` and a K that
+changes from draw to draw; CLAMP `WMS/WMT` 0 or 1 only; TEST `ATE 0` or `ATE 1, GEQUAL, AREF 0x60,
+AFAIL 1` (FB_ONLY); ALPHA `(Cs, Cd, As, Cd)` or `(Cs, 0, As, Cd)`; `DATE 0`; no ALPHA with C = Ad.
+The EE code that sets each of these:
+
+| GS field | PS2 `SLUS_209.10` | value |
+| --- | --- | --- |
+| TEX1 K template, MXL | `TextureSetLodState 0x3652A8(a0, a1)` (texture manager `0x35F278` at `0x35F8D0`, `0x35EE38` at `0x35EE94`; a0 = log2 height `+0x1A`, a1 = levels - 1 `+0x1C`) | `*0x4D8BAC = a0 << 4`, `*0x4D8BB0 = a0`, `*0x4D8BBC = a1`, dirty `0x400` on change |
+| TEX1 register | `RenderStateCommit 0x3620A8`, dirty `0x400` | `(K & 0xFFF) << 32 \| 0x120 \| (MXL & 7) << 2` (LCM 0, MMAG 1, MMIN 4, L 0), UNPACK V4-32 x3 to VU1 qword 20 (`0x6C034014`: A+D GIFtag, qword 21 TEX1_1 kicked copy, qword 22 template), then `MSCAL 0x49B` (VU1 `0x24D8`: empty program) |
+| per-batch K | VU1 batch programs (starts `0x0388`, `0x0D70`, `0x15D0`, `0x18F0`; kick sites `0x0400`, `0x08D0`, `0x0CF8`, `0x0DE8`, `0x1558`, `0x1648`, `0x1968`, `0x1F40`, `0x2460`) | `z = mtir vf13z` of batch qword 198 (EE VIF data, `vifmesh::Batch::q198_zw[0]`); `z <= 0`: qword 21.y = qword 22.y + z + 1000 (`iaddiu 0x3E8`, `iadd`, `isw.y 21`), `xgkick 20`; `z > 0`: no kick, the GS keeps the last TEX1 |
+| particle / sprite K | header word `*0x4D8BB8` (`0x364068`, `0x364328`, `0x3645B8`) = `(int)(bias * 16 - 1000)` both halves (`LodBiasSet 0x365308`; `0x365578` and `0x360E18` set bias 1.0) | K = template + word (the overlay programs are not in the VU1 image; equal to the GS TEX1 in every draw measured) |
+| immediate / flare K | the same word (`0x361468`, `0x361708`, `0x364D18`) | K = template + word + 1000 (equal to the GS TEX1 in every draw measured) |
+| MIPTBP1/2 | `0x35F9A0` (A+D `0x34`, `0x36`) from the level offsets of `0x35F278` | level l at slot base + the 256-byte blocks of the levels below it, `TBW_l = ceil((w >> l) / 64)` |
+| LOD input Q | `0x35B3D0`: `fVar7 = *0x4D7C1C * width * 0.5` | GS `1 / Q` = native screen w / fVar7 (`EOD_NATIVE_QCHECK`: ratio 1.0000, p5..p95 1.0000..1.0002 over 20,000 vertices) |
+| CLAMP_1 | `0x3620A8` dirty `0x30` | `WMS = !(flags & 0x10)`, `WMT = !(flags & 0x20)`, MINU..MAXV 0: REPEAT or CLAMP. No setter writes REGION_CLAMP / REGION_REPEAT (census: modes 0 and 1 only) |
+| TEST_1 | `0x3620A8` dirty `0x241` | ZTST `flags & 0x40 ? GEQUAL : ALWAYS`; `!(flags & 0x200)`: `0x12001` (ATE, NEVER, AFAIL ZB_ONLY: depth only); `flags & 0x201`: `0x1160B` (ATE, GEQUAL, AREF 0x60, AFAIL FB_ONLY); else `0x10000`. DATE is 0 in all three |
+| ZBUF_1.ZMSK | `0x3620A8` dirty `0x80` | `!(flags & 0x80)` |
+| PRIM.ABE | `0x3620A8` dirty `0x109` (GIFtag templates, VU1 qword `0x2C`) | `flags & 1` |
+| ALPHA_1 | `BlendSelect 0x3654E0(sel)` -> `*0x4D8B78`, dirty `0x80000`; `0x3620A8` | `sel ? 0x44 (Cs, Cd, As, Cd) : 0x48 (Cs, 0, As, Cd)`, FIX 0. The other ALPHA writers (`0x362E70` shadow composite `0x44` with FIX = intensity, `0x35BE08` `0x44` FIX `0x80`) do not use C = Ad either: no destination-alpha blend in the retail game |
+| render flags | `RenderFlagsCommit 0x365540` -> `*0x4D8BC8` (A1) | |
+| frame copy / speed blur | the copy of `FBP 0x1180` to the display buffer: sprite, ALPHA `(Cs, Cd, FIX, Cd)`, FIX `0x60` (census) | drawn by the GS on both sides of P3 (2D path); its EE setter is not located yet, not changed |
+
+### Phase A2: native implementation
+
+- `src/native_texstate.cpp` (readable C++, `EOD_DIFF`): `0x3652A8`, `0x3654E0`; `0x365308` and
+  `0x365578` wrapped (the original runs, the feed gets what it stored); `0x360E18` publishes them too.
+  `fill_camera` puts the render flags, blend select, K template, MXL and the bias word in every packet.
+- The batch decoder records each VU1 run's qword 198 z (`Mesh::k_delta`, `k_kick`, `k_runs`); a batch
+  whose runs have different K is drawn run by run, each with its own K (`run K check`: the GS K
+  sequence of every such object is a subsequence of the native one).
+- `native_renderer.cpp` builds TEST, ALPHA, ABE, CLAMP, ZMSK, ZTST and TEX1 from those values
+  (`ee_state`); the frame/depth surfaces, scissor and TEX0 (texture content, TFX/TCC) stay those of the
+  object's first GS draw (R1). `compare_state` counts EE-vs-GS differences per kind (diagnostic only).
+- Textures carry MXL levels (decoded at MIPTBP; a level in GPU-rendered pages ends the chain there).
+  The shader is the GS texture unit: u, v in 1/16 texel, `LOD = -log2approx(Q) << L + K` with the
+  exponent-and-mantissa log2 the software GS uses, rounded, at most MXL, MMIN above level 0 and MMAG at
+  level 0, REPEAT/CLAMP/region addressing, bilinear with 4-bit weights truncated (`>> 8`). The clip
+  matrix is scaled by `1 / fVar7` so clip w is the VU1 w (a uniform scale draws the same pixels).
+- Alpha test: passing pixels with the state as is; failing pixels as a second pass with the test
+  inverted and AFAIL's writes (FB_ONLY colour, ZB_ONLY depth, RGB_ONLY RGB); FB_ONLY without depth
+  write is one pass. Before A2, FB_ONLY failing pixels also wrote depth.
+- Blending: the full `(A - B) C + D` set as fixed-function factors (`blend_classes`, pipeline key bit
+  15): each colour's coefficient `k + j C`; `1 + C` is counted and drawn as 1; C = Ad uses DST_ALPHA
+  (Ad / 255, not Ad / 128) and is counted. Neither occurs in the retail scenes measured.
+- Diagnostics: `EOD_NATIVE_QCHECK=1` (GS Q vs native w), `EOD_R5A2_OFF` (A/B: 1 no mip levels, 2 R4
+  alpha test, 4 hardware sampler, 8 no per-run K), and `tools/p3_compare.py --breakdown` with
+  `EOD_GS_REPLAY_FORCE=mip0|keep|nearest|noblend|nortt` (replay with one feature off: the live frame's
+  MAE against it; lower than against the reference means the live frame lacks that feature).
+
+### Phase A2 results (headless, RenderScale 1, Classic, `EOD_NATIVE_ONLY=2`)
+
+EE state vs the GS registers of each object's first draw (Dundas Copcar run): world 1,861,498
+objects, particle 6,643, sprite 8,681, immediate 76,401, flare 2,134: 0 differences in test, blend,
+clamp, z, K and MXL; queue 262,401 objects: K and MXL 0, test 5, blend 31, z 5 (flags read when the
+record is queued). Run K check 400,934 objects, 0 not matching. EOD_DIFF (separate run, Gilroy
+'Battle (8 AI)', Postal): `0x3652A8` 289/289, `0x3654E0` 406/406 checked, 0 mismatched. P1 equal in
+every frame of both P3 runs.
+
+Before tracking the w scale the LOD used the native w (274 times the VU1 w), so every texture showed
+its last level; the A/B runs (Gilroy, Hearse, 8 frames) found it: mip levels on 4.16 to 4.83 MAE, off
+2.65, then on with the scale 2.64 (SSIM 0.978).
+
+| scene | vehicle | frames | MAE (worst) | p99 (worst) | SSIM (worst) | sky MAE | A1 MAE / p99 / SSIM / sky |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Gilroy 'Battle (8 AI)' night | Limo (`136`) | 24 | 2.44 (4.46) | 28 (49) | 0.9561 (0.9213) | 1.79 | 3.79 / 30 / 0.9338 / 3.29 |
+| Dundas 'Battle (8 AI)' day | Copcar (`504`) | 22 | 3.89 (18.81) | 32 (141) | 0.9563 (0.7448) | 5.62 | 6.61 / 74 / 0.9087 / 8.96 |
+
+Views cycled in both: Cockpit, Bumper, Chassis, NearChase, Chase. Breakdown (Gilroy vb 1050, 1470,
+1820, 2240): against the mip0, keep and nearest replays the live frame is now further away (+0.11,
++11.84, +0.70): it has those features. Against nortt (no projected-shadow composite) it is closer
+(-0.28; Dundas A1 frames up to -4.45): the shadow composite is the largest remaining error source,
+then the Cockpit/Bumper frames (Dundas vb 1402 Cockpit 18.81, vb 2104 Bumper 14.32: closer to the
+no-blend replay by 4.32, i.e. a blended surface near the camera, see "camera inside another car").
+P3 still fails.
 
 ### Open (R5)
 

@@ -14,6 +14,10 @@ common far value with no geometry are sky pixels). It then picks the live frame 
 matches best (GS presentation trails the EE vblank counter) and prints:
   per-channel MAE (1/255 units), p99 of the per-pixel max channel error, SSIM (luma, 8x8 windows,
   stride 4), and the MAE over fog pixels and over sky pixels.
+--breakdown also replays with one GS feature turned off at a time (EOD_GS_REPLAY_FORCE=mip0, keep,
+nearest, noblend, nortt): the pixels that change are the pixels that feature decides, and for each mask the
+tool prints its pixel count and the live frame's MAE against that replay (lower than against the
+reference: the live frame lacks the feature, by that much).
 Gate (docs/MASTER_SPEC.md P3): MAE <= 1, p99 <= 8, SSIM >= 0.98, fog and sky <= 2 (all /255).
 """
 import argparse
@@ -87,16 +91,20 @@ def main():
     ap.add_argument("--region", help="x0,y0,x1,y1: report only this rectangle (display pixels)")
     ap.add_argument("--search", default="-2..3")
     ap.add_argument("--csv")
+    ap.add_argument("--breakdown", action="store_true",
+                    help="error share of the pixels each GS feature decides (EOD_GS_REPLAY_FORCE masks)")
     ap.add_argument("--min-tri-px", type=int, default=100000,
                     help="triangle pixels the replay must draw (replay stats) for the frame to count")
     a = ap.parse_args()
     vbs = [int(v) for v in a.vblanks.split(",")]
     lo, hi = (int(x) for x in a.search.split(".."))
     rows = []
+    bd_tot = {}
     for v in vbs:
         dump = a.dump if len(vbs) == 1 else f"{a.dump}.{v}"
         ref_p = replay(a.exe, a.ini, dump, {})
         ref = load_rgb(ref_p)
+        os.replace(ref_p, dump + ".ref.ppm")  # kept: the later replays write the same file
         # The dump starts from VRAM as the live renderer left it. Unless the window holds a whole
         # GS frame (its triangles, then the copy to the display buffer), the replay shows the live
         # native pixels again and the comparison is void: such windows are skipped.
@@ -136,6 +144,22 @@ def main():
             x0, y0, x1, y1 = (int(t) for t in a.region.split(","))
             live, r, f, s = live[y0:y1, x0:x1], r[y0:y1, x0:x1], f[y0:y1, x0:x1], s[y0:y1, x0:x1]
         mae, p99, ssim, fog, nfog, sky, nsky = metrics(live, r, f, s)
+        if a.breakdown:
+            # MAE of the live frame against the replay with one feature off: when it is lower than
+            # against the reference, the live frame lacks that feature, by that much.
+            base = float(np.abs(live - r).mean())
+            parts = []
+            for feat in ("mip0", "keep", "nearest", "noblend", "nortt"):
+                fp = f"{dump}.{feat}.ppm"
+                os.replace(replay(a.exe, a.ini, dump, {"EOD_GS_REPLAY_FORCE": feat}), fp)
+                alt = load_rgb(fp)
+                if a.region:
+                    alt = alt[y0:y1, x0:x1]
+                m = np.abs(alt - r).max(axis=2) > 0
+                off = float(np.abs(live - alt).mean())
+                parts.append(f"{feat} {int(m.sum())} px, MAE vs off {off:.2f} ({off - base:+.2f})")
+                bd_tot.setdefault(feat, []).append(off - base)
+            print(f"  vb {v} breakdown (MAE {base:.2f}): " + "; ".join(parts))
         rows.append((v, best[1], mae, p99, ssim, fog, nfog, sky, nsky))
         print(f"vb {v} (live offset {best[1]:+d}): MAE r/g/b {mae[0]:.2f}/{mae[1]:.2f}/{mae[2]:.2f} p99 {p99:.0f} "
               f"SSIM {ssim:.4f} fog {fog:.2f} ({nfog} px) sky {sky:.2f} ({nsky} px)")
@@ -150,6 +174,9 @@ def main():
         ok = m[:, 0].max() <= 1 and m[:, 1].max() <= 8 and m[:, 2].min() >= 0.98 and \
             all(x <= 2 for x in fog) and all(x <= 2 for x in sky)
         print("P3 gate:", "PASS" if ok else "FAIL")
+        if bd_tot:
+            print("breakdown, mean MAE change against the feature-off replay (negative: the live frame "
+                  "lacks it): " + "; ".join(f"{k} {np.mean(x):+.2f}" for k, x in bd_tot.items()))
     if a.csv and rows:
         with open(a.csv, "w") as f:
             f.write("vblank,offset,mae_r,mae_g,mae_b,p99,ssim,fog_mae,fog_px,sky_mae,sky_px\n")

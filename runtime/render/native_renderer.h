@@ -69,6 +69,11 @@ void ee_fog_range(float start, float end, float density);
 void ee_fog_colour(uint32_t rgb);
 void ee_render_flags(uint32_t flags);
 uint64_t fog_fge_draws();             // native draws that had FGE set (retail: 0)
+// Texture LOD and blend state from the decompiled setters (src/native_texstate.cpp, stage R5 A2):
+// TextureSetLodState 0x3652A8 (TEX1.K template *0x4D8BAC in 1/16, MXL *0x4D8BBC), LodBiasSet
+// 0x365308 (*0x4D8BB8: the particle/sprite K delta, both halves), BlendSelect 0x3654E0 (*0x4D8B78).
+void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k);
+void ee_blend_select(uint32_t sel);
 void ee_shadow_begin(int32_t alpha);
 void ee_shadow_opened(bool opened);
 void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword);
@@ -146,6 +151,14 @@ struct Packet {
     // fog in effect when it was queued (0x4D8BC8 bit 3, FOGCOL 0x4D8B80, range 0x4D8B84..8C)
     uint32_t fge, fogcol;
     float fog_range[3];
+    // the rest of the EE render state in effect when it was queued (stage R5 A2): render flags
+    // *0x4D8BC8 (0x365540), blend select *0x4D8B78 (0x3654E0), TEX1 K template *0x4D8BAC and MXL
+    // *0x4D8BBC (0x3652A8), the particle/sprite K delta *0x4D8BB8 (0x365308)
+    uint32_t flags, blend_sel, tex_mxl, bias_k;
+    int32_t tex_k;
+    // 1 / (fov * width / 2) (0x35B3D0 fVar7): the native screen w times this is the VU1 w, i.e.
+    // the GS 1 / Q the texture LOD uses (EOD_NATIVE_QCHECK)
+    float w_scale;
 };
 
 struct Vertex {                // GPU vertex (28 bytes)
@@ -164,6 +177,18 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     bool transient = false;    // one draw's geometry (water, camera-facing parts, posed skins): released after use
     bool posed = false;        // skinned vertices posed with the palette / dents in effect (R3)
     uint32_t bind = 0;         // posed: the bind-pose mesh id (P2 check)
+    // TEX1.K delta of the batch's VU1 runs (stage R5 A2): each program start reads the batch
+    // qword 198 z (mtir vi1, vf13z at VU1 0x03B8 / 0x0DA0 / 0x1600 / 0x1920) and, when it is not
+    // positive, kicks TEX1 with K = template + z + 1000 (iaddiu 0x3E8, iadd, isw.y 21, xgkick 20)
+    int32_t k_delta = 0;       // z + 1000 (1/16 units) of the first run
+    bool k_kick = false;       // the first run kicks TEX1 (z <= 0)
+    bool k_mixed = false;      // later runs have other values: drawn run by run (k_runs)
+    struct KRun {
+        uint32_t first, count;  // index range of the run's triangles
+        int32_t delta;
+        bool kick;
+    };
+    std::vector<KRun> k_runs;  // every VU1 run, when k_mixed
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 };

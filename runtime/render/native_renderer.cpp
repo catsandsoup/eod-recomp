@@ -13,6 +13,8 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <string>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -38,7 +40,14 @@ extern uint32_t g_env_serial;
 
 namespace native {
 namespace {
-std::atomic<uint64_t> g_fge_draws{0};  // native draws with PRIM.FGE set (src/native_fog.cpp)
+std::atomic<uint64_t> g_fge_draws{0};
+std::atomic<uint64_t> g_mip_clamped{0};   // EE TEX1.MXL above the levels the GS state decodes
+std::atomic<uint64_t> g_mip_textures{0};  // textures decoded with mip levels
+std::atomic<uint64_t> g_mip_rt{0};        // lookups whose level n lies in GPU-rendered pages (levels < n used)
+uint64_t g_runk_ok = 0, g_runk_bad = 0;  // EE per-run TEX1.K against the GS K sequence (run_k_check)
+std::atomic<uint64_t> g_afail_second{0};
+std::atomic<uint64_t> g_k_mixed{0};       // batches whose VU1 runs have different K deltas (first used)  // objects drawn with an alpha-test-failed second pass
+std::atomic<uint64_t> g_blend_ad{0};      // ALPHA.C = Ad draws (DST_ALPHA factor: Ad/255, not Ad/128)  // native draws with PRIM.FGE set (src/native_fog.cpp)
 
 // ---- per EE frame counters (the frame a record was queued in) ----
 struct FrameStats {
@@ -47,7 +56,7 @@ struct FrameStats {
     uint32_t empty = 0;       // drawn, but the batch decoded to no triangles
     uint32_t skipped = 0;     // frame skipped by the GS (FrameSkip): nothing drawn, as the GS
     uint32_t lost = 0;        // not drawn: no mesh, no surface or no renderer
-    uint32_t textured = 0, untextured_rt = 0, skinned = 0, posed = 0, flushes = 0;
+    uint32_t textured = 0, untextured_rt = 0, skinned = 0, posed = 0, flushes = 0, mipmapped = 0;
     uint64_t suppressed = 0;  // GS primitives not drawn because they were a native object's
     // by Packet::kind (queue, world, water, shadow, flare)
     uint32_t k_objects[KIND_COUNT] = {}, k_drawn[KIND_COUNT] = {}, k_skipped[KIND_COUNT] = {}, k_lost[KIND_COUNT] = {};
@@ -134,10 +143,18 @@ struct PushConstants {
 };
 static_assert(sizeof(PushConstants) == 128, "push constants");
 enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
-                  M_CFIX = 0x200, M_SPEC = 0x400, M_FGE = 0x800 };
+                  M_CFIX = 0x200, M_SPEC = 0x400, M_FGE = 0x800,
+                  // stage R5 A2: GS texture addressing (TEX0 size, TEX1, CLAMP) and the AFAIL second pass
+                  M_TW_SHIFT = 12, M_TH_SHIFT = 16, M_MXL_SHIFT = 20, M_MMAG = 1u << 23, M_MMIN_SHIFT = 24,
+                  M_WMS_SHIFT = 27, M_WMT_SHIFT = 29, M_FAILED = 1u << 31 };
+// mode.z bits 16..27: TEX1.K (signed 7.4), 28..29: TEX1.L, 30: TEX1.LCM
+enum : uint32_t { Z_K_SHIFT = 16, Z_L_SHIFT = 28, Z_LCM = 1u << 30 };
 
 // blend equations (GS ALPHA a, b, d with C in the shader's second output)
 enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_INV_MIX, B_KEEP, B_COUNT };
+// pipeline key bit 15: generic GS blend (bits 16..17 src factor, 18..19 dst factor, 20..21 op,
+// bit 22 C = destination alpha), see blend_classes
+enum : uint32_t { K_GENERIC = 1u << 15, K_CDST = 1u << 22 };
 
 struct GpuMesh {
     std::unique_ptr<Mesh> cpu;
@@ -149,7 +166,9 @@ struct Texture {
     std::unique_ptr<plume::RenderTexture> tex;
     std::unique_ptr<plume::RenderBuffer> staging;  // until the upload is recorded
     std::unique_ptr<plume::RenderDescriptorSet> sets[8];  // per sampler
-    uint32_t w = 0, h = 0;
+    uint32_t w = 0, h = 0, levels = 1;
+    uint64_t offset[7] = {};  // each level's place in the staging buffer
+    uint64_t bytes = 0;       // staging size (texture_bytes accounting)
     uint64_t key = 0, last_use = 0;
     bool pending_upload = false;
 };
@@ -168,6 +187,8 @@ struct Item {
     uint32_t sampler;
     int32_t sc[4];         // scissor, GS pixels (x0, y0, x1, y1 inclusive)
     GpuMesh *mesh;
+    bool second = false;   // the alpha-test-failed pass of the previous item (not counted again)
+    std::vector<int32_t> run_k;  // TEX1.K per VU1 run (Mesh::k_runs), when they differ
 };
 
 struct Target {
@@ -333,6 +354,24 @@ plume::RenderPipeline *pipeline(uint32_t key) {
     plume::RenderBlendDesc &b = d.renderTargetBlend[0];
     b.blendEnabled = blend != B_OPAQUE;
     b.blendOp = blend == B_REVSUB ? O::REV_SUBTRACT : O::ADD;
+    if (key & K_GENERIC) {
+        // GS (A - B) C + D as src * F(src) op dst * F(dst) (blend_classes): F 0 zero, 1 one, 2 C, 3 1 - C;
+        // C is the shader's second output (As or FIX), or the destination alpha when K_CDST
+        const bool cd = (key & K_CDST) != 0;
+        auto factor = [&](uint32_t f) {
+            switch (f & 3) {
+            case 0: return B::ZERO;
+            case 1: return B::ONE;
+            case 2: return cd ? B::DEST_ALPHA : B::SRC1_ALPHA;
+            default: return cd ? B::INV_DEST_ALPHA : B::INV_SRC1_ALPHA;
+            }
+        };
+        const uint32_t sf = (key >> 16) & 3, df = (key >> 18) & 3, op = (key >> 20) & 3;
+        b.blendEnabled = !(sf == 1 && df == 0 && op == 0);
+        b.srcBlend = factor(sf);
+        b.dstBlend = factor(df);
+        b.blendOp = op == 1 ? O::SUBTRACT : op == 2 ? O::REV_SUBTRACT : O::ADD;
+    } else
     switch (blend) {
     case B_MIX: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::INV_SRC1_ALPHA; break;
     case B_ADD: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
@@ -364,13 +403,30 @@ plume::RenderPipeline *pipeline(uint32_t key) {
 // fields that decide the decoding (block offset, width, format, size, CLUT, TEXA). An address
 // whose pages were not written since it was last looked at reuses its entry without hashing.
 // Render-target textures (pages a GPU surface holds newer than the CPU copy) are not decoded.
-Texture *texture(const gs::Env &e, FrameStats &fs) {
+// `levels`: the mip levels beyond the base the draw's TEX1.MXL selects (stage R5 A2), each read at
+// its MIPTBP address (0x35F9A0 writes MIPTBP1/2 from the level offsets 0x35F278 computes).
+Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels) {
     if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
+    // the GS state decodes levels only as far as its own TEX1 asks (gs_draw.cpp setup_env)
+    const uint32_t decodable = (e.mmin >= 2 && e.mxl > 0) ? (uint32_t)std::min(e.mxl, 6) : 0;
+    if (levels > decodable) {
+        g_mip_clamped.fetch_add(1);
+        levels = decodable;
+    }
     uint32_t first, count;
     gs::page_range(e.tbp, e.tbw, e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
     if (!gs::hw::native_texture_on_cpu(first, count)) {
         fs.untextured_rt++;
         return nullptr;
+    }
+    for (uint32_t l = 1; l <= levels; l++) {
+        uint32_t f2, c2;
+        gs::page_range(e.mip_tbp[l], e.mip_tbw[l], e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+        if (!gs::hw::native_texture_on_cpu(f2, c2)) {  // a level in GPU-rendered pages: the levels above it only
+            g_mip_rt.fetch_add(1);
+            levels = l - 1;
+            break;
+        }
     }
     const bool indexed = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT4 || e.tpsm == gs::PSMT8H ||
                          e.tpsm == gs::PSMT4HL || e.tpsm == gs::PSMT4HH;
@@ -378,12 +434,21 @@ Texture *texture(const gs::Env &e, FrameStats &fs) {
                      indexed ? e.pal_hash : 0,
                      e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
     k[4] = e.tbp;
-    const uint64_t addr_key = XXH3_64bits(k, sizeof k);
+    k[1] |= (uint64_t)levels << 48;
+    uint64_t mk[6] = {};
+    for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = e.mip_tbp[l] | (uint64_t)e.mip_tbw[l] << 32;
+    const uint64_t addr_key = XXH3_64bits(k, sizeof k) ^ (levels ? XXH3_64bits(mk, sizeof mk) : 0);
     AddrEntry &ae = g_r.by_addr[addr_key];
     if (ae.tex) {
         bool ok = true;
         for (uint32_t i = 0; i < count && ok; i++)
             if (gs::g_page_gen[(first + i) % gs::kPages] > ae.stamp) ok = false;
+        for (uint32_t l = 1; l <= levels && ok; l++) {
+            uint32_t f2, c2;
+            gs::page_range(e.mip_tbp[l], e.mip_tbw[l], e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+            for (uint32_t i = 0; i < c2 && ok; i++)
+                if (gs::g_page_gen[(f2 + i) % gs::kPages] > ae.stamp) ok = false;
+        }
         if (ok) {
             ae.tex->last_use = g_r.vb;
             return ae.tex;
@@ -402,18 +467,22 @@ Texture *texture(const gs::Env &e, FrameStats &fs) {
         case gs::PSMT4: bw = 32, bh = 16; break;
         default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
         }
-        for (int y = 0; y < (int)e.th; y += bh)
-            for (int x = 0; x < (int)e.tw; x += bw) {
-                uint32_t byte;
-                switch (e.tpsm) {
-                case gs::PSMCT16: byte = gs::addr16(x, y, e.tbp, e.tbw) * 2; break;
-                case gs::PSMCT16S: byte = gs::addr16s(x, y, e.tbp, e.tbw) * 2; break;
-                case gs::PSMT8: byte = gs::addr8(x, y, e.tbp, e.tbw); break;
-                case gs::PSMT4: byte = gs::addr4(x, y, e.tbp, e.tbw) / 2; break;
-                default: byte = gs::addr32(x, y, e.tbp, e.tbw) * 4; break;
+        for (uint32_t l = 0; l <= levels; l++) {
+            const uint32_t bp = e.mip_tbp[l], bwid = e.mip_tbw[l];
+            const int lw = std::max(1, (int)e.tw >> l), lh = std::max(1, (int)e.th >> l);
+            for (int y = 0; y < lh; y += bh)
+                for (int x = 0; x < lw; x += bw) {
+                    uint32_t byte;
+                    switch (e.tpsm) {
+                    case gs::PSMCT16: byte = gs::addr16(x, y, bp, bwid) * 2; break;
+                    case gs::PSMCT16S: byte = gs::addr16s(x, y, bp, bwid) * 2; break;
+                    case gs::PSMT8: byte = gs::addr8(x, y, bp, bwid); break;
+                    case gs::PSMT4: byte = gs::addr4(x, y, bp, bwid) / 2; break;
+                    default: byte = gs::addr32(x, y, bp, bwid) * 4; break;
+                    }
+                    XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
                 }
-                XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
-            }
+        }
     }
     const uint64_t key = XXH3_64bits_digest(st);
     ae.stamp = gs::g_vram_clock;
@@ -430,18 +499,30 @@ Texture *texture(const gs::Env &e, FrameStats &fs) {
     t.last_use = g_r.vb;
     t.w = e.tw;
     t.h = e.th;
-    const uint32_t row = (t.w * 4 + 255) & ~255u;
-    t.staging = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer((uint64_t)row * t.h));
+    t.levels = levels + 1;
+    uint64_t total = 0;
+    for (uint32_t l = 0; l < t.levels; l++) {
+        const uint32_t lw = std::max(1u, t.w >> l), lh = std::max(1u, t.h >> l);
+        t.offset[l] = total;
+        total += (uint64_t)((lw * 4 + 255) & ~255u) * lh;
+        total = (total + 511) & ~511ull;  // placed-footprint offsets
+    }
+    t.staging = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(total));
     auto *dst = static_cast<uint8_t *>(t.staging->map());
-    for (uint32_t v = 0; v < t.h; v++) {
-        uint32_t *line = reinterpret_cast<uint32_t *>(dst + (size_t)v * row);
-        for (uint32_t u = 0; u < t.w; u++) line[u] = gs::tex_fetch(e, (int)u, (int)v, 0);
+    for (uint32_t l = 0; l < t.levels; l++) {
+        const uint32_t lw = std::max(1u, t.w >> l), lh = std::max(1u, t.h >> l), row = (lw * 4 + 255) & ~255u;
+        for (uint32_t v = 0; v < lh; v++) {
+            uint32_t *line = reinterpret_cast<uint32_t *>(dst + t.offset[l] + (size_t)v * row);
+            for (uint32_t u = 0; u < lw; u++) line[u] = gs::tex_fetch(e, (int)u, (int)v, (int)l);
+        }
     }
     t.staging->unmap();
-    t.tex = g_r.dev->createTexture(plume::RenderTextureDesc::Texture2D(t.w, t.h, 1, plume::RenderFormat::R8G8B8A8_UNORM));
+    t.tex = g_r.dev->createTexture(plume::RenderTextureDesc::Texture2D(t.w, t.h, t.levels, plume::RenderFormat::R8G8B8A8_UNORM));
     t.pending_upload = true;
     g_r.uploads.push_back(&t);
-    g_r.texture_bytes += (uint64_t)t.w * t.h * 4;
+    g_r.texture_bytes += total;
+    t.bytes = total;
+    if (levels) g_mip_textures.fetch_add(1);
     g_r.decoded++;
     return &t;
 }
@@ -459,7 +540,7 @@ void evict_textures() {
             tr.tex = std::move(t->tex);
             for (int i = 0; i < 8; i++) tr.sets[i] = std::move(t->sets[i]);
             g_r.trash.push_back(std::move(tr));
-            g_r.texture_bytes -= (uint64_t)t->w * t->h * 4;
+            g_r.texture_bytes -= t->bytes;
             it = g_r.textures.erase(it);
         } else {
             ++it;
@@ -471,10 +552,12 @@ void record_uploads(plume::RenderCommandList *cl) {
     for (Texture *t : g_r.uploads) {
         if (!t->pending_upload || !t->tex) continue;
         cl->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(t->tex.get(), plume::RenderTextureLayout::COPY_DEST));
-        const uint32_t row = (t->w * 4 + 255) & ~255u;
-        cl->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(t->tex.get()),
-                              plume::RenderTextureCopyLocation::PlacedFootprint(t->staging.get(), plume::RenderFormat::R8G8B8A8_UNORM,
-                                                                                t->w, t->h, 1, row / 4));
+        for (uint32_t l = 0; l < t->levels; l++) {
+            const uint32_t lw = std::max(1u, t->w >> l), lh = std::max(1u, t->h >> l), row = (lw * 4 + 255) & ~255u;
+            cl->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(t->tex.get(), l),
+                                  plume::RenderTextureCopyLocation::PlacedFootprint(t->staging.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                                                                                    lw, lh, 1, row / 4, t->offset[l]));
+        }
         cl->barriers(plume::RenderBarrierStage::GRAPHICS,
                      plume::RenderTextureBarrier(t->tex.get(), plume::RenderTextureLayout::SHADER_READ));
         t->pending_upload = false;
@@ -704,7 +787,7 @@ void flush_shadows() {
         // M_TME | M_TCC | TFX=0(modulate) | M_ATE | ATST=6(GREATER) | M_AFAIL_DISCARD | M_CFIX
         cpc.mode[0] = M_TME | M_TCC | M_ATE | (6u << M_ATST_SHIFT) | M_AFAIL_DISCARD | M_CFIX;
         cpc.mode[1] = 0;  // aref = 0 (discard when shadow_mask.a == 0)
-        cpc.mode[2] = intensity & 0xFFu;
+        cpc.mode[2] = (intensity & 0xFFu) | 0x80000000u;  // the sampler (nearest + clamp), not the GS texture unit
         cl->setGraphicsPushConstants(0, &cpc, 0, sizeof cpc);
         const int32_t x0 = std::max(0, comp_sc[0]) * sc, y0 = std::max(0, comp_sc[1]) * sc;
         const int32_t x1 = std::min((int32_t)gw, comp_sc[2] + 1) * sc, y1 = std::min((int32_t)gh, comp_sc[3] + 1) * sc;
@@ -763,6 +846,7 @@ void flush() {
     for (Item &it : g_r.pending) {
         FrameStats &fs = g_frames[it.p.frame];
         if (!it.mesh || !it.mesh->buf) {
+            if (it.second) continue;
             fs.drawn++;
             fs.k_drawn[it.p.kind % KIND_COUNT]++;
             fs.empty++;
@@ -772,11 +856,13 @@ void flush() {
         // GS screen -> this surface's clip space (the backend's convention: ndc = (p + 0.5) * 2 / size - 1)
         PushConstants &pc = it.pc;
         const double kx = (0.5 - it.ox) * 2.0 / gw - 1.0, ky = (0.5 - it.oy) * 2.0 / gh - 1.0;
+        // clip = screen * w_scale (a uniform scale draws the same pixels): clip w is the VU1 w, 1 / GS Q
+        const double ws = it.p.w_scale > 0 ? (double)it.p.w_scale : 1.0;
         for (int c = 0; c < 4; c++) {
-            pc.cx[c] = (float)(it.a[0][c] * 2.0 / gw + it.a[3][c] * kx);
-            pc.cy[c] = (float)(it.a[1][c] * 2.0 / gh + it.a[3][c] * ky);
-            pc.cz[c] = (float)(it.a[2][c] * it.zscale);
-            pc.cw[c] = (float)it.a[3][c];
+            pc.cx[c] = (float)((it.a[0][c] * 2.0 / gw + it.a[3][c] * kx) * ws);
+            pc.cy[c] = (float)((it.a[1][c] * 2.0 / gh + it.a[3][c] * ky) * ws);
+            pc.cz[c] = (float)(it.a[2][c] * it.zscale * ws);
+            pc.cw[c] = (float)(it.a[3][c] * ws);
         }
         if (it.pipeline != bound) {
             cl->setPipeline(pipeline(it.pipeline));
@@ -795,7 +881,20 @@ void flush() {
         const plume::RenderIndexBufferView ibv(m.buf->at(m.index_offset), (uint32_t)(m.cpu->indices.size() * 4),
                                                plume::RenderFormat::R32_UINT);
         cl->setIndexBuffer(&ibv);
-        cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+        static const bool no_runs = std::getenv("EOD_R5A2_OFF") && (std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) & 8);
+        if (!no_runs && !it.run_k.empty() && it.run_k.size() == m.cpu->k_runs.size()) {
+            // one draw per VU1 run: each has its own TEX1.K
+            for (size_t r = 0; r < it.run_k.size(); r++) {
+                const Mesh::KRun &kr = m.cpu->k_runs[r];
+                if (kr.first + kr.count > m.cpu->indices.size()) break;
+                pc.mode[2] = (pc.mode[2] & ~(0xFFFu << Z_K_SHIFT)) | ((uint32_t)it.run_k[r] & 0xFFF) << Z_K_SHIFT;
+                cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
+                cl->drawIndexedInstanced(kr.count, 1, kr.first, 0, 0);
+            }
+        } else {
+            cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+        }
+        if (it.second) continue;
         fs.drawn++;
         fs.k_drawn[it.p.kind % KIND_COUNT]++;
         if (it.p.kind == KIND_WATER) water_view_drawn(m.cpu->indices.size() / 3, it.sc, it.ox, it.oy);
@@ -812,6 +911,35 @@ void flush() {
     g_r.pending.clear();
 }
 
+// GS ALPHA (A - B) * C + D, A/B/D in {Cs, Cd, 0} and C in {As, Ad, FIX}, as fixed-function blending
+// (pipeline key K_GENERIC): each colour's coefficient is k + j*C with k in {0, 1}, j in {-1, 0, 1}.
+// Coefficients 1 + C cannot be expressed (counted, drawn as 1); two negative coefficients give 0
+// (COLCLAMP = 1 clamps the GS result the same way).
+std::atomic<uint64_t> g_blend_approx{0};
+uint32_t blend_classes(bool abe, int a, int b, int c, int d) {
+    if (!abe) return K_GENERIC | 1u << 16;  // src * 1 + dst * 0
+    enum { ZERO, ONE, C, INV_C, NEG_C, ONE_PLUS_C };
+    auto cls = [](int k, int j) {
+        if (j == 0) return k ? ONE : ZERO;
+        if (j > 0) return k ? ONE_PLUS_C : C;
+        return k ? INV_C : NEG_C;
+    };
+    const int src = cls(d == 0, (a == 0) - (b == 0)), dst = cls(d == 1, (a == 1) - (b == 1));
+    uint32_t sf, df, op = 0;
+    auto f = [&](int x) -> uint32_t {
+        if (x == ONE_PLUS_C) {
+            g_blend_approx.fetch_add(1);
+            return 1;
+        }
+        return x == ZERO ? 0 : x == ONE ? 1 : x == INV_C ? 3 : 2;
+    };
+    if (src == NEG_C && dst == NEG_C) sf = 0, df = 0;
+    else if (src == NEG_C) sf = 2, df = f(dst), op = 2;  // dst * F - src * C
+    else if (dst == NEG_C) sf = f(src), df = 2, op = 1;  // src * F - dst * C
+    else sf = f(src), df = f(dst);
+    return K_GENERIC | sf << 16 | df << 18 | op << 20 | (c == 1 ? K_CDST : 0u);
+}
+
 uint32_t blend_of(const gs::Env &e) {
     if (!e.abe) return B_OPAQUE;
     const int a = e.ba, b = e.bb, d = e.bd;  // 0 Cs, 1 Cd, 2 zero
@@ -823,6 +951,184 @@ uint32_t blend_of(const gs::Env &e) {
     if (a == 1 && b == 2 && d == 0) return B_DST_ADD;
     if (a == 1 && b == 0 && d == 0) return B_INV_MIX;
     return B_OPAQUE;
+}
+
+// The GS state RenderStateCommit 0x3620A8 builds from the EE state each packet carries (the
+// decompiled setters' values, docs/NATIVE_RENDERER.md "Stage R5" A2 table). Frame and depth buffer
+// surfaces and the scissor stay those of the object's first GS draw (stage R1).
+struct EeState {
+    bool ate = false;
+    int atst = 1, afail = 0;
+    uint32_t aref = 0;
+    int ztst = 1;
+    bool zwrite = false;
+    bool abe = false;
+    int ba = 0, bb = 1, bc = 0, bd = 1;
+    uint32_t fix = 0;
+    int wms = 0, wmt = 0;
+    int32_t k = 0;   // TEX1.K, 1/16 (12-bit signed)
+    uint32_t mxl = 0;
+    bool mmag = true;
+    int mmin = 4;
+    bool k_known = true;  // false: the batch does not kick TEX1 and no earlier object set it
+};
+
+int32_t sext12(int32_t v) { return (int32_t)((uint32_t)v << 20) >> 20; }
+
+EeState g_last_tex1;  // the TEX1 the last kick left in the GS (a batch with z > 0 does not kick)
+bool g_have_tex1 = false;
+
+EeState ee_state(const Packet &p, const Mesh *cpu) {
+    EeState r;
+    const uint32_t f = p.flags;
+    // 0x3620A8 dirty 0x30: CLAMP_1 = !(flags & 0x10) | !(flags & 0x20) << 2 (REPEAT / CLAMP, bounds 0)
+    r.wms = ((f >> 4) ^ 1) & 1;
+    r.wmt = ((f >> 5) ^ 1) & 1;
+    // dirty 0x241: TEST_1 = ztst << 17 | (flags & 0x200 ? (flags & 1 ? 0x1160B : 0x10000) : 0x12001)
+    r.ztst = (f & 0x40) ? 2 : 1;
+    if (!(f & 0x200)) r.ate = true, r.atst = 0, r.aref = 0, r.afail = 2;   // 0x12001: depth only
+    else if (f & 1) r.ate = true, r.atst = 5, r.aref = 0x60, r.afail = 1;  // 0x1160B
+    // dirty 0x80: ZBUF_1.ZMSK = !(flags & 0x80)
+    r.zwrite = (f & 0x80) != 0;
+    // PRIM.ABE = flags & 1 (GIFtag templates, dirty 0x109)
+    r.abe = (f & 1) != 0;
+    // dirty 0x80000: ALPHA_1 = sel ? 0x44 (Cs, Cd, As, Cd) : 0x48 (Cs, 0, As, Cd), FIX 0
+    r.ba = 0, r.bb = p.blend_sel ? 1 : 2, r.bc = 0, r.bd = 1, r.fix = 0;
+    // dirty 0x400: TEX1 = (K & 0xFFF) << 32 | 0x120 | (MXL & 7) << 2 -> VU1 qwords 20-22
+    // (MMAG 1, MMIN 4 = LINEAR_MIPMAP_NEAREST, L 0, LCM 0); the batch program adds its delta
+    r.mmag = true;
+    r.mmin = 4;
+    const uint32_t kind = p.kind % KIND_COUNT;
+    if (kind == KIND_QUEUE || kind == KIND_WORLD) {
+        if (cpu && cpu->k_kick) {
+            r.k = sext12((p.tex_k & 0xFFF) + cpu->k_delta);
+            r.mxl = p.tex_mxl & 7;
+        } else if (g_have_tex1) {  // no kick: the GS keeps the last TEX1
+            r.k = g_last_tex1.k;
+            r.mxl = g_last_tex1.mxl;
+        } else {
+            r.k_known = false;
+        }
+        if (r.k_known) {
+            g_last_tex1 = r;
+            g_have_tex1 = true;
+        }
+        if (cpu && cpu->k_mixed) {
+            g_k_mixed.fetch_add(1);
+            // each run kicks its own TEX1 (or keeps the one before): the GS state after the object
+            for (const Mesh::KRun &kr : cpu->k_runs)
+                if (kr.kick) {
+                    g_last_tex1.k = sext12((p.tex_k & 0xFFF) + kr.delta);
+                    g_last_tex1.mxl = p.tex_mxl & 7;
+                    g_have_tex1 = true;
+                }
+        }
+    } else {
+        // the particle / sprite / immediate headers carry *0x4D8BB8 = (int)(bias * 16 - 1000)
+        // (0x364068, 0x364328, 0x3645B8, 0x361468, 0x361708, 0x364D18). Immediate geometry and
+        // flares: K = template + word + 1000 (the batch programs' encoding, i.e. + bias * 16);
+        // particles and sprites: K = template + word (no + 1000, so their level is always 0). Both
+        // equal the GS TEX1 in every draw measured (docs/NATIVE_RENDERER.md "Stage R5" A2).
+        const int32_t word = (int16_t)(uint16_t)(p.bias_k & 0xFFFF);
+        r.k = sext12((p.tex_k & 0xFFF) + word + (kind == KIND_PARTICLE || kind == KIND_SPRITE ? 0 : 1000));
+        r.mxl = p.tex_mxl & 7;
+    }
+    return r;
+}
+
+// EE state against the GS registers of the object's first draw (diagnostic only: nothing drawn
+// depends on it). Mismatches per kind: test, blend, clamp, z, K, MXL.
+uint64_t g_st_n[KIND_COUNT], g_st_mis[KIND_COUNT][6];
+std::mutex g_st_mutex;
+void compare_state(const EeState &r, const gs::Env &e, uint32_t kind) {
+    std::lock_guard<std::mutex> lk(g_st_mutex);
+    g_st_n[kind]++;
+    const bool ate = e.ate && e.atst != 1;
+    if (ate != (r.ate && r.atst != 1) || (ate && (e.atst != r.atst || e.aref != r.aref || e.afail != r.afail)))
+        g_st_mis[kind][0]++;
+    if (e.abe != r.abe || (e.abe && (e.ba != r.ba || e.bb != r.bb || e.bc != r.bc || e.bd != r.bd)))
+        g_st_mis[kind][1]++;
+    if (e.tme && (e.wms != r.wms || e.wmt != r.wmt)) g_st_mis[kind][2]++;
+    if (e.ztst != r.ztst || (!e.zmsk) != r.zwrite) g_st_mis[kind][3]++;
+    if (e.tme && e.mmin >= 2 && (int32_t)std::lround(e.k * 16.0f) != r.k) {
+        if (g_st_mis[kind][4]++ < 3)
+            std::fprintf(stderr, "[native] K mismatch kind %u: GS %d EE %d\n", kind, (int)std::lround(e.k * 16.0f), r.k);
+    }
+    if (e.tme && (e.mmin != r.mmin || e.bilinear_mag != r.mmag || (uint32_t)e.mxl != r.mxl)) g_st_mis[kind][5]++;
+}
+
+void state_report() {
+    static const char *names[KIND_COUNT] = {"queue", "world", "water", "shadow", "flare", "particle", "sprite", "immediate", "cockpit"};
+    std::lock_guard<std::mutex> lk(g_st_mutex);
+    for (uint32_t k = 0; k < KIND_COUNT; k++) {
+        if (!g_st_n[k]) continue;
+        std::fprintf(stderr, "[native] EE state vs GS %s: %llu objects, mismatches test %llu blend %llu clamp %llu z %llu K %llu MXL/filter %llu\n",
+                     names[k], (unsigned long long)g_st_n[k], (unsigned long long)g_st_mis[k][0], (unsigned long long)g_st_mis[k][1],
+                     (unsigned long long)g_st_mis[k][2], (unsigned long long)g_st_mis[k][3], (unsigned long long)g_st_mis[k][4],
+                     (unsigned long long)g_st_mis[k][5]);
+    }
+    std::fprintf(stderr, "[native] run K check: %llu objects match the GS K sequence, %llu do not\n",
+                 (unsigned long long)g_runk_ok, (unsigned long long)g_runk_bad);
+    std::fprintf(stderr, "[native] R5 A2: mip textures %llu (MXL clamped %llu, level in rendered pages %llu), alpha-fail second passes %llu, K mixed batches %llu, blend 1+C approximated %llu, Ad blends %llu\n",
+                 (unsigned long long)g_mip_textures.load(), (unsigned long long)g_mip_clamped.load(), (unsigned long long)g_mip_rt.load(),
+                 (unsigned long long)g_afail_second.load(), (unsigned long long)g_k_mixed.load(),
+                 (unsigned long long)g_blend_approx.load(), (unsigned long long)g_blend_ad.load());
+}
+
+// EOD_NATIVE_QCHECK=1 (diagnostic): the GS Q of an object's first textured vertex against 1 / w of
+// the native vertex nearest to it on screen (the LOD uses log2(1 / Q)); printed at exit.
+std::vector<double> g_qratio;
+std::vector<int32_t> g_gs_k;  // distinct consecutive GS TEX1.K values of the current object's draws
+// the GS K sequence is a subsequence of the per-run K the native object uses
+void run_k_check(const std::vector<int32_t> &run_k) {
+    size_t j = 0;
+    for (size_t i = 0; i < run_k.size() && j < g_gs_k.size(); i++)
+        if (run_k[i] == g_gs_k[j]) j++;
+    if (j == g_gs_k.size()) {
+        g_runk_ok++;
+        return;
+    }
+    if (g_runk_bad++ < 4) {
+        std::string a, b;
+        for (int32_t k : run_k) a += " " + std::to_string(k);
+        for (int32_t k : g_gs_k) b += " " + std::to_string(k);
+        std::fprintf(stderr, "[native] run K mismatch: native%s | GS%s\n", a.c_str(), b.c_str());
+    }
+}
+void q_check(const gs::Env &e, const gs::Vertex &v) {
+    static const bool on = std::getenv("EOD_NATIVE_QCHECK") != nullptr;
+    if (!on || !e.tme || e.fst || g_qratio.size() >= 20000) return;
+    if (g_cur.kind != KIND_QUEUE && g_cur.kind != KIND_WORLD) return;
+    auto it = g_r.meshes.find(g_cur.mesh);
+    if (it == g_r.meshes.end() || !it->second.cpu || !(v.q > 0)) return;
+    static const bool hooked = (diff_add_exit_report([] {
+        if (g_qratio.empty()) return;
+        std::sort(g_qratio.begin(), g_qratio.end());
+        const size_t n = g_qratio.size();
+        std::fprintf(stderr, "[native] Q check: %zu vertices, (1/Q) / (w w_scale) p5 %.4f median %.4f p95 %.4f\n", n,
+                     g_qratio[n / 20], g_qratio[n / 2], g_qratio[n - 1 - n / 20]);
+    }), true);
+    (void)hooked;
+    double a[4][4];
+    screen_matrix(g_cur, a);
+    const double xo = (double)(g_xyoffset & 0xFFFF), yo = (double)((g_xyoffset >> 32) & 0xFFFF);
+    double best = 1e30, bw = 0;
+    for (const Vertex &mv : it->second.cpu->vertices) {
+        double sc[4];
+        for (int r = 0; r < 4; r++) sc[r] = a[r][0] * mv.p[0] + a[r][1] * mv.p[1] + a[r][2] * mv.p[2] + a[r][3];
+        if (!(sc[3] > 0)) continue;
+        const double dx = sc[0] / sc[3] * 16.0 - xo - v.x, dy = sc[1] / sc[3] * 16.0 - yo - v.y;
+        const double d = dx * dx + dy * dy;
+        if (d < best) best = d, bw = sc[3];
+    }
+    if (best < 4.0 && bw > 0) {
+        g_qratio.push_back((1.0 / v.q) / (bw * (double)g_cur.w_scale));
+        static int shown = 0;
+        if (shown++ < 4)
+            std::fprintf(stderr, "[native] Q check sample: ratio %.7f near %.5f far %.3f fov %.6f vp %.1f x %.1f aspect %.5f fw %.4f\n",
+                         (1.0 / v.q) / bw, g_cur.near_z, g_cur.far_z, g_cur.fov_scale, g_cur.viewport[2], g_cur.viewport[3],
+                         g_cur.aspect, g_cur.fov_scale * g_cur.viewport[2] * 0.5);
+    }
 }
 
 // The current object is complete: queue it with the GS state it had.
@@ -884,7 +1190,20 @@ void finalize() {
         return;
     }
     if (!g_r.shadow_pending.empty()) flush_shadows();
-    const bool zwrite = !e.zmsk && e.ztst != 0, ztest = e.ztst >= 2;
+    static const bool state_hooked = (diff_add_exit_report(state_report), true);
+    (void)state_hooked;
+    const EeState rs = ee_state(g_cur, mesh ? mesh->cpu.get() : nullptr);
+    if (mesh && mesh->cpu->k_mixed && !mesh->cpu->k_runs.empty() && !g_gs_k.empty()) {
+        std::vector<int32_t> rk;
+        int32_t k = rs.k;
+        for (const Mesh::KRun &kr : mesh->cpu->k_runs) {
+            if (kr.kick) k = sext12((g_cur.tex_k & 0xFFF) + kr.delta);
+            rk.push_back(k);
+        }
+        run_k_check(rk);
+    }
+    compare_state(rs, e, kind);
+    const bool zwrite = rs.zwrite, ztest = rs.ztst >= 2;
     Target tg{e.fbp, e.fbw, e.fpsm_mem, e.zbp, e.zpsm, (uint32_t)e.scy1 + 1, zwrite || ztest};
     if (!g_r.pending.empty() && !(tg == g_r.target)) flush();
     g_r.target = tg;
@@ -925,20 +1244,34 @@ void finalize() {
         const float hz = (float)(h[2] * k);
         std::memcpy(&pc.mode[3], &hz, 4);
     }
-    it.tex = texture(e, fs);
+    static const uint32_t ab = std::getenv("EOD_R5A2_OFF") ? (uint32_t)std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) : 0u;
+    it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0);
     uint32_t m = 0;
     if (it.tex) {
+        // TEX0 TCC/TFX as the texture manager's TEX0 (0x35F9A0) left them; size from the decoded texture
         m |= M_TME | (e.tcc ? M_TCC : 0) | (uint32_t)(e.tfx & 3) << M_TFX_SHIFT;
-        it.sampler = (e.bilinear_mag ? 1u : 0u) | (e.wms != 0 ? 2u : 0u) | (e.wmt != 0 ? 4u : 0u);
+        uint32_t lw = 0, lh = 0;
+        while ((1u << lw) < it.tex->w) lw++;
+        while ((1u << lh) < it.tex->h) lh++;
+        m |= lw << M_TW_SHIFT | lh << M_TH_SHIFT | (it.tex->levels - 1) << M_MXL_SHIFT | (rs.mmag ? M_MMAG : 0) |
+             (uint32_t)rs.mmin << M_MMIN_SHIFT | (uint32_t)rs.wms << M_WMS_SHIFT | (uint32_t)rs.wmt << M_WMT_SHIFT;
+        it.sampler = 0;  // the shader addresses and filters the texels itself (GS bilinear, 4-bit weights)
+        if (ab & 4) it.sampler = (e.bilinear_mag ? 1u : 0u) | (e.wms != 0 ? 2u : 0u) | (e.wmt != 0 ? 4u : 0u);
+        if (it.tex->levels > 1) fs.mipmapped++;
     }
-    if (e.ate) {
-        m |= M_ATE | (uint32_t)(e.atst & 7) << M_ATST_SHIFT;
-        if (e.afail == 0 || e.afail == 2) m |= M_AFAIL_DISCARD;
-    }
-    if (e.bc == 2) m |= M_CFIX;
+    if (rs.ate) m |= M_ATE | (uint32_t)(rs.atst & 7) << M_ATST_SHIFT | M_AFAIL_DISCARD;
+    if (rs.bc == 2) m |= M_CFIX;
     if (g_cur.program == 0x2E0) m |= M_SPEC;  // car bodies: vertex alpha is the highlight
-    pc.mode[1] = e.aref & 0xFF;
-    pc.mode[2] = e.bfix & 0xFF;
+    pc.mode[1] = rs.aref & 0xFF;
+    pc.mode[2] = (rs.fix & 0xFF) | ((uint32_t)rs.k & 0xFFF) << Z_K_SHIFT | ((ab & 4) ? 0x80000000u : 0u);
+    if (it.tex && it.tex->levels > 1 && mesh && mesh->cpu->k_mixed && !mesh->cpu->k_runs.empty() &&
+        (kind == KIND_QUEUE || kind == KIND_WORLD)) {
+        int32_t k = rs.k;
+        for (const Mesh::KRun &kr : mesh->cpu->k_runs) {
+            if (kr.kick) k = sext12((g_cur.tex_k & 0xFFF) + kr.delta);
+            it.run_k.push_back(k);
+        }
+    }
     if (g_cur.fge) {
         // GS PRIM.FGE from the render flags (0x365540 -> 0x4D8BC8 bit 3). No retail path sets it
         // (docs/NATIVE_RENDERER.md "Stage R5"), and VU1's XYZF2 w word is not a fog coefficient, so
@@ -958,9 +1291,45 @@ void finalize() {
         const uint32_t bits = 0xFFu << (ch * 8);
         if ((full & bits) && (e.fbmsk & bits) != bits) mask |= 1u << ch;
     }
-    it.pipeline = blend_of(e) | zf << 4 | (zwrite ? 1u : 0u) << 6 | (tg.depth ? 1u : 0u) << 7 | mask << 8;
+    const uint32_t blend = blend_classes(rs.abe, rs.ba, rs.bb, rs.bc, rs.bd);
+    if (rs.bc == 1) g_blend_ad.fetch_add(1);
+    it.pipeline = blend | zf << 4 | (zwrite ? 1u : 0u) << 6 | (tg.depth ? 1u : 0u) << 7 | mask << 8;
     it.sc[0] = e.scx0, it.sc[1] = e.scy0, it.sc[2] = e.scx1, it.sc[3] = e.scy1;
-    g_r.pending.push_back(it);
+    // Alpha test (TEST.ATE/ATST/AREF/AFAIL): the pixels that pass are drawn as the state says; the
+    // ones that fail write what AFAIL keeps (FB_ONLY: colour, ZB_ONLY: depth, RGB_ONLY: RGB), drawn
+    // as a second pass over the same object with the test inverted.
+    if (ab & 2) {  // A/B: R4 alpha test (KEEP / ZB_ONLY discard, FB_ONLY / RGB_ONLY drawn as pass)
+        if (rs.afail == 1 || rs.afail == 3) it.pc.mode[0] &= ~M_AFAIL_DISCARD;
+        g_r.pending.push_back(it);
+        return;
+    }
+    if (!rs.ate || rs.atst == 1) {
+        it.pc.mode[0] &= ~(M_ATE | M_AFAIL_DISCARD);
+        g_r.pending.push_back(it);
+        return;
+    }
+    uint32_t fail_mask = 0;
+    bool fail_z = false;
+    switch (rs.afail) {
+    case 1: fail_mask = mask; break;                    // FB_ONLY
+    case 2: fail_z = zwrite; break;                     // ZB_ONLY
+    case 3: fail_mask = mask & 7u; break;               // RGB_ONLY
+    default: break;                                     // KEEP
+    }
+    if (rs.afail == 1 && !zwrite) {  // the failing pixels write what the passing ones do: one pass
+        it.pc.mode[0] &= ~(M_ATE | M_AFAIL_DISCARD);
+        g_r.pending.push_back(it);
+        return;
+    }
+    if (rs.atst != 0) g_r.pending.push_back(it);  // NEVER: no pixel passes
+    if (fail_mask || fail_z) {
+        Item f = it;
+        f.second = true;
+        f.pc.mode[0] |= M_FAILED;
+        f.pipeline = (it.pipeline & ~(0x40u | 0xF00u)) | (fail_z ? 0x40u : 0u) | fail_mask << 8;
+        g_r.pending.push_back(f);
+        g_afail_second.fetch_add(1);
+    }
 }
 
 void end_vblank(uint64_t vb) {
@@ -1303,6 +1672,7 @@ void begin_object(const Packet &p) {
     g_active = true;
     g_finalized = false;
     g_have_env = false;
+    g_gs_k.clear();
     g_frames[p.frame].objects++;
     g_frames[p.frame].k_objects[p.kind % KIND_COUNT]++;
     g_newest_frame = std::max(g_newest_frame, p.frame);
@@ -1533,6 +1903,9 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
         g_env = e;
         g_xyoffset = context_xyoffset();
         g_have_env = true;
+#ifdef EOD_PLUME
+        q_check(e, v);
+#endif
     }
 #ifdef EOD_PLUME
     if (vertex_check_on()) {
@@ -1558,6 +1931,10 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
         prims++;
     }
     g_frames[g_cur.frame].suppressed++;
+    if (e.tme && e.mmin >= 2) {  // the TEX1.K sequence the GS sees within the object (run check)
+        const int32_t k = (int32_t)std::lround(e.k * 16.0f);
+        if (g_gs_k.empty() || g_gs_k.back() != k) g_gs_k.push_back(k);
+    }
     return true;
 }
 

@@ -419,6 +419,15 @@ void setup_env(uint32_t attr) {
     e.mip_tbw[5] = bits(c.miptbp2, 34, 6);
     e.mip_tbp[6] = bits(c.miptbp2, 40, 14);
     e.mip_tbw[6] = bits(c.miptbp2, 54, 6);
+    // EOD_GS_REPLAY_FORCE=mip0|keep|nearest|noblend (replay only): P3 breakdown masks, the pixels
+    // that change when one GS feature is turned off (tools/p3_compare.py --breakdown)
+    if (g_replaying) {
+        static const char *force = getenv("EOD_GS_REPLAY_FORCE");
+        if (force && e.tme && !strcmp(force, "mip0")) e.mxl = 0;
+        if (force && e.ate && !strcmp(force, "keep")) e.afail = 0;
+        if (force && e.tme && !strcmp(force, "nearest")) e.bilinear_mag = e.bilinear_min = false, e.mmin = 0;
+        if (force && !strcmp(force, "noblend") && !e.fst) e.abe = false;
+    }
     e.scx0 = (int)bits(c.scissor, 0, 11);
     e.scx1 = (int)bits(c.scissor, 16, 11);
     e.scy0 = (int)bits(c.scissor, 32, 11);
@@ -447,6 +456,12 @@ void setup_env(uint32_t attr) {
     e.z16 = e.zpsm == PSMZ16 || e.zpsm == PSMZ16S;
     uint32_t full = e.fpsm == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.write_none = ((e.fbmsk & full) == full && e.zmsk) || e.ztst == 0;
+    // EOD_GS_REPLAY_FORCE=nortt: drop the textured sprites that copy another frame buffer into this
+    // one (the projected shadow composite): its P3 breakdown mask
+    if (g_replaying && e.tme && e.fst && e.fbp != bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32) {
+        static const char *force = getenv("EOD_GS_REPLAY_FORCE");
+        if (force && !strcmp(force, "nortt")) e.write_none = true;
+    }
     e.zmax = e.z16 ? 0xFFFFu : e.zpsm == PSMZ24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.blend_kind = (e.ba == 0 && e.bb == 1 && e.bd == 1) ? BL_MIX : (e.ba == 0 && e.bb == 2 && e.bd == 1) ? BL_ADD
                                                                                                     : BL_GENERIC;
@@ -562,12 +577,13 @@ void draw(const Env &e, const char *prim, uint64_t area) {
     char k[512];
     snprintf(k, sizeof k,
              "draw %s fb=%x/%d/%x msk=%x z=%x/%x zt=%d zm=%d ate=%d/%d/%x/%d date=%d/%d abe=%d %d%d%d%d fix=%x pabe=%d "
-             "clamp=%d fba=%d tme=%d tex=%x/%x cpsm=%x tfx=%d tcc=%d wrap=%d%d mag=%d min=%d mxl=%d fge=%d iip=%d fst=%d",
+             "clamp=%d fba=%d tme=%d tex=%x/%x cpsm=%x tfx=%d tcc=%d wrap=%d%d mag=%d min=%d mxl=%d lcm=%d l=%d k=%.4g fge=%d iip=%d fst=%d",
              prim, e.fbp, e.fbw, e.fpsm_mem, e.fbmsk, e.zbp, e.zpsm, e.ztst, (int)e.zmsk, (int)e.ate, e.atst, e.aref,
              e.afail, (int)e.date, (int)e.datm, (int)e.abe, e.ba, e.bb, e.bc, e.bd, e.bfix, (int)e.pabe,
              (int)e.colclamp, (int)e.fba, (int)e.tme, e.tme ? e.tbp : 0, e.tme ? e.tpsm : 0, e.tme ? e.cpsm : 0,
              e.tme ? e.tfx : 0, e.tme ? (int)e.tcc : 0, e.tme ? e.wms : 0, e.tme ? e.wmt : 0,
-             e.tme ? (int)e.bilinear_mag : 0, e.tme ? e.mmin : 0, e.tme ? e.mxl : 0, (int)e.fge, (int)e.iip,
+             e.tme ? (int)e.bilinear_mag : 0, e.tme ? e.mmin : 0, e.tme ? e.mxl : 0, e.tme ? e.lcm : 0, e.tme ? e.l : 0,
+             e.tme ? e.k : 0.0f, (int)e.fge, (int)e.iip,
              (int)e.fst);
     std::string key = k;
     add(key, 1);

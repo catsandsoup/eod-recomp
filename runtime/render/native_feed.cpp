@@ -88,8 +88,18 @@ struct CacheEntry {
     std::vector<uint32_t> indices;
     std::vector<FacingVertex> facing;
     std::vector<SkinVertex> skin;
+    int32_t k_delta = 0;  // the decoded mesh's TEX1.K delta (Mesh::k_delta), for the transient copies
+    bool k_kick = false, k_mixed = false;
+    std::vector<Mesh::KRun> k_runs;
 };
 std::unordered_map<uint32_t, CacheEntry> g_cache;
+
+void copy_k(Mesh *m, const CacheEntry &c) {
+    m->k_delta = c.k_delta;
+    m->k_kick = c.k_kick;
+    m->k_mixed = c.k_mixed;
+    m->k_runs = c.k_runs;
+}
 uint32_t g_next_mesh = 1;
 vifmesh::Decoder *g_decoder;
 vifmesh::Mesh g_scratch;
@@ -232,7 +242,20 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     m->skinned = false;
     if (st != vifmesh::Status::Ok) g_mesh_fail++;
     bool has_shadow = false;
-    for (const vifmesh::Batch &b : g_scratch.batches) {
+    for (size_t bi = 0; bi < g_scratch.batches.size(); bi++) {
+        const vifmesh::Batch &b = g_scratch.batches[bi];
+        // TEX1.K delta: VU1 `mtir vi1, vf13z` (batch qword 198 z, low 16 bits, signed), kicked when
+        // not positive with K = template + z + 1000 (docs/NATIVE_RENDERER.md "Stage R5", A2)
+        const int16_t z = (int16_t)(b.q198_zw[0] & 0xFFFF);
+        const int32_t delta = (int16_t)(uint16_t)(z + 1000);
+        if (bi == 0) {
+            m->k_delta = delta;
+            m->k_kick = z <= 0;
+        } else if (m->k_kick != (z <= 0) || (m->k_kick && m->k_delta != delta)) {
+            m->k_mixed = true;
+        }
+        // one decode, one part: the batch's indices are m->indices[first_index, + index_count)
+        if (b.index_count) m->k_runs.push_back({b.first_index, b.index_count, delta, z <= 0});
         if (b.shadow) has_shadow = true;
         if (b.skin != vifmesh::Skin::None) {
             m->skinned = true;
@@ -285,6 +308,21 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
             m->indices.push_back(p.first_vertex + g_scratch.indices[p.first_index + i]);
     c.hash = h;
     c.id = m->id;
+    c.k_delta = m->k_delta;
+    c.k_kick = m->k_kick;
+    c.k_mixed = m->k_mixed;
+    {
+        // the runs must tile the index list (one part, batches in order)
+        uint32_t next = 0;
+        for (const Mesh::KRun &kr : m->k_runs) next = kr.first == next ? next + kr.count : ~0u;
+        if (!m->k_mixed || g_scratch.parts.size() != 1 || next != m->indices.size()) {
+            static uint32_t untiled = 0;  // mixed TEX1.K, runs not tiling the indices: drawn with the first K
+            if (m->k_mixed && untiled++ < 3)
+                std::fprintf(stderr, "[native] batch %08x: TEX1.K runs do not tile its indices (first run's K used)\n", batch);
+            m->k_runs.clear();
+        }
+    }
+    c.k_runs = m->k_runs;
     if (!c.facing.empty() || !c.skin.empty() || has_shadow) {
         c.base = m->vertices;
         c.indices = m->indices;
@@ -361,15 +399,34 @@ struct FogState {
 };
 FogState g_fog;
 
+// Texture LOD and blend state as the decompiled setters left it (src/native_texstate.cpp).
+// Initial values: 0x360E18 / 0x365578 (sel 1, K 0, MXL 1, bias 1.0 -> (int)(16 - 1000) = -984).
+struct TexState {
+    int32_t k = 0;
+    uint32_t mxl = 1, bias_k = 0xFC28FC28u, blend_sel = 1;
+};
+TexState g_tex;
+
 // The camera packet inputs (0x35B3D0) as they are now.
 void fill_camera(Packet &p) {
     p.fge = (g_fog.flags >> 3) & 1;  // 0x3620A8: PRIM.FGE = (flags & 8) << 2
+    p.flags = g_fog.flags;
+    p.blend_sel = g_tex.blend_sel;
+    p.tex_k = g_tex.k;
+    p.tex_mxl = g_tex.mxl;
+    p.bias_k = g_tex.bias_k;
     p.fogcol = g_fog.fogcol & 0xFFFFFF;
     for (int i = 0; i < 3; i++) p.fog_range[i] = g_fog.range[i];
     for (int i = 0; i < 9; i++) p.rotation[i] = rf(kCameraRotation + 4u * (uint32_t)i);
     for (int i = 0; i < 3; i++) p.position[i] = rf(kCameraPosition + 4u * (uint32_t)i);
     for (int i = 0; i < 4; i++) p.viewport[i] = rf(kViewport + 4u * (uint32_t)i);
     p.near_z = rf(kNear);
+    {
+        // the GS 1 / Q is the native screen w / fw, fw = *0x4D7C1C * width * 0.5 (0x35B3D0 fVar7):
+        // measured (EOD_NATIVE_QCHECK) to 5 digits on every textured vertex checked
+        const float fw = rf(kFovScale) * rf(kViewport + 8) * 0.5f;
+        p.w_scale = fw > 0.0f ? 1.0f / fw : 1.0f;
+    }
     p.far_z = rf(kFar);
     p.fov_scale = rf(kFovScale);
     p.aspect = rf(kAspect);
@@ -605,6 +662,7 @@ uint32_t facing_mesh(const CacheEntry &c, uint32_t part, uint32_t &alpha) {
     m->skinned = false;
     m->transient = true;
     m->vertices = c.base;
+    copy_k(m, c);
     m->indices = c.indices;
     for (const FacingVertex &f : c.facing) {
         Vertex &v = m->vertices[f.vertex];
@@ -689,6 +747,7 @@ uint32_t posed_mesh(const CacheEntry &c, const Packet &p) {
     m->posed = true;
     m->bind = c.id;
     m->vertices = c.base;
+    copy_k(m, c);
     m->indices = c.indices;
     UsedQwords used;
     auto note = [&](uint32_t q) {
@@ -758,6 +817,7 @@ uint32_t facing_queue_mesh(const CacheEntry &c, uint32_t batch) {
     m->skinned = false;
     m->transient = true;
     m->vertices = c.base;
+    copy_k(m, c);
     m->indices = c.indices;
     for (const FacingVertex &f : c.facing) {
         Vertex &v = m->vertices[f.vertex];
@@ -957,6 +1017,12 @@ void ee_fog_range(float start, float end, float density) {
 }
 void ee_fog_colour(uint32_t rgb) { g_fog.fogcol = rgb; }
 void ee_render_flags(uint32_t flags) { g_fog.flags = flags; }
+void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k) {
+    g_tex.k = k_template;
+    g_tex.mxl = mxl;
+    g_tex.bias_k = bias_k;
+}
+void ee_blend_select(uint32_t sel) { g_tex.blend_sel = sel; }
 
 void ee_shadow_begin(int32_t alpha) {
     if (!enabled()) return;
@@ -997,6 +1063,7 @@ uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
     m->skinned = false;
     m->transient = true;
     m->vertices = c.base;
+    copy_k(m, c);
     m->indices = c.indices;
     for (Vertex &v : m->vertices) {
         // VU1 0x3BE4C0 0x0130..0x0170: d = dot(n, vf1), e = min(max(0, d) * 65535, extrude)
