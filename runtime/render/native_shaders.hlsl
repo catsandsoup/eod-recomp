@@ -13,7 +13,8 @@ struct Object {
     float4 light;           // model-space light direction x the light scale (VU1 vf12), w: half vector x
     float4 diffuse;         // TOPS+4 rgb (0..128), w: half vector y
     float4 ambient;         // TOPS+5 rgb (0..128), w = vertex alpha (ITOP low byte)
-    uint4 mode;             // x flags (below), y alpha reference, z FIX, w: half vector z (float bits)
+    uint4 mode;             // x flags (below), y alpha reference | FOGCOL << 8, z FIX | F << 8,
+                            // w: half vector z (float bits)
 };
 [[vk::push_constant]] Object obj;
 
@@ -26,6 +27,7 @@ struct Object {
 #define M_AFAIL_DISCARD 0x100  // a failing pixel writes nothing
 #define M_CFIX 0x200     // blend factor C = FIX (else As)
 #define M_SPEC 0x400     // vertex alpha is the car body highlight (VU1 0x2E0), not ITOP
+#define M_FGE 0x800      // GS PRIM.FGE (render flags 0x4D8BC8 bit 3, src/native_fog.cpp)
 
 [[vk::binding(0, 0)]] Texture2D tex;
 [[vk::binding(1, 0)]] SamplerState smp;
@@ -40,6 +42,7 @@ struct VOut {
     float4 pos : SV_Position;
     [[vk::location(0)]] float2 uv : TEXCOORD0;
     [[vk::location(1)]] float4 c : COLOR;     // GS vertex colour 0..128 / alpha
+    [[vk::location(2)]] float f : FOG;        // GS fog coefficient F (0..255), Gouraud like RGBA
 };
 
 VOut vs_main(VIn i) {
@@ -62,6 +65,7 @@ VOut vs_main(VIn i) {
         va = max(0.0, 1152.0 * dot(float3(i.n.xyz) / 128.0, h) - 1056.0);
     }
     o.c = floor(float4(rgb, va));  // ftoi0
+    o.f = (float)((obj.mode.z >> 8) & 0xFF);
     o.uv = i.uv;
     return o;
 }
@@ -110,12 +114,19 @@ POut ps_main(VOut i) {
     }
     rgb = min(rgb, 255.0);
     a = min(a, 255.0);
+    if (m & M_FGE) {
+        // GS fogging after the texture function: C = FOGCOL + (((C - FOGCOL) * F + 128) >> 8)
+        // (runtime/gs/gs_pixel_math.h fog_channel, checked against paraLLEl-GS); alpha is unchanged.
+        const float3 fog = float3(obj.mode.y >> 8 & 0xFF, obj.mode.y >> 16 & 0xFF, obj.mode.y >> 24 & 0xFF);
+        const float F = clamp(floor(i.f), 0.0, 255.0);
+        rgb = fog + floor(((rgb - fog) * F + 128.0) / 256.0);
+    }
     if (m & M_ATE) {
-        if (!alpha_pass(a, (m >> M_ATST_SHIFT) & 7, (float)obj.mode.y) && (m & M_AFAIL_DISCARD)) discard;
+        if (!alpha_pass(a, (m >> M_ATST_SHIFT) & 7, (float)(obj.mode.y & 0xFF)) && (m & M_AFAIL_DISCARD)) discard;
     }
     POut o;
     o.color = float4(rgb / 255.0, a / 255.0);
-    const float c = (m & M_CFIX) ? (float)obj.mode.z : a;
+    const float c = (m & M_CFIX) ? (float)(obj.mode.z & 0xFF) : a;
     o.factor = float4(0, 0, 0, saturate(c / 128.0));
     return o;
 }

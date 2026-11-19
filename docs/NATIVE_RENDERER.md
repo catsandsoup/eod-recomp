@@ -520,6 +520,94 @@ it was queued). Race: 4 render passes for about 965 objects per frame.
 
 ---
 
+## Stage R5: Classic parity (Phase A1: P3 tool and fog)
+
+Phase A1 builds the P3 comparison tool and moves fog onto Plume from decompiled EE code. Mipmaps,
+region clamp/repeat, destination-alpha blend and AFAIL modes follow in Phase A2.
+
+### Fog: what both binaries do (spec before code)
+
+| item | PS2 `SLUS_209.10` | Xbox `default.xbe` (matched) | meaning |
+| --- | --- | --- | --- |
+| fog range setter | `GsFogWriteTables 0x3653F8`: `*0x4D8B84 = f12` (start), `*0x4D8B88 = f13` (end), `*0x4D8B8C = f14`, `*0x4D8B74 \|= 0x800000` | `0x2ACA7C/80/84` stores, `*0x2ACA88 \|= 0x4000` (`0x9E230`, `0x9E130`, `0x132760`) | same three floats, a dirty bit |
+| `FogConfigureRange 0x33ECB8` | jump thunk to `0x3653F8` (`gen/rec_095.c` `f_0033ECB8`) | inlined | |
+| per-view range | `CameraBuildViewportProjection 0x212B58` (call at `0x212C34`): start = `far / views * 0.1`, end = `far / views * 2`, `0.5`; far = `g_DrawDistanceFar 0x495D58`, views clamped 1..4; second call `0x2129D0` (`0x212AAC`) | `0x9E230`: start = `far / views * 0.1`, end = `far + far`, `0.5` | identical formula |
+| boot / screen values | `0x33EB30`: `(0, 1.0, 0.7)` and fog colour `0x34E848(0xFF00FF00)`; `0x360E18` init: colour `0xFF`, `200.0`, `1000.0`, `0.5` | `0x132760` / `0x9E130`: colour `0xFF00`, `0`, `1.0`, `0.7`; `0x13D620`: `100.0`, `1000.0`, `0.5`; `0x131560`: colour `0xC9C9EB` | |
+| fog colour (state `0x4D8B80`) | `0x365428(r, g, b)`: `rgb = r & 0xFF \| (g & 0xFF) << 8 \| (b & 0xFF) << 16`; if changed, store and `*0x4D8B74 \|= 0x10000`; `0x3620A8` (`0x3623CC`) emits it as GS `FOGCOL` (A+D reg `0x3D`) | `0x2ACA78` -> `D3DRS_FOGCOLOR` (`0x13D320` state `0x8A`) | GS `FOGCOL` |
+| readers of the range | **none**: `RefsTo 0x4D8B70..0x4D8BC8` finds only the writes at `0x3653F8` and `0x360E18`; no code tests `0x800000` (`0x3620A8` drops it with `*0x4D8B74 = 0` at `0x362930`) | `0x13DA30` `AND EBX, 0xFFFFA5F9` (`0x13DA4D`) clears `0x4000`, so the `FOGSTART/END/DENSITY` block at `0x13DD5E` (`0x13D320` states `0x5E/0x5F/0x60`) is unreachable | the range is dead state in both |
+| fog enable | GS `PRIM.FGE` = bit 3 of the render flags `*0x4D8BC8` (`0x3620A8`: `(flags & 8) << 2` into both GIFtag templates); flags come from `*0x4CD398` via `0x34F028` -> `0x365540` (bit 3 cleared when `*0x4CD3A0 == 1`) | `D3DRS_FOGENABLE` (`0x1DAE18`, state `0x5C`) = `(*0x2ACA5C >> 3) & 1` (`0x13DD01`) | same bit |
+| who sets that bit | only `RenderStateEnable(2) 0x34DEC0` (`\|= 8`); no call site passes 2. `RenderStateDisable(2) 0x34DFE0` is called at `0x2105F8`, `0x214C98`, `0x304D50`; init `0x34F0C0` sets `0x630` (bit 3 clear); `0x34F7C8` only touches `0x10`/`0x20` (`0x351410`) | game code never writes `0x1DAE18`; `0x13D620` sets `D3DRS_FOGTABLEMODE` (`0x1DAE1C`) = 3 (linear) only | fog never turns on |
+| GS fog arithmetic | `C = FOGCOL + (((C - FOGCOL) * F + 128) >> 8)` per channel (`runtime/gs/gs_pixel_math.h:4`, verified against paraLLEl-GS, docs/RENDERER_REFERENCES.md) | D3D linear table fog `f = (end - d) / (end - start)` (`0x1D31F0`: bias `end / (end - start) + 1`, scale `-1 / (end - start)`), `C = f C + (1 - f) FOGCOL` | |
+| per-vertex F | VU1 writes `XYZF2` with the w word built from integers (`mfir.w` at `0x05E0`, `0x06C0`, `0x0718`; `mul.w vf21, vf2, vf1` at `0x0770`): no distance maths and no read of `0x4D8B84..8C`. Measured in a Dundas replay: `F = 255` on 11,102 vertices, `0` on 6,789, other values on the rest | n/a (fog unit computes f from eye depth) | F is a by-product, not a fog factor |
+
+Measured (GS replay of the live command stream, `EOD_GS_REPLAY_TRACE`): Gilroy 'Battle (8 AI)' night
+vb 1200, `0` of `41,962` primitives with `FGE = 1`; Dundas 'Battle (8 AI)' day vb 1200, `0` of
+`6,743`. Classic parity therefore means: no fog on any retail frame. The renderer still carries the
+exact GS stage so a mod or a future path that sets the bit gets the GS result.
+
+### Fog: native implementation
+
+- `src/native_fog.cpp` (readable C++, `EOD_DIFF`): `0x33ECB8`, `0x3653F8`, `0x365428`, `0x365540`
+  (render flags commit). Each replacement also hands its values to the native feed
+  (`native::ee_fog_range`, `native::ee_fog_colour`, `native::ee_render_flags`); `0x360E18` is wrapped
+  and publishes its init constants (`0xFF`, `200.0`, `1000.0`, `0.5`) after the original runs.
+  Nothing is read back from GS registers.
+- Every packet (`fill_camera`) carries `fge` (flags bit 3), `fogcol` and the range at queue time.
+- `native_shaders.hlsl`: mode bit `M_FGE 0x800`; `mode.y` bits 8..31 = `FOGCOL`; `mode.z` bits
+  8..15 = F. The pixel stage applies `fog + ((c - fog) * F + 128) >> 8` after texture function and
+  before alpha test, as the GS does. Push constants stay 128 bytes.
+- F per vertex: VU1's w word is not a fog coefficient (above), so there is no F to pass. A draw
+  with `FGE` set is counted (`[native] fog: FGE draws`) and left unfogged; FOGCOL is put in
+  `mode.y` only then, so retail push constants are bit-identical to R4. Measured: 0 such draws.
+
+### P3 tool (`tools/p3_compare.py`, `tools/p3_run.sh`)
+
+`tools/p3_run.sh NAME TRACK EVENT CAR` runs one headless, muted race with `EOD_NATIVE_ONLY=2` (new:
+the GS still draws sprites, i.e. clears, HUD and the copy of the 3D buffer `FBP 0x1180` to the
+display buffer, so the 3D on screen is Plume's alone), records the GS command stream at each vblank V
+(`EOD_GS_DUMP_AT`, `EOD_GS_DUMP_N=6`), takes screenshots only near V+6 (`EOD_SCREENSHOT_AT`, new) and
+cycles the camera with Triangle. `tools/p3_compare.py` replays each window in the software GS
+(`--gs-replay`, `Renderer=software`) and reports, numbers only:
+- per-channel MAE, p99 of the per-pixel max channel error, SSIM (luma, 8x8 windows, stride 4);
+- fog-pixel error: pixels that change when the replay's FOGCOL is replaced
+  (`EOD_GS_REPLAY_FOGCOL`, new, two colours);
+- sky-pixel error: pixels whose final depth under the display is 0 (cleared), from
+  `EOD_GS_REPLAY_ZSHOT` (new: the Z buffer through the same DISPFB/DISPLAY mapping as the picture).
+The live frame is the best match in V+3..V+9. A window is skipped unless the replay drew at least
+100,000 triangle pixels: the dump starts from VRAM as the live renderer left it, so a window
+without a whole GS frame shows Plume's pixels again (first runs gave false MAE 0.00 this way). A slow
+EE (EOD_DIFF on a function called 1,000 times a race, e.g. `0x365540`) causes exactly that, so the
+EOD_DIFF smoke and the P3 run are separate runs.
+
+### Phase A1 results (headless, RenderScale 1, Classic, `EOD_NATIVE_ONLY=2`)
+
+EOD_DIFF (separate runs): Gilroy 'Battle (8 AI)' night, Hearse: `0x33ECB8` 7/7, `0x365428` 4/4,
+`0x365540` 1,177/1,177 checked, 0 mismatched; Dundas 'Battle (8 AI)' day, Taxi: 8/8, 4/4,
+1,011/1,011, 0 mismatched. `0x3653F8` is reached only through the thunk (its readable body runs
+inside the `0x33ECB8` check). FGE draws 0 in every run.
+
+| scene | vehicle | frames | MAE (worst) | p99 (worst) | SSIM (worst) | fog px | sky MAE (px) | views |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Gilroy 'Battle (8 AI)' night | Hearse (`502`) | 22 | 3.79 (15.37) | 30 (90) | 0.9338 (0.6475) | 0 | 3.29 (1,829,056) | Cockpit, Bumper, Chassis, NearChase, Chase |
+| Dundas 'Battle (8 AI)' day | Taxi (`508`) | 20 | 6.61 (20.41) | 74 (146) | 0.9087 (0.7836) | 0 | 8.96 (1,115,348) | Cockpit, Bumper, Chassis, NearChase, Chase |
+
+P3 fails as expected before mip levels, blend and the remaining A2 items. Fog contributes nothing:
+no retail pixel is fogged.
+
+### Open (R5)
+
+- Yellow-and-black wedge over the grandstand on an oval track: not investigated.
+- Translucent blurred rectangle in the upper right (speed-blur / RTT `FBP 0x1180` suspected): not investigated.
+- 27 fps with `EOD_NATIVE_ONLY=1`: not investigated.
+- Camera inside another car (e.g. an AI bus): Plume clips at the near plane (`depthClipEnabled`) and
+  the GS does not; a depth-clamp A/B on Dundas Cannon gave Cockpit MAE 38.5 -> 7.9. Not changed in A1.
+- P2 check: the R3/R4 suites set `EOD_VERTEX_CHECK=1`, which the check did not read
+  (`EOD_NATIVE_SKIN_CHECK`), so no run ever printed it. It now reads both, covers every queue object
+  and adds a geometric triangle match: Dundas Bus run, 0 GS triangles missing from the native meshes;
+  native draws triangles the GS never receives for `0x318` batches (51%, likely VU1 back-face culling).
+
+---
+
 ## Stage R4: shadows, particles, sprites, flares and immediate geometry
 
 Stage R4 moves the remaining non-queue 3D/effect GS draws to readable C++ (verified by `EOD_DIFF`)

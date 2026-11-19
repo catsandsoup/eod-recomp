@@ -94,9 +94,9 @@ void trace_prim(const char *kind, const Vertex *v, int n) {
                      e.bfix, e.ate, e.atst, e.aref, e.afail, e.date, e.datm, e.zte, e.ztst, e.zbp, e.zpsm, e.zmsk,
                      e.fge, e.fbmsk, e.iip, e.wms, e.wmt);
     for (int i = 0; i < n && k >= 0 && k < (int)sizeof buf; i++)
-        k += snprintf(buf + k, sizeof buf - k, " | %.1f,%.1f z%u c%02x%02x%02x%02x uv%d,%d st%.3f,%.3f,%.3f",
-                      v[i].x / 16.0, v[i].y / 16.0, v[i].z, v[i].r, v[i].g, v[i].b, v[i].a, v[i].u, v[i].v, v[i].s,
-                      v[i].t, v[i].q);
+        k += snprintf(buf + k, sizeof buf - k, " | %.1f,%.1f z%u c%02x%02x%02x%02x f%u uv%d,%d st%.3f,%.3f,%.3f",
+                      v[i].x / 16.0, v[i].y / 16.0, v[i].z, v[i].r, v[i].g, v[i].b, v[i].a, (unsigned)v[i].f, v[i].u,
+                      v[i].v, v[i].s, v[i].t, v[i].q);
     log_write(LOG_GS, "%s", buf);
 }
 
@@ -423,9 +423,12 @@ void setup_env(uint32_t attr) {
     e.scx1 = (int)bits(c.scissor, 16, 11);
     e.scy0 = (int)bits(c.scissor, 32, 11);
     e.scy1 = (int)bits(c.scissor, 48, 11);
-    e.fogr = bits(st.fogcol, 0, 8);
-    e.fogg = bits(st.fogcol, 8, 8);
-    e.fogb = bits(st.fogcol, 16, 8);
+    // EOD_GS_REPLAY_FOGCOL=hex: replaces FOGCOL (P3 fog-pixel mask, tools/p3_compare.py)
+    static const char *fog_override = getenv("EOD_GS_REPLAY_FOGCOL");
+    const uint64_t fogcol = fog_override ? strtoull(fog_override, nullptr, 16) : st.fogcol;
+    e.fogr = bits(fogcol, 0, 8);
+    e.fogg = bits(fogcol, 8, 8);
+    e.fogb = bits(fogcol, 16, 8);
     // A depth format used as the frame buffer keeps its own memory layout
     // but stores colours like the matching colour format.
     e.fbT = swizzle_table(e.fpsm, e.fbw);
@@ -1571,7 +1574,7 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
         census::draw(e, "sprite", (uint64_t)std::abs((b.x - a.x) >> 4) * (uint64_t)std::abs((b.y - a.y) >> 4));
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
-            if (!(modern::g_on && modern::gs_replaced(e, b.a)) && !(native::enabled() && native::gs_draw(e, a))) hw::draw_sprite(e, a, b);
+            if (!(modern::g_on && modern::gs_replaced(e, b.a)) && !(native::enabled() && native::gs_draw(e, a, &b))) hw::draw_sprite(e, a, b);
             note_draw();  // (the display is presented when its pages change)
         }
         return;

@@ -353,8 +353,19 @@ void roll(uint64_t vb) {
     g_wc = WorldCounts();
 }
 
+// Fog state as the decompiled setters left it (src/native_fog.cpp). Initial values: 0x360E18.
+struct FogState {
+    uint32_t flags = 0;            // *0x4D8BC8 before the first 0x365540 (bit 3 clear either way)
+    uint32_t fogcol = 0xFF;        // 0x360E18: *0x4D8B80 = 0xFF
+    float range[3] = {200.0f, 1000.0f, 0.5f};  // 0x360E18: 0x43480000, 0x447A0000, 0x3F000000
+};
+FogState g_fog;
+
 // The camera packet inputs (0x35B3D0) as they are now.
 void fill_camera(Packet &p) {
+    p.fge = (g_fog.flags >> 3) & 1;  // 0x3620A8: PRIM.FGE = (flags & 8) << 2
+    p.fogcol = g_fog.fogcol & 0xFFFFFF;
+    for (int i = 0; i < 3; i++) p.fog_range[i] = g_fog.range[i];
     for (int i = 0; i < 9; i++) p.rotation[i] = rf(kCameraRotation + 4u * (uint32_t)i);
     for (int i = 0; i < 3; i++) p.position[i] = rf(kCameraPosition + 4u * (uint32_t)i);
     for (int i = 0; i < 4; i++) p.viewport[i] = rf(kViewport + 4u * (uint32_t)i);
@@ -939,6 +950,14 @@ void ee_water_end(bool drawn) {
 // Snapshots the main-viewport camera/projection before 0x363218 overwrites 0x4D7C20 with the PS2
 // 320x512 shadow RT viewport. Each shadow batch is extruded on the EE using the exact VU1 0x0020
 // formula (0x3BE4C0) and rendered by Plume into an adaptive full-RenderScale host shadow buffer.
+void ee_fog_range(float start, float end, float density) {
+    g_fog.range[0] = start;
+    g_fog.range[1] = end;
+    g_fog.range[2] = density;
+}
+void ee_fog_colour(uint32_t rgb) { g_fog.fogcol = rgb; }
+void ee_render_flags(uint32_t flags) { g_fog.flags = flags; }
+
 void ee_shadow_begin(int32_t alpha) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
@@ -1475,6 +1494,14 @@ void take_expected(uint64_t before, std::map<uint64_t, Expected> &out) {
         out[g_expect.begin()->first] = g_expect.begin()->second;
         g_expect.erase(g_expect.begin());
     }
+}
+
+int native_only_level() {
+    static const int level = [] {
+        const char *e = std::getenv("EOD_NATIVE_ONLY");
+        return e && *e && *e != '0' ? std::atoi(e) : 0;
+    }();
+    return level;
 }
 
 bool native_only() {

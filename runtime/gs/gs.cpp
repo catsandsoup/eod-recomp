@@ -1462,6 +1462,32 @@ int gs_replay(const char *path, int repeat) {
     fprintf(stderr, "  sprites/lines: %u pixels\n", (stats.pixels - tri) / repeat);
     std::string shot = std::string(path) + ".ppm";
     gs_screenshot(shot.c_str());
+    // EOD_GS_REPLAY_ZSHOT=file: the final depth under the displayed picture (P3 sky mask,
+    // tools/p3_compare.py): "Z32" w h, then w*h little-endian words, same mapping as read_circuit.
+    if (const char *zpath = getenv("EOD_GS_REPLAY_ZSHOT")) {
+        const int n = (st.pmode & 1) ? 0 : 1;
+        const uint64_t fb = st.dispfb[n], disp = st.display[n];
+        const uint32_t fbp = bits(fb, 0, 9), fbw = bits(fb, 9, 6);
+        const int dbx = (int)bits(fb, 32, 11), dby = (int)bits(fb, 43, 11);
+        const int magh = (int)bits(disp, 23, 4) + 1, magv = (int)bits(disp, 27, 2) + 1;
+        const int w = ((int)bits(disp, 32, 12) + 1) / magh, h = ((int)bits(disp, 44, 11) + 1) / magv;
+        const bool fieldy = (st.smode2 & 1) && ((st.smode2 >> 1) & 1);
+        int c = 0;
+        for (int k = 0; k < 2; k++)
+            if (bits(st.ctx[k].frame, 0, 9) == fbp) { c = k; break; }
+        const uint64_t zb = st.ctx[c].zbuf;
+        const uint32_t zbp = bits(zb, 0, 9) * 32, zpsm = bits(zb, 24, 4) | 0x30;
+        if (FILE *zf = fopen(zpath, "wb"); zf && w > 0 && h > 0 && w <= 2048 && h <= 2048) {
+            fprintf(zf, "Z32 %d %d\n", w, h);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++) {
+                    const int sy = fieldy ? y / 2 : y;
+                    const uint32_t z = read_pixel(zpsm, (dbx + x) & 2047, (dby + sy) & 2047, zbp, fbw);
+                    fwrite(&z, 4, 1, zf);
+                }
+            fclose(zf);
+        }
+    }
     return 0;
 }
 
@@ -2003,7 +2029,22 @@ void gs_vblank() {
         const char *en = getenv("EOD_SCREENSHOT_END");
         s_shot_end = en ? atoi(en) : 0x7FFFFFFF;
     }
-    if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0 &&
+    // EOD_SCREENSHOT_AT=v1,v2,...: only vblanks within -3..+3 of each (P3 pairs, tools/p3_compare.py)
+    static const std::vector<int> s_shot_at = [] {
+        std::vector<int> v;
+        if (const char *a = getenv("EOD_SCREENSHOT_AT"))
+            for (const char *p = a; *p;) {
+                char *e;
+                const long n = strtol(p, &e, 10);
+                if (e == p) break;
+                v.push_back((int)n);
+                p = *e == ',' ? e + 1 : e;
+            }
+        return v;
+    }();
+    bool shot_window = s_shot_at.empty();
+    for (int at : s_shot_at) shot_window |= (int)g_frames >= at - 3 && (int)g_frames <= at + 3;
+    if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0 && shot_window &&
         (int)g_frames >= s_shot_start && (int)g_frames <= s_shot_end) {
         char path[1024];
         snprintf(path, sizeof path, "%s/frame_%05llu.png", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);

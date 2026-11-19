@@ -62,6 +62,13 @@ void ee_water_end(bool drawn);
 // ShadowBegin 0x34C7D0 (before 0x35DA30 overwrites viewport/aspect with the PS2 320x512 cap):
 // snapshots main-viewport camera/projection and shadow intensity; ShadowEmitBatchPass 0x35D170
 // tags each shadow batch DMA REF; ShadowEnd 0x34C798 closes the pass.
+// Fog state from the decompiled setters (src/native_fog.cpp, docs/NATIVE_RENDERER.md "Stage R5"):
+// GsFogWriteTables 0x3653F8 (range), 0x365428 (FOGCOL, state 0x4D8B80), 0x365540 (render flags
+// 0x4D8BC8: bit 3 = GS PRIM.FGE). Never read back from GS registers.
+void ee_fog_range(float start, float end, float density);
+void ee_fog_colour(uint32_t rgb);
+void ee_render_flags(uint32_t flags);
+uint64_t fog_fge_draws();             // native draws that had FGE set (retail: 0)
 void ee_shadow_begin(int32_t alpha);
 void ee_shadow_opened(bool opened);
 void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword);
@@ -103,6 +110,7 @@ struct Expected {
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out);
 // EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
 bool native_only();
+int native_only_level();  // EOD_NATIVE_ONLY value (2: the GS keeps drawing sprites)
 
 // ---- VIF1 thread (runtime/vu/vif.cpp) -------------------------------------------------------
 void vu1_start(uint32_t program, uint32_t itop);
@@ -135,6 +143,9 @@ struct Packet {
     float colour_a[4], colour_b[4], light[4];
     // the camera packet inputs (0x35B3D0) at flush time
     float rotation[9], position[3], viewport[4], near_z, far_z, fov_scale, aspect;
+    // fog in effect when it was queued (0x4D8BC8 bit 3, FOGCOL 0x4D8B80, range 0x4D8B84..8C)
+    uint32_t fge, fogcol;
+    float fog_range[3];
 };
 
 struct Vertex {                // GPU vertex (28 bytes)

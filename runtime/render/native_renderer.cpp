@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define XXH_INLINE_ALL
@@ -36,6 +38,7 @@ extern uint32_t g_env_serial;
 
 namespace native {
 namespace {
+std::atomic<uint64_t> g_fge_draws{0};  // native draws with PRIM.FGE set (src/native_fog.cpp)
 
 // ---- per EE frame counters (the frame a record was queued in) ----
 struct FrameStats {
@@ -65,6 +68,34 @@ struct Parity {
 };
 Parity g_parity;
 uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
+// EOD_NATIVE_ONLY: what the dropped GS primitives were, by (frame buffer, texture, primitive kind),
+// with their screen box (px), printed every EOD_NATIVE_LOG frames: geometry with no native owner.
+struct DropKey {
+    uint32_t fbp, tbp, kind;
+    bool operator<(const DropKey &o) const { return std::tie(fbp, tbp, kind) < std::tie(o.fbp, o.tbp, o.kind); }
+};
+struct DropStat {
+    uint64_t prims = 0;
+    int box[4] = {1 << 20, 1 << 20, -(1 << 20), -(1 << 20)};
+};
+std::map<DropKey, DropStat> g_drops;
+void note_drop(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const gs::Vertex *c) {
+    DropStat &d = g_drops[{(uint32_t)e.fbp, e.tme ? (uint32_t)e.tbp : 0xFFFFFFFFu, b ? (c ? 3u : 2u) : 1u}];
+    d.prims++;
+    for (const gs::Vertex *p : {&v, b, c}) {
+        if (!p) continue;
+        const int x = p->x >> 4, y = p->y >> 4;
+        d.box[0] = std::min(d.box[0], x), d.box[1] = std::min(d.box[1], y);
+        d.box[2] = std::max(d.box[2], x), d.box[3] = std::max(d.box[3], y);
+    }
+}
+void report_drops(uint64_t frame) {
+    for (auto &[k, d] : g_drops)
+        std::fprintf(stderr, "[native] gs frame %llu native-only dropped fb %x tex %x %s: %llu prims box %d,%d..%d,%d\n",
+                     (unsigned long long)frame, k.fbp, k.tbp, k.kind == 3 ? "tri" : k.kind == 2 ? "sprite/line" : "point",
+                     (unsigned long long)d.prims, d.box[0], d.box[1], d.box[2], d.box[3]);
+    g_drops.clear();
+}
 
 uint64_t log_every() {
     static const uint64_t n = [] {
@@ -103,7 +134,7 @@ struct PushConstants {
 };
 static_assert(sizeof(PushConstants) == 128, "push constants");
 enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
-                  M_CFIX = 0x200, M_SPEC = 0x400 };
+                  M_CFIX = 0x200, M_SPEC = 0x400, M_FGE = 0x800 };
 
 // blend equations (GS ALPHA a, b, d with C in the shader's second output)
 enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_INV_MIX, B_KEEP, B_COUNT };
@@ -906,9 +937,19 @@ void finalize() {
     }
     if (e.bc == 2) m |= M_CFIX;
     if (g_cur.program == 0x2E0) m |= M_SPEC;  // car bodies: vertex alpha is the highlight
-    pc.mode[0] = m;
     pc.mode[1] = e.aref & 0xFF;
     pc.mode[2] = e.bfix & 0xFF;
+    if (g_cur.fge) {
+        // GS PRIM.FGE from the render flags (0x365540 -> 0x4D8BC8 bit 3). No retail path sets it
+        // (docs/NATIVE_RENDERER.md "Stage R5"), and VU1's XYZF2 w word is not a fog coefficient, so
+        // there is no F to pass: count the draw and leave it unfogged. FOGCOL (0x365428, state
+        // 0x4D8B80) rides in mode.y bits 8..31 for the shader's M_FGE stage.
+        pc.mode[1] |= (g_cur.fogcol & 0xFFFFFF) << 8;
+        if (g_fge_draws.fetch_add(1) == 0)
+            std::fprintf(stderr, "[native] fog: FGE draw (batch %08x program %04x): per-vertex F not decoded\n",
+                         g_cur.batch, g_cur.program);
+    }
+    pc.mode[0] = m;
     // pipeline key: blend | z function << 4 | z write << 6 | depth << 7 | colour mask << 8
     const uint32_t zf = !ztest ? (e.ztst == 0 ? 3u : 0u) : e.ztst == 2 ? 1u : 2u;
     const uint32_t full = (e.fpsm & 0xF) == 0x1 ? 0xFFFFFFu : 0xFFFFFFFFu;
@@ -987,22 +1028,45 @@ double vertex_check_percentile(double p) {
 }
 struct ProjGrid {
     uint64_t key = ~0ull;           // (frame << 32 | serial) of the object
-    bool on = false, clip = false;
-    std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> posed, bind;
+    bool on = false, clip = false, posed = false;
+    uint32_t batch = 0, program = 0;
+    std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> mine, bind, gs;
+    std::vector<std::pair<double, double>> mine_list;  // the native vertices (window, 1/16 px)
+    int sc[4] = {0, 0, 0, 0};       // scissor (px) the GS clips the object's triangles to
+    uint64_t gs_n = 0, gs_miss = 0;
+    // triangle check (geometric, so duplicated vertices do not matter)
+    std::vector<std::array<double, 7>> ntri;  // corners (window, 1/16 px), [6] = counted (in scissor, > 1 px^2)
+    std::vector<uint8_t> nmatch;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> tgrid;
+    uint64_t gs_t = 0, gs_t_miss = 0;
 };
 ProjGrid g_pg;
+uint64_t g_tri = 0, g_tri_miss = 0, g_mtri = 0, g_mtri_miss = 0;
+// per batch (EOD_NATIVE_SKIN_CHECK report): GS vertices with no native vertex within 1/16 px, and
+// native vertices inside the scissor with no GS vertex within 1/16 px (geometry the GS never drew)
+struct BatchCheck {
+    uint32_t program = 0;
+    bool posed = false;
+    uint64_t objects = 0, gs = 0, gs_miss = 0, mine = 0, mine_miss = 0;
+    uint64_t tri = 0, tri_miss = 0, mtri = 0, mtri_miss = 0;  // GS triangles not in the mesh / mesh triangles the GS never drew
+};
+std::unordered_map<uint32_t, BatchCheck> g_bck;
+uint64_t g_mine = 0, g_mine_miss = 0;
 
 bool vertex_check_on() {
     static const bool on = [] {
         const char *e = std::getenv("EOD_NATIVE_SKIN_CHECK");
-        return e && *e && *e != '0';
+        const char *f = std::getenv("EOD_VERTEX_CHECK");  // the name the R3/R4 suites used
+        return (e && *e && *e != '0') || (f && *f && *f != '0');
     }();
     return on;
 }
 
 void project_into(const Mesh &m, const double a[4][4], double xo, double yo,
-                  std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid) {
+                  std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid,
+                  std::vector<std::pair<double, double>> *list = nullptr) {
     grid.clear();
+    if (list) list->clear();
     for (const Vertex &v : m.vertices) {
         double s[4];
         for (int r = 0; r < 4; r++) s[r] = a[r][0] * v.p[0] + a[r][1] * v.p[1] + a[r][2] * v.p[2] + a[r][3];
@@ -1011,7 +1075,13 @@ void project_into(const Mesh &m, const double a[4][4], double xo, double yo,
         if (!(std::fabs(x) < 1e7 && std::fabs(y) < 1e7)) continue;
         const uint64_t k = (uint64_t)(uint32_t)(int32_t)std::floor(x / 16.0) << 32 | (uint32_t)(int32_t)std::floor(y / 16.0);
         grid[k].push_back({x, y});
+        if (list) list->push_back({x, y});
     }
+}
+
+void grid_add(std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid, double x, double y) {
+    const uint64_t k = (uint64_t)(uint32_t)(int32_t)std::floor(x / 16.0) << 32 | (uint32_t)(int32_t)std::floor(y / 16.0);
+    grid[k].push_back({x, y});
 }
 
 double nearest(const std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid, double x, double y) {
@@ -1028,35 +1098,158 @@ double nearest(const std::unordered_map<uint64_t, std::vector<std::pair<double, 
     return best / 16.0;  // px
 }
 
+uint64_t tri_key(uint32_t a, uint32_t b, uint32_t c) {
+    if (a > b) std::swap(a, b);
+    if (b > c) std::swap(b, c);
+    if (a > b) std::swap(a, b);
+    return (uint64_t)a << 42 | (uint64_t)b << 21 | c;
+}
+
+// The object just finished: which of its native vertices inside the scissor the GS never received.
+void vertex_check_close() {
+    if (!g_pg.on || g_pg.clip || !g_pg.gs_n) return;
+    BatchCheck &bc = g_bck[g_pg.batch];
+    bc.program = g_pg.program;
+    bc.posed = g_pg.posed;
+    bc.objects++;
+    bc.gs += g_pg.gs_n;
+    bc.gs_miss += g_pg.gs_miss;
+    bc.tri += g_pg.gs_t;
+    bc.tri_miss += g_pg.gs_t_miss;
+    g_tri += g_pg.gs_t;
+    g_tri_miss += g_pg.gs_t_miss;
+    for (size_t t = 0; t < g_pg.ntri.size(); t++) {
+        if (g_pg.ntri[t][6] == 0) continue;
+        bc.mtri++;
+        g_mtri++;
+        if (!g_pg.nmatch[t]) bc.mtri_miss++, g_mtri_miss++;
+    }
+    for (auto &p : g_pg.mine_list) {
+        const double x = p.first / 16.0, y = p.second / 16.0;
+        if (x < g_pg.sc[0] + 1 || x > g_pg.sc[2] - 1 || y < g_pg.sc[1] + 1 || y > g_pg.sc[3] - 1) continue;
+        const bool miss = nearest(g_pg.gs, p.first, p.second) > 1.0 / 16.0 + 1e-9;
+        bc.mine++;
+        bc.mine_miss += miss;
+        g_mine++;
+        g_mine_miss += miss;
+    }
+}
+
 void vertex_check(const gs::Vertex *const *vs, int n) {
     const uint64_t key = g_cur.frame << 32 | g_cur.serial;
     if (key != g_pg.key) {
+        vertex_check_close();
         g_pg.key = key;
         g_pg.on = false;
+        g_pg.gs.clear();
+        g_pg.gs_n = g_pg.gs_miss = 0;
         if (g_cur.kind != KIND_QUEUE || !g_cur.mesh) return;
         auto it = g_r.meshes.find(g_cur.mesh);
-        if (it == g_r.meshes.end() || !it->second.cpu || !it->second.cpu->posed) return;
+        if (it == g_r.meshes.end() || !it->second.cpu) return;
         double a[4][4];
         screen_matrix(g_cur, a);
         const double xo = (double)(g_xyoffset & 0xFFFF), yo = (double)((g_xyoffset >> 32) & 0xFFFF);
-        project_into(*it->second.cpu, a, xo, yo, g_pg.posed);
+        project_into(*it->second.cpu, a, xo, yo, g_pg.mine, &g_pg.mine_list);
+        {
+            // native triangles in GS window coordinates (1/16 px), indexed by the cell of each corner
+            const Mesh &m = *it->second.cpu;
+            g_pg.ntri.clear();
+            g_pg.nmatch.clear();
+            g_pg.tgrid.clear();
+            g_pg.gs_t = g_pg.gs_t_miss = 0;
+            std::vector<std::pair<double, double>> scr(m.vertices.size(), {1e30, 1e30});
+            for (uint32_t i = 0; i < m.vertices.size(); i++) {
+                const Vertex &v = m.vertices[i];
+                double s[4];
+                for (int r = 0; r < 4; r++) s[r] = a[r][0] * v.p[0] + a[r][1] * v.p[1] + a[r][2] * v.p[2] + a[r][3];
+                if (!(s[3] > 0)) continue;
+                const double x = s[0] / s[3] * 16.0 - xo, y = s[1] / s[3] * 16.0 - yo;
+                if (std::fabs(x) < 1e7 && std::fabs(y) < 1e7) scr[i] = {x, y};
+            }
+            const double x0 = (g_env.scx0 + 1) * 16.0, y0 = (g_env.scy0 + 1) * 16.0;
+            const double x1 = (g_env.scx1 - 1) * 16.0, y1 = (g_env.scy1 - 1) * 16.0;
+            for (size_t t = 0; t + 2 < m.indices.size(); t += 3) {
+                std::array<double, 7> tr;
+                bool in = true, ok = true;
+                for (int k = 0; k < 3; k++) {
+                    const uint32_t q = m.indices[t + k];
+                    if (q >= scr.size() || scr[q].first > 1e29) { ok = false; break; }
+                    tr[2 * k] = scr[q].first, tr[2 * k + 1] = scr[q].second;
+                    in = in && tr[2 * k] > x0 && tr[2 * k] < x1 && tr[2 * k + 1] > y0 && tr[2 * k + 1] < y1;
+                }
+                if (!ok) continue;
+                const double area = (tr[2] - tr[0]) * (tr[5] - tr[1]) - (tr[4] - tr[0]) * (tr[3] - tr[1]);
+                tr[6] = in && std::fabs(area) > 2.0 * 256.0 ? 1.0 : 0.0;  // counted when inside and > 1 px^2
+                const uint32_t id = (uint32_t)g_pg.ntri.size();
+                g_pg.ntri.push_back(tr);
+                g_pg.nmatch.push_back(0);
+                for (int k = 0; k < 3; k++) {
+                    const uint64_t c = (uint64_t)(uint32_t)(int32_t)std::floor(tr[2 * k] / 16.0) << 32 |
+                                       (uint32_t)(int32_t)std::floor(tr[2 * k + 1] / 16.0);
+                    auto &cell = g_pg.tgrid[c];
+                    if (cell.empty() || cell.back() != id) cell.push_back(id);
+                }
+            }
+        }
         g_pg.bind.clear();
-        auto b = g_r.meshes.find(it->second.cpu->bind);
-        if (b != g_r.meshes.end() && b->second.cpu) project_into(*b->second.cpu, a, xo, yo, g_pg.bind);
+        g_pg.posed = it->second.cpu->posed;
+        if (g_pg.posed) {
+            auto b = g_r.meshes.find(it->second.cpu->bind);
+            if (b != g_r.meshes.end() && b->second.cpu) project_into(*b->second.cpu, a, xo, yo, g_pg.bind);
+        }
+        g_pg.batch = g_cur.batch;
+        g_pg.program = g_cur.program;
+        g_pg.sc[0] = g_env.scx0, g_pg.sc[1] = g_env.scy0, g_pg.sc[2] = g_env.scx1, g_pg.sc[3] = g_env.scy1;
         g_pg.clip = (g_cur.itop & 0x200) != 0;
         g_pg.on = true;
         (g_pg.clip ? g_vck.clip_objects : g_vck.objects)++;
     }
     if (!g_pg.on) return;
+    if (n == 3 && !g_pg.clip) {
+        // a GS triangle (> 1 px^2) matches a native triangle when every corner of one is within
+        // 1/8 px of a corner of the other (any order)
+        const double gx[3] = {(double)vs[0]->x, (double)vs[1]->x, (double)vs[2]->x};
+        const double gy[3] = {(double)vs[0]->y, (double)vs[1]->y, (double)vs[2]->y};
+        const double area = (gx[1] - gx[0]) * (gy[2] - gy[0]) - (gx[2] - gx[0]) * (gy[1] - gy[0]);
+        if (std::fabs(area) > 2.0 * 256.0) {
+            g_pg.gs_t++;
+            bool found = false;
+            const int32_t cx = (int32_t)std::floor(gx[0] / 16.0), cy = (int32_t)std::floor(gy[0] / 16.0);
+            for (int dx = -1; dx <= 1 && !found; dx++)
+                for (int dy = -1; dy <= 1 && !found; dy++) {
+                    auto it = g_pg.tgrid.find((uint64_t)(uint32_t)(cx + dx) << 32 | (uint32_t)(cy + dy));
+                    if (it == g_pg.tgrid.end()) continue;
+                    for (uint32_t id : it->second) {
+                        const auto &tr = g_pg.ntri[id];
+                        bool all = true;
+                        for (int k = 0; k < 3 && all; k++) {
+                            bool any = false;
+                            for (int j = 0; j < 3; j++)
+                                any = any || (std::fabs(tr[2 * j] - gx[k]) <= 2.0 && std::fabs(tr[2 * j + 1] - gy[k]) <= 2.0);
+                            all = any;
+                        }
+                        if (all) {
+                            found = true;
+                            g_pg.nmatch[id] = 1;
+                            break;
+                        }
+                    }
+                }
+            if (!found) g_pg.gs_t_miss++;
+        }
+    }
     for (int i = 0; i < n; i++) {
         const double x = vs[i]->x, y = vs[i]->y;
-        const double d = nearest(g_pg.posed, x, y);
+        const double d = nearest(g_pg.mine, x, y);
         const bool ok = d < 1.0 / 16.0 + 1e-9;
         if (g_pg.clip) {
             g_vck.clip_vertices++;
             g_vck.clip_within += ok;
             continue;
         }
+        grid_add(g_pg.gs, x, y);
+        g_pg.gs_n++;
+        g_pg.gs_miss += !ok;
         g_vck.vertices++;
         g_vck.within += ok;
         g_vck.sum += std::fmin(d, 1e6);
@@ -1064,27 +1257,33 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
         g_vck.hist[d < 4.0 ? (int)(d * 1024.0) : 4096]++;
         if (ok && !g_pg.bind.empty() && nearest(g_pg.bind, x, y) > 1.0 / 16.0) g_vck.bind_off++;
     }
-    static uint64_t last = 0;
-    if (g_vck.vertices / 200000 != last) {
-        last = g_vck.vertices / 200000;
-        std::fprintf(stderr,
-                     "[native] P2 posed vertices vs GS: objects %llu vertices %llu within 1/16 px %llu (worst %.4f px, mean %.4f px; "
-                     "bind pose off by > 1/16 px at %llu of them) | clip-path objects %llu vertices %llu within %llu\n",
-                     (unsigned long long)g_vck.objects, (unsigned long long)g_vck.vertices, (unsigned long long)g_vck.within,
-                     g_vck.worst, g_vck.vertices ? g_vck.sum / (double)g_vck.vertices : 0.0, (unsigned long long)g_vck.bind_off,
-                     (unsigned long long)g_vck.clip_objects, (unsigned long long)g_vck.clip_vertices,
-                     (unsigned long long)g_vck.clip_within);
-    }
 }
 
 void vertex_check_report() {
     if (!vertex_check_on()) return;
+    vertex_check_close();
+    g_pg.on = false;
     std::fprintf(stderr,
-                 "[native] P2 final posed vertices vs GS: objects %llu vertices %llu within 1/16 px %llu (worst %.4f px, p99 %.4f px, mean %.4f px; "
-                 "bind pose off by > 1/16 px at %llu of them) | clip-path objects %llu vertices %llu within %llu\n",
+                 "[native] P2 final vertices vs GS (all queue objects): objects %llu GS vertices %llu within 1/16 px %llu (worst %.4f px, p99 %.4f px, mean %.4f px; "
+                 "bind pose off by > 1/16 px at %llu of them) | native vertices in scissor %llu with no GS vertex within 1/16 px %llu | "
+                 "clip-path objects %llu vertices %llu within %llu | GS triangles %llu not in the native mesh %llu | "
+                 "native triangles in scissor %llu never drawn by the GS %llu\n",
                  (unsigned long long)g_vck.objects, (unsigned long long)g_vck.vertices, (unsigned long long)g_vck.within,
                  g_vck.worst, vertex_check_percentile(0.99), g_vck.vertices ? g_vck.sum / (double)g_vck.vertices : 0.0, (unsigned long long)g_vck.bind_off,
-                 (unsigned long long)g_vck.clip_objects, (unsigned long long)g_vck.clip_vertices, (unsigned long long)g_vck.clip_within);
+                 (unsigned long long)g_mine, (unsigned long long)g_mine_miss,
+                 (unsigned long long)g_vck.clip_objects, (unsigned long long)g_vck.clip_vertices, (unsigned long long)g_vck.clip_within,
+                 (unsigned long long)g_tri, (unsigned long long)g_tri_miss, (unsigned long long)g_mtri, (unsigned long long)g_mtri_miss);
+    std::vector<std::pair<uint32_t, BatchCheck>> v(g_bck.begin(), g_bck.end());
+    std::sort(v.begin(), v.end(), [](auto &x, auto &y) { return x.second.tri_miss + x.second.mtri_miss > y.second.tri_miss + y.second.mtri_miss; });
+    for (size_t i = 0; i < v.size() && i < 400; i++) {
+        const BatchCheck &c = v[i].second;
+        if (!c.tri && !c.mtri) continue;
+        std::fprintf(stderr, "[native] P2 worst batch %08x program %04x posed %d objects %llu: GS vertices %llu missed %llu | native %llu missed %llu | "
+                     "GS triangles %llu not in mesh %llu | mesh triangles %llu not drawn by GS %llu\n",
+                     v[i].first, c.program, (int)c.posed, (unsigned long long)c.objects, (unsigned long long)c.gs,
+                     (unsigned long long)c.gs_miss, (unsigned long long)c.mine, (unsigned long long)c.mine_miss,
+                     (unsigned long long)c.tri, (unsigned long long)c.tri_miss, (unsigned long long)c.mtri, (unsigned long long)c.mtri_miss);
+    }
 }
 #else
 void finalize() {
@@ -1202,6 +1401,8 @@ void report(uint64_t vb) {
                          "render-target texture untextured %u) skipped %u lost %u suppressed GS prims %llu render passes %u (gs vb %llu)\n",
                          (unsigned long long)frame, s.objects, s.drawn, s.empty, s.textured, s.skinned, s.posed, s.untextured_rt,
                          s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb);
+            std::fprintf(stderr, "[native] gs frame %llu fog: FGE draws %llu\n", (unsigned long long)frame,
+                         (unsigned long long)g_fge_draws.load());
             std::fprintf(stderr,
                          "[native] gs frame %llu queue records submitted %u drawn %u | P1 frames queue equal %llu/%llu "
                          "(records drawn %llu of %llu)\n",
@@ -1218,6 +1419,7 @@ void report(uint64_t vb) {
                          (unsigned long long)g_parity.world_drawn, (unsigned long long)g_parity.world_submitted,
                          (unsigned long long)g_parity.water_drawn, (unsigned long long)g_parity.water_submitted,
                          (unsigned long long)g_parity.skipped_frames, (unsigned long long)g_only_dropped);
+            if (native_only()) report_drops(frame);
             std::fprintf(stderr,
                          "[native] gs frame %llu shadows submitted %u drawn %u (lost %u) flares submitted %u drawn %u (lost %u) | "
                          "P1 frames shadow equal %llu/%llu flare equal %llu/%llu (shadows %llu of %llu, flares %llu of %llu)\n",
@@ -1300,8 +1502,11 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
 #ifdef EOD_PLUME
         if (!g_r.pending.empty() || !g_r.shadow_pending.empty()) flush();  // before the GS draws something of its own
 #endif
-        if (native_only()) {
+        // EOD_NATIVE_ONLY=2: the GS still draws sprites (2D, HUD, the frame copy to the display
+        // buffer), so the 3D scene on screen is Plume's alone and screenshots can be compared (P3).
+        if (native_only() && !(native_only_level() == 2 && b && !c)) {
             g_only_dropped++;
+            note_drop(e, v, b, c);
             return true;
         }
         return false;
@@ -1311,6 +1516,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
     if (!g_r.ok || (modern::g_on && modern::live())) {  // no renderer: the GS draws the object
         if (native_only()) {
             g_only_dropped++;
+            note_drop(e, v, b, c);
             return true;
         }
         return false;
@@ -1318,6 +1524,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
 #else
     if (native_only()) {
         g_only_dropped++;
+        note_drop(e, v, b, c);
         return true;
     }
     return false;
@@ -1397,5 +1604,7 @@ void gs_vblank(uint64_t frame) {
     end_vblank(frame);
     report(frame);
 }
+
+uint64_t fog_fge_draws() { return g_fge_draws.load(); }
 
 }  // namespace native
