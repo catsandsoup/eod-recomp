@@ -214,9 +214,27 @@ struct DrawSurface {
 struct WorldTextureBinding {
     uint32_t colors[16];
     uint64_t hash;
+    uint64_t index_version;
     uint16_t bases[7];
     uint8_t pitches[7];
     uint8_t levels, function;
+};
+
+constexpr uint32_t kWorldTextureSide = 128;
+constexpr uint32_t kWorldTextureLevels = 7;
+constexpr uint32_t world_texture_index_bytes(uint32_t levels) {
+    uint32_t bytes = 0;
+    for (uint32_t level = 0; level < levels; ++level) {
+        const uint32_t side = kWorldTextureSide >> level;
+        bytes += side * side / 2;
+    }
+    return bytes;
+}
+
+struct WorldTextureIndices {
+    uint64_t version, mip_hashes[kWorldTextureLevels];
+    uint32_t levels;
+    uint8_t data[world_texture_index_bytes(kWorldTextureLevels)];
 };
 
 struct Packet {
@@ -283,7 +301,7 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
 };
 
 enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4,
-                  CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6 };
+                  CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),

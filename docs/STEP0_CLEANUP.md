@@ -352,3 +352,24 @@ as the GS reference.
   against the live uploaded texels before using the source directly.
   Then replace the admitted world's remaining GIF strip and verify the
   surviving compatibility state for its neighbors.
+
+### R7 STAR — immutable EE world indices (2026-11-21)
+
+- **Situation.** Non-clipped world leaves already took the palette and
+  mip placement from EE data. Their index bytes still came from the
+  transient GS banks.
+- **Task.** Provide an ordered, immutable index snapshot for the verified
+  128×128 PSMT4 class and compare it through bank and viewport reuse.
+- **Action.** Read the relocated mip sources, reproduce the indexed upload
+  layout, and keep each REF's snapshot through its first matching MSCAL.
+  Key the native texture by the used mips and palette. Require complete
+  chains for diagnostic comparisons. Preserve the compatibility mip
+  availability and clamp decisions in both draw paths.
+- **Result.** Checked source chains matched in 6× Modern Dundas, Classic
+  Gilroy night, and both Kenyon head-to-head views. Some reference mips
+  were unavailable in night and split views. The default 6× run selected
+  EE bytes with the index comparison unset. Counts and residuals are in
+  NATIVE_RENDERER_SUCCESS.md.
+- **Next decisive test.** Prove the strip's surviving PRIM, RGBAQ, ST/Q
+  and vertex latches, then bypass it for the admitted class. Establish
+  native mip availability before removing the transient bank dependency.

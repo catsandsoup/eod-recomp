@@ -1844,3 +1844,42 @@ compatibility strip still creates the GS reference state and the indexed
 mip bytes still come from the GS texture upload cache. This step supplies
 native binding data for the next strip migration without replacing the GS
 transfer or CLUT latch.
+
+### R7 immutable world texture mip data
+
+The prepared texture record carries each relocated source address at
+`+0x24 + level × 4`. `0x35EEA8` selects the upload dimensions and
+format before passing those bytes to `0x35FC40`. For the admitted square
+128×128 PSMT4 base, the 128-, 64- and 32-pixel levels transfer as CT32
+rectangles of `side / 2` by `side / 4` at pitch one. For sides below
+32, the same routine transfers the linear 4-bit row data directly.
+The CT32 upload's packing corresponds to each indexed sample's byte
+and nibble through the static GS address layout. Invert those addresses
+as `tools/texture_preview.py` does. This conversion uses layout math and
+the immutable source, with no upload storage in the native path.
+
+Copy each source level at EE world record reserve, before the draw can
+outlive the game allocation. Reuse a snapshot only when the mip count
+and every source byte agree. A bounded host cache retains recent copies.
+Each committed world REF keeps its snapshot alive until its first exact
+MSCAL. In ordered submission, a version change sends the source bytes
+ahead of the draw marker and completes the previous object first. A
+draw's version must agree with the installed data. Include all used
+index levels and the palette content in the native cache key, with no
+memory bank address or page generation in its lookup. Keep stock and
+host material tags based on the same decoded base plane, and evaluate
+host alpha from the same decoded native texels.
+
+Compare the native source with each GS mip in diagnostic mode before
+admitting that version for the first draw at a given bank and viewport.
+Use the GS bridge's block-accurate CPU availability test for all levels
+before counting any texels. The diagnostic reports draws whose chain
+could not yet be observed. A subsequent draw may retry that check.
+Verified tuples are reused during the run. The comparison key includes
+the version, base bank and vertical scissor origin, which distinguished
+the two stacked views in the split-screen test. An invalid source or
+unsupported layout retains the existing indexed texture path. The GS
+still supplies the draw descriptor for comparison and determines which
+mips are available. The same base availability and mip clamp apply to
+both byte sources until the compatibility strip and transient upload
+bank are removed.

@@ -3,11 +3,13 @@
 #include "editor_environment.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <array>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -305,6 +307,7 @@ struct Tagged {
     Packet packet;
     bool range;  // any DMA tag in [start, end) (immediate geometry); else the REF to batch + 0x38
     bool retire_world_leaf = false;
+    std::shared_ptr<const WorldTextureIndices> world_indices{};
 };
 std::map<uint32_t, Tagged> g_tags;     // batch packet start -> record; latest writer wins
 std::vector<Mesh *> g_new_meshes;      // decoded, not yet in the GS stream
@@ -1163,9 +1166,52 @@ void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count) {
 }
 
 static WorldTextureBinding g_world_texture;
+static std::shared_ptr<const WorldTextureIndices> g_world_indices;
+
+static std::shared_ptr<const WorldTextureIndices> snapshot_world_indices(uint32_t texture, uint32_t levels) {
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_WORLD_INDICES");
+        return (!value || value[0] != '0') || std::getenv("EOD_NATIVE_WORLD_INDICES_CHECK");
+    }();
+    if (!enabled) return {};
+
+    // Own a version of each load. A relocated heap address is reusable across tracks.
+    uint32_t source[kWorldTextureLevels];
+    for (uint32_t level = 0; level < levels; ++level) {
+        const uint32_t bytes = world_texture_index_bytes(level + 1) - world_texture_index_bytes(level);
+        source[level] = ee_r32(texture + 0x24 + 4 * level);
+        if (!source[level] || (source[level] & 15) || source[level] > EE_RAM_SIZE - bytes) return {};
+    }
+    static std::unordered_map<uint32_t, std::shared_ptr<const WorldTextureIndices>> snapshots;
+    if (snapshots.size() >= 512 && !snapshots.count(texture))
+        snapshots.clear();
+    auto &cached = snapshots[texture];
+    if (cached && cached->levels == levels) {
+        bool equal = true;
+        for (uint32_t level = 0; level < levels && equal; ++level) {
+            const uint32_t offset = world_texture_index_bytes(level);
+            const uint32_t bytes = world_texture_index_bytes(level + 1) - offset;
+            equal = !std::memcmp(cached->data + offset, g_ram + source[level], bytes);
+        }
+        if (equal) return cached;
+    }
+    static uint64_t next_version = 0;
+    auto snapshot = std::make_shared<WorldTextureIndices>();
+    snapshot->version = ++next_version;
+    snapshot->levels = levels;
+    for (uint32_t level = 0; level < levels; ++level) {
+        const uint32_t offset = world_texture_index_bytes(level);
+        const uint32_t end = world_texture_index_bytes(level + 1);
+        std::memcpy(snapshot->data + offset, g_ram + source[level], end - offset);
+        snapshot->mip_hashes[level] = XXH3_64bits(snapshot->data, end);
+    }
+    cached = snapshot;
+    return snapshot;
+}
 
 void ee_world_material(int32_t slot) {
     g_world_texture = {};
+    g_world_indices.reset();
     if (!enabled() || slot < 0 || ee_r32(0x4D2D38) != uint32_t(slot)) return;
     const uint32_t table = ee_r32(0x4D2D30);
     constexpr uint32_t stride = 0x44;
@@ -1203,6 +1249,8 @@ void ee_world_material(int32_t slot) {
         hash ^= hash >> 29;
     }
     g_world_texture.hash = hash;
+    g_world_indices = snapshot_world_indices(texture, levels);
+    if (g_world_indices) g_world_texture.index_version = g_world_indices->version;
 }
 
 void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop) {
@@ -1272,7 +1320,8 @@ void ee_world_record(bool committed) {
         while (it != g_tags.end() && it->first < a + 16) it = g_tags.erase(it);
         const Packet &leaf = l.second;
         const bool eligible = retire_enabled && leaf.itop == 0x80 && leaf.mesh != 0;
-        g_tags[a] = Tagged{a + 16, leaf, false, eligible};
+        g_tags[a] = Tagged{a + 16, leaf, false, eligible,
+                           leaf.world_texture.index_version ? g_world_indices : nullptr};
         g_wc.leaves++;
     }
     g_leaves.clear();
@@ -2032,6 +2081,7 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod) {
     const uint32_t tag = g_vif1_dma_tag;
     std::vector<Mesh *> meshes;
     Packet p;
+    std::shared_ptr<const WorldTextureIndices> world_indices;
     bool found = false;
     bool retire_world_leaf = false;
     {
@@ -2043,6 +2093,10 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod) {
             if (tag < it->second.end &&
                 (it->second.range || (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38)) {
                 p = it->second.packet;
+                if (program == 0x0270 && itop == 0x80) {
+                    world_indices = std::move(it->second.world_indices);
+                    if (!world_indices) p.world_texture.index_version = 0;
+                }
                 if (tag == it->first && it->second.retire_world_leaf) {
                     // Consume the commit at its first MSCAL. A continuation or stale
                     // reference may still use the marker but cannot retire another leaf.
@@ -2069,6 +2123,12 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod) {
     if (p.kind == KIND_QUEUE) p.itop = itop;  // world, water, shadow, flare carry the ITOP their EE packet sets
     p.program = program;
     if (p.kind != KIND_SHADOW && p.kind != KIND_PARTICLE && p.kind != KIND_SPRITE) check(p);  // shadow uses main-viewport cam; particles/sprites use vf2..vf5
+    static uint64_t sent_index_version;
+    if (world_indices && sent_index_version != world_indices->version) {
+        post(CMD_WORLD_TEXTURE_INDICES, world_indices.get(),
+             offsetof(WorldTextureIndices, data) + world_texture_index_bytes(world_indices->levels));
+        sent_index_version = world_indices->version;
+    }
     post(CMD_OBJ, &p, sizeof p);
     g_obj_active = true;
     g_sent_key = key;

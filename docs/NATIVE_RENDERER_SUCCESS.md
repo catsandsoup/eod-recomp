@@ -869,3 +869,65 @@ storage still supplies the indexed mip texels. This is a binding change,
 and the whole-run VU1, GIF and GS counters still fail R7. Both arms of
 the separately timed night and split runs recorded legacy deferred
 waits, and the binding adds no wait operation.
+
+## R7 world indexed mip bytes from EE assets (2026-11-21)
+
+The admitted non-clipped `0x0270` draws can decode their transient
+128×128 PSMT4 mips from an immutable snapshot of the prepared EE texture.
+The native texture key uses the bytes through the selected mip level and
+the EE palette. The GS still provides the draw descriptor and the existing
+base and mip availability decisions. Unsupported sources retain the
+compatibility path.
+
+`EOD_NATIVE_WORLD_INDICES_CHECK=1` compares the entire chain once for each
+observable version, destination bank and view. Checks with an unavailable
+reference mip count as unobserved attempts and may be retried. They do not
+contribute to the texel count. With that check enabled,
+`EOD_NATIVE_WORLD_INDICES=0` compares without selecting the EE byte
+source. `EOD_R7_AUDIT=1` also reports selections with the comparison unset.
+
+| Public macOS headless case | Complete checks | Texels compared | Mismatches | EE source selections | Unobserved attempts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dundas, Modern 6× | 158 | 3,448,192 | 0 | 31,768 | 0 |
+| Dundas, Modern 6×, EE indices disabled | 158 | 3,448,192 | 0 | 0 | 0 |
+| Dundas, Modern 6×, comparison unset | 0 | 0 | 0 | 33,920 | 0 |
+| Gilroy night, Classic 1× | 54 | 1,178,496 | 0 | 33,274 | 1,714 |
+| Gilroy night, Classic 1×, EE indices disabled | 54 | 1,178,496 | 0 | 0 | 1,712 |
+| Kenyon head-to-head, Classic 1× | 189 | 4,124,736 | 0 | 67,085 | 2,725 |
+| Kenyon head-to-head, Classic 1×, EE indices disabled | 189 | 4,124,736 | 0 | 0 | 2,754 |
+
+The three enabled comparison runs totaled 401 complete checks and
+8,751,424 texels, an average of 21,824 per check. That corresponds to
+the size of a five-level chain. The comparison records do not establish
+individual live coverage for 4×4 or 2×2 mips. Kenyon joined two players
+and reported `viewcount3D1A74 2`.
+At banks `0x2BC4` and `0x2FC8` it verified 49 and 49 source versions in the
+upper view and 45 and 46 in the lower view. All P1 counters printed in these
+samples showed submitted world leaves drawn. The Dundas differential
+checked 1,176 calls to `0x358BD0` with zero mismatches. The public and
+local Mac builds linked, all 99 macOS CTests passed, and the Windows
+public executable cross-linked. No authorized Windows game install path
+was available for replacement with backup or runtime testing.
+
+An independent rerun matched 8,707,776 texels over 399 complete checks
+in the same enabled scene set, and all 1,208 Dundas differential calls
+matched. The ordinary 6× run selected EE indices 32,971 times. An
+isolated, ad-hoc signed macOS bundle passed strict signature
+verification and ran the 6× Dundas Modern headless smoke with Plume
+required, selecting EE indices 32,516 times. The bundle still failed
+the R7 runtime gate.
+
+Independently paced 640×448 Classic scanouts included two disabled runs
+per fixture. The median RGB MAE (out of 255) at the same capture vblank
+was 1.749 enabled/disabled and 2.468 disabled/disabled for Dundas, 0.036
+and 0.012 for Gilroy, and 3.121 and 3.498 for Kenyon. The closest Kenyon
+same-vblank pair had MAE 0.084 in the upper view and 0.148 in the lower
+view. The separately paced runs do not establish equal simulation poses
+at a given capture vblank or pixel-exact parity.
+
+The ordinary 6× run retained 171,371 VU1 starts, 33,833,479 GIF qwords and
+94 GS raster submissions. Gilroy and Kenyon retained one and six deferred
+waits in their checked runs. These runs recorded zero synchronous VRAM
+readbacks, CLUT waits and suppressed GS primitives. The R7 runtime gate still
+fails. The world strip, transient upload banks and availability of GS mip
+storage remain dependencies of this slice.

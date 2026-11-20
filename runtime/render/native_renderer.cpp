@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -51,6 +53,7 @@ std::atomic<uint64_t> g_fge_draws{0};
 std::atomic<uint64_t> g_mip_clamped{0};   // EE TEX1.MXL above the levels the GS state decodes
 std::atomic<uint64_t> g_mip_textures{0};  // textures decoded with mip levels
 std::atomic<uint64_t> g_mip_rt{0};        // lookups whose level n lies in GPU-rendered pages (levels < n used)
+std::atomic<uint64_t> g_world_indices_used{0};
 uint64_t g_runk_ok = 0, g_runk_bad = 0;  // EE per-run TEX1.K against the GS K sequence (run_k_check)
 std::atomic<uint64_t> g_afail_second{0};
 std::atomic<uint64_t> g_k_mixed{0};       // batches whose VU1 runs have different K deltas (first used)  // objects drawn with an alpha-test-failed second pass
@@ -593,14 +596,15 @@ void load_materials() {
 }
 
 // Read the original identity once for both material tags and HOSTTEX lookup.
-MatKey indexed_texture_key(const gs::Env &e, const uint32_t *palette, uint32_t base, uint32_t pitch) {
+template<class ReadIndex>
+MatKey indexed_texture_key(const gs::Env &e, const uint32_t *palette, ReadIndex read_index) {
     const bool eight = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT8H;
     g_textures_indexed++;
     static std::vector<uint8_t> plane;
     plane.resize((size_t)e.tw * e.th);
     for (uint32_t y = 0; y < e.th; y++)
         for (uint32_t x = 0; x < e.tw; x++)
-            plane[(size_t)y * e.tw + x] = (uint8_t)gs::read_pixel(e.tpsm, (int)x, (int)y, base, pitch);
+            plane[(size_t)y * e.tw + x] = read_index(x, y, 0);
     return {gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data()),
             gs::hosttex::palette_key(palette, eight ? 256 : 16), e.tw, e.th};
 }
@@ -725,7 +729,53 @@ plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
     return make(sampler);
 }
 
-// The object's texture from GS memory (TEX0 as its first draw had it). The texture manager
+// The converted form of a square indexed upload, from a source nibble to
+// each sampled index. The address functions supply layouts only.
+struct WorldIndexLayout {
+    std::array<uint16_t, world_texture_index_bytes(kWorldTextureLevels) * 2> lanes{};
+    bool valid = false;
+
+    WorldIndexLayout() {
+        std::array<uint16_t, kWorldTextureSide * kWorldTextureSide / 8> source_words;
+        for (uint32_t level = 0; level < kWorldTextureLevels; ++level) {
+            const uint32_t side = kWorldTextureSide >> level;
+            const uint32_t first = world_texture_index_bytes(level) * 2;
+            if (side < 32) {
+                for (uint32_t i = 0; i < side * side; ++i) lanes[first + i] = uint16_t(first + i);
+                continue;
+            }
+            const uint32_t w = side / 2, h = side / 4;
+            source_words.fill(UINT16_MAX);
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x) {
+                    const uint32_t word = gs::addr32(x, y, 0, 1);
+                    if (word >= source_words.size()) return;
+                    source_words[word] = uint16_t(first + (y * w + x) * 8);
+                }
+            for (uint32_t y = 0; y < side; ++y)
+                for (uint32_t x = 0; x < side; ++x) {
+                    const uint32_t nibble = gs::addr4(x, y, 0, (side + 63) / 64);
+                    const uint32_t word = nibble / 8;
+                    if (word >= source_words.size() || source_words[word] == UINT16_MAX) return;
+                    lanes[first + y * side + x] = uint16_t(source_words[word] + nibble % 8);
+                }
+        }
+        valid = true;
+    }
+};
+
+const WorldIndexLayout &world_index_layout() {
+    static const WorldIndexLayout layout;
+    return layout;
+}
+
+uint8_t world_index(const WorldTextureIndices &indices, uint32_t x, uint32_t y, uint32_t level) {
+    const uint32_t first = world_texture_index_bytes(level) * 2;
+    const uint32_t lane = world_index_layout().lanes[first + y * (kWorldTextureSide >> level) + x];
+    return (indices.data[lane / 2] >> ((lane & 1) * 4)) & 15;
+}
+
+// The compatibility texture from GS memory (TEX0 as its first draw had it). The texture manager
 // uploads each bucket's texture into one of two shared slots (TEX0 0x2BC4 / 0x2FC8 in races), so
 // textures are cached by content: the bytes of the GS memory pages they occupy plus the TEX0
 // fields that decide the decoding (block offset, width, format, size, CLUT, TEXA). An address
@@ -734,7 +784,7 @@ plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
 // `levels`: the mip levels beyond the base the draw's TEX1.MXL selects (stage R5 A2), each read at
 // its MIPTBP address (0x35F9A0 writes MIPTBP1/2 from the level offsets 0x35F278 computes).
 Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_region = false,
-                 const WorldTextureBinding *binding = nullptr) {
+                 const WorldTextureBinding *binding = nullptr, const WorldTextureIndices *indices = nullptr) {
     if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
     // the GS state decodes levels only as far as its own TEX1 asks (gs_draw.cpp setup_env)
     const uint32_t decodable = (e.mmin >= 2 && e.mxl > 0) ? (uint32_t)std::min(e.mxl, 6) : 0;
@@ -744,6 +794,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     }
     const auto base = [&](uint32_t level) { return binding ? uint32_t(binding->bases[level]) : e.mip_tbp[level]; };
     const auto pitch = [&](uint32_t level) { return binding ? uint32_t(binding->pitches[level]) : e.mip_tbw[level]; };
+    // Preserve the compatibility draw's available mip range while its GS bank is live.
     uint32_t first, count;
     gs::page_range(base(0), pitch(0), e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
     if (!(exact_region ? gs::hw::native_texture_region_on_cpu(e) : gs::hw::native_texture_on_cpu(first, count))) {
@@ -753,7 +804,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     for (uint32_t l = 1; l <= levels; l++) {
         uint32_t f2, c2;
         gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
-        if (!gs::hw::native_texture_on_cpu(f2, c2)) {  // a level in GPU-rendered pages: the levels above it only
+        if (!gs::hw::native_texture_on_cpu(f2, c2)) {
             g_mip_rt.fetch_add(1);
             levels = l - 1;
             break;
@@ -763,71 +814,85 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
                          e.tpsm == gs::PSMT4HL || e.tpsm == gs::PSMT4HH;
     const uint32_t *palette = binding ? binding->colors : e.pal;
     const uint64_t palette_hash = binding ? binding->hash : e.pal_hash;
+    const auto read_index = [&](uint32_t u, uint32_t v, uint32_t level) -> uint8_t {
+        if (indices) return world_index(*indices, u, v, level);
+        return uint8_t(gs::read_pixel(e.tpsm, int(u), int(v), base(level), pitch(level)));
+    };
     const auto texel = [&](uint32_t u, uint32_t v, uint32_t level) {
-        if (binding)
-            return palette[gs::read_pixel(e.tpsm, int(u), int(v), base(level), pitch(level))];
+        if (binding) return palette[read_index(u, v, level)];
         return gs::tex_fetch(e, int(u), int(v), int(level));
     };
-    uint64_t k[5] = {(base(0) & 31) | (uint64_t)pitch(0) << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
-                     indexed ? palette_hash : 0,
-                     e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
-    k[4] = base(0);
-    k[1] |= (uint64_t)levels << 48;
-    uint64_t mk[6] = {};
-    for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = base(l) | (uint64_t)pitch(l) << 32;
-    const uint64_t addr_key = XXH3_64bits(k, sizeof k) ^ (levels ? XXH3_64bits(mk, sizeof mk) : 0);
-    AddrEntry &ae = g_r.by_addr[addr_key];
-    if (ae.tex) {
-        bool ok = true;
-        for (uint32_t i = 0; i < count && ok; i++)
-            if (gs::g_page_gen[(first + i) % gs::kPages] > ae.stamp) ok = false;
-        for (uint32_t l = 1; l <= levels && ok; l++) {
-            uint32_t f2, c2;
-            gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
-            for (uint32_t i = 0; i < c2 && ok; i++)
-                if (gs::g_page_gen[(f2 + i) % gs::kPages] > ae.stamp) ok = false;
+    AddrEntry *address = nullptr;
+    uint64_t key;
+    if (indices) {
+        static const bool report_use = std::getenv("EOD_NATIVE_WORLD_INDICES_CHECK") || std::getenv("EOD_R7_AUDIT");
+        if (report_use) g_world_indices_used.fetch_add(1, std::memory_order_relaxed);
+        // Equal asset bytes in either upload bank share the same native texture.
+        const uint64_t identity[] = {indices->mip_hashes[levels], palette_hash, levels};
+        key = XXH3_64bits_withSeed(identity, sizeof identity, 0x50534D5434ull);
+    } else {
+        uint64_t k[5] = {(base(0) & 31) | (uint64_t)pitch(0) << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
+                         indexed ? palette_hash : 0,
+                         e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
+        k[4] = base(0);
+        k[1] |= (uint64_t)levels << 48;
+        uint64_t mk[6] = {};
+        for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = base(l) | (uint64_t)pitch(l) << 32;
+        const uint64_t addr_key = XXH3_64bits(k, sizeof k) ^ (levels ? XXH3_64bits(mk, sizeof mk) : 0);
+        address = &g_r.by_addr[addr_key];
+        if (address->tex) {
+            bool ok = true;
+            for (uint32_t i = 0; i < count && ok; i++)
+                if (gs::g_page_gen[(first + i) % gs::kPages] > address->stamp) ok = false;
+            for (uint32_t l = 1; l <= levels && ok; l++) {
+                uint32_t f2, c2;
+                gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+                for (uint32_t i = 0; i < c2 && ok; i++)
+                    if (gs::g_page_gen[(f2 + i) % gs::kPages] > address->stamp) ok = false;
+            }
+            if (ok) {
+                address->tex->last_use = g_r.vb;
+                return address->tex;
+            }
         }
-        if (ok) {
-            ae.tex->last_use = g_r.vb;
-            return ae.tex;
-        }
-    }
-    // content key
-    XXH3_state_t *st = g_r.hash_state;
-    XXH3_64bits_reset(st);
-    XXH3_64bits_update(st, k, sizeof k - sizeof k[4]);
-    // the 256-byte GS memory blocks the texture covers (pages also hold other textures and CLUTs)
-    {
-        int bw = 8, bh = 8;
-        switch (e.tpsm) {
-        case gs::PSMCT16: case gs::PSMCT16S: bw = 16, bh = 8; break;
-        case gs::PSMT8: bw = 16, bh = 16; break;
-        case gs::PSMT4: bw = 32, bh = 16; break;
-        default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
-        }
-        for (uint32_t l = 0; l <= levels; l++) {
-            const uint32_t bp = base(l), bwid = pitch(l);
-            const int lw = std::max(1, (int)e.tw >> l), lh = std::max(1, (int)e.th >> l);
-            for (int y = 0; y < lh; y += bh)
-                for (int x = 0; x < lw; x += bw) {
-                    uint32_t byte;
-                    switch (e.tpsm) {
-                    case gs::PSMCT16: byte = gs::addr16(x, y, bp, bwid) * 2; break;
-                    case gs::PSMCT16S: byte = gs::addr16s(x, y, bp, bwid) * 2; break;
-                    case gs::PSMT8: byte = gs::addr8(x, y, bp, bwid); break;
-                    case gs::PSMT4: byte = gs::addr4(x, y, bp, bwid) / 2; break;
-                    default: byte = gs::addr32(x, y, bp, bwid) * 4; break;
+        // content key
+        XXH3_state_t *st = g_r.hash_state;
+        XXH3_64bits_reset(st);
+        XXH3_64bits_update(st, k, sizeof k - sizeof k[4]);
+        // the 256-byte GS memory blocks the texture covers (pages also hold other textures and CLUTs)
+        {
+            int bw = 8, bh = 8;
+            switch (e.tpsm) {
+            case gs::PSMCT16: case gs::PSMCT16S: bw = 16, bh = 8; break;
+            case gs::PSMT8: bw = 16, bh = 16; break;
+            case gs::PSMT4: bw = 32, bh = 16; break;
+            default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
+            }
+            for (uint32_t l = 0; l <= levels; l++) {
+                const uint32_t bp = base(l), bwid = pitch(l);
+                const int lw = std::max(1, (int)e.tw >> l), lh = std::max(1, (int)e.th >> l);
+                for (int y = 0; y < lh; y += bh)
+                    for (int x = 0; x < lw; x += bw) {
+                        uint32_t byte;
+                        switch (e.tpsm) {
+                        case gs::PSMCT16: byte = gs::addr16(x, y, bp, bwid) * 2; break;
+                        case gs::PSMCT16S: byte = gs::addr16s(x, y, bp, bwid) * 2; break;
+                        case gs::PSMT8: byte = gs::addr8(x, y, bp, bwid); break;
+                        case gs::PSMT4: byte = gs::addr4(x, y, bp, bwid) / 2; break;
+                        default: byte = gs::addr32(x, y, bp, bwid) * 4; break;
+                        }
+                        XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
                     }
-                    XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
-                }
+            }
         }
+        key = XXH3_64bits_digest(st);
+        address->stamp = gs::g_vram_clock;
     }
-    const uint64_t key = XXH3_64bits_digest(st);
-    ae.stamp = gs::g_vram_clock;
     if (const auto it = g_r.textures.find(key); it != g_r.textures.end()) {
-        ae.tex = it->second.get();
-        ae.tex->last_use = g_r.vb;
-        return ae.tex;
+        Texture *cached = it->second.get();
+        if (address) address->tex = cached;
+        cached->last_use = g_r.vb;
+        return cached;
     }
     auto next = std::make_unique<Texture>();
     Texture &t = *next;
@@ -838,7 +903,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     const bool candidate = store && store->has_dims(e.tw, e.th);
     int found = -1;
     if (indexed && (!g_mats.empty() || candidate)) {
-        const MatKey id = indexed_texture_key(e, palette, base(0), pitch(0));
+        const MatKey id = indexed_texture_key(e, palette, read_index);
         t.mat = material_of(id);
         if (candidate) {
             std::string why;
@@ -859,9 +924,9 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         // Distinct guest placements and mip selections can refer to the same large host image.
         replacement_id = 1 + ((uint64_t)found << 33 | (uint64_t)(t.mat + 1) << 1 | (uint64_t)gs_alpha);
         if (const auto it = g_r.replacements.find(replacement_id); it != g_r.replacements.end()) {
-            ae.tex = it->second;
-            ae.tex->last_use = g_r.vb;
-            return ae.tex;
+            if (address) address->tex = it->second;
+            it->second->last_use = g_r.vb;
+            return it->second;
         }
     }
     const auto prepare_upload = [&](uint32_t w, uint32_t h, uint32_t mip_count) -> uint8_t * {
@@ -893,7 +958,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         t.tex.reset();
         dst = prepare_upload(e.tw, e.th, levels + 1);
         if (!dst) {
-            ae.tex = nullptr;
+            if (address) address->tex = nullptr;
             return nullptr;
         }
     }
@@ -942,7 +1007,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
                      replacement->asset_id.c_str(), replacement->package_id.c_str(), t.w, t.h, t.levels, alpha_lo, alpha_hi);
     }
     g_r.textures.emplace(key, std::move(next));
-    ae.tex = &t;
+    if (address) address->tex = &t;
     if (levels) g_mip_textures.fetch_add(1);
     g_r.decoded++;
     return &t;
@@ -2551,6 +2616,58 @@ struct SurfaceCheck { uint64_t matched, mismatched, unobserved; };
 std::map<std::array<int32_t, 4>, SurfaceCheck> g_world_surfaces;
 uint64_t g_world_texture_matches, g_world_texture_mismatches, g_world_texture_used;
 std::map<std::pair<int32_t, uint16_t>, std::unordered_set<uint64_t>> g_world_texture_slots;
+WorldTextureIndices g_world_indices{};
+uint64_t g_world_indices_mismatches, g_world_indices_compared, g_world_indices_unobserved;
+std::map<std::tuple<uint64_t, uint16_t, int32_t>, bool> g_world_index_checks;
+
+const WorldTextureIndices *draw_world_indices(const WorldTextureBinding *binding, const gs::Env &e) {
+    if (!binding || !binding->index_version || binding->index_version != g_world_indices.version ||
+        binding->levels != g_world_indices.levels)
+        return nullptr;
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_WORLD_INDICES");
+        return !value || value[0] != '0';
+    }();
+    static const bool check = std::getenv("EOD_NATIVE_WORLD_INDICES_CHECK") != nullptr;
+    if (!world_index_layout().valid) return nullptr;
+    if (check) {
+        std::lock_guard<std::mutex> lock(g_st_mutex);
+        const auto key = std::make_tuple(g_world_indices.version, binding->bases[0], e.scy0);
+        auto found = g_world_index_checks.find(key);
+        if (found == g_world_index_checks.end()) {
+            gs::Env mip{};
+            mip.tpsm = gs::PSMT4;
+            for (uint32_t level = 0; level < binding->levels; ++level) {
+                mip.tw = mip.th = kWorldTextureSide >> level;
+                mip.tbp = binding->bases[level];
+                mip.tbw = binding->pitches[level];
+                if (!gs::hw::native_texture_region_on_cpu(mip)) {
+                    ++g_world_indices_unobserved;
+                    return nullptr;
+                }
+            }
+            bool equal = true;
+            for (uint32_t level = 0; level < binding->levels; ++level) {
+                const uint32_t side = kWorldTextureSide >> level;
+                for (uint32_t y = 0; y < side; ++y)
+                    for (uint32_t x = 0; x < side; ++x) {
+                        const uint8_t source = world_index(g_world_indices, x, y, level);
+                        const uint32_t reference = gs::read_pixel(gs::PSMT4, x, y, binding->bases[level], binding->pitches[level]);
+                        ++g_world_indices_compared;
+                        if (source != reference) {
+                            if (g_world_indices_mismatches++ < 4)
+                                std::fprintf(stderr, "[native] world index mismatch slot %x level %u pixel %u,%u: EE %u GS %u\n",
+                                             binding->bases[0], level, x, y, source, reference);
+                            equal = false;
+                        }
+                    }
+            }
+            found = g_world_index_checks.emplace(key, equal).first;
+        }
+        if (!found->second) return nullptr;
+    }
+    return enabled ? &g_world_indices : nullptr;
+}
 
 const WorldTextureBinding *draw_world_texture(const Packet &p, const gs::Env &e) {
     if (!g_have_env || !p.world_texture.levels || p.kind != KIND_WORLD ||
@@ -2628,6 +2745,19 @@ void state_report() {
                                          "sprite", "immediate", "cockpit", "hud"};
     static_assert(names.size() == KIND_COUNT, "every native draw kind needs a state report name");
     std::lock_guard<std::mutex> lk(g_st_mutex);
+    const uint64_t indices_used = g_world_indices_used.load(std::memory_order_relaxed);
+    if (g_world_indices_compared || g_world_indices_unobserved || indices_used) {
+        std::fprintf(stderr, "[native] world EE indices: %zu version/bank/view checks, %llu texels compared, %llu mismatched, %llu draws used, %llu unobserved draw checks\n",
+                     g_world_index_checks.size(), (unsigned long long)g_world_indices_compared,
+                     (unsigned long long)g_world_indices_mismatches, (unsigned long long)indices_used,
+                     (unsigned long long)g_world_indices_unobserved);
+        std::map<std::pair<int32_t, uint16_t>, size_t> matched;
+        for (const auto &[key, equal] : g_world_index_checks)
+            if (equal) ++matched[{std::get<2>(key), std::get<1>(key)}];
+        for (const auto &[slot, versions] : matched)
+            std::fprintf(stderr, "[native] world EE indices view y=%d slot %x: %zu matched source versions\n",
+                         slot.first, slot.second, versions);
+    }
     if (g_world_texture_matches || g_world_texture_mismatches) {
         std::fprintf(stderr, "[native] world EE texture: %llu matched, %llu mismatched, %llu used\n",
                      (unsigned long long)g_world_texture_matches, (unsigned long long)g_world_texture_mismatches,
@@ -2834,7 +2964,8 @@ void finalize() {
     }
     static const uint32_t ab = std::getenv("EOD_R5A2_OFF") ? (uint32_t)std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) : 0u;
     const WorldTextureBinding *world_texture = draw_world_texture(g_cur, e);
-    it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0, false, world_texture);
+    const WorldTextureIndices *world_indices = draw_world_indices(world_texture, e);
+    it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0, false, world_texture, world_indices);
     const bool replacement = it.tex && it.tex->replacement_id;
     uint32_t m = 0;
     if (it.tex) {
@@ -3694,6 +3825,19 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
         finalize();
         g_active = false;
         break;
+    case CMD_WORLD_TEXTURE_INDICES: {
+#ifdef EOD_PLUME
+        constexpr uint32_t header = offsetof(WorldTextureIndices, data);
+        if (size < header) return;
+        uint32_t levels;
+        std::memcpy(&levels, static_cast<const uint8_t *>(data) + offsetof(WorldTextureIndices, levels), sizeof levels);
+        if (!levels || levels > kWorldTextureLevels || size != header + world_texture_index_bytes(levels))
+            return;
+        finalize();
+        std::memcpy(&g_world_indices, data, size);
+#endif
+        break;
+    }
     case CMD_MESH: {
         Mesh *m;
         std::memcpy(&m, data, sizeof m);
