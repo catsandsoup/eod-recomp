@@ -1,0 +1,81 @@
+name: Windows x64 release package smoke
+run-name: Windows x64 package smoke · ${{ inputs.tag }} · release ${{ inputs.release_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact draft release tag
+        required: true
+        type: string
+      release_id:
+        description: Numeric draft release ID
+        required: true
+        type: string
+      source_sha:
+        description: Full Git commit SHA targeted by the draft
+        required: true
+        type: string
+      package_mode:
+        description: Which Windows ZIPs are expected
+        type: choice
+        default: combined
+        options:
+          - combined
+          - separate
+          - game-only
+          - editor-only
+      game_asset:
+        description: Exact Windows game or combined bundle ZIP name, if supplied
+        default: ''
+        type: string
+      game_sha256:
+        description: SHA-256 of the game or combined ZIP, if supplied
+        default: ''
+        type: string
+      editor_asset:
+        description: Exact standalone Windows editor ZIP name, if supplied
+        default: ''
+        type: string
+      editor_sha256:
+        description: SHA-256 of the separate editor ZIP, if supplied
+        default: ''
+        type: string
+
+permissions: {}
+
+jobs:
+  smoke:
+    if: github.repository == 'catsandsoup/eod-recomp'
+    runs-on: windows-2022
+    timeout-minutes: 12
+    # Download the exact draft directly by ID. Pass the token only to the fetch step.
+    permissions:
+      contents: read
+    env:
+      EOD_RELEASE_TAG: ${{ inputs.tag }}
+      EOD_RELEASE_ID: ${{ inputs.release_id }}
+      EOD_SOURCE_SHA: ${{ inputs.source_sha }}
+      EOD_PACKAGE_MODE: ${{ inputs.package_mode }}
+      EOD_GAME_ASSET: ${{ inputs.game_asset }}
+      EOD_GAME_SHA256: ${{ inputs.game_sha256 }}
+      EOD_EDITOR_ASSET: ${{ inputs.editor_asset }}
+      EOD_EDITOR_SHA256: ${{ inputs.editor_sha256 }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the smoke scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/windows-smoke
+      - name: Fetch and authenticate the exact draft assets
+        env:
+          EOD_DRAFT_TOKEN: ${{ github.token }}
+        run: ./tools/windows-smoke/Fetch-DraftAssets.ps1
+      - name: Run clean native package smoke
+        run: |
+          ./tools/windows-smoke/Test-WindowsPackages.ps1 -Scratch (
+              Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          )
