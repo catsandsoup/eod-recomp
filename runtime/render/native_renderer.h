@@ -96,7 +96,9 @@ void ee_sprite_add(const uint32_t col[4], int32_t flip, float size, float x, flo
 void ee_atlas_sprite_add(const uint32_t col[4], int32_t tile, int32_t grid_shift, int32_t grid_mask,
                          float size, float x, float y, float z);
 void ee_sprite_end(bool drawn);
-void ee_imm_begin(bool cockpit);
+// hud: native 2D (R7 A1b): 0x35CAA0 from the rect / sprite leaves 0x11E730 / 0x29E138 and the
+// text flush 0x29A2B8 -> 0x35DF10; drawn as KIND_HUD (never relit by Modern)
+void ee_imm_begin(bool cockpit, bool hud = false);
 bool ee_in_imm();
 void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
 void ee_imm_end(bool drawn);
@@ -115,6 +117,7 @@ void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count);
 struct Expected {
     uint32_t world = 0, water = 0, queue = 0, shadow = 0, flare = 0;  // per EE frame P1 counters
     uint32_t particle = 0, sprite = 0, immediate = 0, cockpit = 0;  // R4 Phase A2 P1 counters
+    uint32_t hud = 0;                                                // R7 A1b P1 counter
 };
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out);
 // EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
@@ -138,7 +141,8 @@ enum : uint32_t {
     KIND_SPRITE = 6,
     KIND_IMMEDIATE = 7,
     KIND_COCKPIT = 8,
-    KIND_COUNT = 9
+    KIND_HUD = 9,  // native 2D: race HUD rects, frame sprites, text (R7 A1b)
+    KIND_COUNT = 10
 };
 struct Packet {
     uint64_t frame;            // EE vblank of the frame it was queued in

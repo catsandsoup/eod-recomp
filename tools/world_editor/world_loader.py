@@ -576,18 +576,23 @@ class WorldObject:
     retail_model_offset: int | None = None
     retail_initial_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     retail_initial_rot: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    retail_initial_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     retail_event_member: str | None = None
     retail_event_section: str | None = None
     retail_event_prop_index: int | None = None
     retail_original_model_key: str | None = None
     opt_terrain_mode: int | None = None
+    compound_id: str = ""
+    compound_label: str = ""
+    user_group_id: str = ""
+    physics_mode: str = "Fixed"  # "Normal" | "Fixed" | "Phased"
 
     def is_transformed(self) -> bool:
         if self.source != "Retail":
             return True
         moved = any(abs(a - b) > 1e-4 for a, b in zip(self.position, self.retail_initial_pos))
         rotated = any(abs(a - b) > 1e-4 for a, b in zip(self.rotation_hpr, self.retail_initial_rot))
-        scaled = any(abs(s - 1.0) > 1e-4 for s in self.scale)
+        scaled = any(abs(a - b) > 1e-4 for a, b in zip(self.scale, self.retail_initial_scale))
         return moved or rotated or scaled
 
     def world_matrix(self) -> np.ndarray:
@@ -797,6 +802,7 @@ class EnvironmentState:
     fog_end: float = 2200.0
     fog_density: float = 0.72
     borrowed_sky_track: str | None = None
+    custom_skybox_path: str | None = None
 
     def apply_preset(self, preset_name: str) -> None:
         cfg = ENVIRONMENT_PRESETS.get(preset_name)
@@ -838,6 +844,7 @@ class EnvironmentState:
             "fog_end": self.fog_end,
             "fog_density": self.fog_density,
             "borrowed_sky_track": self.borrowed_sky_track,
+            "custom_skybox_path": self.custom_skybox_path,
         }
 
     @classmethod
@@ -853,6 +860,7 @@ class EnvironmentState:
             if k in d:
                 setattr(st, k, float(d[k]))
         st.borrowed_sky_track = d.get("borrowed_sky_track")
+        st.custom_skybox_path = d.get("custom_skybox_path")
         return st
 
 
@@ -1010,12 +1018,8 @@ class CollisionData:
             if obj.deleted or not obj.visible:
                 continue
             is_opt_ramp = obj.category == "optional-terrain"
-            is_edited_static_ramp = (
-                obj.category == "static"
-                and obj.is_transformed()
-                and any(tok in obj.name.lower() for tok in ("ramp", "dirt", "jump", "bridge", "hill"))
-            )
-            if not is_opt_ramp and not is_edited_static_ramp:
+            is_edited_static_mesh = obj.category == "static" and obj.is_transformed()
+            if not is_opt_ramp and not is_edited_static_mesh:
                 continue
             model = world.models.get(obj.model_key)
             if model is None:
@@ -1184,6 +1188,10 @@ class TrackWorld:
     active_event_template: str = "All Templates (Combined)"
     sync_all_events: bool = True
     include_lod_twins: bool = True
+    all_walls_noclip: bool = False
+    compound_groups: dict[str, list[str]] = field(default_factory=dict)
+    user_groups: dict[str, list[str]] = field(default_factory=dict)
+    _next_user_group_seq: int = 1
     car_catalog_loaded: bool = False
     car_count: int = 0
     loaded_from_cache: bool = False
@@ -1204,6 +1212,284 @@ class TrackWorld:
             if o.obj_id == obj_id and not o.deleted:
                 return o
         return None
+
+    def get_active_group_id(self, obj: WorldObject | None) -> str:
+        """Return user_group_id (if user-grouped) else auto compound_id, or empty string."""
+        if obj is None:
+            return ""
+        return obj.user_group_id or obj.compound_id or ""
+
+    def get_group_members(self, obj: WorldObject | None, *, visible_only: bool = True) -> list[WorldObject]:
+        """Return all members of `obj`'s active group (user group takes precedence over auto compound)."""
+        if obj is None or obj.deleted:
+            return []
+        gid = self.get_active_group_id(obj)
+        if not gid:
+            return [obj]
+        out: list[WorldObject] = []
+        if obj.user_group_id:
+            for o in self.objects:
+                if o.deleted or o.user_group_id != gid:
+                    continue
+                if visible_only and not self.object_visible_in_event_template(o):
+                    continue
+                out.append(o)
+        else:
+            for o in self.objects:
+                if o.deleted or o.user_group_id or o.compound_id != gid:
+                    continue
+                if visible_only and not self.object_visible_in_event_template(o):
+                    continue
+                out.append(o)
+        return out if out else [obj]
+
+    def create_user_group(self, objs: list[WorldObject], group_id: str | None = None) -> str:
+        """Group the given objects into a single named user group (Ctrl+G)."""
+        valid = [o for o in objs if o is not None and not o.deleted]
+        if len(valid) < 2:
+            return ""
+        gid = group_id or f"grp_{self._next_user_group_seq:03d}"
+        if group_id is None:
+            self._next_user_group_seq += 1
+        for o in valid:
+            o.user_group_id = gid
+        self.user_groups[gid] = [o.obj_id for o in valid]
+        return gid
+
+    def ungroup_objects(self, objs: list[WorldObject]) -> list[tuple[WorldObject, str, str, str]]:
+        """Dissolve user/compound group membership for `objs`, returning undo snapshot."""
+        snap: list[tuple[WorldObject, str, str, str]] = []
+        # Expand to whole groups so ungrouping any member dissolves that group cleanly
+        expanded: list[WorldObject] = []
+        seen: set[str] = set()
+        for o in objs:
+            if o is None or o.deleted:
+                continue
+            members = self.get_group_members(o, visible_only=False)
+            for m in members:
+                if m.obj_id not in seen:
+                    seen.add(m.obj_id)
+                    expanded.append(m)
+        for o in expanded:
+            if o.user_group_id or o.compound_id:
+                snap.append((o, o.user_group_id, o.compound_id, o.compound_label))
+                if o.user_group_id:
+                    self.user_groups.pop(o.user_group_id, None)
+                    o.user_group_id = ""
+                else:
+                    self.compound_groups.pop(o.compound_id, None)
+                    o.compound_id = ""
+                    o.compound_label = ""
+        return snap
+
+    def auto_group_compounds(self) -> int:
+        """Fast (<15 ms) spatial + naming pass grouping multi-part PS2 assemblies on load.
+
+        Auto-groups:
+          1. Multi-part ramps (`ramp*`, `jump*`, `stunt*`) + overlapping dirt/wood top-cap leaves
+          2. Fences/walls + co-located `lod-f*` / `lod-*` billboard twins
+          3. Buildings/props + co-located `*-sh` / `*_sh` / `shadow*` shadow quads
+        """
+        self.compound_groups.clear()
+        for o in self.objects:
+            o.compound_id = ""
+            o.compound_label = ""
+
+        # Precompute world AABBs + XZ spatial hash (16 m grid cells) only for candidate leaves
+        cell_size = 16.0
+        aabbs: dict[int, tuple[float, float, float, float, float, float]] = {}
+        grid: dict[tuple[int, int], list[int]] = {}
+        ramp_seeds: list[int] = []
+        shadow_indices: list[int] = []
+        lod_indices: list[int] = []
+
+        for idx, o in enumerate(self.objects):
+            if o.deleted or o.source != "Retail":
+                continue
+            if o.category not in ("static", "optional-terrain", "billboard", "dyno", "event-prop"):
+                continue
+            m = self.models.get(o.model_key)
+            if m is None:
+                continue
+            lo, hi = o.world_aabb(m)
+            span_x = float(hi[0] - lo[0])
+            span_z = float(hi[2] - lo[2])
+            # Ignore giant whole-track terrain chunks (>85 m span) from auto-grouping
+            if max(span_x, span_z) > 85.0:
+                continue
+            box = (float(lo[0]), float(lo[1]), float(lo[2]), float(hi[0]), float(hi[1]), float(hi[2]))
+            aabbs[idx] = box
+            gx0 = int(math.floor(box[0] / cell_size))
+            gx1 = int(math.floor(box[3] / cell_size))
+            gz0 = int(math.floor(box[2] / cell_size))
+            gz1 = int(math.floor(box[5] / cell_size))
+            for gx in range(gx0, gx1 + 1):
+                for gz in range(gz0, gz1 + 1):
+                    grid.setdefault((gx, gz), []).append(idx)
+
+            nl = o.name.lower()
+            tex_blob = " ".join(t.lower() for t in o.textures)
+            if (
+                any(k in nl for k in ("ramp", "jump", "stunt"))
+                or any(k in tex_blob for k in ("ramp", "jump"))
+                or o.category == "optional-terrain"
+            ):
+                ramp_seeds.append(idx)
+            if nl.endswith("-sh") or nl.endswith("_sh") or "-sh_" in nl or "_sh_" in nl or "shadow" in nl or any("shad" in t.lower() for t in o.textures):
+                shadow_indices.append(idx)
+            if o.category == "billboard" or nl.startswith("lod-f") or nl.startswith("lod_f") or nl.startswith("lod-"):
+                lod_indices.append(idx)
+
+        def _neighbors(idx: int, pad: float = 1.6) -> list[int]:
+            b = aabbs[idx]
+            gx0 = int(math.floor((b[0] - pad) / cell_size))
+            gx1 = int(math.floor((b[3] + pad) / cell_size))
+            gz0 = int(math.floor((b[2] - pad) / cell_size))
+            gz1 = int(math.floor((b[5] + pad) / cell_size))
+            seen_n: set[int] = set()
+            res: list[int] = []
+            for gx in range(gx0, gx1 + 1):
+                for gz in range(gz0, gz1 + 1):
+                    for j in grid.get((gx, gz), ()):
+                        if j != idx and j not in seen_n:
+                            seen_n.add(j)
+                            res.append(j)
+            return res
+
+        def _overlaps(a: tuple[float, float, float, float, float, float], b: tuple[float, float, float, float, float, float], pad_xz: float, pad_y: float) -> bool:
+            return (
+                a[3] + pad_xz >= b[0]
+                and a[0] - pad_xz <= b[3]
+                and a[5] + pad_xz >= b[2]
+                and a[2] - pad_xz <= b[5]
+                and a[4] + pad_y >= b[1]
+                and a[1] - pad_y <= b[4]
+            )
+
+        assigned: set[int] = set()
+        group_seq = 0
+
+        # 1. Multi-part Ramp Assemblies (connected components of overlapping ramp + top-cap leaves)
+        for seed in ramp_seeds:
+            if seed in assigned:
+                continue
+            so = self.objects[seed]
+            sb = aabbs[seed]
+            comp = [seed]
+            queue = [seed]
+            visited = {seed}
+            while queue:
+                cur = queue.pop()
+                cb = aabbs[cur]
+                co = self.objects[cur]
+                for nb in _neighbors(cur, pad=1.5):
+                    if nb in visited or nb in assigned:
+                        continue
+                    no = self.objects[nb]
+                    if no.category not in ("optional-terrain", "static"):
+                        continue
+                    # Don't merge across different event optional-terrain modes
+                    if (
+                        co.opt_terrain_mode is not None
+                        and no.opt_terrain_mode is not None
+                        and co.opt_terrain_mode != no.opt_terrain_mode
+                    ):
+                        continue
+                    nb_box = aabbs[nb]
+                    nb_span = max(nb_box[3] - nb_box[0], nb_box[5] - nb_box[2])
+                    cur_span = max(cb[3] - cb[0], cb[5] - cb[2], 4.0)
+                    # Same-scale cap/side leaf overlapping ramp footprint
+                    if nb_span <= max(cur_span * 1.85, 28.0) and _overlaps(cb, nb_box, 1.2, 2.2):
+                        # Require either same opt_terrain_mode or ramp/dirt cap texture/name overlap
+                        nl = no.name.lower()
+                        is_cap = (
+                            no.opt_terrain_mode == co.opt_terrain_mode
+                            or any(k in nl for k in ("ramp", "jump", "stunt", "top", "cap", "dirt"))
+                            or (set(no.textures) & set(co.textures))
+                        )
+                        if is_cap:
+                            visited.add(nb)
+                            comp.append(nb)
+                            queue.append(nb)
+            if len(comp) >= 2:
+                group_seq += 1
+                gid = f"auto_ramp_{group_seq:04d}"
+                label = f"Ramp Assembly ({len(comp)} parts)"
+                for i_m in comp:
+                    assigned.add(i_m)
+                    self.objects[i_m].compound_id = gid
+                    self.objects[i_m].compound_label = label
+                self.compound_groups[gid] = [self.objects[i_m].obj_id for i_m in comp]
+
+        # 2. Fence / Wall + LOD Billboard Twins
+        for lidx in lod_indices:
+            if lidx in assigned:
+                continue
+            lo_obj = self.objects[lidx]
+            lb = aabbs[lidx]
+            l_span = max(lb[3] - lb[0], lb[5] - lb[2], 3.0)
+            partners: list[int] = [lidx]
+            for nb in _neighbors(lidx, pad=1.8):
+                if nb in assigned:
+                    continue
+                no = self.objects[nb]
+                if no.category not in ("static", "billboard", "optional-terrain"):
+                    continue
+                nb_box = aabbs[nb]
+                nb_span = max(nb_box[3] - nb_box[0], nb_box[5] - nb_box[2])
+                if nb_span > l_span * 2.5 + 4.0:
+                    continue
+                dist_p = math.hypot(no.position[0] - lo_obj.position[0], no.position[2] - lo_obj.position[2])
+                if (dist_p <= 3.5 or _overlaps(lb, nb_box, 1.0, 2.2)) and abs(no.position[1] - lo_obj.position[1]) <= 3.5:
+                    partners.append(nb)
+            if len(partners) >= 2:
+                group_seq += 1
+                gid = f"auto_fence_{group_seq:04d}"
+                label = f"Fence/LOD Assembly ({len(partners)} parts)"
+                for i_m in partners:
+                    assigned.add(i_m)
+                    self.objects[i_m].compound_id = gid
+                    self.objects[i_m].compound_label = label
+                self.compound_groups[gid] = [self.objects[i_m].obj_id for i_m in partners]
+
+        # 3. Building / Prop + Shadow Quad (`*-sh` / `shadow*`)
+        for sidx in shadow_indices:
+            if sidx in assigned:
+                continue
+            so = self.objects[sidx]
+            sb = aabbs[sidx]
+            s_base = so.name.lower().replace("-sh", "").replace("_sh", "").split("_")[0]
+            best_parent = -1
+            best_dist = 1e9
+            for nb in _neighbors(sidx, pad=2.0):
+                if nb in assigned or nb == sidx:
+                    continue
+                no = self.objects[nb]
+                if no.category not in ("static", "dyno", "event-prop"):
+                    continue
+                nb_box = aabbs[nb]
+                if not _overlaps(sb, nb_box, 1.8, 3.0):
+                    continue
+                nb_span = max(nb_box[3] - nb_box[0], nb_box[5] - nb_box[2])
+                if nb_span > 55.0:
+                    continue
+                d = math.hypot(no.position[0] - so.position[0], no.position[2] - so.position[2])
+                if s_base and len(s_base) >= 3 and s_base in no.name.lower():
+                    d *= 0.25
+                if d < best_dist:
+                    best_dist = d
+                    best_parent = nb
+            if best_parent >= 0:
+                group_seq += 1
+                gid = f"auto_bldg_{group_seq:04d}"
+                label = "Building + Shadow (2 parts)"
+                for i_m in (best_parent, sidx):
+                    assigned.add(i_m)
+                    self.objects[i_m].compound_id = gid
+                    self.objects[i_m].compound_label = label
+                self.compound_groups[gid] = [self.objects[best_parent].obj_id, self.objects[sidx].obj_id]
+
+        return len(self.compound_groups)
 
     def object_visible_in_event_template(self, obj: WorldObject, template_name: str | None = None) -> bool:
         """Return whether `obj` belongs to the active Event Template filter in the 3D viewport."""
@@ -1350,6 +1636,79 @@ class TrackWorld:
                     break
 
         return twins, barrier_indices
+
+    def static_overlap_counts(
+        self, obj: WorldObject, *, use_initial: bool = False
+    ) -> tuple[int, list[int]]:
+        """Fast spatial overlap check returning `(scol_tri_count, overlapping_sobl_box_indices)` for `obj`."""
+        model = self.models.get(obj.model_key)
+        if model is None:
+            return 0, []
+        if use_initial:
+            piv = np.array(obj.retail_initial_pos, dtype=np.float64)
+            lo = piv + model.bbox_min.astype(np.float64)
+            hi = piv + model.bbox_max.astype(np.float64)
+        else:
+            lo_f, hi_f = obj.world_aabb(model)
+            lo = lo_f.astype(np.float64)
+            hi = hi_f.astype(np.float64)
+
+        min_x, max_x = float(lo[0]) - 0.5, float(hi[0]) + 0.5
+        min_y, max_y = float(lo[1]) - 6.0, float(hi[1]) + 6.0
+        min_z, max_z = float(lo[2]) - 0.5, float(hi[2]) + 0.5
+
+        scol_hits = 0
+        terr = self.collision.terrain
+        if terr is not None and terr.grid:
+            cell = float(terr.cell)
+            gx0 = int(math.floor(min_x / cell))
+            gx1 = int(math.floor(max_x / cell))
+            gz0 = int(math.floor(min_z / cell))
+            gz1 = int(math.floor(max_z / cell))
+            seen_tris: set[int] = set()
+            for gx in range(gx0, gx1 + 1):
+                for gz in range(gz0, gz1 + 1):
+                    for t in terr.grid.get((gx, gz), ()):
+                        ti = t["index"]
+                        if ti in seen_tris:
+                            continue
+                        seen_tris.add(ti)
+                        verts = t["verts"]
+                        cx = (verts[0][0] + verts[1][0] + verts[2][0]) / 3.0
+                        cy = (verts[0][1] + verts[1][1] + verts[2][1]) / 3.0
+                        cz = (verts[0][2] + verts[1][2] + verts[2][2]) / 3.0
+                        if min_x <= cx <= max_x and min_z <= cz <= max_z and min_y <= cy <= max_y:
+                            scol_hits += 1
+
+        sobl_indices: list[int] = []
+        for rec in self.collision.sobl_records:
+            if rec.get("kind") != "box":
+                continue
+            cx, _cy, cz = rec["centre"]
+            fx, fz = wc.footprint(rec)
+            if (cx + fx) >= min_x and (cx - fx) <= max_x and (cz + fz) >= min_z and (cz - fz) <= max_z:
+                sobl_indices.append(int(rec["index"]))
+
+        return scol_hits, sobl_indices
+
+    def object_collision_status(self, obj: WorldObject) -> str:
+        """Return a clean human-readable Collision status string for the Properties Panel."""
+        if obj.category == "event-prop" or obj.source != "Retail":
+            return "Solid (Event Wall)"
+        if obj.category == "optional-terrain":
+            return "Solid (BPPT Ramp)"
+        if obj.category == "dyno":
+            return "Solid (Event Wall)" if obj.is_transformed() else "Solid (Dyno)"
+        if obj.category == "billboard":
+            return "Visual Only (Billboard)"
+        if obj.category == "static":
+            scol_hits, sobl_hits = self.static_overlap_counts(obj, use_initial=True)
+            if scol_hits > 0:
+                return "Solid (SCOL)"
+            if sobl_hits:
+                return "Solid (SOBL)"
+            return "Visual Backdrop -> Auto-Solidified on Edit"
+        return "Visual Backdrop -> Auto-Solidified on Edit"
 
 
 # ---------------------------------------------------------------------------
@@ -2152,6 +2511,7 @@ def _load_track_cache(
                     retail_model_offset=o[9],
                     retail_initial_pos=(xf[9], xf[10], xf[11]),
                     retail_initial_rot=(xf[12], xf[13], xf[14]),
+                    retail_initial_scale=(xf[6], xf[7], xf[8]),
                     retail_event_member=o[10],
                     retail_event_section=o[11],
                     retail_event_prop_index=o[12],
@@ -2255,7 +2615,7 @@ def _load_track_cache(
         }
 
         wc_pt = meta["world_center"]
-        return TrackWorld(
+        w_cached = TrackWorld(
             game_dir=gdir,
             trk_path=trk_p,
             trk_rel=meta["trk_rel"],
@@ -2284,6 +2644,8 @@ def _load_track_cache(
             cache_path=str(cache_file),
             _cache_backing=raw,
         )
+        w_cached.auto_group_compounds()
+        return w_cached
     except Exception:
         return None
 
@@ -2456,6 +2818,7 @@ def load_track_world(
                 retail_model_offset=mod_off,
                 retail_initial_pos=pos,
                 retail_initial_rot=rot_hpr,
+                retail_initial_scale=scl,
                 retail_original_model_key=mkey,
                 opt_terrain_mode=opt_mode,
             )
@@ -2542,6 +2905,7 @@ def load_track_world(
                             written=True,
                             retail_initial_pos=pos,
                             retail_initial_rot=rot_hpr,
+                            retail_initial_scale=scl,
                             retail_event_member=prop["member"],
                             retail_event_section=prop["section"],
                             retail_event_prop_index=k,
@@ -2670,6 +3034,7 @@ def load_track_world(
         include_lod_twins=True,
     )
     world.collision.rebuild_dynamic_ramp_collision(world)
+    world.auto_group_compounds()
 
     if use_cache and cpath is not None:
         try:

@@ -1567,7 +1567,10 @@ class EodWorldEditorWindow(QMainWindow):
         self.explorer.refresh_counts()
         if self.viewport.selected_obj is not None and self.world is not None:
             sel_cnt = max(1, len([o for o in self.viewport.selected_objects if not o.deleted]))
-            self.properties.show_object(self.viewport.selected_obj, self.world.textures, selected_count=sel_cnt)
+            col_st = self.world.object_collision_status(self.viewport.selected_obj)
+            self.properties.show_object(
+                self.viewport.selected_obj, self.world.textures, selected_count=sel_cnt, collision_status=col_st
+            )
         elif self.viewport.selected_road_node_id is not None and self.world is not None:
             node = self.world.road_graph.nodes.get(self.viewport.selected_road_node_id)
             self.properties.show_road_node(node, self.world.road_graph)
@@ -1581,14 +1584,20 @@ class EodWorldEditorWindow(QMainWindow):
 
     def _on_viewport_obj_selected(self, obj: WorldObject | None) -> None:
         sel_cnt = max(1, len([o for o in self.viewport.selected_objects if not o.deleted]))
-        self.properties.show_object(obj, self.world.textures if self.world else None, selected_count=sel_cnt)
+        col_st = self.world.object_collision_status(obj) if (self.world and obj is not None) else None
+        self.properties.show_object(
+            obj, self.world.textures if self.world else None, selected_count=sel_cnt, collision_status=col_st
+        )
         if obj is not None and sel_cnt <= 1:
             self.set_action_status(f"Selected {obj.name} ({obj.source}, {obj.tri_count} tris)")
 
     def _on_viewport_selection_changed(self, objs: list[WorldObject]) -> None:
         active = [o for o in objs if o is not None and not o.deleted]
         if active:
-            self.properties.show_object(active[-1], self.world.textures if self.world else None, selected_count=len(active))
+            col_st = self.world.object_collision_status(active[-1]) if self.world else None
+            self.properties.show_object(
+                active[-1], self.world.textures if self.world else None, selected_count=len(active), collision_status=col_st
+            )
             if len(active) > 1:
                 self.set_action_status(f"Selected {len(active)} objects (primary: {active[-1].name})")
         elif (
@@ -1983,7 +1992,8 @@ class EodWorldEditorWindow(QMainWindow):
     def _on_texture_swapped(self, tex_name: str) -> None:
         self.viewport.update_gl_texture(tex_name)
         if self.viewport.selected_obj is not None and self.world is not None:
-            self.properties.show_object(self.viewport.selected_obj, self.world.textures)
+            col_st = self.world.object_collision_status(self.viewport.selected_obj)
+            self.properties.show_object(self.viewport.selected_obj, self.world.textures, collision_status=col_st)
 
     def replace_texture_from_png(self, tex_name: str, png_path: Path | str) -> bool:
         """Load `png_path` and undoably replace `tex_name` live in OpenGL + HOSTTEX queue."""

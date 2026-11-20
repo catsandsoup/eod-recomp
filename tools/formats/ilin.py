@@ -394,11 +394,15 @@ def decode(data, context):
     return view
 
 
-def recalculate_geometry(data):
+def recalculate_geometry(data, *, node_heights=None):
     """Recalculate every node's unit tangent (dirX, dirZ), segment_length,
     cumulative distance along the main loop, and the 3 header lap-length floats.
 
     Preserves file size, node count, pointer fixup table, and all unknown/side fields.
+    When `node_heights` (dict mapping node_index -> y or sequence indexed by node_index)
+    is provided, 3D elevation deltas are preserved in segment_length / cumulative distance
+    and near-vertical climbs fall back to a valid unit horizontal tangent instead of
+    zeroing/leaving stale direction vectors.
     """
     buf = bytearray(data)
     layout = _layout(bytes(buf))
@@ -407,22 +411,57 @@ def recalculate_geometry(data):
     if count <= 0:
         return bytes(buf)
 
+    def _height_of(idx):
+        if node_heights is None:
+            return 0.0
+        if isinstance(node_heights, dict):
+            v = node_heights.get(idx, 0.0)
+            return float(v) if v is not None and math.isfinite(float(v)) else 0.0
+        if 0 <= idx < len(node_heights):
+            v = node_heights[idx]
+            return float(v) if v is not None and math.isfinite(float(v)) else 0.0
+        return 0.0
+
     order, closed = main_loop(bytes(buf))
-    # Recompute dirX, dirZ and segment_length for every node that has a valid next pointer
+    # First pass: compute raw horizontal & 3D vectors for every node with a valid next pointer
     seg_lengths = [0.0] * count
+    horiz_dirs: list[tuple[float, float] | None] = [None] * count
+    has_next = [False] * count
     for i in range(count):
         o = base + i * NODE_SIZE
         x, z = struct.unpack_from("<2f", buf, o)
+        y = _height_of(i)
         nxt_idx = _node_index(layout, _u32(buf, o + 20))
         if nxt_idx is not None:
+            has_next[i] = True
             no = base + nxt_idx * NODE_SIZE
             nx, nz = struct.unpack_from("<2f", buf, no)
-            dx, dz = nx - x, nz - z
-            seg = math.hypot(dx, dz)
-            seg_lengths[i] = seg
-            if seg > 1e-6:
-                struct.pack_into("<2f", buf, o + 8, dx / seg, dz / seg)
-            struct.pack_into("<f", buf, o + 24, seg)
+            ny = _height_of(nxt_idx)
+            dx, dy, dz = nx - x, ny - y, nz - z
+            horiz = math.hypot(dx, dz)
+            seg_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+            seg_lengths[i] = seg_3d
+            if horiz > 1e-6:
+                horiz_dirs[i] = (dx / horiz, dz / horiz)
+
+    # Resolve any near-vertical / zero-XZ climb nodes by inheriting nearest valid horizontal tangent
+    last_valid = (0.0, 1.0)
+    for node_i in order:
+        if horiz_dirs[node_i] is not None:
+            last_valid = horiz_dirs[node_i]
+            break
+    for node_i in order:
+        if horiz_dirs[node_i] is not None:
+            last_valid = horiz_dirs[node_i]
+        elif has_next[node_i]:
+            horiz_dirs[node_i] = last_valid
+    for i in range(count):
+        if has_next[i]:
+            o = base + i * NODE_SIZE
+            d_xz = horiz_dirs[i]
+            if d_xz is not None:
+                struct.pack_into("<2f", buf, o + 8, d_xz[0], d_xz[1])
+            struct.pack_into("<f", buf, o + 24, seg_lengths[i])
 
     # Recompute cumulative distance along main loop and header lap length
     total_len = 0.0
@@ -438,10 +477,190 @@ def recalculate_geometry(data):
     return bytes(buf)
 
 
-def encode(data, edits, *, recalculate=False):
+def rebuild_nodes(
+    data,
+    main_nodes,
+    *,
+    side_nodes=None,
+    closed=True,
+):
+    """Rebuild an ILIN (`.ild`) binary with added, split, pulled, or deleted nodes.
+
+    Parameters
+    ----------
+    data : bytes
+        Retail base `.ild` bytes (used as header and node-attribute template).
+    main_nodes : list[dict]
+        Ordered main-loop nodes, each with `x`, `z`, optional `y` (default 0.0),
+        optional `retail_index` (int or None), optional `width` (float or None).
+    side_nodes : list[dict] | None
+        Optional extra side/pulled-out branch nodes, each with `x`, `z`, optional `y`,
+        `next_idx` (index into combined `[main_nodes..., side_nodes...]`),
+        optional `join_main` (main-line node index for `line_position`),
+        optional `retail_index` (int or None).
+    closed : bool
+        Whether the last main node wraps back to main node 0.
+
+    Returns
+    -------
+    bytes
+        Valid ILIN v1 binary with rebuilt pointer fix-up table and recalculated
+        3D segment lengths, unit tangents, cumulative distances, and lap length.
+    """
+    if not main_nodes or len(main_nodes) < 2:
+        raise ValueError("ILIN rebuild requires at least 2 main-line nodes.")
+    src = bytes(data)
+    src_lay = _layout(src)
+    if src_lay["kind"] != "line":
+        raise ValueError("rebuild_nodes only supports racing lines (.ild), not ghost lines (.ili).")
+
+    src_base = src_lay["nodes_offset"]
+    src_count = src_lay["count"]
+    src_primary = src_lay["primary"]
+
+    def _template_tail_bytes(retail_idx, is_main):
+        if retail_idx is not None and 0 <= int(retail_idx) < src_count:
+            off = src_base + int(retail_idx) * NODE_SIZE
+            # bytes +32..+55 (24 bytes: width/curv/speed/junc/flags)
+            return bytearray(src[off + 32 : off + 56])
+        # Copy from first valid retail main or side node if available
+        if is_main and src_count > 0:
+            return bytearray(src[src_base + 32 : src_base + 56])
+        if not is_main and src_primary < src_count:
+            off = src_base + src_primary * NODE_SIZE
+            return bytearray(src[off + 32 : off + 56])
+        # Safe fallback matching retail defaults
+        buf = bytearray(24)
+        struct.pack_into("<f", buf, 0, 35.556 if is_main else 17.778)
+        struct.pack_into("<f", buf, 8, 12.0)
+        struct.pack_into("<I", buf, 20, 256 if is_main else 258)
+        return buf
+
+    side_list = list(side_nodes or [])
+    n_main = len(main_nodes)
+    n_side = len(side_list)
+    total_nodes = n_main + n_side
+
+    # Preserve existing retail side-lines when caller only supplies main_nodes?
+    # No: caller passes the exact desired main_nodes + side_nodes (preserving retail side lines if unchanged).
+    has_tail = n_side > 0 and (len(src) - src_lay["node_end"] == 16)
+    has_secondary = n_side > 0
+
+    # Determine fixup count first so we know exact nodes_offset:
+    # - 1 for header+32 (nodes_offset)
+    # - 1 for header+36 (secondary_start) if has_secondary
+    # - 1 per node for +20 (next pointer) when next_idx is valid
+    # - 1 for main node branch_list (+56) + 1 for tail+12 if has_tail
+    next_indices = []
+    for i in range(n_main):
+        if i + 1 < n_main:
+            next_indices.append(i + 1)
+        else:
+            next_indices.append(0 if closed else None)
+    for j, sn in enumerate(side_list):
+        nxt = sn.get("next_idx")
+        if nxt is not None and 0 <= int(nxt) < total_nodes:
+            next_indices.append(int(nxt))
+        else:
+            # Wrap back to closest / specified join_main node
+            jm = int(sn.get("join_main", 0)) % n_main
+            next_indices.append(jm)
+
+    num_next_fixups = sum(1 for nx in next_indices if nx is not None)
+    branch_main_idx = min(n_main - 1, max(0, int(side_list[0].get("join_main", 0)))) if has_tail else -1
+    fixup_count = 1 + (1 if has_secondary else 0) + num_next_fixups + (2 if has_tail else 0)
+    nodes_offset = HEADER_SIZE + fixup_count * 4
+    node_end = nodes_offset + total_nodes * NODE_SIZE
+    total_size = node_end + (16 if has_tail else 0)
+
+    out = bytearray(total_size)
+    # Copy header template and update structural fields
+    out[0:HEADER_SIZE] = src[0:HEADER_SIZE]
+    struct.pack_into("<I", out, 0, 0)
+    struct.pack_into("<I", out, 4, HEADER_SIZE)
+    struct.pack_into("<I", out, 8, NODE_SIZE)
+    low_flags = struct.unpack_from("<H", out, 28)[0]
+    struct.pack_into("<HH", out, 28, low_flags, n_main)
+    struct.pack_into("<I", out, 32, nodes_offset)
+    sec_off = (nodes_offset + n_main * NODE_SIZE) if has_secondary else 0
+    struct.pack_into("<I", out, 36, sec_off)
+    struct.pack_into("<I", out, 40, 0)
+    struct.pack_into("<I", out, 44, fixup_count)
+
+    fixups = [32]
+    if has_secondary:
+        fixups.append(36)
+
+    heights = {}
+    # Write main-line nodes
+    for i, nd in enumerate(main_nodes):
+        o = nodes_offset + i * NODE_SIZE
+        x = float(nd["x"])
+        z = float(nd["z"])
+        y = float(nd.get("y", 0.0))
+        if not (math.isfinite(x) and math.isfinite(z) and abs(x) <= _LIMIT and abs(z) <= _LIMIT):
+            raise ValueError(f"Main node {i} coordinates out of bounds: ({x}, {z})")
+        heights[i] = y if math.isfinite(y) else 0.0
+        struct.pack_into("<2f", out, o, x, z)
+        struct.pack_into("<2f", out, o + 8, 0.0, 1.0)
+        struct.pack_into("<I", out, o + 16, i << 16)
+        nxt = next_indices[i]
+        if nxt is not None:
+            struct.pack_into("<I", out, o + 20, nodes_offset + nxt * NODE_SIZE)
+            fixups.append(o + 20)
+        tail24 = _template_tail_bytes(nd.get("retail_index"), True)
+        if nd.get("width") is not None and float(nd["width"]) > 0.1:
+            # Optional lane-width override if explicitly requested
+            pass
+        out[o + 32 : o + 56] = tail24
+        if has_tail and i == branch_main_idx:
+            struct.pack_into("<I", out, o + 56, node_end)
+            fixups.append(o + 56)
+        else:
+            struct.pack_into("<I", out, o + 56, 0)
+
+    # Write side-line / pulled-branch nodes
+    for j, sn in enumerate(side_list):
+        idx = n_main + j
+        o = nodes_offset + idx * NODE_SIZE
+        x = float(sn["x"])
+        z = float(sn["z"])
+        y = float(sn.get("y", 0.0))
+        if not (math.isfinite(x) and math.isfinite(z) and abs(x) <= _LIMIT and abs(z) <= _LIMIT):
+            raise ValueError(f"Side node {j} coordinates out of bounds: ({x}, {z})")
+        heights[idx] = y if math.isfinite(y) else 0.0
+        jm = int(sn.get("join_main", 0)) % n_main
+        struct.pack_into("<2f", out, o, x, z)
+        struct.pack_into("<2f", out, o + 8, 0.0, 1.0)
+        struct.pack_into("<I", out, o + 16, jm << 16)
+        nxt = next_indices[idx]
+        if nxt is not None:
+            struct.pack_into("<I", out, o + 20, nodes_offset + nxt * NODE_SIZE)
+            fixups.append(o + 20)
+        tail24 = _template_tail_bytes(sn.get("retail_index"), False)
+        out[o + 32 : o + 56] = tail24
+        struct.pack_into("<I", out, o + 56, 0)
+
+    if has_tail:
+        struct.pack_into("<4I", out, node_end, 0, 0, 2, nodes_offset + n_main * NODE_SIZE)
+        fixups.append(node_end + 12)
+
+    fixups.sort()
+    assert len(fixups) == fixup_count, f"fixup count mismatch: {len(fixups)} != {fixup_count}"
+    for k, fx in enumerate(fixups):
+        struct.pack_into("<I", out, HEADER_SIZE + k * 4, fx)
+
+    rebuilt = recalculate_geometry(bytes(out), node_heights=heights)
+    _layout(rebuilt)
+    return rebuilt
+
+
+def encode(data, edits, *, recalculate=False, node_heights=None, rebuild_main=None, rebuild_side=None, closed=True):
+    if rebuild_main is not None:
+        return rebuild_nodes(data, rebuild_main, side_nodes=rebuild_side, closed=closed)
     data = bytearray(data)
     if not edits:
-        return recalculate_geometry(bytes(data)) if recalculate else bytes(data)
+        return recalculate_geometry(bytes(data), node_heights=node_heights) if recalculate else bytes(data)
     layout = _layout(bytes(data))
     for fid, value in edits.items():
         match = _NODE_ID.match(str(fid))
@@ -456,4 +675,4 @@ def encode(data, edits, *, recalculate=False):
             raise ValueError(f"Node {index} {axis.upper()} must be between -{_LIMIT:.0f} and {_LIMIT:.0f} metres.")
         struct.pack_into("<f", data, layout["nodes_offset"] + index * NODE_SIZE + (0 if axis == "x" else 4), float(value))
     out = bytes(data)
-    return recalculate_geometry(out) if recalculate else out
+    return recalculate_geometry(out, node_heights=node_heights) if recalculate else out

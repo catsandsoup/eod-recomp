@@ -139,6 +139,7 @@ bool g_in_particle = false;
 bool g_in_sprite = false;
 bool g_in_imm = false;
 bool g_imm_cockpit = false;
+bool g_imm_hud = false;
 int32_t g_shadow_intensity = 0;
 Packet g_shadow_cam;
 int32_t g_world_pass = 0;
@@ -165,7 +166,7 @@ struct WorldCounts {
     uint32_t water_draws = 0, water_vertices = 0, water_tris = 0;
     uint32_t shadow_batches = 0, flare_draws = 0, flare_vertices = 0, flare_tris = 0;
     uint32_t particle_draws = 0, particle_quads = 0, sprite_draws = 0, sprite_quads = 0;
-    uint32_t imm_draws = 0, imm_verts = 0, imm_tris = 0, cockpit_draws = 0, sphere_imm_draws = 0;
+    uint32_t imm_draws = 0, imm_verts = 0, imm_tris = 0, cockpit_draws = 0, sphere_imm_draws = 0, hud_draws = 0;
 };
 WorldCounts g_wc;
 
@@ -354,6 +355,7 @@ void roll(uint64_t vb) {
         e.sprite += g_wc.sprite_draws;
         e.immediate += g_wc.imm_draws + g_wc.sphere_imm_draws;
         e.cockpit += g_wc.cockpit_draws;
+        e.hud += g_wc.hud_draws;
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr, "[native] ee vb %llu records %u tagged %u meshes decoded %u (failed %u) cached %zu\n",
@@ -361,12 +363,12 @@ void roll(uint64_t vb) {
         std::fprintf(stderr,
                      "[native] ee vb %llu world passes %u leaves %u (camera-facing %u, no sun quad %u, no mesh %u) "
                      "dropped (no packet space) records %u leaves %u | water draws %u vertices %u triangles %u | "
-                     "shadows %u flares %u (verts %u tris %u) | particles %u (%u) sprites %u (%u) imm %u+%u cockpit %u\n",
+                     "shadows %u flares %u (verts %u tris %u) | particles %u (%u) sprites %u (%u) imm %u+%u cockpit %u hud %u\n",
                      (unsigned long long)g_frame_vb, g_wc.passes, g_wc.leaves, g_wc.facing, g_wc.no_quad, g_wc.nomesh,
                      g_wc.dropped_records, g_wc.dropped_leaves, g_wc.water_draws, g_wc.water_vertices, g_wc.water_tris,
                      g_wc.shadow_batches, g_wc.flare_draws, g_wc.flare_vertices, g_wc.flare_tris,
                      g_wc.particle_draws, g_wc.particle_quads, g_wc.sprite_draws, g_wc.sprite_quads,
-                     g_wc.imm_draws, g_wc.sphere_imm_draws, g_wc.cockpit_draws);
+                     g_wc.imm_draws, g_wc.sphere_imm_draws, g_wc.cockpit_draws, g_wc.hud_draws);
     }
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr,
@@ -1399,13 +1401,13 @@ void ee_sprite_end(bool drawn) {
 }
 
 // ---- general immediate geometry & cockpit quad (0x35DF10 / 0x361708 / 0x361BC8 / 0x35CAA0) -----
-void ee_imm_begin(bool cockpit) {
+void ee_imm_begin(bool cockpit, bool hud) {
     if (!enabled() || g_in_water || g_in_flare) return;
     roll(kernel_vblank_count());
     Packet &p = g_imm;
     std::memset(&p, 0, sizeof p);
     read_matrix_packet(MEM_LW(0x4D7C48), p);
-    p.kind = cockpit ? KIND_COCKPIT : KIND_IMMEDIATE;
+    p.kind = cockpit ? KIND_COCKPIT : hud ? KIND_HUD : KIND_IMMEDIATE;
     p.frame = g_frame_vb;
     p.serial = g_serial++;
     p.itop = 0x280;
@@ -1420,6 +1422,7 @@ void ee_imm_begin(bool cockpit) {
     g_imm_mesh->transient = true;
     p.mesh = g_imm_mesh->id;
     g_imm_cockpit = cockpit;
+    g_imm_hud = hud && !cockpit;
     g_imm_alpha_set = false;
     g_in_imm = true;
 }
@@ -1471,6 +1474,7 @@ void ee_imm_end(bool drawn) {
             kv.second.packet.itop = g_imm.itop;
     limit_note("immediate geometry vertices (0x361468 60/chunk cap)", g_imm_mesh->vertices.size(), 0, 60);
     if (g_imm_cockpit) g_wc.cockpit_draws++;
+    else if (g_imm_hud) g_wc.hud_draws++;
     else g_wc.imm_draws++;
     g_new_meshes.push_back(g_imm_mesh);
     g_imm_mesh = nullptr;

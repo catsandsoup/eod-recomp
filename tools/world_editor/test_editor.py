@@ -969,6 +969,296 @@ class TestEodWorldEditor(unittest.TestCase):
             else:
                 os.environ["EOD_EDITOR_APPDATA"] = old_appdata
 
+    def test_15_scaled_event_prop_wall_baking_and_collision(self) -> None:
+        import struct
+        import modding_backend as mb
+        import valt
+        import world_export as we
+        import world_graf as wg
+
+        w = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        wall = next(
+            (
+                o
+                for o in w.objects
+                if o.source == "Retail"
+                and o.category == "event-prop"
+                and o.retail_event_member
+                and "obswall" in o.model_key.lower()
+            ),
+            None,
+        )
+        self.assertIsNotNone(wall, "Expected retail obswall event-prop in AFTON")
+        assert wall is not None
+        wm = w.models[wall.model_key]
+        orig_dx = float(wm.bbox_max[0] - wm.bbox_min[0])
+        orig_dy = float(wm.bbox_max[1] - wm.bbox_min[1])
+        orig_dz = float(wm.bbox_max[2] - wm.bbox_min[2])
+
+        sx, sy, sz = (2.0, 12.0, 1.5)
+        wall.scale = (sx, sy, sz)
+        wall.rotation_hpr = (35.0, 10.0, 5.0)
+        wall.written = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod_out = Path(tmp) / "mods" / "GiantWallTest"
+            rep = ps.export_mod_layer(w, "GiantWallTest", mod_out)
+            self.assertEqual(rep["custom_objects_compiled"], 1)
+            self.assertTrue(rep["mod_trk_differs_from_retail"])
+
+            mod_trk = Path(rep["mod_trk"])
+            ents = mb.directory(mod_trk)
+            by_l = {e["name"].lower(): e for e in ents}
+            self.assertIn("edp_001.mod", by_l, "Scaled event-prop .mod must be compiled into modded .TRK")
+
+            # Verify baked .mod VIF bounding box is scaled ~12x in Y!
+            mod_raw, _ = mb.payload(mod_trk, by_l["edp_001.mod"]["name"], ents, verify_crc=True)
+            mhdr = wg.parse_model(mod_raw, 0)
+            baked_dy = float(mhdr["bbox"]["max"][1] - mhdr["bbox"]["min"][1])
+            self.assertAlmostEqual(baked_dy, orig_dy * sy, delta=0.5)
+
+            # Verify obstacle.val contains solid type=wall with scaled dx, dy, dz!
+            obst_raw, _ = mb.payload(mod_trk, by_l["obstacle.val"]["name"], ents, verify_crc=True)
+            obst = valt.parse_binary_valt(obst_raw)
+            edp_sec = next(
+                (s for s in obst["sections"] if dict(s["pairs"]).get("name") == "edp_001"),
+                None,
+            )
+            self.assertIsNotNone(edp_sec, "obstacle.val missing edp_001 wall entry")
+            assert edp_sec is not None
+            dp = dict(edp_sec["pairs"])
+            self.assertEqual(dp.get("type"), "wall")
+            self.assertEqual(dp.get("surf_type"), "wall")
+            self.assertAlmostEqual(float(dp["dx"]), max(0.4, orig_dx * sx), delta=0.05)
+            self.assertAlmostEqual(float(dp["dy"]), max(0.4, orig_dy * sy), delta=0.05)
+            self.assertAlmostEqual(float(dp["dz"]), max(0.4, orig_dz * sz), delta=0.05)
+
+            # Verify original retail wall in its va0 was hidden (y < -4000) & new edp_001 was injected
+            va0_key = wall.retail_event_member.lower()
+            va0_raw, _ = mb.payload(mod_trk, by_l[va0_key]["name"], ents, verify_crc=True)
+            vmodel = valt.parse_binary_valt(va0_raw)
+            has_edp_ref = any(dict(s["pairs"]).get("dyno") == "edp_001" for s in vmodel["sections"])
+            self.assertTrue(has_edp_ref, f"{wall.retail_event_member} must spawn scaled edp_001 wall")
+            hidden_count = 0
+            for s in vmodel["sections"]:
+                p = dict(s["pairs"])
+                f64 = p.get("unfloat_frame64")
+                if f64 and len(f64) == 64:
+                    rows = we.decode_frame64(f64)
+                    if rows[10] < -4000.0:
+                        hidden_count += 1
+            self.assertGreaterEqual(hidden_count, 1, "Original retail event-prop wall should be hidden below -4000 m")
+
+            # Verify retail AFTON.TRK untouched
+            self.assertEqual(_sha256_file(self.afton_world.trk_path), self.afton_hash_before)
+            print(
+                f"[VERIFIED] Scaled Event-Prop Wall Bake: baked_dy={baked_dy:.2f}m (orig={orig_dy:.2f}m x{sy:.0f}), "
+                f"obstacle.val wall=({dp['dx']}, {dp['dy']}, {dp['dz']}), hidden_orig={hidden_count}"
+            )
+
+    def test_16_absurd_height_terrain_solid_collision_strow_and_status(self) -> None:
+        import math
+        import struct
+        import modding_backend as mb
+        import vif_patch
+        import world_collision as wc
+        import world_graf as wg
+
+        w = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+
+        # 1. Verify Collision status classification in world_loader + PropertiesPanel
+        hill_scol = next(o for o in w.objects if o.name == "hills_d54c8")
+        hill_backdrop = next(o for o in w.objects if o.name == "s-hill_1a1068")
+        bldg_sobl = next(o for o in w.objects if o.name == "billys_6f308")
+        ev_wall = next(o for o in w.objects if o.category == "event-prop" and "obswall" in o.model_key.lower())
+
+        self.assertEqual(w.object_collision_status(hill_scol), "Solid (SCOL)")
+        self.assertEqual(w.object_collision_status(hill_backdrop), "Visual Backdrop -> Auto-Solidified on Edit")
+        self.assertEqual(w.object_collision_status(bldg_sobl), "Solid (SOBL)")
+        self.assertEqual(w.object_collision_status(ev_wall), "Solid (Event Wall)")
+
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        win._attach_loaded_world(w)
+        win.viewport.select_object(hill_backdrop)
+        self.assertEqual(win.properties.val_collision.text(), "Visual Backdrop -> Auto-Solidified on Edit")
+        win.viewport.select_object(hill_scol)
+        self.assertEqual(win.properties.val_collision.text(), "Solid (SCOL)")
+        win.close()
+        self.app.processEvents()
+
+        # 2. STROW safety test: forbidden_row_offs must NEVER be mutated even on 50x scale!
+        ents_ret = mb.directory(self.afton_world.trk_path)
+        graf_e = next(e for e in ents_ret if e["type"] == "GRAF")
+        graf_orig, _ = mb.payload(self.afton_world.trk_path, graf_e["name"], ents_ret, verify_crc=False)
+        graf_parsed = wg.parse_graf(graf_orig)
+        by_id = {f"i{i:04d}": lf for i, lf in enumerate(graf_parsed["leaves"])}
+        hill_leaf = by_id[hill_scol.retail_instance_id]
+        mhdr = wg.parse_model(graf_orig, hill_leaf["model_offset"])
+        row_offs = {
+            int(b["pos"]["row_off"])
+            for part in mhdr["parts"]
+            for b in vif_patch.scan_part(graf_orig, part)
+            if b.get("count", 0) > 0 and "pos" in b and b["pos"]["row_off"] >= 0
+        }
+        self.assertGreater(len(row_offs), 0)
+        buf_guard = bytearray(graf_orig)
+        ps._encode_vif_parts_vertices(
+            buf_guard,
+            graf_orig,
+            [(part, lambda p: (p[0], p[1] * 50.0, p[2])) for part in mhdr["parts"]],
+            forbidden_row_offs=row_offs,
+        )
+        for ro in row_offs:
+            self.assertEqual(buf_guard[ro : ro + 12], graf_orig[ro : ro + 12], "Forbidden STROW was mutated!")
+
+        # 3. Absurd-height terrain bake: SCOL lifting + NODE_SPHERE cull growth + SOBL scaling + 0-SCOL SOBL synthesis
+        hill_scol.scale = (1.0, 15.0, 1.0)
+        hill_backdrop.scale = (1.0, 12.0, 1.0)
+        bldg_sobl.scale = (1.0, 5.0, 1.0)
+
+        retail_sobl_parsed = wc.parse_sobl(mb.payload(self.afton_world.trk_path, "track.sol", ents_ret, verify_crc=False)[0])
+        retail_sobl_count = int(retail_sobl_parsed["count"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod_out = Path(tmp) / "mods" / "AbsurdHeightTest"
+            rep = ps.export_mod_layer(w, "AbsurdHeightTest", mod_out)
+            self.assertGreaterEqual(rep["vif_models_baked"], 3)
+            self.assertGreater(rep["scol_planes_patched"], 50, "hills_d54c8 should lift >50 SCOL triangles")
+            self.assertGreater(rep["sobl_scaled_barriers"], 0, "billys_6f308 should scale overlapping SOBL barrier heights")
+            self.assertGreater(rep["sobl_boxes_synthesized"], 0, "Visual-only s-hill_1a1068 should auto-synthesize SOBL boxes")
+
+            mod_trk = Path(rep["mod_trk"])
+            mod_ents = mb.directory(mod_trk)
+            mod_sol, _ = mb.payload(mod_trk, "track.sol", mod_ents, verify_crc=True)
+            mod_sobl = wc.parse_sobl(mod_sol)
+            self.assertEqual(mod_sobl["count"], retail_sobl_count + rep["sobl_boxes_synthesized"])
+            # Every synthesized box index must be reachable from the SOBL quadtree index list
+            idx_set = set(mod_sobl["index"])
+            synth_recs = []
+            for new_idx in range(retail_sobl_count, mod_sobl["count"]):
+                self.assertIn(new_idx, idx_set)
+                rec = mod_sobl["records"][new_idx]
+                self.assertEqual(rec["kind"], "box")
+                self.assertGreaterEqual(rec["half_extents"][1], 0.35)
+                synth_recs.append(rec)
+            self.assertGreater(max(r["half_extents"][1] for r in synth_recs), 5.0)
+
+            # Verify ancestor NODE_SPHERE cull radii cover the giant scaled hills_d54c8!
+            mod_graf, _ = mb.payload(mod_trk, graf_e["name"], mod_ents, verify_crc=True)
+            mod_mhdr = wg.parse_model(mod_graf, hill_leaf["model_offset"])
+            nc = tuple(mod_mhdr["centre"])
+            nrad = float(mod_mhdr["radius"])
+            for step in hill_leaf["path"]:
+                if step["kind"] != "sphere":
+                    continue
+                cx, cy, cz, sr = struct.unpack_from("<4f", mod_graf, step["node"] + 0x0C)
+                need = math.dist(nc, (cx, cy, cz)) + nrad
+                self.assertGreaterEqual(sr + 1e-3, need, "Ancestor NODE_SPHERE too small for giant hill!")
+
+            self.assertEqual(_sha256_file(self.afton_world.trk_path), self.afton_hash_before)
+            print(
+                f"[VERIFIED] Absurd-Height Terrain + STROW Safety: scol={rep['scol_planes_patched']}, "
+                f"sobl_scaled={rep['sobl_scaled_barriers']}, sobl_synth={rep['sobl_boxes_synthesized']} "
+                f"(track.sol boxes {retail_sobl_count}->{mod_sobl['count']})"
+            )
+
+    def test_17_stupid_angle_3d_ilin_ramps_and_pie_dpi_rect(self) -> None:
+        import math
+        import struct
+        import modding_backend as mb
+        from formats import ilin as ilin_fmt
+        import pie_host as ph
+
+        # 1. ILIN 3D elevation preservation in recalculate_geometry (steep + vertical climbs!)
+        ents = mb.directory(self.afton_world.trk_path)
+        ild_e = next(e for e in ents if e["name"].lower() == "track.ild")
+        clean_ild, _ = mb.payload(self.afton_world.trk_path, ild_e["name"], ents, verify_crc=False)
+        layout = ilin_fmt._layout(clean_ild)
+        base = layout["nodes_offset"]
+        x0, z0 = struct.unpack_from("<2f", clean_ild, base)
+        # Put node 1 directly above node 0 (vertical 90 deg climb!) and node 2 at a steep 60 deg climb
+        edits = {"node.1.x": x0, "node.1.z": z0, "node.2.x": x0 + 10.0, "node.2.z": z0}
+        heights = {0: 0.0, 1: 40.0, 2: 100.0}
+        recalc_3d = ilin_fmt.encode(clean_ild, edits, recalculate=True, node_heights=heights)
+        seg0 = struct.unpack_from("<f", recalc_3d, base + 24)[0]
+        seg1 = struct.unpack_from("<f", recalc_3d, base + ilin_fmt.NODE_SIZE + 24)[0]
+        dx0, dz0 = struct.unpack_from("<2f", recalc_3d, base + 8)
+        self.assertAlmostEqual(seg0, 40.0, places=2, msg="Vertical 40m climb should preserve 3D segment length!")
+        self.assertAlmostEqual(seg1, math.hypot(10.0, 60.0), places=2, msg="Steep climb should preserve 3D segment length!")
+        self.assertAlmostEqual(math.hypot(dx0, dz0), 1.0, places=3, msg="Vertical climb must keep valid unit horizontal tangent!")
+
+        # 2. PropertiesPanel + ViewportGL 3D gizmo for selected ILIN Road Node
+        w = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        win._attach_loaded_world(w)
+        rn = next(iter(w.road_graph.nodes.values()))
+        win.viewport.select_road_node(rn.node_id)
+        origin, gkind = win.viewport._active_gizmo_origin()
+        self.assertEqual(gkind, "road_node")
+        self.assertIsNotNone(origin)
+        # Arbitrary 3D elevation edit (+85.5 m) must NOT be flattened
+        win._on_prop_road_pos(rn, (rn.x, 85.5, rn.z))
+        self.assertAlmostEqual(rn.y, 85.5, places=3)
+        self.assertIn("P ", win.properties.val_road_dir.text())
+        win.close()
+        self.app.processEvents()
+
+        # 3. 3D tilted optional-terrain ramp (full H/P/R + scale -> tilted BPPT 3D collision planes!)
+        ramp = next(
+            (o for o in w.objects if o.category == "optional-terrain" and o.opt_terrain_mode is not None),
+            None,
+        )
+        self.assertIsNotNone(ramp)
+        assert ramp is not None
+        ramp.rotation_hpr = (25.0, 42.0, 18.0)
+        ramp.scale = (1.5, 2.5, 1.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            mod_out = Path(tmp) / "mods" / "TiltedRampTest"
+            rep = ps.export_mod_layer(w, "TiltedRampTest", mod_out)
+            self.assertGreater(rep["bppt_planes_patched"], 0)
+            mod_ents = mb.directory(Path(rep["mod_trk"]))
+            bpp_mod, _ = mb.payload(Path(rep["mod_trk"]), "track.bpp", mod_ents, verify_crc=True)
+            slot = wl.parse_bppt(bpp_mod)[ramp.opt_terrain_mode]
+            tilted = 0
+            for pi in range(slot["n_planes"]):
+                a, b, c, _d = struct.unpack_from("<4f", bpp_mod, slot["planes_off"] + pi * 20)
+                if b >= 0.01 and (abs(a) > 0.25 or abs(c) > 0.25):
+                    tilted += 1
+            self.assertGreater(tilted, 0, "Expected steeply tilted 3D planes in track.bpp!")
+
+        # 4. Embedded PIE Win32 style stripping + DPI-scaled client rect math (1.0x..2.0x)
+        raw_style = ph.WS_OVERLAPPEDWINDOW | ph.WS_POPUP | ph.WS_VISIBLE
+        raw_exstyle = ph.WS_EX_WINDOWEDGE | ph.WS_EX_CLIENTEDGE | ph.WS_EX_DLGMODALFRAME | ph.WS_EX_APPWINDOW
+        ns, nxs = ph.strip_embedded_window_styles(raw_style, raw_exstyle)
+        self.assertTrue(bool(ns & ph.WS_CHILD))
+        self.assertFalse(bool(ns & (ph.WS_CAPTION | ph.WS_THICKFRAME | ph.WS_BORDER | ph.WS_POPUP)))
+        self.assertEqual(nxs, 0)
+
+        for dpr in (1.0, 1.25, 1.5, 2.0):
+            r = ph.compute_embedded_client_rect(960, 540, dpr)
+            self.assertEqual(r["client_w"], int(round(960 * dpr)))
+            self.assertEqual(r["client_h"], int(round(540 * dpr)))
+            self.assertEqual((r["x"], r["y"], r["w"], r["h"]), (0, 0, r["client_w"], r["client_h"]))
+
+        # Stale oversized Win32 GetClientRect during shrink clamps to exact Qt physical width (no HUD edge clip!)
+        r_shrink = ph.compute_embedded_client_rect(900, 540, 2.0, win32_client_size=(1840, 1080))
+        self.assertEqual(r_shrink["client_w"], 1800)
+
+        # Residual non-client frame insets offset x/y negatively so client area starts at exact (0, 0)
+        r_nc = ph.compute_embedded_client_rect(960, 540, 1.5, nc_insets=(8, 31, 8, 8))
+        self.assertEqual((r_nc["x"], r_nc["y"]), (-8, -31))
+        self.assertEqual((r_nc["w"], r_nc["h"]), (1440 + 16, 810 + 39))
+
+        # Cross-DPI WM_SIZE scaling (Qt PMv2 192 DPI embedding DPI-unaware 96 DPI child)
+        r_dpi = ph.compute_embedded_client_rect(960, 540, 2.0, parent_dpi=192, child_dpi=96)
+        self.assertEqual((r_dpi["client_w"], r_dpi["client_h"]), (1920, 1080))
+        self.assertEqual((r_dpi["wm_size_w"], r_dpi["wm_size_h"]), (960, 540))
+
+        print(
+            f"[VERIFIED] Stupid-Angle 3D ILIN (seg0={seg0:.1f}m, seg1={seg1:.1f}m) + "
+            f"Tilted BPPT ({tilted} 3D planes) + PIE DPI Rect Math (1.0x..2.0x)"
+        )
+
 
 if __name__ == "__main__":
     print(f"Running EOD World Editor tests (PySide6 {PYSIDE6_VERSION}, Python {sys.version.split()[0]})...")

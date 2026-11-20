@@ -225,6 +225,44 @@ void main() {
 }
 """
 
+_ID_VERT = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 2) in vec2 aUv;
+layout(location = 3) in float aObjId;
+uniform mat4 uViewProj;
+uniform mat4 uModel;
+out vec2 vUv;
+flat out float vObjId;
+void main() {
+    vUv = aUv;
+    vObjId = aObjId;
+    gl_Position = uViewProj * uModel * vec4(aPos, 1.0);
+}
+"""
+
+_ID_FRAG = """
+#version 330 core
+in vec2 vUv;
+flat in float vObjId;
+uniform sampler2D uTex;
+uniform int uHasTex;
+uniform int uCutout;
+out vec4 FragColor;
+void main() {
+    if (uHasTex != 0 && uCutout != 0) {
+        if (texture(uTex, vUv).a < 0.35) {
+            discard;
+        }
+    }
+    int id = int(vObjId + 0.5);
+    float r = float(id & 255) / 255.0;
+    float g = float((id >> 8) & 255) / 255.0;
+    float b = float((id >> 16) & 255) / 255.0;
+    FragColor = vec4(r, g, b, 1.0);
+}
+"""
+
 _FLAT_FRAG = """
 #version 330 core
 in vec4 vColor;
@@ -660,6 +698,8 @@ class ViewportGL(QOpenGLWidget):
     dropToGroundRequested = Signal()
     contextMenuRequested = Signal(object)            # QPoint global pos
     multiObjectTransformed = Signal(list, str)       # [(obj, old_p, old_r, old_s, new_p, new_r, new_s), ...], label
+    altDuplicateCompleted = Signal(list, str)        # [cloned_objs...], label (Alt+Drag Duplicate & Drag!)
+    toolCycled = Signal(str)                         # new active_tool ("move" | "rotate" | "scale")
     selectionChanged = Signal(list)                  # list[WorldObject]
     statsUpdated = Signal(dict)
     statusMessage = Signal(str)
@@ -725,12 +765,14 @@ class ViewportGL(QOpenGLWidget):
             "car-wreck": True,
         }
 
-        # Selection
+        # Selection & Compound Group Drill-In
         self.selected_obj: WorldObject | None = None
         self.selected_objects: list[WorldObject] = []
         self.selected_road_node_id: int | None = None
         self.selected_marker: WorldMarker | None = None
         self.selected_barrier_idx: int = -1
+        self._drilled_group_id: str = ""
+        self._alt_drag_clones: list[WorldObject] = []
 
         # Interaction state
         self._keys_down: set[int] = set()
@@ -757,15 +799,31 @@ class ViewportGL(QOpenGLWidget):
         self._prog_sky = 0
         self._prog_world = 0
         self._prog_flat = 0
+        self._prog_id = 0
         self._u_sky: dict[str, int] = {}
         self._u_world: dict[str, int] = {}
         self._u_flat: dict[str, int] = {}
+        self._u_id: dict[str, int] = {}
+        self._pick_fbo = 0
+        self._pick_color_tex = 0
+        self._pick_depth_rb = 0
+        self._pick_fb_size: tuple[int, int] = (0, 0)
         self._vao_empty = 0
         self._gl_textures: dict[str, tuple[int, bool]] = {}  # name -> (tex_id, cutout)
         self._terrain_batches: list[dict[str, Any]] = []
         self._prop_batches: list[dict[str, Any]] = []
         self._static_batches: list[dict[str, Any]] = []
         self._blend_batches: list[dict[str, Any]] = []
+        self._dynamic_batches: list[dict[str, Any]] = []
+        self._dynamic_blend_batches: list[dict[str, Any]] = []
+        self._dynamic_obj_ids: set[str] = set()
+        self._static_obj_spans: dict[str, list[tuple[dict[str, Any], int, int]]] = {}
+        self._last_baked_obj_state: dict[str, tuple[Any, ...]] = {}
+        self._static_filter_sig: Any = None
+        self._force_full_static_rebuild: bool = True
+        self._dynamic_dirty: bool = False
+        self._last_batch_rebuild_ms: float = 0.0
+        self._active_obj_count: int = 0
         self._sel_batches: list[dict[str, Any]] = []
         self._grid_vao = 0
         self._grid_vbo = 0
@@ -849,7 +907,16 @@ class ViewportGL(QOpenGLWidget):
         self.cam_pos = np.array([cx - r * 0.55, cy + r * 0.42, cz - r * 0.65], dtype=np.float32)
         self.look_at(np.array([cx, cy, cz], dtype=np.float32))
 
+        self._drilled_group_id = ""
+        self._alt_drag_clones.clear()
+        self._dynamic_obj_ids.clear()
+        self._static_obj_spans.clear()
+        self._last_baked_obj_state.clear()
+        self._static_filter_sig = None
+        self._force_full_static_rebuild = True
+        self._active_obj_count = sum(1 for o in world.objects if not o.deleted)
         self._static_dirty = True
+        self._dynamic_dirty = True
         self._sel_dirty = True
         self._col_dirty = True
         self._roads_dirty = True
@@ -859,6 +926,7 @@ class ViewportGL(QOpenGLWidget):
             self._upload_textures()
             self._rebuild_collision_vbo()
             self._rebuild_static_batches()
+            self._rebuild_dynamic_batches()
             self._rebuild_selection_batches()
             self.doneCurrent()
         self.update()
@@ -981,6 +1049,7 @@ class ViewportGL(QOpenGLWidget):
         vis = [o for o in self.selected_objects if self.world.object_visible_in_event_template(o)]
         if len(vis) != len(self.selected_objects):
             self.select_objects(vis, emit=True)
+        self._force_full_static_rebuild = True
         self._static_dirty = True
         self._sel_dirty = True
         self.update()
@@ -1067,8 +1136,25 @@ class ViewportGL(QOpenGLWidget):
         if emit:
             self.barrierSelected.emit(self.selected_barrier_idx)
 
-    def mark_scene_dirty(self) -> None:
-        self._static_dirty = True
+    def mark_objects_dirty(self, objs: list[WorldObject] | tuple[WorldObject, ...]) -> None:
+        """Fast O(k) dirty-mark for edited objects (avoids rebuilding 6,000-object static VBOs!)."""
+        if self.world is None:
+            return
+        for o in objs:
+            if o is not None:
+                self._dynamic_obj_ids.add(o.obj_id)
+        self._dynamic_dirty = True
+        self._sel_dirty = True
+        self.update()
+
+    def mark_scene_dirty(self, *, force_full: bool = False) -> None:
+        if force_full:
+            self._force_full_static_rebuild = True
+            self._static_dirty = True
+        else:
+            # Incremental dirty flag: paintGL diffs changed/new objects into dynamic VBO (<4 ms)
+            # and only falls back to full static rebuild when layers/template changed or >256 objects changed!
+            self._dynamic_dirty = True
         self._sel_dirty = True
         self._roads_dirty = True
         self._markers_dirty = True
@@ -1195,6 +1281,7 @@ class ViewportGL(QOpenGLWidget):
         self._prog_sky = _compile_program(_SKY_VERT, _SKY_FRAG)
         self._prog_world = _compile_program(_WORLD_VERT, _WORLD_FRAG)
         self._prog_flat = _compile_program(_FLAT_VERT, _FLAT_FRAG)
+        self._prog_id = _compile_program(_ID_VERT, _ID_FRAG)
 
         # Cache all uniform locations once (zero glGetUniformLocation calls per frame!)
         self._u_sky = {
@@ -1215,6 +1302,10 @@ class ViewportGL(QOpenGLWidget):
         self._u_flat = {
             name: GL.glGetUniformLocation(self._prog_flat, name)
             for name in ("uViewProj", "uModel", "uUseOverride", "uOverrideColor")
+        }
+        self._u_id = {
+            name: GL.glGetUniformLocation(self._prog_id, name)
+            for name in ("uViewProj", "uModel", "uTex", "uHasTex", "uCutout")
         }
 
         self._vao_empty = int(GL.glGenVertexArrays(1))
@@ -1393,6 +1484,14 @@ class ViewportGL(QOpenGLWidget):
         )
 
     def _upload_mesh_batch(self, verts: np.ndarray, indices: np.ndarray, tex: str) -> dict[str, Any]:
+        # Accept either 8-float (pos3, nrm3, uv2) or 9-float (+obj_id) vertex arrays cleanly
+        if verts.ndim == 2 and verts.shape[1] == 8:
+            padded = np.empty((verts.shape[0], 9), dtype=np.float32)
+            padded[:, :8] = verts
+            padded[:, 8] = 0.0
+            verts = padded
+        verts = np.ascontiguousarray(verts, dtype=np.float32)
+        indices = np.ascontiguousarray(indices, dtype=np.uint32)
         vao = int(GL.glGenVertexArrays(1))
         vbo = int(GL.glGenBuffers(1))
         ebo = int(GL.glGenBuffers(1))
@@ -1401,38 +1500,134 @@ class ViewportGL(QOpenGLWidget):
         GL.glBufferData(GL.GL_ARRAY_BUFFER, verts.nbytes, verts, GL.GL_STATIC_DRAW)
         GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, ebo)
         GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL.GL_STATIC_DRAW)
-        stride = 8 * 4
+        stride = 9 * 4
         GL.glEnableVertexAttribArray(0)
         GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(0))
         GL.glEnableVertexAttribArray(1)
         GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(12))
         GL.glEnableVertexAttribArray(2)
         GL.glVertexAttribPointer(2, 2, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(24))
+        GL.glEnableVertexAttribArray(3)
+        GL.glVertexAttribPointer(3, 1, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(32))
         GL.glBindVertexArray(0)
         return {"vao": vao, "vbo": vbo, "ebo": ebo, "count": len(indices), "tris": len(indices) // 3, "tex": tex}
 
+    def _mask_static_object_in_ebo(self, obj_id: str) -> None:
+        """Zero out an object's index slice in static EBOs in-place (<0.05 ms) so it moves cleanly to dynamic VBO."""
+        spans = self._static_obj_spans.pop(obj_id, None)
+        if not spans:
+            return
+        for batch, byte_off, idx_count in spans:
+            if idx_count <= 0 or not batch.get("ebo"):
+                continue
+            zeros = np.zeros(idx_count, dtype=np.uint32)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, batch["ebo"])
+            GL.glBufferSubData(GL.GL_ELEMENT_ARRAY_BUFFER, byte_off, zeros.nbytes, zeros)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)
+
+    def _sync_dirty_scene_batches(self) -> None:
+        """Smart incremental scene sync: splits static vs. dynamic VBO batches so edits stay <4 ms!"""
+        if self.world is None:
+            self._static_dirty = False
+            self._dynamic_dirty = False
+            return
+        t0 = time.perf_counter_ns()
+        cur_sig = (
+            self.world.active_event_template,
+            tuple(sorted(self.layer_visibility.items())),
+        )
+        if (
+            self._force_full_static_rebuild
+            or self._static_dirty
+            or cur_sig != self._static_filter_sig
+            or not self._last_baked_obj_state
+        ):
+            self._rebuild_static_batches()
+            self._rebuild_dynamic_batches()
+            self._last_batch_rebuild_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+            return
+
+        # Fast incremental diff against last baked state (only touches changed/new objects!)
+        changed_ids: list[str] = []
+        active_cnt = 0
+        for obj in self.world.objects:
+            if not obj.deleted:
+                active_cnt += 1
+            oid = obj.obj_id
+            st = (obj.position, obj.rotation_hpr, obj.scale, obj.deleted, obj.visible, obj.model_key)
+            prev = self._last_baked_obj_state.get(oid)
+            if prev != st:
+                changed_ids.append(oid)
+                self._last_baked_obj_state[oid] = st
+        self._active_obj_count = active_cnt
+
+        # If a massive batch edit changed >256 objects at once, rebuild static cleanly
+        if len(changed_ids) > 256:
+            self._rebuild_static_batches()
+            self._rebuild_dynamic_batches()
+            self._last_batch_rebuild_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+            return
+
+        for oid in changed_ids:
+            self._mask_static_object_in_ebo(oid)
+            self._dynamic_obj_ids.add(oid)
+        for oid in list(self._dynamic_obj_ids):
+            if oid in self._static_obj_spans:
+                self._mask_static_object_in_ebo(oid)
+
+        self._rebuild_dynamic_batches()
+        self._last_batch_rebuild_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+
     def _rebuild_static_batches(self) -> None:
         self._static_dirty = False
+        self._force_full_static_rebuild = False
         self._delete_batches(self._terrain_batches)
         self._delete_batches(self._prop_batches)
         self._static_batches.clear()
         self._delete_batches(self._blend_batches)
+        self._static_obj_spans.clear()
+        self._last_baked_obj_state.clear()
         if self.world is None:
+            self._active_obj_count = 0
             return
+
+        self._static_filter_sig = (
+            self.world.active_event_template,
+            tuple(sorted(self.layer_visibility.items())),
+        )
 
         terr_v: dict[str, list[np.ndarray]] = {}
         terr_i: dict[str, list[np.ndarray]] = {}
         terr_base: dict[str, int] = {}
+        terr_idx_off: dict[str, int] = {}
+        terr_spans: dict[str, list[tuple[str, int, int]]] = {}
 
         prop_v: dict[str, list[np.ndarray]] = {}
         prop_i: dict[str, list[np.ndarray]] = {}
         prop_base: dict[str, int] = {}
+        prop_idx_off: dict[str, int] = {}
+        prop_spans: dict[str, list[tuple[str, int, int]]] = {}
 
         blend_v: dict[str, list[np.ndarray]] = {}
         blend_i: dict[str, list[np.ndarray]] = {}
         blend_base: dict[str, int] = {}
+        blend_idx_off: dict[str, int] = {}
+        blend_spans: dict[str, list[tuple[str, int, int]]] = {}
 
-        for obj in self.world.objects:
+        active_cnt = 0
+        for obj_idx, obj in enumerate(self.world.objects):
+            if not obj.deleted:
+                active_cnt += 1
+            self._last_baked_obj_state[obj.obj_id] = (
+                obj.position,
+                obj.rotation_hpr,
+                obj.scale,
+                obj.deleted,
+                obj.visible,
+                obj.model_key,
+            )
+            if obj.obj_id in self._dynamic_obj_ids:
+                continue
             if not self.world.object_visible_in_event_template(obj):
                 continue
             if not self.layer_visibility.get(obj.category, True):
@@ -1447,47 +1642,264 @@ class ViewportGL(QOpenGLWidget):
                 obj.rotation_hpr == (0.0, 0.0, 0.0) and obj.scale == (1.0, 1.0, 1.0)
             )
             is_terrain = obj.category in ("static", "optional-terrain")
+            pick_id = float(obj_idx + 1)
             for part in model.parts:
-                v = part.vertices.copy()
+                nv = len(part.vertices)
+                v = np.empty((nv, 9), dtype=np.float32)
                 if is_ident_rot:
-                    v[:, 0:3] += t3
+                    v[:, 0:3] = part.vertices[:, 0:3] + t3
+                    v[:, 3:8] = part.vertices[:, 3:8]
                 else:
-                    v[:, 0:3] = v[:, 0:3] @ rot3.T + t3
-                    v[:, 3:6] = v[:, 3:6] @ rot3.T
+                    v[:, 0:3] = part.vertices[:, 0:3] @ rot3.T + t3
+                    v[:, 3:6] = part.vertices[:, 3:6] @ rot3.T
+                    v[:, 6:8] = part.vertices[:, 6:8]
+                v[:, 8] = pick_id
                 tex = part.texture
                 ta = self.world.textures.get(tex)
+                ni = len(part.indices)
                 if ta is not None and ta.alpha_kind == "blend":
                     base = blend_base.get(tex, 0)
+                    ioff = blend_idx_off.get(tex, 0)
                     blend_v.setdefault(tex, []).append(v)
                     blend_i.setdefault(tex, []).append(part.indices + base)
-                    blend_base[tex] = base + len(v)
+                    blend_spans.setdefault(tex, []).append((obj.obj_id, ioff * 4, ni))
+                    blend_base[tex] = base + nv
+                    blend_idx_off[tex] = ioff + ni
                 elif is_terrain:
                     base = terr_base.get(tex, 0)
+                    ioff = terr_idx_off.get(tex, 0)
                     terr_v.setdefault(tex, []).append(v)
                     terr_i.setdefault(tex, []).append(part.indices + base)
-                    terr_base[tex] = base + len(v)
+                    terr_spans.setdefault(tex, []).append((obj.obj_id, ioff * 4, ni))
+                    terr_base[tex] = base + nv
+                    terr_idx_off[tex] = ioff + ni
                 else:
                     base = prop_base.get(tex, 0)
+                    ioff = prop_idx_off.get(tex, 0)
                     prop_v.setdefault(tex, []).append(v)
                     prop_i.setdefault(tex, []).append(part.indices + base)
-                    prop_base[tex] = base + len(v)
+                    prop_spans.setdefault(tex, []).append((obj.obj_id, ioff * 4, ni))
+                    prop_base[tex] = base + nv
+                    prop_idx_off[tex] = ioff + ni
+
+        self._active_obj_count = active_cnt
 
         for tex, vlist in terr_v.items():
             verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
             inds = np.ascontiguousarray(np.concatenate(terr_i[tex], axis=0), dtype=np.uint32)
-            self._terrain_batches.append(self._upload_mesh_batch(verts, inds, tex))
+            b = self._upload_mesh_batch(verts, inds, tex)
+            self._terrain_batches.append(b)
+            for oid, byte_off, ni in terr_spans.get(tex, ()):
+                self._static_obj_spans.setdefault(oid, []).append((b, byte_off, ni))
 
         for tex, vlist in prop_v.items():
             verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
             inds = np.ascontiguousarray(np.concatenate(prop_i[tex], axis=0), dtype=np.uint32)
-            self._prop_batches.append(self._upload_mesh_batch(verts, inds, tex))
+            b = self._upload_mesh_batch(verts, inds, tex)
+            self._prop_batches.append(b)
+            for oid, byte_off, ni in prop_spans.get(tex, ()):
+                self._static_obj_spans.setdefault(oid, []).append((b, byte_off, ni))
 
         self._static_batches = self._terrain_batches + self._prop_batches
 
         for tex, vlist in blend_v.items():
             verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
             inds = np.ascontiguousarray(np.concatenate(blend_i[tex], axis=0), dtype=np.uint32)
-            self._blend_batches.append(self._upload_mesh_batch(verts, inds, tex))
+            b = self._upload_mesh_batch(verts, inds, tex)
+            self._blend_batches.append(b)
+            for oid, byte_off, ni in blend_spans.get(tex, ()):
+                self._static_obj_spans.setdefault(oid, []).append((b, byte_off, ni))
+
+    def _rebuild_dynamic_batches(self) -> None:
+        """Rebuild ONLY the small dynamic VBO bucket (edited/moved/placed objects) in <2 ms."""
+        self._dynamic_dirty = False
+        self._delete_batches(self._dynamic_batches)
+        self._delete_batches(self._dynamic_blend_batches)
+        if self.world is None or not self._dynamic_obj_ids:
+            return
+
+        dyn_v: dict[str, list[np.ndarray]] = {}
+        dyn_i: dict[str, list[np.ndarray]] = {}
+        dyn_base: dict[str, int] = {}
+        dbl_v: dict[str, list[np.ndarray]] = {}
+        dbl_i: dict[str, list[np.ndarray]] = {}
+        dbl_base: dict[str, int] = {}
+
+        # Build fast id->index lookup only for dynamic IDs
+        dyn_set = self._dynamic_obj_ids
+        for obj_idx, obj in enumerate(self.world.objects):
+            if obj.obj_id not in dyn_set:
+                continue
+            if not self.world.object_visible_in_event_template(obj):
+                continue
+            if not self.layer_visibility.get(obj.category, True):
+                continue
+            model = self.world.models.get(obj.model_key)
+            if not model:
+                continue
+            m4 = obj.world_matrix()
+            rot3 = m4[:3, :3]
+            t3 = m4[:3, 3]
+            pick_id = float(obj_idx + 1)
+            for part in model.parts:
+                nv = len(part.vertices)
+                v = np.empty((nv, 9), dtype=np.float32)
+                v[:, 0:3] = part.vertices[:, 0:3] @ rot3.T + t3
+                v[:, 3:6] = part.vertices[:, 3:6] @ rot3.T
+                v[:, 6:8] = part.vertices[:, 6:8]
+                v[:, 8] = pick_id
+                tex = part.texture
+                ta = self.world.textures.get(tex)
+                if ta is not None and ta.alpha_kind == "blend":
+                    base = dbl_base.get(tex, 0)
+                    dbl_v.setdefault(tex, []).append(v)
+                    dbl_i.setdefault(tex, []).append(part.indices + base)
+                    dbl_base[tex] = base + nv
+                else:
+                    base = dyn_base.get(tex, 0)
+                    dyn_v.setdefault(tex, []).append(v)
+                    dyn_i.setdefault(tex, []).append(part.indices + base)
+                    dyn_base[tex] = base + nv
+
+        for tex, vlist in dyn_v.items():
+            verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
+            inds = np.ascontiguousarray(np.concatenate(dyn_i[tex], axis=0), dtype=np.uint32)
+            self._dynamic_batches.append(self._upload_mesh_batch(verts, inds, tex))
+        for tex, vlist in dbl_v.items():
+            verts = np.ascontiguousarray(np.concatenate(vlist, axis=0), dtype=np.float32)
+            inds = np.ascontiguousarray(np.concatenate(dbl_i[tex], axis=0), dtype=np.uint32)
+            self._dynamic_blend_batches.append(self._upload_mesh_batch(verts, inds, tex))
+
+    def _ensure_pick_fbo(self, fb_w: int, fb_h: int) -> bool:
+        """Lazily allocate/resize offscreen GPU Object-ID FBO (RGBA8 + DEPTH24) for pixel-exact picking."""
+        if not self._gl_ready or fb_w <= 0 or fb_h <= 0:
+            return False
+        if self._pick_fbo and self._pick_fb_size == (fb_w, fb_h):
+            return True
+        if self._pick_fbo:
+            GL.glDeleteFramebuffers(1, [self._pick_fbo])
+        if self._pick_color_tex:
+            GL.glDeleteTextures(1, [self._pick_color_tex])
+        if self._pick_depth_rb:
+            GL.glDeleteRenderbuffers(1, [self._pick_depth_rb])
+
+        self._pick_fbo = int(GL.glGenFramebuffers(1))
+        self._pick_color_tex = int(GL.glGenTextures(1))
+        self._pick_depth_rb = int(GL.glGenRenderbuffers(1))
+
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._pick_fbo)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._pick_color_tex)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, fb_w, fb_h, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, self._pick_color_tex, 0)
+
+        GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, self._pick_depth_rb)
+        GL.glRenderbufferStorage(GL.GL_RENDERBUFFER, GL.GL_DEPTH_COMPONENT24, fb_w, fb_h)
+        GL.glFramebufferRenderbuffer(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT, GL.GL_RENDERBUFFER, self._pick_depth_rb)
+
+        status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        if status != GL.GL_FRAMEBUFFER_COMPLETE:
+            self._pick_fb_size = (0, 0)
+            return False
+        self._pick_fb_size = (fb_w, fb_h)
+        return True
+
+    def _pick_object_gpu(self, sx: float, sy: float) -> WorldObject | None:
+        """Pixel-exact GPU Object-ID FBO pick (1x1 / 3x3 readback under cursor in <0.8 ms)."""
+        if self.world is None or not self._gl_ready or not self._prog_id:
+            return None
+        w = max(1, self.width())
+        h = max(1, self.height())
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        fb_w = max(1, int(round(w * dpr)))
+        fb_h = max(1, int(round(h * dpr)))
+        px = max(0, min(fb_w - 1, int(round(sx * dpr))))
+        py = max(0, min(fb_h - 1, fb_h - 1 - int(round(sy * dpr))))
+
+        try:
+            self.makeCurrent()
+            if self._static_dirty or self._dynamic_dirty:
+                self._sync_dirty_scene_batches()
+            if not self._ensure_pick_fbo(fb_w, fb_h):
+                self.doneCurrent()
+                return None
+
+            fwd, right, up = self.camera_vectors()
+            view = lh_look_matrix(self.cam_pos, fwd, right, up)
+            proj = lh_perspective(self.cam_fov, w / h, 0.4, 4500.0)
+            view_proj = proj @ view
+            ident = np.eye(4, dtype=np.float32)
+
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._pick_fbo)
+            GL.glViewport(0, 0, fb_w, fb_h)
+            GL.glDisable(GL.GL_BLEND)
+            GL.glEnable(GL.GL_DEPTH_TEST)
+            GL.glDepthMask(GL.GL_TRUE)
+            GL.glDisable(GL.GL_CULL_FACE)
+            GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
+            GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+
+            GL.glUseProgram(self._prog_id)
+            uid = self._u_id
+            GL.glUniformMatrix4fv(uid["uViewProj"], 1, GL.GL_TRUE, view_proj)
+            GL.glUniformMatrix4fv(uid["uModel"], 1, GL.GL_TRUE, ident)
+            GL.glUniform1i(uid["uTex"], 0)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+
+            for batch_list in (self._terrain_batches, self._prop_batches, self._dynamic_batches, self._blend_batches, self._dynamic_blend_batches):
+                for b in batch_list:
+                    tex_entry = self._gl_textures.get(b["tex"])
+                    if tex_entry is not None:
+                        GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
+                        GL.glUniform1i(uid["uHasTex"], 1)
+                        GL.glUniform1i(uid["uCutout"], 1 if tex_entry[1] else 0)
+                    else:
+                        GL.glUniform1i(uid["uHasTex"], 0)
+                        GL.glUniform1i(uid["uCutout"], 0)
+                    GL.glBindVertexArray(b["vao"])
+                    GL.glDrawElements(GL.GL_TRIANGLES, b["count"], GL.GL_UNSIGNED_INT, None)
+
+            GL.glBindVertexArray(0)
+            # Read 3x3 patch centered at (px, py) — exact center pixel first, 1px neighbors fallback for thin fences!
+            rx0 = max(0, px - 1)
+            ry0 = max(0, py - 1)
+            rw = min(3, fb_w - rx0)
+            rh = min(3, fb_h - ry0)
+            GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
+            raw_px = GL.glReadPixels(rx0, ry0, rw, rh, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+            self.doneCurrent()
+
+            arr = np.frombuffer(raw_px, dtype=np.uint8).reshape(rh, rw, 4)
+            cx = px - rx0
+            cy = py - ry0
+            # Check exact pixel first, then immediate neighbors
+            order = [(cy, cx)]
+            for dy_p in range(rh):
+                for dx_p in range(rw):
+                    if (dy_p, dx_p) != (cy, cx):
+                        order.append((dy_p, dx_p))
+            n_objs = len(self.world.objects)
+            for yy, xx in order:
+                r, g, b_c = int(arr[yy, xx, 0]), int(arr[yy, xx, 1]), int(arr[yy, xx, 2])
+                encoded = r | (g << 8) | (b_c << 16)
+                if encoded > 0:
+                    idx = encoded - 1
+                    if 0 <= idx < n_objs:
+                        obj = self.world.objects[idx]
+                        if not obj.deleted and obj.visible:
+                            return obj
+            return None
+        except Exception:
+            try:
+                GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+                self.doneCurrent()
+            except Exception:
+                pass
+            return None
 
     def _rebuild_selection_batches(self) -> None:
         self._sel_dirty = False
@@ -1743,10 +2155,15 @@ class ViewportGL(QOpenGLWidget):
             pa = np.array([na.x, na.y + 0.12, na.z], dtype=np.float32)
             pb = np.array([nb.x, nb.y + 0.12, nb.z], dtype=np.float32)
             seg = pb - pa
-            lxz = math.hypot(float(seg[0]), float(seg[2]))
-            if lxz < 1e-4:
+            seg_3d = float(np.linalg.norm(seg))
+            if seg_3d < 1e-4:
                 continue
-            perp = np.array([-seg[2] / lxz, 0.0, seg[0] / lxz], dtype=np.float32)
+            lxz = math.hypot(float(seg[0]), float(seg[2]))
+            if lxz >= 1e-4:
+                perp = np.array([-seg[2] / lxz, 0.0, seg[0] / lxz], dtype=np.float32)
+            else:
+                # Near-vertical climb: keep ribbon visible with a stable lateral normal
+                perp = np.array([1.0, 0.0, 0.0], dtype=np.float32)
             hw = e.width * 0.5
             p0 = pa - perp * hw
             p1 = pa + perp * hw
@@ -1944,8 +2361,8 @@ class ViewportGL(QOpenGLWidget):
         self.gpu_timer.begin_frame()
         if self._pending_tex_updates:
             self._flush_pending_textures()
-        if self._static_dirty:
-            self._rebuild_static_batches()
+        if self._static_dirty or self._dynamic_dirty:
+            self._sync_dirty_scene_batches()
         if self._sel_dirty:
             self._rebuild_selection_batches()
         if self._ghost_dirty:
@@ -2068,9 +2485,9 @@ class ViewportGL(QOpenGLWidget):
             tris_drawn += b["tris"]
         self.gpu_timer.end_pass("terrain")
 
-        # 3b. Props pass (dyno, event props, cars/wrecks, billboards, selection & ghost preview)
+        # 3b. Props + dynamic edited-object pass (dyno, event props, cars/wrecks, billboards, edited meshes)
         self.gpu_timer.begin_pass("props")
-        for b in self._prop_batches:
+        for b in (*self._prop_batches, *self._dynamic_batches):
             tex_entry = self._gl_textures.get(b["tex"])
             if tex_entry is not None:
                 GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
@@ -2087,11 +2504,11 @@ class ViewportGL(QOpenGLWidget):
 
         # 3c. Translucent water / blend surfaces (e.g. Afton pond `sween.tex`)
         self.gpu_timer.begin_pass("water")
-        if self._blend_batches:
+        if self._blend_batches or self._dynamic_blend_batches:
             GL.glEnable(GL.GL_BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glDepthMask(GL.GL_FALSE)
-            for b in self._blend_batches:
+            for b in (*self._blend_batches, *self._dynamic_blend_batches):
                 tex_entry = self._gl_textures.get(b["tex"])
                 if tex_entry is not None:
                     GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
@@ -2224,13 +2641,8 @@ class ViewportGL(QOpenGLWidget):
         # 7b. Scatter Brush terrain ring
         draws += self._draw_scatter_brush(view_proj)
 
-        # 8. Interactive 3D Transform Gizmo (for selected Object OR selected Marker!)
-        gizmo_origin = None
-        if self.active_tool in ("move", "rotate", "scale", "select"):
-            if self.selected_obj is not None and not self.selected_obj.deleted:
-                gizmo_origin = np.array(self.selected_obj.position, dtype=np.float32)
-            elif self.selected_marker is not None:
-                gizmo_origin = np.array(self.selected_marker.position, dtype=np.float32)
+        # 8. Interactive 3D Transform Gizmo (for selected Object, Marker, OR Road Node!)
+        gizmo_origin, _gizmo_kind = self._active_gizmo_origin()
         if gizmo_origin is not None:
             glines, gtris = self._build_gizmo_geometry(gizmo_origin)
             GL.glClear(GL.GL_DEPTH_BUFFER_BIT)
@@ -2308,6 +2720,10 @@ class ViewportGL(QOpenGLWidget):
             return np.array(self.selected_obj.position, dtype=np.float32), "obj"
         if self.selected_marker is not None:
             return np.array(self.selected_marker.position, dtype=np.float32), "marker"
+        if self.selected_road_node_id is not None and self.world is not None:
+            n = self.world.road_graph.nodes.get(self.selected_road_node_id)
+            if n is not None:
+                return np.array([n.x, n.y + 0.65, n.z], dtype=np.float32), "road_node"
         return None, ""
 
     def _pick_gizmo_axis(self, ray_o: np.ndarray, ray_d: np.ndarray) -> int:
@@ -2343,19 +2759,23 @@ class ViewportGL(QOpenGLWidget):
         return best_axis
 
     def _pick_sobl_barrier(self, ray_o: np.ndarray, ray_d: np.ndarray) -> int:
-        """Pick the closest SOBL collision box when Collision Overlay is visible."""
+        """Pick the closest SOBL collision box using exact oriented bounding box (OBB) ray intersection."""
         if self.world is None or not self.show_collision:
             return -1
-        inv_d = np.where(np.abs(ray_d) > 1e-8, 1.0 / ray_d, 1e12).astype(np.float32)
         best_idx = -1
         best_t = 1e9
         for rec in self.world.collision.sobl_records:
             if rec.get("kind") != "box":
                 continue
-            corners = np.array(wc.box_corners(rec), dtype=np.float32)
-            lo = corners.min(axis=0)
-            hi = corners.max(axis=0)
-            t = ray_aabb_hit(ray_o, inv_d, lo, hi)
+            centre = np.array(rec["centre"], dtype=np.float32)
+            radii = np.array(rec["radii"], dtype=np.float32)
+            axes = np.array(rec["axes"], dtype=np.float32)  # 3x3 row-major basis
+            # Transform ray into box-local coordinates so rotated SOBL walls pick accurately!
+            rel_o = ray_o - centre
+            local_o = axes @ rel_o
+            local_d = axes @ ray_d
+            inv_ld = np.where(np.abs(local_d) > 1e-8, 1.0 / local_d, 1e12).astype(np.float32)
+            t = ray_aabb_hit(local_o, inv_ld, -radii, radii)
             if t is not None and t < best_t:
                 best_t = t
                 best_idx = int(rec["index"])
@@ -2427,6 +2847,15 @@ class ViewportGL(QOpenGLWidget):
                 best = m
         return best
 
+    def _pick_object_at_screen(self, sx: float, sy: float) -> WorldObject | None:
+        """Primary pixel-exact picker: GPU Object-ID FBO (1x1/3x3 readback) with exact ray-triangle fallback."""
+        if self._gl_ready and self._prog_id:
+            gpu_hit = self._pick_object_gpu(sx, sy)
+            if gpu_hit is not None:
+                return gpu_hit
+        ray_o, ray_d = self.screen_ray(sx, sy)
+        return self._pick_object(ray_o, ray_d)
+
     def _pick_object(self, ray_o: np.ndarray, ray_d: np.ndarray) -> WorldObject | None:
         if self.world is None:
             return None
@@ -2448,7 +2877,7 @@ class ViewportGL(QOpenGLWidget):
 
         best_obj: WorldObject | None = None
         best_t = 1e9
-        for aabb_t, obj in candidates[:48]:
+        for aabb_t, obj in candidates:
             if aabb_t > best_t:
                 break
             model = self.world.models[obj.model_key]
@@ -2555,11 +2984,21 @@ class ViewportGL(QOpenGLWidget):
                 if ax_idx >= 0:
                     self._gizmo_drag_axis = ax_idx
                     self._gizmo_drag_target = gkind
+                    self._alt_drag_clones = []
                     if gkind == "obj" and self.selected_obj is not None:
+                        active_sel = [o for o in self.selected_objects if not o.deleted] or [self.selected_obj]
+                        # Alt + Drag on gizmo: UE / 3ds Max / Lumion Duplicate & Drag in ONE motion!
+                        if (event.modifiers() & Qt.KeyboardModifier.AltModifier) and self.world is not None:
+                            clones = self._spawn_alt_drag_clones(active_sel)
+                            if clones:
+                                self._alt_drag_clones = clones
+                                active_sel = clones
+                                self.select_objects(clones, emit=True)
+                                self.mark_objects_dirty(clones)
+                                self.statusMessage.emit(f"Alt+Drag: duplicating {len(clones)} object(s)...")
                         self._gizmo_drag_orig_pos = self.selected_obj.position
                         self._gizmo_drag_orig_rot = self.selected_obj.rotation_hpr
                         self._gizmo_drag_orig_scale = self.selected_obj.scale
-                        active_sel = [o for o in self.selected_objects if not o.deleted] or [self.selected_obj]
                         self._gizmo_drag_multi = []
                         for so in active_sel:
                             base_min_y = so.position[1]
@@ -2572,6 +3011,10 @@ class ViewportGL(QOpenGLWidget):
                     elif gkind == "marker" and self.selected_marker is not None:
                         self._gizmo_drag_orig_pos = self.selected_marker.position
                         self._gizmo_drag_orig_hdg = self.selected_marker.heading_deg
+                    elif gkind == "road_node" and self.selected_road_node_id is not None and self.world is not None:
+                        rn = self.world.road_graph.nodes.get(self.selected_road_node_id)
+                        if rn is not None:
+                            self._gizmo_drag_orig_pos = (rn.x, rn.y, rn.z)
                     ax = np.eye(3, dtype=np.float32)[ax_idx]
                     if self.active_tool == "rotate":
                         hit = ray_plane_intersect(ray_o, ray_d, origin, ax)
@@ -2699,16 +3142,39 @@ class ViewportGL(QOpenGLWidget):
                 self.update()
                 return
 
-        # Dragging a selected road node
+            if self._gizmo_drag_target == "road_node" and self.selected_road_node_id is not None and self.world is not None:
+                rn = self.world.road_graph.nodes.get(self.selected_road_node_id)
+                if rn is not None:
+                    t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
+                    delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
+                    new_p = list(self._gizmo_drag_orig_pos)
+                    new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
+                    rn.x, rn.y, rn.z = float(new_p[0]), float(new_p[1]), float(new_p[2])
+                    self._roads_dirty = True
+                    self.roadNodeSelected.emit(rn)
+                    self.update()
+                return
+
+        # Dragging a selected road node (Shift+Drag = pure 3D vertical Y elevation drag; else preserves custom height offset!)
         if self._dragging_road_node and self.selected_road_node_id is not None and self.world is not None:
-            tp = self._raycast_terrain_point(ray_o, ray_d)
-            if tp is not None:
-                n = self.world.road_graph.nodes.get(self.selected_road_node_id)
-                if n is not None:
-                    n.x, n.y, n.z = float(tp[0]), float(tp[1]) + 0.35, float(tp[2])
+            n = self.world.road_graph.nodes.get(self.selected_road_node_id)
+            if n is not None:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    origin_r = np.array(self._drag_road_orig_pos, dtype=np.float32)
+                    t_y, _ = closest_point_ray_to_line(ray_o, ray_d, origin_r, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+                    n.y = self._snap_val(float(self._drag_road_orig_pos[1] + t_y), self.grid_snap_step, self.grid_snap_enabled)
                     self._roads_dirty = True
                     self.roadNodeSelected.emit(n)
                     self.update()
+                else:
+                    tp = self._raycast_terrain_point(ray_o, ray_d)
+                    if tp is not None:
+                        orig_gnd = self.world.collision.ground_height(self._drag_road_orig_pos[0], self._drag_road_orig_pos[2])
+                        elev_offset = max(0.35, float(self._drag_road_orig_pos[1]) - orig_gnd)
+                        n.x, n.y, n.z = float(tp[0]), float(tp[1]) + elev_offset, float(tp[2])
+                        self._roads_dirty = True
+                        self.roadNodeSelected.emit(n)
+                        self.update()
             return
 
         # Hover updates
@@ -2766,6 +3232,17 @@ class ViewportGL(QOpenGLWidget):
                 self._gizmo_drag_target = ""
                 drag_list = list(self._gizmo_drag_multi)
                 self._gizmo_drag_multi = []
+                alt_clones = list(self._alt_drag_clones)
+                self._alt_drag_clones = []
+                if target == "obj" and alt_clones and self.world is not None:
+                    # Remove temporary clones so QUndoStack.push() adds them cleanly in one undoable step
+                    for c in alt_clones:
+                        if c in self.world.objects:
+                            self.world.objects.remove(c)
+                    self.altDuplicateCompleted.emit(
+                        alt_clones, f"Alt+Drag duplicate ({len(alt_clones)} item{'s' if len(alt_clones) != 1 else ''})"
+                    )
+                    return
                 if target == "obj" and self.selected_obj is not None:
                     label = {"move": "Move object", "rotate": "Rotate object", "scale": "Scale object"}.get(
                         self.active_tool, "Transform object"
@@ -2794,6 +3271,14 @@ class ViewportGL(QOpenGLWidget):
                         mk.position, mk.heading_deg = op, oh
                         label = "Rotate marker" if self.active_tool == "rotate" else "Move marker"
                         self.markerTransformed.emit(mk, op, oh, np_, nh, label)
+                elif target == "road_node" and self.selected_road_node_id is not None and self.world is not None:
+                    rn = self.world.road_graph.nodes.get(self.selected_road_node_id)
+                    if rn is not None:
+                        op = self._gizmo_drag_orig_pos
+                        np_ = (rn.x, rn.y, rn.z)
+                        if op != np_:
+                            rn.x, rn.y, rn.z = op
+                            self.roadNodeMoved.emit(rn, op, np_)
                 return
 
             # Finish road node drag
@@ -2884,17 +3369,95 @@ class ViewportGL(QOpenGLWidget):
                     self.select_barrier(hit_b)
                     return
 
-            hit_obj = self._pick_object(ray_o, ray_d)
+            hit_obj = self._pick_object_at_screen(event.position().x(), event.position().y())
             if hit_obj is not None:
+                gid = self.world.get_active_group_id(hit_obj) if self.world is not None else ""
+                if self._drilled_group_id and gid != self._drilled_group_id:
+                    self._drilled_group_id = ""
                 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                     self.toggle_object_selection(hit_obj)
+                elif gid and gid != self._drilled_group_id and self.world is not None:
+                    members = self.world.get_group_members(hit_obj, visible_only=True)
+                    # Put clicked object last so it is primary selected_obj while all members move/scale/delete together
+                    ordered = [m for m in members if m is not hit_obj] + [hit_obj]
+                    self.select_objects(ordered)
+                    if len(ordered) > 1:
+                        lbl = hit_obj.compound_label or f"Group {gid}"
+                        self.statusMessage.emit(
+                            f"Selected {lbl} ({len(ordered)} parts) — double-click to drill into sub-part, Ctrl+Shift+G to ungroup"
+                        )
                 else:
                     self.select_object(hit_obj)
             elif not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                self._drilled_group_id = ""
                 self.select_object(None)
                 self.select_road_node(None)
                 self.select_marker(None)
                 self.select_barrier(-1, emit=False)
+
+    def _spawn_alt_drag_clones(self, src_objs: list[WorldObject]) -> list[WorldObject]:
+        """Clone `src_objs` in-place for Alt+Drag Duplicate & Drag in one motion."""
+        if self.world is None or not src_objs:
+            return []
+        clones: list[WorldObject] = []
+        base_n = len(self.world.objects) + 1
+        new_gid = ""
+        if len(src_objs) > 1:
+            new_gid = f"grp_{self.world._next_user_group_seq:03d}"
+            self.world._next_user_group_seq += 1
+        for k, src in enumerate(src_objs):
+            wm = self.world.models.get(src.model_key)
+            if wm is None:
+                continue
+            oid = f"ed_alt_{base_n + k:04d}_{int(time.time() * 1000) % 100000:05d}"
+            c = WorldObject(
+                obj_id=oid,
+                name=f"{src.name} (Copy)",
+                model_key=src.model_key,
+                source="Placed by the editor",
+                category=src.category if src.category in ("dyno", "prop-catalog", "car-wreck") else "dyno",
+                subtype=wm.subtype,
+                section_mlist="editor_layer",
+                model_store=wm.model_store,
+                hash_hex=wm.hash_hex,
+                tri_count=wm.tri_count,
+                textures=list(wm.textures),
+                position=tuple(src.position),
+                rotation_hpr=tuple(src.rotation_hpr),
+                scale=tuple(src.scale),
+                written=False,
+                user_group_id=new_gid,
+                physics_mode=src.physics_mode,
+            )
+            self.world.objects.append(c)
+            clones.append(c)
+        return clones
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Double-click a grouped object to drill into its individual sub-part (UE / SketchUp / Blender convention)."""
+        if event.button() == Qt.MouseButton.LeftButton and self.world is not None:
+            hit_obj = self._pick_object_at_screen(event.position().x(), event.position().y())
+            if hit_obj is not None:
+                gid = self.world.get_active_group_id(hit_obj)
+                if gid:
+                    self._drilled_group_id = gid
+                    self.select_object(hit_obj)
+                    self.statusMessage.emit(
+                        f"Drilled into sub-part '{hit_obj.name}' ({gid}) — press Esc or click empty space to exit group"
+                    )
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+
+    def cycle_transform_tool(self) -> str:
+        """Cycle Move -> Rotate -> Scale -> Move (Tab shortcut)."""
+        order = ("move", "rotate", "scale")
+        cur = self.active_tool if self.active_tool in order else "move"
+        nxt = order[(order.index(cur) + 1) % len(order)]
+        self.set_tool(nxt)
+        self.toolCycled.emit(nxt)
+        self.statusMessage.emit(f"Transform tool: {nxt.capitalize()} (Tab to cycle)")
+        return nxt
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         steps = event.angleDelta().y() / 120.0

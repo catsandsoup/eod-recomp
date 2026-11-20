@@ -40,12 +40,21 @@ GWL_STYLE = -16
 GWL_EXSTYLE = -20
 WS_CHILD = 0x40000000
 WS_VISIBLE = 0x10000000
+WS_CLIPSIBLINGS = 0x04000000
+WS_CLIPCHILDREN = 0x02000000
 WS_POPUP = 0x80000000
+WS_BORDER = 0x00800000
+WS_DLGFRAME = 0x00400000
 WS_CAPTION = 0x00C00000
 WS_THICKFRAME = 0x00040000
 WS_MINIMIZEBOX = 0x00020000
 WS_MAXIMIZEBOX = 0x00010000
 WS_SYSMENU = 0x00080000
+WS_OVERLAPPEDWINDOW = 0x00CF0000
+WS_EX_DLGMODALFRAME = 0x00000001
+WS_EX_WINDOWEDGE = 0x00000100
+WS_EX_CLIENTEDGE = 0x00000200
+WS_EX_STATICEDGE = 0x00020000
 WS_EX_APPWINDOW = 0x00040000
 WM_SIZE = 0x0005
 WM_ACTIVATE = 0x0006
@@ -55,10 +64,94 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WA_ACTIVE = 1
 SIZE_RESTORED = 0
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
+
+_STRIP_STYLE_MASK = (
+    WS_OVERLAPPEDWINDOW
+    | WS_CAPTION
+    | WS_BORDER
+    | WS_DLGFRAME
+    | WS_THICKFRAME
+    | WS_MINIMIZEBOX
+    | WS_MAXIMIZEBOX
+    | WS_SYSMENU
+    | WS_POPUP
+)
+_STRIP_EXSTYLE_MASK = (
+    WS_EX_DLGMODALFRAME
+    | WS_EX_WINDOWEDGE
+    | WS_EX_CLIENTEDGE
+    | WS_EX_STATICEDGE
+    | WS_EX_APPWINDOW
+)
+
+
+def strip_embedded_window_styles(style: int, exstyle: int) -> tuple[int, int]:
+    """Strip all top-level window frame/border/ex-edge chrome for borderless WS_CHILD embedding."""
+    new_style = (int(style) & ~_STRIP_STYLE_MASK) | WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS
+    new_exstyle = int(exstyle) & ~_STRIP_EXSTYLE_MASK
+    return new_style, new_exstyle
+
+
+def compute_embedded_client_rect(
+    logical_w: int,
+    logical_h: int,
+    dpr: float = 1.0,
+    *,
+    win32_client_size: tuple[int, int] | None = None,
+    nc_insets: tuple[int, int, int, int] = (0, 0, 0, 0),
+    parent_dpi: int = 0,
+    child_dpi: int = 0,
+) -> dict[str, int]:
+    """Compute exact Win32 physical rect for the embedded child HWND at any DPI scale.
+
+    Returns dict with:
+      - `x`, `y`, `w`, `h`: exact outer rect passed to `SetWindowPos` / `MoveWindow` so the
+        child's *client* area fills `(0, 0, client_w, client_h)` with zero left/right clipping.
+      - `client_w`, `client_h`: exact physical client pixels of the embed container.
+      - `wm_size_w`, `wm_size_h`: DPI-consistent client dimensions for `WM_SIZE` `lparam`.
+    """
+    scale = float(dpr) if dpr and dpr > 0.0 else 1.0
+    qt_w = max(1, int(round(max(1, int(logical_w)) * scale)))
+    qt_h = max(1, int(round(max(1, int(logical_h)) * scale)))
+
+    if win32_client_size is not None and win32_client_size[0] > 0 and win32_client_size[1] > 0:
+        rw, rh = int(win32_client_size[0]), int(win32_client_size[1])
+        # Never exceed the smaller of Win32 GetClientRect and Qt's DPI-scaled size during layout
+        # transitions so left/right HUD edges are never pushed outside the visible container.
+        client_w = min(rw, qt_w) if abs(rw - qt_w) > 2 else rw
+        client_h = min(rh, qt_h) if abs(rh - qt_h) > 2 else rh
+    else:
+        client_w, client_h = qt_w, qt_h
+
+    nc_l, nc_t, nc_r, nc_b = (max(0, int(v)) for v in nc_insets)
+    win_x = -nc_l
+    win_y = -nc_t
+    win_w = max(1, client_w + nc_l + nc_r)
+    win_h = max(1, client_h + nc_t + nc_b)
+
+    if parent_dpi > 0 and child_dpi > 0 and child_dpi != parent_dpi:
+        ratio = float(child_dpi) / float(parent_dpi)
+        wm_w = max(1, int(round(client_w * ratio)))
+        wm_h = max(1, int(round(client_h * ratio)))
+    else:
+        wm_w, wm_h = client_w, client_h
+
+    return {
+        "x": win_x,
+        "y": win_y,
+        "w": win_w,
+        "h": win_h,
+        "client_w": client_w,
+        "client_h": client_h,
+        "wm_size_w": wm_w,
+        "wm_size_h": wm_h,
+    }
 
 # Canonical event display labels aligned with src/session_start.cpp canonical_contest_alias()
 CANONICAL_EVENT_MAP: dict[str, str] = {
@@ -386,6 +479,12 @@ def _win32_user32():
     u32.AttachThreadInput.restype = wt.BOOL
     u32.SetFocus.argtypes = [wt.HWND]
     u32.SetFocus.restype = wt.HWND
+    if hasattr(u32, "GetDpiForWindow"):
+        u32.GetDpiForWindow.argtypes = [wt.HWND]
+        u32.GetDpiForWindow.restype = wt.UINT
+    if hasattr(u32, "ClientToScreen"):
+        u32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(wt.POINT)]
+        u32.ClientToScreen.restype = wt.BOOL
     _USER32_TYPED = u32
     return u32
 
@@ -474,6 +573,7 @@ class PieHostWidget(QWidget):
         self._attached_tid: int = 0
         self._orig_style: int = 0
         self._orig_exstyle: int = 0
+        self._last_embedded_size: tuple[int, int] = (0, 0)
         self._popped_out: bool = False
         self._last_spec: dict[str, Any] | None = None
         self._poll_attempts: int = 0
@@ -565,9 +665,12 @@ class PieHostWidget(QWidget):
         self.embed_container = QWidget()
         self.embed_container.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.embed_container.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.embed_container.setContentsMargins(0, 0, 0, 0)
         self.embed_container.setStyleSheet(f"background-color: {BG_ROOT}; border: none;")
         self.embed_container.installEventFilter(self)
         c_lay = QVBoxLayout(self.embed_container)
+        c_lay.setContentsMargins(0, 0, 0, 0)
+        c_lay.setSpacing(0)
         self.lbl_placeholder = QLabel("Launching eod.exe Vulkan viewport...")
         self.lbl_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_placeholder.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 11pt; background: transparent;")
@@ -727,16 +830,22 @@ class PieHostWidget(QWidget):
             self.pieStopped.emit()
             return
 
-        if sys.platform == "win32" and not self._child_hwnd and not self._popped_out:
-            self._poll_attempts += 1
-            hwnd = _find_process_hwnd_win32(self._proc.pid)
-            if hwnd:
-                self._attach_hwnd(hwnd)
-            elif self._poll_attempts > 250:
-                # 15 seconds fallback: keep monitoring process without blocking
-                self.lbl_placeholder.setText(
-                    "eod.exe is running in an external window.\nClick Stop PIE (Shift+Esc) to return."
-                )
+        if sys.platform == "win32" and not self._popped_out:
+            if not self._child_hwnd:
+                self._poll_attempts += 1
+                hwnd = _find_process_hwnd_win32(self._proc.pid)
+                if hwnd:
+                    self._attach_hwnd(hwnd)
+                elif self._poll_attempts > 250:
+                    # 15 seconds fallback: keep monitoring process without blocking
+                    self.lbl_placeholder.setText(
+                        "eod.exe is running in an external window.\nClick Stop PIE (Shift+Esc) to return."
+                    )
+            else:
+                # Re-sync automatically if Qt layout/splitter/DPI changed the embed container size
+                cur_sz = self._physical_client_size()
+                if cur_sz != self._last_embedded_size:
+                    self._sync_embedded_geometry()
 
     def _detach_thread_input(self) -> None:
         if sys.platform != "win32" or not self._attached_tid:
@@ -787,20 +896,30 @@ class PieHostWidget(QWidget):
             self._orig_style = int(user32.GetWindowLongPtrW(hwnd, GWL_STYLE))
             self._orig_exstyle = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
 
-            new_style = (
-                self._orig_style
-                & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_POPUP)
-            ) | WS_CHILD | WS_VISIBLE
+            # Strip ALL non-client frame/border/ex-edge chrome before SetParent so Win32 drops
+            # DWM/WS_THICKFRAME/WS_BORDER/WS_EX_WINDOWEDGE insets (which otherwise clip left/right HUD!)
+            new_style, new_exstyle = strip_embedded_window_styles(self._orig_style, self._orig_exstyle)
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, new_style)
+            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_exstyle)
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
             user32.SetParent(hwnd, parent_hwnd)
+            # Ensure parent clips children cleanly
+            p_style = int(user32.GetWindowLongPtrW(parent_hwnd, GWL_STYLE))
+            if not (p_style & WS_CLIPCHILDREN):
+                user32.SetWindowLongPtrW(parent_hwnd, GWL_STYLE, p_style | WS_CLIPCHILDREN)
             self._child_hwnd = hwnd
+            self._last_embedded_size = (0, 0)
             self.lbl_placeholder.hide()
             self.lbl_state.setText("● PIE RUNNING")
             self._sync_embedded_geometry()
             self.focus_embedded_game()
-            # Re-sync after Vulkan swapchain creation so client rect & HUD never clip on left/edges
-            QTimer.singleShot(250, self._sync_embedded_geometry)
-            QTimer.singleShot(750, self._sync_embedded_geometry)
+            # Re-sync after Vulkan swapchain creation so client rect & HUD never clip on left/right edges
+            QTimer.singleShot(150, self._sync_embedded_geometry)
+            QTimer.singleShot(450, self._sync_embedded_geometry)
+            QTimer.singleShot(900, self._sync_embedded_geometry)
             QTimer.singleShot(800, self.focus_embedded_game)
             self.pieStatusChanged.emit(
                 f"PIE embedded live Vulkan viewport (HWND 0x{hwnd:X}) — WASD/Arrows or Controller to drive"
@@ -808,8 +927,34 @@ class PieHostWidget(QWidget):
         except Exception as exc:
             self.pieStatusChanged.emit(f"PIE embed warning: {exc}")
 
+    def _measure_child_nc_insets(self, child_hwnd: int) -> tuple[int, int, int, int]:
+        """Measure any residual non-client (left, top, right, bottom) frame insets on `child_hwnd`."""
+        if sys.platform != "win32" or not child_hwnd:
+            return (0, 0, 0, 0)
+        try:
+            import ctypes.wintypes as wt
+
+            user32 = _win32_user32()
+            wrc = wt.RECT()
+            crc = wt.RECT()
+            if not user32.GetWindowRect(child_hwnd, ctypes.byref(wrc)):
+                return (0, 0, 0, 0)
+            if not user32.GetClientRect(child_hwnd, ctypes.byref(crc)):
+                return (0, 0, 0, 0)
+            pt = wt.POINT(0, 0)
+            if hasattr(user32, "ClientToScreen") and user32.ClientToScreen(child_hwnd, ctypes.byref(pt)):
+                nc_l = max(0, int(pt.x - wrc.left))
+                nc_t = max(0, int(pt.y - wrc.top))
+                nc_r = max(0, int(wrc.right - (pt.x + (crc.right - crc.left))))
+                nc_b = max(0, int(wrc.bottom - (pt.y + (crc.bottom - crc.top))))
+                return (nc_l, nc_t, nc_r, nc_b)
+        except Exception:
+            pass
+        return (0, 0, 0, 0)
+
     def _physical_client_size(self) -> tuple[int, int]:
-        """Exact physical pixel client size of embed_container via Win32 GetClientRect (DPI-exact)."""
+        """Exact physical pixel client size of embed_container (DPI-exact across 100%-200%+ scaling)."""
+        win32_sz: tuple[int, int] | None = None
         if sys.platform == "win32":
             try:
                 import ctypes.wintypes as wt
@@ -822,11 +967,17 @@ class PieHostWidget(QWidget):
                         rw = int(rc.right - rc.left)
                         rh = int(rc.bottom - rc.top)
                         if rw > 0 and rh > 0:
-                            return rw, rh
+                            win32_sz = (rw, rh)
             except Exception:
                 pass
-        dpr = float(self.devicePixelRatioF())
-        return max(1, int(round(self.embed_container.width() * dpr))), max(1, int(round(self.embed_container.height() * dpr)))
+        dpr = float(self.embed_container.devicePixelRatioF() or self.devicePixelRatioF() or 1.0)
+        rect = compute_embedded_client_rect(
+            self.embed_container.width(),
+            self.embed_container.height(),
+            dpr,
+            win32_client_size=win32_sz,
+        )
+        return rect["client_w"], rect["client_h"]
 
     def _sync_embedded_geometry(self) -> None:
         if sys.platform != "win32" or not self._child_hwnd or self._popped_out:
@@ -835,14 +986,49 @@ class PieHostWidget(QWidget):
             user32 = _win32_user32()
             if not user32.IsWindow(self._child_hwnd):
                 return
-            w, h = self._physical_client_size()
-            user32.MoveWindow(self._child_hwnd, 0, 0, w, h, True)
+            parent_hwnd = int(self.embed_container.winId())
+            parent_dpi = 0
+            child_dpi = 0
+            if hasattr(user32, "GetDpiForWindow"):
+                try:
+                    if parent_hwnd:
+                        parent_dpi = int(user32.GetDpiForWindow(parent_hwnd))
+                    child_dpi = int(user32.GetDpiForWindow(self._child_hwnd))
+                except Exception:
+                    parent_dpi = child_dpi = 0
+
+            win32_sz: tuple[int, int] | None = None
+            if parent_hwnd:
+                import ctypes.wintypes as wt
+
+                rc = wt.RECT()
+                if user32.GetClientRect(parent_hwnd, ctypes.byref(rc)):
+                    rw = int(rc.right - rc.left)
+                    rh = int(rc.bottom - rc.top)
+                    if rw > 0 and rh > 0:
+                        win32_sz = (rw, rh)
+
+            dpr = float(self.embed_container.devicePixelRatioF() or self.devicePixelRatioF() or 1.0)
+            nc_insets = self._measure_child_nc_insets(self._child_hwnd)
+            rect = compute_embedded_client_rect(
+                self.embed_container.width(),
+                self.embed_container.height(),
+                dpr,
+                win32_client_size=win32_sz,
+                nc_insets=nc_insets,
+                parent_dpi=parent_dpi,
+                child_dpi=child_dpi,
+            )
+            x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+            user32.MoveWindow(self._child_hwnd, x, y, w, h, True)
             user32.SetWindowPos(
-                self._child_hwnd, 0, 0, 0, w, h,
+                self._child_hwnd, 0, x, y, w, h,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
             )
-            lparam = ((h & 0xFFFF) << 16) | (w & 0xFFFF)
+            wm_w, wm_h = rect["wm_size_w"], rect["wm_size_h"]
+            lparam = ((wm_h & 0xFFFF) << 16) | (wm_w & 0xFFFF)
             user32.SendMessageW(self._child_hwnd, WM_SIZE, SIZE_RESTORED, lparam)
+            self._last_embedded_size = (rect["client_w"], rect["client_h"])
         except Exception:
             pass
 
@@ -927,7 +1113,13 @@ class PieHostWidget(QWidget):
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         if self.is_running and not self._popped_out and self._child_hwnd:
             etype = event.type()
-            if etype == QEvent.Type.MouseButtonPress and obj is self.embed_container:
+            if obj is self.embed_container and etype in (
+                QEvent.Type.Resize,
+                QEvent.Type.Move,
+                QEvent.Type.Show,
+            ):
+                QTimer.singleShot(0, self._sync_embedded_geometry)
+            elif etype == QEvent.Type.MouseButtonPress and obj is self.embed_container:
                 self.focus_embedded_game()
             elif etype in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and isinstance(event, QKeyEvent):
                 # Do not steal typing from text/number inputs when user intentionally clicks one
@@ -951,6 +1143,7 @@ class PieHostWidget(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._sync_embedded_geometry()
+        QTimer.singleShot(0, self._sync_embedded_geometry)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):

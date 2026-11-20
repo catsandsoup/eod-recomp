@@ -257,6 +257,7 @@ class PropertiesPanel(QWidget):
         self.val_hash = _make_kv_row(grid, 3, "Hash")
         self.val_tris = _make_kv_row(grid, 4, "Triangles")
         self.val_tex = _make_kv_row(grid, 5, "Textures")
+        self.val_collision = _make_kv_row(grid, 6, "Collision")
         m_lay.addLayout(grid)
         lay.addWidget(m_card)
 
@@ -279,7 +280,7 @@ class PropertiesPanel(QWidget):
 
         lbl_scl = QLabel("Scale")
         lbl_scl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt; background: transparent;")
-        self.obj_scl_ed = Vec3Editor(("X", "Y", "Z"), decimals=2, step=0.1, minimum=0.05, maximum=50.0)
+        self.obj_scl_ed = Vec3Editor(("X", "Y", "Z"), decimals=2, step=0.1, minimum=0.05, maximum=200.0)
         self.obj_scl_ed.editingFinished.connect(self._on_obj_transform_edited)
 
         t_lay.addWidget(lbl_pos)
@@ -813,6 +814,7 @@ class PropertiesPanel(QWidget):
         obj: WorldObject | None,
         textures: dict[str, TextureAsset] | None = None,
         selected_count: int = 1,
+        collision_status: str | None = None,
     ) -> None:
         if obj is None or obj.deleted:
             self.show_nothing()
@@ -849,6 +851,20 @@ class PropertiesPanel(QWidget):
         if len(obj.textures) > 3:
             tex_list += f" (+{len(obj.textures) - 3})"
         self.val_tex.setText(f"{len(obj.textures)}" + (f" ({tex_list})" if tex_list else ""))
+        if collision_status is None:
+            if obj.category == "event-prop" or obj.source != "Retail":
+                collision_status = "Solid (Event Wall)"
+            elif obj.category == "optional-terrain":
+                collision_status = "Solid (BPPT Ramp)"
+            elif obj.category == "static":
+                collision_status = "Solid (SCOL)"
+            else:
+                collision_status = "Visual Backdrop -> Auto-Solidified on Edit"
+        self.val_collision.setText(collision_status)
+        col_color = ACCENT_GREEN if collision_status.startswith("Solid") else ACCENT_AMBER
+        self.val_collision.setStyleSheet(
+            f"color: {col_color}; font-size: 8.5pt; font-weight: 600; background: transparent;"
+        )
 
         self.obj_pos_ed.setValues(*obj.position)
         self.obj_rot_ed.setValues(*obj.rotation_hpr)
@@ -873,6 +889,7 @@ class PropertiesPanel(QWidget):
         kind = graph.node_kind(node.node_id)
         dx, dy, dz = graph.node_direction(node.node_id)
         hdg = math.degrees(math.atan2(dx, dz))
+        slope_deg = math.degrees(math.atan2(dy, max(1e-6, math.hypot(dx, dz))))
 
         self.road_title.setText(f"Road node {node.node_id}")
         self.road_subtitle.setText(
@@ -883,7 +900,7 @@ class PropertiesPanel(QWidget):
         self.val_road_line.setText(graph.line_name)
         dir_txt = "two-way" if node.two_way else "one-way"
         self.val_road_lanes.setText(f"{node.lanes} lane{'s' if node.lanes != 1 else ''} · {node.width:.1f} m ({dir_txt})")
-        self.val_road_dir.setText(f"({dx:+.2f}, {dy:+.2f}, {dz:+.2f}) · {hdg:+.1f}°")
+        self.val_road_dir.setText(f"({dx:+.2f}, {dy:+.2f}, {dz:+.2f}) · H {hdg:+.1f}° / P {slope_deg:+.1f}°")
         self.road_pos_ed.setValues(node.x, node.y, node.z)
 
         self.stack.setCurrentIndex(2)

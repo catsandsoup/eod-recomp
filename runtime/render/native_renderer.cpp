@@ -77,6 +77,7 @@ struct Parity {
     uint64_t sprite_equal = 0, sprite_submitted = 0, sprite_drawn = 0;
     uint64_t imm_equal = 0, imm_submitted = 0, imm_drawn = 0;
     uint64_t cockpit_equal = 0, cockpit_submitted = 0, cockpit_drawn = 0;
+    uint64_t hud_equal = 0, hud_submitted = 0, hud_drawn = 0;
 };
 Parity g_parity;
 uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
@@ -2273,6 +2274,7 @@ void report(uint64_t vb) {
         const uint32_t sprite = e != expected.end() ? e->second.sprite : 0;
         const uint32_t imm = e != expected.end() ? e->second.immediate : 0;
         const uint32_t cockpit = e != expected.end() ? e->second.cockpit : 0;
+        const uint32_t hud = e != expected.end() ? e->second.hud : 0;
         if (s.skipped) {
             g_parity.skipped_frames++;
         } else {
@@ -2313,6 +2315,14 @@ void report(uint64_t vb) {
             g_parity.cockpit_equal += ce;
             g_parity.cockpit_submitted += cockpit;
             g_parity.cockpit_drawn += s.k_drawn[KIND_COCKPIT];
+            const bool he = s.k_drawn[KIND_HUD] == hud && s.k_objects[KIND_HUD] == hud;
+            g_parity.hud_equal += he;
+            g_parity.hud_submitted += hud;
+            g_parity.hud_drawn += s.k_drawn[KIND_HUD];
+            if (log_parity && !he)
+                std::fprintf(stderr, "[native] parity frame %llu hud %u/%u/%u
+", (unsigned long long)frame, hud,
+                             s.k_objects[KIND_HUD], s.k_drawn[KIND_HUD]);
             if (log_parity && !qe)
                 std::fprintf(stderr, "[native] parity frame %llu queue records submitted %u objects %u drawn %u lost %u\n",
                              (unsigned long long)frame, queue, s.k_objects[KIND_QUEUE], s.k_drawn[KIND_QUEUE],
@@ -2374,7 +2384,7 @@ void report(uint64_t vb) {
             std::fprintf(stderr,
                          "[native] gs frame %llu particles %u/%u sprites %u/%u imm %u/%u cockpit %u/%u | "
                          "P1 equal p=%llu/%llu s=%llu/%llu i=%llu/%llu c=%llu/%llu "
-                         "(totals p=%llu/%llu s=%llu/%llu i=%llu/%llu c=%llu/%llu)\n",
+                         "(totals p=%llu/%llu s=%llu/%llu i=%llu/%llu c=%llu/%llu) hud P1 equal %llu/%llu (%llu/%llu)\n",
                          (unsigned long long)frame, s.k_drawn[KIND_PARTICLE], particle, s.k_drawn[KIND_SPRITE], sprite,
                          s.k_drawn[KIND_IMMEDIATE], imm, s.k_drawn[KIND_COCKPIT], cockpit,
                          (unsigned long long)g_parity.particle_equal, (unsigned long long)g_parity.frames,
@@ -2384,7 +2394,9 @@ void report(uint64_t vb) {
                          (unsigned long long)g_parity.particle_drawn, (unsigned long long)g_parity.particle_submitted,
                          (unsigned long long)g_parity.sprite_drawn, (unsigned long long)g_parity.sprite_submitted,
                          (unsigned long long)g_parity.imm_drawn, (unsigned long long)g_parity.imm_submitted,
-                         (unsigned long long)g_parity.cockpit_drawn, (unsigned long long)g_parity.cockpit_submitted);
+                         (unsigned long long)g_parity.cockpit_drawn, (unsigned long long)g_parity.cockpit_submitted,
+                         (unsigned long long)g_parity.hud_equal, (unsigned long long)g_parity.frames,
+                         (unsigned long long)g_parity.hud_drawn, (unsigned long long)g_parity.hud_submitted);
         }
         if (it != g_frames.end()) g_frames.erase(it);
     }

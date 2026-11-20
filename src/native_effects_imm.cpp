@@ -137,6 +137,10 @@ constexpr uint32_t kTexStateWord = 0x4D8BB8;   // 0x4E0000 - 29768
 
 // Cockpit quad marker: set when 0x35CAA0 is invoked from 0x219C48 (RA 0x21A064)
 bool g_cockpit_quad_scope = false;
+// Native 2D marker (R7 A1b, KIND_HUD): 0x35CAA0 reached through 0x34DB70 (RA kept) from the rect
+// leaf 0x11E730 (RA 0x11E834, under 0x11C278) or the frame sprite leaf 0x29E138 (RA 0x29E488);
+// the text flush 0x29A2B8 calls 0x35DF10 directly (RA 0x29A368)
+bool g_hud_scope = false;
 
 // ---- Particles (0x4D8798, VU1 0x08E0) ---------------------------------------------------------
 
@@ -626,7 +630,8 @@ void immediate_begin() {
 
     // Start general immediate / cockpit stream if not already inside water or flare
     const bool track_imm = !diff_in_original_side() && !native::ee_in_water() && !native::ee_in_flare();
-    if (track_imm) native::ee_imm_begin(g_cockpit_quad_scope);
+    const bool hud = g_hud_scope || (uint32_t)saved_ra == 0x29A368u;
+    if (track_imm) native::ee_imm_begin(g_cockpit_quad_scope, hud);
 
     set(4, num_verts);
     call(f_00361468, 0x35DF2C);
@@ -907,8 +912,9 @@ void immediate_draw_indexed_tris() {
     const uint32_t sp = reg(29) - 0x70;
     set(29, (int32_t)sp);
 
-    const bool prev_cockpit = g_cockpit_quad_scope;
+    const bool prev_cockpit = g_cockpit_quad_scope, prev_hud = g_hud_scope;
     if ((uint32_t)saved_ra == 0x21A064u) g_cockpit_quad_scope = true;
+    if ((uint32_t)saved_ra == 0x11E834u || (uint32_t)saved_ra == 0x29E488u) g_hud_scope = true;
 
     set(4, num_indices);
     call(f_0035DF10, 0x35CAD4);
@@ -927,6 +933,7 @@ void immediate_draw_indexed_tris() {
             if (reg(2) == 1) break;
         }
         g_cockpit_quad_scope = prev_cockpit;
+        g_hud_scope = prev_hud;
         set64(31, saved_ra);
         set(29, (int32_t)(sp + 0x70));
         f_00361BC8();
@@ -934,6 +941,7 @@ void immediate_draw_indexed_tris() {
     }
 
     g_cockpit_quad_scope = prev_cockpit;
+        g_hud_scope = prev_hud;
     set64(31, saved_ra);
     set(29, (int32_t)(sp + 0x70));
 }
