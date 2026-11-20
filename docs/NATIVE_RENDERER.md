@@ -833,6 +833,22 @@ same-look neighbour 5 vblanks away).
 - `EOD_DIFF` mismatch in `0x214B68` (1 of 5 calls): check whether it reproduces in Classic.
 - P3 at the A1 window set (24 windows vb 700..2310) for a like-for-like Classic number.
 
+### Results (R6 Phase A3, partial)
+
+| Check | Result |
+|---|---|
+| Classic P3, A1 window set | Gilroy night, Battle (8 AI), Limo (vehicle 136, as A1), 24 windows vb 700..2310 step 70, HEAD 7d43b3d: MAE 2.38 / SSIM 0.9640 over 16 windows (8 skipped: no whole GS frame in the replay window), worst 4.03 / 0.9389, vs A1 2.73 / 0.9533. Classic unchanged by A2: no bisect needed. (`tools/p3_run.sh` with a relative `EXE` fails at the compare step: pass an absolute `--exe`.) |
+| Night darkness, located | Gilroy night, Postal, cycled views (pairs T-5 / T+5 of toggles every 30 from vb 1500): Chase / Chassis / Bumper views have the top regions at 0.63..0.72 of Classic, the Cockpit view (vb 2101+) has whole 0.65, middle row 0.33 / 0.47 / 0.33 (uniform grey 84 -> 27 per channel). |
+
+### Open (R6 A3)
+
+- Rows 4/5 at night, two causes found (`EOD_R6_DIAG_*` per-item dumps and class overrides, not committed):
+  1. Prelit world records with `metal4` 9..14 (e.g. T1119, T1082, T1058, T1075) lose `(1 - metal)` of the baked light and their indirect specular sees only the night-scaled sky. Tried in `ps_modern`: indirect radiance `lerp(sky_radiance * occl, E, metal)` (E = the game's light at the pixel): Chase / Chassis / Bumper top regions 0.63..0.72 -> 0.78..0.84 (still below 0.85). Not committed: Dundas / Career not rerun.
+  2. Cockpit view: forcing every lit (VU1, `n.w != 0`) draw to unlit gives 1.00 in every region, while forcing prelit draws or `metal4 > 4` draws to unlit changes nothing. So the cause is a lit queue draw with `metal4 <= 4` (cabin mesh `mz 0x04c3` metal 3 / rough 12, `M_SPEC`, TFX 0, TCC, a box over the whole screen; or paint `0x1452`). Keeping the game's q17 highlight (packed into `ambient.w`, `+va` for TFX 2/3, no double sun lobe) did not change it. Next: compare that item's alpha (`a = t.a * va / 128` under `M_SPEC`, used by its blend key `0x18fd0`) in Classic and Modern. Modern computes `va` per pixel from `L + V`, while Classic uses the game's q17 half vector per vertex, so the alpha and the blend weight may differ.
+- Dundas row 5 region 1.159 (limit 1.15): not rerun.
+- Modern VFX opaque blocks (row 7 with `EOD_MODERN_VFX=1`): not started; VFX stays opt-in.
+- `EOD_DIFF` mismatch in `0x214B68`: not started (check Classic and f0ef513, R2 split-screen parity-off gate).
+
 ---
 
 ## Stage R4: shadows, particles, sprites, flares and immediate geometry
