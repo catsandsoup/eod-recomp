@@ -20,6 +20,7 @@
 #include "../core/host_file.h"
 #include "../core/limit_tracker.h"
 #include "../core/memory.h"
+#include "../hw/offload.h"
 #include "scene_tap.h"
 #include "sun_cascades.h"
 #include "vif_mesh.h"
@@ -78,6 +79,38 @@ bool scene_clear_enabled() {
 #else
     return false;
 #endif
+}
+
+bool bootstrap_quad_enabled() {
+#ifdef EOD_PLUME
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_BOOT_QUAD");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+// Tag updates follow VIF1 DMA work in producer order. The optional VU1
+// worker consumes the previous transfer before it sees a new value.
+static BootstrapQuad g_bootstrap_quad;
+static bool g_bootstrap_quad_pending;
+
+void ee_tag_bootstrap_quad(const BootstrapQuad &quad) {
+    offload_run([quad] {
+        g_bootstrap_quad = quad;
+        g_bootstrap_quad_pending = true;
+    });
+}
+
+bool take_bootstrap_quad(uint32_t dma_tag, uint32_t qwc, BootstrapQuad &quad) {
+    if (dma_tag != kBootstrapQuadDmaTag || qwc != kBootstrapQuadDirectQwc || !g_bootstrap_quad_pending)
+        return false;
+    g_bootstrap_quad_pending = false;
+    quad = g_bootstrap_quad;
+    return true;
 }
 
 bool bootstrap_raster_enabled() {

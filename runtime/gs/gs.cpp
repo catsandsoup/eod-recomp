@@ -894,11 +894,11 @@ bool matches_bootstrap_history(const native::DisplayCopy &copy, const uint8_t *p
     return true;
 }
 
-bool apply_bootstrap_quad(const uint8_t *packet, uint32_t qwc) {
+bool apply_bootstrap_quad(const native::BootstrapQuad &quad, const uint8_t *packet, uint32_t qwc) {
     const auto &ctx = st.ctx[0];
     const auto &path = g_path[GIF_PATH2];
     if (qwc != native::kBootstrapQuadDirectQwc || !hw::g_on || !native::enabled() ||
-        scene_capture::g_on || scene_emit::g_on || (modern::g_on && modern::live()) ||
+        scene_capture::g_on || scene_emit::capture_requested() || (modern::g_on && modern::live()) ||
         (path.in_packet && path.nloop) || !(st.prmodecont & 1) || st.scanmsk || st.pabe || ctx.fba ||
         ctx.frame != 0x000a0000 || ctx.test != 0x30000 || ctx.zbuf != 0x10a000118 ||
         ctx.clamp != 5 || ctx.scissor != 0x01bf0000027f0000ull || ctx.xyoffset != 0x71ff00006bffull)
@@ -916,14 +916,14 @@ bool apply_bootstrap_quad(const uint8_t *packet, uint32_t qwc) {
     if (memcmp(packet, header, sizeof header) != 0) return false;
     native::Vertex vertices[4]{};
     for (unsigned i = 0; i < 4; ++i) {
-        uint64_t pair[4];
-        memcpy(pair, packet + sizeof header + i * sizeof pair, sizeof pair);
+        const auto &xy = quad.xy[i];
+        const auto &uv = quad.uv[i];
         const unsigned u = (i & 1) ? 496 : 16, v = (i & 2) ? 496 : 16;
-        if (pair[0] != (uint64_t(u) | (uint64_t(v) << 32)) || pair[1] != 0 ||
-            (pair[2] & ~0x0000ffff0000ffffull) || pair[3] != 0)
-            return false;
-        vertices[i].p[0] = (int32_t(bits(pair[2], 0, 16)) - 0x6bff) / 16.0f;
-        vertices[i].p[1] = (int32_t(bits(pair[2], 32, 16)) - 0x71ff) / 16.0f;
+        if (uv[0] != u || uv[1] != v || (xy[0] | xy[1]) > 0xffff) return false;
+        const uint64_t encoded[] = {u | (uint64_t(v) << 32), 0, xy[0] | (uint64_t(xy[1]) << 32), 0};
+        if (memcmp(packet + sizeof header + i * sizeof encoded, encoded, sizeof encoded) != 0) return false;
+        vertices[i].p[0] = (int32_t(xy[0]) - 0x6bff) / 16.0f;
+        vertices[i].p[1] = (int32_t(xy[1]) - 0x71ff) / 16.0f;
         vertices[i].uv[0] = u / 16.0f;
         vertices[i].uv[1] = v / 16.0f;
     }
@@ -941,7 +941,7 @@ bool apply_bootstrap_quad(const uint8_t *packet, uint32_t qwc) {
     vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, 448);
     static unsigned quads;
     ++quads;
-    if (quads == 1 || quads % 8 == 0)
+    if (r7_audit::enabled() || quads == 1 || quads % 8 == 0)
         fprintf(stderr, "[native] bootstrap alpha quads: %u (two triangles each)\n", quads);
     return true;
 }
@@ -1248,6 +1248,7 @@ native::SceneClear g_ordered_scene_clear;
 bool g_have_ordered_scene_clear;
 native::DisplayCopy g_ordered_display_copy;
 bool g_have_ordered_display_copy;
+native::BootstrapQuad g_ordered_bootstrap_quad;
 bool g_have_ordered_bootstrap_quad;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
@@ -1592,7 +1593,7 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             if (live && h[1] == GIF_PATH2) {
                 if (g_have_ordered_bootstrap_quad) {
                     g_have_ordered_bootstrap_quad = false;
-                    if (h[2] == 0 && apply_bootstrap_quad(d, h[3] / 16)) break;
+                    if (h[2] == 0 && apply_bootstrap_quad(g_ordered_bootstrap_quad, d, h[3] / 16)) break;
                 }
                 if (g_have_ordered_scene_clear) {
                     g_have_ordered_scene_clear = false;
@@ -1631,7 +1632,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                 } else if (h[1] == native::CMD_DISPLAY_COPY && h[3] == sizeof g_ordered_display_copy) {
                     memcpy(&g_ordered_display_copy, d, sizeof g_ordered_display_copy);
                     g_have_ordered_display_copy = true;
-                } else if (h[1] == native::CMD_BOOTSTRAP_QUAD && h[3] == 0) {
+                } else if (h[1] == native::CMD_BOOTSTRAP_QUAD && h[3] == sizeof g_ordered_bootstrap_quad) {
+                    memcpy(&g_ordered_bootstrap_quad, d, sizeof g_ordered_bootstrap_quad);
                     g_have_ordered_bootstrap_quad = true;
                 } else {
                     native::gs_command(h[1], d, h[3]);
@@ -2058,13 +2060,13 @@ void gif_movie_clear(const uint8_t *data, uint32_t caller) {
 }
 
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::SceneClear *clear,
-                  const native::DisplayCopy *copy, native::ShadowPass shadow, bool bootstrap_quad) {
+                  const native::DisplayCopy *copy, native::ShadowPass shadow, const native::BootstrapQuad *bootstrap_quad) {
     ProfScope prof(P_EE_GIF);
     if (scene_capture::g_on) scene_capture::gif(path, data, qwc);
     if (scene_emit::g_on) scene_emit::gif(path, data, qwc);
     if (!g_threaded) {
         if ((!clear || !apply_scene_clear(*clear, data, qwc)) && (!copy || !apply_display_copy(*copy, data, qwc)) &&
-            !apply_shadow_pass(shadow, data, qwc) && (!bootstrap_quad || !apply_bootstrap_quad(data, qwc)))
+            !apply_shadow_pass(shadow, data, qwc) && (!bootstrap_quad || !apply_bootstrap_quad(*bootstrap_quad, data, qwc)))
             gif_process(path, data, qwc);
         return;
     }
@@ -2078,7 +2080,7 @@ void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::Sce
         native::post(native::CMD_DISPLAY_COPY, copy, sizeof *copy);
         tag = kGifDisplayCopy;
     } else if (bootstrap_quad) {
-        native::post(native::CMD_BOOTSTRAP_QUAD, nullptr, 0);
+        native::post(native::CMD_BOOTSTRAP_QUAD, bootstrap_quad, sizeof *bootstrap_quad);
     } else if (shadow == native::ShadowPass::Prepare) {
         tag = kGifShadowPrepare;
     } else if (shadow == native::ShadowPass::Composite) {

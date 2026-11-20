@@ -195,6 +195,7 @@
 0035A810 VifWriteUnpackMscal [I]  # VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it) -> docs/NATIVE_RENDERER.md
 0035B3D0 Vu1WriteCameraPacket [I]  # camera packet (VU1 qwords 1..16) -> docs/NATIVE_RENDERER.md
 0035BBD0 DisplayCopyBuildPacket [V]  # Builds the display-history composition packet and updates its blend countdown -> docs/NATIVE_RENDERER.md
+0035BE08 BootstrapIconBuildQuad [V]  # Projects the rotating loading icon and builds its ordered display packet -> docs/NATIVE_RENDERER.md
 0035C460 FrameWaitVblank [V]  # Idle busy-wait loop for vblank counter increment -> docs/INDEX.md
 0035C528 FrameWaitDrawDone [V]  # Idle busy-wait loop for GS draw-done state (1 or 7) -> docs/INDEX.md
 0035CAA0 ImmediateDrawIndexedTris [I]  # ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices) + cockpit quad (0x219C48) -> docs/NATIVE_RENDERER.md

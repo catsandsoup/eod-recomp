@@ -66,7 +66,14 @@ struct DisplayCopy {
     uint32_t source, fix, caller;
 };
 constexpr uint32_t kDisplayCopyDirectQwc = 88;
+struct BootstrapQuad {
+    uint32_t xy[4][2], uv[4][2];  // unsigned 12.4 XYZ and UV fields
+};
 constexpr uint32_t kBootstrapQuadDirectQwc = 14;
+constexpr uint32_t kBootstrapQuadDmaTag = 0x4d7650;
+bool bootstrap_quad_enabled();
+void ee_tag_bootstrap_quad(const BootstrapQuad &quad);
+bool take_bootstrap_quad(uint32_t dma_tag, uint32_t qwc, BootstrapQuad &quad);
 bool display_copy_enabled();
 bool bootstrap_raster_enabled();
 void ee_tag_display_copy(uint32_t addr, const DisplayCopy &copy);

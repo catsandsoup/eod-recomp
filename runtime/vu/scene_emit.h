@@ -20,6 +20,7 @@ struct VUState;
 namespace scene_emit {
 
 extern bool g_on;
+bool capture_requested();
 
 // Producer side (the thread that runs VU1 and queues GS commands).
 bool observing_vu();

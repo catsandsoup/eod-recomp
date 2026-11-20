@@ -173,6 +173,7 @@
 00366D78 wrap     # packet reserve, second manager: tagged for VU1 start attribution
 00366DD8 wrap     # packet reserve, second manager: tagged for VU1 start attribution
 0035BBD0 wrap     # display copy packet builder: attach 0x1180 -> 0 composition to its DMA tag
+0035BE08 wrap     # bootstrap icon rotation and ordered native quad
 
 # Track world, sky and water (src/native_world.cpp, readable C++; EOD_DIFF checks each; stage R2 of
 # docs/NATIVE_RENDERER.md). 0x3582B8 above is the mlist calc (hle_draw_distance.cpp forwards to it).

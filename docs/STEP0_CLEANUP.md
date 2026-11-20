@@ -216,3 +216,29 @@ macOS build passed all 99 CTest tests.
 **Next decisive test.** Trace the remaining graphics submission work,
 remove it from the release link graph and measure the packaged game
 against the full R7 lifecycle, visuals and timing gates.
+
+## R7 bootstrap/loading icon handoff (2026-11-21)
+
+**Situation.** The boot icon's TEX0 size caused the GS texture lookup
+to read Z16S pages outside the icon upload. The optional Plume draw
+also rejected normal sessions because the legacy scene emitter's
+support flag was set even when idle.
+
+**Task.** Keep the rotating icon visible in both looks while removing
+its synchronous VRAM reads from the normal boot and load sequence.
+
+**Action.** Decompiled 0x35BE08 and submitted its typed quad at the
+original position in the display chain. Plume samples only the 32×32
+crop after checking current memory blocks and destination ownership.
+The compatibility packet stays available to the reference path.
+
+**Result.** The live differential checked 1,117 calls with zero
+mismatches. The 1× and 6× Dundas rotation across both looks recorded
+138→0 synchronous readbacks with zero GS suppression. The optional
+VU1 worker also passed. Headless loading-icon images agree to within
+one RGB code value in the sampled matched poses. Ordinary movie
+playback still has 210 synchronous readbacks in the A/B window.
+
+**Next decisive test.** Isolate the movie-path readbacks and validate
+the native movie transfer, crop and presentation at the same boundary
+as the GS reference.

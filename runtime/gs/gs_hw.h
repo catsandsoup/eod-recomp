@@ -108,6 +108,7 @@ void native_end();
 bool native_display_copy(const Env &e);
 void native_display_copy_fallback();
 bool native_texture_on_cpu(uint32_t first_page, uint32_t count);
+bool native_texture_region_on_cpu(const Env &e);
 const hosttex::Store *native_host_textures();
 #endif
 #ifdef EOD_HW_SELECT

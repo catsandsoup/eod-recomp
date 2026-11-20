@@ -627,3 +627,36 @@ interfaces. CMake now excludes those exact paths from its source lists and
 the normal macOS build passes. The build retains the existing duplicate
 `-lm` linker warning. All 99 macOS CTest tests passed. The Windows
 cross-build linked `eod.exe` and built the CPU boundary test.
+
+## R7 bootstrap/loading icon readbacks (2026-11-21)
+
+The replacement for 0x35BE08 matched all 1,117 checked live calls in
+EOD_DIFF. The comparison covers the generated compatibility packet and
+the return value. A separate 6× Modern smoke checked 308 calls with
+zero mismatches.
+
+With movie skip and ordinary Plume, 160-vblank Dundas Battle runs across
+Classic and Modern at 1× and 6× each removed 138 synchronous readbacks.
+The reference used EOD_NATIVE_BOOT_QUAD=0. The native runs reported zero
+synchronous reads, 13–15 replacement icon draws, and zero suppressed GS
+draws. The optional VU1-worker case used 13 native draws with zero
+synchronous reads or suppressed draws. Other legacy work remained,
+including deferred waits in the Classic race runs.
+
+Frame comparisons used visible loading-icon images. At 1× Classic,
+13 same-vblank pairs differed in 1–5 icon pixels per frame, with a
+maximum difference of one RGB code value. At 6× Modern, two matched
+rotation poses captured at 640×448 differed in three and five icon
+pixels, also by at most one code value. These are headless comparison
+runs. The separately paced boot transitions differed in vblank timing.
+
+Ordinary startup played logos.pss in both arms of a 230-vblank A/B run.
+The reference recorded 279 synchronous readbacks and Plume recorded 210.
+A longer trace attributed all 210 remaining reads to target acquisition.
+A separate explicit scene capture produced both files and retained the
+reference draw and its 138 reads. The macOS build passed 99 of 99 CTest
+tests. The Windows cross-build linked eod.exe.
+
+The change still uses the compatibility transfer and GS state bridge.
+Movie handoff, the full R7 release build, player visual parity, and
+performance remain open.

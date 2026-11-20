@@ -129,7 +129,7 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
             surface_pages_rect(surface, 0, 0, cols, rows, pages);
             for (const auto &page : pages) {
                 const Surface *owner = g_owner[page.page];
-                if (owner && owner != surface && !g_vram_ok[page.page])
+                if (owner != surface && ((owner && !g_vram_ok[page.page]) || g_deferred[page.page]))
                     return false;
             }
         }
@@ -206,6 +206,19 @@ bool native_texture_on_cpu(uint32_t first, uint32_t count) {
     for (uint32_t i = 0; i < count && i < kPages; i++) {
         const uint32_t p = (first + i) % kPages;
         if (g_owner[p] && !g_vram_ok[p]) return false;
+    }
+    return true;
+}
+
+bool native_texture_region_on_cpu(const Env &e) {
+    const auto coverage = page_coverage(e.tbp, e.tbw, e.tpsm, 0, 0, e.tw, e.th);
+    for (uint32_t i = 0; i < coverage.count; ++i) {
+        const uint32_t page = coverage.pages[i];
+        const uint32_t touched = coverage.touched[page];
+        const auto *deferred = g_deferred[page];
+        if ((deferred && (touched & deferred->pending_blocks)) ||
+            (g_owner[page] && !g_vram_ok[page] && (touched & ~g_cpu_valid_blocks[page])))
+            return false;
     }
     return true;
 }

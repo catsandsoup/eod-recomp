@@ -732,7 +732,7 @@ plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
 // Render-target textures (pages a GPU surface holds newer than the CPU copy) are not decoded.
 // `levels`: the mip levels beyond the base the draw's TEX1.MXL selects (stage R5 A2), each read at
 // its MIPTBP address (0x35F9A0 writes MIPTBP1/2 from the level offsets 0x35F278 computes).
-Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels) {
+Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_region = false) {
     if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
     // the GS state decodes levels only as far as its own TEX1 asks (gs_draw.cpp setup_env)
     const uint32_t decodable = (e.mmin >= 2 && e.mxl > 0) ? (uint32_t)std::min(e.mxl, 6) : 0;
@@ -742,7 +742,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels) {
     }
     uint32_t first, count;
     gs::page_range(e.tbp, e.tbw, e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
-    if (!gs::hw::native_texture_on_cpu(first, count)) {
+    if (!(exact_region ? gs::hw::native_texture_region_on_cpu(e) : gs::hw::native_texture_on_cpu(first, count))) {
         fs.untextured_rt++;
         return nullptr;
     }
@@ -3504,7 +3504,7 @@ bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]) {
     gs::Env crop = env;
     crop.tw = crop.th = 32;
     FrameStats texture_stats{};
-    Texture *tex = texture(crop, texture_stats, 0);
+    Texture *tex = texture(crop, texture_stats, 0, true);
     if (!tex) return false;
     auto *pipeline = g_r.scene.pipeline(K_BOOTSTRAP_QUAD | B_MIX | (0xfu << 8));
     if (!pipeline) return false;

@@ -1681,3 +1681,30 @@ failure, or no matching records fails the check. Repeat with
 Sources: `gen/rec_100.c`, `gen/rec_099.c`, the retail VIF0 tag and VU0
 instruction disassembly, and the CLIP definition in the
 [Sony VU User’s Manual, §3.3.3](https://www.manuallib.com/download/VU-USER-MANUAL.PDF).
+
+### R7 bootstrap/loading icon
+
+The fixed display chain at EE physical 0x004D70C0 calls 0x35BE08 from
+0x35E948 with return address 0x35E994. It adds a 15-qword CNT at 0x004D7650,
+including the DMA/VIF header and 14 DIRECT qwords. The readable builder
+uses center, radii and UV bounds at 0x4D7CD0, the phase word at 0x3E579C
+and the signed quadrant lookup at 0x429BF0. It preserves the compatibility
+packet and its return value. The builder supplies the typed quad to the
+native renderer. Metadata is ordered with DMA even when the optional
+VU1 worker is active.
+
+The retail TEX0 describes a 1024×512 CT32 texture at 0x2300. Across the
+fixed U/V interval 1–31, bilinear taps only touch a 32×32 CT32 region
+with the original TBW and swizzle. A full texture decode can synchronously
+read unrelated pages from the Z16S surface that shares that address.
+The Plume path decodes the cropped texture only when all sampled blocks
+are current in CPU memory and outside any pending preservation region.
+Destination acquisition also rejects page ownership that would require
+a readback or deferred merge. Unsupported packets and capture/replay can
+use the compatibility path.
+
+The old renderer's support flag is enabled by default even when that
+renderer is idle. The bootstrap selector checks for a live old renderer
+or an explicitly requested scene capture. Set EOD_NATIVE_BOOT_QUAD=0 to
+run the reference raster path. Bootstrap history and clear experiments
+retain their own selector.

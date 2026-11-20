@@ -836,7 +836,8 @@ void flush_frame() {
 }
 }  // namespace
 
-bool g_on = (g_path && *g_path) || g_modern;
+bool capture_requested() { return g_path && *g_path; }
+bool g_on = capture_requested() || g_modern;
 
 // The sky dome: program 0x270 in ITOP mode 0x280 with the sky's own matrix (camera translation,
 // no rotation), all drawn before the first world geometry of the frame. The same program and mode

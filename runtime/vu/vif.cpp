@@ -468,13 +468,12 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
             const bool has_clear = v.n == 1 && native::take_scene_clear(g_vif1_dma_tag, qwc, clear);
             const bool has_copy = v.n == 1 && native::take_display_copy(g_vif1_dma_tag, qwc, copy);
             const auto shadow = v.n == 1 ? native::take_shadow_pass(g_vif1_dma_tag, qwc) : native::ShadowPass::None;
-            // 0x35BE08 writes this CNT immediately after the 0x35BBD0
-            // history packet in the fixed boot display chain at 0x4D70C0.
-            const bool boot_quad = v.n == 1 && qwc == native::kBootstrapQuadDirectQwc &&
-                                  g_vif1_dma_tag == 0x4d7650 && native::bootstrap_raster_enabled() &&
-                                  !diff_in_original_side();
+            native::BootstrapQuad quad;
+            const bool boot_quad = v.n == 1 && !diff_in_original_side() &&
+                                   native::take_bootstrap_quad(g_vif1_dma_tag, qwc, quad);
             gif_transfer(GIF_PATH2, reinterpret_cast<const uint8_t *>(d), qwc,
-                         has_clear ? &clear : nullptr, has_copy ? &copy : nullptr, shadow, boot_quad);
+                         has_clear ? &clear : nullptr, has_copy ? &copy : nullptr, shadow,
+                         boot_quad ? &quad : nullptr);
             break;
         }
         default:

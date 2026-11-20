@@ -1,6 +1,6 @@
 // render_trace.cpp - EOD_RENDER_TRACE (diagnostic): runtime evidence for the EE 3D submission path in
-// docs/EE_RENDER_SUBMISSION.md. The wrappers only observe; the queue functions themselves run as the
-// readable C++ in src/render_queue.cpp (eod_rq_*), the others as recompiled.
+// docs/EE_RENDER_SUBMISSION.md. Queue wrappers call the readable implementations in
+// src/render_queue.cpp. The display-chain wrappers also attach native operations to EE packets.
 //
 //   EOD_RENDER_TRACE=<vblank>[,<vblank>...]  log every submission/flush event in those vblanks, in order
 //   EOD_RENDER_TRACE_EVERY=<n>               per-vblank counters every n vblanks (default 0: off)
@@ -452,4 +452,80 @@ extern "C" void f_0035BBD0() {
     f_0035BBD0_orig();  // retain the original packet, EE return value and countdown
     if (g_ee.r[2].uw[0] == native::kDisplayCopyDirectQwc + 1)
         native::ee_tag_display_copy(addr & 0x0fffffffu, copy);  // EE RAM alias to VIF DMA address
+}
+
+namespace {
+// 0x35BE08 uses the game's quarter-sine table. The phase is an eight-bit
+// turn. Multiplication takes the low EE word before the arithmetic shift.
+uint32_t boot_sine(uint32_t phase) {
+    const uint32_t quarter = phase & 0x3f;
+    const uint32_t index = ((phase & 0x40) ? 0x3f - quarter : quarter) >> 1;
+    const uint32_t value = MEM_LW(0x429bf0 + index * 4);
+    return (phase & 0x80) ? 0u - value : value;
+}
+
+uint32_t boot_project(uint32_t wave, uint32_t radius) {
+    return static_cast<uint32_t>(static_cast<int32_t>(wave * radius) >> 8);
+}
+
+void build_bootstrap_quad() {
+    const uint32_t address = arg(0);
+    constexpr uint32_t settings = 0x4d7cd0;
+    const uint32_t center_x = (MEM_LW(settings) + 0x6bf) << 4;
+    const uint32_t center_y = (MEM_LW(settings + 4) + 0x71f) << 4;
+    const uint32_t radius_x = MEM_LW(settings + 8) << 4;
+    const uint32_t radius_y = MEM_LW(settings + 12) << 4;
+    const uint32_t phase = MEM_LW(0x3e579c) << 1;
+    const uint32_t sine = boot_sine(phase);
+    const uint32_t cosine = boot_sine(phase + 0x40);
+    const uint32_t sin_x = boot_project(sine, radius_x), sin_y = boot_project(sine, radius_y);
+    const uint32_t cos_x = boot_project(cosine, radius_x), cos_y = boot_project(cosine, radius_y);
+    native::BootstrapQuad quad{
+        {{center_x - cos_x + sin_y, center_y - sin_x - cos_y},
+         {center_x + cos_x + sin_y, center_y + sin_x - cos_y},
+         {center_x - cos_x - sin_y, center_y - sin_x + cos_y},
+         {center_x + cos_x - sin_y, center_y + sin_x + cos_y}},
+        {},
+    };
+    for (unsigned i = 0; i < 4; ++i) {
+        quad.uv[i][0] = MEM_LW(settings + 16 + 8 * (i & 1)) << 4;
+        quad.uv[i][1] = MEM_LW(settings + 20 + 8 * (i >> 1)) << 4;
+    }
+
+    // Retain the same DMA/VIF packet for compatibility and offline replay.
+    constexpr uint64_t header[][2] = {
+        {0x1000000e, 0x5000000e13000000ull},
+        {0x4000000000000001ull, 0xeeee},
+        {0x8000000044ull, 0x42},
+        {0x60, 0x14},
+        {0x200000066802a300ull, 0x06},
+        {0x40808080, 0x01},
+        {0x80aa400000008001ull, 0x53535353},
+    };
+    uint32_t out = address;
+    for (const auto &word : header) {
+        MEM_SD(out, word[0]);
+        MEM_SD(out + 8, word[1]);
+        out += 16;
+    }
+    for (unsigned i = 0; i < 4; ++i) {
+        MEM_SW(out, quad.uv[i][0]);
+        MEM_SW(out + 4, quad.uv[i][1]);
+        MEM_SD(out + 8, 0);
+        MEM_SW(out + 16, quad.xy[i][0]);
+        MEM_SW(out + 20, quad.xy[i][1]);
+        MEM_SD(out + 24, 0);
+        out += 32;
+    }
+    g_ee.r[2].ud[0] = native::kBootstrapQuadDirectQwc + 1;
+    if (!diff_in_original_side() && native::bootstrap_quad_enabled() && native::enabled())
+        native::ee_tag_bootstrap_quad(quad);
+}
+}  // namespace
+
+extern "C" void f_0035BE08_orig();
+extern "C" void f_0035BE08() {
+    if (ra() != 0x35e994 || (arg(0) & 0x0fffffffu) != native::kBootstrapQuadDmaTag)
+        return f_0035BE08_orig();
+    diff_run(0x0035be08, build_bootstrap_quad, f_0035BE08_orig);
 }
