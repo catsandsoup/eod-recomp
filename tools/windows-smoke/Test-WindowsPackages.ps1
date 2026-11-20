@@ -129,13 +129,23 @@ $empty = Join-Path $Scratch 'empty'
 foreach ($directory in @($empty, "$profileRoot\Local", "$profileRoot\Roaming", "$profileRoot\Temp", "$profileRoot\Editor")) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
-# The game uses SHGetFolderPath for its installed-disc fallback. Confirm the runner account is clean.
-if ($game -and (Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'TDEODRecomp\disc'))) {
-    throw 'The Windows runner already has a game installation.'
+# Keep the disposable runner's real Windows known folders for the game and setup.
+# The packaged game asks the shell for LocalAppData before it checks for a disc.
+$windowsProfile = @{
+    USERPROFILE = [Environment]::GetFolderPath('UserProfile')
+    LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+    APPDATA = [Environment]::GetFolderPath('ApplicationData')
+    HOMEDRIVE = $env:HOMEDRIVE
+    HOMEPATH = $env:HOMEPATH
+}
+if ($game -and (-not (Test-Path -LiteralPath $windowsProfile.LOCALAPPDATA -PathType Container) -or
+    (Test-Path -LiteralPath (Join-Path $windowsProfile.LOCALAPPDATA 'TDEODRecomp\disc')))) {
+    throw 'The Windows runner must have an accessible LocalAppData folder and no installed game.'
 }
 
 $childEnvironment = @{
     SystemRoot = $systemRoot
+    SystemDrive = $env:SystemDrive
     WINDIR = $systemRoot
     ComSpec = $cmd
     PATH = "$systemRoot\System32;$systemRoot"
@@ -166,12 +176,17 @@ public class EodWindowsSmoke {
 # Disable loader/critical-error dialogs for package processes. Their exit codes still fail the smoke.
 [EodWindowsSmoke]::SetErrorMode(0x8003) | Out-Null
 
-function New-PackageProcess([string] $File, [string] $WorkingDirectory) {
+function New-PackageProcess([string] $File, [string] $WorkingDirectory, [switch] $UseWindowsProfile) {
     $info = [Diagnostics.ProcessStartInfo]::new($File)
     $info.WorkingDirectory = $WorkingDirectory
     $info.UseShellExecute = $false
     $info.Environment.Clear()
     foreach ($item in $childEnvironment.GetEnumerator()) { $info.Environment[$item.Key] = $item.Value }
+    if ($UseWindowsProfile) {
+        foreach ($item in $windowsProfile.GetEnumerator()) {
+            if ($item.Value) { $info.Environment[$item.Key] = $item.Value }
+        }
+    }
     $info
 }
 
@@ -260,17 +275,17 @@ function Invoke-DetachedLauncher([string] $Name, [scriptblock] $Check) {
 }
 
 if ($game) {
-    $gameInfo = New-PackageProcess (Join-Path $game 'eod.exe') $empty
+    $gameInfo = New-PackageProcess (Join-Path $game 'eod.exe') $empty -UseWindowsProfile
     $gameInfo.ArgumentList.Add('--help')
     Invoke-PackageCheck $gameInfo 'eod.exe --help' 0 '(?m)^usage:.+--data DIR.+--renderer'
 
-    $gameInfo = New-PackageProcess (Join-Path $game 'eod.exe') $empty
+    $gameInfo = New-PackageProcess (Join-Path $game 'eod.exe') $empty -UseWindowsProfile
     foreach ($argument in @('--headless', '--renderer', 'software', '--config', "$empty\empty.ini")) {
         $gameInfo.ArgumentList.Add($argument)
     }
     Invoke-PackageCheck $gameInfo 'eod.exe clean missing-disc startup' 1 'Choose a game ISO or pass --data <image>\.'
 
-    $setup = [Diagnostics.Process]::Start((New-PackageProcess (Join-Path $game 'eodsetup.exe') $empty))
+    $setup = [Diagnostics.Process]::Start((New-PackageProcess (Join-Path $game 'eodsetup.exe') $empty -UseWindowsProfile))
     try {
         Wait-ForMainWindow $setup 'Eve of Destruction - Setup'
         Close-PackageWindow $setup 'eodsetup.exe'
