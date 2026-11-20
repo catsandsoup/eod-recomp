@@ -671,7 +671,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi, bool draw_vertices = true)
     }
 }
 
-void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
+void parse_gif(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices) {
     r7_audit::add(r7_audit::Counter::GifQwords, qwc);
     if (scene_capture::g_on) scene_capture::gs_packet(path);
     if (scene_emit::g_on) scene_emit::gs_packet(path);
@@ -734,6 +734,76 @@ void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices
         }
         if (ps.nloop == 0 && ps.eop) ps.in_packet = false;
     }
+}
+
+native::WorldStripTerminal g_world_strip_check{};
+bool g_have_world_strip_check;
+uint64_t g_world_strips_checked, g_world_strips_partial, g_world_strips_empty;
+uint64_t g_world_strip_triangles, g_world_strip_adc, g_world_strip_qwords;
+
+void arm_world_strip_check(const void *data) {
+    if (g_have_world_strip_check) fatal("world strip check still awaiting PATH1");
+    memcpy(&g_world_strip_check, data, sizeof g_world_strip_check);
+    g_have_world_strip_check = true;
+}
+
+bool check_strip_vertex(const Vertex &got, const native::WorldStripTerminal::Vertex &want, uint64_t xy, uint64_t uv) {
+    return got.x == int32_t(want.x) - int32_t(bits(xy, 0, 16)) &&
+           got.y == int32_t(want.y) - int32_t(bits(xy, 32, 16)) &&
+           got.z == want.z && got.f == want.fog &&
+           got.r == bits(want.rgba, 0, 8) && got.g == bits(want.rgba, 8, 8) &&
+           got.b == bits(want.rgba, 16, 8) && got.a == bits(want.rgba, 24, 8) &&
+           memcmp(&got.s, &want.s, 4) == 0 && memcmp(&got.t, &want.t, 4) == 0 &&
+           memcmp(&got.q, &want.q, 4) == 0 && got.u == int32_t(bits(uv, 0, 14)) &&
+           got.v == int32_t(bits(uv, 16, 14));
+}
+
+void check_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices) {
+    g_have_world_strip_check = false;
+    const auto &tail = g_world_strip_check;
+    if (qwc != 1 + 3 * tail.vertices) fatal("world strip check expected the next PATH1 kick");
+    const PathState &path = g_path[GIF_PATH1];
+    if (path.in_packet && path.nloop) {
+        ++g_world_strips_partial;
+        return parse_gif(GIF_PATH1, data, qwc, draw_vertices);
+    }
+    // PRE replaces PRIM. With AC clear only the topology comes from PRE.
+    const uint32_t attr = st.prmodecont & 1 ? tail.prim : (uint32_t(st.prmode) & ~7u) | (tail.prim & 7u);
+    const Context &ctx = st.ctx[(attr >> 9) & 1];
+    const uint64_t xy = ctx.xyoffset, uv = st.uv, fog = st.fog, tex0 = ctx.tex0, tex1 = ctx.tex1;
+    const auto prims = stats.prims;
+    constexpr uint32_t writes = TAINT_ST | TAINT_Q | TAINT_RGBA;
+    const uint32_t taint = g_attr_taint & ~writes, written = g_attr_written | writes;
+
+    parse_gif(GIF_PATH1, data, qwc, draw_vertices);
+
+    const auto &last = tail.fifo[2];
+    const uint32_t triangles = draw_vertices ? tail.triangle_attempts : 0;
+    const bool boundary = !path.in_packet && path.nloop == 0 && path.nreg == 3 &&
+                          path.reg == 0 && path.flg == 0 && path.eop;
+    const bool latches = st.prim == tail.prim && st.vcount == 3 &&
+                         st.st == (uint64_t(last.t) << 32 | last.s) &&
+                         st.rgbaq == (uint64_t(last.q) << 32 | last.rgba) &&
+                         memcmp(&st.q, &last.q, 4) == 0 && st.uv == uv && st.fog == fog &&
+                         ctx.tex0 == tex0 && ctx.tex1 == tex1 &&
+                         g_attr_taint == taint && g_attr_written == written;
+    bool fifo = true;
+    for (unsigned i = 0; i < 3; ++i)
+        fifo &= check_strip_vertex(st.vq[i], tail.fifo[i], xy, uv);
+    if (!boundary || !latches || !fifo || stats.prims - prims != triangles)
+        fatal("world strip terminal mismatch: PATH1 %d, latches %d, FIFO %d, triangle attempts %llu/%u",
+              boundary, latches, fifo, (unsigned long long)(stats.prims - prims), triangles);
+    ++g_world_strips_checked;
+    g_world_strips_empty += triangles == 0;
+    g_world_strip_triangles += triangles;
+    g_world_strip_adc += tail.adc_vertices;
+    g_world_strip_qwords += qwc;
+}
+
+void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
+    if (path == GIF_PATH1 && g_have_world_strip_check)
+        return check_world_strip(data, qwc, draw_vertices);
+    parse_gif(path, data, qwc, draw_vertices);
 }
 
 uint64_t g_world_lod_applied, g_world_lod_fallback;
@@ -1365,6 +1435,8 @@ void native::post(uint32_t kind, const void *data, uint32_t size) {
     if (!g_threaded) {
         if (kind == CMD_WORLD_TEXTURE_LOD && size == sizeof(WorldTextureLod))
             return apply_world_texture_lod(data);
+        if (kind == CMD_WORLD_STRIP_CHECK && size == sizeof(WorldStripTerminal))
+            return arm_world_strip_check(data);
         return gs_command(kind, data, size);
     }
     push_cmd(CMD_NATIVE, kind, 0, data, size);
@@ -1682,6 +1754,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     g_have_ordered_bootstrap_quad = true;
                 } else if (h[1] == native::CMD_WORLD_TEXTURE_LOD && h[3] == sizeof(native::WorldTextureLod)) {
                     apply_world_texture_lod(d);
+                } else if (h[1] == native::CMD_WORLD_STRIP_CHECK && h[3] == sizeof(native::WorldStripTerminal)) {
+                    arm_world_strip_check(d);
                 } else {
                     native::gs_command(h[1], d, h[3]);
                 }
@@ -2072,6 +2146,13 @@ void gs_shutdown() {
     close_cold_zip("closed at shutdown");
     if (g_dump) { fclose(g_dump); g_dump = nullptr; }
     raster_shutdown();
+    if (g_have_world_strip_check) fatal("world strip check did not receive PATH1 before shutdown");
+    if (g_world_strips_checked || g_world_strips_partial)
+        std::fprintf(stderr, "[native] world strip terminal: %llu checked, %llu partial PATH1, %llu without triangle attempts, "
+                     "%llu triangle attempts, %llu ADC vertices, %llu qwords retained\n",
+                     (unsigned long long)g_world_strips_checked, (unsigned long long)g_world_strips_partial,
+                     (unsigned long long)g_world_strips_empty, (unsigned long long)g_world_strip_triangles,
+                     (unsigned long long)g_world_strip_adc, (unsigned long long)g_world_strip_qwords);
     if (r7_audit::enabled() && (g_world_lod_applied || g_world_lod_fallback))
         std::fprintf(stderr, "[native] world TEX1 typed: %llu applied, %llu PATH1 fallbacks\n",
                      (unsigned long long)g_world_lod_applied, (unsigned long long)g_world_lod_fallback);

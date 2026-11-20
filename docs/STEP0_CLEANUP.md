@@ -373,3 +373,26 @@ as the GS reference.
 - **Next decisive test.** Prove the strip's surviving PRIM, RGBAQ, ST/Q
   and vertex latches, then bypass it for the admitted class. Establish
   native mip availability before removing the transient bank dependency.
+
+### R7 STAR — ordered world strip terminal oracle (2026-11-21)
+
+- **Situation.** The admitted world texture can use immutable EE mip
+  indices, but the compatibility strip still supplies the first native
+  draw descriptor and changes the GS state used by later packets.
+- **Task.** Prove the surviving FIFO and latches on the exact
+  non-clipped leaf, and identify the remaining effects of the strip.
+- **Action.** Queue a diagnostic terminal payload immediately ahead
+  of the existing PATH1 strip. Compare the original parser's terminal
+  cursor, attributes, FIFO and ADC-filtered triangle attempts without
+  replacing that parse. Replay a fixed Dundas packet stream with the
+  check unset against the previous build.
+- **Result.** The checked suite matched 446,404 strips across 6× Modern,
+  Classic day/night, Classic 2P and the live world differential. The
+  24,589,084 checked strip qwords all reached GS. The unset replay
+  matched primitive and pixel counts, final scanout and GS VRAM. Build
+  and test evidence and residual audit counters are in
+  NATIVE_RENDERER_SUCCESS.md.
+- **Next decisive test.** Resolve worker admission with ordered EE
+  material, mips, LOD, surface and mesh. Verify texture availability
+  and trimming against attachment aliases, allocation failure behavior,
+  and ownership of target dirty pages before omitting the strip.

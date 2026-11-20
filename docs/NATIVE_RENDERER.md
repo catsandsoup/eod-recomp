@@ -1883,3 +1883,49 @@ still supplies the draw descriptor for comparison and determines which
 mips are available. The same base availability and mip clamp apply to
 both byte sources until the compatibility strip and transient upload
 bank are removed.
+
+### R7 non-clipped world strip terminal state
+
+The Xbox Ghidra call export shows WorldFrameRender (`0x0A8390`) calling
+WorldRenderPass (`0x138840`), which calls D3D8's SetVertexShader
+(`0x1CA370`), SetStreamSource_4 (`0x1C9A50`) and DrawIndexedVertices
+(`0x1CD710`). Its state setup calls SetViewport (`0x1C8DD0`) through
+`0x13D540` and SetTexture (`0x1C8FF0`) through `0x13DA30`.
+The PS2 compatibility contract comes from the matching world pass
+`0x358BD0` and the exact `0x0270` microprogram. The EE state flush at
+`0x3620A8` supplies the tag templates via `0x25F0`. The first kick at
+`0x0908` updates TEX1_1, and the final kick reads the strip at TOP+200.
+
+| Strip operation | State a following compatibility draw can observe |
+| --- | --- |
+| Standalone PACKED EOP/PRE tag, register list ST, RGBAQ, XYZF2 | PRIM (triangle strip; known context 1, optional ABE), cleared vertex count, and completed PATH1 at the end |
+| ST then RGBAQ | Final S/T bits, Q in both the standalone latch and RGBAQ's high word, and RGBA in its low word. Clear ST/Q/RGBA taint and mark those values written |
+| XYZF2 | ADC inhibits that triangle only. The FIFO always advances. Last three vertices survive; their signed X/Y use the active context's XYOFFSET, Z is 24 bits, and fog is the XYZF2 byte |
+| No UV, FOG, TEX0 or TEX1 write in the strip | Inherit UV (including in the FIFO records) and FOG. The fog bytes carried in the FIFO do not replace the FOG latch. TEX1 comes from the earlier ordered kick |
+
+With `EOD_NATIVE_WORLD_STRIP_CHECK=1`, the diagnostic checks a typed terminal
+payload from the exact retirement against the parser at the next
+ordered PATH1 transfer. It compares the final latches and FIFO,
+the completed packet boundary, and the triangle-attempt count implied
+by ADC after the first two strip vertices. This is the count at
+`vertex_kick`, before `draw_triangle` applies drawing filters. An
+unfinished PATH1 tag is reported as ineligible for independent
+replacement. The unmodified parser remains the reference and consumes
+the actual transfer exactly once. The diagnostic derives its payload
+from the retired packet and observes the worker state. With the check
+unset there is no payload, worker command, or diagnostic counter update.
+
+Independently, `gs_draw.cpp::draw_triangle` runs `setup_env` and marks
+`g_draw_dirty` for rasterable draws even when the native renderer takes
+ownership of the primitive. The hardware triangle path calls
+`note_draw` only after `count_prim` and `setup_env`, with
+`!e.write_none && !g_skip_frame`. The terminal count does not predict
+those calls or the pages they affect. Subsequent register use, reads
+and presentation may publish those writes through `raster_mark_pages`.
+The current Plume object also captures the first drawable triangle's
+state. A replacement must submit from the immutable EE surface,
+material, indexed mip chain and LOD at the same ordered boundary,
+admit only when the required target and source are usable, and preserve
+the compatibility dirty-page protocol until its last consumer leaves.
+Omitting the parser while leaving the object to sample a later
+environment cannot establish that contract.

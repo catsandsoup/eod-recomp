@@ -187,6 +187,20 @@ struct WorldTextureLod {
 constexpr uint64_t world_tex1(const WorldTextureLod &lod) {
     return 0x120 | (uint64_t(lod.max_level) << 2) | (uint64_t(lod.bias) << 32);
 }
+
+// Terminal attributes and FIFO of the exact non-clipped world strip.
+// Positions are in the GS input grid, before the ordered viewport offset.
+struct WorldStripTerminal {
+    struct Vertex {
+        uint16_t x, y;
+        uint32_t z, rgba;
+        uint32_t s, t, q;  // float bit patterns (latch comparison is exact)
+        uint8_t fog;
+    };
+    Vertex fifo[3];
+    uint32_t prim, vertices, adc_vertices, triangle_attempts;
+};
+
 bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod);
 
 // ---- GS command stream ----------------------------------------------------------------------
@@ -301,7 +315,8 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
 };
 
 enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4,
-                  CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7 };
+                  CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7,
+                  CMD_WORLD_STRIP_CHECK = 8 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),

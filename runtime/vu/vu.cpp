@@ -1877,6 +1877,29 @@ void write_world_leaf_memory(const WorldLeafRetirement &result, uint8_t *memory,
     std::memcpy(memory + (top + kWorldStripOffset) * 16, result.strip, result.strip_qwords * 16);
 }
 
+native::WorldStripTerminal world_strip_terminal(const WorldLeafRetirement &result) {
+    native::WorldStripTerminal tail{};
+    tail.prim = (result.strip[0].u[1] >> 15) & 0x7FF;
+    tail.vertices = (result.strip_qwords - 1) / 3;
+    for (unsigned i = 0; i < tail.vertices; ++i) {
+        const VUReg &xyzf = result.strip[3 + i * 3];
+        const bool adc = (xyzf.u[3] & 0x8000) != 0;
+        tail.adc_vertices += adc;
+        tail.triangle_attempts += i >= 2 && !adc;
+    }
+    for (unsigned i = 0; i < 3; ++i) {
+        const VUReg *vertex = &result.strip[1 + (tail.vertices - 3 + i) * 3];
+        const VUReg &stq = vertex[0], &rgba = vertex[1], &xyzf = vertex[2];
+        const uint32_t color = (rgba.u[0] & 255) | ((rgba.u[1] & 255) << 8) |
+                               ((rgba.u[2] & 255) << 16) | ((rgba.u[3] & 255) << 24);
+        tail.fifo[i] = {
+            uint16_t(xyzf.u[0]), uint16_t(xyzf.u[1]), (xyzf.u[2] >> 4) & 0xFFFFFF, color,
+            stq.u[0], stq.u[1], stq.u[2], uint8_t(xyzf.u[3] >> 4),
+        };
+    }
+    return tail;
+}
+
 void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsigned top,
                             const native::WorldTextureLod &lod) {
     vu = result.after;
@@ -1890,6 +1913,11 @@ void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsi
         native::post(native::CMD_WORLD_TEXTURE_LOD, &lod, sizeof lod);
     else
         xgkick(&vu, 20);
+    static const bool strip_check = std::getenv("EOD_NATIVE_WORLD_STRIP_CHECK") != nullptr;
+    if (strip_check && !g_vu_mute_kick) {
+        const auto tail = world_strip_terminal(result);
+        native::post(native::CMD_WORLD_STRIP_CHECK, &tail, sizeof tail);
+    }
     xgkick(&vu, top + kWorldStripOffset);
 }
 

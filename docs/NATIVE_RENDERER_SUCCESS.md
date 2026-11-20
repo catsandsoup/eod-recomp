@@ -931,3 +931,61 @@ waits in their checked runs. These runs recorded zero synchronous VRAM
 readbacks, CLUT waits and suppressed GS primitives. The R7 runtime gate still
 fails. The world strip, transient upload banks and availability of GS mip
 storage remain dependencies of this slice.
+
+## R7 non-clipped world strip terminal oracle (2026-11-21)
+
+The oracle compares the exact retired `0x0270` strip's terminal payload
+against the GS worker's next ordered PATH1 parse. It covers the packet
+cursor, PRIM, ST/Q/RGBAQ, inherited UV/FOG/TEX0/TEX1, attribute taint
+and written masks, the three FIFO vertices, and triangle attempts after
+ADC. These attempts precede draw filtering and `note_draw`. The parser
+still processes the same packet and performs the same draw effects.
+
+| Public macOS Plume headless case | Strips checked | Triangle attempts | ADC vertices | GIF qwords inspected and retained |
+| --- | ---: | ---: | ---: | ---: |
+| Dundas, Modern 6× (Phase A) | 48,408 | 511,557 | 472,687 | 3,001,140 |
+| Dundas day, Classic 1× | 23,196 | 242,696 | 222,661 | 1,419,267 |
+| Gilroy night, Classic 1× | 33,112 | 343,897 | 274,027 | 1,886,884 |
+| Kenyon 2P, Classic 1× | 118,017 | 879,698 | 622,373 | 4,624,230 |
+| Dundas, Modern 1×, world differential | 223,671 | 2,326,161 | 2,151,803 | 13,657,563 |
+
+All 446,404 checked strips matched across these runs. There were zero
+partial PATH1 packets, zero strips without triangle attempts, and zero
+discarded strip qwords. These counts cover the exact retired microcode
+case, including strips outside the EE indexed texture class. Kenyon
+reported two live views and matched 58,209 upper-view and 59,808
+lower-view EE surfaces with zero mismatches or unobserved surfaces.
+The checked and unset Classic runs reported zero lost world leaves in
+the sampled frames and zero suppressed GS primitives. Capture at the
+same vblank in independently paced runs did not align rendered frames
+or audit totals.
+
+For an exact unset control, the same four-vblank recorded Dundas GS
+stream replayed on the preceding build and the new build. Both software
+replays recorded 69,349 primitive attempts, 2,352,271 pixels and one
+game frame. The final scanout and GS VRAM matched byte for byte. This
+replay covers the parser and its draw effects on a fixed stream. Live
+Plume evidence comes from the ordered comparisons above.
+
+The public Release interpreter-enabled executable SHA-256 was
+`8e839f2502e2d602ea598d703dd2cca141506c4566fcc2e0669b1817d40cfc4f`.
+The Dundas `EOD_DIFF=00358BD0` run matched all 1,168 live calls.
+The public and local Mac builds linked, all 99 macOS CTests passed,
+and the Windows executable cross-linked. Windows installation with
+backup and runtime testing were unavailable.
+
+The strict R7 audit remains red. The 6× sample retained 151,738 VU1
+executions, 29,966,467 GIF qwords and 91 GS raster submissions. The
+Classic checked runs recorded one deferred wait each in Dundas and
+Gilroy and six in Kenyon, with zero synchronous VRAM reads, CLUT
+waits and suppressed draws. No fullscreen or performance result
+was measured for this prerequisite.
+
+The worker still needs an independent admission decision from the
+ordered EE target, scissor, material, immutable mip/palette snapshot,
+LOD and mesh. Mip availability, trimming around live attachment
+aliases and allocation failures are unresolved. The first native
+triangle still takes its draw descriptor through GS. Target dirty-page
+ownership and propagation through `note_draw` and `raster_mark_pages`
+remain live compatibility dependencies. Verify these together before
+dropping the first strip packet.
