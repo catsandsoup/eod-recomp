@@ -1586,6 +1586,14 @@ const Env &current_env() {
     return g_env;
 }
 
+const Env &world_strip_env(uint32_t attr) {
+    setup_env(attr);
+    return g_env;
+}
+
+void note_world_strip_draw() { note_draw(); }
+bool world_strip_draw_dirty() { return g_draw_dirty; }
+
 void draw_sprite(const Vertex &a, const Vertex &b) {
     if (!count_prim()) return;
     uint32_t attr = current_attr();

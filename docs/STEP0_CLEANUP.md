@@ -396,3 +396,31 @@ as the GS reference.
   material, mips, LOD, surface and mesh. Verify texture availability
   and trimming against attachment aliases, allocation failure behavior,
   and ownership of target dirty pages before omitting the strip.
+
+### R7 STAR — ordered world-strip omission (2026-11-21)
+
+- **Situation.** The exact non-clipped `0x0270` world branch derived the
+  native world texture and geometry, but every strip still entered
+  the GS parser before Plume finalized the object.
+- **Task.** Omit only the strips whose native draw can join the ordered
+  batch with prepared GPU resources. Preserve the GS dirty-page and
+  terminal latch effects and route every decline through the original
+  parser once.
+- **Action.** Gate on the live PATH1 boundary, opaque EE surface and
+  LOD, immutable EE texture version and palette, compatibility mip
+  range, mesh and render resources. Check one indexed recording per
+  admission. In reference mode, parse the original strip and verify
+  its state, ownership, texture and pipeline through normal recording.
+- **Result.** The 6× matrix admitted and recorded 156,377 native draws,
+  avoiding 6,889,898 parser qwords. Both Classic and Modern Kenyon
+  views admitted draws. The original path verified each decline and
+  all same-state reference admissions. Unset and disabled-index
+  controls retained the parser. The option remains opt-in. The
+  release audit remains red. Scanout and build evidence are in
+  NATIVE_RENDERER_SUCCESS.md.
+- **Next decisive test.** Audit later consumers of VU TOP+200 strip
+  storage. Prove whether the exact retired leaf can submit its known
+  contiguous qword span directly, eliminating the generic XGKICK
+  scan while preserving worker fallback. If no later consumer needs
+  the retired memory, omit the TOP+200 store as well. Full producer-side removal requires native target and
+  texture ownership and a proven order for every dependent draw.

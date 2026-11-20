@@ -332,6 +332,12 @@ void gs_command(uint32_t kind, const void *data, uint32_t size);
 bool gs_clear_scene(const gs::Env &env, const SceneClear &clear);
 bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]);
 bool gs_shadow_boundary(ShadowPass pass);
+// GS worker: conditionally accepts the verified strip as one native world object.
+bool gs_world_strip_ready();
+bool gs_submit_world_strip(const gs::Env &env, uint64_t xy, uint32_t triangles, bool reference);
+bool gs_check_world_strip_draw(uint64_t xy, uint32_t triangles);
+int world_strip_mode();  // 0: original, 1: omit when admitted, 2: verify the original path when admitted
+void gs_report_world_strips(uint64_t expected);
 // a primitive the GS is about to draw: true = it belongs to a native object (do not draw)
 // (b, c: the other vertices of a triangle, for the P2 vertex check EOD_NATIVE_SKIN_CHECK=1)
 bool gs_draw(const gs::Env &e, const gs::Vertex &first, const gs::Vertex *b = nullptr, const gs::Vertex *c = nullptr);

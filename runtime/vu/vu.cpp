@@ -1914,7 +1914,7 @@ void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsi
     else
         xgkick(&vu, 20);
     static const bool strip_check = std::getenv("EOD_NATIVE_WORLD_STRIP_CHECK") != nullptr;
-    if (strip_check && !g_vu_mute_kick) {
+    if (!g_vu_mute_kick && (strip_check || native::world_strip_mode())) {
         const auto tail = world_strip_terminal(result);
         native::post(native::CMD_WORLD_STRIP_CHECK, &tail, sizeof tail);
     }

@@ -2,6 +2,7 @@
 // belong to native objects, the objects' GS state, and the plume renderer that draws them.
 #include "../core/r7_audit.h"
 #include "core/diff_harness.h"
+#include "core/log.h"
 #include "core/trace.h"
 #include "native_renderer.h"
 #include "editor_environment.h"
@@ -129,6 +130,18 @@ uint64_t log_every() {
 
 // ---- the object whose GS commands are arriving ----
 bool g_active = false, g_finalized = false, g_have_env = false;
+std::map<int32_t, uint64_t> g_world_strip_recorded_by_view;
+#ifdef EOD_PLUME
+uint64_t g_world_strip_reference_prims;
+uint32_t g_world_strip_reference_env;
+#endif
+enum class StripDecline { Object, Material, State, Mesh, Target, Framebuffer, Indices, Texture, Sampler, Pipeline, Count };
+uint64_t g_world_strip_declines[size_t(StripDecline::Count)];
+
+[[maybe_unused]] bool decline_world_strip(StripDecline reason) {
+    ++g_world_strip_declines[size_t(reason)];
+    return false;
+}
 Packet g_cur;
 gs::Env g_env;          // its GS state at its first draw
 uint64_t g_xyoffset = 0;
@@ -184,6 +197,13 @@ struct Texture {
     int32_t mat = -1;                 // material record (stage R6), -1: none
     uint32_t sky_top = 0, sky_hor = 0;  // a sky texture's mean upper / lower colour (RGBA8)
 };
+// Until the original PATH1 draw reaches normal finalization in reference mode.
+struct StripReference {
+    Texture *texture = nullptr;
+    uint32_t pipeline = 0;
+    uint32_t sampler = 0;
+} g_world_strip_reference;
+
 struct AddrEntry {
     Texture *tex = nullptr;
     uint32_t stamp = 0;  // g_vram_clock when the pages were last checked
@@ -200,6 +220,7 @@ struct Item {
     int32_t sc[4];         // scissor, GS pixels (x0, y0, x1, y1 inclusive)
     GpuMesh *mesh;
     bool second = false;   // the alpha-test-failed pass of the previous item (not counted again)
+    bool world_strip = false; // an admitted strip or its original-path reference
     std::vector<int32_t> run_k;  // TEX1.K per VU1 run (Mesh::k_runs), when they differ
 };
 
@@ -784,7 +805,8 @@ uint8_t world_index(const WorldTextureIndices &indices, uint32_t x, uint32_t y, 
 // `levels`: the mip levels beyond the base the draw's TEX1.MXL selects (stage R5 A2), each read at
 // its MIPTBP address (0x35F9A0 writes MIPTBP1/2 from the level offsets 0x35F278 computes).
 Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_region = false,
-                 const WorldTextureBinding *binding = nullptr, const WorldTextureIndices *indices = nullptr) {
+                 const WorldTextureBinding *binding = nullptr, const WorldTextureIndices *indices = nullptr,
+                 bool cached_only = false) {
     if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
     // the GS state decodes levels only as far as its own TEX1 asks (gs_draw.cpp setup_env)
     const uint32_t decodable = (e.mmin >= 2 && e.mxl > 0) ? (uint32_t)std::min(e.mxl, 6) : 0;
@@ -798,14 +820,14 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     uint32_t first, count;
     gs::page_range(base(0), pitch(0), e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
     if (!(exact_region ? gs::hw::native_texture_region_on_cpu(e) : gs::hw::native_texture_on_cpu(first, count))) {
-        fs.untextured_rt++;
+        if (!cached_only) fs.untextured_rt++;
         return nullptr;
     }
     for (uint32_t l = 1; l <= levels; l++) {
         uint32_t f2, c2;
         gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
         if (!gs::hw::native_texture_on_cpu(f2, c2)) {
-            g_mip_rt.fetch_add(1);
+            if (!cached_only) g_mip_rt.fetch_add(1);
             levels = l - 1;
             break;
         }
@@ -826,7 +848,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     uint64_t key;
     if (indices) {
         static const bool report_use = std::getenv("EOD_NATIVE_WORLD_INDICES_CHECK") || std::getenv("EOD_R7_AUDIT");
-        if (report_use) g_world_indices_used.fetch_add(1, std::memory_order_relaxed);
+        if (report_use && !cached_only) g_world_indices_used.fetch_add(1, std::memory_order_relaxed);
         // Equal asset bytes in either upload bank share the same native texture.
         const uint64_t identity[] = {indices->mip_hashes[levels], palette_hash, levels};
         key = XXH3_64bits_withSeed(identity, sizeof identity, 0x50534D5434ull);
@@ -894,6 +916,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         cached->last_use = g_r.vb;
         return cached;
     }
+    if (cached_only) return nullptr;
     auto next = std::make_unique<Texture>();
     Texture &t = *next;
     t.key = key;
@@ -2205,7 +2228,10 @@ void flush() {
     e.fbp = tg.fbp, e.fbw = tg.fbw, e.fpsm_mem = tg.fpsm, e.zbp = tg.zbp, e.zpsm = tg.zpsm, e.scy1 = (int)tg.rows - 1;
     gs::hw::NativeSurfaces s{};
     if (!gs::hw::native_begin(e, tg.depth, s)) {
-        for (const Item &it : g_r.pending) g_frames[it.p.frame].lost++;
+        for (const Item &it : g_r.pending) {
+            g_frames[it.p.frame].lost++;
+            if (it.world_strip) fatal("admitted world strip lost its attachments before recording");
+        }
         g_r.pending.clear();
         return;
     }
@@ -2263,6 +2289,7 @@ void flush() {
     for (Item &it : g_r.pending) {
         FrameStats &fs = g_frames[it.p.frame];
         if (!it.mesh || !it.mesh->buf) {
+            if (it.world_strip) fatal("admitted world strip lost its mesh before recording");
             if (it.second) continue;
             fs.drawn++;
             fs.k_drawn[it.p.kind % KIND_COUNT]++;
@@ -2360,8 +2387,12 @@ void flush() {
                 (it.mesh->billboard_offset ? K_VFX_BILLBOARD : 0u);
             g_r.scene.pipeline(modern_key | K_SCENE_INPUTS);
         }
+        auto *pipeline = key != bound || it.world_strip ? g_r.scene.pipeline(key) : nullptr;
+        if (it.world_strip && (!it.tex || !depth || !fb || !pipeline ||
+            !static_cast<plume::VulkanGraphicsPipeline *>(pipeline)->vk || !t->sets[samp]))
+            fatal("admitted world strip lost its draw resources before recording");
         if (key != bound) {
-            cl->setPipeline(g_r.scene.pipeline(key));
+            cl->setPipeline(pipeline);
             bound = key;
         }
         cl->setGraphicsDescriptorSet(texture_set(t, samp), 0);
@@ -2397,6 +2428,11 @@ void flush() {
                 cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, first_instance);
                 pass_draws++;
             }
+        }
+        if (it.world_strip) {
+            if (vfx_billboard || !it.run_k.empty())
+                fatal("admitted world strip did not record as one indexed draw");
+            ++g_world_strip_recorded_by_view[it.sc[1]];
         }
         if (capture_sun) observe_sun_caster(it, tg, s);
         if (modern && depth && !it.second && it.p.kind == KIND_WORLD && (it.pipeline & 0x40u) &&
@@ -2669,8 +2705,8 @@ const WorldTextureIndices *draw_world_indices(const WorldTextureBinding *binding
     return enabled ? &g_world_indices : nullptr;
 }
 
-const WorldTextureBinding *draw_world_texture(const Packet &p, const gs::Env &e) {
-    if (!g_have_env || !p.world_texture.levels || p.kind != KIND_WORLD ||
+const WorldTextureBinding *draw_world_texture(const Packet &p, const gs::Env &e, bool report = true) {
+    if (!p.world_texture.levels || p.kind != KIND_WORLD ||
         p.program != 0x0270 || p.itop != 0x80)
         return nullptr;
     const WorldTextureBinding &binding = p.world_texture;
@@ -2687,7 +2723,7 @@ const WorldTextureBinding *draw_world_texture(const Packet &p, const gs::Env &e)
         return !value || value[0] != '0';
     }();
     static const bool check = std::getenv("EOD_NATIVE_WORLD_TEXTURE_CHECK") != nullptr;
-    if (check) {
+    if (check && report) {
         std::lock_guard<std::mutex> lock(g_st_mutex);
         if (matches) {
             ++g_world_texture_matches;
@@ -2702,16 +2738,25 @@ const WorldTextureBinding *draw_world_texture(const Packet &p, const gs::Env &e)
     return enabled && matches ? &binding : nullptr;
 }
 
-const DrawSurface &draw_surface(const Packet &p, const DrawSurface &reference, bool observed) {
-    if (p.kind != KIND_WORLD || p.program != 0x0270 || p.itop != 0x80)
-        return reference;
-    const DrawSurface &ee = p.world_surface;
-    const bool matches = observed && ee.color_base == reference.color_base &&
+DrawSurface reference_surface(const gs::Env &e, uint64_t xy) {
+    return {e.fbp, e.fbw, e.fpsm_mem, e.fbmsk, e.zbp, e.zpsm, {e.scx0, e.scy0, e.scx1, e.scy1},
+            uint16_t(xy), uint16_t(xy >> 32)};
+}
+
+bool same_surface(const DrawSurface &ee, const DrawSurface &reference) {
+    return ee.color_base == reference.color_base &&
         ee.color_pitch == reference.color_pitch && ee.color_format == reference.color_format &&
         ee.color_mask == reference.color_mask && ee.depth_base == reference.depth_base &&
         ee.depth_format == reference.depth_format && ee.origin_x == reference.origin_x &&
         ee.origin_y == reference.origin_y &&
         std::equal(std::begin(ee.scissor), std::end(ee.scissor), std::begin(reference.scissor));
+}
+
+const DrawSurface &draw_surface(const Packet &p, const DrawSurface &reference, bool observed) {
+    if (p.kind != KIND_WORLD || p.program != 0x0270 || p.itop != 0x80)
+        return reference;
+    const DrawSurface &ee = p.world_surface;
+    const bool matches = observed && same_surface(ee, reference);
     static const bool check = std::getenv("EOD_NATIVE_WORLD_SURFACE_CHECK") != nullptr;
     if (check) {
         std::lock_guard<std::mutex> lock(g_st_mutex);
@@ -2843,7 +2888,7 @@ void q_check(const gs::Env &e, const gs::Vertex &v) {
 }
 
 // The current object is complete: queue it with the GS state it had.
-void finalize() {
+void finalize(bool owns_world_strip = false) {
     if (!g_active || g_finalized) return;
     g_finalized = true;
     FrameStats &fs = g_frames[g_cur.frame];
@@ -2915,8 +2960,7 @@ void finalize() {
     }
     compare_state(rs, e, kind);
     const bool zwrite = rs.zwrite, ztest = rs.ztst >= 2;
-    const DrawSurface reference{e.fbp, e.fbw, e.fpsm_mem, e.fbmsk, e.zbp, e.zpsm,
-                                {e.scx0, e.scy0, e.scx1, e.scy1}, uint16_t(xy), uint16_t(xy >> 32)};
+    const DrawSurface reference = reference_surface(e, xy);
     const DrawSurface &surface = draw_surface(g_cur, reference, g_have_env);
     const int32_t *scissor = surface.scissor;
     Target tg{surface.color_base, surface.color_pitch, surface.color_format, surface.depth_base,
@@ -2932,6 +2976,7 @@ void finalize() {
     Item it{};
     it.p = g_cur;
     it.mesh = mesh;
+    it.world_strip = owns_world_strip || g_world_strip_reference.texture;
     screen_matrix(g_cur, it.a, kind == KIND_QUEUE && mesh && mesh->cpu->skinned);
     it.ox = float(surface.origin_x) / 16.0f;
     it.oy = float(surface.origin_y) / 16.0f;
@@ -2963,7 +3008,7 @@ void finalize() {
         std::memcpy(&pc.mode[3], &hz, 4);
     }
     static const uint32_t ab = std::getenv("EOD_R5A2_OFF") ? (uint32_t)std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) : 0u;
-    const WorldTextureBinding *world_texture = draw_world_texture(g_cur, e);
+    const WorldTextureBinding *world_texture = g_have_env ? draw_world_texture(g_cur, e) : nullptr;
     const WorldTextureIndices *world_indices = draw_world_indices(world_texture, e);
     it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0, false, world_texture, world_indices);
     const bool replacement = it.tex && it.tex->replacement_id;
@@ -3030,6 +3075,13 @@ void finalize() {
         if (rs.afail == 1 || rs.afail == 3) it.pc.mode[0] &= ~M_AFAIL_DISCARD;
         g_r.pending.push_back(it);
         return;
+    }
+    if (g_world_strip_reference.texture) {
+        const auto &reference_draw = g_world_strip_reference;
+        if (it.tex != reference_draw.texture || it.pipeline != reference_draw.pipeline ||
+            it.sampler != reference_draw.sampler || rs.ate)
+            fatal("world strip reference draw changed before finalization");
+        g_world_strip_reference = {};
     }
     if (!rs.ate || rs.atst == 1) {
         it.pc.mode[0] &= ~(M_ATE | M_AFAIL_DISCARD);
@@ -3870,6 +3922,136 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
     }
     default: break;
     }
+}
+
+bool gs_world_strip_ready() {
+#ifdef EOD_PLUME
+    static const bool diagnostic = std::getenv("EOD_NATIVE_PASSES") || std::getenv("EOD_NATIVE_QCHECK") ||
+                                   std::getenv("EOD_R5A2_OFF") || std::getenv("EOD_GS_SKIPALL");
+    if (!g_active || g_finalized || g_have_env || !g_r.ok || gs::g_skip_frame ||
+        native_only() || diagnostic || vertex_check_on() || g_cur.kind != KIND_WORLD ||
+        g_cur.program != 0x0270 || g_cur.itop != 0x80)
+        return decline_world_strip(StripDecline::Object);
+    if ((g_cur.flags & 0x2C1) != 0x2C0 || g_cur.fge || !g_cur.world_lod.valid || !g_cur.world_texture.levels)
+        return decline_world_strip(StripDecline::Material);
+    if (g_r.pending.empty() || !g_r.shadow_pending.empty())
+        return decline_world_strip(StripDecline::Target);
+    return true;
+#else
+    return false;
+#endif
+}
+
+int world_strip_mode() {
+    static const int mode = [] {
+        const char *v = std::getenv("EOD_NATIVE_WORLD_STRIP");
+        return v && (v[0] == '1' || v[0] == '2') && !v[1] ? int(v[0] - '0') : 0;
+    }();
+    return mode;
+}
+
+bool gs_submit_world_strip(const gs::Env &env, uint64_t xy, uint32_t triangles, bool reference) {
+#ifdef EOD_PLUME
+    const auto &lod = g_cur.world_lod;
+    if (gs::g_skip_frame || env.ate || env.abe || env.date || env.fge || env.fst || !env.iip ||
+        env.fbmsk || env.zmsk || env.ztst != 2 || env.lcm || env.l || env.mmin != 4 || !env.bilinear_mag ||
+        env.wms != int(((g_cur.flags >> 4) ^ 1) & 1) || env.wmt != int(((g_cur.flags >> 5) ^ 1) & 1) ||
+        env.mxl != lod.max_level || std::lround(env.k * 16.0f) != sext12(lod.bias) ||
+        !same_surface(g_cur.world_surface, reference_surface(env, xy)))
+        return decline_world_strip(StripDecline::State);
+
+    const auto mesh = g_r.meshes.find(g_cur.mesh);
+    if (mesh == g_r.meshes.end() || !mesh->second.buf || !mesh->second.cpu ||
+        !static_cast<plume::VulkanBuffer *>(mesh->second.buf.get())->vk ||
+        mesh->second.cpu->indices.size() != size_t(triangles) * 3 || !mesh->second.cpu->k_kick ||
+        mesh->second.cpu->k_mixed)
+        return decline_world_strip(StripDecline::Mesh);
+
+    const DrawSurface &surface = g_cur.world_surface;
+    const Target target{surface.color_base, surface.color_pitch, surface.color_format,
+                        surface.depth_base, surface.depth_format, uint32_t(surface.scissor[3]) + 1, true};
+    uint64_t color, depth;
+    if (!(target == g_r.target) || !gs::hw::native_cached_targets(env, color, depth))
+        return decline_world_strip(StripDecline::Target);
+    const auto fb = g_r.framebuffers.find({color, depth});
+    if (fb == g_r.framebuffers.end() || !fb->second || !static_cast<plume::VulkanFramebuffer *>(fb->second.get())->vk)
+        return decline_world_strip(StripDecline::Framebuffer);
+
+    const auto *binding = draw_world_texture(g_cur, env, false);
+    const auto *indices = draw_world_indices(binding, env);
+    if (!indices) return decline_world_strip(StripDecline::Indices);
+    FrameStats preflight{};
+    auto *tex = texture(env, preflight, lod.max_level, false, binding, indices, true);
+    if (!tex || !tex->tex || tex->pending_upload ||
+        !static_cast<plume::VulkanTexture *>(tex->tex.get())->imageView)
+        return decline_world_strip(StripDecline::Texture);
+    const uint32_t classic_sampler = !tex->replacement_id ? 0 : 1 | (env.wms ? 2 : 0) | (env.wmt ? 4 : 0);
+    const uint32_t modern_sampler = 8 | (env.wms ? 2 : 0) | (env.wmt ? 4 : 0);
+    for (uint32_t sampler : {classic_sampler, modern_sampler})
+        if (!tex->sets[sampler] || !static_cast<plume::VulkanDescriptorSet *>(tex->sets[sampler].get())->vk)
+            return decline_world_strip(StripDecline::Sampler);
+    // Opaque, GEQUAL, full writable channels, with the typed target depth buffer.
+    const uint32_t mask = (surface.color_format & 0xF) == 1 ? 7 : 15;
+    const uint32_t key = blend_classes(false, 0, 0, 0, 0) | 0xD0u | (mask << 8);
+    for (uint32_t pipeline_key : {key, key | K_MODERN}) {
+        auto *pipeline = g_r.scene.pipeline(pipeline_key);
+        if (!pipeline || !static_cast<plume::VulkanGraphicsPipeline *>(pipeline)->vk)
+            return decline_world_strip(StripDecline::Pipeline);
+    }
+    if (reference) {
+        if (g_world_strip_reference.texture) fatal("world strip reference was not finalized");
+        g_world_strip_reference = {tex, key, classic_sampler};
+        g_world_strip_reference_prims = g_frames[g_cur.frame].suppressed;
+        g_world_strip_reference_env = gs::g_env_serial;
+        return true;
+    }
+    // No later setup or batching operation may resample the first-draw state.
+    g_env = env;
+    g_xyoffset = xy;
+    g_have_env = true;
+    const size_t before = g_r.pending.size();
+    finalize(true);
+    if (g_r.pending.size() != before + 1 || g_r.pending.back().tex != tex ||
+        g_r.pending.back().pipeline != key || g_r.pending.back().sampler != classic_sampler)
+        fatal("world strip admission failed to enqueue its verified draw");
+    return true;
+#else
+    (void)env;
+    (void)xy;
+    (void)triangles;
+    (void)reference;
+    return false;
+#endif
+}
+
+bool gs_check_world_strip_draw(uint64_t xy, uint32_t triangles) {
+#ifdef EOD_PLUME
+    return g_active && g_have_env && !g_finalized && g_xyoffset == xy &&
+           gs::g_env_serial == g_world_strip_reference_env &&
+           g_frames[g_cur.frame].suppressed == g_world_strip_reference_prims + triangles;
+#else
+    (void)xy;
+    (void)triangles;
+    return false;
+#endif
+}
+
+void gs_report_world_strips(uint64_t expected) {
+    uint64_t total = 0;
+    for (const auto &[view_y, count] : g_world_strip_recorded_by_view) {
+        std::fprintf(stderr, "[native] world strip native view y=%d: %llu recorded\n",
+                     view_y, (unsigned long long)count);
+        total += count;
+    }
+    std::fprintf(stderr, "[native] world strip native recording: %llu recorded\n", (unsigned long long)total);
+    if (total != expected) fatal("world strip recording count differs from admissions");
+    static constexpr const char *names[] = {"object", "material", "state", "mesh", "target", "framebuffer",
+                                             "indices", "texture", "sampler", "pipeline"};
+    static_assert(std::size(names) == std::size(g_world_strip_declines));
+    std::fprintf(stderr, "[native] world strip declines");
+    for (size_t i = 0; i < std::size(names); ++i)
+        std::fprintf(stderr, " %s=%llu", names[i], (unsigned long long)g_world_strip_declines[i]);
+    std::fprintf(stderr, "\n");
 }
 
 bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const gs::Vertex *c) {

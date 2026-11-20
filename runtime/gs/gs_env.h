@@ -90,6 +90,7 @@ struct Env {
 
 // The state of the current primitive (gs_draw.cpp setup_env).
 extern Env g_env;
+extern bool g_trace;
 // bumped whenever g_env is recomputed
 extern uint32_t g_env_serial;
 // bumped whenever the CLUT buffer may have changed
@@ -98,6 +99,9 @@ extern uint32_t g_clut_gen;
 uint32_t tex_fetch(const Env &e, int u, int v, int lvl);
 // The draw state a primitive would get now (registers and PRIM/PRMODE), without drawing one.
 const Env &current_env();
+const Env &world_strip_env(uint32_t attr);
+void note_world_strip_draw();
+bool world_strip_draw_dirty();
 // A skipped VU1 run's state was replayed: its vertex attribute registers were not written (gs.cpp).
 void taint_attributes();
 void attr_mark();

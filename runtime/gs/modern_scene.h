@@ -79,6 +79,7 @@ extern Target g_target;
 // GS thread
 void gs_packet(int path);
 void gs_batch(int32_t index);
+bool gs_path1_has_replacement();
 constexpr int32_t kSuppressed = -2;  // batch(kSuppressed): the following PATH1 draws are dropped
 // true: this draw belongs to a replaced batch (the caller skips it); its texture is noted
 // alpha: the draw's vertex alpha (0x80 = 1.0; the car damage layer fades in with it)

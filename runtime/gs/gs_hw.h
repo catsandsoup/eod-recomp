@@ -102,6 +102,8 @@ struct NativeSurfaces {
     uint64_t color_ownership, depth_ownership; // physical pages reacquired since the prior use
 };
 bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback = false);
+// Match already allocated attachments without growing, acquiring or writing them.
+bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth);
 bool native_begin_depth_clear(const Env &e, NativeSurfaces &out);
 void native_mark_bootstrap_depth_clear(const Env &e);
 void native_end();

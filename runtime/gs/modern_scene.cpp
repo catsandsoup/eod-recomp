@@ -90,6 +90,8 @@ int32_t g_noted = -1;   // its texture was handed to the backend
 
 void gs_packet(int path) { g_path = path; }
 
+bool gs_path1_has_replacement() { return g_batch != -1; }
+
 void gs_batch(int32_t index) {
     g_batch = index;
     gs::attr_mark();
@@ -107,7 +109,7 @@ bool gs_replaced(const gs::Env &e, uint32_t alpha) {
     return r;
 }
 static bool gs_replaced_(const gs::Env &e, uint32_t alpha) {
-    if (g_path != 1 || g_batch == -1) return false;
+    if (g_path != 1 || !gs_path1_has_replacement()) return false;
     if (g_batch == kSuppressed) return true;
     g_target = {true, e.fbp, e.fbw, e.fpsm, gs::st.ctx[0].xyoffset, gs::st.ctx[0].scissor, e.zbp, e.zpsm};
     if (g_noted != g_batch && gs::hw::g_on) {  // the batch's texture and blend state (first draw)

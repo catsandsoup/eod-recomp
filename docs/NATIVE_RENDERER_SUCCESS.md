@@ -989,3 +989,72 @@ triangle still takes its draw descriptor through GS. Target dirty-page
 ownership and propagation through `note_draw` and `raster_mark_pages`
 remain live compatibility dependencies. Verify these together before
 dropping the first strip packet.
+
+## R7 ordered world-strip omission (2026-11-21)
+
+On Apple M2 Pro, the public Release executable with the interpreter
+enabled recorded the following native draws at 6× headless. Mode 1
+omits a worker-side PATH1 parse after admission. Mode 2 runs the
+original parser once and checks its first-draw environment generation,
+XYOFFSET, native triangle ownership and dirty flag. It then verifies
+that normal finalization and recording use the prepared texture,
+pipeline and sampler for a single indexed draw.
+
+| Case | Omitted and recorded | GIF qwords that bypassed the parser | Original-path reference matches | Option-unset strips terminal-checked |
+| --- | ---: | ---: | ---: | ---: |
+| Classic Dundas day | 16,846 | 811,147 | 16,600 | 56,716 |
+| Classic Gilroy night | 23,167 | 1,076,551 | 22,968 | 60,240 |
+| Classic Kenyon 2P | 50,020 (24,451 upper, 25,569 lower) | 2,111,797 | 47,561 (23,184 upper, 24,377 lower) | 113,929 |
+| Modern Dundas day | 16,203 | 776,121 | 15,979 | 48,468 |
+| Modern Kenyon 2P | 50,141 (24,520 upper, 25,621 lower) | 2,114,282 | 50,057 (24,449 upper, 25,608 lower) | 152,234 |
+| Total | 156,377 | 6,889,898 | 153,165 | 431,587 |
+
+The omitted runs forwarded all 326,886 declined strips, with
+15,706,620 qwords verified by the terminal oracle. The reference
+admissions matched 1,226,429 triangle attempts. The omission runs
+compared 16,193,408 indexed texels over 742 complete version, bank
+and view checks with zero mismatches. With EE indices
+disabled in Classic Kenyon, the index gate declined 49,178 candidates
+and all 152,071 strips reached the original parser. There were zero
+omissions. All sampled P1 world leaves were drawn in the matrix.
+With the texture, index, surface and strip terminal checks unset,
+Modern Kenyon separately recorded 24,880 omitted and indexed draws in
+the upper view and 25,996 in the lower view.
+
+Two 1× Classic Dundas repeats used the same controller input and
+synchronous GS execution. Each compared 35 scanouts at vblanks
+152–198. In the final repeat, the median 8-bit RGB MAE was 0.306 for
+omission/reference, 0.474 for omission/unset and 0.427 for
+reference/unset. Completed frame counts varied, and no scanouts were
+byte-identical in either repeat. The per-draw
+ordered reference proves the local draw-state checks. Exact live
+scanout parity remains open.
+
+The Modern Dundas omission run still recorded 169,952 VU1
+executions, 32,818,103 parsed GIF qwords and 91 GS raster submissions.
+The 6× omission matrix reported 0–13 deferred waits per run and zero
+synchronous VRAM reads, CLUT waits, suppressed GS draws or VU0
+matrix-list executions. The strict R7 audit rejected every run. GIF
+construction, XGKICK extraction and queue copying still occur.
+The native draw still depends on GS mip availability, attachment
+ownership and the terminal compatibility bridge.
+
+The mode stays opt-in. A preflight rejection leaves the original
+packet available to the GS worker. Unexpected loss of prepared GPU
+resources after admission aborts the run because its draw no longer
+has an ordered recovery path. Pixel-exact matched-input presentation
+and recovery under late attachment failure remain open for default
+enablement.
+
+The Modern Dundas differential matched all 1,178 calls to
+`0x358BD0`. The local macOS build passed all 99 CTests, the public
+macOS executable linked and ran the matrix, and the Windows
+executable cross-linked. Windows runtime and installation with
+backup were unavailable. No release or fullscreen performance
+measurement was made.
+
+| Executable | SHA-256 |
+| --- | --- |
+| Public macOS | `ac846f7e6641a45f788c298430c5f5b41633cace8d3d0c65cb18a0aa2350f301` |
+| Local macOS | `0cc30716599dab9f08784adbdf6ccec1fab684f370b394803fea5462a352151d` |
+| Windows cross-link | `22992d4a75f0389e4ce2f7a7f455f376f0a716b9424a34978b80b77b5b4e50c1` |

@@ -155,6 +155,20 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
     return true;
 }
 
+bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth) {
+    if (!e.fbw || e.scy1 < 0) return false;
+    const int rows = e.scy1 + 1;
+    const int allocation_rows = rows <= 512 ? 512 : rows <= 1024 ? 1024 : 2048;
+    const Surface *rt = find_surface(e.fbp, e.fbw, e.fpsm_mem, false);
+    const Surface *ds = find_surface(e.zbp, e.fbw, e.zpsm, true);
+    if (!rt || !ds || !rt->tex || !ds->tex || rt->w != ds->w || rt->h != ds->h ||
+        rt->h < allocation_rows || e.scx1 >= rt->w || e.scy1 >= rt->h)
+        return false;
+    color = (uint64_t)rt->tex->image;
+    depth = (uint64_t)ds->tex->image;
+    return color && depth;
+}
+
 bool native_begin_depth_clear(const Env &e, NativeSurfaces &out) {
     constexpr int cols = 640, rows = 448;
     if (g_skip_frame || (g_scale > 1 && e.scy1 != rows - 1)) return false;

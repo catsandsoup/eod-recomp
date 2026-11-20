@@ -42,6 +42,7 @@ struct ClutSnapshot;
 void vram_write_complete();
 #ifdef EOD_PLUME
 bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback);
+bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth);
 bool native_begin_depth_clear(const Env &e, NativeSurfaces &out);
 void native_mark_bootstrap_depth_clear(const Env &e);
 void native_end();
@@ -113,6 +114,9 @@ bool vulkan_active() { return g_on && g_vk; }
 #ifdef EOD_PLUME
 bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback) {
     return g_vk && vulkan::native_begin(e, depth, out, require_no_readback);
+}
+bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth) {
+    return g_vk && vulkan::native_cached_targets(e, color, depth);
 }
 bool native_begin_depth_clear(const Env &e, NativeSurfaces &out) { return g_vk && vulkan::native_begin_depth_clear(e, out); }
 void native_mark_bootstrap_depth_clear(const Env &e) {

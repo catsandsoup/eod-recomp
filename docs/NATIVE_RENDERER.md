@@ -1929,3 +1929,35 @@ admit only when the required target and source are usable, and preserve
 the compatibility dirty-page protocol until its last consumer leaves.
 Omitting the parser while leaving the object to sample a later
 environment cannot establish that contract.
+
+### R7 ordered world-strip omission
+
+The first omission candidate is restricted to one rasterable opaque indexed
+world leaf from `0x35DEFC`, using the exact `0x0270` and ITOP `0x80`
+retirement above. The Xbox indexed draw confirms the ownership boundary.
+The PS2 strip transports final compatibility latches and triggers the first
+drawable-triangle observation. The native mesh already supplies the geometry.
+
+| Ordered input | Admission and handoff |
+| --- | --- |
+| VU result and original strip | Recognize the verified standalone tag after the ordered TEX1 write. Retain the original bytes up to the worker decision so a decline can forward them once |
+| EE draw marker | Match the surface and scissor, opaque render state, signed TEX1.K and MXL, texture descriptor and palette, plus the immutable EE index version. Use the compatibility environment as the ordered first-draw reference |
+| Plume work | Require a usable mesh, a cached texture for the compatibility-available mip range, a compatible current native batch and prepared attachment resources, and a valid scene pipeline and descriptor. Retain the normal batch submission order |
+| Legacy readers | Apply the exact terminal attributes and PATH1 state, carry forward the triangle-attempt count and the same dirty-page notification as the accepted hardware triangle path |
+
+`EOD_NATIVE_WORLD_STRIP=1` enables omission. Mode 2 runs the same admission
+checks, then executes the original parser once. It compares the first-draw
+environment generation, XYOFFSET, native-owned triangle count and dirty-page
+notification alongside the existing terminal-state oracle. Its normal finalize
+and recording path verifies the same prepared texture, pipeline and sampler
+and reports indexed draws by viewport. The option is
+off by default. Frame skipping, capture modes, blended leaves, cold
+resources and all other declines continue through the original parser. Each
+admitted leaf queues exactly one indexed native draw in the existing batch.
+An unexpected late loss of prepared draw resources fails the opt-in run.
+
+The omission counter measures qwords that never entered the GS parser. The
+recording counter measures indexed native draws recorded from omitted
+packets. The original bytes remain in the worker queue for fallback, and
+the retired VU memory, GS compatibility environment, attachment ownership
+and final latch bridge remain live.

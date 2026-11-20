@@ -740,6 +740,8 @@ native::WorldStripTerminal g_world_strip_check{};
 bool g_have_world_strip_check;
 uint64_t g_world_strips_checked, g_world_strips_partial, g_world_strips_empty;
 uint64_t g_world_strip_triangles, g_world_strip_adc, g_world_strip_qwords;
+uint64_t g_world_strips_omitted, g_world_strips_forwarded, g_world_qwords_omitted, g_world_qwords_forwarded;
+uint64_t g_world_strips_reference, g_world_triangles_reference, g_world_triangles_omitted;
 
 void arm_world_strip_check(const void *data) {
     if (g_have_world_strip_check) fatal("world strip check still awaiting PATH1");
@@ -800,9 +802,95 @@ void check_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices) {
     g_world_strip_qwords += qwc;
 }
 
+bool try_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices, bool reference) {
+    const auto &tail = g_world_strip_check;
+    auto &path = g_path[GIF_PATH1];
+    static const bool capture_mode = std::getenv("EOD_GS_DUMP") || std::getenv("EOD_GS_DUMP_COLD_START") ||
+                                     std::getenv("EOD_GS_CENSUS");
+    static const char *frame_skip = std::getenv("EOD_FRAMESKIP");
+    const bool skip_enabled = frame_skip ? std::atoi(frame_skip) != 0 : g_config.frame_skip;
+    if (skip_enabled || !draw_vertices || !tail.triangle_attempts || qwc != 1 + 3 * tail.vertices ||
+        path.nloop || !(st.prmodecont & 1) || tail.prim != 0x1C || !hw::g_on || g_trace ||
+        capture_mode || g_stale_prim || (modern::g_on && (modern::live() || modern::gs_path1_has_replacement())) ||
+        scene_capture::g_on || scene_emit::capture_requested() || !native::gs_world_strip_ready())
+        return false;
+    uint64_t tag[2];
+    memcpy(tag, data, sizeof tag);
+    constexpr uint64_t header = 0x300E400000008000ull;
+    if (tag[0] != (header | tail.vertices) || (tag[1] & 0xFFF) != 0x412)
+        return false;
+
+    const uint64_t xy = st.ctx[0].xyoffset;
+    const Env &env = world_strip_env(tail.prim);
+    if (env.write_none || !native::gs_submit_world_strip(env, xy, tail.triangle_attempts, reference))
+        return false;
+    if (reference) {
+        check_world_strip(data, qwc, draw_vertices);
+        if (!world_strip_draw_dirty() || !native::gs_check_world_strip_draw(xy, tail.triangle_attempts))
+            fatal("world strip original-path admission mismatch");
+        ++g_world_strips_reference;
+        g_world_triangles_reference += tail.triangle_attempts;
+        return true;
+    }
+
+    if (scene_emit::g_on) scene_emit::gs_packet(GIF_PATH1);
+    if (modern::g_on) modern::gs_packet(GIF_PATH1);
+
+    // Commit compatibility latches only after the native object owns the draw.
+    const auto &last = tail.fifo[2];
+    st.prim = tail.prim;
+    st.vcount = 3;
+    st.st = uint64_t(last.t) << 32 | last.s;
+    st.rgbaq = uint64_t(last.q) << 32 | last.rgba;
+    memcpy(&st.q, &last.q, sizeof st.q);
+    constexpr uint32_t writes = TAINT_ST | TAINT_Q | TAINT_RGBA;
+    g_attr_taint &= ~writes;
+    g_attr_written |= writes;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto &src = tail.fifo[i];
+        Vertex &dst = st.vq[i];
+        dst.x = int32_t(src.x) - int32_t(bits(xy, 0, 16));
+        dst.y = int32_t(src.y) - int32_t(bits(xy, 32, 16));
+        dst.z = src.z;
+        dst.f = src.fog;
+        dst.r = uint8_t(src.rgba);
+        dst.g = uint8_t(src.rgba >> 8);
+        dst.b = uint8_t(src.rgba >> 16);
+        dst.a = uint8_t(src.rgba >> 24);
+        dst.u = int32_t(bits(st.uv, 0, 14));
+        dst.v = int32_t(bits(st.uv, 16, 14));
+        memcpy(&dst.s, &src.s, sizeof dst.s);
+        memcpy(&dst.t, &src.t, sizeof dst.t);
+        memcpy(&dst.q, &src.q, sizeof dst.q);
+    }
+    path = PathState{false, tag[0], tag[1], 0, 3, 0, 0, true};
+    stats.prims += tail.triangle_attempts;
+    g_world_triangles_omitted += tail.triangle_attempts;
+    note_world_strip_draw();
+    return true;
+}
+
 void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
-    if (path == GIF_PATH1 && g_have_world_strip_check)
-        return check_world_strip(data, qwc, draw_vertices);
+    if (path == GIF_PATH1 && g_have_world_strip_check) {
+        const int mode = native::world_strip_mode();
+        if (mode) {
+            const bool reference = mode == 2;
+            if (try_world_strip(data, qwc, draw_vertices, reference)) {
+                g_have_world_strip_check = false;
+                if (!reference) {
+                    ++g_world_strips_omitted;
+                    g_world_qwords_omitted += qwc;
+                }
+                return;
+            }
+            ++g_world_strips_forwarded;
+            g_world_qwords_forwarded += qwc;
+            if (reference) return check_world_strip(data, qwc, draw_vertices);
+        }
+        static const bool check = std::getenv("EOD_NATIVE_WORLD_STRIP_CHECK") != nullptr;
+        if (check) return check_world_strip(data, qwc, draw_vertices);
+        g_have_world_strip_check = false;
+    }
     parse_gif(path, data, qwc, draw_vertices);
 }
 
@@ -2147,6 +2235,19 @@ void gs_shutdown() {
     if (g_dump) { fclose(g_dump); g_dump = nullptr; }
     raster_shutdown();
     if (g_have_world_strip_check) fatal("world strip check did not receive PATH1 before shutdown");
+    if (native::world_strip_mode() == 1) {
+        std::fprintf(stderr, "[native] world strip omission: %llu admitted, %llu declined, %llu qwords avoided, %llu forwarded\n",
+                     (unsigned long long)g_world_strips_omitted, (unsigned long long)g_world_strips_forwarded,
+                     (unsigned long long)g_world_qwords_omitted, (unsigned long long)g_world_qwords_forwarded);
+        std::fprintf(stderr, "[native] world strip omitted triangle attempts: %llu\n",
+                     (unsigned long long)g_world_triangles_omitted);
+        native::gs_report_world_strips(g_world_strips_omitted);
+    } else if (native::world_strip_mode() == 2) {
+        std::fprintf(stderr, "[native] world strip admission reference: %llu matched, %llu declined, %llu triangle attempts matched\n",
+                     (unsigned long long)g_world_strips_reference, (unsigned long long)g_world_strips_forwarded,
+                     (unsigned long long)g_world_triangles_reference);
+        native::gs_report_world_strips(g_world_strips_reference);
+    }
     if (g_world_strips_checked || g_world_strips_partial)
         std::fprintf(stderr, "[native] world strip terminal: %llu checked, %llu partial PATH1, %llu without triangle attempts, "
                      "%llu triangle attempts, %llu ADC vertices, %llu qwords retained\n",
