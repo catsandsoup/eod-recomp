@@ -1053,6 +1053,75 @@ executable cross-linked. Windows runtime and installation with
 backup were unavailable. No release or fullscreen performance
 measurement was made.
 
+## R7 bounded world-strip producer transport (2026-11-21)
+
+`EOD_NATIVE_WORLD_STRIP_DIRECT=1` bypasses the producer's generic XGKICK
+tag walk for the exact retired opaque `0x0270/0x80` leaf. The validated
+PRE/EOP PACKED tag fixes the non-wrapping range to `1 + 3 * NLOOP`
+qwords in either TOP bank. The retirement oracle compared both kick
+payloads, final VU state and data memory, and the live scoreboard
+against the same-state interpreter for each retired leaf in these
+headless public runs. TEX1 and the terminal check retain their place
+before the original strip bytes in the PATH1 order.
+
+| 6× headless case | Mode 1 direct producer packets | Mode 1 direct producer qwords | Mode 1 native recordings | Mode 2 direct packets parsed |
+| --- | ---: | ---: | ---: | ---: |
+| Classic Dundas day | 22,716 | 1,196,967 | 11,794 | 23,380 |
+| Classic Gilroy night | 24,799 | 1,215,337 | 15,423 | 30,081 |
+| Classic Kenyon 2P | 60,522 | 2,943,294 | 36,433 (17,733 upper, 18,700 lower) | 68,432 |
+| Modern Kenyon 2P | 51,013 | 2,517,385 | 30,819 (14,778 upper, 16,041 lower) | 68,463 |
+| Modern Dundas day | 22,023 | 1,159,431 | 11,550 | 28,052 |
+| Total | 181,073 | 9,032,414 | 106,019 | 218,408 |
+
+Mode 1 transported 90,981 packets at TOP `0x0E0` and 90,092 at
+`0x270`. All 206,910 worker declines matched the original parser's
+terminal state. At least 75,054 directly transported packets reached
+that fallback. Mode 2 called the original parser on all strips,
+including 10,851,380 directly transported qwords. It verified the
+terminal state of 378,697 strips and recorded all 126,026 matched
+admissions. Five mode-2 controls with direct transport unset checked
+401,947 terminals and recorded 131,576 admissions with no direct
+packets. The 6× Modern Dundas control's periodic P1 lines ended before
+race leaves appeared, though the recording counter covered race draws.
+All worker-path checks reported zero partial PATH1 packets.
+
+With the GS worker disabled, Classic Dundas and Classic Kenyon sent
+85,089 direct packets, totaling 4,199,970 qwords. All 152,520 terminals
+matched and 50,821 admitted draws recorded, including 20,037 in the upper
+and 21,185 in the lower Kenyon view. The portable Dundas GS capture
+produced 14,061,460 bytes with the direct option enabled and zero direct
+packets. Its software replay matched the archived reference's 69,349
+primitive attempts, 2,352,271 pixels, final scanout and VRAM. This
+diagnostic capture incurred 411 synchronous readbacks.
+
+The initial mode-1 6× Modern Kenyon run reported 114,393 of 114,546
+world leaves drawn in its cumulative P1 samples, with one parity
+frame short. The same interval reported deficits for queue records,
+shadows, sprites and immediate draws. All 30,819 admitted strips
+recorded and all 63,770 declined terminals matched. Two alternated
+mode-1 repeats with parity logging recorded all 171,539 and 114,639
+sampled world leaves with direct transport on, and all 139,912 and
+171,758 with it unset. The cause of the initial parity discrepancy
+remains open. These separately paced runs leave full P1 and
+pixel-exact live scanout parity open.
+
+At 1× Modern Dundas, all 1,030 live EE differential calls to
+`0x00358BD0` matched. The interval transported 135,138 direct
+packets and the original parser matched their terminal states as part
+of 204,698 checks. The Apple M2 Pro public executable SHA-256 was
+`c89cf0a538221f20984ba463f4a3748b8237e06629b0aef774698b7e14283b4a`.
+The local macOS build passed all 99 CTests. Windows cross-linked to
+SHA-256 `6dcd5e64acda5883066f50ab4e60668ab9614b977d77c3c6dab97bb879d05495`.
+Windows runtime and installation with backup were unavailable.
+
+The strict runtime audit rejected the 6× mode-1 matrix. Modern Dundas
+reported 105,473 VU1 starts, 20,470,962 parsed GIF qwords and 87 GS
+raster submissions. The five runs retained zero to seven deferred
+waits each, with zero suppressed GS primitives, synchronous VRAM
+readbacks, CLUT waits or VU0 matrix-list starts. Strip construction,
+VU writes and PATH1 transport remain live. The option stays opt-in.
+The headless runs provide no fullscreen pacing or performance claim.
+
 | Executable | SHA-256 |
 | --- | --- |
 | Public macOS | `ac846f7e6641a45f788c298430c5f5b41633cace8d3d0c65cb18a0aa2350f301` |

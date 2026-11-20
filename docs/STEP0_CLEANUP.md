@@ -424,3 +424,32 @@ as the GS reference.
   scan while preserving worker fallback. If no later consumer needs
   the retired memory, omit the TOP+200 store as well. Full producer-side removal requires native target and
   texture ownership and a proven order for every dependent draw.
+
+### R7 STAR — bounded world-strip producer transport (2026-11-21)
+
+- **Situation.** The worker can omit the GS parse for a prepared opaque
+  world draw. The producer still walks the reconstructed strip tag
+  in VU memory to find the transfer length.
+- **Task.** Supply the exact complete span in order for the verified
+  opaque leaf while preserving the VU write, worker decline, muted
+  reference and portable capture behavior.
+- **Action.** Validate a single PRE/EOP PACKED strip of 4–60 vertices
+  in either TOP bank. Send the already materialized span through the
+  same GIF transport after TEX1 and the terminal payload. Keep
+  XGKICK for other producers and for blended or muted kicks.
+- **Result.** The 6× mode-1 matrix bypassed 181,073 producer tag walks.
+  Mode 2 checked the original parser with direct transport in the same
+  scenes. Threaded and inline paths, both TOPs and split views,
+  differential, capture replay, builds and tests are documented in
+  NATIVE_RENDERER_SUCCESS.md. One Modern Kenyon parity shortfall remains
+  unexplained. The option stays opt-in and the R7 release gate remains
+  red.
+- **Next decisive test.** A one-race liveness probe marked writes in
+  24,769 low-TOP and 24,745 high-TOP leaves and saw zero marked-lane
+  reads. Establish the reaching definitions across `0x0618 -> 0x0388`
+  and `0x0920 -> 0x0650`, clipping and immediate branches, vehicles,
+  loaded VU images and direct EE/DMA mappings. Preserve ST.W, the
+  q21 TEX1 update and VI/TPC behavior. Use paired same-state lane and
+  packet checks across overwrites before removing TOP+200 writes. Drop
+  strip construction and PATH1 transport only once ordered native
+  admission, fallback and dependent draw state are accounted for.

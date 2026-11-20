@@ -1653,8 +1653,15 @@ constexpr uint32_t kWorldLeafTpc = 0x920;
 constexpr unsigned kWorldStripOffset = 200;
 constexpr unsigned kWorldMaxVertices = 60;
 constexpr unsigned kWorldStripQwords = 1 + 3 * kWorldMaxVertices;
+constexpr unsigned kWorldStripBlend = 0x00200000u;
+static_assert(0x270 + kWorldStripOffset + kWorldStripQwords <= 0x400);
 constexpr uint64_t kWorldFirstFourCycles = 104;
 constexpr uint64_t kWorldVertexLoopCycles = 13;
+
+struct WorldStripTransportStats {
+    uint64_t packets = 0, qwords = 0;
+};
+WorldStripTransportStats g_world_strip_direct[2];
 
 struct WorldLeafVertices {
     // GS PACKED retains the raw fog/ADC word and the input ST padding word.
@@ -1720,7 +1727,7 @@ bool derive_world_leaf(const VUState &before, unsigned top, bool interpreted, Wo
     const int16_t lod = static_cast<int16_t>(st_base.u[2]);
     if ((source_tag.u[0] & ~0x7FFFu) != 0x8000 || count < 4 || count > kWorldMaxVertices ||
         // PRIM.ABE may differ. Both strip templates use the same packed register list.
-        (tag_template.u[1] & ~0x00200000u) != 0x300E4000 ||
+        (tag_template.u[1] & ~kWorldStripBlend) != 0x300E4000 ||
         (tag_template.u[2] & 0xFFF) != 0x412 ||
         out.tex1[0].u[0] != 0x8001 || out.tex1[0].u[1] != 0x10000000 ||
         (out.tex1[0].u[2] & 15) != 0xE || (out.tex1[1].u[2] & 0xFF) != 0x14 ||
@@ -1918,7 +1925,17 @@ void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsi
         const auto tail = world_strip_terminal(result);
         native::post(native::CMD_WORLD_STRIP_CHECK, &tail, sizeof tail);
     }
-    xgkick(&vu, top + kWorldStripOffset);
+    static const char *direct = std::getenv("EOD_NATIVE_WORLD_STRIP_DIRECT");
+    if (!direct || direct[0] != '1' || g_vu_mute_kick || (result.strip[0].u[1] & kWorldStripBlend)) {
+        xgkick(&vu, top + kWorldStripOffset);
+        return;
+    }
+    // The admitted EOP/PACKED tag fixes the complete, non-wrapping span.
+    // gif_transfer consumes it inline or copies it into the ordered worker queue.
+    gif_transfer(GIF_PATH1, reinterpret_cast<const uint8_t *>(result.strip), result.strip_qwords);
+    auto &stats = g_world_strip_direct[top == 0x270];
+    ++stats.packets;
+    stats.qwords += result.strip_qwords;
 }
 
 bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned top, bool verbose) {
@@ -1963,6 +1980,17 @@ bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned
 
 }  // namespace
 #endif
+
+void vu_report_world_strip_transport() {
+#ifdef EOD_VULKAN
+    const auto &low = g_world_strip_direct[0];
+    const auto &high = g_world_strip_direct[1];
+    if (low.packets || high.packets)
+        std::fprintf(stderr, "[native] world strip direct PATH1: TOP 0e0 %llu packets %llu qwords, TOP 270 %llu packets %llu qwords\n",
+                     (unsigned long long)low.packets, (unsigned long long)low.qwords,
+                     (unsigned long long)high.packets, (unsigned long long)high.qwords);
+#endif
+}
 
 bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::WorldTextureLod &lod) {
 #ifdef EOD_VULKAN

@@ -1961,3 +1961,29 @@ recording counter measures indexed native draws recorded from omitted
 packets. The original bytes remain in the worker queue for fallback, and
 the retired VU memory, GS compatibility environment, attachment ownership
 and final latch bridge remain live.
+
+### R7 world-strip producer transport
+
+The PS2 WorldRenderPass at `0x358BD0` and `0x35DEFC` REF establish the
+retail ITOP `0x80` leaf boundary. Xbox WorldRenderPass `0x138840` submits
+an indexed draw through `0x1CD710`. At the PS2 producer the reconstructed
+strip is one PACKED tag with PRE and EOP, three registers per vertex,
+and 4–60 vertices. The exact span is `1 + 3 * NLOOP` qwords at
+`TOP + 200`: at most `[0x1A8, 0x25D)` for TOP `0x0E0` and
+`[0x338, 0x3ED)` for TOP `0x270`. Neither span wraps.
+
+The ordered TEX1 transfer and terminal payload precede the original strip
+at the same PATH1 boundary as before. With `EOD_NATIVE_WORLD_STRIP_DIRECT=1`,
+the producer supplies the owned opaque strip span directly to the existing
+GIF transport. Threaded transport copies it before returning and inline
+transport consumes it before returning. All original PATH1 side effects,
+capture handling and worker fallback use that same transport. Shutdown
+counts direct PATH1 packets and qwords per TOP. Each packet skips one
+producer tag walk and still sends its original qwords to the worker.
+
+Keep the VU compatibility writes until changed lanes have no downstream
+readers. Later leaf construction reads ST.W, which the strip's retail
+SQ.xyz preserves. Masked UNPACKs overwrite only enabled lanes. VIF1
+MSCNT uses the previous TPC, including `0x0920`, with the new TOP. The
+interpreter, compiled VU code and the EE mapping at `0x1100C000` can
+also access the data memory.

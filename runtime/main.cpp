@@ -164,7 +164,10 @@ static bool g_game_started = false;
     }
     platform_shutdown();
     diff_report();
-    if (g_game_started && code == 0) r7_audit::report();
+    if (g_game_started && code == 0) {
+        vu_report_world_strip_transport();
+        r7_audit::report();
+    }
     eod_profile::report("exit");
     fflush(nullptr);
     _exit(code);
