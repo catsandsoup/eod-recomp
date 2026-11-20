@@ -4,6 +4,7 @@
 #include "../vu/scene_emit.h"
 #include "modern_scene.h"
 #include "../render/native_renderer.h"
+#include "../render/plume_device.h"
 #include "gs.h"
 #include "gs_env.h"
 #include "gs_hw.h"
@@ -761,6 +762,50 @@ bool matches_clear_packet(const native::SceneClear &clear, const uint8_t *packet
     return true;
 }
 
+bool movie_clear_backend() {
+#if defined(EOD_PLUME) && defined(EOD_VULKAN)
+#ifdef EOD_HW_SELECT
+    if (!hw::vulkan_active()) return false;
+#endif
+    return hw::g_on && plume_device::render_device();
+#else
+    return false;
+#endif
+}
+
+bool apply_movie_clear(const uint8_t *packet, uint32_t caller) {
+    const auto &path = g_path[GIF_PATH3];
+    const auto &ctx = st.ctx[0];
+    if (!gs_native_movie_handoff_enabled() || !native::gs_movie_clear_ready() ||
+        scene_capture::g_on || scene_emit::g_on || (modern::g_on && modern::live()) || g_trace ||
+        std::getenv("EOD_GS_CENSUS") || (g_attr_taint & TAINT_RGBA) ||
+        !is_movie_clear_caller(caller) || std::memcmp(packet, kMovieClearKick, sizeof kMovieClearKick) != 0 ||
+        !path.in_packet || path.nloop != 1 || path.nreg != 1 || path.reg != 0 || path.flg != 0 || !path.eop ||
+        path.tag_lo != 0x1000000000008001ull || path.tag_hi != 0xe ||
+        st.prim != 0x106 || st.prmodecont != 1 || st.vcount != 1 || st.rgbaq != 0 || st.scanmsk || st.dthe ||
+        st.vq[0].x != 0 || st.vq[0].y != 0 || st.vq[0].z != 0 ||
+        ctx.frame != 0xa0000 || ctx.zbuf != 0x100000000ull || ctx.test != 0x30000 ||
+        ctx.xyoffset || ctx.fba || ctx.scissor != 0x0540000002800000ull)
+        return false;
+
+    current_env();  // Preserve ordinary frame flip and skip accounting.
+    if (!g_skip_frame) {
+        // 0x367E10 covers all 420 CT32 pages from FB0. Complete physical
+        // writes invalidate even differently formatted owners and never need
+        // their old bytes, including the first FBW 12 movie crop's 165 pages.
+        constexpr int width = 640, height = 1344, fbw = width / 64;
+        hw::vram_written(0, fbw, PSMCT32, 0, 0, width, height);
+        std::memset(vram, 0, width * height * sizeof(uint32_t));
+        vram_mark(0, fbw, PSMCT32, 0, 0, width, height);
+    }
+    // XYZ3 assembles the same vertex and completes the same GIF tag, without
+    // drawing a sprite. The portable capture retains the original XYZ2.
+    constexpr uint32_t no_kick[] = {kMovieClearKick[0], 0, 0xd, 0};
+    gif_process(GIF_PATH3, reinterpret_cast<const uint8_t *>(no_kick), 1);
+    LOG(LOG_GS, "native movie framebuffer clear: caller=%06x%s", caller, g_skip_frame ? " skipped" : "");
+    return true;
+}
+
 bool apply_scene_clear(const native::SceneClear &clear, const uint8_t *packet, uint32_t qwc) {
     const auto &ctx = st.ctx[0];
     const bool depth_only = clear.target == native::SceneClearTarget::Depth;
@@ -995,7 +1040,7 @@ bool apply_shadow_pass(native::ShadowPass pass, const uint8_t *packet, uint32_t 
             !matches(8, 0x40ab400000008014ull, 0x5e5e))
             return false;
     }
-    if (!native::gs_shadow_boundary()) return false;
+    if (!native::gs_shadow_boundary(pass)) return false;
     // Preserve the producer's packed A+D, RGBA and final PRE/UV state.
     // Plume samples scene depth and composites its private accumulation
     // surface, so the strips need no emulated local-memory writes.
@@ -1501,9 +1546,20 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         memcpy(h, &c[p], 16);
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
+        const bool movie_clear = live && h[0] == CMD_GIF && h[1] == GIF_PATH3 && h[3] == 16 &&
+                                 is_movie_clear_caller(h[2]);
+        // The FIFO command carries its caller in the live auxiliary field.
+        // Serialize the retail kick with the original PATH3 header.
+        const uint8_t *portable = c + p;
+        uint32_t raw_movie_clear[8];
+        if (movie_clear && (g_dump || g_cold_zip)) {
+            memcpy(raw_movie_clear, portable, sizeof raw_movie_clear);
+            raw_movie_clear[2] = 0;
+            portable = reinterpret_cast<const uint8_t *>(raw_movie_clear);
+        }
         // Presentation-only markers are not part of the portable GS capture format.
         if (live && h[0] != CMD_EDITOR_RACE_FRAME && h[0] != CMD_MODERN && h[0] != CMD_NATIVE && g_cold_zip) {
-            if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
+            if (!g_cold_zip->write(portable, len)) close_cold_zip("stopped at decoded/pending limit or compression error");
             else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
                 close_cold_zip("stopped at compressed limit or write error");
         }
@@ -1515,7 +1571,7 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                 g_dump = nullptr;
                 fprintf(stderr, "cold GS dump reached 256 MiB limit\n");
             } else {
-                fwrite(&c[p], 1, len, g_dump);
+                fwrite(portable, 1, len, g_dump);
                 g_cold_dump_bytes += len;
             }
         }
@@ -1528,6 +1584,7 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             break;
         case CMD_GIF: {
             EOD_ZONE("gs.gif_process");
+            if (movie_clear && apply_movie_clear(d, h[2])) break;
             if (!live && g_replay_depth_capture && h[1] == GIF_PATH2)
                 replay_capture_display_depth(d, h[3]);
             if (live && h[1] == GIF_PATH2) {
@@ -1978,6 +2035,24 @@ void gs_init() {
             LOG(LOG_GS, "%s is not available - using the software renderer",g_config.renderer.c_str());
     }
     gs_thread_start();
+}
+
+bool gs_native_movie_handoff_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_MOVIE_HANDOFF");
+        return value && value[0] == '1';
+    }();
+    return enabled && native::native_only_level() == 1 && movie_clear_backend();
+}
+
+void gif_movie_clear(const uint8_t *data, uint32_t caller) {
+    if (scene_capture::g_on || scene_emit::g_on) {
+        gif_transfer(GIF_PATH3, data, 1);
+    } else if (g_threaded) {
+        push_cmd(CMD_GIF, GIF_PATH3, caller, data, 16);
+    } else if (!apply_movie_clear(data, caller)) {
+        gif_transfer(GIF_PATH3, data, 1);
+    }
 }
 
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::SceneClear *clear,

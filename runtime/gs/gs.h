@@ -12,6 +12,17 @@ void gs_shutdown();
 // Feeds qwc quadwords of GIF data on a path (packets may span calls).
 void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::SceneClear *clear = nullptr,
                   const native::DisplayCopy *copy = nullptr, native::ShadowPass shadow = {}, bool bootstrap_quad = false);
+// 0x367E10 restores the caller before sending the final A+D XYZ2 to the FIFO.
+namespace gs {
+constexpr uint32_t kMovieClearEnter = 0x3674a8;
+constexpr uint32_t kMovieClearExit = 0x3679bc;
+constexpr uint32_t kMovieClearKick[4] = {0x54002800, 0, 5, 0};
+constexpr bool is_movie_clear_caller(uint32_t caller) {
+    return caller == kMovieClearEnter || caller == kMovieClearExit;
+}
+}  // namespace gs
+bool gs_native_movie_handoff_enabled();
+void gif_movie_clear(const uint8_t *data, uint32_t caller);
 uint32_t gif_reg_read(uint32_t off);
 void gif_reg_write(uint32_t off, uint32_t v);
 

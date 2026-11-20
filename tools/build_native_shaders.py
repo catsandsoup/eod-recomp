@@ -23,12 +23,16 @@ ENTRIES = [("vs_main", "vs"), ("ps_main", "ps"), ("vs_static_queue", "vs")]
 # stage R6: the Modern look, its own file so the Classic SPIR-V never changes with it
 MODERN_SRC = os.path.join(ROOT, "runtime", "render", "native_modern.hlsl")
 MODERN_OUT = os.path.join(ROOT, "runtime", "render", "native_modern_spv.inc")
-MODERN_ENTRIES = [("vs_modern", "vs"), ("ps_modern", "ps")]
-JOBS = {"classic": (SRC, OUT, ENTRIES), "modern": (MODERN_SRC, MODERN_OUT, MODERN_ENTRIES)}
+MODERN_ENTRIES = [("vs_modern", "vs"), ("vs_vfx_billboard", "vs"), ("ps_modern", "ps"), ("ps_modern_scene", "ps")]
+SUN_SRC = os.path.join(ROOT, "runtime", "render", "native_sun_cascades.hlsl")
+SUN_OUT = os.path.join(ROOT, "runtime", "render", "native_sun_cascades_spv.inc")
+SUN_ENTRIES = [("vs_sun_caster", "vs"), ("vs_sun_receiver", "vs"), ("ps_sun_receiver", "ps")]
+JOBS = {"classic": (SRC, OUT, ENTRIES), "modern": (MODERN_SRC, MODERN_OUT, MODERN_ENTRIES),
+        "sun": (SUN_SRC, SUN_OUT, SUN_ENTRIES)}
 
 
 def main():
-    """usage: build_native_shaders.py [classic] [modern] (default: both)"""
+    """usage: build_native_shaders.py [classic] [modern] [sun] (default: all)"""
     for name in sys.argv[1:] or list(JOBS):
         build(*JOBS[name])
 

@@ -1,0 +1,2477 @@
+// gs.cpp - GIF front end, GS registers, local memory transfers and display.
+#include "core/trace.h"
+#include "../vu/scene_capture.h"
+#include "../vu/scene_emit.h"
+#include "modern_scene.h"
+#include "../render/native_renderer.h"
+#include "gs.h"
+#include "gs_env.h"
+#include "gs_hw.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <string>
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
+#include "../core/config.h"
+#include "../core/log.h"
+#include "../hw/hw.h"
+#include "../hw/offload.h"
+#include "../kernel/kernel.h"
+#include "../platform/platform.h"
+#include "../platform/presentation.h"
+#include "../platform/editor_test_startup.h"
+#include "gs_mem.h"
+#include "gs_replay_types.h"
+#include "gs_capture_io.h"
+#include <memory>
+#include "gs_transfer_chunk.h"
+#include "gs_state.h"
+#include "gs_swizzle.h"
+#include "../core/prof.h"
+#include "../ui/overlay.h"
+
+namespace gs {
+extern bool g_trace;
+extern bool g_skip_frame;
+
+State st;
+Stats stats;
+
+// Game frames: the display buffer starts being drawn after other buffers
+// were (a flip, or a copy of the finished frame into a fixed display buffer).
+std::atomic<uint64_t> g_flips{0};
+// all game frames, drawn or skipped
+std::atomic<uint64_t> g_game_flips{0};
+// frame skipping: vblanks issued by the EE and composed by the GS thread
+std::atomic<uint64_t> g_ee_vblanks{0}, g_gs_vblanks{0};
+
+namespace {
+std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
+
+// ------------------------------------------------------------ GIF parsing
+PathState g_path[4];
+Transfer g_xfer;
+
+void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog);
+
+void write_reg(uint32_t reg, uint64_t v);
+
+uint32_t gif_reg_ctrl, gif_reg_mode;
+
+// --------------------------------------------------------------- transfer
+// Host->local transfers: on Windows (Direct3D 11) the declared TRXREG extent is
+// reported when the transfer starts, as upstream does; the other backends
+// report each supplied chunk from xfer_data (docs/GS_CPU_WRITE_PRESERVATION.md).
+#if defined(_WIN32) && defined(EOD_HW_SELECT)
+#define kChunkedHostWrites (hw::vulkan_active())  // the backend chosen at start
+#elif defined(_WIN32)
+constexpr bool kChunkedHostWrites = false;
+#else
+constexpr bool kChunkedHostWrites = true;
+#endif
+
+// Which fast paths the destination's swizzle allows (xfer_small, the 32-bit pair/quad stores).
+void xfer_layout(Transfer &t) {
+    t.pairs = false;
+    t.quads = false;
+    if (bits_per_pixel(t.dpsm) == 32 && t.dpsm != PSMCT24 && t.dpsm != PSMZ24) {
+        const SwizzleTab *T = t.T;
+        bool ok = T->colB[0] == T->colB[7];
+        for (int r = 0; r < 8 && ok; r++)
+            for (int m = 0; m < 8; m += 2) {
+                uint32_t a = T->colT[T->rowC[r] + T->colC[m]], b = T->colT[T->rowC[r] + T->colC[m + 1]];
+                if ((a & 1) || b != a + 1 || T->colC[m] != (uint16_t)m || T->colC[m + 1] != (uint16_t)(m + 1)) ok = false;
+            }
+        t.pairs = ok;
+        for (int y = 0; y < 64 && ok; y += 2) {
+            ok = T->rowB[y] == T->rowB[y + 1];
+            for (int m = 0; m < 8 && ok; m += 2) {
+                uint32_t a = T->colT[T->rowC[y] + T->colC[m]], b = T->colT[T->rowC[y + 1] + T->colC[m]];
+                ok = (a & 3) == 0 && b == a + 2;
+            }
+        }
+        t.quads = ok;
+    } else if (t.dpsm == PSMCT16 || t.dpsm == PSMCT16S || t.dpsm == PSMZ16 || t.dpsm == PSMZ16S || t.dpsm == PSMT8 ||
+               t.dpsm == PSMT4) {
+        const SwizzleTab *T = t.T;
+        bool ok = true;
+        for (int y = 0; y < 64 && ok; y++)
+            for (int x = 0; x < 128 && ok; x += 2) {
+                uint32_t a = T->addr(0, x, y);
+                ok = (a & 1) == 0 && T->addr(0, x + 1, y) == a + 1;
+            }
+        t.pairs = ok;
+    }
+}
+
+void xfer_start() {
+    if (replay_frozen()) {
+        g_xfer.active = false;
+        return;
+    }
+    uint32_t dir = bits(st.trxdir, 0, 2);
+    uint32_t dbp = bits(st.bitbltbuf, 32, 14), dbw = bits(st.bitbltbuf, 48, 6), dpsm = bits(st.bitbltbuf, 56, 6);
+    uint32_t sbp = bits(st.bitbltbuf, 0, 14), sbw = bits(st.bitbltbuf, 16, 6), spsm = bits(st.bitbltbuf, 24, 6);
+    int w = (int)bits(st.trxreg, 0, 12), h = (int)bits(st.trxreg, 32, 12);
+    int sx = (int)bits(st.trxpos, 0, 11), sy = (int)bits(st.trxpos, 16, 11);
+    int dx = (int)bits(st.trxpos, 32, 11), dy = (int)bits(st.trxpos, 48, 11);
+    stats.transfers++;
+    census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
+    if (hw::g_on) {
+        if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h, dir == 1 ? "local->host" : "local->local");
+        if ((dir == 0 && !kChunkedHostWrites) || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
+    }
+    if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
+    if (dir == 1) raster_sync();
+    if ((dir == 0 && !kChunkedHostWrites) || dir == 2) {
+        raster_vram_write(dbp, dbw, dpsm, dx, dy, w, h);
+        vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
+    }
+    if (dir == 0) {
+        g_xfer.active = true;
+        g_xfer.dbp = dbp;
+        g_xfer.dbw = dbw;
+        g_xfer.dpsm = dpsm;
+        g_xfer.x0 = dx;
+        g_xfer.y0 = dy;
+        g_xfer.w = w;
+        g_xfer.h = h;
+        g_xfer.x = 0;
+        g_xfer.y = 0;
+        g_xfer.pend_n = 0;
+        g_xfer.T = swizzle_table(dpsm, dbw);
+        g_xfer.ry = -1;
+        xfer_layout(g_xfer);
+        LOG(LOG_GSXFER, "transfer host->local bp=%x bw=%d psm=%x at %d,%d size %dx%d", dbp, dbw, dpsm, dx, dy, w, h);
+    } else if (dir == 2) {
+        LOG(LOG_GSXFER, "transfer local->local %x(%x)->%x(%x) %dx%d", sbp, spsm, dbp, dpsm, w, h);
+        // overlapping copies: go through a temporary buffer
+        std::vector<uint32_t> tmp((size_t)w * h);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                tmp[(size_t)y * w + x] = read_pixel(spsm, (sx + x) & 2047, (sy + y) & 2047, sbp, sbw);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                write_pixel(dpsm, (dx + x) & 2047, (dy + y) & 2047, dbp, dbw, tmp[(size_t)y * w + x]);
+        if (hw::g_on) hw::vram_write_complete();
+    } else if (dir == 1) {
+        static unsigned n;
+        if (++n <= 8 || g_log_enabled[LOG_GSXFER])
+            LOG(LOG_GS, "transfer local->host requested (%dx%d) - not supported yet", w, h);
+    }
+}
+
+inline void xfer_put(uint32_t v) {
+    Transfer &t = g_xfer;
+    if (t.y >= t.h) return;
+    int py = (t.y0 + t.y) & 2047;
+    if (py != t.ry) {
+        t.ry = py;
+        t.rb = t.T->row_base(t.dbp, py);
+        t.rc = t.T->rowC[py];
+    }
+    uint32_t a = t.T->addr_row(t.rb, t.rc, (t.x0 + t.x) & 2047);
+    switch (t.dpsm) {
+    case PSMCT32: case PSMZ32: word(a) = v; break;
+    case PSMCT24: case PSMZ24: word(a) = (word(a) & 0xFF000000u) | (v & 0xFFFFFF); break;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: half(a) = (uint16_t)v; break;
+    case PSMT8: byte(a) = (uint8_t)v; break;
+    case PSMT4: set_nibble(a, v); break;
+    case PSMT8H: word(a) = (word(a) & 0x00FFFFFFu) | (v << 24); break;
+    case PSMT4HL: word(a) = (word(a) & 0xF0FFFFFFu) | ((v & 0xF) << 24); break;
+    case PSMT4HH: word(a) = (word(a) & 0x0FFFFFFFu) | ((v & 0xF) << 28); break;
+    default: write_pixel(t.dpsm, (t.x0 + t.x) & 2047, py, t.dbp, t.dbw, v); break;
+    }
+    if (++t.x >= t.w) {
+        t.x = 0;
+        t.y++;
+    }
+}
+
+// 16, 8 and 4-bit formats: runs of a row at a time, pixel pairs where they are adjacent
+template <int BPP>
+void xfer_small(Transfer &t, const uint8_t *p, uint32_t n) {
+    uint32_t total = n * 8 / BPP, k = 0;
+    while (k < total && t.y < t.h) {
+        int py = (t.y0 + t.y) & 2047;
+        if (py != t.ry) {
+            t.ry = py;
+            t.rb = t.T->row_base(t.dbp, py);
+            t.rc = t.T->rowC[py];
+        }
+        int run = std::min<int>(t.w - t.x, (int)(total - k));
+        int px = t.x0 + t.x, j = 0;
+        if (t.pairs && ((px | k) & 1) == 0) {
+            for (; j + 2 <= run; j += 2) {
+                uint32_t a = t.T->addr_row(t.rb, t.rc, px + j);
+                if (BPP == 4) vram[(a >> 1) & 0x3FFFFF] = p[(k + j) >> 1];
+                if (BPP == 8) memcpy(&byte(a), p + k + j, 2);
+                if (BPP == 16) memcpy(&half(a), p + (k + j) * 2, 4);
+            }
+        }
+        for (; j < run; j++) {
+            uint32_t a = t.T->addr_row(t.rb, t.rc, px + j), i = k + j;
+            if (BPP == 4) set_nibble(a, (p[i >> 1] >> ((i & 1) * 4)) & 0xF);
+            if (BPP == 8) byte(a) = p[i];
+            if (BPP == 16) half(a) = (uint16_t)(p[i * 2] | (p[i * 2 + 1] << 8));
+        }
+        k += (uint32_t)run;
+        t.x += run;
+        if (t.x >= t.w) {
+            t.x = 0;
+            t.y++;
+        }
+    }
+    if (t.y >= t.h) t.active = false;
+}
+
+void xfer_data(const uint8_t *p, uint32_t n) {
+    EOD_ZONE("gs.xfer_data");
+    Transfer &t = g_xfer;
+    if (!t.active) return;
+    // Source bytes are available now, unlike TRXREG's promised transfer size.
+    // Preserve partial GPU pages before writing, and invalidate caches/raster
+    // dependencies for every chunk (including an interrupted IMAGE packet).
+    if (kChunkedHostWrites) {
+        unsigned bpp = bits_per_pixel(t.dpsm);
+        uint64_t pixels = transfer_pixels_supplied(bpp, n, t.pend_n);
+        const auto regions = transfer_write_regions(t.x0, t.y0, t.w, t.h, t.x, t.y, pixels);
+        for (unsigned i = 0; i < regions.count; ++i) {
+            const auto &r = regions.rects[i];
+            if (hw::g_on) hw::vram_written(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            raster_vram_write(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            vram_mark(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+        }
+    }
+    bool small = true;
+    switch (t.dpsm) {
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: xfer_small<16>(t, p, n & ~1u); break;
+    case PSMT8: xfer_small<8>(t, p, n); break;
+    case PSMT4: xfer_small<4>(t, p, n); break;
+    default: small = false; break;
+    }
+    if (small) {
+        if (hw::g_on) hw::vram_write_complete();
+        return;
+    }
+    if (t.dpsm == PSMCT32 || t.dpsm == PSMZ32) {
+        // whole runs of a row at a time
+        uint32_t i = 0;
+        while (i + 4 <= n && t.y < t.h) {
+            int py = (t.y0 + t.y) & 2047;
+#if defined(__SSE2__)
+            if (t.quads && t.x == 0 && !(py & 1) && !(t.x0 & 7) && !(t.w & 7) && t.y + 1 < t.h &&
+                n - i >= (uint32_t)t.w * 8) {
+                // two whole rows: 16-byte stores of two pixels from each
+                uint32_t rb = t.T->row_base(t.dbp, py);
+                const uint16_t *ct = t.T->colT + t.T->rowC[py];
+                const uint8_t *r0 = p + i, *r1 = p + i + t.w * 4;
+                for (int x = 0; x < t.w; x += 8) {
+                    uint32_t base = (rb + (uint32_t)t.T->colB[(t.x0 + x) & 2047]) << t.T->shift;
+                    for (int m = 0; m < 8; m += 2) {
+                        __m128i a = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(r0 + (x + m) * 4));
+                        __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(r1 + (x + m) * 4));
+                        _mm_storeu_si128(reinterpret_cast<__m128i *>(vram + (((base + ct[m]) & 0xFFFFF) << 2)),
+                                         _mm_unpacklo_epi64(a, b));
+                    }
+                }
+                i += (uint32_t)t.w * 8;
+                t.y += 2;
+                continue;
+            }
+#endif
+            if (py != t.ry) {
+                t.ry = py;
+                t.rb = t.T->row_base(t.dbp, py);
+                t.rc = t.T->rowC[py];
+            }
+            int run = std::min<int>(t.w - t.x, (int)((n - i) / 4));
+            for (int k = 0; k < run;) {
+                int px = (t.x0 + t.x + k) & 2047;
+                if (t.pairs && (px & 7) == 0 && run - k >= 8) {
+                    // a whole block row: four word pairs
+                    uint32_t base = ((t.rb + (uint32_t)t.T->colB[px]) << t.T->shift);
+                    const uint16_t *ct = t.T->colT + t.rc;
+                    uint64_t *v64 = reinterpret_cast<uint64_t *>(vram);
+                    for (int m = 0; m < 8; m += 2) {
+                        uint64_t d;
+                        memcpy(&d, p + i + m * 4, 8);
+                        v64[((base + ct[m]) & 0xFFFFF) >> 1] = d;
+                    }
+                    k += 8;
+                    i += 32;
+                    continue;
+                }
+                uint32_t v;
+                memcpy(&v, p + i, 4);
+                word(t.T->addr_row(t.rb, t.rc, px)) = v;
+                k++;
+                i += 4;
+            }
+            t.x += run;
+            if (t.x >= t.w) {
+                t.x = 0;
+                t.y++;
+            }
+        }
+        if (hw::g_on) hw::vram_write_complete();
+        if (t.y >= t.h) t.active = false;
+        return;
+    }
+    switch (bits_per_pixel(t.dpsm)) {
+    case 32:
+        for (uint32_t i = 0; i + 4 <= n; i += 4) {
+            uint32_t v;
+            memcpy(&v, p + i, 4);
+            xfer_put(v);
+        }
+        break;
+    case 24:
+        for (uint32_t i = 0; i < n; i++) {
+            t.pend[t.pend_n++] = p[i];
+            if (t.pend_n == 3) {
+                xfer_put(t.pend[0] | (t.pend[1] << 8) | (t.pend[2] << 16));
+                t.pend_n = 0;
+            }
+        }
+        break;
+    case 16:
+        for (uint32_t i = 0; i + 2 <= n; i += 2) xfer_put(p[i] | (p[i + 1] << 8));
+        break;
+    case 8:
+        for (uint32_t i = 0; i < n; i++) xfer_put(p[i]);
+        break;
+    case 4:
+        for (uint32_t i = 0; i < n; i++) {
+            xfer_put(p[i] & 0xF);
+            xfer_put(p[i] >> 4);
+        }
+        break;
+    }
+    if (hw::g_on) hw::vram_write_complete();
+    if (t.y >= t.h) t.active = false;
+}
+
+// ------------------------------------------------------------- registers
+// A drawing state register: only a different value counts as a state change
+// (the game resends whole register sets with each object).
+inline void set_state(uint64_t &r, uint64_t v) {
+    if (r != v) {
+        r = v;
+        g_reg_gen++;
+    }
+}
+
+void tex0_write(int c, uint64_t v) {
+    set_state(st.ctx[c].tex0, v);
+    clut_load(v);
+}
+
+// Skipped-run proof (scene_emit state replay): attribute registers a skipped VU1 run would have
+// written are tainted until rewritten; a drawn vertex that reads a tainted one is counted.
+enum : uint32_t { TAINT_RGBA = 1, TAINT_Q = 2, TAINT_ST = 4, TAINT_UV = 8, TAINT_FOG = 16 };
+uint32_t g_attr_taint, g_attr_written;  // written: since the last batch marker
+uint64_t g_attr_taint_reads;
+struct TaintReport {
+    ~TaintReport() {
+        if (g_attr_taint_reads) fprintf(stderr, "[skipproof] stale attribute reads %llu\n", (unsigned long long)g_attr_taint_reads);
+    }
+} g_taint_report;
+
+void write_reg(uint32_t reg, uint64_t v) {
+    // vertex data, image transfer words and the drawing state registers (below) don't count as changes here
+    if (reg >= 0x3F && reg != 0x54 && !(reg >= 0x40 && reg <= 0x4F)) g_reg_gen++;
+    switch (reg) {
+    case 0x00:  // PRIM
+        st.prim = v;
+        st.vcount = 0;
+        break;
+    case 0x01: {  // RGBAQ
+        g_attr_taint &= ~(TAINT_RGBA | TAINT_Q), g_attr_written |= TAINT_RGBA | TAINT_Q;
+        st.rgbaq = v;
+        uint32_t q = (uint32_t)(v >> 32);
+        memcpy(&st.q, &q, 4);
+        break;
+    }
+    case 0x02: st.st = v; g_attr_taint &= ~TAINT_ST, g_attr_written |= TAINT_ST; break;
+    case 0x03: st.uv = v; g_attr_taint &= ~TAINT_UV, g_attr_written |= TAINT_UV; break;
+    case 0x04: vertex_kick(true, v, true, (uint8_t)(v >> 56)); break;   // XYZF2
+    case 0x05: vertex_kick(true, v, false, 0); break;                   // XYZ2
+    case 0x06: tex0_write(0, v); break;
+    case 0x07: tex0_write(1, v); break;
+    case 0x08: set_state(st.ctx[0].clamp, v); break;
+    case 0x09: set_state(st.ctx[1].clamp, v); break;
+    case 0x0A: st.fog = v; g_attr_taint &= ~TAINT_FOG, g_attr_written |= TAINT_FOG; break;
+    case 0x0C: vertex_kick(false, v, true, (uint8_t)(v >> 56)); break;  // XYZF3
+    case 0x0D: vertex_kick(false, v, false, 0); break;                  // XYZ3
+    case 0x14: set_state(st.ctx[0].tex1, v); break;
+    case 0x15: set_state(st.ctx[1].tex1, v); break;
+    case 0x16:
+    case 0x17: {  // TEX2: PSM, CBP, CPSM, CSM, CSA, CLD of TEX0
+        int c = reg - 0x16;
+        const uint64_t mask = 0xFFFFFFE003F00000ull;
+        set_state(st.ctx[c].tex2, v);
+        tex0_write(c, (st.ctx[c].tex0 & ~mask) | (v & mask));
+        break;
+    }
+    case 0x18: set_state(st.ctx[0].xyoffset, v); break;
+    case 0x19: set_state(st.ctx[1].xyoffset, v); break;
+    case 0x1A: set_state(st.prmodecont, v); break;
+    case 0x1B: set_state(st.prmode, v); break;
+    case 0x1C: set_state(st.texclut, v); break;
+    case 0x22: set_state(st.scanmsk, v); break;
+    case 0x34: set_state(st.ctx[0].miptbp1, v); break;
+    case 0x35: set_state(st.ctx[1].miptbp1, v); break;
+    case 0x36: set_state(st.ctx[0].miptbp2, v); break;
+    case 0x37: set_state(st.ctx[1].miptbp2, v); break;
+    case 0x3B: set_state(st.texa, v); break;
+    case 0x3D: set_state(st.fogcol, v); break;
+    case 0x3F: break;  // TEXFLUSH
+    case 0x40: set_state(st.ctx[0].scissor, v); break;
+    case 0x41: set_state(st.ctx[1].scissor, v); break;
+    case 0x42: set_state(st.ctx[0].alpha, v); break;
+    case 0x43: set_state(st.ctx[1].alpha, v); break;
+    case 0x44: set_state(st.dimx, v); break;
+    case 0x45: set_state(st.dthe, v); break;
+    case 0x46: set_state(st.colclamp, v); break;
+    case 0x47: set_state(st.ctx[0].test, v); break;
+    case 0x48: set_state(st.ctx[1].test, v); break;
+    case 0x49: set_state(st.pabe, v); break;
+    case 0x4A: set_state(st.ctx[0].fba, v); break;
+    case 0x4B: set_state(st.ctx[1].fba, v); break;
+    case 0x4C: set_state(st.ctx[0].frame, v); break;
+    case 0x4D: set_state(st.ctx[1].frame, v); break;
+    case 0x4E: set_state(st.ctx[0].zbuf, v); break;
+    case 0x4F: set_state(st.ctx[1].zbuf, v); break;
+    case 0x50: st.bitbltbuf = v; break;
+    case 0x51: st.trxpos = v; break;
+    case 0x52: st.trxreg = v; break;
+    case 0x53:
+        st.trxdir = v;
+        if (native::enabled()) native::gs_barrier();  // (native objects drawn before the transfer)
+        xfer_start();
+        break;
+    case 0x54: {  // HWREG
+        uint8_t b[8];
+        memcpy(b, &v, 8);
+        xfer_data(b, 8);
+        break;
+    }
+    case 0x60: {  // SIGNAL
+        uint32_t id = (uint32_t)(v >> 32), mask = (uint32_t)v;
+        st.siglblid = (st.siglblid & ~(uint64_t)mask) | (id & mask);
+        g_csr |= 1;
+        if (!(st.imr & 0x100)) intc_raise(INTC_GS);
+        break;
+    }
+    case 0x61:  // FINISH
+        g_csr |= 2;
+        if (!(st.imr & 0x200)) intc_raise(INTC_GS);
+        break;
+    case 0x62: {  // LABEL
+        uint32_t id = (uint32_t)(v >> 32), mask = (uint32_t)v;
+        st.siglblid = (st.siglblid & ~((uint64_t)mask << 32)) | ((uint64_t)(id & mask) << 32);
+        break;
+    }
+    default:
+        LOG(LOG_GS, "write to unknown GS register %02x = %016llx", reg, (unsigned long long)v);
+    }
+}
+
+// --------------------------------------------------------------- vertices
+uint32_t prim_attr() {
+    // PRMODECONT.AC = 1: attributes come from PRIM; 0: from PRMODE
+    return (st.prmodecont & 1) ? (uint32_t)st.prim : ((uint32_t)st.prmode & ~7u) | ((uint32_t)st.prim & 7);
+}
+
+void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog) {
+    uint32_t attr = prim_attr();
+    if (g_attr_taint && draw) {
+        const bool tme = (attr >> 4) & 1, fst = (attr >> 8) & 1, fge = (attr >> 5) & 1;
+        const uint32_t reads = TAINT_RGBA | (tme && !fst ? TAINT_Q | TAINT_ST : 0) | (tme && fst ? TAINT_UV : 0) |
+                               (fge && !has_fog ? TAINT_FOG : 0);
+        if (reads & g_attr_taint) {
+            g_attr_taint_reads++;
+            g_stale_prim = true;
+        }
+    }
+    int ctxt = (attr >> 9) & 1;
+    const Context &c = st.ctx[ctxt];
+    Vertex v;
+    int32_t ofx = (int32_t)bits(c.xyoffset, 0, 16), ofy = (int32_t)bits(c.xyoffset, 32, 16);
+    v.x = (int32_t)(xyz & 0xFFFF) - ofx;
+    v.y = (int32_t)((xyz >> 16) & 0xFFFF) - ofy;
+    v.z = has_fog ? (uint32_t)((xyz >> 32) & 0xFFFFFF) : (uint32_t)(xyz >> 32);
+    v.f = has_fog ? fog : (uint8_t)(st.fog >> 56);
+    v.r = (uint8_t)st.rgbaq;
+    v.g = (uint8_t)(st.rgbaq >> 8);
+    v.b = (uint8_t)(st.rgbaq >> 16);
+    v.a = (uint8_t)(st.rgbaq >> 24);
+    uint32_t s = (uint32_t)st.st, t = (uint32_t)(st.st >> 32);
+    memcpy(&v.s, &s, 4);
+    memcpy(&v.t, &t, 4);
+    v.q = st.q;
+    v.u = (int32_t)bits(st.uv, 0, 14);
+    v.v = (int32_t)bits(st.uv, 16, 14);
+
+    uint32_t type = st.prim & 7;
+    // queue handling per primitive type
+    switch (type) {
+    case 0:  // point
+        if (draw) {
+            stats.prims++;
+            draw_point(v);
+        }
+        st.vcount = 0;
+        return;
+    case 1:  // line
+    case 6:  // sprite
+        st.vq[st.vcount++] = v;
+        if (st.vcount == 2) {
+            if (draw) {
+                stats.prims++;
+                if (type == 1) draw_line(st.vq[0], st.vq[1]);
+                else draw_sprite(st.vq[0], st.vq[1]);
+            }
+            st.vcount = 0;
+        }
+        return;
+    case 2:  // line strip
+        if (st.vcount < 2) {
+            st.vq[st.vcount++] = v;
+        } else {
+            st.vq[0] = st.vq[1];
+            st.vq[1] = v;
+        }
+        if (st.vcount == 2 && draw) {
+            stats.prims++;
+            draw_line(st.vq[0], st.vq[1]);
+        }
+        return;
+    case 3:  // triangle
+        st.vq[st.vcount++] = v;
+        if (st.vcount == 3) {
+            if (draw) {
+                stats.prims++;
+                draw_triangle(st.vq[0], st.vq[1], st.vq[2]);
+            }
+            st.vcount = 0;
+        }
+        return;
+    case 4:  // triangle strip
+        if (st.vcount < 3) {
+            st.vq[st.vcount++] = v;
+        } else {
+            st.vq[0] = st.vq[1];
+            st.vq[1] = st.vq[2];
+            st.vq[2] = v;
+        }
+        if (st.vcount == 3 && draw) {
+            stats.prims++;
+            draw_triangle(st.vq[0], st.vq[1], st.vq[2]);
+        }
+        return;
+    case 5:  // triangle fan
+        if (st.vcount < 3) {
+            st.vq[st.vcount++] = v;
+        } else {
+            st.vq[1] = st.vq[2];
+            st.vq[2] = v;
+        }
+        if (st.vcount == 3 && draw) {
+            stats.prims++;
+            draw_triangle(st.vq[0], st.vq[1], st.vq[2]);
+        }
+        return;
+    default:
+        st.vcount = 0;
+        return;
+    }
+}
+
+// ------------------------------------------------------------ GIF packets
+void packed_reg(uint32_t r, uint64_t lo, uint64_t hi, bool draw_vertices = true) {
+    switch (r) {
+    case 0x0:  // PRIM
+        write_reg(0x00, lo & 0x7FF);
+        break;
+    case 0x1: {  // RGBAQ: R,G,B,A in the low byte of each word; Q from ST
+        uint64_t v = (lo & 0xFF) | (((lo >> 32) & 0xFF) << 8) | ((hi & 0xFF) << 16) | (((hi >> 32) & 0xFF) << 24);
+        uint32_t q;
+        memcpy(&q, &st.q, 4);
+        st.rgbaq = v | ((uint64_t)q << 32);
+        g_attr_taint &= ~TAINT_RGBA, g_attr_written |= TAINT_RGBA;
+        break;
+    }
+    case 0x2: {  // ST (+Q)
+        g_attr_taint &= ~(TAINT_ST | TAINT_Q), g_attr_written |= TAINT_ST | TAINT_Q;
+        st.st = lo;
+        uint32_t q = (uint32_t)hi;
+        memcpy(&st.q, &q, 4);
+        break;
+    }
+    case 0x3:  // UV
+        st.uv = (lo & 0x3FFF) | (((lo >> 32) & 0x3FFF) << 16);
+        g_attr_taint &= ~TAINT_UV, g_attr_written |= TAINT_UV;
+        break;
+    case 0x4: {  // XYZF2
+        uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF;
+        uint64_t z = (hi >> 4) & 0xFFFFFF, f = (hi >> 36) & 0xFF;
+        bool adc = !draw_vertices || ((hi >> 47) & 1);
+        uint64_t v = x | (y << 16) | (z << 32) | (f << 56);
+        write_reg(adc ? 0x0C : 0x04, v);
+        break;
+    }
+    case 0x5: {  // XYZ2
+        uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF, z = hi & 0xFFFFFFFF;
+        bool adc = !draw_vertices || ((hi >> 47) & 1);
+        write_reg(adc ? 0x0D : 0x05, x | (y << 16) | (z << 32));
+        break;
+    }
+    case 0xA:  // FOG
+        st.fog = ((hi >> 36) & 0xFF) << 56;
+        g_attr_taint &= ~TAINT_FOG, g_attr_written |= TAINT_FOG;
+        break;
+    case 0xC: {  // XYZF3
+        uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF;
+        uint64_t z = (hi >> 4) & 0xFFFFFF, f = (hi >> 36) & 0xFF;
+        write_reg(0x0C, x | (y << 16) | (z << 32) | (f << 56));
+        break;
+    }
+    case 0xD: {  // XYZ3
+        uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF, z = hi & 0xFFFFFFFF;
+        write_reg(0x0D, x | (y << 16) | (z << 32));
+        break;
+    }
+    case 0xE:  // A+D
+        write_reg((uint32_t)(hi & 0xFF), lo);
+        break;
+    case 0xF:  // NOP
+        break;
+    default:  // TEX0_1/2, CLAMP_1/2 etc: register = descriptor
+        write_reg(r, lo);
+        break;
+    }
+}
+
+void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
+    if (scene_capture::g_on) scene_capture::gs_packet(path);
+    if (scene_emit::g_on) scene_emit::gs_packet(path);
+    if (modern::g_on) modern::gs_packet(path);
+    PathState &ps = g_path[path];
+    for (uint32_t i = 0; i < qwc; i++) {
+        const uint8_t *q = data + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, q, 8);
+        memcpy(&hi, q + 8, 8);
+        if (!ps.in_packet || ps.nloop == 0) {
+            // new GIF tag
+            ps.tag_lo = lo;
+            ps.tag_hi = hi;
+            ps.nloop = (uint32_t)(lo & 0x7FFF);
+            ps.eop = (lo >> 15) & 1;
+            ps.flg = (uint32_t)((lo >> 58) & 3);
+            ps.nreg = (uint32_t)((lo >> 60) & 0xF);
+            if (ps.nreg == 0) ps.nreg = 16;
+            ps.reg = 0;
+            ps.in_packet = true;
+            if ((lo >> 46) & 1) write_reg(0x00, (lo >> 47) & 0x7FF);  // PRE: set PRIM
+            if (ps.flg == 1 && ps.nloop) {
+                // REGLIST: 64-bit units; handled below by splitting qwords
+            }
+            if (ps.nloop == 0) {
+                if (ps.eop) ps.in_packet = false;
+            }
+            continue;
+        }
+        switch (ps.flg) {
+        case 0: {  // PACKED
+            uint32_t r = (uint32_t)((ps.tag_hi >> (ps.reg * 4)) & 0xF);
+            packed_reg(r, lo, hi, draw_vertices);
+            if (++ps.reg == ps.nreg) {
+                ps.reg = 0;
+                ps.nloop--;
+            }
+            break;
+        }
+        case 1: {  // REGLIST: two 64-bit register values per qword
+            uint64_t vals[2] = {lo, hi};
+            for (int k = 0; k < 2 && ps.nloop; k++) {
+                uint32_t r = (uint32_t)((ps.tag_hi >> (ps.reg * 4)) & 0xF);
+                if (r < 0xE) write_reg(r, vals[k]);
+                if (++ps.reg == ps.nreg) {
+                    ps.reg = 0;
+                    ps.nloop--;
+                }
+            }
+            break;
+        }
+        default: {  // IMAGE: all the qwords of the packet that are here at once
+            uint32_t m = std::min(ps.nloop, qwc - i);
+            xfer_data(q, m * 16);
+            ps.nloop -= m;
+            i += m - 1;
+            break;
+        }
+        }
+        if (ps.nloop == 0 && ps.eop) ps.in_packet = false;
+    }
+}
+
+// This typed command is tagged by 0x361098 before DMA. The original DIRECT
+// packet remains available for fallback and for portable reference captures.
+constexpr uint64_t kDepthClearTest = 0x32001;  // NEVER, ZB_ONLY, Z always
+constexpr uint64_t kClearStripTag = 0x2000000000008014ull;
+constexpr uint64_t kClearStripRegs = 0x55;
+
+bool matches_clear_packet(const native::SceneClear &clear, const uint8_t *packet, uint32_t qwc) {
+    if (scene_capture::g_on || scene_emit::g_on || qwc != native::kSceneClearDirectQwc) return false;
+    const uint64_t header[][2] = {
+        {0x3003400000000001ull, 0x1ee},
+        {clear.target == native::SceneClearTarget::Depth ? kDepthClearTest : 0x30000, 0x47},
+        {clear.zbuf, 0x4e},
+        {(clear.rgba & 0xffu) | ((uint64_t)((clear.rgba >> 8) & 0xffu) << 32),
+         ((clear.rgba >> 16) & 0xffu) | ((uint64_t)(clear.rgba >> 24) << 32)},
+        {kClearStripTag, kClearStripRegs},
+    };
+    if (memcmp(packet, header, sizeof header) != 0) return false;
+    for (int x = clear.left; x < clear.right; x += 32) {
+        const uint64_t strip[][2] = {
+            {(uint64_t)(x * 16) | ((uint64_t)(clear.top * 16) << 32), 0},
+            {(uint64_t)((x + 32) * 16) | ((uint64_t)(clear.bottom * 16) << 32), 0},
+        };
+        const size_t offset = sizeof header + (size_t)((x - clear.left) / 32) * sizeof strip;
+        if (memcmp(packet + offset, strip, sizeof strip) != 0) return false;
+    }
+    return true;
+}
+
+bool apply_scene_clear(const native::SceneClear &clear, const uint8_t *packet, uint32_t qwc) {
+    const auto &ctx = st.ctx[0];
+    const bool depth_only = clear.target == native::SceneClearTarget::Depth;
+    const bool bootstrap = clear.target == native::SceneClearTarget::Bootstrap;
+    if (!native::enabled() || !hw::g_on || (g_path[GIF_PATH2].in_packet && g_path[GIF_PATH2].nloop) ||
+        !(st.prmodecont & 1) || ctx.frame != 0x000a008c || clear.zbuf != 0x0a000118 ||
+        bits(ctx.scissor, 0, 11) != 0 || bits(ctx.scissor, 16, 11) != 639 ||
+        bits(ctx.scissor, 32, 11) != 0 || (!bootstrap && bits(ctx.scissor, 48, 11) < 447) ||
+        (!depth_only && ctx.fba && !(clear.rgba & 0x80000000)))
+        return false;
+    const int ofx = bits(ctx.xyoffset, 0, 16), ofy = bits(ctx.xyoffset, 32, 16);
+    const auto pixel = [](int coord, int offset) { return (coord * 16 - offset + 15) >> 4; };
+    if (pixel(clear.left, ofx) != 0 || pixel(clear.top, ofy) != 0 ||
+        pixel(clear.right, ofx) != 640 || pixel(clear.bottom, ofy) != (bootstrap ? 419 : 448))
+        return false;
+    if ((depth_only || bootstrap) &&
+        (ctx.xyoffset != 0x71ff00006bffull || st.scanmsk || !matches_clear_packet(clear, packet, qwc)))
+        return false;
+    // The black color/depth initialization extends one pixel past the
+    // 418-row scissor. Its typed clear covers only the visible rectangle.
+    if (bootstrap && (ctx.scissor != 0x01a10000027f0000ull || clear.rgba != 0xff000000 ||
+                      (modern::g_on && modern::live())))
+        return false;
+
+    // Publish the register effects of the original PRE and packed A+D/RGBA.
+    // The draw-state refresh must precede the GPU clear for frame-skip logic.
+    write_reg(0x00, 6);
+    write_reg(0x47, depth_only ? kDepthClearTest : 0x30000);
+    write_reg(0x4e, clear.zbuf);
+    packed_reg(1, (clear.rgba & 0xffu) | ((uint64_t)((clear.rgba >> 8) & 0xffu) << 32),
+               ((clear.rgba >> 16) & 0xffu) | ((uint64_t)(clear.rgba >> 24) << 32));
+    const Env &env = current_env();
+    if (!native::gs_clear_scene(env, clear)) return false;
+    const int rows = bootstrap ? 418 : 448;
+    if (!depth_only) vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, rows);
+    vram_mark(env.zbp, env.fbw, env.zpsm, 0, 0, 640, rows);
+    if (bootstrap) {
+        gif_process(GIF_PATH2, packet, qwc, false);
+        fprintf(stderr, "[native] bootstrap color/depth initialization: 20 strips replaced\n");
+        return true;
+    }
+    auto &path = g_path[GIF_PATH2];
+    path = PathState{};
+    if (depth_only) {
+        // Preserve the last assembled strip and the EOP state for portable
+        // snapshots without kicking a raster primitive.
+        vertex_kick(false, (uint64_t)((clear.right - 32) * 16) | ((uint64_t)(clear.top * 16) << 16), false, 0);
+        vertex_kick(false, (uint64_t)(clear.right * 16) | ((uint64_t)(clear.bottom * 16) << 16), false, 0);
+        path.tag_lo = kClearStripTag;
+        path.tag_hi = kClearStripRegs;
+        path.nreg = 2;
+        path.eop = true;
+    }
+    return true;
+}
+
+bool matches_bootstrap_history(const native::DisplayCopy &copy, const uint8_t *packet, uint32_t qwc) {
+    if (qwc != native::kDisplayCopyDirectQwc ||
+        scene_capture::g_on || scene_emit::g_on || (modern::g_on && modern::live()))
+        return false;
+    const uint64_t header[][2] = {
+        {0x6000000000000001ull, 0xeeeeee},
+        {0x000a0000, 0x4c},
+        {0x10a000118, 0x4e},
+        {0x30000, 0x47},
+        {(uint64_t)copy.fix << 32 | 0x64, 0x42},
+        {0, 0x14},
+        {0x2000000e68028000ull | copy.source, 0x06},
+        {0x40ab400000008014ull, 0x5353},
+    };
+    if (memcmp(packet, header, sizeof header) != 0) return false;
+    // At zero XYOFFSET the entire packet starts at y = 1823, outside
+    // the retail bootstrap scissor. Allow a full pixel of margin.
+    for (uint64_t i = 0; i < 20; ++i) {
+        const uint64_t u = i * 0x200;
+        const uint64_t strip[][2] = {
+            {u, 0},
+            {0x000071f000006bf0ull + u, 0},
+            {0x00001c0000000200ull + u, 0},
+            {0x00008df000006df0ull + u, 0},
+        };
+        if (memcmp(packet + sizeof header + i * sizeof strip, strip, sizeof strip) != 0) return false;
+    }
+    return true;
+}
+
+bool apply_bootstrap_quad(const uint8_t *packet, uint32_t qwc) {
+    const auto &ctx = st.ctx[0];
+    const auto &path = g_path[GIF_PATH2];
+    if (qwc != native::kBootstrapQuadDirectQwc || !hw::g_on || !native::enabled() ||
+        scene_capture::g_on || scene_emit::g_on || (modern::g_on && modern::live()) ||
+        (path.in_packet && path.nloop) || !(st.prmodecont & 1) || st.scanmsk || st.pabe || ctx.fba ||
+        ctx.frame != 0x000a0000 || ctx.test != 0x30000 || ctx.zbuf != 0x10a000118 ||
+        ctx.clamp != 5 || ctx.scissor != 0x01bf0000027f0000ull || ctx.xyoffset != 0x71ff00006bffull)
+        return false;
+    // Fixed register writes and UVs from 0x35BE08. Only the four rotating
+    // XY pairs vary. Reject ADC, Z and any reserved fields.
+    constexpr uint64_t header[][2] = {
+        {0x4000000000000001ull, 0xeeee},
+        {0x8000000044ull, 0x42},
+        {0x60, 0x14},
+        {0x200000066802a300ull, 0x06},
+        {0x40808080, 0x01},
+        {0x80aa400000008001ull, 0x53535353},
+    };
+    if (memcmp(packet, header, sizeof header) != 0) return false;
+    native::Vertex vertices[4]{};
+    for (unsigned i = 0; i < 4; ++i) {
+        uint64_t pair[4];
+        memcpy(pair, packet + sizeof header + i * sizeof pair, sizeof pair);
+        const unsigned u = (i & 1) ? 496 : 16, v = (i & 2) ? 496 : 16;
+        if (pair[0] != (uint64_t(u) | (uint64_t(v) << 32)) || pair[1] != 0 ||
+            (pair[2] & ~0x0000ffff0000ffffull) || pair[3] != 0)
+            return false;
+        vertices[i].p[0] = (int32_t(bits(pair[2], 0, 16)) - 0x6bff) / 16.0f;
+        vertices[i].p[1] = (int32_t(bits(pair[2], 32, 16)) - 0x71ff) / 16.0f;
+        vertices[i].uv[0] = u / 16.0f;
+        vertices[i].uv[1] = v / 16.0f;
+    }
+
+    // Decode the draw environment without advancing PATH2. These fixed
+    // register writes are repeated verbatim by the original packet on fallback.
+    write_reg(0x42, header[1][0]);
+    write_reg(0x14, header[2][0]);
+    write_reg(0x06, header[3][0]);
+    write_reg(0x00, 0x154);
+    const auto &env = current_env();
+    if (!g_skip_frame && !native::gs_draw_bootstrap_quad(env, vertices)) return false;
+    gif_process(GIF_PATH2, packet, qwc, false);
+    if (g_skip_frame) return true;
+    vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, 448);
+    static unsigned quads;
+    ++quads;
+    if (quads == 1 || quads % 8 == 0)
+        fprintf(stderr, "[native] bootstrap alpha quads: %u (two triangles each)\n", quads);
+    return true;
+}
+
+bool apply_display_copy(const native::DisplayCopy &copy, const uint8_t *packet, uint32_t qwc) {
+#ifdef EOD_PLUME
+    if (!hw::g_on) return false;
+#ifdef EOD_HW_SELECT
+    if (!hw::vulkan_active()) return false;
+#endif
+    const auto &ctx = st.ctx[0];
+    const auto &path = g_path[GIF_PATH2];
+    if (native::bootstrap_raster_enabled() && copy.source == 0x1180 && copy.fix == 0x80 &&
+        !(path.in_packet && path.nloop) && (st.prmodecont & 1) && ctx.xyoffset == 0 &&
+        bits(ctx.scissor, 48, 11) < 1822 && matches_bootstrap_history(copy, packet, qwc)) {
+        hw::native_display_copy_fallback();
+        // Keep the packet state, assembled vertices and ordinary flip/skip accounting.
+        gif_process(GIF_PATH2, packet, qwc, false);
+        current_env();
+        static unsigned packets;
+        ++packets;
+        fprintf(stderr, "[native] bootstrap display history: %u clipped packets (20 strips each)\n", packets);
+        return true;
+    }
+    if (!native::prepare()) return false;
+    if (copy.source != 0x1180 || copy.fix > 255 || (path.in_packet && path.nloop) ||
+        !(st.prmodecont & 1) || st.scanmsk || !(st.pmode & 3) ||
+        bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 20) != 0x1400 ||
+        bits(ctx.xyoffset, 0, 16) != 0x6bff || bits(ctx.xyoffset, 32, 16) != 0x71ff ||
+        bits(ctx.scissor, 0, 11) != 0 || bits(ctx.scissor, 16, 11) != 639 ||
+        bits(ctx.scissor, 32, 11) != 0 || bits(ctx.scissor, 48, 11) < 447) {
+        hw::native_display_copy_fallback();
+        return false;
+    }
+
+    // Preserve the register updates around the first sprite. current_env()
+    // sees the FBP0 transition and performs the ordinary flip/skip accounting.
+    write_reg(0x4c, 0x000a0000);
+    write_reg(0x4e, 0x10a000118);
+    write_reg(0x47, 0x30000);
+    write_reg(0x42, ((uint64_t)copy.fix << 32) | 0x64);
+    write_reg(0x14, 0);
+    write_reg(0x06, 0x2000000e68028000ull | copy.source);
+    write_reg(0x00, 0x156);
+    const Env &env = current_env();
+    if (!hw::native_display_copy(env)) {
+        hw::native_display_copy_fallback();
+        return false;
+    }
+    write_reg(0x03, 0x1c002800);  // final UV of the last sprite
+    g_path[GIF_PATH2] = PathState{};
+    if (!g_skip_frame) {
+        vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, 448);
+        static unsigned copies;
+        if (++copies == 1 || copies % 120 == 0)
+            fprintf(stderr, "[native] EE display copies %u (20 strips each), caller %08x, FIX %02x\n",
+                    copies, copy.caller, copy.fix);
+    }
+    return true;
+#else
+    (void)copy;
+    (void)packet;
+    (void)qwc;
+    return false;
+#endif
+}
+
+bool apply_shadow_pass(native::ShadowPass pass, const uint8_t *packet, uint32_t qwc) {
+    if (pass == native::ShadowPass::None || !hw::g_on) return false;
+    const auto &path = g_path[GIF_PATH2];
+    const auto &ctx = st.ctx[0];
+    const bool prepare = pass == native::ShadowPass::Prepare;
+    const auto word = [&](uint32_t index, uint32_t half = 0) {
+        uint64_t value;
+        memcpy(&value, packet + index * 16 + half * 8, sizeof value);
+        return value;
+    };
+    const auto matches = [&](uint32_t index, uint64_t lo, uint64_t hi) {
+        return word(index) == lo && word(index, 1) == hi;
+    };
+    if ((path.in_packet && path.nloop) || !(st.prmodecont & 1) ||
+        ctx.xyoffset != 0x71ff00006bffull)
+        return false;
+    if (prepare) {
+        if (qwc != native::kShadowPrepareDirectQwc ||
+            !matches(0, 0x4000000000000001ull, 0x1eee) ||
+            !matches(1, 0x3205015f, 0x4c) ||
+            !matches(5, 0x200340000000000aull, 0x55) ||
+            !matches(31, 0x2000000e6ba2a300ull, 6) ||
+            !matches(32, 0x40ab40000000000aull, 0x5e5e) ||
+            !matches(73, 0x3000000000008001ull, 0xeeee))
+            return false;
+    } else {
+        if (qwc != native::kShadowCompositeDirectQwc || ctx.frame != 0x000a008c ||
+            !matches(0, 0x7000000000000001ull, 0x1eeeeee) ||
+            !matches(2, 0x10a000118, 0x4e) || !matches(3, 0x44, 0x42) ||
+            !matches(6, 0x20000006642173e0ull, 6) ||
+            !matches(8, 0x40ab400000008014ull, 0x5e5e))
+            return false;
+    }
+    if (!native::gs_shadow_boundary()) return false;
+    // Preserve the producer's packed A+D, RGBA and final PRE/UV state.
+    // Plume samples scene depth and composites its private accumulation
+    // surface, so the strips need no emulated local-memory writes.
+    const auto ad = [&](uint32_t first, uint32_t end) {
+        for (uint32_t i = first; i < end; i++)
+            packed_reg(0xe, word(i), word(i, 1));
+    };
+    if (prepare) {
+        ad(1, 4);
+        packed_reg(1, word(4), word(4, 1));
+        ad(27, 32);
+        write_reg(0x00, 0x156);
+        write_reg(0x03, word(71));
+        ad(74, 77);
+    } else {
+        ad(1, 7);
+        packed_reg(1, word(7), word(7, 1));
+        write_reg(0x00, 0x156);
+        write_reg(0x03, word(87));
+    }
+    g_path[GIF_PATH2] = PathState{};
+    static uint32_t preparations = 0, composites = 0;
+    auto &count = prepare ? preparations : composites;
+    if (++count == 1 || count % 120 == 0)
+        fprintf(stderr, "[native] EE shadow %s %u (20 strips each)\n",
+                prepare ? "preparations" : "composites", count);
+    return true;
+}
+
+// --------------------------------------------------------------- display
+std::vector<uint32_t> g_frame;
+int g_frame_w, g_frame_h;
+uint64_t g_frames;
+
+inline uint32_t to_rgba(uint32_t psm, uint32_t v) {
+    switch (psm) {
+    case PSMCT32:
+        return v | 0xFF000000u;
+    case PSMCT24:
+        return v | 0xFF000000u;
+    case PSMCT16:
+    case PSMCT16S:
+        return ((v & 0x1F) << 3) | (((v >> 5) & 0x1F) << 11) | (((v >> 10) & 0x1F) << 19) | 0xFF000000u;
+    }
+    return v | 0xFF000000u;
+}
+
+// Reads one display circuit into an RGBA image.
+bool read_circuit(int n, std::vector<uint32_t> &img, int &w, int &h) {
+    uint64_t fb = st.dispfb[n], disp = st.display[n];
+    uint32_t fbp = bits(fb, 0, 9) * 32, fbw = bits(fb, 9, 6), psm = bits(fb, 15, 5);
+    int dbx = (int)bits(fb, 32, 11), dby = (int)bits(fb, 43, 11);
+    int magh = (int)bits(disp, 23, 4) + 1, magv = (int)bits(disp, 27, 2) + 1;
+    int dw = (int)bits(disp, 32, 12) + 1, dh = (int)bits(disp, 44, 11) + 1;
+    w = dw / magh;
+    h = dh / magv;
+    if (w <= 0 || h <= 0 || w > 2048 || h > 2048) return false;
+    census_display(fbp, fbw, psm, w, h);
+    // field mode with interlace: only half the lines are in memory
+    bool interlaced = st.smode2 & 1;
+    bool field_mode = (st.smode2 >> 1) & 1;
+    int lines = (interlaced && field_mode) ? h / 2 : h;
+    img.resize((size_t)w * h);
+    const SwizzleTab *T = swizzle_table(psm, fbw);
+    bool b16 = psm == PSMCT16 || psm == PSMCT16S;
+    for (int y = 0; y < h; y++) {
+        int sy = (interlaced && field_mode) ? y / 2 : y;
+        if (sy >= lines) sy = lines - 1;
+        uint32_t *row = &img[(size_t)y * w];
+        if (y > 0 && sy == ((interlaced && field_mode) ? (y - 1) / 2 : y - 1)) {
+            memcpy(row, row - w, (size_t)w * 4);  // line doubling
+            continue;
+        }
+        int py = (dby + sy) & 2047;
+        uint32_t rb = T->row_base(fbp, py), rc = T->rowC[py];
+        if (b16) {
+            for (int x = 0; x < w; x++) row[x] = to_rgba(psm, half(T->addr_row(rb, rc, (dbx + x) & 2047)));
+        } else {
+            for (int x = 0; x < w; x++) row[x] = word(T->addr_row(rb, rc, (dbx + x) & 2047)) | 0xFF000000u;
+        }
+    }
+    return true;
+}
+
+// Has anything the display shows changed since the last composition?
+bool display_changed() {
+    static uint64_t last_regs[8];
+    static uint32_t last_clock;
+    static bool valid;
+    uint64_t regs[8] = {st.pmode, st.dispfb[0], st.dispfb[1], st.display[0], st.display[1], st.smode2, st.bgcolor, 0};
+    raster_mark_pages();
+    bool changed = !valid || memcmp(regs, last_regs, sizeof regs) != 0;
+    for (int n = 0; n < 2 && !changed; n++) {
+        if (!((st.pmode >> n) & 1)) continue;
+        uint64_t fb = st.dispfb[n], disp = st.display[n];
+        uint32_t fbp = bits(fb, 0, 9) * 32, fbw = bits(fb, 9, 6), psm = bits(fb, 15, 5);
+        int dby = (int)bits(fb, 43, 11), dh = (int)bits(disp, 44, 11) + 1;
+        uint32_t first, count;
+        page_range(fbp, fbw, psm, 0, 0, (int)(fbw ? fbw : 1) * 64, std::min(2048, dby + dh * 2), first, count);
+        for (uint32_t i = 0; i < count && !changed; i++)
+            if (g_page_gen[(first + i) % kPages] > last_clock) changed = true;
+    }
+    memcpy(last_regs, regs, sizeof regs);
+    last_clock = g_vram_clock;
+    valid = true;
+    return changed;
+}
+
+// Composes the displayed image into g_frame; false when it is unchanged.
+bool compose_display() {
+    raster_sync();
+    if (!display_changed()) return false;
+    bool en1 = st.pmode & 1, en2 = (st.pmode >> 1) & 1;
+    std::vector<uint32_t> a, b;
+    int wa = 0, ha = 0, wb = 0, hb = 0;
+    bool ha_ok = en1 && read_circuit(0, a, wa, ha);
+    bool hb_ok = en2 && read_circuit(1, b, wb, hb);
+    if (!ha_ok && !hb_ok) {
+        g_frame_w = 640;
+        g_frame_h = 448;
+        g_frame.assign(640 * 448, 0xFF000000u);
+        return true;
+    }
+    if (ha_ok && hb_ok) {
+        // blend circuit 1 over circuit 2
+        bool mmod = (st.pmode >> 5) & 1;
+        uint32_t alp = bits(st.pmode, 8, 8);
+        int w = wa < wb ? wa : wb, h = ha < hb ? ha : hb;
+        g_frame.resize((size_t)w * h);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                uint32_t p1 = a[(size_t)y * wa + x], p2 = b[(size_t)y * wb + x];
+                uint32_t al = mmod ? alp : 255;  // per-pixel alpha would need the raw value
+                // x / 255 == (x * 0x8081) >> 23 for x < 65536
+                uint32_t r = ((((p1 & 0xFF) * al) + ((p2 & 0xFF) * (255 - al))) * 0x8081u) >> 23;
+                uint32_t g = (((((p1 >> 8) & 0xFF) * al) + (((p2 >> 8) & 0xFF) * (255 - al))) * 0x8081u) >> 23;
+                uint32_t bb = (((((p1 >> 16) & 0xFF) * al) + (((p2 >> 16) & 0xFF) * (255 - al))) * 0x8081u) >> 23;
+                g_frame[(size_t)y * w + x] = r | (g << 8) | (bb << 16) | 0xFF000000u;
+            }
+        g_frame_w = w;
+        g_frame_h = h;
+        return true;
+    }
+    if (ha_ok) {
+        g_frame.swap(a);
+        g_frame_w = wa;
+        g_frame_h = ha;
+    } else {
+        g_frame.swap(b);
+        g_frame_w = wb;
+        g_frame_h = hb;
+    }
+    return true;
+}
+
+}  // namespace
+
+uint64_t g_taint_sets;
+bool g_stale_prim;
+uint64_t g_stale_visible;
+void attr_mark() { g_attr_written = 0; }
+void taint_attributes() {
+    // what the skipped run would have written and its replayed register writes did not
+    g_attr_taint |= (TAINT_RGBA | TAINT_Q | TAINT_ST | TAINT_UV | TAINT_FOG) & ~g_attr_written;
+    // the proof, every 2^20 skipped batches: stale reads must stay 0
+    if ((++g_taint_sets & 0xFFFFF) == 0)
+        fprintf(stderr, "[skipproof] skipped batches %llu, stale attribute reads %llu, in drawn primitives %llu\n",
+                (unsigned long long)g_taint_sets, (unsigned long long)g_attr_taint_reads, (unsigned long long)g_stale_visible);
+}
+}  // namespace gs
+
+using namespace gs;
+
+extern int g_opt_frames;
+extern int g_opt_screenshot_every;
+extern std::string g_opt_screenshot_dir;
+
+void priv_apply(uint32_t off, uint64_t v);
+void gs_flush();
+void gs_sync();
+[[noreturn]] void app_exit(int code);  // main.cpp
+void gs_frame_end(uint64_t frame, int aspect);
+namespace { void editor_preview_capture(uint64_t frame, bool offscreen, bool software_locked); }
+
+// ------------------------------------------------------------ GS thread
+// With a second CPU core the GIF stream is executed on a worker thread:
+// the EE side appends commands (GIF data, privileged register writes,
+// vblank) to chunks that the worker runs in order.  The EE only waits for
+// it when it reads state the worker produces.
+namespace {
+
+enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN, CMD_NATIVE };
+constexpr uint32_t kGifSceneClear = 1;  // CMD_GIF's live-only aux field
+constexpr uint32_t kGifDisplayCopy = 2;
+constexpr uint32_t kGifShadowPrepare = 3;
+constexpr uint32_t kGifShadowComposite = 4;
+
+bool g_threaded;
+bool g_gs_stop; // guarded by g_q_mtx
+std::thread g_gs_worker;
+bool g_shutdown_complete;
+native::SceneClear g_ordered_scene_clear;
+bool g_have_ordered_scene_clear;
+native::DisplayCopy g_ordered_display_copy;
+bool g_have_ordered_display_copy;
+bool g_have_ordered_bootstrap_quad;
+// vblanks the GS thread may trail the EE (beyond that the EE waits; with
+// frame skipping the GS normally catches up by dropping frames first)
+// Keep the Mac input-to-display queue short. This is a pacing/backpressure
+// bound, not a change to guest time or the game update frequency.
+#if defined(__APPLE__)
+constexpr uint64_t kDefaultGsLag = 2;
+#else
+constexpr uint64_t kDefaultGsLag = 12;
+#endif
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : kDefaultGsLag;
+std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
+// Process-lifetime queue storage; normal exits drain and join its worker.
+std::mutex &g_q_mtx = *new std::mutex;
+std::condition_variable &g_q_cv = *new std::condition_variable, &g_q_cv_done = *new std::condition_variable;
+// a command chunk: growing it doesn't zero the bytes about to be copied in
+template <class T>
+struct NoInitAlloc : std::allocator<T> {
+    template <class U>
+    struct rebind {
+        using other = NoInitAlloc<U>;
+    };
+    NoInitAlloc() = default;
+    template <class U>
+    NoInitAlloc(const NoInitAlloc<U> &) {}
+    template <class U>
+    void construct(U *p) { ::new (static_cast<void *>(p)) U; }
+    template <class U, class... A>
+    void construct(U *p, A &&...a) { ::new (static_cast<void *>(p)) U(std::forward<A>(a)...); }
+};
+using Chunk = std::vector<uint8_t, NoInitAlloc<uint8_t>>;
+std::deque<Chunk> &g_q = *new std::deque<Chunk>;
+Chunk g_chunk;
+// chunks the worker has run, kept for reuse (guarded by g_q_mtx): allocating
+// fresh ones cost a regrowth copy and freshly zeroed pages every 256KB
+std::vector<Chunk> &g_free = *new std::vector<Chunk>;
+constexpr size_t kChunkFlush = 256 * 1024, kChunkReserve = kChunkFlush + 64 * 1024;
+uint64_t g_pushed, g_done;  // chunks (guarded by g_q_mtx)
+uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mtx)
+
+// last composed frame (presented on the EE thread)
+std::mutex &g_pub_mtx = *new std::mutex;
+std::vector<uint32_t> g_pub;
+int g_pub_w, g_pub_h, g_pub_aspect = -1;
+uint64_t g_pub_frame;
+
+void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t size) {
+    uint32_t h[4] = {kind, a, b, size};
+    size_t at = g_chunk.size();
+    g_chunk.resize(at + 16 + ((size + 15) & ~15u));
+    memcpy(&g_chunk[at], h, 16);
+    if (size) memcpy(&g_chunk[at + 16], data, size);
+    if (g_chunk.size() >= kChunkFlush) gs_flush();
+}
+
+}  // namespace
+
+// EOD_MODERN commands from the producer, in GS order (modern_scene.h).
+void modern::post_batch(int32_t index) {
+    if (!g_threaded) return gs_batch(index);
+    push_cmd(CMD_MODERN, 0, (uint32_t)index, nullptr, 0);
+}
+void modern::post_batch_state(int32_t index) {
+    if (!g_threaded) return gs_batch_state(index);
+    push_cmd(CMD_MODERN, 2, (uint32_t)index, nullptr, 0);
+}
+void modern::post_draw(Frame *f) {
+    if (!g_threaded) return gs_draw(f);
+    push_cmd(CMD_MODERN, 1, 0, &f, sizeof f);
+}
+
+// Native renderer commands from the producer, in GS order (render/native_renderer.h).
+void native::post(uint32_t kind, const void *data, uint32_t size) {
+    if (!g_threaded) return gs_command(kind, data, size);
+    push_cmd(CMD_NATIVE, kind, 0, data, size);
+}
+
+// Publishes the display and does the per-frame bookkeeping (GS side).
+void gs_frame_end(uint64_t frame, int aspect) {
+    if (native::enabled()) native::gs_vblank(frame);
+    if (scene_capture::g_on) scene_capture::gs_vblank(frame);
+    if (scene_emit::g_on) scene_emit::gs_vblank(frame, st.fogcol);
+    presentation::set(aspect);
+    if (hw::g_on) {
+        bool changed = display_changed();
+        if (changed) editor_test_startup::state().hardware_display_changed(g_flips.load());
+        if (overlay_changed() || changed) {  // (the in-game menu or frame counter changed too)
+            // no vsync wait while the GS thread trails the EE
+            uint64_t lag = g_ee_vblanks.load() - frame;
+            hw::present(g_config.vsync && lag < 2);
+            editor_preview_capture(frame, platform_native_window() == nullptr, false);
+        }
+        hw::vblank();
+    } else if (compose_display()) {
+        std::lock_guard<std::mutex> lk(g_pub_mtx);
+        g_pub.swap(g_frame);
+        g_pub_w = g_frame_w;
+        g_pub_h = g_frame_h;
+        g_pub_aspect = aspect;
+        g_pub_frame = frame;
+        if ((st.pmode & 3) && editor_test_startup::state().software_composed(g_flips.load()))
+            std::fprintf(stderr, "[editor-test] software race scanout composed: vblank=%llu size=%dx%d pmode=%llx dispfb=%llx/%llx\n",
+                (unsigned long long)frame, g_pub_w, g_pub_h, (unsigned long long)st.pmode,
+                (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
+    }
+    {
+        static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
+        if (trace_at >= 0) gs::g_trace = (int)frame >= trace_at && (int)frame < trace_at + 4;
+        if (gs::g_trace) fprintf(stderr, "GS trace on at frame %d\n", (int)frame);
+    }
+    if ((frame % 60) == 0) {
+        raster_collect_stats();
+        LOG(LOG_GS, "frames to %llu: %u prims, %u pixels, %u transfers, %u texels decoded, %u uncached samples, %u env setups per vblank",
+            (unsigned long long)frame, stats.prims / 60, stats.pixels / 60, stats.transfers / 60, stats.decoded / 60,
+            stats.slow_samples / 60, stats.env_setups / 60);
+        LOG(LOG_GS, "  raster time %.2f ms per vblank, %.1f ns per pixel", stats.raster_ns / 60 / 1e6,
+            stats.pixels ? (double)stats.raster_ns / stats.pixels : 0.0);
+        LOG(LOG_GS, "  raster jobs %u, barriers: other %u, tex-after-draw %u, draw-over-read %u, layout %u, "
+            "tex-setup %u, clut %u, transfer %u (per vblank)", stats.jobs / 60, stats.barriers[0] / 60,
+            stats.barriers[1] / 60, stats.barriers[2] / 60, stats.barriers[3] / 60, stats.barriers[4] / 60,
+            stats.barriers[5] / 60, stats.barriers[6] / 60);
+        for (int k = 0; k < 64; k++)
+            if (stats.kind_px[k] / 60 > 5000)
+                LOG(LOG_GS, "  tri kind gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels per vblank", k & 1, (k >> 1) & 1,
+                    (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, stats.kind_px[k] / 60);
+        if (hw::g_on && g_log_enabled[LOG_GS]) {  // totals over the last 60 vblanks
+            char line[1024];
+            hw::stats_line(line, sizeof line);
+            LOG(LOG_GS, "  %s", line);
+        }
+        stats = Stats();
+    }
+}
+
+void gs_flush() {
+    if (!g_threaded || g_chunk.empty()) return;
+    Chunk next;
+    {
+        std::lock_guard<std::mutex> lk(g_q_mtx);
+        g_q.push_back(std::move(g_chunk));
+        g_pushed++;
+        if (!g_free.empty()) {
+            next = std::move(g_free.back());
+            g_free.pop_back();
+        }
+    }
+    g_q_cv.notify_one();
+    g_chunk = std::move(next);
+    g_chunk.clear();
+    g_chunk.reserve(kChunkReserve);
+}
+
+void gs_sync() {
+    if (!g_threaded) return;
+    offload_sync();  // (the command stream's producer, when it runs on its own thread)
+    gs_flush();
+    ProfScope prof(P_EE_WAIT);
+    uint64_t t = platform_time_us();
+    std::unique_lock<std::mutex> lk(g_q_mtx);
+    g_q_cv_done.wait(lk, [] { return g_done == g_pushed; });
+    g_ee_wait_us += platform_time_us() - t;
+    g_ee_sync_us += platform_time_us() - t;
+}
+
+// ------------------------------------------------------------ capture / replay
+// EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count] records the GS
+// state and VRAM after that vblank, then the commands of the next `count`
+// vblanks; `eod --gs-replay file` replays them alone (renderer benchmarks).
+// EOD_GS_DUMP_LIVE=1 also captures the live scanout at the terminal GS vblank.
+// EOD_GS_DUMP_COLD_START=N instead records before the first queued command
+// through vblank N (1..6600), capped at 256 MiB, for packet-backend experiments.
+namespace {
+FILE *g_dump;
+uint64_t g_dump_end;
+uint64_t g_cold_dump_bytes;
+bool g_cold_dump;
+std::string g_dump_pair_base;
+std::unique_ptr<capture::Writer> g_cold_zip;
+const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
+
+// This diagnostic samples depth before 0x35BBD0 copies the scene into the
+// fixed color-only display target. Later GS commands can clear or reuse
+// scene depth while the same color image remains on screen.
+bool g_replay_depth_capture;
+std::vector<uint32_t> g_replay_display_depth;
+constexpr int kReplayCopyWidth = 640, kReplayCopyHeight = 448;
+
+void replay_capture_display_depth(const uint8_t *data, uint32_t bytes) {
+    if (bytes != native::kDisplayCopyDirectQwc * 16) return;
+    uint64_t header[8][2];
+    memcpy(header, data, sizeof header);
+    if (header[0][0] != 0x6000000000000001ull || header[0][1] != 0xeeeeee ||
+        header[1][0] != 0xa0000 || header[1][1] != 0x4c ||
+        header[2][0] != 0x10a000118ull || header[2][1] != 0x4e ||
+        (header[4][0] & 0xffffffff) != 0x64 || !bits(header[4][0], 32, 8) || header[4][1] != 0x42 ||
+        header[6][0] != 0x2000000e68029180ull || header[6][1] != 6 ||
+        header[7][0] != 0x40ab400000008014ull || header[7][1] != 0x5353)
+        return;
+    raster_sync();
+    g_replay_display_depth.resize(kReplayCopyWidth * kReplayCopyHeight);
+    for (int y = 0; y < kReplayCopyHeight; y++)
+        for (int x = 0; x < kReplayCopyWidth; x++)
+            g_replay_display_depth[(size_t)y * kReplayCopyWidth + x] = read_pixel(PSMZ16S, x, y, 0x2300, 10);
+}
+
+void dump_state(FILE *f, capture::Writer *zip = nullptr) {
+    clut_resolve();  // st.clut is serialized
+    // Raster synchronization only drains CPU workers. Hardware-owned GS pages
+    // must also reach the CPU copy before serializing a replay's initial VRAM.
+    if (hw::g_on) {
+        hw::finish(); // Flush pending batches before consulting page ownership.
+        for (uint32_t p = 0; p < kPages; ++p)
+            hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+    }
+    uint32_t sizes[3] = {(uint32_t)sizeof st, (uint32_t)sizeof g_path, (uint32_t)sizeof g_xfer};
+    auto write = [f, zip](const void *data, size_t size) {
+        if (zip) zip->write(data, size);
+        else fwrite(data, 1, size, f);
+    };
+    write(kDumpMagic, 8);
+    write(sizes, sizeof sizes);
+    write(&st, sizeof st);
+    write(g_path, sizeof g_path);
+    write(&g_xfer, sizeof g_xfer);
+    write(vram, kVramSize);
+}
+
+template <typename Read> bool load_state_read(Read read) {
+    char magic[8];
+    uint32_t sizes[3];
+    if (read(magic, 8) != 8 || memcmp(magic, kDumpMagic, 8) || read(sizes, sizeof sizes) != sizeof sizes ||
+        sizes[0] != sizeof st || sizes[1] != sizeof g_path || sizes[2] != sizeof g_xfer)
+        return false;
+    clut_drop();  // st (with its CLUT) is replaced
+    bool ok = read(&st, sizeof st) == sizeof st && read(g_path, sizeof g_path) == sizeof g_path &&
+              read(&g_xfer, sizeof g_xfer) == sizeof g_xfer && read(vram, kVramSize) == kVramSize;
+    if (g_xfer.active) {
+        g_xfer.T = swizzle_table(g_xfer.dpsm, g_xfer.dbw);
+        xfer_layout(g_xfer);  // (not trusted from the capture: older ones have padding there)
+    }
+    g_xfer.ry = -1;
+    g_clut_gen++;
+    g_reg_gen++;
+    return ok;
+}
+bool load_state(FILE *f) {
+    return load_state_read([f](void *data, size_t size) { return fread(data, 1, size, f); });
+}
+bool load_state(capture::Reader &f) {
+    return load_state_read([&f](void *data, size_t size) { return f.read(data, size); });
+}
+void close_cold_zip(const char *reason) {
+    if (!g_cold_zip) return;
+    fprintf(stderr, "cold gzip GS dump %s (%llu compressed bytes; completed vblank members only)\n",
+            reason, (unsigned long long)g_cold_zip->bytes());
+    g_cold_zip.reset(); // Discard an unfinished member, if any.
+}
+
+}  // namespace
+
+// Runs queued GS commands; returns the last vblank seen.
+uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
+    // A bounded clean-start stream can seed an independent packet GS without
+    // guessing how to import its private CLUT, vertex or transfer state.
+    static bool cold_attempted = false;
+    if (live && !cold_attempted) {
+        cold_attempted = true;
+        const char *count = getenv("EOD_GS_DUMP_COLD_START");
+        const char *path = getenv("EOD_GS_DUMP");
+        const uint64_t n = count ? strtoull(count, nullptr, 10) : 0;
+        if (path && n && n <= 6600) {
+            g_dump_end = n;
+            if (capture::gzip_path(path)) {
+                uint64_t disk_mib, raw_gib;
+                if (!capture::parse_limit(getenv("EOD_GS_DUMP_COLD_MAX_MIB"), 1, 2048, 256, disk_mib) ||
+                    !capture::parse_limit(getenv("EOD_GS_DUMP_COLD_MAX_RAW_GIB"), 1, 64, 16, raw_gib)) {
+                    fprintf(stderr, "invalid cold GS limit: MAX_MIB must be 1..2048, MAX_RAW_GIB must be 1..64\n");
+                } else g_cold_zip = std::make_unique<capture::Writer>(path, disk_mib << 20, raw_gib << 30);
+                if (g_cold_zip && g_cold_zip->good()) {
+                    dump_state(nullptr, g_cold_zip.get());
+                    if (!g_cold_zip->checkpoint()) close_cold_zip("initial-state write failed");
+                } else if (g_cold_zip) {
+                    close_cold_zip("cannot open (requires zlib support)");
+                }
+            } else {
+                g_dump = fopen(path, "wb");
+                if (g_dump) {
+                    dump_state(g_dump);
+                    g_cold_dump = true;
+                    g_cold_dump_bytes = (uint64_t)ftell(g_dump);
+                }
+            }
+        }
+    }
+    uint64_t frames = 0;
+    for (size_t p = 0; p < size;) {
+        uint32_t h[4];
+        memcpy(h, &c[p], 16);
+        const uint8_t *d = &c[p + 16];
+        size_t len = 16 + ((h[3] + 15) & ~15u);
+        // Presentation-only markers are not part of the portable GS capture format.
+        if (live && h[0] != CMD_EDITOR_RACE_FRAME && h[0] != CMD_MODERN && h[0] != CMD_NATIVE && g_cold_zip) {
+            if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
+            else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
+                close_cold_zip("stopped at compressed limit or write error");
+        }
+        if (live && g_dump && h[0] != CMD_MODERN && h[0] != CMD_NATIVE) {
+            // Never let a diagnostic boot trace grow without a bound. Close at
+            // a command boundary so even a size-limited trace stays parseable.
+            if (g_cold_dump && g_cold_dump_bytes + len > 256ull * 1024 * 1024) {
+                fclose(g_dump);
+                g_dump = nullptr;
+                fprintf(stderr, "cold GS dump reached 256 MiB limit\n");
+            } else {
+                fwrite(&c[p], 1, len, g_dump);
+                g_cold_dump_bytes += len;
+            }
+        }
+        switch (h[0]) {
+        case CMD_EDITOR_RACE_FRAME:
+            if (live && editor_test_startup::state().race_submitted(g_flips.load()))
+                std::fprintf(stderr, "[editor-test] native race draw consumed by GS: vblank=%llu drawn=%llu pmode=%llx dispfb=%llx/%llx\n",
+                    (unsigned long long)g_gs_vblanks.load(), (unsigned long long)g_flips.load(),
+                    (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
+            break;
+        case CMD_GIF: {
+            EOD_ZONE("gs.gif_process");
+            if (!live && g_replay_depth_capture && h[1] == GIF_PATH2)
+                replay_capture_display_depth(d, h[3]);
+            if (live && h[1] == GIF_PATH2) {
+                if (g_have_ordered_bootstrap_quad) {
+                    g_have_ordered_bootstrap_quad = false;
+                    if (h[2] == 0 && apply_bootstrap_quad(d, h[3] / 16)) break;
+                }
+                if (g_have_ordered_scene_clear) {
+                    g_have_ordered_scene_clear = false;
+                    const uint32_t tag = g_ordered_scene_clear.target == native::SceneClearTarget::ColorAndDepth ? kGifSceneClear : 0;
+                    if (h[2] == tag && h[3] == native::kSceneClearDirectQwc * 16 &&
+                        apply_scene_clear(g_ordered_scene_clear, d, h[3] / 16)) break;
+                }
+                if (h[2] == kGifDisplayCopy && h[3] == native::kDisplayCopyDirectQwc * 16 && g_have_ordered_display_copy) {
+                    g_have_ordered_display_copy = false;
+                    if (apply_display_copy(g_ordered_display_copy, d, h[3] / 16)) break;
+                }
+                if (h[2] == kGifShadowPrepare && apply_shadow_pass(native::ShadowPass::Prepare, d, h[3] / 16)) break;
+                if (h[2] == kGifShadowComposite && apply_shadow_pass(native::ShadowPass::Composite, d, h[3] / 16)) break;
+            }
+            gif_process((int)h[1], d, h[3] / 16);
+            break;
+        }
+        case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer,
+                          // 2 = batch state capture (a[2])
+            if (!live) break;
+            if (h[1] == 0) {
+                modern::gs_batch((int32_t)h[2]);
+            } else if (h[1] == 2) {
+                modern::gs_batch_state((int32_t)h[2]);
+            } else {
+                modern::Frame *f;
+                memcpy(&f, d, sizeof f);
+                modern::gs_draw(f);
+            }
+            break;
+        case CMD_NATIVE:  // live only (never in dumps): h[1] kind, payload in d
+            if (live) {
+                if (h[1] == native::CMD_SCENE_CLEAR && h[3] == sizeof g_ordered_scene_clear) {
+                    memcpy(&g_ordered_scene_clear, d, sizeof g_ordered_scene_clear);
+                    g_have_ordered_scene_clear = true;
+                } else if (h[1] == native::CMD_DISPLAY_COPY && h[3] == sizeof g_ordered_display_copy) {
+                    memcpy(&g_ordered_display_copy, d, sizeof g_ordered_display_copy);
+                    g_have_ordered_display_copy = true;
+                } else if (h[1] == native::CMD_BOOTSTRAP_QUAD && h[3] == 0) {
+                    g_have_ordered_bootstrap_quad = true;
+                } else {
+                    native::gs_command(h[1], d, h[3]);
+                }
+            }
+            break;
+        case CMD_PRIV: {
+            uint64_t v;
+            memcpy(&v, d, 8);
+            priv_apply(h[1], v);
+            break;
+        }
+        case CMD_VBLANK:
+            g_gs_vblanks = h[1];
+            { EOD_ZONE("gs.frame_end"); gs_frame_end(h[1], presentation::from_tag(h[2])); }
+            EOD_FRAME_MARK_NAMED("GS vblank");
+            frames = h[1];
+            if (live) {
+                if (g_cold_zip && h[1] >= g_dump_end) close_cold_zip("written");
+                // EOD_GS_DUMP_AT may list several vblanks (a,b,c): one file per
+                // capture, named <EOD_GS_DUMP>.<vblank> when there are several
+                static const char *dump = getenv("EOD_GS_DUMP");
+                static std::vector<uint64_t> at_list = [] {
+                    std::vector<uint64_t> v;
+                    if (const char *a = getenv("EOD_GS_DUMP_AT"))
+                        for (const char *p = a; *p;) {
+                            char *e;
+                            uint64_t n = strtoull(p, &e, 10);
+                            if (e == p) break;
+                            v.push_back(n);
+                            p = *e == ',' ? e + 1 : e;
+                        }
+                    return v;
+                }();
+                if (g_dump && h[1] >= g_dump_end) {
+                    const bool dump_ok = fclose(g_dump) == 0;
+                    g_dump = nullptr;
+                    if (!g_dump_pair_base.empty()) {
+                        const std::string image = g_dump_pair_base + ".live.png";
+                        const std::string marker = g_dump_pair_base + ".live.vblank";
+                        if (dump_ok && h[1] == g_dump_end && gs_screenshot(image.c_str())) {
+                            if (FILE *f = fopen(marker.c_str(), "wb")) {
+                                const int written = fprintf(f, "%u\n", h[1]);
+                                const int closed = fclose(f);
+                                if (written < 0 || closed != 0) std::remove(marker.c_str());
+                            }
+                        }
+                        g_dump_pair_base.clear();
+                    }
+                    fprintf(stderr, "GS dump written\n");
+                }
+                if (dump && !g_dump && std::find(at_list.begin(), at_list.end(), h[1]) != at_list.end()) {
+                    raster_sync();
+                    std::string name = dump;
+                    if (at_list.size() > 1) name += "." + std::to_string(h[1]);
+                    if (capture::gzip_path(name.c_str())) {
+                        fprintf(stderr, "gzip capture requires EOD_GS_DUMP_COLD_START; snapshot capture not opened\n");
+                        break;
+                    }
+                    static const char *pair = getenv("EOD_GS_DUMP_LIVE");
+                    const bool want_pair = pair && strcmp(pair, "1") == 0;
+                    if (want_pair) std::remove((name + ".live.vblank").c_str());
+                    g_dump = fopen(name.c_str(), "wb");
+                    if (g_dump) {
+                        g_cold_dump = false;
+                        dump_state(g_dump);
+                        if (want_pair) g_dump_pair_base = name;
+                    }
+                    g_dump_end = h[1] + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
+                }
+            }
+            break;
+        case CMD_PATH_RESET:
+            for (auto &ps : g_path) ps = PathState();
+            break;
+        case CMD_REDRAW:
+            if (hw::g_on) {
+                hw::redraw();
+                hw::vblank();  // screenshots requested while the game is held (menu, first-run screen)
+            }
+            break;
+        }
+        p += len;
+    }
+    return frames;
+}
+
+// eod --gs-replay FILE [--repeat N]: replays a capture, prints the time
+// and writes the last frame to FILE.ppm.
+int gs_replay(const char *path, int repeat) {
+    mem_init();
+    const char *measure_env = getenv("EOD_GS_REPLAY_MEASURE_AT");
+    const char *stop_env = getenv("EOD_GS_REPLAY_STOP_AT");
+    const uint64_t measure_at = measure_env ? strtoull(measure_env, nullptr, 10) : 0;
+    const uint64_t stop_at = stop_env ? strtoull(stop_env, nullptr, 10) : 0;
+    if (repeat < 1 || (stop_env && (!stop_at || stop_at <= measure_at))) {
+        fprintf(stderr, "invalid GS replay repeat/window (stop must be after measure vblank)\n");
+        return 1;
+    }
+    const bool streaming = capture::gzip_path(path) || measure_env || stop_env;
+    capture::Reader input(path);
+    FILE *f = streaming ? nullptr : fopen(path, "rb");
+    if ((!streaming && !f) || (streaming && !input.good())) {
+        fprintf(stderr, "can't open %s%s\n", path,
+                capture::gzip_path(path) ? " (gzip input requires zlib support)" : "");
+        return 1;
+    }
+    long start = 0;
+    {
+        std::vector<uint8_t> tmp;
+        if (!(streaming ? load_state(input) : load_state(f))) {
+            fprintf(stderr, "%s is not a GS capture from this build (gzip requires zlib)\n", path);
+            if (f) fclose(f);
+            return 1;
+        }
+        if (f) start = ftell(f);
+    }
+    std::vector<uint8_t> cmds;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long end = ftell(f);
+        if (end < start) { fclose(f); return 1; }
+        cmds.resize((size_t)(end - start));
+        fseek(f, start, SEEK_SET);
+        if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) { fclose(f); return 1; }
+    }
+    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") && hw::start(false)) fprintf(stderr, "replaying with %s\n",g_config.renderer.c_str());
+    int hw = platform_cpu_count();
+    int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
+    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
+    if (hw::g_on) n = 0;
+    raster_start(n);
+    const char *zpath = getenv("EOD_GS_REPLAY_ZSHOT");
+    g_replay_depth_capture = zpath && !hw::g_on;
+    double best = 1e30;
+    for (int r = 0; r < repeat; r++) {
+        g_replay_display_depth.clear();
+        if (streaming) {
+            if (!input.rewind() || !load_state(input)) return 1;
+        } else {
+            fseek(f, 0, SEEK_SET);
+            if (!load_state(f)) { fclose(f); return 1; }
+        }
+        raster_reset();
+        if (hw::g_on) hw::reset();
+        // EOD_GS_REPLAY_TRACE: log every primitive of the first replay
+        static const bool replay_trace = getenv("EOD_GS_REPLAY_TRACE") != nullptr;
+        gs::g_trace = replay_trace && r == 0;
+        uint64_t t0 = platform_time_us(), tk0 = prof_ticks();
+        prof_thread_begin(P_GS_CMDS);
+        if (!streaming) run_cmds(cmds.data(), cmds.size(), false);
+        else if (measure_env && stop_env) {
+            // Only the short measured interval is buffered. Parsing/decompression
+            // can let warm GPU work retire, so drain it after loading the window,
+            // then time a single contiguous dispatch with complete GPU work.
+            std::vector<uint8_t> command, window;
+            uint64_t last_vblank = 0;
+            bool warm = measure_at == 0, reached_stop = false;
+            int status = 0;
+            while ((status = input.command(command)) == 1) {
+                uint32_t h[4]; memcpy(h, command.data(), sizeof h);
+                if (!warm) {
+                    run_cmds(command.data(), command.size(), false);
+                    if (h[0] == CMD_VBLANK) {
+                        last_vblank = h[1];
+                        if (last_vblank >= measure_at) {
+                            if (last_vblank != measure_at) break;
+                            warm = true;
+                        }
+                    }
+                    continue;
+                }
+                if (command.size() > (256u << 20) - window.size()) {
+                    fprintf(stderr, "GS replay measured interval exceeds 256 MiB buffer limit\n");
+                    return 1;
+                }
+                window.insert(window.end(), command.begin(), command.end());
+                if (h[0] == CMD_VBLANK) {
+                    last_vblank = h[1];
+                    if (last_vblank >= stop_at) {
+                        reached_stop = last_vblank == stop_at;
+                        break;
+                    }
+                }
+            }
+            if (status < 0 || !warm || !reached_stop || window.empty()) {
+                fprintf(stderr, "GS replay invalid/truncated or exact requested window not reached (last vblank %llu)\n",
+                        (unsigned long long)last_vblank);
+                return 1;
+            }
+            raster_sync(); if (hw::g_on) hw::finish();
+            const uint64_t render_start = platform_time_us();
+            run_cmds(window.data(), window.size(), false);
+            raster_sync(); if (hw::g_on) hw::finish();
+            const uint64_t render_us = platform_time_us() - render_start;
+            fprintf(stderr, "GS render window (%llu,%llu]: %.3f ms (contiguous wall time; parsing/I/O/output excluded; completion included)\n",
+                    (unsigned long long)measure_at, (unsigned long long)stop_at, render_us / 1000.0);
+        } else {
+            std::vector<uint8_t> command;
+            uint64_t last_vblank = 0, dispatch_us = 0;
+            bool measuring = measure_at == 0, started = measuring, complete_boundary = false;
+            int status;
+            while ((status = input.command(command)) == 1) {
+                uint32_t h[4]; memcpy(h, command.data(), sizeof h);
+                const uint64_t tick = platform_time_us();
+                run_cmds(command.data(), command.size(), false);
+                complete_boundary = h[0] == CMD_VBLANK;
+                if (measuring) dispatch_us += platform_time_us() - tick;
+                if (h[0] != CMD_VBLANK) continue;
+                last_vblank = h[1];
+                if (!measuring && last_vblank >= measure_at) {
+                    raster_sync(); if (hw::g_on) hw::finish();
+                    measuring = started = true;
+                    dispatch_us = 0;
+                }
+                if (stop_at && last_vblank >= stop_at) break;
+            }
+            const uint64_t drain = platform_time_us();
+            raster_sync(); if (hw::g_on) hw::finish();
+            if (measuring) dispatch_us += platform_time_us() - drain;
+            if (status < 0 || !started || !complete_boundary || last_vblank <= measure_at ||
+                (stop_at && last_vblank < stop_at)) {
+                fprintf(stderr, "GS replay invalid/truncated or requested window not reached (last vblank %llu)\n",
+                        (unsigned long long)last_vblank);
+                return 1;
+            }
+            fprintf(stderr, "GS diagnostic dispatch window (%llu,%llu]: %.3f ms (parsing/I/O/output excluded; completion included)\n",
+                    (unsigned long long)measure_at, (unsigned long long)last_vblank, dispatch_us / 1000.0);
+        }
+        raster_sync();
+        prof_switch(P_GS_IDLE);
+        {
+            // time per GS category for the commands (before waiting for the GPU)
+            double us = (double)(platform_time_us() - t0), per_ms = (double)(prof_ticks() - tk0) / (us / 1000.0);
+            static const char *names[] = {"commands", "state", "draws", "textures", "new textures", "uploads",
+                                          "readbacks", "conversions", "present"};
+            fprintf(stderr, "  commands %.1f ms:", us / 1000.0);
+            for (int c = P_GS_CMDS; c < P_GS_IDLE; c++)
+                fprintf(stderr, " %s %.1f", names[c - P_GS_CMDS], (double)g_prof[c].exchange(0) / per_ms);
+            fprintf(stderr, "\n");
+        }
+        if (const char *dump = getenv("EOD_GS_REPLAY_DUMP")) {  // the GS memory after the replay
+            if (hw::g_on)
+                for (uint32_t p = 0; p < kPages; p++) hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+            if (FILE *df = fopen(dump, "wb")) {
+                fwrite(vram, 1, kVramSize, df);
+                fclose(df);
+            }
+        }
+        g_prim_counter = 0;
+        if (hw::g_on) {
+            hw::finish();
+            char line[1024];
+            hw::stats_line(line, sizeof line);
+            fprintf(stderr, "%s\n", line);
+        }
+        double ms = (platform_time_us() - t0) / 1000.0;
+        best = std::min(best, ms);
+        fprintf(stderr, "replay %d: %.1f ms\n", r + 1, ms);
+    }
+    if (f) fclose(f);
+    raster_collect_stats();
+    fprintf(stderr, "best %.1f ms, %d raster workers; per replay: %u prims, %u pixels, %llu game frames\n", best, n,
+            stats.prims / repeat, stats.pixels / repeat, (unsigned long long)(g_flips.load() / repeat));
+    uint32_t tri = 0;
+    for (int k = 0; k < 64; k++) {
+        tri += stats.kind_px[k];
+        if (stats.kind_px[k] / repeat > 20000)
+            fprintf(stderr, "  triangles gour=%d tex=%d stq=%d fog=%d zt=%d zw=%d: %u pixels\n", k & 1, (k >> 1) & 1,
+                    (k >> 2) & 1, (k >> 3) & 1, (k >> 4) & 1, (k >> 5) & 1, stats.kind_px[k] / repeat);
+    }
+    fprintf(stderr, "  sprites/lines: %u pixels\n", (stats.pixels - tri) / repeat);
+    std::string shot = std::string(path) + ".ppm";
+    gs_screenshot(shot.c_str());
+    // EOD_GS_REPLAY_ZSHOT=file: "Z32" w h, then w*h little-endian words.
+    if (zpath) {
+        const int n = (st.pmode & 1) ? 0 : 1;
+        const uint64_t fb = st.dispfb[n], disp = st.display[n];
+        const uint32_t fbp = bits(fb, 0, 9), fbw = bits(fb, 9, 6);
+        const int dbx = (int)bits(fb, 32, 11), dby = (int)bits(fb, 43, 11);
+        const int magh = (int)bits(disp, 23, 4) + 1, magv = (int)bits(disp, 27, 2) + 1;
+        const int w = ((int)bits(disp, 32, 12) + 1) / magh, h = ((int)bits(disp, 44, 11) + 1) / magv;
+        const bool fieldy = (st.smode2 & 1) && ((st.smode2 >> 1) & 1);
+        int c = 0;
+        for (int k = 0; k < 2; k++)
+            if (bits(st.ctx[k].frame, 0, 9) == fbp) { c = k; break; }
+        const uint64_t zb = st.ctx[c].zbuf;
+        const uint32_t zbp = bits(zb, 0, 9) * 32, zpsm = bits(zb, 24, 4) | 0x30;
+        if (w > 0 && h > 0 && w <= 2048 && h <= 2048) {
+            if (FILE *zf = fopen(zpath, "wb")) {
+                fprintf(zf, "Z32 %d %d\n", w, h);
+                if (!g_replay_display_depth.empty() && fbp == 0 && fbw == 10 && !dbx && !dby && !fieldy &&
+                    w == kReplayCopyWidth && h == kReplayCopyHeight) {
+                    fwrite(g_replay_display_depth.data(), sizeof(uint32_t), g_replay_display_depth.size(), zf);
+                } else {
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++) {
+                            const int sy = fieldy ? y / 2 : y;
+                            const uint32_t z = read_pixel(zpsm, (dbx + x) & 2047, (dby + sy) & 2047, zbp, fbw);
+                            fwrite(&z, 4, 1, zf);
+                        }
+                }
+                fclose(zf);
+            }
+        }
+        g_replay_depth_capture = false;
+        g_replay_display_depth.clear();
+    }
+    return 0;
+}
+
+static void gs_worker() {
+    platform_thread_fast();
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "eod-gs");
+#endif
+    hw::bind_thread();
+    EOD_THREAD_NAME("GS");
+    prof_thread_begin(P_GS_CMDS);
+    for (;;) {
+        Chunk c;
+        {
+            ProfScope prof(P_GS_IDLE);
+            std::unique_lock<std::mutex> lk(g_q_mtx);
+            g_q_cv.wait(lk, [] { return g_gs_stop || !g_q.empty(); });
+            if (g_gs_stop && g_q.empty()) break;
+            c = std::move(g_q.front());
+            g_q.pop_front();
+        }
+        uint64_t t_start = platform_time_us();
+        uint64_t frames;
+        {
+            EOD_ZONE("gs.chunk");
+            frames = run_cmds(c.data(), c.size(), true);
+        }
+        g_gs_busy_us += platform_time_us() - t_start;
+        {
+            std::lock_guard<std::mutex> lk(g_q_mtx);
+            g_done++;
+            if (frames) g_frames_done = frames;
+            if (g_free.size() < 8 && c.capacity() <= 4 * kChunkReserve) g_free.push_back(std::move(c));
+        }
+        g_q_cv_done.notify_all();
+    }
+    raster_sync();
+    if (hw::g_on) hw::finish(); // Finish rendering on its owning thread.
+}
+
+void gs_thread_start() {
+    const char *e = getenv("EOD_GS_THREAD");
+    bool want = e ? atoi(e) != 0 : platform_cpu_count() >= 2;
+    if (!want) return;
+    g_gs_stop = false;
+    g_threaded = true;
+    g_gs_worker = std::thread(gs_worker);
+    offload_start();
+    // raster workers on the cores left after the EE and GS threads
+    // (EOD_GS_RASTER=n overrides, 0 disables)
+    int hw = platform_cpu_count();
+    int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
+    if (n > 4) n = 4;
+    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);  // an explicit count is not capped
+    if (hw::g_on) n = 0;  // the GPU draws
+    raster_start(n);
+    LOG(LOG_GS, "GS runs on its own thread, %d raster workers", n > 0 ? n : 0);
+}
+
+void gs_shutdown() {
+    if (g_shutdown_complete) return;
+    g_shutdown_complete = true;
+    // Called by normal exit paths before static destruction. The EE has
+    // stopped issuing work. Stop its ticker, then the VIF/GIF producer before
+    // draining the GS stream; GS may still reference raster jobs and caches.
+    platform_stop_ticker();
+    offload_shutdown();
+    if (g_threaded) {
+        gs_sync();
+        {
+            std::lock_guard<std::mutex> lk(g_q_mtx);
+            g_gs_stop = true;
+        }
+        g_q_cv.notify_all();
+        g_gs_worker.join();
+        g_threaded = false;
+    } else {
+        raster_sync();
+        if (hw::g_on) hw::finish();
+    }
+    close_cold_zip("closed at shutdown");
+    if (g_dump) { fclose(g_dump); g_dump = nullptr; }
+    raster_shutdown();
+}
+
+void gs_init() {
+    mem_init();
+    memset(&st, 0, sizeof st);
+    st.imr = 0xFF00;
+    st.prmodecont = 1;
+    if (g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") {
+        if (hw::start(platform_native_window() != nullptr && !getenv("EOD_D3D_NOWINDOW")))
+            LOG(LOG_GS, "%s renderer",g_config.renderer.c_str());
+        else
+            LOG(LOG_GS, "%s is not available - using the software renderer",g_config.renderer.c_str());
+    }
+    gs_thread_start();
+}
+
+void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::SceneClear *clear,
+                  const native::DisplayCopy *copy, native::ShadowPass shadow, bool bootstrap_quad) {
+    ProfScope prof(P_EE_GIF);
+    if (scene_capture::g_on) scene_capture::gif(path, data, qwc);
+    if (scene_emit::g_on) scene_emit::gif(path, data, qwc);
+    if (!g_threaded) {
+        if ((!clear || !apply_scene_clear(*clear, data, qwc)) && (!copy || !apply_display_copy(*copy, data, qwc)) &&
+            !apply_shadow_pass(shadow, data, qwc) && (!bootstrap_quad || !apply_bootstrap_quad(data, qwc)))
+            gif_process(path, data, qwc);
+        return;
+    }
+    uint32_t tag = 0;
+    if (clear) {
+        native::post(native::CMD_SCENE_CLEAR, clear, sizeof *clear);
+        // Depth clear metadata is adjacent and live-only. Leave its original
+        // GIF header and payload byte-for-byte portable in GS captures.
+        if (clear->target == native::SceneClearTarget::ColorAndDepth) tag = kGifSceneClear;
+    } else if (copy) {
+        native::post(native::CMD_DISPLAY_COPY, copy, sizeof *copy);
+        tag = kGifDisplayCopy;
+    } else if (bootstrap_quad) {
+        native::post(native::CMD_BOOTSTRAP_QUAD, nullptr, 0);
+    } else if (shadow == native::ShadowPass::Prepare) {
+        tag = kGifShadowPrepare;
+    } else if (shadow == native::ShadowPass::Composite) {
+        tag = kGifShadowComposite;
+    }
+    push_cmd(CMD_GIF, (uint32_t)path, tag, data, qwc * 16);
+}
+
+namespace {
+std::vector<uint8_t> g_p3q;  // queued PATH3 data
+size_t g_p3pos;
+
+// Follows GIF tags to find packet boundaries (without executing them).
+struct GifTracker {
+    bool in_packet = false;
+    uint32_t left = 0;  // data quadwords left in the current tag
+    bool eop = false;
+    void feed(const uint8_t *q) {
+        if (!in_packet || left == 0) {
+            uint64_t lo;
+            memcpy(&lo, q, 8);
+            uint32_t nloop = (uint32_t)(lo & 0x7FFF), flg = (uint32_t)((lo >> 58) & 3);
+            uint32_t nreg = (uint32_t)((lo >> 60) & 0xF);
+            if (!nreg) nreg = 16;
+            eop = (lo >> 15) & 1;
+            left = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+            in_packet = true;
+            if (left == 0 && eop) in_packet = false;
+            return;
+        }
+        if (--left == 0 && eop) in_packet = false;
+    }
+    // feed() over the quadwords from pos to end, a tag's data at a time; stops
+    // after a packet ends.  Returns the new position.
+    size_t advance(const uint8_t *base, size_t pos, size_t end) {
+        while (pos < end) {
+            if (!in_packet || left == 0) {
+                feed(base + pos);
+                pos += 16;
+            } else {
+                size_t k = std::min<size_t>(left, (end - pos) / 16);
+                left -= (uint32_t)k;
+                pos += k * 16;
+                if (left == 0 && eop) in_packet = false;
+            }
+            if (!in_packet) break;
+        }
+        return pos;
+    }
+} g_p3track;
+bool g_p3_vif_mask, g_p3_mode_mask;
+}  // namespace
+
+void gif_path3_enqueue(const uint8_t *data, uint32_t qwc) {
+    ProfScope prof(P_EE_GIF);
+    if (!gif_path3_pending() && !g_p3_vif_mask && !g_p3_mode_mask) {
+        // not masked and nothing queued: what gif_path3_run would release right away
+        size_t end = (size_t)qwc * 16;
+        for (size_t pos = 0; pos < end;) pos = g_p3track.advance(data, pos, end);
+        gif_transfer(GIF_PATH3, data, qwc);
+        return;
+    }
+    g_p3q.insert(g_p3q.end(), data, data + (size_t)qwc * 16);
+}
+
+bool gif_path3_pending() { return g_p3pos < g_p3q.size(); }
+
+void gif_set_path3_mask(bool masked) { g_p3_vif_mask = masked; }
+
+bool gif_path3_run(int max_packets) {
+    ProfScope prof(P_EE_GIF);
+    if (g_p3_vif_mask || g_p3_mode_mask) return !gif_path3_pending();
+    int done = 0;
+    size_t start = g_p3pos;
+    while (g_p3pos < g_p3q.size()) {
+        g_p3pos = g_p3track.advance(g_p3q.data(), g_p3pos, g_p3q.size());
+        if (!g_p3track.in_packet) {  // packet finished (EOP)
+            if (max_packets >= 0 && ++done >= max_packets) break;
+        }
+    }
+    if (g_p3pos > start) gif_transfer(GIF_PATH3, &g_p3q[start], (uint32_t)((g_p3pos - start) / 16));
+    if (g_p3pos >= g_p3q.size()) {
+        g_p3q.clear();
+        g_p3pos = 0;
+        // the GIF DMA channel completes once its data has been consumed
+        dmac_channel_done(DMA_GIF);
+        return true;
+    }
+    return false;
+}
+
+uint32_t gif_reg_read(uint32_t off) {
+    switch (off) {
+    case 0x3000: return gif_reg_ctrl;
+    case 0x3010: return gif_reg_mode;
+    case 0x3020: return 0;  // STAT: idle
+    }
+    return 0;
+}
+
+void gif_reg_write(uint32_t off, uint32_t v) {
+    if (off == 0x3000) {
+        gif_reg_ctrl = v;
+        if (v & 1) {
+            g_p3track = GifTracker();
+            if (g_threaded) push_cmd(CMD_PATH_RESET, 0, 0, nullptr, 0);
+            else
+                for (auto &p : g_path) p = PathState();
+        }
+    } else if (off == 0x3010) {
+        gif_reg_mode = v;
+        g_p3_mode_mask = v & 1;  // M3R
+        if (!g_p3_mode_mask) gif_path3_run(-1);
+    }
+}
+
+void gs_set_crt(int interlace, int mode, int ffmd) {
+    LOG(LOG_GS, "SetGsCrt(interlace=%d, mode=%d, ffmd=%d)", interlace, mode, ffmd);
+    gs_priv_write64(0x0020, (interlace & 1) | ((ffmd & 1) << 1));
+}
+
+uint32_t gs_get_imr() { return (uint32_t)st.imr; }
+void gs_put_imr(uint32_t v) { st.imr = v; }
+
+uint64_t gs_priv_read64(uint32_t p) {
+    uint32_t off = p & 0x1FFF;
+    if (off == 0x1000) {
+        offload_sync();
+        gs_flush();  // let the GS thread reach pending FINISH/SIGNAL
+        return g_csr;
+    }
+    if (off == 0x1010) return st.imr;
+    if (off == 0x1080) {
+        static uint32_t n;
+        if ((++n & 255) == 1) LOG(LOG_GS, "SIGLBLID read #%u", n);
+        gs_sync();
+        return st.siglblid;
+    }
+    return 0;
+}
+
+void gs_priv_write64(uint32_t p, uint64_t v) {
+    uint32_t off = p & 0x1FFF;
+    if (off == 0x1000) {
+        // CSR: writing 1 clears SIGNAL/FINISH/HSINT/VSINT/EDWINT
+        g_csr &= ~(v & 0x1F);
+        if (v & 0x200) {  // RESET
+            if (g_threaded) offload_run([] { push_cmd(CMD_PATH_RESET, 0, 0, nullptr, 0); });
+            else
+                for (auto &ps : g_path) ps = PathState();
+        }
+        return;
+    }
+    if (off == 0x1010) {
+        st.imr = v;
+        return;
+    }
+    if (g_threaded) {
+        offload_run([off, v] { push_cmd(CMD_PRIV, off, 0, &v, 8); });
+        return;
+    }
+    priv_apply(off, v);
+}
+
+void priv_apply(uint32_t off, uint64_t v) {
+    switch (off) {
+    case 0x0000: st.pmode = v; break;
+    case 0x0010: st.smode1 = v; break;
+    case 0x0020: st.smode2 = v; break;
+    case 0x0030: st.srfsh = v; break;
+    case 0x0040: st.synch1 = v; break;
+    case 0x0050: st.synch2 = v; break;
+    case 0x0060: st.syncv = v; break;
+    case 0x0070: st.dispfb[0] = v; break;
+    case 0x0080: st.display[0] = v; break;
+    case 0x0090: st.dispfb[1] = v; break;
+    case 0x00A0: st.display[1] = v; break;
+    case 0x00B0: st.extbuf = v; break;
+    case 0x00C0: st.extdata = v; break;
+    case 0x00D0: st.extwrite = v; break;
+    case 0x00E0: st.bgcolor = v; break;
+    case 0x1040: st.busdir = v; break;
+    case 0x1080: st.siglblid = v; break;
+    default: break;
+    }
+}
+
+void gs_priv_write32(uint32_t p, uint32_t v) {
+    uint32_t off = p & 0x1FFF;
+    uint64_t cur = 0;
+    switch (off & ~7u) {
+    case 0x1000: cur = g_csr; break;
+    case 0x1010: cur = st.imr; break;
+    default: break;
+    }
+    if (off & 4)
+        gs_priv_write64(off & ~7u, (cur & 0xFFFFFFFFull) | ((uint64_t)v << 32));
+    else if ((off & ~7u) == 0x1000)
+        gs_priv_write64(off, v);  // CSR: only the written bits matter
+    else
+        gs_priv_write64(off, (cur & ~0xFFFFFFFFull) | v);
+}
+
+// A self-contained PNG writer (RGB8, zlib "stored" blocks, no compression
+// library) so screenshots open directly in any viewer on every platform.
+static bool write_png(const char *path, const std::vector<uint32_t> &img, int w, int h) {
+    static uint32_t crc_table[256];
+    if (!crc_table[1])
+        for (uint32_t n = 0; n < 256; ++n) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crc_table[n] = c;
+        }
+    std::vector<uint8_t> raw;
+    raw.reserve((size_t)h * ((size_t)w * 3 + 1));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);  // filter: none
+        for (int x = 0; x < w; ++x) {
+            const uint32_t px = img[(size_t)y * w + x];
+            raw.push_back((uint8_t)px); raw.push_back((uint8_t)(px >> 8)); raw.push_back((uint8_t)(px >> 16));
+        }
+    }
+    std::vector<uint8_t> z = {0x78, 0x01};
+    uint32_t a = 1, b = 0;
+    for (uint8_t c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
+    for (size_t off = 0; off < raw.size() || off == 0; ) {
+        const size_t n = std::min<size_t>(65535, raw.size() - off);
+        const bool last = off + n >= raw.size();
+        z.push_back(last ? 1 : 0);
+        z.push_back((uint8_t)n); z.push_back((uint8_t)(n >> 8));
+        z.push_back((uint8_t)~n); z.push_back((uint8_t)(~n >> 8));
+        z.insert(z.end(), raw.begin() + off, raw.begin() + off + n);
+        off += n;
+        if (last) break;
+    }
+    const uint32_t adler = (b << 16) | a;
+    for (int i = 3; i >= 0; --i) z.push_back((uint8_t)(adler >> (i * 8)));
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    auto be32 = [&](uint32_t v) { uint8_t q[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v}; fwrite(q, 1, 4, f); };
+    auto chunk = [&](const char *type, const uint8_t *data, size_t n) {
+        be32((uint32_t)n);
+        uint32_t c = 0xFFFFFFFFu;
+        for (int i = 0; i < 4; ++i) c = crc_table[(c ^ (uint8_t)type[i]) & 0xFF] ^ (c >> 8);
+        for (size_t i = 0; i < n; ++i) c = crc_table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        fwrite(type, 1, 4, f);
+        if (n) fwrite(data, 1, n, f);
+        be32(c ^ 0xFFFFFFFFu);
+    };
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    fwrite(sig, 1, 8, f);
+    const uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                              (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
+    chunk("IHDR", ihdr, 13);
+    chunk("IDAT", z.data(), z.size());
+    chunk("IEND", nullptr, 0);
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
+bool gs_screenshot(const char *path) {
+    std::vector<uint32_t> img;
+    int w = 0, h = 0;
+    if (hw::g_on) {
+        if (!hw::read_display(img, w, h)) return false;
+    } else {
+        std::lock_guard<std::mutex> lk(g_pub_mtx);
+        if (g_pub.empty()) return false;
+        img = g_pub;
+        w = g_pub_w;
+        h = g_pub_h;
+    }
+    const size_t len = strlen(path);
+    if (len > 4 && (strcmp(path + len - 4, ".png") == 0 || strcmp(path + len - 4, ".PNG") == 0))
+        return write_png(path, img, w, h);
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (uint32_t px : img) {
+        uint8_t rgb[3] = {(uint8_t)px, (uint8_t)(px >> 8), (uint8_t)(px >> 16)};
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+    return true;
+}
+
+namespace {
+void editor_preview_capture(uint64_t frame, bool offscreen, bool software_locked) {
+    const char *path = std::getenv("EOD_EDITOR_PREVIEW");
+    if (!path || !*path || !editor_test_startup::state().claim_preview(offscreen)) return;
+    // Reuse the existing screenshot readback/PNG writer. Publish only a complete
+    // PNG; a missing/unwritable project path must never prevent the race running.
+    const std::string temporary = std::string(path) + ".tmp.png";
+    const bool written = software_locked ? write_png(temporary.c_str(), g_pub, g_pub_w, g_pub_h)
+                                         : gs_screenshot(temporary.c_str());
+    const bool published = written && std::rename(temporary.c_str(), path) == 0;
+    if (!published) std::remove(temporary.c_str());
+    std::fprintf(stderr, "[editor-test] first race preview %s: vblank=%llu drawn=%llu source=%s path=%s\n",
+        published ? "saved" : "failed", (unsigned long long)frame, (unsigned long long)g_flips.load(),
+        offscreen ? "offscreen scanout (no window presentation)" : "accepted presentation", path);
+}
+} // namespace
+
+void gs_editor_preview_software_frame(bool offscreen) {
+    // Called by the SDL presenter while gs_vblank holds g_pub_mtx, after the
+    // exact published image was accepted or copied by the headless presenter.
+    editor_preview_capture(g_pub_frame, offscreen, true);
+}
+
+uint64_t gs_drawn_frames() { return g_flips.load(); }
+
+void gs_editor_race_frame_submitted() {
+    if (!editor_test_startup::state().enabled()) return;
+    if (g_threaded) {
+        offload_run([] {
+            push_cmd(CMD_EDITOR_RACE_FRAME, 0, 0, nullptr, 0);
+            gs_flush();
+        });
+    } else {
+        offload_run([] {
+            if (editor_test_startup::state().race_submitted(g_flips.load()))
+                std::fprintf(stderr, "[editor-test] native race draw consumed by GS (unthreaded): vblank=%llu drawn=%llu\n",
+                    (unsigned long long)g_frames, (unsigned long long)g_flips.load());
+        });
+    }
+}
+
+// Shows the last image again with the overlay (the game is paused in the in-game menu).
+void gs_overlay_redraw() {
+    if (!hw::g_on) return;
+    if (g_threaded) {
+        offload_run([] {
+            push_cmd(CMD_REDRAW, 0, 0, nullptr, 0);
+            gs_flush();
+        });
+    } else {
+        hw::redraw();
+    }
+}
+
+void gs_menu_hold_frame(uint64_t n) {
+    if (g_opt_screenshot_every && n % (uint64_t)g_opt_screenshot_every == 0) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/menu_%05llu.png", g_opt_screenshot_dir.c_str(), (unsigned long long)n);
+        gs_screenshot(path);
+    }
+    if (g_opt_frames && g_frames + n >= (uint64_t)g_opt_frames) {
+        LOG(LOG_CORE, "reached %d frames (menu open) - exiting", g_opt_frames);
+        app_exit(0);
+    }
+}
+
+void gs_vblank() {
+    // VSINT, field toggle
+    g_csr |= 8;
+    g_csr ^= 0x2000;
+    if (!(st.imr & 0x800)) intc_raise(INTC_GS);
+    g_frames++;
+    g_ee_vblanks = g_frames;
+    log_frame(g_frames);
+    if (g_threaded) {
+        uint64_t f = g_frames;
+        const uint32_t aspect = presentation::tag(eod_presentation_aspect());
+        offload_run([f, aspect] {
+            if (scene_capture::g_on) scene_capture::vblank(f);
+            if (scene_emit::g_on) scene_emit::vblank(f);
+            push_cmd(CMD_VBLANK, (uint32_t)f, aspect, nullptr, 0);
+            gs_flush();
+        });
+        // don't let the GS thread fall more than a couple of frames behind
+        ProfScope prof(P_EE_WAIT);
+        uint64_t t = platform_time_us();
+        std::unique_lock<std::mutex> lk(g_q_mtx);
+        g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
+        g_ee_wait_us += platform_time_us() - t;
+    } else {
+        if (scene_capture::g_on) offload_run([f = g_frames] { scene_capture::vblank(f); });
+        if (scene_emit::g_on) offload_run([f = g_frames] { scene_emit::vblank(f); });
+        gs_frame_end(g_frames, eod_presentation_aspect());
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_pub_mtx);
+        if (!g_pub.empty()) {
+            presentation::set(g_pub_aspect);
+            platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        }
+    }
+    {
+        // speed in the window title, every second
+        static uint64_t tt0, tf0, tv0;
+        uint64_t tnow = platform_time_us();
+        if (!tt0) tt0 = tnow, tf0 = g_flips, tv0 = g_frames;
+        if (tnow - tt0 >= 1000000) {
+            double sec = (double)(tnow - tt0) / 1e6;
+            char buf[96];
+            snprintf(buf, sizeof buf, "%.0f%% speed, %.0f fps", (double)(g_frames - tv0) / sec * (100.0 / 59.94),
+                     (double)(g_flips - tf0) / sec);
+            platform_set_status(buf);
+            tt0 = tnow, tf0 = g_flips, tv0 = g_frames;
+        }
+    }
+    {
+        // EOD_FPS=1: print the game's frame rate every 5 seconds
+        static bool show = getenv("EOD_FPS") != nullptr;
+        static uint64_t t0, f0, g0, v0, i0;
+        if (show) {
+            extern std::atomic<uint64_t> g_ee_idle_us;
+            uint64_t now = platform_time_us();
+            if (!t0) t0 = now, f0 = g_flips, g0 = g_game_flips, v0 = g_frames, i0 = g_ee_idle_us;
+            if (now - t0 >= 5000000) {
+                double sec = (double)(now - t0) / 1e6;
+                fprintf(stderr,
+                        "fps: %.1f vblank/s, game %.1f frames/s, drawn %.1f frames/s, EE busy %.0f%%, GS busy %.0f%%, "
+                        "EE waiting %.0f%% (%.0f%% in syncs)\n",
+                        (double)(g_frames - v0) / sec, (double)(g_game_flips - g0) / sec, (double)(g_flips - f0) / sec,
+                        100.0 - (double)(g_ee_idle_us - i0) / (sec * 1e4), g_gs_busy_us / (sec * 1e4),
+                        g_ee_wait_us / (sec * 1e4), g_ee_sync_us / (sec * 1e4));
+                char ee[256], gsl[256];
+                prof_report(ee, sizeof ee, gsl, sizeof gsl);
+                fprintf(stderr, "%s\n%s\n", ee, gsl);
+                g_ee_sync_us = 0;
+                g_gs_busy_us = 0;
+                g_ee_wait_us = 0;
+                t0 = now;
+                f0 = g_flips;
+                g0 = g_game_flips;
+                v0 = g_frames;
+                i0 = g_ee_idle_us;
+            }
+        }
+    }
+    static int s_shot_start = -1, s_shot_end = -1;
+    if (s_shot_start == -1) {
+        const char *st = getenv("EOD_SCREENSHOT_START");
+        s_shot_start = st ? atoi(st) : 0;
+        const char *en = getenv("EOD_SCREENSHOT_END");
+        s_shot_end = en ? atoi(en) : 0x7FFFFFFF;
+    }
+    // EOD_SCREENSHOT_AT=v1,v2,...: only vblanks within -3..+3 of each (P3 pairs, tools/p3_compare.py)
+    static const std::vector<int> s_shot_at = [] {
+        std::vector<int> v;
+        if (const char *a = getenv("EOD_SCREENSHOT_AT"))
+            for (const char *p = a; *p;) {
+                char *e;
+                const long n = strtol(p, &e, 10);
+                if (e == p) break;
+                v.push_back((int)n);
+                p = *e == ',' ? e + 1 : e;
+            }
+        return v;
+    }();
+    bool shot_window = s_shot_at.empty();
+    for (int at : s_shot_at) shot_window |= (int)g_frames >= at - 3 && (int)g_frames <= at + 3;
+    if (g_opt_screenshot_every && (g_frames % g_opt_screenshot_every) == 0 && shot_window &&
+        (int)g_frames >= s_shot_start && (int)g_frames <= s_shot_end) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/frame_%05llu.png", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
+        gs_screenshot(path);
+        if (getenv("EOD_DUMP_VRAM")) {  // raw 4MB VRAM next to the screenshot
+            gs_sync();
+            snprintf(path, sizeof path, "%s/vram_%05llu.bin", g_opt_screenshot_dir.c_str(), (unsigned long long)g_frames);
+            if (FILE *f = fopen(path, "wb")) {
+                fwrite(vram, 1, kVramSize, f);
+                fclose(f);
+            }
+        }
+    }
+    if (g_opt_frames && (int)g_frames >= g_opt_frames) {
+        LOG(LOG_CORE, "reached %d frames - exiting", g_opt_frames);
+        app_exit(0);
+    }
+}

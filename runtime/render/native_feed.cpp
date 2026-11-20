@@ -22,6 +22,7 @@
 #include "../core/limit_tracker.h"
 #include "../core/memory.h"
 #include "scene_tap.h"
+#include "sun_cascades.h"
 #include "vif_mesh.h"
 #include "vu.h"
 
@@ -104,6 +105,18 @@ bool display_copy_enabled() {
 #endif
 }
 
+bool sun_cascades_enabled() {
+#ifdef EOD_PLUME
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_SUN_CASCADES");
+        return !value || value[0] == '1';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 namespace {
 
 bool shadow_pass_enabled() {
@@ -112,17 +125,21 @@ bool shadow_pass_enabled() {
         const char *value = std::getenv("EOD_NATIVE_SHADOW_PASS");
         return !value || value[0] != '0';
     }();
-    return on && native_only();
+    return on && (native_only() || sun_cascades_enabled());
 #else
     return false;
 #endif
 }
+
+// EE-thread selection, latched before ShadowTargetOpen for both ordered DIRECT packets.
+bool g_hybrid_shadow_cascades = false;
 
 uint32_t shadow_direct_qwc(ShadowPass pass) {
     return pass == ShadowPass::Prepare ? kShadowPrepareDirectQwc : kShadowCompositeDirectQwc;
 }
 
 ShadowPass shadow_reservation(uint32_t ra, uint32_t qwc) {
+    if (!native_only() && !g_hybrid_shadow_cascades) return ShadowPass::None;
     const ShadowPass pass = ra == 0x362a34 ? ShadowPass::Prepare
                           : ra == 0x362f34 ? ShadowPass::Composite : ShadowPass::None;
     if (pass == ShadowPass::None || qwc != shadow_direct_qwc(pass) + 1) return ShadowPass::None;
@@ -1277,11 +1294,15 @@ void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k) {
 }
 void ee_blend_select(uint32_t sel) { g_tex.blend_sel = sel; }
 
-void ee_shadow_begin(int32_t alpha) {
+void ee_shadow_begin(int32_t alpha, bool retail_single_view) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
     std::memset(&g_shadow_cam, 0, sizeof g_shadow_cam);
     fill_camera(g_shadow_cam);
+    g_shadow_cam.retail_shadow_view = retail_single_view;
+    g_hybrid_shadow_cascades = sun_cascades_enabled() && look_modern() && retail_single_view &&
+                              !g_shadow_cam.editor_environment && !g_shadow_cam.fge &&
+                              sun_cascades::daylight(g_shadow_cam.fogcol);
     // 0x363480: intensity = (alpha >> 1) + (alpha >> 7) in GS 0..128 alpha units
     const int32_t half = (alpha - (alpha >> 31)) >> 1;
     const int32_t adj = (alpha < 0 ? alpha + 0x7F : alpha) >> 7;
@@ -1492,6 +1513,12 @@ void ee_particle_add(int32_t col_rgb, int32_t col_alpha, float size, float x, fl
     static constexpr float kU[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     static constexpr float kV[4] = {1.0f, 1.0f, 0.0f, 0.0f};
     Mesh &m = *g_particle_mesh;
+    if (m.billboards.size() < scene::kMaxEffectBillboardsPerStream &&
+        g_wc.particle_quads + g_wc.sprite_quads < scene::kMaxEffectBillboardsPerVblank) {
+        const auto rgb = (uint8_t)rgb_base;
+        m.billboards.push_back({{x, y, z}, size, {0.0f, 1.0f, 1.0f, 0.0f},
+                                angle, half_scale, {rgb, rgb, rgb, alpha}});
+    }
     const uint32_t base = (uint32_t)m.vertices.size();
     for (int k = 0; k < 4; k++) {
         const float dx = kSx[k] * rpx + kSy[k] * upx;
@@ -1588,6 +1615,9 @@ void emit_sprite_quad(const uint32_t col[4], float x, float y, float z, float si
     const float us[4] = {u0, u1, u0, u1};
     const float vs[4] = {v0, v0, v1, v1};
     Mesh &m = *g_sprite_mesh;
+    if (m.billboards.size() < scene::kMaxEffectBillboardsPerStream &&
+        g_wc.particle_quads + g_wc.sprite_quads < scene::kMaxEffectBillboardsPerVblank)
+        m.billboards.push_back({{x, y, z}, size, {u0, v0, u1, v1}, 0.0f, 0.0f, {r, g, b, a}});
     const uint32_t base = (uint32_t)m.vertices.size();
     for (int k = 0; k < 4; k++) {
         Vertex v{};
@@ -1680,7 +1710,7 @@ void ee_imm_begin(bool cockpit, bool hud) {
 
 bool ee_in_imm() { return g_in_imm && g_imm_mesh; }
 
-void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip) {
+void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip, float spark_age) {
     if (!g_in_imm || !g_imm_mesh) return;
     uint32_t c = (colour >> 1) & 0x7F7F7F7Fu;
     c += (c & 0x40404040u) >> 6;
@@ -1698,6 +1728,11 @@ void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint3
     v.c[2] = (uint8_t)c;
     v.c[3] = a;
     Mesh &m = *g_imm_mesh;
+    if (std::isfinite(spark_age) && spark_age >= 0.0f) {
+        // A prelit immediate vertex has no normal. Reserve zero for unknown age.
+        v.n[0] = (int8_t)(1 + std::lround(std::min(1.0f, spark_age) * 126.0f));
+        m.has_spark_age = true;
+    }
     const uint32_t idx = (uint32_t)m.vertices.size();
     m.vertices.push_back(v);
     g_wc.imm_verts++;

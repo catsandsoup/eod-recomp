@@ -44,7 +44,14 @@ extern "C" void f_0034E308_orig() { simulate_original(); }
 extern "C" void f_00212B58_orig() { uint32_t u=MEM_LW(0x495d58); std::memcpy(&distance_seen,&u,4); simulate_original(); }
 extern "C" void f_00212B58();
 uint8_t g_scratchpad[0x4000];                     // hle_draw_distance.cpp (DrawDistance off here)
-extern "C" void f_00214678_orig() { simulate_original(); }
+static bool graf_needs_relocation = true;
+constexpr uint32_t guest_stack = 0x20000;
+extern "C" void f_00214678_orig() {
+    // Simulate the version and relocation outputs written by the native resource lookup.
+    MEM_SW(g_ee.r[29].uw[0] - 0xd0 + 0x30, 18);
+    MEM_SW(g_ee.r[29].uw[0] - 0xd0 + 0x3c, graf_needs_relocation);
+    simulate_original();
+}
 extern "C" void f_00214678();
 extern "C" void f_003582B8_orig() { simulate_original(); }
 extern "C" void f_0021ABF8();
@@ -53,6 +60,7 @@ extern "C" void f_00218E68();
 extern "C" void f_0034E308();
 static void invoke(void (*fn)()) {
     std::memset(&g_ee,0,sizeof g_ee); g_ee.r[4].uw[0]=object;
+    g_ee.r[29].uw[0] = guest_stack;
     fn();
     check(std::memcmp(&g_ee,&native_after,sizeof g_ee)==0,"full native EE result preserved");
     check(MEM_LW(0x200)==0x12345678,"native side effect preserved");
@@ -91,16 +99,33 @@ static void check_world_lod(std::vector<uint8_t> &memory, bool maximum, bool ext
                          {100 * factor, open, open}, {100, 400 * factor, open},
                          {100, 100 * factor, open}};
     for (unsigned i = 0; i < 5; ++i) std::memcpy(expected.data() + groups + 32 * i, wanted[i], 12);
+    constexpr uint32_t version = 18, first_load = 1, resident = 0;
+    const uint32_t graf_version = guest_stack - 0xd0 + 0x30;
+    const uint32_t graf_relocate = guest_stack - 0xd0 + 0x3c;
+    std::memcpy(expected.data() + graf_version, &version, 4);
+    std::memcpy(expected.data() + graf_relocate, &first_load, 4);
     invoke(f_00214678);
     check(memory == expected, "only populated retail-shaped world LODs collapse at Maximum, with the cutoff scaled once");
+
+    graf_needs_relocation = false;
+    std::memcpy(expected.data() + graf_relocate, &resident, 4);
+    invoke(f_00214678);
+    check(memory == expected, "reusing the same relocated GRAF keeps all existing world LOD thresholds");
+
+    // A freshly loaded GRAF can reuse the same guest addresses.
+    for (unsigned i = 0; i < 5; ++i) std::memcpy(memory.data() + groups + 32 * i, original[i], 12);
+    graf_needs_relocation = true;
+    std::memcpy(expected.data() + graf_relocate, &first_load, 4);
+    invoke(f_00214678);
+    check(memory == expected, "world LOD policy applies again to fresh GRAF bytes at the same address");
 }
 
 int main(int argc,char **argv) {
     check(argc==2 || argc==3,"mode: off/one/two/trace/invalid/high/maximum/override [8]");
     const std::string mode=argv[1];
     const bool test_draw_distance = argc == 3;
-    check(!test_draw_distance || (mode == "maximum" && std::strcmp(argv[2], "8") == 0),
-          "extended draw distance requires maximum mode and factor 8");
+    check(!test_draw_distance || ((mode == "maximum" || mode == "off") && std::strcmp(argv[2], "8") == 0),
+          "extended draw distance requires maximum or off mode and factor 8");
     unsetenv("EOD_CAR_LOD_MULTIPLIER"); unsetenv("EOD_LOD_TRACE");
     unsetenv("EOD_DRAW_DISTANCE");
     if (mode=="one") setenv("EOD_CAR_LOD_MULTIPLIER","1",1);
@@ -166,8 +191,12 @@ int main(int argc,char **argv) {
         MEM_SW(0x3d1a74,views);
         auto snapshot = memory;
         if (test_draw_distance) {
-            const float fog_start = views == 5 ? 28.75f : 115.0f;
-            const float fog_end = views == 5 ? 575.0f : 2300.0f;
+            uint32_t fog_views = views;
+            if (views == 0 || (mode == "maximum" && views <= 4)) fog_views = 1;
+            if (views > 4) fog_views = 4;
+            const float fog_distance = 1150.0f / float(fog_views);
+            const float fog_start = fog_distance * 0.1f;
+            const float fog_end = fog_distance * 2.0f;
             std::memcpy(snapshot.data() + 0x4d8b84, &fog_start, sizeof fog_start);
             std::memcpy(snapshot.data() + 0x4d8b88, &fog_end, sizeof fog_end);
         }

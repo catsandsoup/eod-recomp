@@ -99,6 +99,7 @@ struct NativeSurfaces {
     uint32_t width, height;        // surface size in pixels
     uint32_t gs_width, gs_height;  // in GS pixels
     int scale;                     // RenderScale
+    uint64_t color_ownership, depth_ownership; // physical pages reacquired since the prior use
 };
 bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback = false);
 bool native_begin_depth_clear(const Env &e, NativeSurfaces &out);
