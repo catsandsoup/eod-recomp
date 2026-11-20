@@ -322,7 +322,7 @@ struct Context {
     uint64_t gpuPresents = 0, gpuReportUs = 0, gpuFirst = UINT64_MAX, gpuLast = 0, gpuCmdbufs = 0, gpuWaits0 = 0;
     bool gpu_prof() {
         if (gpuProf < 0) {
-            gpuProf = (getenv("EOD_FPS") || getenv("EOD_GPU_PROF") || getenv("EOD_DRAW_PROF")) ? 1 : 0;
+            gpuProf = (getenv("EOD_FPS") || getenv("EOD_GPU_PROF") || getenv("EOD_GPU_TIMING") || getenv("EOD_DRAW_PROF")) ? 1 : 0;
             VkPhysicalDeviceProperties p;
             vkGetPhysicalDeviceProperties(physical, &p);
             tsPeriod = p.limits.timestampPeriod;

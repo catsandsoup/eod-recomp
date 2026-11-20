@@ -807,6 +807,32 @@ Headless, muted, `RenderScale=1`, `Detail=maximum`, Battle (8 AI) unless named.
 - Headless captures every vblank lag the look by a few frames (identical Classic / Modern halves); the checker skips such pairs.
 - Camera views were not cycled in the guardrail runs (default chase view only).
 
+### Results (R6 Phase A2)
+
+R6 A2 by Antigravity "Neon", verified and finished by Claude. Headless, muted, `RenderScale=1`,
+`Detail=maximum`, `DrawDistance=8`, Battle (8 AI) with `EOD_CHICKENS=1`, camera view changed by the
+pad script at vb 900 / 1300 / 1700 / 2100, look toggled every 30 vblanks from vb 1500; pairs are
+vb T-5 / T+5 of each toggle, skipping pairs in a game fade or cut (a frame more than 5% off its
+same-look neighbour 5 vblanks away).
+
+| Check | Result |
+|---|---|
+| Materials (`tools/material_runtime.py`) | the 318 `needs_human` records are resolved by deterministic name rules (`AUTO_NAME_RULES`; blend cards stay unlit `fx`, PBR bounds on resolved metal); `.tm0` high-res members inherit their `.tex` record by stem; unmatched indexed TEX members get an auto record. 3,167 records (3,133 keyed) vs 2,728 (2,694); draws with a record: Dundas 96.3..96.7% (was 69.9%), Gilroy 88.2..89.7% (was 72.1..74.0%), Career free roam 85.9..87.4% (was 71.8%); low-confidence records seen 0 |
+| Row 8 (`EOD_GPU_TIMING=1`) | Vulkan timestamps around each native main and shadow pass (8-slot query ring, read back late); `[r6] GPU timing` line, counted from the first toggle on. Modern - Classic: Dundas +0.09..+0.23 ms (1.62 / 1.71..1.85 ms), Gilroy +0.04..+0.12 ms, Career -0.19..+0.02 ms. PASS. Modern issues fewer API draws than Classic (Classic draws once per VU1 TEX1.K run of an item; same item list) |
+| Row 1 (`EOD_NATIVE_ONLY=1`) | Plume clears its own target from the dropped GS clear sprites, and the display reads Plume's last 3D target, so native-only captures are no longer black: Dundas 10 frames lum mean 122..125, 100% non-zero; Gilroy night 12.0..12.8, 59..63% non-zero; Career 8 of 9 frames lum 116..141 (one frame at a game fade, black) |
+| Rows 4..7 | Career free roam: whole 0.999, region 0.899, new 1.0 px 0, opaque blocks 0: PASS. Dundas: whole 1.052, region 1.159 (one pair), new 1.0 px 0.016%, opaque 0.089%. Gilroy night (Postal, cycled views): whole 0.61, region 0.33, opaque 0 - the same with the A1 material table (0.66 / 0.32..2.10), so it comes from the cycled camera views, not from A2 |
+| Modern GPU VFX | `vfx_fire` / `vfx_smoke` / `vfx_spark` classes (soft radial mask on particle / sprite quads, fBM flame / wisp, ember core; tint and mask only, never brighter than Classic). Opt-in with `EOD_MODERN_VFX=1`: with it on, row 7 fails (opaque blocks Dundas 0.18%, Gilroy 1.79%; 0.09% / 0% with it off), so by default these records are unlit `fx` cards |
+| Classic | Classic SPIR-V (`native_shaders_spv.inc`), pipelines and push constants unchanged; all A2 code runs only for Look=Modern, `EOD_NATIVE_ONLY=1` or `EOD_GPU_TIMING`. P3 Gilroy night (Taxi, 7 windows vb 1050..2250): MAE 3.50 / SSIM 0.928, per window 1.5..7.1, inside A1's per-window range 1.18..8.82 (A1 24 windows: 2.73 / 0.953) |
+| P5 toggle | 24 toggles per scene: pipelines 19 -> 19 (Dundas, Gilroy), 17 -> 17 (Career) |
+| EOD_DIFF | Gilroy Limo, `EOD_DIFF=all`, Look=Modern toggling every 97 vblanks, 1,500 frames: 28 functions, 1,279 checked, 1 mismatched (`0x214B68`, camera / LOD EE code that A2 does not touch); EE state vs GS: 0 mismatches |
+
+### Open (R6 A2)
+
+- Modern GPU VFX makes flat bright blocks (row 7 FAIL with `EOD_MODERN_VFX=1`): find which cards (KIND_QUEUE / immediate fire meshes without the radial mask are the suspects) and fix before turning it on by default.
+- Gilroy night with cycled camera views: Modern region luminance 0.33..0.63 of Classic (rows 4/5), pre-existing with the A1 table; find which view and region.
+- `EOD_DIFF` mismatch in `0x214B68` (1 of 5 calls): check whether it reproduces in Classic.
+- P3 at the A1 window set (24 windows vb 700..2310) for a like-for-like Classic number.
+
 ---
 
 ## Stage R4: shadows, particles, sprites, flares and immediate geometry

@@ -120,6 +120,8 @@ void take_expected(uint64_t before, std::map<uint64_t, Expected> &out);
 // EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
 bool native_only();
 int native_only_level();  // EOD_NATIVE_ONLY value (2: the GS keeps drawing sprites)
+// Last 3D target Plume rendered to (used by EOD_NATIVE_ONLY=1 capture when the GS copy sprite is dropped)
+bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm);
 
 // ---- VIF1 thread (runtime/vu/vif.cpp) -------------------------------------------------------
 void vu1_start(uint32_t program, uint32_t itop);

@@ -15,7 +15,7 @@ fails blocks the commit.
 | 5 | Washed-out ground | Baked vertex light × 1.35, then ACES lifting the lows | Never relight on top of baked light. Baked vertex light multiplies albedo once, and tone mapping keeps the mid-tones. Check: average luminance per screen region within ±15% of Classic, in day and at night. |
 | 6 | White streaks | Over-exposure made the dust decals read white | Decals and FX keep the game's blend. Check: no pixel at luminance 1.0 outside sky, sun, lights and emissive surfaces. |
 | 7 | Solid walls from FX cards | Draws with no GS state were drawn with default state | Blend and alpha come only from the game's render state (the material table has no blend field). A batch with no state is skipped and logged, never drawn opaque. Check: `fx` and `emissive_light` cards show no opaque rectangles. |
-| 8 | Lag (11→18.6 ms/frame, 14–23k draws) | Per-draw CPU cost in the GS shim, alpha-test pass/fail splits | No GS shim in the Modern path. Draws are batched by material, with no per-draw descriptor churn. Check: Modern costs at most 2 ms/frame more than Classic at 1x on Dundas with max cars (`EOD_GPU_PROF`), and the draw count is about the same as Classic. |
+| 8 | Lag (11→18.6 ms/frame, 14–23k draws) | Per-draw CPU cost in the GS shim, alpha-test pass/fail splits | No GS shim in the Modern path. Draws are batched by material, with no per-draw descriptor churn. Check: Modern costs at most 2 ms/frame more than Classic at 1x on Dundas with max cars (`EOD_GPU_TIMING=1`, `[r6] GPU timing`), and Modern draws the same items as Classic (no more API draws). |
 | 9 | 4x MSAA on top of supersampling | MSAA was left on with RenderScale > 1 | MSAA is off when RenderScale ≥ 2. |
 
 ## General rules

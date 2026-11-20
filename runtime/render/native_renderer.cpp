@@ -1,6 +1,7 @@
 // native_renderer.cpp - GS-thread side of the native renderer (native_renderer.h): which GS draws
 // belong to native objects, the objects' GS state, and the plume renderer that draws them.
 #include "core/diff_harness.h"
+#include "core/trace.h"
 #include "native_renderer.h"
 
 #include <algorithm>
@@ -255,7 +256,10 @@ struct Renderer {
 Renderer g_r;
 
 // ---- stage R6: material records and the Classic / Modern look (docs/NATIVE_RENDERER.md "Stage R6")
-enum : uint32_t { C_GENERIC = 0, C_UNLIT = 1, C_PAINT = 2, C_GLASS = 3, C_WATER = 4, C_CHROME = 5 };
+enum : uint32_t {
+    C_GENERIC = 0, C_UNLIT = 1, C_PAINT = 2, C_GLASS = 3, C_WATER = 4, C_CHROME = 5,
+    C_VFX_FIRE = 6, C_VFX_SMOKE = 7, C_VFX_SPARK = 8
+};
 struct Material {
     std::string id, surface;
     uint32_t cls = C_GENERIC, metal4 = 0, rough4 = 12;
@@ -274,11 +278,151 @@ std::atomic<uint32_t> g_look_toggles{0};
 // statistics: draws drawn in each look, draws with a material, Modern draws whose texture has a
 // low-confidence record (the 318 needs_human records)
 uint64_t g_draws_textured = 0, g_draws_material = 0, g_draws_all = 0, g_textures_material = 0, g_textures_indexed = 0;
+uint64_t g_draws_vfx[3] = {};  // Modern GPU VFX draws: fire, smoke, spark
 uint64_t g_pk_fallback = 0, g_sets_late = 0;
 std::map<int32_t, uint32_t> g_low_seen;  // record -> bbox lines logged
 float g_sun_world[3] = {0.0f, 1.0f, 0.0f}, g_sun_col[3] = {64, 64, 64};
 uint32_t g_sky_top = 0, g_sky_hor = 0;
 bool g_sky_seen = false;
+
+// ---- stage R6 A2: EOD_NATIVE_ONLY=1 Plume-side clear state (guardrail row 1) ----
+struct OnlyClear {
+    bool color = false, depth = false;
+    float r = 0, g = 0, b = 0, a = 1, z = 0;
+};
+std::unordered_map<uint32_t, OnlyClear> g_only_clears;
+
+// ---- stage R6 A2: Native Vulkan GPU Timestamp Timer (guardrail row 8, EOD_GPU_TIMING=1) ----
+struct GpuTimer {
+    static constexpr uint32_t kRing = 8;
+    static constexpr uint32_t kQueries = 64;  // up to 32 native passes per vblank
+    struct Slot {
+        VkQueryPool pool = VK_NULL_HANDLE;
+        uint32_t used = 0;
+        uint32_t spans[kQueries / 2] = {};    // bit 0: is_shadow, upper bits: start query index
+        uint32_t n_spans = 0;
+        uint32_t draws = 0;
+        uint64_t vb = 0;
+        uint8_t look = 0;
+        bool reset_done = false;
+        bool pending = false;
+    };
+    bool enabled = false;
+    double ts_period = 1.0;  // nanoseconds per tick
+    Slot slots[kRing]{};
+    uint32_t cur = 0;
+    // Per-look GPU timing accumulators (0 = Classic, 1 = Modern)
+    double sum_ms[2] = {}, max_ms[2] = {}, shadow_ms[2] = {};
+    uint64_t frames[2] = {}, draws[2] = {};
+};
+GpuTimer g_gpu;
+
+void gpu_timer_init() {
+    auto env_on = [](const char *k) {
+        const char *v = std::getenv(k);
+        return v && *v && *v != '0';
+    };
+    if (!env_on("EOD_GPU_TIMING") && !env_on("EOD_GPU_PROF")) return;
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g_r.dev->physicalDevice, &props);
+    if (!props.limits.timestampComputeAndGraphics || props.limits.timestampPeriod <= 0.0f) return;
+    g_gpu.ts_period = (double)props.limits.timestampPeriod;
+    VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    ci.queryCount = GpuTimer::kQueries;
+    for (uint32_t i = 0; i < GpuTimer::kRing; i++) {
+        if (vkCreateQueryPool(g_r.dev->vk, &ci, nullptr, &g_gpu.slots[i].pool) != VK_SUCCESS) {
+            for (uint32_t j = 0; j < i; j++) {
+                vkDestroyQueryPool(g_r.dev->vk, g_gpu.slots[j].pool, nullptr);
+                g_gpu.slots[j].pool = VK_NULL_HANDLE;
+            }
+            return;
+        }
+    }
+    g_gpu.enabled = true;
+    std::fprintf(stderr, "[r6] native Vulkan GPU timer ready (timestampPeriod %.2f ns)\n", g_gpu.ts_period);
+}
+
+void gpu_timer_collect_slot(GpuTimer::Slot &s, bool wait) {
+    if (!s.pending || !s.pool || s.used == 0) return;
+    uint64_t ts[GpuTimer::kQueries]{};
+    const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | (wait ? VK_QUERY_RESULT_WAIT_BIT : 0u);
+    if (vkGetQueryPoolResults(g_r.dev->vk, s.pool, 0, s.used, sizeof ts, ts, sizeof(uint64_t), flags) != VK_SUCCESS)
+        return;
+    double main_ns = 0.0, sh_ns = 0.0;
+    for (uint32_t i = 0; i < s.n_spans; i++) {
+        const uint32_t q0 = s.spans[i] >> 1;
+        const bool is_sh = (s.spans[i] & 1u) != 0;
+        if (q0 + 1 < s.used && ts[q0 + 1] >= ts[q0]) {
+            const double dt = (double)(ts[q0 + 1] - ts[q0]) * g_gpu.ts_period;
+            if (is_sh) sh_ns += dt;
+            else main_ns += dt;
+        }
+    }
+    const double total_ms = (main_ns + sh_ns) / 1e6;
+    const double sh_ms = sh_ns / 1e6;
+    const int l = s.look ? 1 : 0;
+    // Row 8 compares the looks over the same stretch of play: once a toggle has happened, the
+    // frames before it (boot, menus, loading, pre-race in one look only) are dropped.
+    static bool toggled_once = false;
+    if (!toggled_once && g_look_toggles.load(std::memory_order_relaxed)) {
+        toggled_once = true;
+        for (int k = 0; k < 2; k++) g_gpu.sum_ms[k] = g_gpu.max_ms[k] = g_gpu.shadow_ms[k] = 0.0, g_gpu.frames[k] = g_gpu.draws[k] = 0;
+    }
+    g_gpu.sum_ms[l] += total_ms;
+    g_gpu.shadow_ms[l] += sh_ms;
+    g_gpu.max_ms[l] = std::max(g_gpu.max_ms[l], total_ms);
+    g_gpu.frames[l]++;
+    g_gpu.draws[l] += s.draws;
+    EOD_PLOT("native_gpu_us", (int64_t)std::llround(total_ms * 1000.0));
+    EOD_PLOT("native_gpu_shadow_us", (int64_t)std::llround(sh_ms * 1000.0));
+    if (l) EOD_PLOT("native_gpu_modern_us", (int64_t)std::llround(total_ms * 1000.0));
+    else EOD_PLOT("native_gpu_classic_us", (int64_t)std::llround(total_ms * 1000.0));
+    s.pending = false;
+    s.reset_done = false;
+    s.used = 0;
+    s.n_spans = 0;
+    s.draws = 0;
+}
+
+uint32_t gpu_timer_begin(VkCommandBuffer cmd, bool is_shadow, bool modern) {
+    if (!g_gpu.enabled) return ~0u;
+    GpuTimer::Slot &s = g_gpu.slots[g_gpu.cur];
+    if (s.pending) gpu_timer_collect_slot(s, true);
+    if (!s.reset_done) {
+        vkCmdResetQueryPool(cmd, s.pool, 0, GpuTimer::kQueries);
+        s.reset_done = true;
+        s.used = 0;
+        s.n_spans = 0;
+        s.draws = 0;
+        s.look = modern ? 1 : 0;
+    }
+    if (s.used + 2 > GpuTimer::kQueries || s.n_spans >= GpuTimer::kQueries / 2) return ~0u;
+    const uint32_t q0 = s.used;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.pool, q0);
+    s.spans[s.n_spans++] = (q0 << 1) | (is_shadow ? 1u : 0u);
+    s.used += 2;
+    return q0;
+}
+
+void gpu_timer_end(VkCommandBuffer cmd, uint32_t q0, uint32_t draw_count) {
+    if (!g_gpu.enabled || q0 == ~0u) return;
+    GpuTimer::Slot &s = g_gpu.slots[g_gpu.cur];
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.pool, q0 + 1);
+    s.draws += draw_count;
+}
+
+void gpu_timer_end_vblank(uint64_t vb) {
+    if (!g_gpu.enabled) return;
+    for (uint32_t i = 0; i < GpuTimer::kRing; i++)
+        if (g_gpu.slots[i].pending) gpu_timer_collect_slot(g_gpu.slots[i], false);
+    GpuTimer::Slot &s = g_gpu.slots[g_gpu.cur];
+    if (s.used > 0) {
+        s.vb = vb;
+        s.pending = true;
+        g_gpu.cur = (g_gpu.cur + 1) % GpuTimer::kRing;
+    }
+}
 
 void load_materials() {
     const char *text = k_material_tsv;
@@ -326,6 +470,12 @@ void load_materials() {
             if (su == "fx" || su == "emissive_light" || su == "sky" || su == "backdrop" || su == "crowd_sprite" ||
                 su == "fake_shadow" || su == "ui")
                 m.cls = C_UNLIT;
+            else if (su == "vfx_fire" || su == "vfx_smoke" || su == "vfx_spark") {
+                // Modern GPU VFX is opt-in (EOD_MODERN_VFX=1) until guardrail 7 passes with it
+                // (docs/NATIVE_RENDERER.md "Open (R6 A2)"); otherwise these stay unlit fx cards
+                static const bool vfx = std::getenv("EOD_MODERN_VFX") && *std::getenv("EOD_MODERN_VFX") != '0';
+                m.cls = !vfx ? C_UNLIT : su == "vfx_fire" ? C_VFX_FIRE : su == "vfx_smoke" ? C_VFX_SMOKE : C_VFX_SPARK;
+            }
             else if (su == "car_paint") m.cls = C_PAINT;
             else if (su == "glass") m.cls = C_GLASS, m.rough4 = std::min(m.rough4, 2u);
             else if (su == "water") m.cls = C_WATER, m.rough4 = std::min(m.rough4, 3u);
@@ -450,6 +600,7 @@ bool init() {
     g_r.white.w = g_r.white.h = 1;
     g_r.white.pending_upload = true;
     g_r.uploads.push_back(&g_r.white);
+    gpu_timer_init();
     g_r.ok = true;
     std::fprintf(stderr, "[native] plume renderer ready (%s)\n", dev->description.name.c_str());
     return true;
@@ -917,6 +1068,8 @@ void flush_shadows() {
     const uint32_t view_wh = (uint32_t)(vw & 0xFFFF) | (uint32_t)(vh & 0xFFFF) << 16;
 
     // Pass 1: shadow volumes into the target (0x363708 counts, z test against the main depth)
+    const uint32_t gpu_q = gpu_timer_begin((VkCommandBuffer)s.cmd, true, g_modern.load(std::memory_order_relaxed));
+    uint32_t sh_draws = 0;
     plume::RenderTextureBarrier in1[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::COLOR_WRITE),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::SHADER_READ)};
     cl->barriers(plume::RenderBarrierStage::GRAPHICS, in1, 2);
@@ -973,6 +1126,7 @@ void flush_shadows() {
                                                plume::RenderFormat::R32_UINT);
         cl->setIndexBuffer(&ibv);
         cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+        sh_draws++;
         fs.drawn++;
         fs.k_drawn[KIND_SHADOW]++;
     }
@@ -1020,8 +1174,10 @@ void flush_shadows() {
         const plume::RenderIndexBufferView qibv(g_r.quad_buf->at(4 * sizeof(Vertex)), 6 * 4, plume::RenderFormat::R32_UINT);
         cl->setIndexBuffer(&qibv);
         cl->drawIndexedInstanced(6, 1, 0, 0, 0);
+        sh_draws++;
         cl->setFramebuffer(nullptr);
     }
+    gpu_timer_end((VkCommandBuffer)s.cmd, gpu_q, sh_draws);
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
     cl->barriers(plume::RenderBarrierStage::ALL, out, 2);
@@ -1066,6 +1222,23 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
     const uint32_t kind = it.p.kind;
     const bool surface = kind == KIND_QUEUE || kind == KIND_WORLD || kind == KIND_WATER;
     uint32_t cls = C_UNLIT, metal = 0, rough = 12, em = 0, height = 0, rec = 0;
+    if (it.tex && it.tex->mat >= 0) {
+        const Material &m = g_mats[(size_t)it.tex->mat];
+        if (m.cls >= C_VFX_FIRE && m.cls <= C_VFX_SPARK &&
+            (kind == KIND_PARTICLE || kind == KIND_SPRITE || kind == KIND_IMMEDIATE || kind == KIND_QUEUE)) {
+            // Modern-only GPU procedural fire, smoke & sparks (stage R6 A2)
+            cls = m.cls;
+            metal = (kind == KIND_SPRITE && it.p.pass >= 2 && it.p.pass <= 8) ? it.p.pass : 1u;  // atlas grid dim
+            height = (kind == KIND_PARTICLE || kind == KIND_SPRITE) ? 1u : 0u;                   // radial quad mask
+            em = 1;
+            rec = 1;
+            out.mode[2] = (pc.mode[2] & 0xFFFFu) | metal << 16 | rough << 20 | em << 24 | height << 25 | rec << 26 | cls << 27;
+            const float t_sec = (float)(g_r.vb % 60000ull) / 60.0f;
+            std::memcpy(&out.mode[3], &t_sec, 4);
+            if (!it.second) g_draws_vfx[cls - C_VFX_FIRE]++;
+            return;
+        }
+    }
     if (surface && it.tex) {
         cls = C_GENERIC;
         if (it.tex->mat >= 0) {
@@ -1135,8 +1308,11 @@ void r6_lowconf(const Item &it, double gw, double gh) {
     if (x1 - x0 < 4 || y1 - y0 < 4) return;
     n++;
     const Material &m = g_mats[(size_t)it.tex->mat];
-    std::fprintf(stderr, "[r6] lowconf %s %s conf %.2f vb %llu box %.4f %.4f %.4f %.4f\n", m.id.c_str(), m.surface.c_str(),
-                 m.conf, (unsigned long long)g_r.vb, x0 / gw, y0 / gh, x1 / gw, y1 / gh);
+    // key: blend class (bits 0..3) / generic blend; mode.x: TCC, TFX, ATE, ATST (the game's render state:
+    // the in-context evidence tools/material_lowconf.py reads)
+    std::fprintf(stderr, "[r6] lowconf %s %s conf %.2f vb %llu box %.4f %.4f %.4f %.4f key %08x mx %08x\n", m.id.c_str(),
+                 m.surface.c_str(), m.conf, (unsigned long long)g_r.vb, x0 / gw, y0 / gh, x1 / gw, y1 / gh, it.pipeline,
+                 it.pc.mode[0]);
 }
 
 void flush() {
@@ -1162,6 +1338,9 @@ void flush() {
     plume::RenderTextureBarrier in[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
     cl->barriers(plume::RenderBarrierStage::GRAPHICS, in, depth ? 2 : 1);
+    const bool modern = g_modern.load(std::memory_order_relaxed);  // stage R6: one look per flush
+    const uint32_t gpu_q = gpu_timer_begin((VkCommandBuffer)s.cmd, false, modern);
+    uint32_t pass_draws = 0;
     auto &fb = g_r.framebuffers[{s.color, s.depth}];
     if (!fb) {
         const plume::RenderTexture *ca[1] = {color};
@@ -1169,11 +1348,21 @@ void flush() {
     }
     cl->setFramebuffer(fb.get());
     cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
+    if (native_only() && native_only_level() == 1) {
+        auto cit = g_only_clears.find(tg.fbp);
+        if (cit != g_only_clears.end()) {
+            cl->setScissors(plume::RenderRect(0, 0, (int32_t)s.width, (int32_t)s.height));
+            if (cit->second.color)
+                cl->clearColor(0, plume::RenderColor(cit->second.r, cit->second.g, cit->second.b, cit->second.a));
+            if (depth && cit->second.depth)
+                cl->clearDepth(true, cit->second.z);
+            g_only_clears.erase(cit);
+        }
+    }
     cl->setGraphicsPipelineLayout(g_r.layout.get());
     const double gw = s.gs_width, gh = s.gs_height;
     const int sc = s.scale;
     uint32_t bound = ~0u;
-    const bool modern = g_modern.load(std::memory_order_relaxed);  // stage R6: one look per flush
     PushConstants mpc;
     for (Item &it : g_r.pending) {
         FrameStats &fs = g_frames[it.p.frame];
@@ -1236,9 +1425,11 @@ void flush() {
                 pc.mode[2] = (pc.mode[2] & ~(0xFFFu << Z_K_SHIFT)) | ((uint32_t)it.run_k[r] & 0xFFF) << Z_K_SHIFT;
                 cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
                 cl->drawIndexedInstanced(kr.count, 1, kr.first, 0, 0);
+                pass_draws++;
             }
         } else {
             cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+            pass_draws++;
         }
         if (it.second) continue;
         fs.drawn++;
@@ -1249,6 +1440,7 @@ void flush() {
         if (m.cpu->posed) fs.posed++;
     }
     cl->setFramebuffer(nullptr);  // ends the render pass
+    gpu_timer_end((VkCommandBuffer)s.cmd, gpu_q, pass_draws);
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
     cl->barriers(plume::RenderBarrierStage::ALL, out, depth ? 2 : 1);
@@ -1683,6 +1875,7 @@ void finalize() {
 
 void end_vblank(uint64_t vb) {
     g_r.vb = vb;
+    gpu_timer_end_vblank(vb);
     evict_textures();
     if (log_every() > 1 && vb % log_every() == 0 && g_r.ok)
         std::fprintf(stderr, "[native] vb %llu textures decoded %llu (total), cached %zu (%llu MB), meshes %zu\n",
@@ -2224,6 +2417,22 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
         // EOD_NATIVE_ONLY=2: the GS still draws sprites (2D, HUD, the frame copy to the display
         // buffer), so the 3D scene on screen is Plume's alone and screenshots can be compared (P3).
         if (native_only() && !(native_only_level() == 2 && b && !c)) {
+#ifdef EOD_PLUME
+            // EOD_NATIVE_ONLY=1: intercept untextured Z/color clear sprites so Plume clears its
+            // own target at the start of the next flush (zero GS primitives drawn, no stale depth).
+            if (native_only_level() == 1 && b && !c && !e.tme && e.ztst == 1 && !e.zmsk) {
+                OnlyClear &oc = g_only_clears[(uint32_t)e.fbp];
+                oc.depth = true;
+                oc.z = (float)((double)v.z / depth_range(e.zpsm));
+                if ((e.fbmsk & 0xFFFFFFu) != 0xFFFFFFu) {
+                    oc.color = true;
+                    oc.r = v.r / 255.0f;
+                    oc.g = v.g / 255.0f;
+                    oc.b = v.b / 255.0f;
+                    oc.a = v.a / 255.0f;
+                }
+            }
+#endif
             g_only_dropped++;
             note_drop(e, v, b, c);
             return true;
@@ -2343,15 +2552,34 @@ uint64_t count_sets() {
 }
 void r6_report() {
     if (!g_r.ok) return;
+    if (g_gpu.enabled) {
+        for (uint32_t i = 0; i < GpuTimer::kRing; i++)
+            if (g_gpu.slots[i].pending) gpu_timer_collect_slot(g_gpu.slots[i], false);
+    }
     std::fprintf(stderr,
                  "[r6] materials: %zu records (%zu keyed); textures decoded %llu, indexed %llu, with a record %llu; "
                  "draws %llu, textured %llu, with a record %llu (%.1f%% of draws, %.1f%% of textured); palette fallbacks %llu; "
-                 "low-confidence records seen %zu\n",
+                 "low-confidence records seen %zu; Modern VFX draws fire %llu smoke %llu spark %llu\n",
                  g_mat_records, g_mat_bound, (unsigned long long)g_r.decoded, (unsigned long long)g_textures_indexed,
                  (unsigned long long)g_textures_material, (unsigned long long)g_draws_all, (unsigned long long)g_draws_textured,
                  (unsigned long long)g_draws_material, g_draws_all ? 100.0 * g_draws_material / g_draws_all : 0.0,
                  g_draws_textured ? 100.0 * g_draws_material / g_draws_textured : 0.0, (unsigned long long)g_pk_fallback,
-                 g_low_seen.size());
+                 g_low_seen.size(), (unsigned long long)g_draws_vfx[0], (unsigned long long)g_draws_vfx[1],
+                 (unsigned long long)g_draws_vfx[2]);
+    if (g_gpu.enabled && (g_gpu.frames[0] || g_gpu.frames[1])) {
+        const double cm = g_gpu.frames[0] ? g_gpu.sum_ms[0] / g_gpu.frames[0] : 0.0;
+        const double mm = g_gpu.frames[1] ? g_gpu.sum_ms[1] / g_gpu.frames[1] : 0.0;
+        const double cs = g_gpu.frames[0] ? g_gpu.shadow_ms[0] / g_gpu.frames[0] : 0.0;
+        const double ms = g_gpu.frames[1] ? g_gpu.shadow_ms[1] / g_gpu.frames[1] : 0.0;
+        const double cd = g_gpu.frames[0] ? (double)g_gpu.draws[0] / g_gpu.frames[0] : 0.0;
+        const double md = g_gpu.frames[1] ? (double)g_gpu.draws[1] / g_gpu.frames[1] : 0.0;
+        std::fprintf(stderr,
+                     "[r6] GPU timing: Classic mean %.3f ms (max %.3f, shadow %.3f, %llu frames, %.0f draws/f) | "
+                     "Modern mean %.3f ms (max %.3f, shadow %.3f, %llu frames, %.0f draws/f) | delta %+.3f ms\n",
+                     cm, g_gpu.max_ms[0], cs, (unsigned long long)g_gpu.frames[0], cd,
+                     mm, g_gpu.max_ms[1], ms, (unsigned long long)g_gpu.frames[1], md,
+                     (g_gpu.frames[0] && g_gpu.frames[1]) ? (mm - cm) : 0.0);
+    }
     for (int l = 0; l < 2; l++)
         if (g_lt.n[l])
             std::fprintf(stderr, "[look] %s frames %llu, mean %.2f ms, max %.2f ms\n", l ? "Modern" : "Classic",
@@ -2384,6 +2612,19 @@ void toggled(uint32_t n) {  // GS thread
 }
 }  // namespace
 bool look_modern() { return g_modern.load(); }
+
+bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm) {
+#ifdef EOD_PLUME
+    if (!g_r.has_main_target) return false;
+    fbp = g_r.main_target.fbp;
+    fbw = g_r.main_target.fbw;
+    psm = g_r.main_target.fpsm;
+    return true;
+#else
+    (void)fbp; (void)fbw; (void)psm;
+    return false;
+#endif
+}
 
 void gs_vblank(uint64_t frame) {
     if (g_active) finalize();

@@ -1289,13 +1289,14 @@ void ee_particle_end(bool drawn) {
 }
 
 // ---- effect sprites (0x363F48/0x363DE8 VU1 0x01B8 & 0x363D78/0x363C18 VU1 0x05E0) --------------
-void ee_sprite_begin(int32_t) {
+void ee_sprite_begin(int32_t grid_size) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
     Packet &p = g_sprite;
     std::memset(&p, 0, sizeof p);
     p.model[0] = p.model[5] = p.model[10] = 1.0f;  // world space (VU1 0x01B8/0x05E0 uses view-proj vf2..vf5)
     p.kind = KIND_SPRITE;
+    p.pass = grid_size == 64 ? 8u : grid_size == 16 ? 4u : grid_size == 4 ? 2u : 1u;  // atlas grid dim (Modern VFX)
     p.frame = g_frame_vb;
     p.serial = g_serial++;
     p.itop = 0x280;

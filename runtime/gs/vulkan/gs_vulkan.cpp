@@ -35,6 +35,7 @@
 #include "../gs_state.h"
 #include "../gs_swizzle.h"
 #include "../texture_replacements.h"
+#include "../../render/native_renderer.h"
 #include "vk_compat.h"
 #include "../../ui/overlay.h"
 #include "gs_page_coverage.h"
@@ -2868,6 +2869,16 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
                                          float &sh) {
     Surface *s = find_surface(c.fbp, c.fbw ? c.fbw : 1, c.psm, false);
     uint32_t page = (c.fbp >> 5) % kPages;
+    // EOD_NATIVE_ONLY=1 drops the GS blit sprite from the 3D render target to DISPFB, so display
+    // and headless capture read Plume's last 3D color target directly (guardrail row 1).
+    if (native::enabled() && native::native_only() && native::native_only_level() == 1) {
+        uint32_t nfbp = 0, nfbw = 0, npsm = 0;
+        if (native::last_target(nfbp, nfbw, npsm)) {
+            Surface *d = find_surface(nfbp, nfbw ? nfbw : 1, npsm, false);
+            if (d && g_owner[(d->bp >> 5) % kPages] == d)
+                s = d, page = (d->bp >> 5) % kPages;
+        }
+    }
     static const char *show = getenv("EOD_D3D_SHOW"); // debug: display this buffer (hex block address) instead
     if (show) {
         Surface *d = find_surface((uint32_t)strtoul(show, nullptr, 16), c.fbw ? c.fbw : 1, c.psm, false);

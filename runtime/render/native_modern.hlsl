@@ -37,12 +37,15 @@ struct Object {
 #define M_FGE 0x800
 #define M_FAILED 0x80000000u
 
-#define C_GENERIC 0
-#define C_UNLIT 1
-#define C_PAINT 2
-#define C_GLASS 3
-#define C_WATER 4
-#define C_CHROME 5
+#define C_GENERIC   0
+#define C_UNLIT     1
+#define C_PAINT     2
+#define C_GLASS     3
+#define C_WATER     4
+#define C_CHROME    5
+#define C_VFX_FIRE  6
+#define C_VFX_SMOKE 7
+#define C_VFX_SPARK 8
 
 [[vk::binding(0, 0)]] Texture2D tex;
 [[vk::binding(1, 0)]] SamplerState smp;
@@ -159,6 +162,20 @@ float3 sky_radiance(float3 dir, float3 up, float r) {
     return h >= 0 ? sky : lerp(hor * 0.5, hor, saturate(1.0 + h * 2.0) * r);
 }
 
+// Procedural 2D value noise & 2-octave fBM for Modern GPU VFX (fire / smoke / sparks, stage R6 A2)
+float vfx_hash(float2 x) {
+    return frac(sin(dot(x, float2(127.1, 311.7))) * 43758.5453);
+}
+float vfx_noise(float2 x) {
+    const float2 fl = floor(x), fr = frac(x);
+    const float2 u = fr * fr * (3.0 - 2.0 * fr);
+    return lerp(lerp(vfx_hash(fl), vfx_hash(fl + float2(1.0, 0.0)), u.x),
+                lerp(vfx_hash(fl + float2(0.0, 1.0)), vfx_hash(fl + float2(1.0, 1.0)), u.x), u.y);
+}
+float vfx_fbm(float2 x) {
+    return 0.65 * vfx_noise(x) + 0.35 * vfx_noise(x * 2.07 + float2(13.1, 7.7));
+}
+
 POut ps_modern(VOut i) {
     const uint m = obj.mode.x;
     const uint mz = obj.mode.z;
@@ -170,7 +187,8 @@ POut ps_modern(VOut i) {
     float3 v = i.c.rgb;
     float va = i.c.a;
     const uint cls = (mz >> 27) & 15;
-    const bool unlit = cls == C_UNLIT || (mz & (1u << 24)) != 0;
+    const bool is_vfx = cls >= C_VFX_FIRE && cls <= C_VFX_SPARK;
+    const bool unlit = cls == C_UNLIT || is_vfx || (mz & (1u << 24)) != 0;
     float3 V = normalize(i.mv);
     float3 N;
     if (i.mn.w > 0.5) {
@@ -249,6 +267,48 @@ POut ps_modern(VOut i) {
             col = col * (1.0 - Fcv) + (PI * Frc * NoL * sun + sky_radiance(R, up, 0.1) * Fcv) * occl;
         }
         rgb = min(col * 255.0, 255.0);
+    } else if (is_vfx) {
+        // Modern-only GPU procedural fire, smoke & sparks (stage R6 A2):
+        // preserves the game's blend equation and brightness envelope while replacing hard square
+        // billboard edges with soft radial falloff and animated procedural flame/wisp/ember detail.
+        const float gdim = max((float)((mz >> 16) & 15), 1.0);
+        const float2 luv = gdim > 1.5 ? frac(i.uv * gdim * 0.9999 + 0.00005) : saturate(i.uv);
+        const float2 p = luv * 2.0 - 1.0;
+        const float r = length(p);
+        const float t_sec = asfloat(obj.mode.w);
+        const bool quad_mask = ((mz >> 25) & 1) != 0;
+        // guardrails 6 / 7: a tint and a mask only (multiplies the Classic colour by <= 1), so a VFX
+        // card keeps the texture's detail and is never brighter than Classic
+        if (cls == C_VFX_FIRE) {
+            const float rad = quad_mask ? (1.0 - smoothstep(0.45, 0.96, r)) : 1.0;
+            const float turb = vfx_fbm(float2(p.x * 2.6, p.y * 2.2 + t_sec * 4.2));
+            const float core = saturate(1.0 - r * 0.95 + (turb - 0.45) * 0.75);
+            const float flame_mask = quad_mask ? saturate(rad * (0.45 + 0.85 * core)) : (0.68 + 0.50 * turb);
+            const float base_lum = dot(rgb, float3(0.299, 0.587, 0.114)) / 255.0;
+            const float heat = saturate(base_lum * (0.65 + 0.70 * core));
+            const float3 bb = lerp(float3(1.0, 0.26, 0.04),
+                                   lerp(float3(1.0, 0.68, 0.14), float3(1.0, 0.94, 0.76), smoothstep(0.55, 0.95, heat)),
+                                   smoothstep(0.15, 0.65, heat));
+            rgb = rgb * lerp(float3(1.0, 1.0, 1.0), bb, 0.35) * saturate(flame_mask);
+            if (quad_mask) a *= rad;
+        } else if (cls == C_VFX_SMOKE) {
+            const float rad = quad_mask ? (1.0 - smoothstep(0.35, 0.96, r)) : 1.0;
+            const float wisp = 0.74 + 0.42 * vfx_fbm(p * 2.0 + float2(t_sec * 0.35, t_sec * 0.85));
+            const float soft = quad_mask ? saturate(rad * wisp) : saturate(0.82 + 0.28 * wisp);
+            const float puff_shade = quad_mask ? (0.94 + 0.10 * saturate(-p.y)) : 1.0;
+            rgb = rgb * min(puff_shade, 1.0);
+            a *= soft;
+        } else {
+            // C_VFX_SPARK: crisp radial incandescent core + soft ember halo with subtle flicker
+            const float rad = quad_mask ? (1.0 - smoothstep(0.55, 0.96, r)) : 1.0;
+            const float core = exp(-r * r * 5.5);
+            const float halo = (1.0 - smoothstep(0.12, 0.95, r)) * 0.45;
+            const float flicker = 0.88 + 0.12 * sin(t_sec * 37.0 + dot(i.mp, float3(11.3, 17.1, 7.9)));
+            const float spark = quad_mask ? saturate((core + halo) * rad * flicker) : flicker;
+            const float3 ember = lerp(float3(1.0, 0.55, 0.12), float3(1.0, 0.95, 0.78), core);
+            rgb = rgb * lerp(float3(1.0, 1.0, 1.0), ember, 0.30) * saturate(0.45 + 0.85 * spark);
+            if (quad_mask) a *= rad;
+        }
     }
     rgb = min(rgb, 255.0);
     a = min(a, 255.0);
