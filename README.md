@@ -4,9 +4,20 @@
 
 [**Download Remaster 1.0 (Windows x64 & macOS)**](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0) · [**Step-by-Step Modding Tutorials**](docs/TUTORIALS.md) · [**World Editor Guide**](docs/WORLD_EDITOR.md) · [**Technical Wiki**](docs/wiki/Home.md) · [**Engine Documentation Index**](docs/INDEX.md)
 
+> **Active development continues.** Remaster 1.0 is the stable download. Expect further improvements to rendering, split-screen draw distance, and mod tools in future releases. [Renderer development status](docs/NATIVE_RENDERER_SUCCESS.md)
+
+![A yellow school bus leans into Mankato’s banked turn alongside the field](docs/img/gallery/eod-mankato-bus.jpg)
+
+*A school bus joins the rolling start at Mankato. The new Mankato and Career screenshots were captured in a macOS development build with the Modern look at 6× internal resolution.*
+
+<details>
+<summary>Earlier remaster gameplay</summary>
+
 ![6x internal resolution native Vulkan gameplay with cow-painted school bus and live mesh deformation](docs/img/world_editor/remaster_6x_gameplay.jpg)
 
 *Native 6× internal resolution Vulkan rendering with hardware-decoded VIF meshes, unthrottled LODs, live vertex deformation, and zero PS2 debris caps.*
+
+</details>
 
 ---
 
@@ -119,6 +130,10 @@ Press **`F5`** (*Play Free Roam*) or **`Shift+F5`** (*Play Event / Race*) to com
 ![The bonus Phantom car lining up at the start of a race](docs/img/phantom-bonus-car.jpg)
 
 ### Career, Wide Open
+
+![A weathered car heads down a fenced country road in Career free roam](docs/img/gallery/eod-career-free-roam.jpg)
+
+*Heading down a country road in Career free roam.*
 
 * **Every shop and event open from day one.** Upgrades, Time Challenges, the Highway, Troy's Place, and all 25 Eves are open right away.
 * **The dealer sells every car.** Every visit to the auto shop brings in a fresh lineup until you've seen the entire roster — including the Phantom, NASCAR stock cars, and all six special vehicles — with 100% trade-in refunds so you can experiment freely.
