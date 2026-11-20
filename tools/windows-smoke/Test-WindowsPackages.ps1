@@ -326,7 +326,7 @@ if ($editor) {
     Invoke-DetachedLauncher 'Launch EOD Vehicle Tools.bat' {
         param($Process)
         Wait-ForMainWindow $Process 'Test Drive: Eve of Destruction - Modding Studio'
-        Close-PackageWindow $Process 'bundled Vehicle Tools launcher'
+        Write-Host 'PASS bundled Vehicle Tools launcher opened its main window'
     }
 
     $commands = "python -I -B tools\mod_package.py --help && python -I -B tools\mod_install.py --help && echo EOD_TOOLS_PROMPT_OK`r`nexit`r`n"
