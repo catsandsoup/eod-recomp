@@ -593,16 +593,16 @@ void load_materials() {
 }
 
 // Read the original identity once for both material tags and HOSTTEX lookup.
-MatKey indexed_texture_key(const gs::Env &e) {
+MatKey indexed_texture_key(const gs::Env &e, const uint32_t *palette, uint32_t base, uint32_t pitch) {
     const bool eight = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT8H;
     g_textures_indexed++;
     static std::vector<uint8_t> plane;
     plane.resize((size_t)e.tw * e.th);
     for (uint32_t y = 0; y < e.th; y++)
         for (uint32_t x = 0; x < e.tw; x++)
-            plane[(size_t)y * e.tw + x] = (uint8_t)gs::read_pixel(e.tpsm, (int)x, (int)y, e.mip_tbp[0], e.mip_tbw[0]);
+            plane[(size_t)y * e.tw + x] = (uint8_t)gs::read_pixel(e.tpsm, (int)x, (int)y, base, pitch);
     return {gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data()),
-            gs::hosttex::palette_key(e.pal, eight ? 256 : 16), e.tw, e.th};
+            gs::hosttex::palette_key(palette, eight ? 256 : 16), e.tw, e.th};
 }
 
 int32_t material_of(const MatKey &key) {
@@ -733,7 +733,8 @@ plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
 // Render-target textures (pages a GPU surface holds newer than the CPU copy) are not decoded.
 // `levels`: the mip levels beyond the base the draw's TEX1.MXL selects (stage R5 A2), each read at
 // its MIPTBP address (0x35F9A0 writes MIPTBP1/2 from the level offsets 0x35F278 computes).
-Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_region = false) {
+Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_region = false,
+                 const WorldTextureBinding *binding = nullptr) {
     if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
     // the GS state decodes levels only as far as its own TEX1 asks (gs_draw.cpp setup_env)
     const uint32_t decodable = (e.mmin >= 2 && e.mxl > 0) ? (uint32_t)std::min(e.mxl, 6) : 0;
@@ -741,15 +742,17 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         g_mip_clamped.fetch_add(1);
         levels = decodable;
     }
+    const auto base = [&](uint32_t level) { return binding ? uint32_t(binding->bases[level]) : e.mip_tbp[level]; };
+    const auto pitch = [&](uint32_t level) { return binding ? uint32_t(binding->pitches[level]) : e.mip_tbw[level]; };
     uint32_t first, count;
-    gs::page_range(e.tbp, e.tbw, e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
+    gs::page_range(base(0), pitch(0), e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
     if (!(exact_region ? gs::hw::native_texture_region_on_cpu(e) : gs::hw::native_texture_on_cpu(first, count))) {
         fs.untextured_rt++;
         return nullptr;
     }
     for (uint32_t l = 1; l <= levels; l++) {
         uint32_t f2, c2;
-        gs::page_range(e.mip_tbp[l], e.mip_tbw[l], e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+        gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
         if (!gs::hw::native_texture_on_cpu(f2, c2)) {  // a level in GPU-rendered pages: the levels above it only
             g_mip_rt.fetch_add(1);
             levels = l - 1;
@@ -758,13 +761,20 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     }
     const bool indexed = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT4 || e.tpsm == gs::PSMT8H ||
                          e.tpsm == gs::PSMT4HL || e.tpsm == gs::PSMT4HH;
-    uint64_t k[5] = {(e.tbp & 31) | (uint64_t)e.tbw << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
-                     indexed ? e.pal_hash : 0,
+    const uint32_t *palette = binding ? binding->colors : e.pal;
+    const uint64_t palette_hash = binding ? binding->hash : e.pal_hash;
+    const auto texel = [&](uint32_t u, uint32_t v, uint32_t level) {
+        if (binding)
+            return palette[gs::read_pixel(e.tpsm, int(u), int(v), base(level), pitch(level))];
+        return gs::tex_fetch(e, int(u), int(v), int(level));
+    };
+    uint64_t k[5] = {(base(0) & 31) | (uint64_t)pitch(0) << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
+                     indexed ? palette_hash : 0,
                      e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
-    k[4] = e.tbp;
+    k[4] = base(0);
     k[1] |= (uint64_t)levels << 48;
     uint64_t mk[6] = {};
-    for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = e.mip_tbp[l] | (uint64_t)e.mip_tbw[l] << 32;
+    for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = base(l) | (uint64_t)pitch(l) << 32;
     const uint64_t addr_key = XXH3_64bits(k, sizeof k) ^ (levels ? XXH3_64bits(mk, sizeof mk) : 0);
     AddrEntry &ae = g_r.by_addr[addr_key];
     if (ae.tex) {
@@ -773,7 +783,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
             if (gs::g_page_gen[(first + i) % gs::kPages] > ae.stamp) ok = false;
         for (uint32_t l = 1; l <= levels && ok; l++) {
             uint32_t f2, c2;
-            gs::page_range(e.mip_tbp[l], e.mip_tbw[l], e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+            gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
             for (uint32_t i = 0; i < c2 && ok; i++)
                 if (gs::g_page_gen[(f2 + i) % gs::kPages] > ae.stamp) ok = false;
         }
@@ -796,7 +806,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
         }
         for (uint32_t l = 0; l <= levels; l++) {
-            const uint32_t bp = e.mip_tbp[l], bwid = e.mip_tbw[l];
+            const uint32_t bp = base(l), bwid = pitch(l);
             const int lw = std::max(1, (int)e.tw >> l), lh = std::max(1, (int)e.th >> l);
             for (int y = 0; y < lh; y += bh)
                 for (int x = 0; x < lw; x += bw) {
@@ -828,7 +838,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     const bool candidate = store && store->has_dims(e.tw, e.th);
     int found = -1;
     if (indexed && (!g_mats.empty() || candidate)) {
-        const MatKey id = indexed_texture_key(e);
+        const MatKey id = indexed_texture_key(e, palette, base(0), pitch(0));
         t.mat = material_of(id);
         if (candidate) {
             std::string why;
@@ -844,7 +854,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
             const uint32_t lw = std::max(1u, e.tw >> l), lh = std::max(1u, e.th >> l);
             for (uint32_t y = 0; y < lh && gs_alpha; y++)
                 for (uint32_t x = 0; x < lw && gs_alpha; x++)
-                    gs_alpha = gs::hosttex::gs_alpha_domain(gs::tex_fetch(e, (int)x, (int)y, (int)l) >> 24);
+                    gs_alpha = gs::hosttex::gs_alpha_domain(texel(x, y, l) >> 24);
         }
         // Distinct guest placements and mip selections can refer to the same large host image.
         replacement_id = 1 + ((uint64_t)found << 33 | (uint64_t)(t.mat + 1) << 1 | (uint64_t)gs_alpha);
@@ -898,7 +908,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         } else {
             for (uint32_t v = 0; v < lh; v++) {
                 auto *line = reinterpret_cast<uint32_t *>(level + (size_t)v * row);
-                for (uint32_t u = 0; u < lw; u++) line[u] = gs::tex_fetch(e, (int)u, (int)v, (int)l);
+                for (uint32_t u = 0; u < lw; u++) line[u] = texel(u, v, l);
             }
         }
     }
@@ -2539,6 +2549,41 @@ uint64_t g_st_n[KIND_COUNT], g_st_mis[KIND_COUNT][6];
 std::mutex g_st_mutex;
 struct SurfaceCheck { uint64_t matched, mismatched, unobserved; };
 std::map<std::array<int32_t, 4>, SurfaceCheck> g_world_surfaces;
+uint64_t g_world_texture_matches, g_world_texture_mismatches, g_world_texture_used;
+std::map<std::pair<int32_t, uint16_t>, std::unordered_set<uint64_t>> g_world_texture_slots;
+
+const WorldTextureBinding *draw_world_texture(const Packet &p, const gs::Env &e) {
+    if (!g_have_env || !p.world_texture.levels || p.kind != KIND_WORLD ||
+        p.program != 0x0270 || p.itop != 0x80)
+        return nullptr;
+    const WorldTextureBinding &binding = p.world_texture;
+    bool descriptor_matches =
+        e.tme && e.tpsm == gs::PSMT4 && e.cpsm == gs::PSMCT32 && e.csa == 0 &&
+        e.tw == 128 && e.th == 128 && e.tcc && e.tfx == binding.function &&
+        e.mxl + 1 == binding.levels;
+    for (uint32_t l = 0; l < binding.levels && descriptor_matches; ++l)
+        descriptor_matches = binding.bases[l] == e.mip_tbp[l] && binding.pitches[l] == e.mip_tbw[l];
+    const bool matches = descriptor_matches && binding.hash == e.pal_hash &&
+        std::equal(std::begin(binding.colors), std::end(binding.colors), e.pal);
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_WORLD_TEXTURE");
+        return !value || value[0] != '0';
+    }();
+    static const bool check = std::getenv("EOD_NATIVE_WORLD_TEXTURE_CHECK") != nullptr;
+    if (check) {
+        std::lock_guard<std::mutex> lock(g_st_mutex);
+        if (matches) {
+            ++g_world_texture_matches;
+            if (enabled) ++g_world_texture_used;
+            g_world_texture_slots[{e.scy0, binding.bases[0]}].insert(binding.hash);
+        } else if (g_world_texture_mismatches++ < 4) {
+            std::fprintf(stderr, "[native] world texture mismatch: GS %u/%u/%u %ux%u %d levels, EE %u levels and function %u, GS/EE base %x/%x palette %016llx/%016llx\n",
+                         e.tpsm, e.cpsm, e.csa, e.tw, e.th, e.mxl + 1, binding.levels, binding.function,
+                         e.tbp, binding.bases[0], (unsigned long long)e.pal_hash, (unsigned long long)binding.hash);
+        }
+    }
+    return enabled && matches ? &binding : nullptr;
+}
 
 const DrawSurface &draw_surface(const Packet &p, const DrawSurface &reference, bool observed) {
     if (p.kind != KIND_WORLD || p.program != 0x0270 || p.itop != 0x80)
@@ -2583,6 +2628,14 @@ void state_report() {
                                          "sprite", "immediate", "cockpit", "hud"};
     static_assert(names.size() == KIND_COUNT, "every native draw kind needs a state report name");
     std::lock_guard<std::mutex> lk(g_st_mutex);
+    if (g_world_texture_matches || g_world_texture_mismatches) {
+        std::fprintf(stderr, "[native] world EE texture: %llu matched, %llu mismatched, %llu used\n",
+                     (unsigned long long)g_world_texture_matches, (unsigned long long)g_world_texture_mismatches,
+                     (unsigned long long)g_world_texture_used);
+        for (const auto &[slot, palettes] : g_world_texture_slots)
+            std::fprintf(stderr, "[native] world EE texture view y=%d slot %x: %zu palette contents\n",
+                         slot.first, slot.second, palettes.size());
+    }
     for (const auto &[rect, result] : g_world_surfaces)
         std::fprintf(stderr, "[native] world EE surface %d,%d-%d,%d: %llu matched, %llu mismatched, %llu unobserved\n",
                      rect[0], rect[1], rect[2], rect[3],
@@ -2780,12 +2833,13 @@ void finalize() {
         std::memcpy(&pc.mode[3], &hz, 4);
     }
     static const uint32_t ab = std::getenv("EOD_R5A2_OFF") ? (uint32_t)std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) : 0u;
-    it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0);
+    const WorldTextureBinding *world_texture = draw_world_texture(g_cur, e);
+    it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0, false, world_texture);
     const bool replacement = it.tex && it.tex->replacement_id;
     uint32_t m = 0;
     if (it.tex) {
         // TEX0 TCC/TFX as the texture manager's TEX0 (0x35F9A0) left them; size from the decoded texture
-        m |= M_TME | (e.tcc ? M_TCC : 0) | (uint32_t)(e.tfx & 3) << M_TFX_SHIFT;
+        m |= M_TME | (e.tcc ? M_TCC : 0) | uint32_t(world_texture ? world_texture->function : (e.tfx & 3)) << M_TFX_SHIFT;
         uint32_t lw = 0, lh = 0;
         while ((1u << lw) < it.tex->w) lw++;
         while ((1u << lh) < it.tex->h) lh++;

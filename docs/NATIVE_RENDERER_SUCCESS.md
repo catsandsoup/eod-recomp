@@ -830,3 +830,42 @@ headless rendering only. The default public binary still executes
 VU1 and the GS bridge. The typed TEX1 work removes a packet rather
 than the renderer family. In particular the strip, texture/CLUT
 contents and remaining compatibility state still depend on GS.
+## R7 world texture binding from EE assets (2026-11-21)
+
+The public Plume build uses an immutable EE binding for transient
+128×128 PSMT4 world textures on verified non-clipped `0x0270` draws.
+The draw must match the reference's PSM, dimensions, texture function,
+TCC, active mip count, each mip base and pitch, and all 16 palette
+entries. This copies the active palette during the EE world record and
+uses it for the renderer's cache identity, material and host-texture
+lookup, and pixel expansion. The mip addresses likewise come from the
+EE binding when it passes the comparison. `EOD_NATIVE_WORLD_TEXTURE=0`
+selects the reference and `EOD_NATIVE_WORLD_TEXTURE_CHECK=1` reports
+comparisons and distinct palette hashes by view and bank.
+
+| Public headless case | Matched | Mismatched | Native bindings selected | Sync/deferred/CLUT waits | GS suppressed |
+| --- | ---: | ---: | ---: | --- | ---: |
+| Dundas Modern at 6× | 24,656 | 0 | 24,656 | 0/0/0 | 0 |
+| Dundas Modern at 6× binding disabled | 22,493 | 0 | 0 | 0/0/0 | 0 |
+| Gilroy night Classic at 1× | 26,202 | 0 | 26,202 | 0/2/0 | 0 |
+| Gilroy night Classic at 1× binding disabled | 34,650 | 0 | 0 | 0/1/0 | 0 |
+| Kenyon Classic at 1×, two players | 69,897 | 0 | 69,897 | 0/7/0 | 0 |
+| Kenyon Classic at 1×, two players, binding disabled | 70,916 | 0 | 0 | 0/6/0 | 0 |
+
+Dundas observed 78 distinct palette hashes in each of the reused
+`0x2BC4` and `0x2FC8` banks. Kenyon independently saw 50 and 49 in the
+upper view and 46 and 46 in the lower view. Reported P1 samples drew all
+submitted world leaves. Two separately paced Dundas Classic 1× scanout
+windows had a closest nearby comparison of RGB MAE 0.230/255. The
+scanouts were independently timed and did not match exactly.
+
+A longer public Dundas differential checked 1,150 calls to
+`0x358BD0` with zero mismatches and matched 124,069 bindings. The
+public and local Mac builds linked, 99 macOS CTests passed, and the
+Windows public cross-build linked.
+
+The compatibility strip still supplies the draw reference. GS upload
+storage still supplies the indexed mip texels. This is a binding change,
+and the whole-run VU1, GIF and GS counters still fail R7. Both arms of
+the separately timed night and split runs recorded legacy deferred
+waits, and the binding adds no wait operation.

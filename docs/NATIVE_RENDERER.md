@@ -1804,3 +1804,43 @@ the original TEX1 command.
 This retires the two LOD GIF qwords themselves. The compatibility latch
 still serves later legacy consumers. The strip packet, texture content
 and CLUT ownership still run through the compatibility bridge.
+
+### R7 world texture palette from the EE asset
+
+The world record opened at `0x358E84` selects a texture through
+`0x34F8D0 → 0x3514F0`. The latter reads the 0x44-byte entry of
+`*0x4D2D30` and prefers its texture pointer at +0x38 over +0x18.
+Restrict the first native source to transient 128×128 PSMT4
+texture records. The live record has pixel type 8 at +0x10,
+palette type 0 at +0x14, log2 dimensions at +0x18/+0x1A,
+mip count at +0x1C, relocated mip pointers at +0x24 and the
+palette pointer at +0x40, as filled by `0x360408`.
+
+`0x3521E8` relocates the asset palette and calls `0x360060` before
+registering the load. The latter converts the asset's ARGB entries to RGBA,
+uses half alpha with 255 mapping to 128, and swaps index bits 3 and 4 for
+CT32 palette upload. `0x35EEA8` uploads 16×2 CT32 pixels for PSMT4
+with transfer pitch 1. The first 16 logical colors occupy entries
+0–7 and 16–23 in that source block.
+`0x35F9A0` sets CSM1, CSA zero and CLD one. The PSMT4 CSM1 lookup reads
+those two spans in logical index order. The native feed
+copies these 16 already converted entries at world packet reserve time,
+with the dimensions, levels and texture function from the same EE record.
+For a transient texture, `0x35F4F4` uses the second word of the
+12-byte bank record at `0x4D7D60` as the base. `0x35F57C` advances
+the two-bank cursor at `0x3E5820` after selecting it, so the previous
+bank is the active one when the world record is open. In `0x35F350`
+each level consumes its 4-bit image rounded to 256-byte blocks and
+`0x35F9A0` sets each pitch to the mip width rounded up to units of 64
+pixels. Snapshot those addresses together with the palette. The copy
+is immutable through submission and remains valid when the EE record
+or GS upload slot is reused. Invalid RAM ranges, resident allocations
+and different GS descriptors retain the reference.
+
+Compare all sixteen entries and the material descriptor against the
+observed first draw. When they match, Plume's indexed material key and
+lookup use the copied entries and the matching mip addresses. The
+compatibility strip still creates the GS reference state and the indexed
+mip bytes still come from the GS texture upload cache. This step supplies
+native binding data for the next strip migration without replacing the GS
+transfer or CLUT latch.

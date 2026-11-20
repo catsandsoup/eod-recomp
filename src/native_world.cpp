@@ -471,6 +471,7 @@ void world_render_pass() {
                         native::ee_world_record(false);
                         break;
                     }
+                    native::ee_world_material(static_cast<int32_t>(slot));
                 }
                 const uint32_t matrix = lwu(kMatrixTable + lhu(sp + 0x34) * 4);
                 if (lwu(sp + 0x60) != matrix) {

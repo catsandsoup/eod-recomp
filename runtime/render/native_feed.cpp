@@ -1162,6 +1162,49 @@ void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count) {
             }
 }
 
+static WorldTextureBinding g_world_texture;
+
+void ee_world_material(int32_t slot) {
+    g_world_texture = {};
+    if (!enabled() || slot < 0 || ee_r32(0x4D2D38) != uint32_t(slot)) return;
+    const uint32_t table = ee_r32(0x4D2D30);
+    constexpr uint32_t stride = 0x44;
+    if (!table || table >= EE_RAM_SIZE || uint32_t(slot) >= (EE_RAM_SIZE - table) / stride) return;
+    const uint32_t entry = table + uint32_t(slot) * stride;
+    uint32_t texture = ee_r32(entry + 0x38);
+    if (!texture) texture = ee_r32(entry + 0x18);
+    if (!texture || texture > EE_RAM_SIZE - 0x44 || (texture & 3)) return;
+    if (MEM_LB(texture + 0xC) || ee_r32(texture + 0x10) != 8 || ee_r32(texture + 0x14) != 0 ||
+        ee_r32(texture + 0x18) != 0x00070007)
+        return;
+    const uint32_t levels = MEM_LB(texture + 0x1C);
+    const uint32_t palette = ee_r32(texture + 0x40);
+    if (!levels || levels > 7 || !palette || palette > EE_RAM_SIZE - 24 * sizeof(uint32_t) || (palette & 3))
+        return;
+
+    const uint32_t next_bank = ee_r32(0x3E5820);
+    if (next_bank >= 2) return;
+    // 0x35F4F4 selected this bank and 0x35F57C advanced the cursor.
+    uint32_t base = ee_r32(0x4D7D64 + (1 - next_bank) * 12);
+    if (base >= 0x4000) return;
+    for (uint32_t level = 0; level < levels; ++level) {
+        const uint32_t side = 128u >> level;
+        g_world_texture.bases[level] = uint16_t(base & 0x3FFF);
+        g_world_texture.pitches[level] = uint8_t((side + 63) / 64);
+        base += (side * side + 511) / 512;  // 0x35F350: 4-bit image in 256-byte blocks
+    }
+    g_world_texture.levels = uint8_t(levels);
+    g_world_texture.function = ee_r32(texture + 8) ? 3 : 0;
+    uint64_t hash = 0x9E3779B97F4A7C15ull;
+    for (uint32_t i = 0; i < 16; ++i) {
+        const uint32_t color = ee_r32(palette + 4 * (i + (i & 8)));
+        g_world_texture.colors[i] = color;
+        hash = (hash ^ color) * 0x100000001B3ull;
+        hash ^= hash >> 29;
+    }
+    g_world_texture.hash = hash;
+}
+
 void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop) {
     if (!enabled()) return;
     apply_material();  // WorldPacketBegin (0x35BA10) sent the material in effect before these REFs
@@ -1178,6 +1221,7 @@ void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, ui
     p.texture_key = -1;
     p.layer = -1;
     fill_camera(p);
+    if (itop == 0x80) p.world_texture = g_world_texture;
     // The world packet's 0x35BA10 call has committed these EE render-state
     // inputs through 0x3620A8. Bases here use the renderer's 256-byte units.
     p.world_surface = {

@@ -100,6 +100,7 @@ ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc);
 void ee_world_pass(int32_t pass, uint32_t identity_packet);
 void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop);
 void ee_world_record(bool committed);
+void ee_world_material(int32_t slot);
 void ee_world_pass_end();
 // WaterDraw 0x325728: begin (before ImmediateBegin 0x35DF10, whose packets are the water's), each
 // vertex ImmediateVertex 0x361708 accepted (colour word, strip flag = draws a triangle, guest
@@ -210,6 +211,14 @@ struct DrawSurface {
     uint16_t origin_x, origin_y; // 12.4 screen origin
 };
 
+struct WorldTextureBinding {
+    uint32_t colors[16];
+    uint64_t hash;
+    uint16_t bases[7];
+    uint8_t pitches[7];
+    uint8_t levels, function;
+};
+
 struct Packet {
     uint64_t frame;            // EE vblank of the frame it was queued in
     uint32_t kind;             // KIND_*: draw-queue record, track world leaf, water surface
@@ -242,6 +251,7 @@ struct Packet {
     int32_t shadow_rt[6];
     DrawSurface world_surface;  // EE RenderStateCommit inputs, sampled at the world REF
     WorldTextureLod world_lod;
+    WorldTextureBinding world_texture;
 };
 
 using Vertex = scene::Vertex;

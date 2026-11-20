@@ -330,3 +330,25 @@ as the GS reference.
   `0x35F9A0` and `0x35F278`. Prove the correct palette lifetime and the
   strip's surviving PRIM, RGBAQ, ST/Q, and vertex latch, then run an
   isolated world slice without the remaining GIF strip.
+
+### R7 STAR — EE world texture binding (2026-11-21)
+
+- **Situation.** The native world draw still took texture selection and
+  palette state from its first compatibility triangle.
+- **Task.** Provide a verified EE source for a commonly drawn world
+  texture class, including material identity and palette lifetime as the
+  two upload banks are reused.
+- **Action.** Follow the world slot to its runtime texture, compute each
+  mip base and pitch from the selected transient bank, and copy the
+  prepared CT32 palette through the world packet. Compare at the same
+  draw as the GS reference. Use the matching EE data for decode, cache
+  identity and material lookup.
+- **Result.** Public 6× Dundas, Gilroy night and both views of Kenyon
+  matched all admitted bindings and drew all sampled leaves. The
+  reference-off control uses no EE binding. Both banks saw many distinct
+  palettes, including reuse in each split view.
+- **Next decisive test.** Decode an immutable indexed mip payload from
+  the EE texture's +0x24 source pointer table. Verify all mip bytes
+  against the live uploaded texels before using the source directly.
+  Then replace the admitted world's remaining GIF strip and verify the
+  surviving compatibility state for its neighbors.
