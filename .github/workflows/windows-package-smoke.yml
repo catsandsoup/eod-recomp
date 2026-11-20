@@ -53,7 +53,7 @@ jobs:
       inputs.source_sha == '50d39fb46c73c14f25aed8aa3007cbab79c2fd27' &&
       inputs.package_mode == 'combined' &&
       inputs.game_asset == 'EOD-Recomp-v1.1.0-dev.20261121-Windows-x64.zip' &&
-      inputs.game_sha256 == '8f77b3c4e19abaf934020d2cd745d62aa0515c855ca50cd0ce9b93f2eabd051e' &&
+      inputs.game_sha256 == '74f5a75db4e123e999650edb46795525423d6e55a0a21adcd1f03171d3a440c2' &&
       inputs.editor_asset == '' && inputs.editor_sha256 == ''
     runs-on: windows-2022
     timeout-minutes: 6
@@ -115,7 +115,7 @@ jobs:
         run: |
           $scratch = Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $expected = @{
-            'game.zip' = '8f77b3c4e19abaf934020d2cd745d62aa0515c855ca50cd0ce9b93f2eabd051e'
+            'game.zip' = '74f5a75db4e123e999650edb46795525423d6e55a0a21adcd1f03171d3a440c2'
             'Test-WindowsPackages.ps1' = 'b7f7e7532a714333c2cd0c5428ad1aecd76bb38ff3dfb93d334beb95e7bc758d'
             'probe-editor.py' = '1aa75dae5c9619507e49ec937a86f2334d7b205f26a078205ae1db828a4581e9'
           }
@@ -125,7 +125,7 @@ jobs:
           }
           $receipt = Get-Content -LiteralPath (Join-Path $scratch 'receipt.json') -Raw | ConvertFrom-Json
           if ($receipt.release_id -ne 452722638 -or $receipt.source_commit -cne '50d39fb46c73c14f25aed8aa3007cbab79c2fd27' -or
-              $receipt.game.id -ne 771933722 -or $receipt.game.sha256 -cne $expected['game.zip']) {
+              $receipt.game.id -ne 771943590 -or $receipt.game.sha256 -cne $expected['game.zip']) {
             throw 'Transferred receipt does not identify the approved Windows archive.'
           }
           & (Join-Path $scratch 'Test-WindowsPackages.ps1') -Scratch $scratch
