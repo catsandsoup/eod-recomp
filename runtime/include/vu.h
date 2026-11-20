@@ -62,18 +62,20 @@ typedef struct VUState VUState;
 extern VUState g_vu0;
 extern VUState g_vu1;
 
-/* Execute a micro program starting at tpc until the E bit retires. */
-void vu_execute(VUState *vu, uint32_t start_pc);
-#ifdef __cplusplus
-/* Retire the verified VU1 MSCAL E-bit NOP and delay pair at 0x24D8. */
-bool vu_retire_mscal_nop(VUState *vu, uint32_t start_pc);
-/* Report producer-only PATH1 transport counts after the VIF worker drains. */
-void vu_report_world_strip_transport(void);
-#endif
 /* Run a single macro-mode (COP2) instruction on VU0. */
 void vu0_macro(uint32_t instr);
 
 #ifdef __cplusplus
 }
+
+enum class VuLaunch { Direct, Mscal, Mscalf, Mscnt, Vcallms, Vcallmsr, Cmsar1 };
+/* Execute a micro program starting at tpc until the E bit retires. */
+void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch = VuLaunch::Direct,
+                uint32_t ee_ra = 0);
+/* Retire the verified VU1 MSCAL E-bit NOP and delay pair at 0x24D8. */
+bool vu_retire_mscal_nop(VUState *vu, uint32_t start_pc);
+/* Report producer-only PATH1 transport counts after the VIF worker drains. */
+void vu_report_world_strip_transport(void);
+void vu_report_census();
 #endif
 #endif

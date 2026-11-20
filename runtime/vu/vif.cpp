@@ -65,7 +65,7 @@ bool matches_world_leaf_ref(const Vif &v, const uint32_t *payload, size_t words)
            v.tops == (v.dbf ? 0x270u : 0xE0u);
 }
 
-void start_micro(Vif &v, uint32_t addr, bool mscal = false,
+void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
                  const uint32_t *ref_payload = nullptr, size_t ref_words = 0) {
     if (v.n == 1) {
         v.itop = v.itops;
@@ -79,13 +79,11 @@ void start_micro(Vif &v, uint32_t addr, bool mscal = false,
 #ifdef EOD_PLUME
         // The verified E-bit NOP pair is shared by ordinary MSCAL producers.
         static const char *nop_setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
-        if (mscal && addr == 0x24D8 && (!nop_setting || nop_setting[0] != '0') &&
+        if (launch == VuLaunch::Mscal && addr == 0x24D8 && (!nop_setting || nop_setting[0] != '0') &&
             native::enabled() && !diff_in_original_side() && vu_retire_mscal_nop(v.vu, addr)) {
             ++g_vu1_nops_retired;
             return;
         }
-#else
-        (void)mscal;
 #endif
         if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload, ref_words) &&
             vu_retire_world_leaf(v.vu, addr, v.top, world_lod)) {
@@ -97,7 +95,7 @@ void start_micro(Vif &v, uint32_t addr, bool mscal = false,
     } else {
         v.itop = v.itops;
     }
-    vu_execute(v.vu, addr);
+    vu_execute(v.vu, addr, launch);
 }
 
 // Number of data words an UNPACK consumes.
@@ -439,10 +437,10 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         case 0x14:  // MSCAL
             LOG(LOG_VIF, "VIF%d MSCAL %04x", v.n, imm * 8);
             // Admission checks the committed REF; later commands run from the same VIF stream.
-            start_micro(v, imm * 8, true, v.n == 1 && !(n & 3) ? w : nullptr, n);
+            start_micro(v, imm * 8, VuLaunch::Mscal, v.n == 1 && !(n & 3) ? w : nullptr, n);
             break;
-        case 0x15: start_micro(v, imm * 8); break;       // MSCALF
-        case 0x17: start_micro(v, v.vu->tpc); break;     // MSCNT
+        case 0x15: start_micro(v, imm * 8, VuLaunch::Mscalf); break;
+        case 0x17: start_micro(v, v.vu->tpc, VuLaunch::Mscnt); break;
         case 0x20: v.mask = d[0]; break;                 // STMASK
         case 0x30: memcpy(v.row, d, 16); break;          // STROW
         case 0x31: memcpy(v.col, d, 16); break;          // STCOL

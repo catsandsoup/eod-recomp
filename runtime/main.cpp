@@ -166,6 +166,7 @@ static bool g_game_started = false;
     diff_report();
     if (g_game_started && code == 0) {
         vu_report_world_strip_transport();
+        vu_report_census();
         r7_audit::report();
     }
     eod_profile::report("exit");

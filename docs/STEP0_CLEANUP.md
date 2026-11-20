@@ -453,3 +453,30 @@ as the GS reference.
   packet checks across overwrites before removing TOP+200 writes. Drop
   strip construction and PATH1 transport only once ordered native
   admission, fallback and dependent draw state are accounted for.
+
+### R7 STAR — whole-run VU census and audit v2 (2026-11-21)
+
+- **Situation.** The R7 shutdown audit distinguished the retired visibility
+  program, but could miss gameplay VU0 dispatch, macro and control work.
+  Render trace sampled VIF1 reserve sites, with no whole-run accounting for
+  actual entries across VU units.
+- **Task.** Count the remaining VU paths without turning on legacy
+  execution, and identify a producer boundary for the next replacement.
+- **Action.** Added v2 lifecycle counters and a bounded opt-in histogram at
+  actual dispatch, macro, control and retirement sites. Check each unit's
+  histogram against its shutdown totals after the workers drain. Reject
+  older audit schemas and records outside the shutdown report.
+- **Result.** Seventeen successful headless runs reconciled, including
+  Classic day and night, both views of Classic and Modern 2P, the main
+  menu, copied-save Career fixtures, the VU1 worker and the local reference
+  build. The public world differential matched 1,041 calls, local macOS
+  passed 99/99 CTests, and Windows cross-linked. Every complete audit
+  still reported legacy work. Garage and dealer zone arrivals are verified
+  and their menu actions remain open. Raw counts and release limitations are
+  in NATIVE_RENDERER_SUCCESS.md.
+- **Next decisive test.** Recover the VIF0 program from the DMA0 data at
+  `0x003BC590` and match the PC 0 image `dc7d103a5a6e1a99`. Scope one
+  readable same-state replacement for `0x001DE7B0` and its caller's result
+  contract at `0x00187E08`. Measure its actual dispatch, macro, control
+  and direct-state removals across race and Career. For VU1, trace the
+  bounded queue REF at reserve `0x003613E0` through `0x02E0 → 0x0D48`.

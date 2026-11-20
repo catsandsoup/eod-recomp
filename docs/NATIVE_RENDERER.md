@@ -1604,12 +1604,17 @@ shutdown. The option defaults to off. A successful game exit emits one
 per successful game process. An absent, malformed, duplicate or nonzero
 summary fails the check.
 
+Version 2 (`[r7-audit] v=2 ...`) adds `vu0_micro` (every VU0 microprogram
+dispatch), `vu0_macro` (non-launch VU0 macro operations, including unknown
+opcodes as a conservative failure), and `vu0_control` (COP2 control accesses,
+including CMSAR1 writes). Earlier versions lack this coverage and fail the
+current gate explicitly.
+
 `vu1` counts dispatches to compiled or interpreted VU1 microprograms.
-`vu0_mlist` counts VU0 dispatches to entry `0x40` with MlistVisibilityCalc's
+`vu0_mlist` is the subset of `vu0_micro` at entry `0x40` with MlistVisibilityCalc's
 retail microcode block (the bytes from `0x40` through `0x117`, including the
-E-bit delay slot). It excludes gameplay VU0 programs. Use a fresh native
-run without `EOD_DIFF` or the offline reference for this counter. Logs from
-before the field was added lack the required counter.
+E-bit delay slot). Use a fresh native run without `EOD_DIFF` or offline
+reference helpers for release evidence.
 `gif_qwords` counts qwords consumed by the compatibility parser.
 `gs_raster` counts primitives queued for hardware rasterization or
 submitted to the software rasterizer. `gs_suppressed` counts primitives
@@ -1623,16 +1628,33 @@ or a fence wait for an earlier copy. Copies already complete when consumed
 add no wait count. Run explicit screenshots and offline replay separately
 from ordinary shipped-play checks.
 
+`EOD_R7_VU_CENSUS=1` emits a bounded whole-run histogram at the same shutdown
+boundary. Micro rows group actual dispatches by VU, launch source, normalized
+byte PC, full micro-memory fingerprint and context. Context is ITOP for VIF1
+launches and the raw EE return register for EE-issued operations. Native
+VIF retirements have their own rows. The fingerprint uses the same identity
+as `EOD_VU_DUMP` and is cached until VIF MPG or a generation-tracked mapped
+micro-memory write. Pair with `EOD_RENDER_TRACE_EVERY` in the default inline
+VU1 path to sample VIF1 producers by packet reserve site. A shared program
+address or image can serve several producers.
+
+Run both `EOD_R7_AUDIT=1` and `EOD_R7_VU_CENSUS=1`, then validate the combined
+log with `tools/r7_audit.py --check-vu-census`. This compares actual VU1 and
+VU0 dispatches, macros and controls before applying the strict zero gate.
+It also requires both shutdown histograms to finish before the audit line,
+with zero rows lost to the 16,384-row per-unit limit. Source, build graph
+and link inspection must cover generated VF transfers and VU memory
+mappings that bypass these dispatch hooks.
+
 Run the exact release candidate through fresh install and upgrade,
 startup and menus, movie play and skip, loading, Career including save/load,
 the race and split-screen rotation, netplay, return to menus, quit, and
-reopen. Require zero graphics audit counts and the separate release build
-graph, link map and package inspection for VU1 and GS exclusion. Verify
+reopen. Require zero audit counts and the separate release build
+graph, link map and package inspection for VU0, VU1 and GS exclusion. Verify
 the packaged visuals, settings and content against the approved local
 Mac build. Measure actual presented frame cadence on target displays at
 fullscreen 6× for the 60 FPS gate and run the independent unpaced S5
-workload for the 3.33 ms budget. Any other graphics-specific VU0 work
-requires separate verification.
+workload for the 3.33 ms budget.
 
 ### R7 native world visibility
 

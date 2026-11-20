@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <map>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <chrono>
 #include <vector>
 #include <cstdio>
@@ -1076,6 +1078,74 @@ void decode_pair(DecPair &d, uint32_t lo, uint32_t hi) {
 uint32_t g_vu_micro_gen[2];
 
 namespace {
+uint64_t micro_image_id(const VUState &vu) {
+    // Use the same fingerprint as existing EOD_VU_DUMP files.
+    static uint32_t seen_gen[2] = {~0u, ~0u};
+    static uint64_t current[2];
+    const int unit = vu.index;
+    if (seen_gen[unit] != g_vu_micro_gen[unit]) {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t i = 0; i <= vu.micro_mask; ++i)
+            hash = (hash ^ vu.micro[i]) * 1099511628211ull;
+        seen_gen[unit] = g_vu_micro_gen[unit];
+        current[unit] = hash;
+    }
+    return current[unit];
+}
+
+bool census_enabled() {
+    static const bool enabled = [] {
+        const char *setting = getenv("EOD_R7_VU_CENSUS");
+        return setting && setting[0] == '1' && setting[1] == '\0';
+    }();
+    return enabled;
+}
+
+struct CensusKey {
+    std::string_view kind;
+    uint32_t address;
+    uint64_t image;
+    uint32_t context;
+
+    bool operator<(const CensusKey &other) const {
+        return std::tie(kind, address, image, context) <
+               std::tie(other.kind, other.address, other.image, other.context);
+    }
+};
+
+// VU0 belongs to the EE. VU1 belongs to the offload path, which also runs
+// synchronously when no worker is active. Report only after the worker joins.
+struct Census {
+    std::map<CensusKey, uint64_t> rows;
+    uint64_t dropped = 0;
+};
+Census g_census[2];
+
+void census_add(int unit, const CensusKey &key) {
+    constexpr size_t kMaxRows = 16384;
+    auto &census = g_census[unit];
+    auto it = census.rows.lower_bound(key);
+    if (it != census.rows.end() && !(key < it->first)) {
+        ++it->second;
+    } else if (census.rows.size() < kMaxRows) {
+        census.rows.emplace_hint(it, key, 1);
+    } else {
+        ++census.dropped;
+    }
+}
+
+void census_micro(const VUState &vu, uint32_t pc, VuLaunch launch, uint32_t ee_ra) {
+    static constexpr const char *names[] = {"direct", "mscal", "mscalf", "mscnt", "vcallms", "vcallmsr", "cmsar1"};
+    const bool vif = launch == VuLaunch::Mscal || launch == VuLaunch::Mscalf || launch == VuLaunch::Mscnt;
+    const uint32_t context = vif && vu.index == 1 ? g_vif1_itop : ee_ra;
+    census_add(vu.index, {names[static_cast<unsigned>(launch)], pc, micro_image_id(vu), context});
+}
+
+void census_retire(const VUState &vu, uint32_t pc, const char *kind) {
+    if (census_enabled())
+        census_add(vu.index, {kind, pc, micro_image_id(vu), g_vif1_itop});
+}
+
 // EOD_VU_DUMP=dir: writes each distinct VU micro memory image that runs
 // (dir/vu<n>_<hash>.bin) and lists the entry points (dir/vu_entries.txt):
 // the input of tools/vurecomp.py.
@@ -1083,17 +1153,14 @@ void vu_dump(VUState *vu, uint32_t pc) {
     static const char *dir = getenv("EOD_VU_DUMP");
     if (!dir) return;
     static uint32_t seen_gen[2] = {~0u, ~0u};
-    static uint64_t cur_hash[2];
     static std::set<std::pair<uint64_t, uint32_t>> entries;
     int n = vu->index;
     uint32_t size = vu->micro_mask + 1;
+    const uint64_t hash = micro_image_id(*vu);
     if (seen_gen[n] != g_vu_micro_gen[n]) {
         seen_gen[n] = g_vu_micro_gen[n];
-        uint64_t h = 1469598103934665603ull;
-        for (uint32_t i = 0; i < size; i++) h = (h ^ vu->micro[i]) * 1099511628211ull;
-        cur_hash[n] = h;
         char path[1024];
-        snprintf(path, sizeof path, "%s/vu%d_%016llx.bin", dir, n, (unsigned long long)h);
+        snprintf(path, sizeof path, "%s/vu%d_%016llx.bin", dir, n, (unsigned long long)hash);
         if (FILE *f = fopen(path, "rb")) {
             fclose(f);
         } else if ((f = fopen(path, "wb"))) {
@@ -1101,16 +1168,29 @@ void vu_dump(VUState *vu, uint32_t pc) {
             fclose(f);
         }
     }
-    if (entries.insert({cur_hash[n] ^ (uint64_t)n, pc}).second) {
+    if (entries.insert({hash ^ (uint64_t)n, pc}).second) {
         char path[1024];
         snprintf(path, sizeof path, "%s/vu_entries.txt", dir);
         if (FILE *f = fopen(path, "a")) {
-            fprintf(f, "vu%d %016llx %04x\n", n, (unsigned long long)cur_hash[n], pc);
+            fprintf(f, "vu%d %016llx %04x\n", n, (unsigned long long)hash, pc);
             fclose(f);
         }
     }
 }
 }  // namespace
+
+void vu_report_census() {
+    if (!census_enabled()) return;
+    for (int unit = 0; unit < 2; ++unit) {
+        const auto &census = g_census[unit];
+        for (const auto &[key, count] : census.rows)
+            fprintf(stderr, "[r7-vu] vu=%d kind=%s address=%08x image=%016llx context=%08x count=%llu\n",
+                    unit, key.kind.data(), key.address, (unsigned long long)key.image, key.context,
+                    (unsigned long long)count);
+        fprintf(stderr, "[r7-vu] vu=%d rows=%zu dropped=%llu\n",
+                unit, census.rows.size(), (unsigned long long)census.dropped);
+    }
+}
 
 // --------------------------------------------------------------- micro mode
 // Interprets from `pc` until the program ends.
@@ -1640,9 +1720,10 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
             std::memcmp(vu->mem, memory, sizeof(memory)))
             fatal("MSCAL no-op retirement differs from VU1 execution at vblank %llu (%s)",
                   (unsigned long long)kernel_vblank_count(), compiled ? "compiled" : "interpreted");
-        return true;
+    } else {
+        retire(vu);
     }
-    retire(vu);
+    census_retire(*vu, pc, "retired_nop");
     return true;
 }
 
@@ -2011,6 +2092,7 @@ bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::
     if (check && !check_world_leaf(result, *vu, top, true))
         fatal("world VU1 retirement differs at vblank %llu", (unsigned long long)kernel_vblank_count());
     materialize_world_leaf(result, *vu, top, lod);
+    census_retire(*vu, pc, "retired_world");
     return true;
 #else
     return false;
@@ -2029,7 +2111,7 @@ static bool is_mlist_visibility_image(const VUState &vu) {
     return fingerprint == 0x2a3140a9ff711e39ull;
 }
 
-void vu_execute(VUState *vu, uint32_t start_pc) {
+void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch, uint32_t ee_ra) {
     EOD_ZONE("vu_execute");
     ProfScope prof(P_EE_VU);
     uint32_t pc = start_pc & vu->micro_mask & ~7u;
@@ -2037,8 +2119,9 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     vu_dump(vu, pc);
     if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
     if (scene_emit::g_on && vu->index == 1 && scene_emit::vu1_start(vu, pc)) return;
-    if (vu->index == 1) r7_audit::add(r7_audit::Counter::Vu1);
-    else if (pc == kMlistVisibilityPc && r7_audit::enabled()) {
+    r7_audit::add(vu->index == 1 ? r7_audit::Counter::Vu1 : r7_audit::Counter::Vu0Micro);
+    if (census_enabled()) census_micro(*vu, pc, launch, ee_ra);
+    if (vu->index == 0 && pc == kMlistVisibilityPc && r7_audit::enabled()) {
         static uint32_t checked_generation = ~0u;
         static bool is_mlist;
         if (checked_generation != g_vu_micro_gen[0]) {
@@ -2154,14 +2237,19 @@ extern "C" void vu0_macro(uint32_t ins) {
     flush_q(vu);
     flush_p(vu);
     uint32_t f = ins & 0x3F;
+    const bool call = f == 0x38 || f == 0x39;
+    if (!call) {
+        r7_audit::add(r7_audit::Counter::Vu0Macro);
+        if (census_enabled()) census_add(0, {"macro", ins, 0, g_ee.r[31].uw[0]});
+    }
     if (f < 0x30) {
         upper(c, ins);
         commit_upper(c);
     } else if (f >= 0x30 && f <= 0x35) {
         lower_op(c, ins);
-    } else if (f == 0x38 || f == 0x39) {
+    } else if (call) {
         uint32_t addr = f == 0x38 ? ((ins >> 6) & 0x7FFF) * 8 : vu->cmsar * 8;
-        vu_execute(vu, addr);
+        vu_execute(vu, addr, f == 0x38 ? VuLaunch::Vcallms : VuLaunch::Vcallmsr, g_ee.r[31].uw[0]);
     } else if (f >= 0x3C) {
         uint32_t ext = ((ins >> 6) & 31) << 2 | (ins & 3);
         if (ext < 0x30) {
@@ -2344,6 +2432,8 @@ int vu_bench(const char *path, int repeat) {
 extern "C" void vu0_sync(void) {}
 
 extern "C" uint32_t vu0_cfc2(int reg) {
+    r7_audit::add(r7_audit::Counter::Vu0Control);
+    if (census_enabled()) census_add(0, {"cfc2", static_cast<uint32_t>(reg), 0, g_ee.r[31].uw[0]});
     VUState *vu = &g_vu0;
     if (reg < 16) return vu->vi[reg] & 0xFFFF;
     switch (reg) {
@@ -2363,6 +2453,8 @@ extern "C" uint32_t vu0_cfc2(int reg) {
 }
 
 extern "C" void vu0_ctc2(int reg, uint32_t v) {
+    r7_audit::add(r7_audit::Counter::Vu0Control);
+    if (census_enabled()) census_add(0, {"ctc2", static_cast<uint32_t>(reg), 0, g_ee.r[31].uw[0]});
     VUState *vu = &g_vu0;
     if (reg < 16) {
         set_vi(vu, reg, v);
@@ -2381,12 +2473,14 @@ extern "C" void vu0_ctc2(int reg, uint32_t v) {
         if (v & 2) { /* reset VU0 */ }
         if (v & 0x200) { /* reset VU1 */ }
         break;
-    case REG_CMSAR1:
-        offload_run([v] {
+    case REG_CMSAR1: {
+        const uint32_t ee_ra = g_ee.r[31].uw[0];
+        offload_run([v, ee_ra] {
             g_vu1.cmsar = v & 0xFFFF;
-            vu_execute(&g_vu1, (v & 0xFFFF) * 8);
+            vu_execute(&g_vu1, (v & 0xFFFF) * 8, VuLaunch::Cmsar1, ee_ra);
         });
         break;
+    }
     default:
         break;
     }

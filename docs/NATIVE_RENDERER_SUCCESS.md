@@ -1127,3 +1127,99 @@ The headless runs provide no fullscreen pacing or performance claim.
 | Public macOS | `ac846f7e6641a45f788c298430c5f5b41633cace8d3d0c65cb18a0aa2350f301` |
 | Local macOS | `0cc30716599dab9f08784adbdf6ccec1fab684f370b394803fea5462a352151d` |
 | Windows cross-link | `22992d4a75f0389e4ce2f7a7f455f376f0a716b9424a34978b80b77b5b4e50c1` |
+
+## R7 whole-run VU census and audit v2 (2026-11-21)
+
+The release audit now counts VU0 micro dispatch, COP2 macros and COP2
+control accesses, alongside VU1 and the existing GS counters. An opt-in
+census records actual dispatches by launch route, byte PC, micro-memory
+fingerprint and context. It keeps the exact native VIF retirements
+separate. VU0 `vu0_mlist` remains a subset. The parser rejects old schemas,
+missing and duplicate reports, census overflow, and census records after
+shutdown. All 17 successful Phase B census runs reconciled with zero
+dropped rows. Every one still failed the strict emulator-work gate.
+
+The public interpreter Vulkan/Plume executable on Apple M2 Pro had
+SHA-256 `8cdd91db27c589c512f6ebe0620d18d8dfbc77165d7ed2293befef81d2507ae7`.
+These are whole-process counts from public headless runs with movie
+skip, heap checking, default native admission and the stated vblank
+windows. The two Kenyon runs each showed two stacked 640×224 viewports.
+Their counts combine both views.
+
+| Scene | Vblanks | VU1 MSCAL / MSCNT | World / NOP retired | VU0 micro | VU0 macro | COP2 reads / writes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Modern Dundas day, 6× | 360 | 44,060 / 86,850 | 42,268 / 25,164 | 2,420 | 315,541 | 17 / 18,273 |
+| Classic Dundas day, 6× | 360 | 47,233 / 93,015 | 45,416 / 26,988 | 2,447 | 320,101 | 17 / 18,487 |
+| Classic Gilroy night, 6× | 475 | 90,151 / 131,882 | 47,472 / 40,853 | 3,610 | 493,849 | 17 / 27,851 |
+| Classic Kenyon 2P, 6× | 485 | 83,872 / 113,273 | 130,517 / 35,695 | 2,833 | 382,453 | 17 / 21,461 |
+| Modern Kenyon 2P, 6× | 485 | 84,469 / 116,492 | 127,326 / 36,198 | 2,920 | 393,643 | 17 / 22,159 |
+| Classic main menu, 1× | 360 | 21,747 / 0 | 0 / 9,679 | 0 | 25,057 | 17 / 1 |
+| Classic Career Home, 1× | 1,800 | 912,753 / 161,553 | 46,257 / 444,820 | 22,737 | 2,482,156 | 17 / 139,625 |
+| Classic Career garage zone, 1× | 2,200 | 299,056 / 206,810 | 169,963 / 141,848 | 26,135 | 2,350,735 | 17 / 160,325 |
+| Classic Career dealer zone, 1× | 2,200 | 218,496 / 315,031 | 166,863 / 101,741 | 10,227 | 980,215 | 17 / 64,877 |
+| Modern Dundas differential, 6× | 2,200 | 204,229 / 353,664 | 209,026 / 120,094 | 10,840 | 1,521,541 | 17 / 85,633 |
+
+The Career fixtures used separate copies of a saved Career. Two early
+warps stopped at a pending zone. Delaying the warp to 240 Home Driver
+updates let the game settle into the garage and dealer zones. Garage
+and dealer menu actions remain unverified. Across the five 6× race runs,
+the audit measured 25,919,907–43,633,827 parsed GIF qwords, 92–4,186 GS
+raster submissions and 0–14 deferred waits per run. Career Home alone
+had 183,405,394 parsed qwords, 68,620 GS raster submissions and 249
+deferred waits. All completed runs had zero VU0 matrix-list dispatches,
+strict suppressions, synchronous VRAM reads and CLUT waits.
+
+The sampled VIF1 reserve-site trace attributed all 42,270 sampled starts
+across the five 6× races. At `0x003613E0`, the Modern Dundas sample attributed
+2,739 starts of `0x0D48` and 2,133 of `0x24B0` to queue batches. The whole
+Modern Dundas run counted 35,606 and 27,729 respective continuations,
+both at ITOP `0x080` on image `fd0ce30ab0ec263c`. Together they supplied
+25.2–48.4% of actual VU1 starts in the five race runs. The Modern sample
+also attributed clipped/world starts to `0x0035DEFC`, shared `0x0270`
+starts to immediate reserve `0x003614CC`, and `0x2538` / `0x25F0` starts to
+texture and state reserves `0x0035F824` / `0x00362104`. These reserve
+samples do not identify the exact model or caller mix across the full
+run. The menu's whole-run histogram independently logged 13,456 starts
+of `0x0270` at ITOP `0x200`, 4,142 of `0x2538` at `0x200`, and 346 of
+`0x25F0` at `0x200`.
+
+Every VU0 dispatch in the displayed matrix was VCALLMS to PC 0 on image
+`dc7d103a5a6e1a99`. All used the retained EE return registers
+`0x001DE864` and `0x001DEBA4` inside `0x001DE7B0`. Those sites accounted
+for 91.5–94.2% of VU0 macros across the five race runs and 1,928,151 in
+Career Home. The census observed no direct, VIF0, MSCALF, VCALLMSR or
+CMSAR1 launches in these fixtures. Generated code still contains 475
+other macro sites, seven VCALLMS sites, 30 CTC2, 12 CFC2 and 19 no-op
+sync helper calls. The 164 direct VF loads, 120 stores and 29 register
+copies, and the mapped VU memory routes, require separate source and
+build/link verification.
+
+The public differential matched all 1,041 live `0x00358BD0` calls
+with zero replayed. The earlier Phase A differential matched 1,179.
+Two worker tests with sender tracing unset reconciled after drain and
+join, including 168,640 VU1 dispatches in Modern Dundas. An earlier
+worker run with sender tracing active hit a drawing DMA timeout and
+emitted no shutdown audit. The disabled control exited normally and
+emitted neither diagnostic. With both settings unset, the runtime
+skips hashing, row updates and atomic increments at the audited sites.
+Disabled-mode timing overhead was not measured.
+
+The local macOS build linked with reference VU tables and passed 99/99
+CTests. Its own Dundas smoke reconciled 849,872 VU1 and 2,650 VU0 dispatches.
+The Windows executable cross-linked with SHA-256
+`5c202c8e261e9d8aa0ab69c401ec2dc50cdd180ccf18cadf28d08e4d4114b24c`.
+Windows installation and runtime were unavailable. Movie play, manual
+Career save/load and menu actions, 4P, netplay, full lifecycle parity,
+packaged VU/GS absence and fullscreen performance remain open.
+
+The next replacement is the gameplay producer `0x001DE7B0`, called at
+`0x00187E08`. Recover the DMA0 image staged at `0x003BC590` and cross-check
+the observed PC 0 fingerprint and the local reference's `0x0000` program
+range. Trace the EE prelude, VF/VI and VU memory inputs, and the outputs and
+consumers before replacing the upload, macros and VCALLMS together. Use
+same-state comparisons and verify that the replaced producer's launches
+and support operations disappear for the same workload. The largest
+mapped graphics follow-on is the exact `0x35CB88 → 0x3613C0` queue class
+with `0x02E0 → MSCNT 0x0D48`. Prove TOP ownership, posed/dented geometry
+and terminal effects before dropping its packet. Treat `0x24B0` and
+the other queue variants as separate admissions.
