@@ -1598,6 +1598,11 @@ per successful game process. An absent, malformed, duplicate or nonzero
 summary fails the check.
 
 `vu1` counts dispatches to compiled or interpreted VU1 microprograms.
+`vu0_mlist` counts VU0 dispatches to entry `0x40` with MlistVisibilityCalc's
+retail microcode block (the bytes from `0x40` through `0x117`, including the
+E-bit delay slot). It excludes gameplay VU0 programs. Use a fresh native
+run without `EOD_DIFF` or the offline reference for this counter. Logs from
+before the field was added lack the required counter.
 `gif_qwords` counts qwords consumed by the compatibility parser.
 `gs_raster` counts primitives queued for hardware rasterization or
 submitted to the software rasterizer. `gs_suppressed` counts primitives
@@ -1619,5 +1624,60 @@ graph, link map and package inspection for VU1 and GS exclusion. Verify
 the packaged visuals, settings and content against the approved local
 Mac build. Measure actual presented frame cadence on target displays at
 fullscreen 6× for the 60 FPS gate and run the independent unpaced S5
-workload for the 3.33 ms budget. Graphics-specific VU0 work, including
-the world visibility path at `0x3582B8`, requires separate verification.
+workload for the 3.33 ms budget. Any other graphics-specific VU0 work
+requires separate verification.
+
+### R7 native world visibility
+
+Replace MlistVisibilityCalc's VIF0 upload and local COP2 operations with CPU
+arithmetic at `0x3582B8`, including the group LOD helper `0x357E60`.
+The retail executable's chain at `0x3BD4D0` is a CNT tag with 24 payload
+qwords and VIF command `0x4A300000` (MPG, 48 instruction pairs at address 0),
+followed by an empty END tag at `0x3BD660`. MPG writes the VU instruction
+memory only. Both EE launches of the visibility entry
+are in this function, at `0x358804` and `0x358AD4`. The other VIF0 wait
+callers at `0x1DE85C`, `0x1DFB14`, `0x1DFD8C` and `0x2EF784` clear the
+channel 0 completion bit for their own request before waiting. They
+install their own code for entry 0. The additional entry `0x20` call at
+`0x1E00F0` also uses its enclosing routine's own MPG upload from
+`0x3BC290`. The display-object callbacks and scratchpad DMA in the
+epilogue remain part of the existing EE path.
+
+| Source | CPU contract |
+|---|---|
+| `0x3584E8..0x358714` | View rotation columns are the transpose of the camera rows. Translation is the negated dot of the camera position with each row in X, Y, Z order. Preserve the four guest camera quadwords and the existing EE projection-factor call. |
+| VU0 `0x0040..0x0068` | Accumulate centre in view space in column order X, Y, Z, translation. The plus and minus radius endpoints add or subtract `(0, 0, 1 / y)` times record W. Round products before adding. |
+| VU0 `0x0080..0x00E0` | Each endpoint keeps unprojected Z as clip W. Multiply XYZ by `(1 / x, 1 / x, (far+near)/(far-near))` and add `far * (1-ratio)` to Z. Clip the plus endpoint first and the minus endpoint second using strict comparisons against ±abs(W). Depth is `max(1, 0 + minus.z)` from before projection. |
+| EE `0x358810..0x358840`, `0x358AF0..0x358B20` | The two six-bit CLIP groups give `0` when any bit in `0xBD0` is set, `0x81` when any bit in `0x42F` is set, or `1` otherwise. Older CLIP history does not enter either mask. |
+| EE `0x357E60` | For a group with a nonzero parent visibility byte, subtract group XYZ at +0x10 from camera XYZ. Square and sum in X, Y, Z order. Apply the original EE `(distance² + f12) * f13` and compare the three thresholds at +0x00/+0x04/+0x08 to its absolute value. Each threshold at or below that value contributes bit 0, 2, or 4 respectively. |
+| Guest output | `0x70000000[0] = 0x81`, then spheres (stride 16), groups (stride 32) and models (stride 32). A model evaluates only if `(parent & 0x7F) == required` and writes depth for every evaluated model, including one rejected by clipping. A model skipped by its parent writes visibility 0 and leaves depth untouched. The depth index is the same combined sphere/group/model index as the visibility byte. |
+| Guest aliases | Retain the `0x4D6F00` quadword copies from sphere `+0x20` and evaluated model `+0x40`, including aligned EE access and the associated EE `v0` high word. The destination ends immediately before the current-list pointer at `0x4D6F10`. Preserve the identity/matrix-table loop and its overwrite at entry `count`. |
+
+The old sphere VF31 store at stack `+0x80` had no consumer and the
+group count and pointer overwrite its first eight bytes. The model VF31
+store at `+0xA0` only fed its X depth word, now written directly to the
+guest depth table. Both stores and the old matrix temporaries were in
+the callee's ordinary EE stack frame.
+
+Use `EOD_DIFF=003582B8 EOD_DIFF_RAM_MB=128` to compare full guest RAM and
+scratchpad, including the projection and camera globals, visibility and
+matrix entries, the copied quadword, and stale depth words. When the native
+function runs on the replacement side, the VF comparison ignores exactly
+`vf1–5`, `vf20–24`, `vf26` and `vf28–31`. These are the registers
+written by the retired camera setup, group clip and sphere/model microcode.
+This applies if the function is nested inside a frame comparison too.
+The generated EE uses VF20 and above in this cull routine alone. Other
+VF registers, the checked EE registers, VU integer registers, and VU data
+RAM still compare. The group reads its newly written low CLIP group, and the
+three EE status-flag readers at `0x38B9F8`, `0x38BA78` and `0x38BB28` clear
+the status register before use.
+
+Use `EOD_MLIST_VISIBILITY_BENCH_CHECK=1 eod --vu-bench CAPTURE` to compare
+the two low CLIP groups and the raw VF31 depth bits against the reference
+on recorded VU inputs. A different image at that entry, a comparison
+failure, or no matching records fails the check. Repeat with
+`EOD_VU_INTERP=1` for the interpreter reference.
+
+Sources: `gen/rec_100.c`, `gen/rec_099.c`, the retail VIF0 tag and VU0
+instruction disassembly, and the CLIP definition in the
+[Sony VU User’s Manual, §3.3.3](https://www.manuallib.com/download/VU-USER-MANUAL.PDF).

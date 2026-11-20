@@ -8,7 +8,7 @@
 
 namespace r7_audit {
 
-enum class Counter { Vu1, GifQwords, GsRaster, GsSuppressed, SyncVram, DeferredWait, ClutWait, Count };
+enum class Counter { Vu1, GifQwords, GsRaster, GsSuppressed, SyncVram, DeferredWait, ClutWait, Vu0Mlist, Count };
 
 inline std::atomic<uint64_t> counts[static_cast<unsigned>(Counter::Count)]{};
 
@@ -33,10 +33,10 @@ inline void report() {
     };
     std::fprintf(stderr,
                  "[r7-audit] vu1=%llu gif_qwords=%llu gs_raster=%llu gs_suppressed=%llu "
-                 "sync_vram=%llu deferred_wait=%llu clut_wait=%llu\n",
+                 "sync_vram=%llu deferred_wait=%llu clut_wait=%llu vu0_mlist=%llu\n",
                  get(Counter::Vu1), get(Counter::GifQwords), get(Counter::GsRaster),
                  get(Counter::GsSuppressed), get(Counter::SyncVram), get(Counter::DeferredWait),
-                 get(Counter::ClutWait));
+                 get(Counter::ClutWait), get(Counter::Vu0Mlist));
 }
 
 } // namespace r7_audit

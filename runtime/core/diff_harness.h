@@ -26,6 +26,9 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
 // True while the original side of a comparison runs (its guest results are kept, but the
 // replacement side repeats every nested call): host-side bookkeeping done there is undone.
 bool diff_in_original_side();
+// VF scratch omitted by a native replacement. A nested call contributes to
+// the current comparison only. VI registers and data memory still compare.
+void diff_retire_vu0_scratch(uint32_t mask);
 // Frozen host timestamp (microseconds) while a diff comparison runs (0 outside comparison),
 // so functions calling TimerGetMs (0x337718) see identical hardware timer reads on both sides.
 uint64_t diff_frozen_time_us();

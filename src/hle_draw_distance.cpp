@@ -23,9 +23,7 @@
 #include "ee.h"
 
 extern "C" void f_00214678_orig();
-extern "C" void f_003582B8_orig();
-// readable replacement (src/native_world.cpp registers it); the recompiled original otherwise
-extern "C" { void (*eod_mlist_calc_impl)(void) = nullptr; }
+extern "C" void eod_world_003582B8();  // src/native_world.cpp
 
 namespace {
 constexpr uint32_t kGraf = 0x3d1c18;          // loaded track.grf header {root, mlistA, mlistB}
@@ -180,8 +178,7 @@ extern "C" void f_003582B8() {
     FILE *csv = frame_log();
     const bool sampled_trace = trace();
     const uint64_t t0 = csv ? now_us() : 0;
-    if (eod_mlist_calc_impl) eod_mlist_calc_impl();
-    else f_003582B8_orig();
+    eod_world_003582B8();
     if (!csv && !sampled_trace) return;
     const uint64_t t1 = csv ? now_us() : 0;
     static unsigned calls, lines;

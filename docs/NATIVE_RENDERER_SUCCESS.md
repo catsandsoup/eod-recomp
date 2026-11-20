@@ -584,3 +584,46 @@ libraries must exclude VU1 and GS in the build graph and link map and
 match the approved local Mac visuals, settings and content. Actual
 fullscreen 6× presentation at 60 FPS requires target-hardware runs.
 The independent unpaced S5 workload must also meet 3.33 ms.
+
+## R7 native world visibility (2026-11-21)
+
+The native MlistVisibilityCalc at `0x3582B8` now performs camera setup,
+sphere and model clipping, model depth, and group LOD on the CPU. The
+retail visibility upload, both VU0 entry `0x40` calls and the group's
+direct COP2 macros have been removed from the regular path.
+
+On the Apple M2 Pro, the full-RAM `EOD_DIFF` rotation matched the
+legacy EE reference on all 2,949 live calls. It compares the guest
+visibility bytes, matrix table, depth words and camera state. Only the
+documented cull-private VF registers are excluded.
+
+| Scene | Look | Detail | Checked `0x3582B8` calls | Mismatches |
+|---|---|---|---:|---:|
+| Dundas day, Bus, 12 AI | Modern | Maximum | 1,934 | 0 |
+| Gilroy night, Taxi, 12 AI | Classic | Original | 362 | 0 |
+| Dundas, two joined players | Classic | Original | 365 | 0 |
+| Career, HomeBase and dealer | Modern | Maximum | 288 | 0 |
+
+A separate Dundas `EOD_DIFF=00214B68` run matched 82 enclosing world-frame
+calls. The direct oracle smoke also counted 115,335 launches of the
+retail visibility image, confirming the audit detects the reference path.
+
+Offline replay matched the two six-bit CLIP groups and VF31 depth bits for
+2,097 Dundas records and 778 Career records against the compiled VU
+reference, and again against the interpreter. Each replay had zero
+mismatches and zero unsupported images.
+
+A separate native-only rotation at scale 1 recorded zero retail Mlist
+VU0 dispatches on all four scenes. The split race logged two joined
+players and both 640×224 viewports. The full R7 audit still rejected the
+runs because compatibility VU1, GIF and GS-suppressed work was present.
+This check covers cull/depth parity. It leaves player visual sign-off,
+release link exclusions, install/upgrade and the two performance gates
+open.
+
+CMake regeneration initially included six tracked numbered source copies.
+Stale GS and Vulkan copies failed to compile against the current renderer
+interfaces. CMake now excludes those exact paths from its source lists and
+the normal macOS build passes. The build retains the existing duplicate
+`-lm` linker warning. All 99 macOS CTest tests passed. The Windows
+cross-build linked `eod.exe` and built the CPU boundary test.

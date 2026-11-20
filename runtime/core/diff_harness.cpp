@@ -116,7 +116,7 @@ void report_at_exit() {
                      (unsigned long long)s.mismatched);
 }
 
-int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned flags) {
+int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned flags, uint32_t retired_vfs) {
     std::vector<int> kGpr = {2, 16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 31};
     std::vector<int> kFpr = {20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
     if (flags & kDiffRet64) kGpr.push_back(3);
@@ -140,8 +140,12 @@ int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned fl
             std::snprintf(t, sizeof t, "f%d new %08x orig %08x", f, a, b);
             note(t);
         }
-    if (std::memcmp(g_vu0.vf, orig.vu0.vf, sizeof g_vu0.vf) || std::memcmp(g_vu0.vi, orig.vu0.vi, 16 * sizeof(uint32_t)))
-        note("VU0 registers differ");
+    for (unsigned vf = 0; vf < 32; ++vf)
+        if (!(retired_vfs & (1u << vf)) &&
+            std::memcmp(&g_vu0.vf[vf], &orig.vu0.vf[vf], sizeof g_vu0.vf[vf]))
+            note("VU0 VF" + std::to_string(vf) + " differs");
+    if (std::memcmp(g_vu0.vi, orig.vu0.vi, 16 * sizeof(uint32_t)))
+        note("VU0 VI registers differ");
     if (std::memcmp(g_vu0.mem, orig.vu0_mem.data(), orig.vu0_mem.size())) note("VU0 memory differs");
     for (uint32_t i = 0; i < sizeof orig.spr; i += 4)
         if (std::memcmp(g_scratchpad + i, orig.spr + i, 4)) {
@@ -175,6 +179,11 @@ int compare(uint32_t addr, const Snapshot &orig, uint32_t caller_sp, unsigned fl
 // Inside a comparison, nested wrapped calls follow the side being run.
 static enum class Side { kNone, kOriginal, kReplacement } g_side = Side::kNone;
 static uint64_t g_frozen_time_us = 0;
+static uint32_t g_retired_vfs = 0;
+
+void diff_retire_vu0_scratch(uint32_t mask) {
+    if (g_side == Side::kReplacement) g_retired_vfs |= mask;
+}
 
 bool diff_in_original_side() { return g_side == Side::kOriginal; }
 uint64_t diff_frozen_time_us() { return g_frozen_time_us; }
@@ -229,12 +238,13 @@ void diff_run(uint32_t addr, void (*replacement)(void), void (*original)(void), 
         after_orig.stack_from = before.stack_from;
         after_orig.stack.assign(g_ram + before.stack_from, g_ram + EE_RAM_SIZE);
         before.restore();
+        g_retired_vfs = 0;
         g_side = Side::kReplacement;
         replacement();
         g_side = Side::kNone;
         s.checked++;
         if (run) s.replayed++;
-        if (compare(addr, after_orig, sp, flags)) s.mismatched++;
+        if (compare(addr, after_orig, sp, flags, g_retired_vfs)) s.mismatched++;
         if ((s.checked & (s.checked - 1)) == 0 || s.checked % 1024 == 0)  // 1, 2, 4, ... then every 1024 (the game may exit without atexit)
             std::fprintf(stderr, "[diff] %08x: %llu calls, %llu checked (%llu replayed), %llu mismatched\n", addr,
                          (unsigned long long)s.calls, (unsigned long long)s.checked, (unsigned long long)s.replayed,

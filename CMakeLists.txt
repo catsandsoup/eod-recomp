@@ -76,6 +76,15 @@ file(GLOB_RECURSE RUNTIME_SOURCES
   ${CMAKE_SOURCE_DIR}/runtime/spu/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/render/*.cpp
   ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.c)
+# These tracked editor copies are snapshots, not translation units.
+set(EOD_VULKAN_GS_EDITOR_COPY "${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/gs_vulkan 2.cpp")
+list(REMOVE_ITEM RUNTIME_SOURCES
+  "${CMAKE_SOURCE_DIR}/runtime/gs/gs 2.cpp"
+  "${EOD_VULKAN_GS_EDITOR_COPY}"
+  "${CMAKE_SOURCE_DIR}/runtime/hw/hw 2.cpp"
+  "${CMAKE_SOURCE_DIR}/runtime/render/native_renderer 2.cpp"
+  "${CMAKE_SOURCE_DIR}/runtime/render/native_renderer 3.cpp"
+  "${CMAKE_SOURCE_DIR}/src/hle_draw_distance 2.cpp")
 # The optional standalone Plume scene library owns this source.
 list(REMOVE_ITEM RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/render/plume_scene.cpp)
 list(APPEND RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/main.cpp)
@@ -165,6 +174,7 @@ if(WIN32)
   option(EOD_VULKAN "Build the Vulkan GS backend" ON)
   if(EOD_VULKAN)
     file(GLOB VULKAN_GS_SOURCES ${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/*.cpp)
+    list(REMOVE_ITEM VULKAN_GS_SOURCES "${EOD_VULKAN_GS_EDITOR_COPY}")
     list(APPEND PLATFORM_SOURCES ${VULKAN_GS_SOURCES})
   endif()
 else()
@@ -741,7 +751,16 @@ if(APPLE AND BUILD_TESTING AND SDL3_FOUND)
   add_test(NAME audio_volume_offline COMMAND audio_volume_test)
   set_tests_properties(audio_volume_offline PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
 endif()
+if(BUILD_TESTING)
+  add_executable(world_visibility_test tests/world_visibility_test.cpp)
+  target_include_directories(world_visibility_test PRIVATE runtime runtime/include)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(world_visibility_test PRIVATE -ffp-contract=off)
+  endif()
+  add_test(NAME world_visibility_boundaries COMMAND world_visibility_test)
+endif()
 if(BUILD_TESTING AND Python3_FOUND)
+  add_test(NAME r7_audit_parser COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tests/r7_audit_test.py")
   set(NATIVE_WEAPON_REFERENCE "${CMAKE_CURRENT_BINARY_DIR}/native_weapon_reference.c")
   add_custom_command(OUTPUT "${NATIVE_WEAPON_REFERENCE}"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/extract_native_weapon_reference.py" "${GEN_DIR}" "${NATIVE_WEAPON_REFERENCE}"

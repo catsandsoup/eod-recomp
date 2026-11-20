@@ -8,9 +8,10 @@ from pathlib import Path
 
 SUMMARY = re.compile(
     r"\[r7-audit\] vu1=([0-9]+) gif_qwords=([0-9]+) gs_raster=([0-9]+) gs_suppressed=([0-9]+) "
-    r"sync_vram=([0-9]+) deferred_wait=([0-9]+) clut_wait=([0-9]+)"
+    r"sync_vram=([0-9]+) deferred_wait=([0-9]+) clut_wait=([0-9]+) vu0_mlist=([0-9]+)"
 )
-FIELDS = ("vu1", "gif_qwords", "gs_raster", "gs_suppressed", "sync_vram", "deferred_wait", "clut_wait")
+FIELDS = ("vu1", "gif_qwords", "gs_raster", "gs_suppressed", "sync_vram", "deferred_wait", "clut_wait",
+          "vu0_mlist")
 
 
 def main():

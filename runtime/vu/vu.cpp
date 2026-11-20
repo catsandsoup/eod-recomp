@@ -5,6 +5,7 @@
 // instruction, Q/P results become visible after their latency, branches
 // have a delay slot and the E bit ends the program after the next pair.
 #include "../core/r7_audit.h"
+#include "../render/world_visibility.h"
 #include "vu.h"
 #include "core/trace.h"
 #include "../core/prof.h"
@@ -1870,6 +1871,18 @@ bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top) {
 #endif
 }
 
+static constexpr uint32_t kMlistVisibilityPc = 0x40;
+
+static bool is_mlist_visibility_image(const VUState &vu) {
+    // FNV-1a of the retail entry through its E-bit delay slot (0x40..0x117).
+    constexpr uint32_t end = 0x118;
+    if (vu.micro_mask < end - 1) return false;
+    uint64_t fingerprint = 0xcbf29ce484222325ull;
+    for (uint32_t address = kMlistVisibilityPc; address < end; ++address)
+        fingerprint = (fingerprint ^ vu.micro[address]) * 0x100000001b3ull;
+    return fingerprint == 0x2a3140a9ff711e39ull;
+}
+
 void vu_execute(VUState *vu, uint32_t start_pc) {
     EOD_ZONE("vu_execute");
     ProfScope prof(P_EE_VU);
@@ -1879,6 +1892,15 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
     if (scene_emit::g_on && vu->index == 1 && scene_emit::vu1_start(vu, pc)) return;
     if (vu->index == 1) r7_audit::add(r7_audit::Counter::Vu1);
+    else if (pc == kMlistVisibilityPc && r7_audit::enabled()) {
+        static uint32_t checked_generation = ~0u;
+        static bool is_mlist;
+        if (checked_generation != g_vu_micro_gen[0]) {
+            checked_generation = g_vu_micro_gen[0];
+            is_mlist = is_mlist_visibility_image(*vu);
+        }
+        if (is_mlist) r7_audit::add(r7_audit::Counter::Vu0Mlist);
+    }
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;
@@ -2054,6 +2076,8 @@ int vu_bench(const char *path, int repeat) {
     const bool world_check = getenv("EOD_NATIVE_WORLD_BENCH_CHECK") != nullptr;
     size_t world_matched = 0, world_mismatched = 0, world_unsupported = 0;
 #endif
+    const bool mlist_check = getenv("EOD_MLIST_VISIBILITY_BENCH_CHECK") != nullptr;
+    size_t mlist_matched = 0, mlist_mismatched = 0, mlist_unsupported = 0;
     for (int rep = 0; rep < repeat; rep++) {
         double before = ns[1];
         for (const Rec &r : recs) {
@@ -2086,6 +2110,30 @@ int vu_bench(const char *path, int repeat) {
                 continue;
             }
 #endif
+            if (mlist_check) {
+                if (rep != 0 || r.h.index != 0 || r.h.pc != kMlistVisibilityPc) continue;
+                if (!is_mlist_visibility_image(*vu)) {
+                    ++mlist_unsupported;
+                    continue;
+                }
+                const auto *vf = vu->vf;
+                const world_visibility::Frustum view{
+                    {{vf[20].f[0], vf[21].f[0], vf[22].f[0]},
+                     {vf[20].f[1], vf[21].f[1], vf[22].f[1]},
+                     {vf[20].f[2], vf[21].f[2], vf[22].f[2]}},
+                    {vf[23].f[0], vf[23].f[1], vf[23].f[2]},
+                    vf[24].f[0], vf[26].f[2], vf[24].f[2], vf[26].f[3]};
+                const auto expected = world_visibility::classify(
+                    view, {vf[30].f[0], vf[30].f[1], vf[30].f[2]}, vf[30].f[3]);
+                vu_execute(vu, r.h.pc);
+                if (expected.clip == (vu->clip & 0xFFF) && f2u(expected.depth) == vu->vf[31].u[0]) {
+                    ++mlist_matched;
+                } else if (mlist_mismatched++ < 8) {
+                    fprintf(stderr, "mlist-bench: clip %03x / %03x, depth %08x / %08x\n",
+                            expected.clip, vu->clip & 0xFFF, f2u(expected.depth), vu->vf[31].u[0]);
+                }
+                continue;
+            }
             uint64_t c0 = vu->cycle;
             auto t0 = std::chrono::steady_clock::now();
             vu_execute(vu, r.h.pc);
@@ -2104,13 +2152,22 @@ int vu_bench(const char *path, int repeat) {
         }
         pass.push_back(ns[1] - before);
     }
+    bool checks_requested = mlist_check;
+    bool checks_passed = true;
 #if defined(EOD_VULKAN) && defined(VU_REC)
     if (world_check) {
         fprintf(stderr, "world-bench: %zu matched, %zu mismatched, %zu unsupported\n",
                 world_matched, world_mismatched, world_unsupported);
-        return world_matched && !world_mismatched ? 0 : 1;
+        checks_requested = true;
+        checks_passed = world_matched && !world_mismatched;
     }
 #endif
+    if (mlist_check) {
+        fprintf(stderr, "mlist-bench: %zu matched, %zu mismatched, %zu unsupported\n",
+                mlist_matched, mlist_mismatched, mlist_unsupported);
+        checks_passed = checks_passed && mlist_matched && !mlist_mismatched && !mlist_unsupported;
+    }
+    if (checks_requested) return checks_passed ? 0 : 1;
     std::sort(pass.begin(), pass.end());
     if (!g_blk_stats.empty()) {
         std::vector<std::pair<uint64_t, std::string>> top;

@@ -5,7 +5,6 @@
 //   0x214B68 WorldFrameRender      one view: mlist visibility, world passes 0..4 around the queued
 //                                  frame 0x22D7F0
 //   0x3582B8 MlistVisibilityCalc   per sphere / LOD group / model visibility bytes in the scratchpad
-//                                  (VU0 frustum test, microprogram 0x40)
 //   0x358BD0 WorldRenderPass(pass) DMA REFs to the visible world batches of one pass
 //   0x35DEE0 WorldPacketBegin(qwc) camera/matrix/material REFs (0x35BA10), then a packet (0x366D30)
 //   0x35CBB8 PacketCommit(qwc)     closes the open packet (body of 0x366CD0)
@@ -25,6 +24,7 @@
 #include "core/limit_tracker.h"
 #include "core/memory.h"
 #include "render/native_renderer.h"
+#include "render/world_visibility.h"
 
 #include <cmath>
 #include <cstdint>
@@ -67,7 +67,6 @@ void f_0033CA18(void);  // ProfileLabel(name)
 void f_0033CA08(void);  // ProfileLabelClear()
 void f_0033C578(void);  // DmaChannelsOpen(state)
 void f_0033C620(void);  // DmaChannelsClose(state)
-void f_001E0830(void);  // DmaWaitVif0(pcr*)
 void f_0035CD28(void);  // MatrixPacketBuild(m) -> packet
 void f_0035E018(void);  // SetMatrixPacket(packet)
 void f_0034F760(void);  // RenderStatePush()
@@ -82,7 +81,6 @@ void f_0035BA10(void);  // EmitCameraMatrixMaterial()
 void f_00366D30(void);  // PacketReserve(qwc) -> pointer or 0
 void f_0034FC68(void);  // Camera() -> 0x4CD2F8 (rows, then position at +0x24)
 void f_0034F5E8(void);  // ProjectionFactors(out, near*, far*, out2*)
-void f_00357E60(void);  // MlistGroupLod(group, camera qword; f12, f13) -> visibility byte
 void f_002111D0(void);  // ViewFov(view) -> f0
 void f_0039BB28(void);  // cosf(f12) -> f0
 void f_0034BDA8(void);  // RenderQueueSubmitModel(model, matrix, material, layer mask)
@@ -137,11 +135,6 @@ inline void copy_q_v0(uint32_t dst, uint32_t src) {
     MEM_LQ(src, &g_ee.r[2]);
     MEM_SQ(dst, &g_ee.r[2]);
 }
-inline void copy_q(uint32_t dst, uint32_t src) {
-    R128 q;
-    MEM_LQ(src, &q);
-    MEM_SQ(dst, &q);
-}
 // ldl/ldr + sdl/sdr pair: 8 bytes, any alignment
 inline void copy8(uint32_t dst, uint32_t src) {
     for (uint32_t k = 0; k < 8; k++) sb(dst + k, lbu(src + k));
@@ -188,32 +181,14 @@ struct Frame {
     uint32_t sp() const { return reg(29); }
 };
 
-// VU0 macro instructions the original issues (COP2), by instruction word.
-enum : uint32_t {
-    kVmulRow0 = 0x4BC3106A,     // vmul.xyz  vf1, vf2, vf3
-    kVmulRow1 = 0x4BC4106A,     // vmul.xyz  vf1, vf2, vf4
-    kVmulRow2 = 0x4BC5106A,     // vmul.xyz  vf1, vf2, vf5
-    kVaddY = 0x4B010841,        // vaddy.x   vf1, vf1, vf1y
-    kVaddZ = 0x4B010842,        // vaddz.x   vf1, vf1, vf1z
-    kVmulZ = 0x4BC1105A,        // vmulz.xyz vf1, vf2, vf1z
-    kVmoveVf20 = 0x4BF42B3C,    // vmove vf20, vf5
-    kVmoveVf21 = 0x4BF5233C,    // vmove vf21, vf4
-    kVmoveVf22 = 0x4BF61B3C,    // vmove vf22, vf3
-    kVmoveVf23 = 0x4BF70B3C,    // vmove vf23, vf1
-    kVmoveXyzVf2 = 0x4BC2133C,  // vmove.xyz vf2, vf2
-    kVmoveWVf2 = 0x4A220B3C,    // vmove.w   vf2, vf1
-    kVmoveVf24 = 0x4BF80B3C,    // vmove vf24, vf1
-    kVmoveVf26 = 0x4BFA133C,    // vmove vf26, vf2
-    kVmoveVf30 = 0x4BFE0B3C,    // vmove vf30, vf1   (sphere into the microprogram's input)
-    kVcallms40 = 0x4A000238,    // vcallms 0x40      (frustum / distance test)
-    kVmoveFromVf31 = 0x4BE1FB3C,// vmove vf1, vf31   (the microprogram's result)
-};
-inline void vu0(uint32_t w) { vu0_macro(w); }
-inline void vf_load(int n, uint32_t a) { MEM_LQ(a, (R128 *)&VU0.vf[n]); }
-inline void vf_store(uint32_t a, int n) { MEM_SQ(a, (const R128 *)&VU0.vf[n]); }
-
-// The microprogram's clip flags as a visibility byte: outside -> 0, partly outside -> 0x81, in -> 1.
-inline uint32_t visibility(uint32_t clip) { return (clip & 0xBD0) ? 0u : (clip & 0x42F) ? 0x81u : 1u; }
+inline world_visibility::Vec3 xyz(const R128 &q) {
+    return {bitsf(q.uw[0]), bitsf(q.uw[1]), bitsf(q.uw[2])};
+}
+inline world_visibility::Vec3 load_xyz(uint32_t address) {
+    R128 q;
+    MEM_LQ(address, &q);
+    return xyz(q);
+}
 
 constexpr uint32_t kScratch = 0x70000000;       // visibility bytes
 constexpr uint32_t kMatrixTable = 0x70001C00;   // 256 matrix packets (scratchpad)
@@ -301,22 +276,14 @@ void world_frame_render() {
 void mlist_visibility_calc() {
     const uint32_t mlist = reg(4), matrices = reg(6);
     const int32_t count = (int32_t)reg(7);
-    const uint32_t lod_a = g_ee.fpr[12].u, lod_b = g_ee.fpr[13].u;
+    const float lod_a = g_ee.fpr[12].f, lod_b = g_ee.fpr[13].f;
     Frame f(0x1C0);
     const uint32_t sp = f.sp();
     set(4, 0x4296B0);  // "mlist: calc"
     call(f_0033CA18, 0x358314);
 
-    // VU0 microcode upload: VIF0 DMA chain at 0x3BD4D0 (D_PCR saved, CPCOND0 only, then restored)
-    const uint32_t pcr = lwu(0x1000E020);
-    sw(sp + 0x100, pcr);
-    sw(0x1000E020, 0x10001);
-    sw(0x10008030, 0x3BD4D0u & 0xEFFFFFFFu);  // VIF0 TADR
-    sw(0x10008020, 0);                         // VIF0 QWC
-    sw(0x1000E010, 1);                         // D_STAT: clear channel 0
-    sw(0x10008000, 0x144);                     // VIF0 CHCR: chain, start
-    set(4, (int32_t)(sp + 0x100));
-    call(f_001E0830, 0x358388);
+    // The original's VF writes were local to the visibility calculation.
+    diff_retire_vu0_scratch(0x3Eu | (0x1Fu << 20) | (1u << 26) | (0xFu << 28));
 
     // identity 3x4 on the stack -> matrix packet 0, the default of every table entry
     sw(sp + 0x20, 0x3F800000);
@@ -329,7 +296,6 @@ void mlist_visibility_calc() {
     sw(sp + 0x18, 0);
     sw(sp + 0x1C, 0);
     sw(sp + 0x24, 0);
-    sw(0x1000E020, lwu(sp + 0x100));
     sw(kMlist, mlist);
     sw(sp + 0x2C, 0);
     sw(sp + 0x28, 0);
@@ -356,136 +322,59 @@ void mlist_visibility_calc() {
     sq3(0x4D2E90, lwu(cam + 0x00), lwu(cam + 0x04), lwu(cam + 0x08));
     sq3(0x4D2EB0, lwu(cam + 0x18), lwu(cam + 0x1C), lwu(cam + 0x20));
     sq3(0x4D2EC0, lwu(cam + 0x24), lwu(cam + 0x28), lwu(cam + 0x2C));
-    copy_q(sp + 0x40, 0x4D2E90);
-    copy_q(sp + 0x50, 0x4D2EA0);
-    copy_q(sp + 0x60, 0x4D2EB0);
-    copy_q(sp + 0x70, 0x4D2EC0);
-    vf_load(3, sp + 0x40);
-    vf_load(4, sp + 0x50);
-    vf_load(5, sp + 0x60);
-    // transposed rotation: columns at sp+0x80 / 0x90 / 0xA0 (and the 3x3 at sp+0xC0, column major)
-    const uint32_t r0x = lwu(sp + 0x40), r0y = lwu(sp + 0x44), r0z = lwu(sp + 0x48);
-    const uint32_t r1x = lwu(sp + 0x50), r1y = lwu(sp + 0x54), r1z = lwu(sp + 0x58);
-    const uint32_t r2x = lwu(sp + 0x60), r2y = lwu(sp + 0x64), r2z = lwu(sp + 0x68);
-    vf_store(sp + 0xF0, 5);
-    sw(sp + 0xC0, r0x);
-    sw(sp + 0xC4, r1x);
-    sw(sp + 0xCC, r0y);
-    sw(sp + 0xD0, r1y);
-    sw(sp + 0xDC, r1z);
-    sw(sp + 0xD8, r0z);
-    sq3(sp + 0x80, r0x, r1x, r2x);
-    sq3(sp + 0x90, r0y, r1y, r2y);
-    sw(sp + 0xC8, r2x);
-    sq3(sp + 0xA0, r0z, r1z, r2z);
-    sw(sp + 0xE0, r2z);
-    sw(sp + 0xD4, r2y);
-    // camera position . each row (VU0): -R c, the view translation
-    vf_load(2, sp + 0x70);
-    vu0(kVmulRow0);
-    vu0(kVaddY);
-    vu0(kVaddZ);
-    vf_store(sp + 0xC0, 1);
-    const uint32_t d0 = lwu(sp + 0xC0);
-    vu0(kVmulRow1);
-    vu0(kVaddY);
-    vu0(kVaddZ);
-    vf_store(sp + 0xC0, 1);
-    const uint32_t d1 = lwu(sp + 0xC0);
-    vu0(kVmulRow2);
-    vu0(kVaddY);
-    vu0(kVaddZ);
-    vf_store(sp + 0xC0, 1);
-    sq3(sp + 0xB0, d0, d1, lwu(sp + 0xC0));
-    MEM_LQ(sp + 0xB0, (R128 *)&VU0.vf[2]);
-    sw(sp + 0xC8, 0xBF800000);  // -1
-    vf_load(1, sp + 0xC0);
-    vu0(kVmulZ);
-    vf_store(sp + 0xB0, 1);
+    const world_visibility::Vec3 campos = load_xyz(0x4D2EC0);
+    world_visibility::Frustum view{};
+    for (unsigned row = 0; row < 3; ++row)
+        view.rows[row] = load_xyz(0x4D2E90 + 16 * row);
+    using world_visibility::dot;
+    view.translation = {fmul_ps2(-1.0f, dot(campos, view.rows[0])),
+                        fmul_ps2(-1.0f, dot(campos, view.rows[1])),
+                        fmul_ps2(-1.0f, dot(campos, view.rows[2]))};
     set(4, 0x4D2E80);
     set(5, 0x3DE6D8);
     set(6, 0x3DE6DC);
     set(7, (int32_t)(sp + 0x104));
     call(f_0034F5E8, 0x358714);
-    // projection constants: vf24 = (1/x, 1/x, (f+n)/(f-n), .), vf26 = (0, 0, 1/y, f (1 - (f+n)/(f-n)))
-    const float far = lf(0x3DE6DC), near = lf(0x3DE6D8), one = 1.0f;
-    const float range = fsub_ps2(far, near);
-    float ratio = fadd_ps2(far, near);
-    const float inv_x = fdiv_ps2(one, lf(0x4D2E80));
-    const float inv_y = fdiv_ps2(one, lf(sp + 0x104));
-    vf_load(5, sp + 0x80);
-    vf_load(4, sp + 0x90);
-    vf_load(3, sp + 0xA0);
-    vf_load(1, sp + 0xB0);
-    ratio = fdiv_ps2(ratio, range);
-    const float far_term = fmul_ps2(far, fsub_ps2(one, ratio));
-    const uint64_t a0_lo = (uint64_t)fbits(inv_x) | (uint64_t)fbits(inv_x) << 32, a0_hi = sx(fbits(ratio));
-    {
+    const float far = lf(0x3DE6DC), near = lf(0x3DE6D8);
+    view.horizontal_scale = fdiv_ps2(1.0f, lf(0x4D2E80));
+    view.radius_scale = fdiv_ps2(1.0f, lf(sp + 0x104));
+    view.depth_scale = fdiv_ps2(fadd_ps2(far, near), fsub_ps2(far, near));
+    view.depth_offset = fmul_ps2(far, fsub_ps2(1.0f, view.depth_scale));
+    // The EE builds a projection quadword in v0. Its high half can survive the call.
+    g_ee.r[2].ud[1] = sx(fbits(view.depth_offset));
+
+    const auto classify_record = [&view](uint32_t rec) {
         R128 q;
-        q.ud[0] = 0;
-        q.ud[1] = sx(fbits(inv_y));
-        std::memcpy(&VU0.vf[2], &q, 16);
-    }
-    vu0(kVmoveVf20);
-    vu0(kVmoveVf21);
-    vu0(kVmoveVf22);
-    vu0(kVmoveVf23);
-    sq_v0(sp + 0xC0, 0, sx(fbits(far_term)));
-    vu0(kVmoveXyzVf2);
-    sw(sp + 0xCC, lwu(sp + 0xC8));
-    vf_load(1, sp + 0xC0);
-    vu0(kVmoveWVf2);
-    {
-        R128 q;
-        q.ud[0] = a0_lo;
-        q.ud[1] = a0_hi;
-        std::memcpy(&VU0.vf[1], &q, 16);
-    }
-    vu0(kVmoveVf24);
-    vu0(kVmoveVf26);
+        MEM_LQ(rec, &q);
+        return world_visibility::classify(view, xyz(q), bitsf(q.uw[3]));
+    };
 
     // spheres: entries 1..n
     sb(kScratch, 0x81);
     uint32_t idx = 1;
     for (int32_t i = 0; i < lw(sp + 0x30); i++) {
         const uint32_t rec = lwu(sp + 0x34) + (uint32_t)i * 16;
-        vf_load(1, rec);
-        vu0(kVmoveVf30);
-        vu0(kVcallms40);
+        const auto result = classify_record(rec);
         copy_q_v0(0x4D6F00, rec + 32);
-        vu0_sync();
-        const uint32_t clip = vu0_cfc2(18);
-        vu0(kVmoveFromVf31);
-        vf_store(sp + 0x80, 1);
-        sb(kScratch + idx, visibility(clip));
+        sb(kScratch + idx, result.visibility);
         idx++;
         if (i + 1 < lw(sp + 0x30)) IRQ_CHECK();
     }
 
-    // LOD groups: 0x357E60 when the parent sphere is visible (the original unrolls by 4; the
-    // return address follows the unrolled slot)
+    // LOD groups enter only when their parent sphere has a nonzero byte.
     copy8(sp + 0x80, mlist + 0x18);
-    R128 campos;
-    MEM_LQ(sp + 0x70, &campos);
     const int32_t groups = lw(sp + 0x80);
-    if (groups > 0) {
-        static const uint32_t kLead[3] = {0x3588CC, 0x358910, 0x358954};
-        static const uint32_t kLoop[4] = {0x35899C, 0x3589D8, 0x358A14, 0x358A50};
-        const int32_t lead = (4 - ((-groups) & 3)) & 3;
-        uint32_t rec = lwu(sp + 0x84);
-        for (int32_t k = 0; k < groups; k++, rec += 0x20, idx++) {
-            uint32_t v = 0;
-            if (lbu(kScratch + lhu(rec + 12)) != 0) {
-                set(4, (int32_t)rec);
-                std::memcpy(&g_ee.r[5], &campos, 16);
-                set_f(12, lod_a);
-                set_f(13, lod_b);
-                call(f_00357E60, k < lead ? kLead[3 - lead + k] : kLoop[(k - lead) & 3]);
-                v = reg(2);
-            }
-            sb(kScratch + idx, v);
-            if (k >= lead && ((k - lead) & 3) == 3 && k + 1 < groups) IRQ_CHECK();
+    const int32_t lead = groups > 0 ? (4 - ((-groups) & 3)) & 3 : 0;
+    uint32_t group = lwu(sp + 0x84);
+    for (int32_t k = 0; k < groups; ++k, group += 0x20, ++idx) {
+        uint8_t v = 0;
+        if (lbu(kScratch + lhu(group + 12)) != 0) {
+            v = world_visibility::group_lod(campos, load_xyz(group + 16), load_xyz(group), lod_a, lod_b);
+            set(2, v);
         }
+        sb(kScratch + idx, v);
+        // Preserve the back-edge interrupt check of the original four-at-a-time loop.
+        if (k >= lead && ((k - lead) & 3) == 3 && k + 1 < groups) IRQ_CHECK();
     }
 
     // models: visible when the parent's byte (low 7 bits) is the model's required value
@@ -494,16 +383,10 @@ void mlist_visibility_calc() {
     uint32_t rec = lwu(sp + 0x94);
     for (int32_t k = 0; k < models; k++, rec += 0x20, idx++) {
         if ((lbu(kScratch + lhu(rec + 16)) & 0x7F) == lhu(rec + 18)) {
-            vf_load(1, rec);
-            vu0(kVmoveVf30);
-            vu0(kVcallms40);
+            const auto result = classify_record(rec);
             copy_q_v0(0x4D6F00, rec + 64);
-            vu0_sync();
-            const uint32_t clip = vu0_cfc2(18);
-            vu0(kVmoveFromVf31);
-            vf_store(sp + 0xA0, 1);
-            sw(kModelDepth + idx * 4, lwu(sp + 0xA0));
-            sb(kScratch + idx, visibility(clip));
+            sw(kModelDepth + idx * 4, fbits(result.depth));
+            sb(kScratch + idx, result.visibility);
         } else {
             sb(kScratch + idx, 0);
         }
@@ -1000,9 +883,7 @@ extern "C" void f_00214B68(void) {
     if (force) sw(0x3D1B0C, 0);
 }
 // 0x3582B8 is reached through src/hle_draw_distance.cpp's wrapper (EOD_CULL_TRACE, frame log).
-extern "C" void (*eod_mlist_calc_impl)(void);
 extern "C" void eod_world_003582B8(void) { diff_run(0x003582B8, mlist_visibility_calc, f_003582B8_orig); }
-static const bool g_mlist_registered = (eod_mlist_calc_impl = eod_world_003582B8, true);
 extern "C" void f_00358BD0(void) { diff_run(0x00358BD0, world_render_pass, f_00358BD0_orig); }
 extern "C" void f_0035DEE0(void) { diff_run(0x0035DEE0, world_packet_begin, f_0035DEE0_orig); }
 extern "C" void f_0035CBB8(void) { diff_run(0x0035CBB8, packet_commit, f_0035CBB8_orig); }

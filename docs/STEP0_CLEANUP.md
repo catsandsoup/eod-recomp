@@ -189,3 +189,30 @@ feeds compatibility state through GS. See
 state directly in native order. Compare the previous GS-visible
 state and output across the same scene rotation before removing the
 compatibility kick and its dependence on VU-local state.
+
+## R7 native world visibility handoff (2026-11-21)
+
+**Situation.** The world visibility producer still uploaded graphics
+microcode to VIF0, launched VU0 for every tested sphere and model, and used
+VU0 macros for camera setup and LOD groups.
+
+**Task.** Remove the visibility producer's dependence on VU0 while
+preserving clipping, LOD, depth and the guest table layout.
+
+**Action.** Derived the CPU calculation from the retail EE and VU0
+instructions. Preserved visibility, matrix and depth indexing and the
+quadword copies adjacent to the list pointer. Scoped the differential
+exception to retired VF scratch. Added a counter for dispatches of the
+retail visibility image, exact input-replay checks and CPU boundary tests.
+CMake now excludes the six tracked source copies with numbered names that
+were inadvertently pulled into fresh build graphs.
+
+**Result.** The day, night, two-player and Career differential rotation
+checked 2,949 live calls with zero mismatches. The native-only runs on
+those scenes reported zero `vu0_mlist` dispatches. Compiled and interpreted
+replays independently matched all 2,875 sampled clip/depth results. The
+macOS build passed all 99 CTest tests.
+
+**Next decisive test.** Trace the remaining graphics submission work,
+remove it from the release link graph and measure the packaged game
+against the full R7 lifecycle, visuals and timing gates.
