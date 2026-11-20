@@ -1182,3 +1182,48 @@ Particle emitters (0x2F2020, 0x2F2268, 0x2F24B0, 0x2F2AC8, ...)
 - **Native renderer impact:** None needed — `0x25F0` emits zero GS primitives and only updates VU1's GIFtag PRIM state (fog/alpha/AA/prim flags that Plume already reads directly from live `gs::Env` on every native draw).
 
 
+
+---
+
+## Stage R7: native 2D and emulator removal
+
+### Phase A1: race HUD producer table (`SLUS_209.10`, Ghidra `DecompileAddrs`, 2026-11-20)
+
+`0x0011CA48(view)` (per player from `0x00101C00` at `0x00101D34`; full screen view -1 from
+`0x001063DC`) calls `HudDrawLeftRaceRows`, `HudDrawRightSpeedRows`, then the centred `0x0011ACC0`.
+
+| Producer | Address | Role | Callees that reach the GS | GS state |
+|---|---|---|---|---|
+| `HudDrawLeftRaceRows` | `0x00119888` | left queue rows (`0x003C4370` font, count `0x003C45F8`, 0x40-byte rows at `0x003C4378`, type `+0x38`, slide `+0x3C`) | `0x0011C278` backing rect (colour `0x66000000`), `0x0011B960` text, `0x001194C0` bar row, `0x0029CA40`/`0x0029E138` frame sprites | see leaves |
+| `HudDrawRightSpeedRows` | `0x00119F40` | right queue rows (`0x003C4600`) | same leaves (`0x0011C278` at `0x0011A0DC`, `0x0011A414`) | see leaves |
+| X anchors | `0x0011DC50` / `0x0011DC30` | left/right endpoint `0x003C4310 + view*0x18 + 4/8` (`0x0011D2C8` table, overscan `0x00297498`) | none | widescreen edge shift: `src/hle_hud.cpp` -106.667 / +106.667 (16:9), -64 / +64 (16:10) native units, restored after the call |
+| rect leaf | `0x0011C278` -> `0x0011C2E8` (`0x0034F8D0(-1)`: no texture) -> `0x0011E730` -> `0x0035CAA0` | 4 verts by `0x00297298` (z 1.0), indices `0x003EE718` | `ImmediateDrawIndexedTris` -> `0x35DF10`/`0x361708`/`0x361BC8` (VU1 `0x0270`) | untextured, vertex alpha blend, then `0x0034F888` state flush |
+| sprite leaf | `0x0029E138` | 4 verts by `0x00297B60` (`{x,y,z,u,v,colour}`), indices `0x00413AE0`, texture `0x0034F928(font+0x84, 0x00294D40())` | `0x0035CAA0` (same VU1 `0x0270` path) | textured, alpha `0xFF000000` template, `0x0034F888` |
+| text leaf | `0x0011B960` -> `0x0029A9E8` (twice: drop shadow at +2,-2 with colour & `0xFF000000`, then text) | queues 0x54-byte entries at `*0x003D7440`, count `0x004A7E3C`, flushed by `0x0029A2B8` when > `0x5F` (PS2 cap: 96 strings, P10 item) | `0x0029A2B8` -> `0x0034F888` (`0x0029A648`) | font texture per glyph |
+
+HUD matrix `0x00297A88` is identity with Z = -365 under the active projection; all HUD geometry
+reaches the GS through the immediate path, which R4 already feeds to Plume as `KIND_IMMEDIATE`.
+
+### Results (R7 Phase A1, measured 2026-11-20, `EOD_NATIVE_ONLY=1`, Classic, RenderScale 1)
+
+- Dundas 'Battle (8 AI)' (vehicle 790, Cockpit -> NearChase via Select), 1,300 vb: **~80 dropped
+  GS primitives per GS frame**, all full-screen sprite strips, **0 HUD triangles**: fb 0 tex 1180
+  (20, display copy), fb 1180 tex 33e0 (20), fb 1180 untextured (20), fb 2be0 tex 2300 (10, half
+  width), fb 2be0 untextured (10); 1 stray tri (fb 1180 tex 2fc8) per 100 frames. P1 immediate
+  1116/1116. The R4 "~35/frame race" figure counted EE frames, not GS frames.
+- So the race HUD is not in the dropped set: the remaining drops are full-screen post / copy
+  passes (frame path, R7 A4 scope), not the HUD.
+- P3 (`tools/p3_run.sh`, `ONLY=1`, Dundas Battle, Limo vehicle 136, vb 850/1250/1650) whole frame MAE 35.03, SSIM 0.670;
+  corner regions TL MAE 6.70 / SSIM 0.850, TR 29.73 / 0.763, BL 50.17 / 0.633, BR 32.09 / 0.752.
+  Not HUD-isolated: the dropped full-screen passes change every pixel, so these numbers do not
+  measure HUD parity.
+
+### Open (R7 A1)
+
+- Readable C++ for `0x00119888` / `0x00119F40` under `diff_run` + `EOD_DIFF` (>= 1,000 calls, 0
+  mismatches) not written yet; the leaves already reach Plume through `KIND_IMMEDIATE`.
+- Decide what the HUD 2D pass is: move HUD `KIND_IMMEDIATE` draws (RA inside `0x0011E730` /
+  `0x0029E138` -> `0x0035CAA0`) to a new `KIND_HUD` orthographic pass after 3D in both looks.
+- Identify the EE producers of the five full-screen strip passes (fb 1180 / 2be0 / 0) and feed them.
+- HUD-only P3 needs a HUD pixel mask (for example a replay with `0x0011CA48` skipped) before parity can be scored.
+- Night flood-lit track, 2P split-screen, odd-vehicle rotation runs for A1 are not done yet.
