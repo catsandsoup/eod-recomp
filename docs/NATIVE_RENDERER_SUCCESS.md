@@ -360,3 +360,52 @@ Notes on specific paths:
   to Plume so `EOD_NATIVE_ONLY=1` reaches 0 dropped primitives.
 - **Deferred from R2:** `0x214B68` split-screen parity-off gate and split-screen water verification
   on Woodly (AFTON.TRK) 2P Battle.
+
+## 10. Stage R6: Modern look materials, Phase B suite (2026-11-20)
+
+Numbers only (owner rule: no image comparisons until the end of R7). Build: `build/eod.exe` at
+`85d8aff` (`ninja -C build eod`: no work to do, no stale objects). Every run: headless, muted,
+`RenderScale=1`, `Detail=maximum`, `DrawDistance=8`, `EOD_NATIVE=1 EOD_LOOK=modern` (Modern VFX on
+by default), look toggled every 30 vb from vb 1500 (24 toggles, `EOD_LOOK_TOGGLE_*`), Triangle on
+the pad script at vb 900 / 1300 / 1700 / 1900 / 2100 (camera cycle Cockpit -> NearChase -> Chase
+-> Chassis -> Bumper -> Cockpit -> NearChase), `EOD_CHICKENS=1`, `EOD_HEAP_CHECK=1`,
+`EOD_GPU_TIMING=1`, 2,300 vb. Runs in `D:/eod-runs/r6b` (`rb.sh`, `pair.py`, `sum.sh`).
+
+Pairs (`pair.py`, from `EOD_LOOK_FRAME_LOG`): old look = the capture at T-1 (flushed before the
+toggle), new look = the first new game frame at T+1..T+8 (1 vblank after the toggle, plus the
+game's own frame step); toggles within -10..+12 vb of a camera change skipped.
+Guardrails = `tools/modern_guardrails.py` rows 4/5, 6, 7, 8 (row 1 on the native-only run).
+
+| Scene | `[SESSION] start:` | Views | Pairs | Rows 4/5 whole / region worst | Row 6 | Row 7 | Row 8 Modern - Classic | P5 pipelines (1st toggle -> end), sets late, textures MB | P1 (all 9 kinds) | Heap | Exit |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| (a) Dundas day, Bus `790`, `ai=12` | Eve 4 'Dundas' contest 323 'Battle (8 AI)' | 5 of 5 pad views | 20 | 1.032 / 1.117 | 0.0031% | 0% | +0.035 ms (3.906 / 3.941). PASS | 19 -> 19, 0, 205.3 -> 111.0 | 1510/1510 | 0 | 0 |
+| (b) Gilroy night, Taxi `508` | Eve 6 'Gilroy' contest 325 'Battle (8 AI)' | 5 of 5 | 22 | 1.023 / 1.038 | 0% | 0% | +0.482 ms. PASS | 19 -> 19, 0, 171.0 -> 249.6 | 1056/1056 | 0 | 0 |
+| (c) Baxter night (flares 744 in 300 vb), Limo `136` | Eve 2 'Baxter' contest 331 'Battle (8 AI)' | 5 of 5 | 19 | 1.022 / 1.078 | 0% | 0% | -0.216 ms. PASS | 17 -> 17, 0, 123.9 -> 127.6 | 1522/1522 | 0 | 0 |
+| (d) Career free roam (`mode=career;place=malt`) | career start, TJ's Diner (Malt Shop) | 5 of 5 | 20 | 1.042 / 1.103 | 0.0209% | 0% | -0.076 ms. PASS | 17 -> 17, 0, 71.8 -> 73.7 | 1355/1355 | 0 | 0 |
+| (e) 2P, Kenyon, Hearse `502`, `humans=2` (both pad scripts) | Eve 10 'Kenyon' contest 329 'Battle (8 AI)' humans 2 | Cockpit only (see open) | 21 | 1.009 / 1.017 | 0% | 0% | -0.968 ms. PASS | 17 -> 17, 0, 32.0 -> 32.0 | 1312/1312 | 0 | 0 |
+| (f) `EOD_NATIVE_ONLY=1`, Hampton night, Postal `503` | Eve 7 'Hampton' contest 317 'Battle (8 AI)' | 5 of 5 | row 1: 19 frames | lum mean min 9.41 avg 11.27, nonzero min 44.3% avg 52.1%: **FAIL** (50% bar) | - | - | Modern 1.418 ms | 17 -> 17 | 1201/1201 | 0 | 0 |
+
+P5: pipelines never grow after the first toggle in any scene; "sets made for a texture that
+already had its Classic and Modern sets" 0 everywhere; the texture MB moves with streaming (Dundas
+falls, Gilroy rises), not with the toggle. `EOD_NATIVE_ONLY=1` still drops 60,934 GS primitives in
+2,300 vb (2D / HUD / menus, R7).
+
+EOD_DIFF (starts the race): `EOD_DIFF=00214b68`, Dundas 'Battle (8 AI)' Bus, Look=Modern toggling
+every 97 vb, 1,500 vb: `[SESSION] start:` reached, 506 calls, 506 checked, **0 mismatched**; EE
+state vs GS immediate 21,060 objects, 0 mismatches. The known `0x214B68` first-call field (two words
+0x70 apart at `0x772C60` / `0x772CD0`, upper halfword `0x0A30`) is accepted: it shows on Gilroy
+Limo only (A5, Classic too), not on Dundas Bus.
+
+### Open items (R6 -> R7)
+
+- Row 1 on a dark night track: Hampton native-only frames are 44..52% non-zero (bar 50%), Gilroy
+  night in A2 was 59..63%. Row 1's 50% bar is a daylight bar or Plume misses night geometry: decide
+  at the R7 image step (no image comparison before then).
+- 2P (`humans=2`): the pad Triangle did not change the camera (`[camera]` logs Cockpit only) and
+  the textures stay at 32.0 MB; split-screen (view count `0x3D1A74` = 2) is not proven by this run.
+- `0x214B68` first-call field on Gilroy Limo (stride 0x70 at `0x772C60`): accepted, not fixed.
+- `EOD_DIFF=all` (and some multi-function lists) do not reach `[SESSION] start:` on Gilroy Limo
+  (Classic too): bisect the stalling function.
+- `metal_painted` metalness (A4).
+- R5 open items: oval-track grandstand wedge, upper-right blurred rectangle (`FBP 0x1180`), 27 fps
+  under `EOD_NATIVE_ONLY=1`, near-plane clip vs GS (depth clamp), P2 `0x318` back-face culling.

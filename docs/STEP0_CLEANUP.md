@@ -113,3 +113,29 @@ in race — 2D/HUD/menus).
 **Next decisive test.** R5 (fog, mipmaps, GS blend/alpha-test parity), R6 (skip redundant VU1
 execution for native batches), and R7 (move the remaining ~35/frame 2D/HUD/menu GS draws to Plume
 to reach 0 dropped primitives under `EOD_NATIVE_ONLY=1`).
+
+## R6 handoff (STAR, 2026-11-20)
+
+**Situation.** After R5, Plume drew every native kind in Classic only. R6 Phase A (`f0ef513`,
+`7d43b3d`, `a393207`, `2927407`, `85d8aff`) added the Modern look (material records -> PBR shader
+inputs, F9 / `EOD_LOOK` switch, Modern VFX on by default) with guardrails rows 1, 4..8.
+
+**Task.** Phase B: verify Look=Modern with toggling and VFX on across a multi-scene headless suite
+(Dundas day max cars, two night tracks, Career free roam, 2P, `EOD_NATIVE_ONLY=1`), numbers only,
+with P5, P1, heap and one race-starting `EOD_DIFF` run, and document Section 10 of
+`docs/NATIVE_RENDERER_SUCCESS.md`.
+
+**Action.** Clean build check (`ninja -C build eod`: no work). Six 2,300-vb runs in
+`D:/eod-runs/r6b` with 24 look toggles, five pad camera changes, rotated special vehicles (Bus,
+Taxi, Limo, Career car, Hearse 2P, Postal native-only), 1-vblank pairs scored by
+`tools/modern_guardrails.py`, and `EOD_DIFF=00214b68` on Dundas.
+
+**Result.** Rows 4..8 PASS in all five toggled scenes (worst whole 1.042, region 1.117, row 6
+0.0209%, row 7 0%, row 8 <= +0.482 ms). P5: 0 pipeline growth, 0 late sets. P1 100% for all 9 kinds
+in all six runs, 0 heap corruptions, exit 0 everywhere. `EOD_DIFF` 506/506 checked, 0 mismatched.
+Row 1 (native-only, Hampton night) FAIL at 44.3% non-zero vs the 50% bar.
+
+**Next decisive test.** R7 (2D / HUD / menus on Plume, 0 dropped GS primitives, S5 <= 3.33 ms at
+RenderScale 6), then the image step: decide the night row-1 bar, prove 2P split-screen camera
+cycling, and close the open list in Section 10 (`0x214B68` Gilroy first call, `EOD_DIFF=all`
+stall, `metal_painted`, R5 items).
