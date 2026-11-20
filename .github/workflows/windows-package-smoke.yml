@@ -45,13 +45,21 @@ on:
 permissions: {}
 
 jobs:
-  smoke:
-    if: github.repository == 'catsandsoup/eod-recomp'
+  fetch:
+    if: >-
+      github.repository == 'catsandsoup/eod-recomp' &&
+      inputs.tag == 'v1.1.0-dev.20261121' &&
+      inputs.release_id == '452722638' &&
+      inputs.source_sha == '50d39fb46c73c14f25aed8aa3007cbab79c2fd27' &&
+      inputs.package_mode == 'combined' &&
+      inputs.game_asset == 'EOD-Recomp-v1.1.0-dev.20261121-Windows-x64.zip' &&
+      inputs.game_sha256 == '8f77b3c4e19abaf934020d2cd745d62aa0515c855ca50cd0ce9b93f2eabd051e' &&
+      inputs.editor_asset == '' && inputs.editor_sha256 == ''
     runs-on: windows-2022
-    timeout-minutes: 12
-    # Download the exact draft directly by ID. Pass the token only to the fetch step.
+    timeout-minutes: 6
+    # GitHub requires a write-capable repository identity to read draft releases.
     permissions:
-      contents: read
+      contents: write
     env:
       EOD_RELEASE_TAG: ${{ inputs.tag }}
       EOD_RELEASE_ID: ${{ inputs.release_id }}
@@ -74,8 +82,50 @@ jobs:
         env:
           EOD_DRAFT_TOKEN: ${{ github.token }}
         run: ./tools/windows-smoke/Fetch-DraftAssets.ps1
-      - name: Run clean native package smoke
+      - name: Stage the reviewed smoke scripts
         run: |
-          ./tools/windows-smoke/Test-WindowsPackages.ps1 -Scratch (
-              Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          )
+          $scratch = Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          Copy-Item -LiteralPath ./tools/windows-smoke/Test-WindowsPackages.ps1, ./tools/windows-smoke/probe-editor.py -Destination $scratch
+      - name: Transfer the verified ZIP and smoke scripts for this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/game.zip
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/Test-WindowsPackages.ps1
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/probe-editor.py
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  smoke:
+    needs: fetch
+    permissions: {}
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - name: Download this run's verified package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Run clean native package smoke
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $expected = @{
+            'game.zip' = '8f77b3c4e19abaf934020d2cd745d62aa0515c855ca50cd0ce9b93f2eabd051e'
+            'Test-WindowsPackages.ps1' = 'b7f7e7532a714333c2cd0c5428ad1aecd76bb38ff3dfb93d334beb95e7bc758d'
+            'probe-editor.py' = '1aa75dae5c9619507e49ec937a86f2334d7b205f26a078205ae1db828a4581e9'
+          }
+          foreach ($file in $expected.Keys) {
+            $actual = (Get-FileHash -LiteralPath (Join-Path $scratch $file) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $expected[$file]) { throw "Unexpected transfer digest for $file." }
+          }
+          $receipt = Get-Content -LiteralPath (Join-Path $scratch 'receipt.json') -Raw | ConvertFrom-Json
+          if ($receipt.release_id -ne 452722638 -or $receipt.source_commit -cne '50d39fb46c73c14f25aed8aa3007cbab79c2fd27' -or
+              $receipt.game.id -ne 771933722 -or $receipt.game.sha256 -cne $expected['game.zip']) {
+            throw 'Transferred receipt does not identify the approved Windows archive.'
+          }
+          & (Join-Path $scratch 'Test-WindowsPackages.ps1') -Scratch $scratch
