@@ -864,9 +864,48 @@ from 1500, captures every vblank 1490..2210. Pair = last old-look frame and firs
 ### Open (R6 A4)
 
 - `metal_painted` records at 0.6..0.7 metalness (paint is a dielectric): retag via `tools/material_runtime.py` if a day scene shows them too shiny; not needed for rows 4/5.
-- Career free roam (Time Challenge gate 1) rerun: only the hub was run in A4.
-- Modern VFX opaque blocks (row 7 with `EOD_MODERN_VFX=1`): not started; VFX stays opt-in.
-- `EOD_DIFF` mismatch in `0x214B68`: not started (check Classic and f0ef513, R2 split-screen parity-off gate).
+- Career free roam (Time Challenge gate 1) rerun: only the hub was run in A4 (done in A5).
+- Modern VFX opaque blocks (row 7 with `EOD_MODERN_VFX=1`): not started; VFX stays opt-in (A5: harness artefact, VFX on by default).
+- `EOD_DIFF` mismatch in `0x214B68`: not started (check Classic and f0ef513, R2 split-screen parity-off gate) (A5: reproduces in Classic, see A5).
+
+
+### Results (R6 Phase A5)
+
+Modern GPU VFX on by default. Same harness as A4 (headless, muted, `RenderScale=1`,
+`DrawDistance=8`, Battle (8 AI) + `EOD_CHICKENS=1`, Triangle at vb 900 / 1300 / 1700 / 2100, look
+toggled every 30 vb from 1500, 1-vblank pairs, toggles within -10..+12 vb of a camera change skipped).
+
+| Item | Result |
+|---|---|
+| Where the A2 "blocks" came from | Re-scoring the A2 captures pair by pair: Gilroy's 1.786% is the one T-5 / T+5 pair at vb 2100, which straddles the Cockpit camera cut at vb 2101 (Classic half Bumper view, Modern half Cockpit view: whole 1.71, region 2.78); Dundas' 0.179% / 0.089% are single T-5 / T+5 pairs with motion (the VFX-off set has 0.089% too). With A4's 1-vblank pairs the A2 shader (HEAD) with VFX on already gives 0% on Gilroy and Dundas. No VFX draw is opaque: every VFX draw seen uses a standard mix (`Cs As + Cd (1 - As)`) or an additive blend (`Cs As + Cd`) from the game's state (`EOD_VFX_LOG=1`: particles, sprites and immediate fire / smoke / spark, records 2442 / 2486 / 2491 / 2492 / 2532 / 2535 / 381) |
+| Shader hardening (`ps_modern`) | coverage = the game's alpha (texture alpha x vertex alpha, the TCC / TFX combine) x the procedural falloff, applied the way the game's GS blend fades a card (`modern_patch` puts the fade in mode.z bits 20..21): source alpha for a mix, source colour when Cd is kept whole (additive / subtractive), C -> 1 for an inverse mix, and no change at all for opaque, FIX or destination-alpha blends (they draw exactly as Classic). The tint stays <= 1 per channel; the colour is no longer also darkened by the mask on mix blends; the alpha test uses the game's alpha, not the masked one |
+| Default | Modern VFX is on in Look=Modern; `EOD_MODERN_VFX=0` turns it off (records then unlit `fx` cards) |
+
+| Scene (VFX on) | Rows 4/5 whole / region worst | Row 6 | Row 7 before (HEAD shader) -> after | Row 8 Modern - Classic |
+|---|---|---|---|---|
+| Gilroy night, Postal, views cycled (19 pairs) | 0.965 / 0.881 | 0 | 0% -> 0% (A2 T-5 / T+5 scoring: 1.79%, camera-cut pair) | - |
+| Dundas day, Hearse, views cycled (13 pairs; HEAD 20) | 1.021 / 0.902 | 0.0014% | 0% -> 0% (A2: 0.18%) | +0.33 ms (5.26 / 5.59 ms; HEAD run +0.22 ms). PASS |
+| Career free roam (`place=malt`, Drive Around, 17 pairs) | 1.035 / 1.072 | 0.0049% | -> 0% | +0.12 ms. PASS |
+
+Classic: Classic SPIR-V, pipelines and push constants untouched (`ps_modern` and `modern_patch`
+only). `EOD_DIFF=00214b68` Gilroy Limo, Look=Modern toggling every 97 vb, VFX on by default,
+2,000 frames: 678 checked, 1 mismatched (the first call, see below); EE state vs GS immediate:
+29,036 objects, 0 mismatches.
+
+`0x214B68`: the mismatch reproduces in Classic (`ModernRenderer=0`, no toggle, 2,400 frames: 800
+checked, 1 mismatched), so it is not renderer state. It is only the first call of the race: two
+words 0x70 apart (`0x772C60`, `0x772CD0`) where the original leaves the upper halfword `0x0A30`
+and the readable `0x214B68` writes 0 (`0x00006BEF` vs `0x0A306BEF`), every later call matches;
+single view, so not the split-screen parity gate. Not fixed (not trivial in the time box).
+
+### Open (R6 A5)
+
+- `0x214B68` first-call mismatch: find which field (stride 0x70 at `0x772C60`) the original fills
+  in its upper halfword on the first frame and the readable path does not.
+- `EOD_DIFF=all` (and some multi-function lists) on Gilroy Limo did not reach the race in 2,400
+  vblanks (no `[SESSION] start:`), where A2 did in 1,500; `EOD_DIFF=00214b68` alone does. Classic
+  as well, so not A5: bisect which checked function stalls the direct start.
+- `metal_painted` metalness (from A4) still open.
 
 ---
 

@@ -471,9 +471,9 @@ void load_materials() {
                 su == "fake_shadow" || su == "ui")
                 m.cls = C_UNLIT;
             else if (su == "vfx_fire" || su == "vfx_smoke" || su == "vfx_spark") {
-                // Modern GPU VFX is opt-in (EOD_MODERN_VFX=1) until guardrail 7 passes with it
-                // (docs/NATIVE_RENDERER.md "Open (R6 A2)"); otherwise these stay unlit fx cards
-                static const bool vfx = std::getenv("EOD_MODERN_VFX") && *std::getenv("EOD_MODERN_VFX") != '0';
+                // Modern GPU VFX is on by default since R6 A5 (guardrails 4..8 pass with it);
+                // EOD_MODERN_VFX=0 keeps these records unlit fx cards
+                static const bool vfx = !std::getenv("EOD_MODERN_VFX") || *std::getenv("EOD_MODERN_VFX") != '0';
                 m.cls = !vfx ? C_UNLIT : su == "vfx_fire" ? C_VFX_FIRE : su == "vfx_smoke" ? C_VFX_SMOKE : C_VFX_SPARK;
             }
             else if (su == "car_paint") m.cls = C_PAINT;
@@ -1239,6 +1239,27 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
             cls = m.cls;
             metal = (kind == KIND_SPRITE && it.p.pass >= 2 && it.p.pass <= 8) ? it.p.pass : 1u;  // atlas grid dim
             height = (kind == KIND_PARTICLE || kind == KIND_SPRITE) ? 1u : 0u;                   // radial quad mask
+            // how the game's GS blend fades this card (stage R6 A5, guardrail 7): 1 by the source
+            // alpha (Cs C + Cd (1 - C)), 2 by the source colour (Cd kept whole), 3 inverse (Cs (1 - C)
+            // + Cd C, C -> 1); 0 no fade: an opaque, FIX or destination-alpha blend has no coverage
+            // the shader can lower, so it is drawn exactly as Classic (masking it made the blocks)
+            {
+                const uint32_t key = it.pipeline, sf = (key >> 16) & 3, df = (key >> 18) & 3, op = (key >> 20) & 3;
+                const bool c_src = !(key & K_CDST) && !(pc.mode[0] & M_CFIX);
+                rough = 0;
+                if (df == 1 && sf != 0 && (op == 0 || op == 2)) rough = 2;
+                else if (c_src && op == 0 && sf == 2 && df == 3) rough = 1;
+                else if (c_src && op == 0 && sf == 3 && df == 2) rough = 3;
+                static const bool vlog = std::getenv("EOD_VFX_LOG") != nullptr;
+                static std::unordered_set<uint64_t> seen;
+                const uint64_t sig = (uint64_t)m.cls | (uint64_t)kind << 4 | (uint64_t)(sf | df << 2 | op << 4) << 8 |
+                                     (uint64_t)((key & K_CDST) ? 1 : 0) << 14 | (uint64_t)((pc.mode[0] & M_CFIX) ? 1 : 0) << 15 |
+                                     (uint64_t)((pc.mode[0] & M_ATE) ? 1 : 0) << 16 | (uint64_t)rough << 17;
+                if (vlog && seen.insert(sig).second && seen.size() <= 64)
+                    std::fprintf(stderr, "[r6] vfx class %u kind %u blend sf %u df %u op %u cdst %d cfix %d ate %d -> fade %u (record %d)\n",
+                                 m.cls, kind, sf, df, op, (key & K_CDST) ? 1 : 0, (pc.mode[0] & M_CFIX) ? 1 : 0,
+                                 (pc.mode[0] & M_ATE) ? 1 : 0, rough, it.tex->mat);
+            }
             em = 1;
             rec = 1;
             out.mode[2] = (pc.mode[2] & 0xFFFFu) | metal << 16 | rough << 20 | em << 24 | height << 25 | rec << 26 | cls << 27;

@@ -209,6 +209,7 @@ POut ps_modern(VOut i) {
     const float3 L = normalize(obj.light.xyz + float3(0, 1e-9, 0));
     float3 rgb;
     float a;
+    float a_game = 0.0;  // the alpha before the Modern VFX coverage: the alpha test is the game's
     float3 albedo = float3(1, 1, 1);
     if (m & M_TME) {
         const float4 t = ts;
@@ -277,46 +278,55 @@ POut ps_modern(VOut i) {
         col = max(col, albedo * E);
         rgb = min(col * 255.0, 255.0);
     } else if (is_vfx) {
-        // Modern-only GPU procedural fire, smoke & sparks (stage R6 A2):
-        // preserves the game's blend equation and brightness envelope while replacing hard square
-        // billboard edges with soft radial falloff and animated procedural flame/wisp/ember detail.
+        a_game = a;
+        // Modern-only GPU procedural fire, smoke & sparks (stage R6 A2, A5): a tint (<= 1 per
+        // channel) and a coverage mask (radial falloff x noise, <= 1) on the game's own result, so a
+        // VFX card keeps the texture's alpha and detail and is never brighter than Classic. The
+        // coverage is applied the way the game's GS blend fades a card out (modern_patch, bits
+        // 20..21): 1 src alpha (C = As, Cs C + Cd (1 - C)), 2 src colour (Cd kept: Cs F + Cd),
+        // 3 inverse (Cs (1 - C) + Cd C: C -> 1), 0 no fade (opaque / FIX / destination-alpha blends
+        // draw exactly as Classic: masking them would make or keep square blocks)
         const float gdim = max((float)((mz >> 16) & 15), 1.0);
         const float2 luv = gdim > 1.5 ? frac(i.uv * gdim * 0.9999 + 0.00005) : saturate(i.uv);
         const float2 p = luv * 2.0 - 1.0;
         const float r = length(p);
         const float t_sec = asfloat(obj.mode.w);
         const bool quad_mask = ((mz >> 25) & 1) != 0;
-        // guardrails 6 / 7: a tint and a mask only (multiplies the Classic colour by <= 1), so a VFX
-        // card keeps the texture's detail and is never brighter than Classic
+        const uint fade = (mz >> 20) & 3;
+        float3 tint = float3(1, 1, 1);
+        float cov = 1.0;
         if (cls == C_VFX_FIRE) {
             const float rad = quad_mask ? (1.0 - smoothstep(0.45, 0.96, r)) : 1.0;
             const float turb = vfx_fbm(float2(p.x * 2.6, p.y * 2.2 + t_sec * 4.2));
             const float core = saturate(1.0 - r * 0.95 + (turb - 0.45) * 0.75);
-            const float flame_mask = quad_mask ? saturate(rad * (0.45 + 0.85 * core)) : (0.68 + 0.50 * turb);
+            cov = quad_mask ? rad * saturate(0.45 + 0.85 * core) : saturate(0.68 + 0.50 * turb);
             const float base_lum = dot(rgb, float3(0.299, 0.587, 0.114)) / 255.0;
             const float heat = saturate(base_lum * (0.65 + 0.70 * core));
             const float3 bb = lerp(float3(1.0, 0.26, 0.04),
                                    lerp(float3(1.0, 0.68, 0.14), float3(1.0, 0.94, 0.76), smoothstep(0.55, 0.95, heat)),
                                    smoothstep(0.15, 0.65, heat));
-            rgb = rgb * lerp(float3(1.0, 1.0, 1.0), bb, 0.35) * saturate(flame_mask);
-            if (quad_mask) a *= rad;
+            tint = lerp(float3(1.0, 1.0, 1.0), bb, 0.35);
         } else if (cls == C_VFX_SMOKE) {
             const float rad = quad_mask ? (1.0 - smoothstep(0.35, 0.96, r)) : 1.0;
             const float wisp = 0.74 + 0.42 * vfx_fbm(p * 2.0 + float2(t_sec * 0.35, t_sec * 0.85));
-            const float soft = quad_mask ? saturate(rad * wisp) : saturate(0.82 + 0.28 * wisp);
-            const float puff_shade = quad_mask ? (0.94 + 0.10 * saturate(-p.y)) : 1.0;
-            rgb = rgb * min(puff_shade, 1.0);
-            a *= soft;
+            cov = quad_mask ? rad * wisp : 0.82 + 0.28 * wisp;
+            tint = (quad_mask ? min(0.94 + 0.10 * saturate(-p.y), 1.0) : 1.0).xxx;
         } else {
             // C_VFX_SPARK: crisp radial incandescent core + soft ember halo with subtle flicker
             const float rad = quad_mask ? (1.0 - smoothstep(0.55, 0.96, r)) : 1.0;
             const float core = exp(-r * r * 5.5);
             const float halo = (1.0 - smoothstep(0.12, 0.95, r)) * 0.45;
             const float flicker = 0.88 + 0.12 * sin(t_sec * 37.0 + dot(i.mp, float3(11.3, 17.1, 7.9)));
-            const float spark = quad_mask ? saturate((core + halo) * rad * flicker) : flicker;
-            const float3 ember = lerp(float3(1.0, 0.55, 0.12), float3(1.0, 0.95, 0.78), core);
-            rgb = rgb * lerp(float3(1.0, 1.0, 1.0), ember, 0.30) * saturate(0.45 + 0.85 * spark);
-            if (quad_mask) a *= rad;
+            cov = quad_mask ? rad * (0.45 + 0.85 * saturate((core + halo) * flicker)) : flicker;
+            tint = lerp(float3(1.0, 1.0, 1.0), lerp(float3(1.0, 0.55, 0.12), float3(1.0, 0.95, 0.78), core), 0.30);
+        }
+        cov = saturate(cov);
+        if (fade == 1) {
+            rgb *= tint, a *= cov;
+        } else if (fade == 2) {
+            rgb *= tint * cov;
+        } else if (fade == 3) {
+            rgb *= tint, a = 128.0 - (128.0 - min(a, 128.0)) * cov;
         }
     }
     rgb = min(rgb, 255.0);
@@ -327,7 +337,7 @@ POut ps_modern(VOut i) {
         rgb = fog + floor(((rgb - fog) * F + 128.0) / 256.0);
     }
     if (m & M_ATE) {
-        const bool pass = alpha_pass(a, (m >> M_ATST_SHIFT) & 7, (float)(obj.mode.y & 0xFF));
+        const bool pass = alpha_pass(is_vfx ? min(a_game, 255.0) : a, (m >> M_ATST_SHIFT) & 7, (float)(obj.mode.y & 0xFF));
         if (m & M_FAILED) {
             if (pass) discard;
         } else if (!pass && (m & M_AFAIL_DISCARD)) {
