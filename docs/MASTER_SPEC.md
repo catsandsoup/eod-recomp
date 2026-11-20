@@ -67,6 +67,12 @@ recompiled into `eod`. Quality bar: Halo 2 Anniversary (MCC).
   VRAM readback stalls.
 - **S4 no emulated graphics in the frame path:** 0 VU1 microprogram executions, 0 emulated
   GS rasterizations, 0 synchronous VRAM readbacks per frame across the scene suite.
+- **S5 efficiency (owner, 2026-11-20):** on the owner's PC at RenderScale 6, max LOD, Modern,
+  Dundas with max cars and draw distance, the per-frame cost is `<= 3.33 ms`. That is the
+  300 fps budget: the mean of CPU frame work (EE + native feed + record/submit) and GPU frame
+  time, measured unpaced with Tracy + `EOD_GPU_TIMING`. Night flood-lit tracks and 2P
+  split-screen must also meet it. The game still simulates at 60 Hz; this gate is about
+  efficiency headroom, not the displayed frame rate.
 
 ### Decompilation gates
 - **D1:** readable C++ replaces every function in the subsystem (`config/hle.txt` `wrap` / `diff_run`).
@@ -153,7 +159,10 @@ it with adaptive host memory that grows on demand and releases when unused.
   `HudDrawLeftRaceRows 0x00119888`, `HudDrawRightSpeedRows 0x00119F40`, HUD queues
   `0x003C4370`/`0x003C4600`, widescreen edge shift, `GTEX` v4 fonts, `CANV` v1 canvases,
   `.PSS` movies, loading / memory card) to Plume; cut VU1 and GS emulation from the frame
-  loop (S4 = 0), removing all 58 synchronous VRAM readbacks per frame.
+  loop (S4 = 0), removing all 58 synchronous VRAM readbacks per frame. R7 is done only once
+  S5 (`<= 3.33 ms`/frame at 6x) is met: profile and remove every remaining PS2 leftover in
+  the frame path (emulated DMA/VIF/GIF paths, the GS shim, the old `ModernRenderer` pass,
+  per-frame PS2 cap bookkeeping).
 - **R8 macOS, speed sign-off, photo mode, Creation Kit:** `plume_metal.cpp` on macOS; P11,
   P13; sign off S1–S3 and P12 with fullscreen Tracy + `EOD_GPU_PROF`.
 - **R9 Creation Kit world editor (clean-room, workflow modelled on modern community map
