@@ -15,7 +15,7 @@ PACKAGE = ROOT / 'tools/editor_macos'
 
 def build_layout(root):
     root = Path(root).resolve()
-    output = root / 'build/creation-kit'
+    output = Path(os.environ['EOD_KIT_BUILD_OUTPUT']) if 'EOD_KIT_BUILD_OUTPUT' in os.environ else root / 'build/creation-kit'
     layout = dict(output=output, scratch=output / 'swift',
                   app=output / 'EOD Creation Kit Development.app',
                   stage=output / 'EOD Creation Kit Development.staging.app',
@@ -68,6 +68,10 @@ def main():
     config = runtime_config(ROOT, args.game_executable, args.project)
     command = ['swift', 'build', '--build-system', 'native', '--package-path', str(PACKAGE),
                '--scratch-path', str(layout['scratch']), '-c', 'release',
+               '--cache-path', str(layout['output'] / 'swift-cache'),
+               '--config-path', str(layout['output'] / 'swift-config'),
+               '--security-path', str(layout['output'] / 'swift-security'),
+               '--manifest-cache', 'local',
                '-Xswiftc', '-file-prefix-map', '-Xswiftc', str(Path.home()) + '=/build',
                '-Xswiftc', '-debug-prefix-map', '-Xswiftc', str(Path.home()) + '=/build']
     subprocess.run(command, check=True)

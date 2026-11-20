@@ -19,6 +19,7 @@ def rpaths(path):
         if 'cmd LC_RPATH' in line:
             result.append(lines[i+2].strip().split(' (offset')[0].removeprefix('path '))
     return result
+release_deps = os.environ.get('EOD_MAC_RELEASE_DEPENDENCY_ROOT')
 seen={}; pending=[(exe,exe)]
 resources=app/'Contents/Resources'; resources.mkdir(exist_ok=True)
 bundled_mods=resources/'Mods'
@@ -90,7 +91,8 @@ while pending:
         if dep.startswith('@rpath/'):
             suffix=dep[len('@rpath/'):]
             candidates=[pathlib.Path(p.replace('@loader_path',str(src.parent)).replace('@executable_path',str(exe.parent)))/suffix for p in paths]
-            candidates += [pathlib.Path('/opt/homebrew/lib')/suffix]
+            dependency_lib = pathlib.Path(release_deps) / 'lib' if release_deps else pathlib.Path('/opt/homebrew/lib')
+            candidates += [dependency_lib / suffix]
         else:
             candidates=[pathlib.Path(dep.replace('@loader_path',str(src.parent)).replace('@executable_path',str(exe.parent)))]
         actual=next((p.resolve() for p in candidates if p.exists()),None)
@@ -127,6 +129,9 @@ if not sdl_license.is_file(): sdl_license=pathlib.Path('/opt/homebrew/opt/sdl3/L
 for name,license_path in [('SDL3',str(sdl_license)),('libusb','/opt/homebrew/opt/libusb/COPYING'),('MoltenVK','/opt/homebrew/opt/molten-vk/LICENSE')]:
     source=pathlib.Path(license_path)
     if source.exists(): shutil.copyfile(source,licenses/(name+'.txt'))
+if release_deps:
+    for name in ('libusb', 'MoltenVK', 'Opus'):
+        shutil.copyfile(pathlib.Path(release_deps) / 'licenses' / (name + '.txt'), licenses / (name + '.txt'))
 if len(sys.argv)>2:
     xxhash_license=pathlib.Path(sys.argv[2]).resolve().parent/'_deps/eod_xxhash-src/LICENSE'
     if xxhash_license.is_file(): shutil.copyfile(xxhash_license,licenses/'xxHash.txt')

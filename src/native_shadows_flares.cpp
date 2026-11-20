@@ -124,6 +124,7 @@ constexpr uint32_t kFlareBucketCount = 0x3D94F0; // int32_t flare bucket count
 constexpr uint32_t kFlareBucketBase = 0x3D94F4;  // FlareBucket[n] (stride 0x308)
 
 constexpr uint32_t kViewCount = 0x3D1A74;        // int32_t viewport count (1, 2, 4)
+constexpr uint32_t kPhyscamView = 0x48CB8C;      // active player 0 gameplay/replay view (0..18)
 constexpr uint32_t kViewIndex = 0x3D1A78;        // int32_t active viewport index
 constexpr uint32_t kScreenW = 0x3DC978;          // int32_t screen width
 constexpr uint32_t kScreenH = 0x3DC97C;          // int32_t screen height
@@ -158,7 +159,11 @@ void shadow_begin() {
     sw(kShadowDir + 8, lwu(dir_ptr + 8));
 
     // Snapshot main-viewport camera/projection BEFORE 0x35DA30 -> 0x363218 overwrites 0x4D7C20
-    if (!diff_in_original_side()) native::ee_shadow_begin(alpha);
+    if (!diff_in_original_side()) {
+        const bool race_view = saved_ra == 0x30A59C && lwu(kViewCount) == 1 &&
+                               lwu(kViewIndex) == 0 && lwu(kPhyscamView) <= 18;
+        native::ee_shadow_begin(alpha, race_view);
+    }
 
     set(4, alpha);
     call(f_0035DA30, 0x34C808);

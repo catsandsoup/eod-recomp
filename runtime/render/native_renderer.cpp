@@ -36,6 +36,7 @@
 #include "plume_device.h"
 #include "plume_scene.h"
 #include "plume_vulkan.h"
+#include "sun_cascades.h"
 #endif
 
 namespace gs {
@@ -144,6 +145,7 @@ uint64_t context_xyoffset() {
 #ifdef EOD_PLUME
 #include "material_table.inc"
 using namespace scene;
+#include "native_sun_cascades_spv.inc"
 
 constexpr uint32_t kAuthoredEnvironment = 1u << 31; // Modern mode.z, above the material class
 enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
@@ -159,8 +161,10 @@ enum : uint32_t { S_ON = 1u << 31, S_COMPOSITE = 1u << 30 };
 
 struct GpuMesh {
     std::unique_ptr<Mesh> cpu;
-    std::unique_ptr<plume::RenderBuffer> buf;  // vertices, then indices
+    std::unique_ptr<plume::RenderBuffer> buf;  // vertices, indices, optional billboard instances
     uint64_t index_offset = 0;
+    uint64_t billboard_offset = 0;
+    sun_cascades::Bounds sun_bounds;
 };
 
 struct Texture {
@@ -208,6 +212,28 @@ struct Target {
     }
 };
 
+enum class SceneStage { Reflection, Water, Particles, Count };
+using SceneRect = std::array<int32_t, 4>;  // scaled, exclusive right/bottom
+struct SceneSnapshot {
+    std::unique_ptr<plume::RenderTexture> color, depth;
+    std::unique_ptr<plume::RenderBuffer> params;
+    std::unique_ptr<plume::RenderDescriptorSet> set;
+    SceneRect rect{};
+    uint32_t width = 0, height = 0, surface_width = 0, surface_height = 0;
+    uint64_t color_source = 0, depth_source = 0;
+    bool captured = false;
+};
+struct SceneView {
+    SceneRect rect{};
+    Target target{};
+    uint64_t color_source = 0, depth_source = 0;
+    uint64_t color_ownership = 0, depth_ownership = 0;
+    Packet camera{};
+    float ox = 0, oy = 0;
+    bool world_drawn = false, blocked = false;
+    std::array<std::unique_ptr<SceneSnapshot>, size_t(SceneStage::Count)> inputs;
+};
+
 // Destroyed some vblanks later, when the GPU no longer reads them.
 struct Trash {
     uint64_t vb;
@@ -215,6 +241,44 @@ struct Trash {
     std::unique_ptr<plume::RenderTexture> tex;
     std::unique_ptr<plume::RenderDescriptorSet> sets[16];
     std::unique_ptr<plume::RenderFramebuffer> fb;
+    std::unique_ptr<SceneSnapshot> scene_input;
+};
+
+struct SunCaster {
+    float model[12];
+    sun_cascades::Bounds bounds;
+    const plume::RenderBuffer *buffer;
+    uint64_t index_offset;
+    uint32_t vertex_bytes, index_count, kind;
+};
+
+struct SunView {
+    Packet camera{}, shadow{};
+    uint64_t color_image = 0, depth_image = 0, xy = 0;
+    uint64_t color_ownership = 0, depth_ownership = 0;
+    Target target{};
+    sun_cascades::Vec3 sun{};
+    bool have_sun = false, valid = false, prepared = false, armed = false;
+    std::vector<SunCaster> casters;
+
+    void reset() {
+        valid = have_sun = prepared = armed = false;
+        casters.clear();
+    }
+};
+
+struct SunMaps {
+    bool attempted = false;
+    std::unique_ptr<plume::RenderTexture> depth[2];
+    std::unique_ptr<plume::RenderFramebuffer> framebuffer[2];
+    std::unique_ptr<plume::RenderPipelineLayout> caster_layout, receiver_layout;
+    std::unique_ptr<plume::RenderPipeline> caster_pipeline, receiver_pipeline;
+    std::unique_ptr<plume::RenderTexture> scene_color, scene_depth;
+    std::unique_ptr<plume::RenderDescriptorSet> receiver_set;
+    std::unique_ptr<plume::RenderFramebuffer> scene_framebuffer;
+    uint64_t color_image = 0, depth_image = 0;
+    uint32_t size[2] = {};
+    uint64_t scene_binds = 0, composites = 0, armed = 0, resolved = 0;
 };
 
 struct Renderer {
@@ -244,6 +308,9 @@ struct Renderer {
     Target target{};
     // adaptive full-RenderScale shadow accumulation buffer (removes PS2 320x512 cap)
     std::vector<Item> shadow_pending;
+    SunView sun_view;
+    SunMaps sun_maps;
+    bool hybrid_shadow_prepared = false;
     Target main_target{};
     bool has_main_target = false;
     uint64_t main_xy = 0;
@@ -252,6 +319,13 @@ struct Renderer {
     std::unique_ptr<plume::RenderFramebuffer> shadow_fb;
     uint64_t shadow_fb_depth = 0;
     std::unique_ptr<plume::RenderBuffer> quad_buf;
+    // The game renders at most four camera views (0x3D1A74). Each stage records
+    // at most one copy in a view, even when GS ordering splits a native flush.
+    std::array<SceneView, 4> scene_views;
+    uint64_t scene_frame = ~0ull;
+    bool scene_blit = false;
+    uint32_t scene_captures[size_t(SceneStage::Count)] = {}, scene_draws[size_t(SceneStage::Count)] = {};
+    uint32_t scene_material_draws[6] = {};
     std::vector<Texture *> uploads;
     std::deque<std::pair<uint32_t, uint64_t>> transient;  // one-draw meshes (id, vblank they arrived)
 };
@@ -281,6 +355,13 @@ std::atomic<uint32_t> g_look_toggles{0};
 // low-confidence record (the 318 needs_human records)
 uint64_t g_draws_textured = 0, g_draws_material = 0, g_draws_all = 0, g_textures_material = 0, g_textures_indexed = 0;
 uint64_t g_draws_vfx[3] = {};  // Modern GPU VFX draws: fire, smoke, spark
+constexpr uint32_t kMaxVfxVolumeDrawsPerVblank = 256;
+uint64_t g_vfx_budget_vb = ~0ull;
+uint32_t g_vfx_billboards_this_vb = 0;
+uint32_t g_vfx_volume_this_vb = 0;
+uint32_t g_vfx_billboard_peak = 0;
+uint64_t g_vfx_billboards = 0, g_vfx_budget_fallbacks = 0;
+uint64_t g_vfx_volume_draws[5] = {};  // indexed by VfxProfile
 uint64_t g_pk_fallback = 0, g_sets_late = 0;
 std::map<int32_t, uint32_t> g_low_seen;  // record -> bbox lines logged
 float g_sun_world[3] = {0.0f, 1.0f, 0.0f}, g_sun_col[3] = {64, 64, 64};
@@ -481,7 +562,10 @@ void load_materials() {
             else if (su == "car_paint") m.cls = C_PAINT;
             else if (su == "glass") m.cls = C_GLASS, m.rough4 = std::min(m.rough4, 2u);
             else if (su == "water") m.cls = C_WATER, m.rough4 = std::min(m.rough4, 3u);
-            else if (su == "chrome") m.cls = C_CHROME;
+            // Polished unpainted metal uses the same scene lobe as chrome.
+            // The tagged metalness and roughness still drive its response.
+            else if (su == "chrome" || (su == "metal_bare" && m.metal4 >= 12 && m.rough4 <= 8))
+                m.cls = C_CHROME;
             idx = (int32_t)g_mats.size();
             g_mats.push_back(m);
             by_id[f[0]] = idx;
@@ -547,6 +631,13 @@ bool init() {
         return false;
     }
     g_r.dev = dev;
+    const auto supports_blit = [dev](VkFormat format) {
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(dev->physicalDevice, format, &props);
+        constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        return (props.optimalTilingFeatures & required) == required;
+    };
+    g_r.scene_blit = supports_blit(VK_FORMAT_R8G8B8A8_UNORM) && supports_blit(VK_FORMAT_D32_SFLOAT);
     VkPhysicalDeviceFloatControlsProperties float_controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceProperties2 gpu_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     gpu_properties.pNext = &float_controls;
@@ -894,29 +985,62 @@ GpuMesh *gpu_mesh(uint32_t id) {
     if (!m.buf && !m.cpu->indices.empty()) {
         const uint64_t vb = m.cpu->vertices.size() * sizeof(Vertex);
         m.index_offset = (vb + 15) & ~15ull;
-        const uint64_t size = m.index_offset + m.cpu->indices.size() * 4;
-        m.buf = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
-            size, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
-        auto *p = static_cast<uint8_t *>(m.buf->map());
+        const uint64_t index_end = m.index_offset + m.cpu->indices.size() * sizeof(uint32_t);
+        uint64_t size = index_end;
+        const auto &billboards = m.cpu->billboards;
+        if (!billboards.empty() && billboards.size() * 6 == m.cpu->indices.size()) {
+            m.billboard_offset = (index_end + 15) & ~15ull;
+            size = m.billboard_offset + billboards.size() * sizeof(EffectBillboard);
+        }
+        const auto map_upload = [&](uint64_t bytes) -> uint8_t * {
+            m.buf = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+                bytes, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
+            return m.buf ? static_cast<uint8_t *>(m.buf->map()) : nullptr;
+        };
+        auto *p = map_upload(size);
+        if (!p && m.billboard_offset) {
+            m.billboard_offset = 0;
+            p = map_upload(index_end);
+        }
+        if (!p) {
+            m.buf.reset();
+            m.billboard_offset = 0;
+            return &m;
+        }
         std::memcpy(p, m.cpu->vertices.data(), vb);
         std::memcpy(p + m.index_offset, m.cpu->indices.data(), m.cpu->indices.size() * 4);
+        if (m.billboard_offset)
+            std::memcpy(p + m.billboard_offset, billboards.data(), billboards.size() * sizeof(EffectBillboard));
         m.buf->unmap();
+        if (sun_cascades_enabled()) {
+            sun_cascades::Vec3 lo, hi;
+            for (size_t k = 0; k < 3; ++k) lo[k] = hi[k] = m.cpu->vertices.front().p[k];
+            for (const Vertex &v : m.cpu->vertices)
+                for (size_t k = 0; k < 3; ++k) {
+                    lo[k] = std::min(lo[k], static_cast<double>(v.p[k]));
+                    hi[k] = std::max(hi[k], static_cast<double>(v.p[k]));
+                }
+            m.sun_bounds = {sun_cascades::scale(sun_cascades::add(lo, hi), 0.5),
+                            sun_cascades::scale(sun_cascades::sub(hi, lo), 0.5)};
+        }
     }
     return &m;
+}
+
+std::unique_ptr<plume::VulkanTexture> make_wrapper(uint64_t image, uint32_t w, uint32_t h, bool depth) {
+    auto t = std::make_unique<plume::VulkanTexture>(g_r.dev, (VkImage)image);
+    t->desc = plume::RenderTextureDesc::Texture2D(w, h, 1, depth ? plume::RenderFormat::D32_FLOAT : plume::RenderFormat::R8G8B8A8_UNORM,
+                                                  depth ? plume::RenderTextureFlag::DEPTH_TARGET : plume::RenderTextureFlag::RENDER_TARGET);
+    t->imageFormat = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    t->fillSubresourceRange();
+    t->createImageView(t->imageFormat);
+    return t;
 }
 
 plume::RenderTexture *wrapper(uint64_t image, uint32_t w, uint32_t h, bool depth) {
     const uint64_t key = image ^ ((uint64_t)w << 48) ^ ((uint64_t)h << 32) ^ (depth ? 1 : 0);
     auto &slot = g_r.wrappers[key];
-    if (!slot) {
-        auto *t = new plume::VulkanTexture(g_r.dev, (VkImage)image);
-        t->desc = plume::RenderTextureDesc::Texture2D(w, h, 1, depth ? plume::RenderFormat::D32_FLOAT : plume::RenderFormat::R8G8B8A8_UNORM,
-                                                      depth ? plume::RenderTextureFlag::DEPTH_TARGET : plume::RenderTextureFlag::RENDER_TARGET);
-        t->imageFormat = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-        t->fillSubresourceRange();
-        t->createImageView(t->imageFormat);
-        slot.reset(t);
-    }
+    if (!slot) slot = make_wrapper(image, w, h, depth);
     auto *t = static_cast<plume::VulkanTexture *>(slot.get());
     t->textureLayout = plume::RenderTextureLayout::GENERAL;  // the backend keeps every image there
     t->barrierStages = plume::RenderBarrierStage::ALL;
@@ -977,7 +1101,338 @@ void ensure_shadow_resources(uint32_t w, uint32_t h) {
     }
 }
 
-void flush_shadows() {
+bool sun_scene_target(const Target &target) {
+    // Retail 0x361098 scene clear, followed by 0x362968 / 0x362E70 shadow packets.
+    return target.depth && target.fbp == 0x1180 && target.fbw == 10 && target.zbp == 0x2300 &&
+           target.rows == 448 && target.fpsm == gs::PSMCT32 && target.zpsm == gs::PSMZ16S;
+}
+
+bool same_scene_camera(const Packet &a, const Packet &b) {
+    return a.frame == b.frame && a.near_z == b.near_z && a.far_z == b.far_z &&
+           a.fov_scale == b.fov_scale && a.aspect == b.aspect &&
+           std::memcmp(a.rotation, b.rotation, sizeof a.rotation) == 0 &&
+           std::memcmp(a.position, b.position, sizeof a.position) == 0 &&
+           std::memcmp(a.viewport, b.viewport, sizeof a.viewport) == 0;
+}
+
+void observe_sun_caster(const Item &it, const Target &target, const gs::hw::NativeSurfaces &surface) {
+    const Packet &p = it.p;
+    SunView &view = g_r.sun_view;
+    const uint64_t xy = static_cast<uint32_t>(it.ox * 16) | (static_cast<uint64_t>(it.oy * 16) << 32);
+    const bool fullscreen = it.sc[0] == 0 && it.sc[1] == 0 && it.sc[2] == 639 && it.sc[3] == 447;
+    const bool same_source = view.color_image == surface.color && view.depth_image == surface.depth &&
+                             view.color_ownership == surface.color_ownership && view.depth_ownership == surface.depth_ownership;
+    const bool same_view = same_source && view.target == target && view.xy == xy && fullscreen &&
+                           same_scene_camera(view.camera, p);
+    // Every later depth writer to the armed target must use the receiver's camera.
+    if (view.armed && (it.pipeline & 0x40) && !same_view) {
+        view.reset();
+        return;
+    }
+    if ((p.kind != KIND_QUEUE && p.kind != KIND_WORLD) || p.editor_environment || it.second || !surface.depth)
+        return;
+    const bool opaque = (it.pipeline & (K_GENERIC | 0x3F0000)) == (K_GENERIC | (1u << 16)) &&
+                        (it.pipeline & 0x40) && (it.pipeline & 0x700) && !(it.pc.mode[0] & M_ATE);
+    const Material *mat = it.tex && it.tex->mat >= 0 ? &g_mats[static_cast<size_t>(it.tex->mat)] : nullptr;
+    const bool shaded = !mat || (mat->cls != C_GLASS && mat->cls != C_WATER && mat->cls != C_UNLIT &&
+                                mat->cls < C_VFX_FIRE && !mat->emissive);
+    if (!fullscreen || !opaque || !shaded) return;
+
+    if (view.camera.frame != p.frame) view.reset();
+    if (!view.valid) {
+        view.camera = p;
+        view.color_image = surface.color;
+        view.depth_image = surface.depth;
+        view.color_ownership = surface.color_ownership;
+        view.depth_ownership = surface.depth_ownership;
+        view.xy = xy;
+        view.target = target;
+        view.valid = true;
+    } else if (!same_view) {
+        return;
+    }
+
+    const GpuMesh &mesh = *it.mesh;
+    if (!view.have_sun && p.kind == KIND_QUEUE && mesh.cpu->vertices.front().n[3]) {
+        // Same source and sign convention as r6_observe. In native world space the sun is above
+        // the road at negative Y. Packet light.w scales the VU1 vertex light independently.
+        const sun_cascades::Vec3 dir{p.light[0], p.light[1], p.light[2]};
+        const double length2 = sun_cascades::dot(dir, dir);
+        if (std::isfinite(length2) && length2 > 1e-8) {
+            const double light = 0.2126 * p.colour_a[0] + 0.7152 * p.colour_a[1] + 0.0722 * p.colour_a[2];
+            if (light > 12 && sun_cascades::unit(dir)[1] < -0.05) {
+                view.sun = sun_cascades::unit(dir);
+                view.have_sun = true;
+            }
+        }
+    }
+
+    // Keep the exact draw buffer even if a later CMD_MESH replaces its cache entry. The
+    // existing trash queue retains that buffer until GPU work from this vblank is complete.
+    SunCaster caster{};
+    std::copy_n(p.model, 12, caster.model);
+    caster.bounds = mesh.sun_bounds;
+    caster.buffer = mesh.buf.get();
+    caster.index_offset = mesh.index_offset;
+    caster.vertex_bytes = static_cast<uint32_t>(mesh.cpu->vertices.size() * sizeof(Vertex));
+    caster.index_count = static_cast<uint32_t>(mesh.cpu->indices.size());
+    caster.kind = p.kind;
+    view.casters.push_back(caster);
+}
+
+struct SunConstants {
+    float ray[3][4];
+    float box[2][4];
+    float depth_fade[4], surface[4], transition[4];
+};
+static_assert(sizeof(SunConstants) == 128, "cascade push constant layout");
+
+plume::RenderDescriptorSetDesc sun_receiver_desc() {
+    static const plume::RenderDescriptorRange ranges[] = {
+        {plume::RenderDescriptorRangeType::TEXTURE, 0, 1},
+        {plume::RenderDescriptorRangeType::TEXTURE, 1, 1},
+        {plume::RenderDescriptorRangeType::TEXTURE, 2, 1},
+    };
+    return plume::RenderDescriptorSetDesc(ranges, 3);
+}
+
+bool ensure_sun_maps() {
+    SunMaps &maps = g_r.sun_maps;
+    if (maps.attempted) return maps.caster_pipeline && maps.receiver_pipeline;
+    VkFormatProperties formats{};
+    vkGetPhysicalDeviceFormatProperties(g_r.dev->physicalDevice, VK_FORMAT_D32_SFLOAT, &formats);
+    maps.attempted = true;
+    constexpr VkFormatFeatureFlags flags = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if ((formats.optimalTilingFeatures & flags) != flags) return false;
+    using namespace plume;
+    namespace Stage = RenderShaderStageFlag;
+    const uint32_t res = sun_cascades::kResolution;
+    const RenderPushConstantRange caster_pc(0, 0, 0, sizeof(SunConstants), Stage::VERTEX);
+    const RenderPushConstantRange receiver_pc(0, 0, 0, sizeof(SunConstants), Stage::PIXEL);
+    const RenderDescriptorSetDesc desc = sun_receiver_desc();
+    maps.caster_layout = g_r.dev->createPipelineLayout(RenderPipelineLayoutDesc(&caster_pc, 1, nullptr, 0, false, true));
+    maps.receiver_layout = g_r.dev->createPipelineLayout(RenderPipelineLayoutDesc(&receiver_pc, 1, &desc, 1));
+    auto caster = g_r.dev->createShader(k_native_vs_sun_caster, sizeof k_native_vs_sun_caster, "vs_sun_caster", RenderShaderFormat::SPIRV);
+    auto quad = g_r.dev->createShader(k_native_vs_sun_receiver, sizeof k_native_vs_sun_receiver, "vs_sun_receiver", RenderShaderFormat::SPIRV);
+    auto resolve = g_r.dev->createShader(k_native_ps_sun_receiver, sizeof k_native_ps_sun_receiver, "ps_sun_receiver", RenderShaderFormat::SPIRV);
+    if (!maps.caster_layout || !maps.receiver_layout || !caster || !quad || !resolve) return false;
+    for (size_t i = 0; i < 2; ++i) {
+        maps.depth[i] = g_r.dev->createTexture(RenderTextureDesc::DepthTarget(res, res, RenderFormat::D32_FLOAT));
+        if (!maps.depth[i]) return false;
+        maps.framebuffer[i] = g_r.dev->createFramebuffer(RenderFramebufferDesc(nullptr, 0, maps.depth[i].get()));
+        if (!maps.framebuffer[i]) return false;
+    }
+    const RenderInputSlot slot(0, sizeof(Vertex));
+    const RenderInputElement position("POSITION", 0, 0, RenderFormat::R32G32B32_FLOAT, 0, 0);
+    RenderGraphicsPipelineDesc d;
+    d.pipelineLayout = maps.caster_layout.get();
+    d.vertexShader = caster.get();
+    d.inputSlots = &slot;
+    d.inputSlotsCount = 1;
+    d.inputElements = &position;
+    d.inputElementsCount = 1;
+    d.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+    d.cullMode = RenderCullMode::NONE;
+    d.depthTargetFormat = RenderFormat::D32_FLOAT;
+    d.depthEnabled = d.depthWriteEnabled = true;
+    d.depthFunction = RenderComparisonFunction::LESS_EQUAL;
+    maps.caster_pipeline = g_r.dev->createGraphicsPipeline(d);
+
+    d = RenderGraphicsPipelineDesc{};
+    d.pipelineLayout = maps.receiver_layout.get();
+    d.vertexShader = quad.get();
+    d.pixelShader = resolve.get();
+    d.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+    d.cullMode = RenderCullMode::NONE;
+    d.renderTargetCount = 1;
+    d.renderTargetFormat[0] = RenderFormat::R8G8B8A8_UNORM;
+    d.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+    d.renderTargetBlend[0].renderTargetWriteMask = 7; // Keep retail framebuffer alpha.
+    maps.receiver_pipeline = g_r.dev->createGraphicsPipeline(d);
+    if (maps.caster_pipeline && !static_cast<VulkanGraphicsPipeline *>(maps.caster_pipeline.get())->vk)
+        maps.caster_pipeline.reset();
+    if (maps.receiver_pipeline && !static_cast<VulkanGraphicsPipeline *>(maps.receiver_pipeline.get())->vk)
+        maps.receiver_pipeline.reset();
+    return maps.caster_pipeline && maps.receiver_pipeline;
+}
+
+bool bind_sun_target(const gs::hw::NativeSurfaces &surface) {
+    SunMaps &maps = g_r.sun_maps;
+    if (maps.receiver_set && maps.color_image == surface.color && maps.depth_image == surface.depth &&
+        maps.size[0] == surface.width && maps.size[1] == surface.height)
+        return true;
+
+    // External images are owned by the GS backend. Keep the prior views, framebuffer and
+    // descriptor alive for in-flight command buffers if the backend grows either surface.
+    if (maps.receiver_set) {
+        Trash t{g_r.vb};
+        t.sets[0] = std::move(maps.receiver_set);
+        t.fb = std::move(maps.scene_framebuffer);
+        t.tex = std::move(maps.scene_color);
+        g_r.trash.push_back(std::move(t));
+        Trash old_depth{g_r.vb};
+        old_depth.tex = std::move(maps.scene_depth);
+        g_r.trash.push_back(std::move(old_depth));
+    }
+    auto color = make_wrapper(surface.color, surface.width, surface.height, false);
+    auto depth = make_wrapper(surface.depth, surface.width, surface.height, true);
+    const plume::RenderTexture *attachments[] = {color.get()};
+    auto framebuffer = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(attachments, 1));
+    auto set = g_r.dev->createDescriptorSet(sun_receiver_desc());
+    if (!framebuffer || !set || !static_cast<plume::VulkanFramebuffer *>(framebuffer.get())->vk ||
+        !static_cast<plume::VulkanDescriptorSet *>(set.get())->vk) return false;
+    const auto sampled = plume::RenderTextureLayout::SHADER_READ;
+    set->setTexture(0, depth.get(), sampled);
+    set->setTexture(1, maps.depth[0].get(), sampled);
+    set->setTexture(2, maps.depth[1].get(), sampled);
+    maps.scene_color = std::move(color);
+    maps.scene_depth = std::move(depth);
+    maps.scene_framebuffer = std::move(framebuffer);
+    maps.receiver_set = std::move(set);
+    maps.color_image = surface.color;
+    maps.depth_image = surface.depth;
+    maps.size[0] = surface.width;
+    maps.size[1] = surface.height;
+    ++maps.scene_binds;
+    std::fprintf(stderr, "[sun] receiver attachments bound %ux%u\n", surface.width, surface.height);
+    return true;
+}
+
+void arm_sun_cascades(const gs::hw::NativeSurfaces &surface, const Packet &shadow) {
+    SunView &input = g_r.sun_view;
+    ++g_r.sun_maps.composites;
+    const bool same_view = input.valid && input.prepared && same_scene_camera(input.camera, shadow) &&
+                           input.color_image == surface.color && input.depth_image == surface.depth &&
+                           input.color_ownership == surface.color_ownership && input.depth_ownership == surface.depth_ownership &&
+                           input.target == g_r.main_target && input.xy == g_r.main_xy;
+    const uint32_t fog = shadow.fogcol;
+    input.armed = shadow.retail_shadow_view && !shadow.editor_environment && !shadow.fge && same_view &&
+                  sun_cascades::daylight(fog) && !input.casters.empty();
+    if (input.armed) {
+        ++g_r.sun_maps.armed;
+        input.shadow = shadow;
+    } else {
+        static uint32_t guarded = 0;
+        if (++guarded <= 8 || guarded % 120 == 0)
+            std::fprintf(stderr, "[sun] guard retail=%d authored=%d same_view=%d fog=%06x casters=%zu frame=%llu\n",
+                         shadow.retail_shadow_view, shadow.editor_environment, same_view,
+                         fog, input.casters.size(), static_cast<unsigned long long>(shadow.frame));
+    }
+}
+
+uint32_t draw_sun_cascades(plume::RenderCommandList &list, const gs::hw::NativeSurfaces &surface,
+                           const SunView &input, plume::RenderTexture *color, uint32_t boundary) {
+    using namespace sun_cascades;
+    using namespace plume;
+    const Packet &camera = input.camera;
+    const Vec3 origin{camera.position[0], camera.position[1], camera.position[2]};
+    const Vec3 forward{camera.rotation[6], camera.rotation[7], camera.rotation[8]};
+    const View view = make_view(origin, forward, input.sun);
+    Packet world = camera;
+    std::fill_n(world.model, 12, 0.0f);
+    world.model[0] = world.model[5] = world.model[10] = 1;
+    double screen[4][4];
+    screen_matrix(world, screen);
+    Rows clip;
+    const double w = surface.gs_width, h = surface.gs_height;
+    const double ox = static_cast<double>(input.xy & 0xFFFF) / 16;
+    const double oy = static_cast<double>(input.xy >> 32 & 0xFFFF) / 16;
+    const double dz = depth_range(input.target.zpsm);
+    for (size_t i = 0; i < 4; ++i) {
+        clip[0][i] = (2 / w) * screen[0][i] + ((0.5 - ox) * 2 / w - 1) * screen[3][i];
+        clip[1][i] = (2 / h) * screen[1][i] + ((0.5 - oy) * 2 / h - 1) * screen[3][i];
+        clip[2][i] = screen[2][i] / dz;
+        clip[3][i] = screen[3][i];
+    }
+    const Reprojection ray = make_reprojection(clip, view.axis);
+    if (!ray.valid || !ensure_sun_maps() || !bind_sun_target(surface)) return 0;
+
+    enum class Casters { All, World, Queue, None };
+    static const Casters caster_filter = [] {
+        const char *v = std::getenv("EOD_NATIVE_SUN_CASTERS");
+        if (!v) return Casters::All;
+        if (std::strcmp(v, "world") == 0) return Casters::World;
+        if (std::strcmp(v, "queue") == 0) return Casters::Queue;
+        if (std::strcmp(v, "none") == 0) return Casters::None;
+        return Casters::All;
+    }();
+    static const bool mask = [] {
+        const char *v = std::getenv("EOD_NATIVE_SUN_MASK");
+        return v && v[0] == '1';
+    }();
+
+    SunMaps &maps = g_r.sun_maps;
+    SunConstants pc{};
+    uint32_t counts[2][2]{};
+    constexpr auto graphics = RenderBarrierStage::GRAPHICS;
+    constexpr auto sampled = RenderTextureLayout::SHADER_READ;
+    constexpr uint32_t res = kResolution;
+    for (size_t i = 0; i < 2; ++i) {
+        const RenderTextureBarrier write(maps.depth[i].get(), RenderTextureLayout::DEPTH_WRITE);
+        list.barriers(graphics, &write, 1);
+        list.setFramebuffer(maps.framebuffer[i].get());
+        list.setViewports(RenderViewport(0, 0, res, res));
+        list.setScissors(RenderRect(0, 0, res, res));
+        list.clearDepth(true, 1.0f);
+        list.setGraphicsPipelineLayout(maps.caster_layout.get());
+        list.setPipeline(maps.caster_pipeline.get());
+        for (const SunCaster &caster : input.casters) {
+            if (caster_filter == Casters::None || (caster_filter == Casters::World && caster.kind != KIND_WORLD) ||
+                (caster_filter == Casters::Queue && caster.kind != KIND_QUEUE))
+                continue;
+            if (!caster_rows(view, view.box[i], caster.model, caster.bounds, pc.ray)) continue;
+            list.setGraphicsPushConstants(0, &pc, 0, sizeof pc);
+            bind_indexed_mesh(list, *caster.buffer, caster.vertex_bytes, caster.index_offset,
+                              caster.index_count * sizeof(uint32_t));
+            list.drawIndexedInstanced(caster.index_count, 1, 0, 0, 0);
+            ++counts[i][caster.kind == KIND_QUEUE];
+        }
+        list.setFramebuffer(nullptr);
+    }
+
+    std::memcpy(pc.ray, ray.rows, sizeof pc.ray);
+    for (size_t i = 0; i < 2; ++i) {
+        const Box &box = view.box[i];
+        pc.box[i][0] = static_cast<float>(box.center[0] - dot(view.axis[0], origin));
+        pc.box[i][1] = static_cast<float>(box.center[1] - dot(view.axis[1], origin));
+        pc.box[i][2] = static_cast<float>(box.center[2] - box.half_depth - dot(view.axis[2], origin));
+        pc.box[i][3] = static_cast<float>(2 * box.radius);
+        pc.depth_fade[i] = static_cast<float>(0.5 / box.half_depth);
+    }
+    pc.depth_fade[2] = kFarFadeStart;
+    pc.depth_fade[3] = kFarFadeEnd;
+    pc.surface[0] = 1.0f / surface.width;
+    pc.surface[1] = 1.0f / surface.height;
+    pc.surface[2] = mask ? 1.0f : 0.0f;
+    pc.surface[3] = 0.26f;
+    pc.transition[0] = kNearBlendStart;
+    pc.transition[1] = kNearBlendEnd;
+    pc.transition[2] = camera.near_z;
+    pc.transition[3] = res;
+
+    const RenderTextureBarrier ready[] = {{maps.depth[0].get(), sampled}, {maps.depth[1].get(), sampled},
+                                           {color, RenderTextureLayout::COLOR_WRITE}};
+    list.barriers(graphics, ready, 3);
+    list.setFramebuffer(maps.scene_framebuffer.get());
+    list.setViewports(RenderViewport(0, 0, surface.width, surface.height));
+    list.setScissors(RenderRect(0, 0, 640 * surface.scale, 448 * surface.scale));
+    list.setGraphicsPipelineLayout(maps.receiver_layout.get());
+    list.setPipeline(maps.receiver_pipeline.get());
+    list.setGraphicsDescriptorSet(maps.receiver_set.get(), 0);
+    list.setGraphicsPushConstants(0, &pc, 0, sizeof pc);
+    list.drawInstanced(3, 1, 0, 0);
+    list.setFramebuffer(nullptr);
+
+    const auto drawn = ++maps.resolved;
+    if (drawn <= 8 || drawn % 120 == 0)
+        std::fprintf(stderr, "[sun] pass %llu frame=%llu scale=%d near=%u world/%u queue far=%u world/%u queue "
+                             "sun=%.4f,%.4f,%.4f fog=%06x before-kind=%u\n",
+                     static_cast<unsigned long long>(drawn), static_cast<unsigned long long>(input.shadow.frame), surface.scale,
+                     counts[0][0], counts[0][1], counts[1][0], counts[1][1],
+                     input.sun[0], input.sun[1], input.sun[2], input.shadow.fogcol, boundary);
+    return counts[0][0] + counts[0][1] + counts[1][0] + counts[1][1] + 1;
+}
+void flush_shadows(bool ordered_composite = false) {
     if (g_r.shadow_pending.empty()) return;
     if (!g_r.has_main_target) {
         for (const Item &it : g_r.shadow_pending) {
@@ -1148,6 +1603,8 @@ void flush_shadows() {
         sh_draws++;
         cl->setFramebuffer(nullptr);
     }
+    if (ordered_composite && sun_cascades_enabled() && g_modern.load(std::memory_order_relaxed))
+        arm_sun_cascades(s, p0);
     gpu_timer_end((VkCommandBuffer)s.cmd, gpu_q, sh_draws);
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
@@ -1186,6 +1643,15 @@ uint32_t oct_encode(double x, double y, double z) {
     return a | b << 12;
 }
 
+uint32_t vfx_fade_mode(const Item &it, const PushConstants &pc) {
+    const uint32_t key = it.pipeline, sf = (key >> 16) & 3, df = (key >> 18) & 3, op = (key >> 20) & 3;
+    const bool c_src = !(key & K_CDST) && !(pc.mode[0] & M_CFIX);
+    if (df == 1 && sf != 0 && (op == 0 || op == 2)) return 2;
+    if (c_src && op == 0 && sf == 2 && df == 3) return 1;
+    if (c_src && op == 0 && sf == 3 && df == 2) return 3;
+    return 0;
+}
+
 // The Modern push constants of an item (native_modern.hlsl header): everything the game decides
 // (blend, tests, alpha, fog, FIX) stays as the Classic item has it.
 void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
@@ -1216,11 +1682,7 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
             // the shader can lower, so it is drawn exactly as Classic (masking it made the blocks)
             {
                 const uint32_t key = it.pipeline, sf = (key >> 16) & 3, df = (key >> 18) & 3, op = (key >> 20) & 3;
-                const bool c_src = !(key & K_CDST) && !(pc.mode[0] & M_CFIX);
-                rough = 0;
-                if (df == 1 && sf != 0 && (op == 0 || op == 2)) rough = 2;
-                else if (c_src && op == 0 && sf == 2 && df == 3) rough = 1;
-                else if (c_src && op == 0 && sf == 3 && df == 2) rough = 3;
+                rough = vfx_fade_mode(it, pc);
                 static const bool vlog = std::getenv("EOD_VFX_LOG") != nullptr;
                 static std::unordered_set<uint64_t> seen;
                 const uint64_t sig = (uint64_t)m.cls | (uint64_t)kind << 4 | (uint64_t)(sf | df << 2 | op << 4) << 8 |
@@ -1231,7 +1693,6 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
                                  m.cls, kind, sf, df, op, (key & K_CDST) ? 1 : 0, (pc.mode[0] & M_CFIX) ? 1 : 0,
                                  (pc.mode[0] & M_ATE) ? 1 : 0, rough, it.tex->mat);
             }
-            em = 1;
             rec = 1;
             out.mode[2] = (pc.mode[2] & 0xFFFFu) | metal << 16 | rough << 20 | em << 24 | height << 25 | rec << 26 | cls << 27;
             const float t_sec = (float)(g_r.vb % 60000ull) / 60.0f;
@@ -1300,6 +1761,294 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
     // day run: -0.857), so the GS world is y-down
     const double ux = has_m ? -M[4] : 0, uy = has_m ? -M[5] : -1, uz = has_m ? -M[6] : 0;  // M^T (0, -1, 0)
     out.mode[3] = oct_encode(ux, uy, uz);
+}
+
+enum VfxProfile : uint32_t {
+    VFX_LEGACY, VFX_FIRE, VFX_SMOKE, VFX_EXHAUST, VFX_EMBER
+};
+constexpr uint32_t kVfxProfileShift = 22;
+constexpr uint32_t kVfxProfileMask = 7u << kVfxProfileShift;
+constexpr uint32_t kVfxVolumeActive = 1u << 31;  // sign bit of the nonnegative VFX clock
+
+VfxProfile vfx_profile(const Item &it) {
+    static const char *const volume_env = std::getenv("EOD_MODERN_VFX_VOLUME");
+    if ((volume_env && *volume_env == '0') || !it.tex || it.tex->mat < 0 || !it.mesh ||
+        (it.pipeline & 0xC0) != 0x80 || !(it.pipeline & 0x700))
+        return VFX_LEGACY;
+    const uint32_t compare = (it.pipeline >> 4) & 3;
+    if (compare != 1 && compare != 2) return VFX_LEGACY;
+    const Material &mat = g_mats[(size_t)it.tex->mat];
+    const bool billboard = it.p.kind == KIND_PARTICLE || it.p.kind == KIND_SPRITE;
+    if (mat.cls == C_VFX_SMOKE && billboard) return VFX_SMOKE;
+    if (mat.cls == C_VFX_FIRE && (billboard || it.p.kind == KIND_IMMEDIATE)) {
+        // RACE.RES exhaust assets loaded through the retail texture group at 0x3DC070.
+        if (mat.id == "T2004" || mat.id == "T2005" || mat.id == "T2006") return VFX_EXHAUST;
+        return VFX_FIRE;
+    }
+    if (it.p.kind == KIND_IMMEDIATE && it.mesh->cpu->has_spark_age && mat.id == "T2097" && mat.cls == C_VFX_SPARK)
+        return VFX_EMBER;
+    return VFX_LEGACY;
+}
+
+VfxProfile vfx_payload_profile(const PushConstants &pc) {
+    const uint32_t cls = (pc.mode[2] >> 27) & 15;
+    return cls >= C_VFX_FIRE && cls <= C_VFX_SPARK && (pc.mode[3] & kVfxVolumeActive)
+        ? (VfxProfile)((pc.mode[2] & kVfxProfileMask) >> kVfxProfileShift) : VFX_LEGACY;
+}
+
+// Called after modern_patch and the instance budget check. Skip the scene
+// snapshot whenever the draw will use the original R6 VFX shader behavior.
+bool vfx_needs_scene_depth(const PushConstants &modern_pc) {
+    static const char *const depth_env = std::getenv("EOD_MODERN_VFX_DEPTH");
+    return (!depth_env || *depth_env != '0') && vfx_payload_profile(modern_pc) != VFX_LEGACY;
+}
+
+bool prepare_vfx(const Item &it, PushConstants &pc) {
+    const uint32_t cls = (pc.mode[2] >> 27) & 15;
+    if (cls < C_VFX_FIRE || cls > C_VFX_SPARK || !(pc.mode[2] & (3u << 20))) return false;
+    const VfxProfile profile = vfx_profile(it);
+    if (profile == VFX_LEGACY) return false;
+    const bool billboard = it.p.kind == KIND_PARTICLE || it.p.kind == KIND_SPRITE;
+    if (g_vfx_volume_this_vb >= kMaxVfxVolumeDrawsPerVblank) {
+        g_vfx_budget_fallbacks++;
+        return false;
+    }
+    if (billboard) {
+        const uint32_t count = (uint32_t)it.mesh->cpu->billboards.size();
+        if (!it.mesh->billboard_offset || count > kMaxEffectBillboardsPerVblank - g_vfx_billboards_this_vb) {
+            g_vfx_budget_fallbacks++;
+            return false;
+        }
+        g_vfx_billboards_this_vb += count;
+        g_vfx_billboard_peak = std::max(g_vfx_billboard_peak, g_vfx_billboards_this_vb);
+        std::copy_n(it.p.rotation, 3, pc.light);
+        std::copy_n(it.p.rotation + 3, 3, pc.diffuse);
+        pc.light[3] = it.p.kind == KIND_PARTICLE ? 1.0f : 0.0f;
+    }
+    g_vfx_volume_this_vb++;
+    pc.mode[2] = (pc.mode[2] & ~kVfxProfileMask) | ((uint32_t)profile << kVfxProfileShift);
+    // Effect animation shares the EE-submitted frame across camera projections.
+    const float time = (float)(it.p.frame % 60000ull) / 60.0f;
+    std::memcpy(&pc.mode[3], &time, sizeof time);
+    pc.mode[3] |= kVfxVolumeActive;
+    static const bool trace = std::getenv("EOD_VFX_LOG") != nullptr;
+    static std::unordered_set<uint64_t> reported;
+    const uint64_t identity = (uint64_t)it.tex->mat << 5 | (it.p.kind & 15u) << 1 | it.second;
+    if (trace && reported.size() < 64 && reported.insert(identity).second) {
+        std::fprintf(stderr, "[r6] volume VFX material %s profile %u kind %u fade %u, "
+                     "EE frame %llu, scissor %d %d %d %d\n",
+                     g_mats[(size_t)it.tex->mat].id.c_str(), profile, it.p.kind, (pc.mode[2] >> 20) & 3u,
+                     (unsigned long long)it.p.frame, it.sc[0], it.sc[1], it.sc[2], it.sc[3]);
+    }
+    return billboard;
+}
+
+// A/B switches for the two color consumers. Soft particles use their own VFX switch.
+bool scene_reflections_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_MODERN_REFLECTIONS");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool scene_water_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_MODERN_WATER");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool scene_capture_log() {
+    static const bool enabled = std::getenv("EOD_NATIVE_SCENE_INPUT_LOG") != nullptr;
+    return enabled;
+}
+
+void invalidate_scene_inputs() {
+    for (auto &view : g_r.scene_views) {
+        view.world_drawn = false;
+        view.blocked = false;
+        for (auto &snapshot : view.inputs)
+            if (snapshot) snapshot->captured = false;
+    }
+}
+
+SceneView *scene_view(const Item &it, const Target &tg, const gs::hw::NativeSurfaces &s, bool world) {
+    if (!tg.depth || tg.fbp != 0x1180 || tg.fbw != 10 || tg.fpsm != gs::PSMCT32 ||
+        tg.zbp != 0x2300 || tg.zpsm != gs::PSMZ16S || tg.rows > 448) return nullptr;
+    // The exact-copy fallback is bounded to the same 2x footprint as the
+    // normal downsampled images. Unsupported high-scale inputs keep base shading.
+    if (!g_r.scene_blit && s.scale > 2) return nullptr;
+    if (g_r.scene_frame != it.p.frame) {
+        invalidate_scene_inputs();
+        g_r.scene_frame = it.p.frame;
+    }
+    // Match the same projection and scissor used to draw this view. The GS
+    // viewport center in screen_matrix is relative to XYOFFSET's 640x448 origin.
+    const float *viewport = it.p.viewport;
+    const float left = viewport[0] + 1727.9375f - it.ox;
+    const float top = viewport[1] + 1823.9375f - it.oy;
+    const float right = left + viewport[2], bottom = top + viewport[3];
+    if (!(left >= -1.0f && top >= -1.0f && right <= s.gs_width + 1.0f && bottom <= s.gs_height + 1.0f &&
+          viewport[2] >= 16.0f && viewport[3] >= 16.0f && it.p.near_z > 0.0f && it.p.far_z > it.p.near_z &&
+          it.p.fov_scale > 0.0f && it.p.aspect > 0.0f && std::isfinite(it.p.far_z) &&
+          std::isfinite(it.p.fov_scale) && std::isfinite(it.p.aspect)))
+        return nullptr;
+    const int32_t scale = s.scale;
+    const SceneRect rect = {
+        std::max({0, it.sc[0], int32_t(std::lround(left))}) * scale,
+        std::max({0, it.sc[1], int32_t(std::lround(top))}) * scale,
+        std::min({int32_t(s.gs_width), it.sc[2] + 1, int32_t(std::lround(right))}) * scale,
+        std::min({int32_t(s.gs_height), int32_t(tg.rows), it.sc[3] + 1, int32_t(std::lround(bottom))}) * scale};
+    if (rect[2] <= rect[0] || rect[3] <= rect[1]) return nullptr;
+    SceneView *free = nullptr;
+    SceneView *same_rect = nullptr;
+    for (auto &view : g_r.scene_views) {
+        if (view.world_drawn) {
+            if (view.rect == rect && view.target == tg && view.ox == it.ox && view.oy == it.oy &&
+                view.color_source == s.color && view.depth_source == s.depth &&
+                view.color_ownership == s.color_ownership && view.depth_ownership == s.depth_ownership &&
+                same_scene_camera(view.camera, it.p) && view.camera.w_scale == it.p.w_scale)
+                return view.blocked ? nullptr : &view;
+            // Different cameras sharing an overlapping rectangle cannot make
+            // each other's depth safe, even when both are drawn in one frame.
+            if (rect[0] < view.rect[2] && view.rect[0] < rect[2] &&
+                rect[1] < view.rect[3] && view.rect[1] < rect[3]) {
+                if (world) view.blocked = true;
+                return nullptr;
+            }
+        } else {
+            if (!free) free = &view;
+            if (view.rect == rect) same_rect = &view;
+        }
+    }
+    if (same_rect) free = same_rect;
+    if (!world || !free) return nullptr;
+    free->rect = rect;
+    free->target = tg;
+    free->color_source = s.color;
+    free->depth_source = s.depth;
+    free->color_ownership = s.color_ownership;
+    free->depth_ownership = s.depth_ownership;
+    free->camera = it.p;
+    free->ox = it.ox;
+    free->oy = it.oy;
+    free->world_drawn = true;
+    return free;
+}
+
+SceneStage scene_surface_stage(const Item &it) {
+    if (!(it.pipeline & (7u << 8)) || !(it.pc.mode[0] & M_TME)) return SceneStage::Count;
+    if (it.p.kind == KIND_WATER && scene_water_enabled()) return SceneStage::Water;
+    if (it.p.kind != KIND_QUEUE || !scene_reflections_enabled() || !it.tex || it.tex->mat < 0)
+        return SceneStage::Count;
+    const auto &material = g_mats[size_t(it.tex->mat)];
+    if (material.emissive) return SceneStage::Count;
+    return material.cls == C_PAINT || material.cls == C_CHROME || material.cls == C_GLASS
+        ? SceneStage::Reflection : SceneStage::Count;
+}
+
+bool allocate_scene_input(SceneSnapshot &input, const SceneRect &rect, uint32_t w, uint32_t h,
+                          const gs::hw::NativeSurfaces &s, bool color) {
+    using namespace plume;
+    if (color)
+        input.color = g_r.dev->createTexture(RenderTextureDesc::Texture2D(w, h, 1, RenderFormat::R8G8B8A8_UNORM));
+    input.depth = g_r.dev->createTexture(RenderTextureDesc::DepthTarget(w, h, RenderFormat::D32_FLOAT));
+    const float data[] = {float(rect[0]), float(rect[1]), float(rect[2] - rect[0]), float(rect[3] - rect[1]),
+                          float(w), float(h), float(s.width), float(s.height)};
+    input.params = g_r.dev->createBuffer(RenderBufferDesc::UploadBuffer(sizeof data, RenderBufferFlag::CONSTANT));
+    input.set = g_r.dev->createDescriptorSet(scene_input_desc());
+    const auto valid_texture = [](const std::unique_ptr<RenderTexture> &t) {
+        return t && static_cast<VulkanTexture *>(t.get())->imageView != VK_NULL_HANDLE;
+    };
+    if ((color && !valid_texture(input.color)) || !valid_texture(input.depth) || !input.params ||
+        !static_cast<VulkanBuffer *>(input.params.get())->vk || !input.set ||
+        !static_cast<VulkanDescriptorSet *>(input.set.get())->vk) return false;
+    auto *mapped = input.params->map();
+    if (!mapped) return false;
+    std::memcpy(mapped, data, sizeof data);
+    input.params->unmap();
+    input.set->setTexture(0, color ? input.color.get() : g_r.white.tex.get(), RenderTextureLayout::SHADER_READ);
+    input.set->setTexture(1, input.depth.get(), RenderTextureLayout::SHADER_READ);
+    input.set->setSampler(2, g_r.samplers[1 | 2 | 4].get());
+    input.set->setBuffer(3, input.params.get(), sizeof data);
+    input.rect = rect;
+    input.width = w;
+    input.height = h;
+    input.surface_width = s.width;
+    input.surface_height = s.height;
+    return true;
+}
+
+void copy_scene_input(plume::VulkanCommandList &cl, plume::RenderTexture &dst, plume::RenderTexture &src,
+                      const SceneRect &rect, uint32_t w, uint32_t h, bool depth) {
+    using namespace plume;
+    if (int32_t(w) == rect[2] - rect[0] && int32_t(h) == rect[3] - rect[1]) {
+        const RenderBox box(rect[0], rect[1], rect[2], rect[3]);
+        cl.copyTextureRegion(RenderTextureCopyLocation::Subresource(&dst, 0),
+                             RenderTextureCopyLocation::Subresource(&src, 0), 0, 0, 0, &box);
+        return;
+    }
+    const auto aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageBlit region{};
+    region.srcSubresource = region.dstSubresource = {aspect, 0, 0, 1};
+    region.srcOffsets[0] = {rect[0], rect[1], 0};
+    region.srcOffsets[1] = {rect[2], rect[3], 1};
+    region.dstOffsets[1] = {int32_t(w), int32_t(h), 1};
+    vkCmdBlitImage(cl.vk, static_cast<VulkanTexture &>(src).vk, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   static_cast<VulkanTexture &>(dst).vk, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &region, VK_FILTER_NEAREST);
+}
+
+plume::RenderDescriptorSet *capture_scene_input(plume::VulkanCommandList &cl, plume::RenderFramebuffer &fb,
+                                                 plume::RenderTexture &color, plume::RenderTexture &depth,
+                                                 SceneView &view, SceneStage stage,
+                                                 const gs::hw::NativeSurfaces &s) {
+    using namespace plume;
+    const bool need_color = stage != SceneStage::Particles;
+    auto &slot = view.inputs[size_t(stage)];
+    if (slot && slot->captured) {
+        // An alias or a resize within an EE frame invalidates this phase's
+        // snapshot. Decline the effect until the next frame instead of recopying.
+        return slot->color_source == s.color && slot->depth_source == s.depth ? slot->set.get() : nullptr;
+    }
+    const uint32_t divisor = g_r.scene_blit ? std::max(1, (s.scale + 1) / 2) : 1;
+    const uint32_t w = (view.rect[2] - view.rect[0] + divisor - 1) / divisor;
+    const uint32_t h = (view.rect[3] - view.rect[1] + divisor - 1) / divisor;
+    if (!slot || slot->rect != view.rect || slot->width != w || slot->height != h ||
+        slot->surface_width != s.width || slot->surface_height != s.height) {
+        auto next = std::make_unique<SceneSnapshot>();
+        if (!allocate_scene_input(*next, view.rect, w, h, s, need_color)) return nullptr;
+        if (slot) {
+            Trash old{g_r.vb};
+            old.scene_input = std::move(slot);
+            g_r.trash.push_back(std::move(old));
+        }
+        slot = std::move(next);
+    }
+    cl.setFramebuffer(nullptr);
+    const RenderTextureBarrier before[] = {
+        {&depth, RenderTextureLayout::COPY_SOURCE}, {slot->depth.get(), RenderTextureLayout::COPY_DEST},
+        {&color, RenderTextureLayout::COPY_SOURCE}, {slot->color.get(), RenderTextureLayout::COPY_DEST}};
+    static_cast<RenderCommandList &>(cl).barriers(RenderBarrierStage::COPY, before, need_color ? 4 : 2);
+    copy_scene_input(cl, *slot->depth, depth, view.rect, w, h, true);
+    if (need_color) copy_scene_input(cl, *slot->color, color, view.rect, w, h, false);
+    const RenderTextureBarrier after[] = {
+        {&depth, RenderTextureLayout::DEPTH_WRITE}, {slot->depth.get(), RenderTextureLayout::SHADER_READ},
+        {&color, RenderTextureLayout::COLOR_WRITE}, {slot->color.get(), RenderTextureLayout::SHADER_READ}};
+    static_cast<RenderCommandList &>(cl).barriers(RenderBarrierStage::GRAPHICS, after, need_color ? 4 : 2);
+    cl.setFramebuffer(&fb);
+    slot->captured = true;
+    slot->color_source = s.color;
+    slot->depth_source = s.depth;
+    if (scene_capture_log()) {
+        ++g_r.scene_captures[size_t(stage)];
+        std::fprintf(stderr, "[scene-input] frame %llu stage %zu target %x depth %x view %d,%d-%d,%d copy %ux%u\n",
+                     (unsigned long long)g_r.scene_frame, size_t(stage), view.target.fbp, view.target.zbp,
+                     view.rect[0], view.rect[1], view.rect[2], view.rect[3], w, h);
+    }
+    return slot->set.get();
 }
 
 // A low-confidence record's draw: its screen box (0..1 of the GS frame), for the in-context crops
@@ -1395,6 +2144,12 @@ void flush() {
                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
     cl->barriers(plume::RenderBarrierStage::GRAPHICS, in, depth ? 2 : 1);
     const bool modern = g_modern.load(std::memory_order_relaxed);  // stage R6: one look per flush
+    const bool capture_sun = modern && sun_cascades_enabled() && sun_scene_target(tg);
+    if (g_vfx_budget_vb != g_r.vb) {
+        g_vfx_budget_vb = g_r.vb;
+        g_vfx_billboards_this_vb = 0;
+        g_vfx_volume_this_vb = 0;
+    }
     const uint32_t gpu_q = gpu_timer_begin((VkCommandBuffer)s.cmd, false, modern);
     uint32_t pass_draws = 0;
     auto &fb = g_r.framebuffers[{s.color, s.depth}];
@@ -1413,6 +2168,7 @@ void flush() {
             if (depth && cit->second.depth)
                 cl->clearDepth(true, cit->second.z);
             g_only_clears.erase(cit);
+            invalidate_scene_inputs();
         }
     }
     cl->setGraphicsPipelineLayout(g_r.scene.layout());
@@ -1425,6 +2181,8 @@ void flush() {
     uint32_t static_projection_index = 0;
     uint32_t bound = ~0u;
     PushConstants mpc;
+    plume::RenderDescriptorSet *bound_scene_input = nullptr;
+    const Item *last_scene_world = nullptr;
     for (Item &it : g_r.pending) {
         FrameStats &fs = g_frames[it.p.frame];
         if (!it.mesh || !it.mesh->buf) {
@@ -1446,6 +2204,13 @@ void flush() {
             pc.cz[c] = (float)(it.a[2][c] * it.zscale * ws);
             pc.cw[c] = (float)(it.a[3][c] * ws);
         }
+        // Classic GS texel and alpha-test parity for the original world textures at 1×.
+        // The primary and AFAIL passes both interpolate STQ over the same snapped XY.
+        if (!modern && sc == 1 && it.p.kind == KIND_WORLD && !(it.p.itop & 0x200) &&
+            it.tex && !it.tex->replacement_id && it.tex->levels > 1 && (pc.mode[0] & M_ATE) &&
+            !(pc.mode[0] & M_SPEC) && gw > 0 && gw < 4096 && gh > 0 && gh < 4096) {
+            pc.mode[3] = 0x20000000u | (uint32_t)gw | (uint32_t)gh << 12;
+        }
         r6_observe(it);
         if (!it.second) {
             g_draws_all++;
@@ -1458,18 +2223,69 @@ void flush() {
         if (modern && eligible) g_r.scene.pipeline(it.pipeline | scene::K_STATIC_QUEUE);
         const bool static_queue = static_projections && eligible;
         const uint32_t first_instance = static_queue ? static_projection_index++ : 0;
-        const uint32_t key = modern ? it.pipeline | K_MODERN :
-                             static_queue ? it.pipeline | scene::K_STATIC_QUEUE : it.pipeline;
-        if (key != bound) {
-            cl->setPipeline(g_r.scene.pipeline(key));
-            bound = key;
-        }
+        uint32_t key = modern ? it.pipeline | K_MODERN :
+                       static_queue ? it.pipeline | scene::K_STATIC_QUEUE : it.pipeline;
+        SceneStage stage = depth ? scene_surface_stage(it) : SceneStage::Count;
         Texture *t = it.tex ? it.tex : &g_r.white;
         uint32_t samp = it.tex ? it.sampler : 0;
+        bool vfx_billboard = false;
         if (modern) {
             const uint32_t mx = pc.mode[0];
             samp = 8 | (((mx >> M_WMS_SHIFT) & 3) ? 2u : 0u) | (((mx >> M_WMT_SHIFT) & 3) ? 4u : 0u);
             modern_patch(it, pc, mpc);
+            vfx_billboard = prepare_vfx(it, mpc);
+            if (vfx_billboard) {
+                const auto *variant = g_r.scene.pipeline(key | K_VFX_BILLBOARD);
+                if (variant && static_cast<const plume::VulkanGraphicsPipeline *>(variant)->vk) {
+                    key |= K_VFX_BILLBOARD;
+                } else {
+                    vfx_billboard = false;
+                    mpc.mode[2] &= ~kVfxProfileMask;
+                    mpc.mode[3] &= ~kVfxVolumeActive;
+                }
+            }
+            if (depth && stage == SceneStage::Count && vfx_needs_scene_depth(mpc))
+                stage = SceneStage::Particles;
+            if (stage != SceneStage::Count) {
+                if (SceneView *view = scene_view(it, tg, s, false)) {
+                    auto *variant = g_r.scene.pipeline(key | K_SCENE_INPUTS);
+                    if (variant && static_cast<plume::VulkanGraphicsPipeline *>(variant)->vk) {
+                        auto *input = capture_scene_input(*vl, *fb, *color, *depth, *view, stage, s);
+                        if (input) {
+                            key |= K_SCENE_INPUTS;
+                            if (stage == SceneStage::Water) {
+                                // The 0x325728 surface represents an animated dielectric.
+                                // Preserve the stock ripple texture and give its projected
+                                // waves the water lobe's low roughness.
+                                const uint32_t rough4 = std::min(3u, (mpc.mode[2] >> 20) & 15u);
+                                mpc.mode[2] = (mpc.mode[2] & ~((15u << 27) | (3u << 24) | (255u << 16))) |
+                                              (C_WATER << 27) | (rough4 << 20);
+                            }
+                            if (bound_scene_input != input) {
+                                cl->setGraphicsDescriptorSet(input, 2);
+                                bound_scene_input = input;
+                            }
+                            if (scene_capture_log()) {
+                                ++g_r.scene_draws[size_t(stage)];
+                                const uint32_t cls = (mpc.mode[2] >> 27) & 15u;
+                                if (cls < std::size(g_r.scene_material_draws)) ++g_r.scene_material_draws[cls];
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (stage != SceneStage::Count) {
+            // Prepare this material's Modern variant before the player switches looks.
+            g_r.scene.pipeline(it.pipeline | K_MODERN | K_SCENE_INPUTS);
+        }
+        if (!modern && depth && vfx_fade_mode(it, pc) && vfx_profile(it) != VFX_LEGACY) {
+            const uint32_t modern_key = it.pipeline | K_MODERN |
+                (it.mesh->billboard_offset ? K_VFX_BILLBOARD : 0u);
+            g_r.scene.pipeline(modern_key | K_SCENE_INPUTS);
+        }
+        if (key != bound) {
+            cl->setPipeline(g_r.scene.pipeline(key));
+            bound = key;
         }
         cl->setGraphicsDescriptorSet(texture_set(t, samp), 0);
         cl->setGraphicsPushConstants(0, modern ? &mpc : &pc, 0, sizeof pc);
@@ -1477,24 +2293,47 @@ void flush() {
         const int32_t x1 = std::min((int32_t)gw, it.sc[2] + 1) * sc, y1 = std::min((int32_t)gh, it.sc[3] + 1) * sc;
         cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
         const GpuMesh &m = *it.mesh;
-        bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
-                          (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)));
-        static const bool no_runs = std::getenv("EOD_R5A2_OFF") && (std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) & 8);
-        if (!modern && !no_runs && !it.run_k.empty() && it.run_k.size() == m.cpu->k_runs.size()) {
-            // one draw per VU1 run: each has its own TEX1.K
-            for (size_t r = 0; r < it.run_k.size(); r++) {
-                const Mesh::KRun &kr = m.cpu->k_runs[r];
-                if (kr.first + kr.count > m.cpu->indices.size()) break;
-                pc.mode[2] = (pc.mode[2] & ~(0xFFFu << Z_K_SHIFT)) | ((uint32_t)it.run_k[r] & 0xFFF) << Z_K_SHIFT;
-                cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
-                cl->drawIndexedInstanced(kr.count, 1, kr.first, 0, first_instance);
+        if (vfx_billboard) {
+            const auto count = (uint32_t)m.cpu->billboards.size();
+            const plume::RenderVertexBufferView view(m.buf->at(m.billboard_offset), count * sizeof(EffectBillboard));
+            const plume::RenderInputSlot slot(0, sizeof(EffectBillboard),
+                plume::RenderInputSlotClassification::PER_INSTANCE_DATA);
+            cl->setVertexBuffers(0, &view, 1, &slot);
+            cl->drawInstanced(6, count, 0, 0);
+            g_vfx_billboards += count;
+            pass_draws++;
+        } else {
+            bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
+                              (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)));
+            static const bool no_runs = std::getenv("EOD_R5A2_OFF") && (std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) & 8);
+            if (!modern && !no_runs && !it.run_k.empty() && it.run_k.size() == m.cpu->k_runs.size()) {
+                // one draw per VU1 run: each has its own TEX1.K
+                for (size_t r = 0; r < it.run_k.size(); r++) {
+                    const Mesh::KRun &kr = m.cpu->k_runs[r];
+                    if (kr.first + kr.count > m.cpu->indices.size()) break;
+                    pc.mode[2] = (pc.mode[2] & ~(0xFFFu << Z_K_SHIFT)) | ((uint32_t)it.run_k[r] & 0xFFF) << Z_K_SHIFT;
+                    cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
+                    cl->drawIndexedInstanced(kr.count, 1, kr.first, 0, first_instance);
+                    pass_draws++;
+                }
+            } else {
+                cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, first_instance);
                 pass_draws++;
             }
-        } else {
-            cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, first_instance);
-            pass_draws++;
+        }
+        if (capture_sun) observe_sun_caster(it, tg, s);
+        if (modern && depth && !it.second && it.p.kind == KIND_WORLD && (it.pipeline & 0x40u) &&
+            (it.p.pass == 0 || it.p.pass == 2) &&
+            (!last_scene_world || last_scene_world->p.frame != it.p.frame ||
+             std::memcmp(last_scene_world->sc, it.sc, sizeof it.sc) != 0 ||
+             last_scene_world->ox != it.ox || last_scene_world->oy != it.oy ||
+             !same_scene_camera(last_scene_world->p, it.p))) {
+            scene_view(it, tg, s, true);
+            last_scene_world = &it;
         }
         if (it.second) continue;
+        const VfxProfile profile = modern ? vfx_payload_profile(mpc) : VFX_LEGACY;
+        if (profile != VFX_LEGACY) g_vfx_volume_draws[profile]++;
         fs.drawn++;
         fs.k_drawn[it.p.kind % KIND_COUNT]++;
         if (it.p.kind == KIND_WATER) water_view_drawn(m.cpu->indices.size() / 3, it.sc, it.ox, it.oy);
@@ -1515,6 +2354,56 @@ void flush() {
     vl->vk = own;
     gs::hw::native_end();
     g_r.pending.clear();
+}
+
+// The car queue in ViewportRenderFinish (0x20F2D8) follows the stock shadow
+// composite. Close the armed scene after that queue and before the first native foreground draw.
+void finish_sun_cascades(uint64_t frame, uint32_t boundary) {
+    SunView &input = g_r.sun_view;
+    if (!input.armed) return;
+    flush();
+    if (!input.armed || frame != input.camera.frame || !input.have_sun || !g_modern.load(std::memory_order_relaxed)) {
+        static uint32_t guarded = 0;
+        if (++guarded <= 8 || guarded % 120 == 0)
+            std::fprintf(stderr, "[sun] foreground guard scene=%llu next=%llu kind=%u lit=%d armed=%d\n",
+                         (unsigned long long)input.camera.frame, (unsigned long long)frame, boundary, input.have_sun, input.armed);
+        input.reset();
+        return;
+    }
+    const Target &target = input.target;
+    gs::Env e{};
+    e.fbp = target.fbp;
+    e.fbw = target.fbw;
+    e.fpsm_mem = target.fpsm;
+    e.zbp = target.zbp;
+    e.zpsm = target.zpsm;
+    e.scy1 = target.rows - 1;
+    gs::hw::NativeSurfaces surface{};
+    if (!gs::hw::native_begin(e, true, surface, true)) {
+        input.reset();
+        return;
+    }
+    if (surface.color == input.color_image && surface.depth == input.depth_image &&
+        surface.color_ownership == input.color_ownership && surface.depth_ownership == input.depth_ownership) {
+        const auto vk = static_cast<VkCommandBuffer>(surface.cmd);
+        auto *bridge_list = static_cast<plume::VulkanCommandList *>(g_r.list.get());
+        const auto owned = bridge_list->vk;
+        bridge_list->vk = vk;
+        auto *list = g_r.list.get();
+        auto *color = wrapper(surface.color, surface.width, surface.height, false);
+        auto *depth = wrapper(surface.depth, surface.width, surface.height, true);
+        list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::SHADER_READ));
+        const uint32_t timer = gpu_timer_begin(vk, true, true);
+        const uint32_t draws = draw_sun_cascades(*list, surface, input, color, boundary);
+        gpu_timer_end(vk, timer, draws);
+        const plume::RenderTextureBarrier done[] = {{color, plume::RenderTextureLayout::GENERAL},
+                                                    {depth, plume::RenderTextureLayout::GENERAL}};
+        list->barriers(plume::RenderBarrierStage::ALL, done, 2);
+        bridge_list->vk = owned;
+    }
+    gs::hw::native_end();
+    input.reset();
 }
 
 // GS ALPHA (A - B) * C + D, A/B/D in {Cs, Cd, 0} and C in {As, Ad, FIX}, as fixed-function blending
@@ -1837,7 +2726,9 @@ void finalize() {
     }
     std::memcpy(pc.diffuse, g_cur.colour_a, 16);
     std::memcpy(pc.ambient, g_cur.colour_b, 16);
-    pc.ambient[3] = (float)(g_cur.itop & 0xFF);
+    // The water immediate packet's per-vertex STQ.z is added to ITOP by VU1 0x04C0.
+    // KIND_WATER uses ITOP 0x200, so its low-byte alpha is the decoded vertex alpha.
+    pc.ambient[3] = kind == KIND_WATER ? -1.0f : (float)(g_cur.itop & 0xFF);
     // q17 (setup 0x0000): h = -normalize(M^T (camera forward + light)), the car highlight's half vector
     {
         double h[3], len = 0;
@@ -1949,7 +2840,22 @@ void finalize() {
 }
 
 void end_vblank(uint64_t vb) {
+    g_r.sun_view.reset();
     g_r.vb = vb;
+    if (scene_capture_log()) {
+        if (g_r.scene_draws[size_t(SceneStage::Reflection)]) {
+            auto *m = g_r.scene_material_draws;
+            std::fprintf(stderr, "[scene-input] vb %llu paint %u chrome %u glass %u\n",
+                         (unsigned long long)vb, m[C_PAINT], m[C_CHROME], m[C_GLASS]);
+        }
+        std::fill_n(g_r.scene_material_draws, std::size(g_r.scene_material_draws), 0u);
+        for (size_t i = 0; i < size_t(SceneStage::Count); ++i) {
+            if (g_r.scene_captures[i] || g_r.scene_draws[i])
+                std::fprintf(stderr, "[scene-input] vb %llu stage %zu captures %u draws %u\n",
+                             (unsigned long long)vb, i, g_r.scene_captures[i], g_r.scene_draws[i]);
+            g_r.scene_captures[i] = g_r.scene_draws[i] = 0;
+        }
+    }
     gpu_timer_end_vblank(vb);
     evict_textures();
     if (log_every() > 1 && vb % log_every() == 0 && g_r.ok)
@@ -2304,6 +3210,10 @@ void end_vblank(uint64_t) {}
 
 void begin_object(const Packet &p) {
     finalize();
+#ifdef EOD_PLUME
+    if (g_r.sun_view.armed && p.kind != KIND_QUEUE && p.kind != KIND_WORLD && p.kind != KIND_SHADOW)
+        finish_sun_cascades(p.frame, p.kind);
+#endif
     g_cur = p;
     g_active = true;
     g_finalized = false;
@@ -2482,13 +3392,33 @@ bool prepare() {
 #endif
 }
 
-bool gs_shadow_boundary() {
+bool gs_shadow_boundary(ShadowPass pass) {
 #ifdef EOD_PLUME
     if (!prepare() || (modern::g_on && modern::live())) return false;
     if (g_active) finalize();
-    flush();
+    SunView &view = g_r.sun_view;
+    if (pass == ShadowPass::Prepare) {
+        flush();
+        const bool ordered_scene = view.valid && view.target == g_r.main_target && view.xy == g_r.main_xy &&
+                                   !view.camera.fge && sun_cascades::daylight(view.camera.fogcol);
+        g_r.hybrid_shadow_prepared = !native_only() && ordered_scene;
+        if (!native_only() && !g_r.hybrid_shadow_prepared) {
+            view.reset();
+            return false;
+        }
+        view.prepared = view.valid;
+        view.armed = false;
+    } else {
+        // A hybrid packet may have kept its retail prepare. Preserve its composite in that case.
+        if (!native_only() && !g_r.hybrid_shadow_prepared) return false;
+        g_r.hybrid_shadow_prepared = false;
+        flush_shadows(true);
+        flush();
+        if (!view.armed) view.reset();
+    }
     return true;
 #else
+    (void)pass;
     return false;
 #endif
 }
@@ -2503,6 +3433,7 @@ bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
     gs::hw::NativeSurfaces surfaces{};
     const bool depth_only = clear.target == SceneClearTarget::Depth;
     const bool bootstrap = clear.target == SceneClearTarget::Bootstrap;
+    g_r.sun_view.reset();
     const uint32_t rows = bootstrap ? env.scy1 + 1 : 448;
     if (depth_only ? !gs::hw::native_begin_depth_clear(env, surfaces)
                    : !gs::hw::native_begin(env, true, surfaces, bootstrap)) return false;
@@ -2533,6 +3464,7 @@ bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
         list->clearColor(0, plume::RenderColor(byte(0), byte(8), byte(16), byte(24)), &rect, 1);
     }
     list->clearDepth(true, 0.0f, &rect, 1);
+    invalidate_scene_inputs();
     list->setFramebuffer(nullptr);
     const plume::RenderTextureBarrier end[] = {
         {depth, plume::RenderTextureLayout::GENERAL}, {color, plume::RenderTextureLayout::GENERAL}};
@@ -2679,7 +3611,18 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
 bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const gs::Vertex *c) {
     if (!g_active) {
 #ifdef EOD_PLUME
+        const bool retained_gs = !native_only() || (native_only_level() == 2 && b && !c);
+        if (g_r.sun_view.armed && retained_gs && !e.write_none && e.fbp == g_r.sun_view.target.fbp)
+            finish_sun_cascades(g_r.sun_view.camera.frame, KIND_COUNT);
         if (!g_r.pending.empty() || !g_r.shadow_pending.empty()) flush();  // before the GS draws something of its own
+        if (retained_gs && !e.write_none && b && !c && !e.tme && !e.abe && e.ztst == 1 && !e.zmsk) {
+            for (const auto &view : g_r.scene_views) {
+                if (view.world_drawn && view.target.zbp == e.zbp) {
+                    invalidate_scene_inputs();
+                    break;
+                }
+            }
+        }
 #endif
         // EOD_NATIVE_ONLY=2: the GS still draws sprites (2D, HUD, the frame copy to the display
         // buffer), so the 3D scene on screen is Plume's alone and screenshots can be compared (P3).
@@ -2801,6 +3744,14 @@ void gs_barrier() {
 #endif
 }
 
+bool gs_movie_clear_ready() {
+#ifdef EOD_PLUME
+    return !g_active && g_r.pending.empty() && g_r.shadow_pending.empty();
+#else
+    return false;
+#endif
+}
+
 // ---- stage R6: look toggle, P5 numbers ------------------------------------------------------
 #ifdef EOD_PLUME
 namespace {
@@ -2821,6 +3772,13 @@ uint64_t count_sets() {
     return n;
 }
 void r6_report() {
+    if (sun_cascades_enabled()) {
+        const SunMaps &maps = g_r.sun_maps;
+        std::fprintf(stderr, "[sun] summary composites=%llu armed=%llu resolved=%llu target-binds=%llu\n",
+                     (unsigned long long)maps.composites, (unsigned long long)maps.armed,
+                     (unsigned long long)maps.resolved, (unsigned long long)maps.scene_binds);
+    }
+
     if (!g_r.ok) return;
     if (g_gpu.enabled) {
         for (uint32_t i = 0; i < GpuTimer::kRing; i++)
@@ -2836,6 +3794,12 @@ void r6_report() {
                  g_draws_textured ? 100.0 * g_draws_material / g_draws_textured : 0.0, (unsigned long long)g_pk_fallback,
                  g_low_seen.size(), (unsigned long long)g_draws_vfx[0], (unsigned long long)g_draws_vfx[1],
                  (unsigned long long)g_draws_vfx[2]);
+    if (g_vfx_billboards || g_vfx_volume_draws[VFX_FIRE] || g_vfx_volume_draws[VFX_EXHAUST] || g_vfx_volume_draws[VFX_EMBER])
+        std::fprintf(stderr, "[r6] volume VFX fire %llu smoke %llu exhaust %llu ember %llu, "
+                     "GPU billboard projections %llu, peak/vblank %u, budget fallbacks %llu\n",
+                     (unsigned long long)g_vfx_volume_draws[VFX_FIRE], (unsigned long long)g_vfx_volume_draws[VFX_SMOKE],
+                     (unsigned long long)g_vfx_volume_draws[VFX_EXHAUST], (unsigned long long)g_vfx_volume_draws[VFX_EMBER],
+                     (unsigned long long)g_vfx_billboards, g_vfx_billboard_peak, (unsigned long long)g_vfx_budget_fallbacks);
     if (g_gpu.enabled && (g_gpu.frames[0] || g_gpu.frames[1])) {
         const double cm = g_gpu.frames[0] ? g_gpu.sum_ms[0] / g_gpu.frames[0] : 0.0;
         const double mm = g_gpu.frames[1] ? g_gpu.sum_ms[1] / g_gpu.frames[1] : 0.0;

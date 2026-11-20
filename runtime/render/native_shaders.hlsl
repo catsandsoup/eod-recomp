@@ -14,7 +14,7 @@ struct Object {
     float4 diffuse;         // TOPS+4 rgb (0..128), w: half vector y
     float4 ambient;         // TOPS+5 rgb (0..128), w = vertex alpha (ITOP low byte)
     uint4 mode;             // x flags (below), y alpha reference | FOGCOL << 8, z FIX | F << 8,
-                            // w: half vector z (float bits)
+                            // w: half vector z (float bits), or the Classic world GS viewport
 };
 [[vk::push_constant]] Object obj;
 
@@ -56,7 +56,7 @@ struct VOut {
     [[vk::location(3)]] float w : TEXCOORD1;  // clip w = 1 / GS Q (VU1 div Q, vf0w, w)
 };
 
-VOut vs_main(VIn i) {
+VOut classic_vertex(VIn i) {
     VOut o;
     float4 q = float4(i.p, 1);
     o.pos = float4(dot(obj.cx, q), dot(obj.cy, q), dot(obj.cz, q), dot(obj.cw, q));
@@ -79,6 +79,22 @@ VOut vs_main(VIn i) {
     o.f = (float)((obj.mode.z >> 8) & 0xFF);
     o.uv = i.uv;
     o.w = o.pos.w;
+    return o;
+}
+
+VOut vs_main(VIn i) {
+    VOut o = classic_vertex(i);
+    // The water immediate feed preserves VU1's per-vertex alpha in COLOR.w.
+    if (obj.ambient.w < 0.0 && !(obj.mode.x & M_SPEC))
+        o.c.a = round(i.c.a * 255.0);
+    // Unclipped world draws convert to GS 12.4 XY before interpolating STQ.
+    // Snap in the same window space as the GS, retaining the original Z and W.
+    if ((obj.mode.w >> 24) == 0x20 && !(obj.mode.x & M_SPEC) && o.pos.w > 0.0) {
+        const float2 size = float2(obj.mode.w & 0xFFF, (obj.mode.w >> 12) & 0xFFF);
+        const float2 gs_xy = (o.pos.xy / o.pos.w + 1.0) * (size * 0.5) - 0.5;
+        const float2 snapped_xy = floor(gs_xy * 16.0) * (1.0 / 16.0);
+        o.pos.xy = ((snapped_xy + 0.5) * (2.0 / size) - 1.0) * o.pos.w;
+    }
     return o;
 }
 
@@ -107,7 +123,7 @@ VOut vs_static_queue(VIn i,
                      [[vk::location(6)]] float4 sw : SCREEN_W,
                      [[vk::location(7)]] float4 window : SCREEN_WINDOW) {
     vk::ext_execution_mode(4461, 32);  // SignedZeroInfNanPreserve 32
-    VOut o = vs_main(i);
+    VOut o = classic_vertex(i);
     o.pos.xy = static_queue_xy(o.pos, i.p, sx, sy, sw, window);
     return o;
 }

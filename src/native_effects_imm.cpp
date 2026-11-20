@@ -647,7 +647,7 @@ void immediate_begin() {
 int32_t imm_vertex_body(uint32_t state, uint32_t colour, uint32_t strip,
                         uint32_t x_u, uint32_t y_u, uint32_t z_u, uint32_t u_u, uint32_t v_u,
                         uint32_t commit_ra, uint32_t reserve_ra, uint32_t cont1_ra, uint32_t cont2_ra,
-                        bool feed_native) {
+                        bool feed_native, uint32_t producer_ra = 0) {
     if (lwu(state + 48) == 0) return 1;
 
     int32_t failed = 0;
@@ -692,7 +692,18 @@ int32_t imm_vertex_body(uint32_t state, uint32_t colour, uint32_t strip,
         const float st[2] = {fbits(u_u), fbits(v_u)};
         if (native::ee_in_water()) native::ee_water_vertex(xyz, st, colour, strip);
         else if (native::ee_in_flare()) native::ee_flare_vertex(xyz, st, colour, strip);
-        else if (native::ee_in_imm()) native::ee_imm_vertex(xyz, st, colour, strip);
+        else if (native::ee_in_imm()) {
+            float age = -1.0f;
+            switch (producer_ra) {
+            // Both four-vertex paths in the long/short spark emitter 0x2FA5F8.
+            // f31 is the game time and s0 points to its active 32-byte spark record.
+            case 0x2FAC18: case 0x2FAC40: case 0x2FAC68: case 0x2FAC90:
+            case 0x2FAEA8: case 0x2FAED0: case 0x2FAEF8: case 0x2FAF20:
+                age = g_ee.fpr[31].f - rf(reg(16) + 24);
+                break;
+            }
+            native::ee_imm_vertex(xyz, st, colour, strip, age);
+        }
     }
 
     int32_t ret = 0;
@@ -749,7 +760,7 @@ void immediate_vertex() {
     set(29, (int32_t)sp);
 
     const int32_t ret = imm_vertex_body(kImmState, colour, strip, x_u, y_u, z_u, u_u, v_u,
-                                        0x361784, 0x3617E4, 0x361B34, 0x361B58, true);
+                                        0x361784, 0x3617E4, 0x361B34, 0x361B58, true, (uint32_t)saved_ra);
 
     set(2, ret);
     set64(31, saved_ra);

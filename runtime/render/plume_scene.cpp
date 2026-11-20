@@ -19,12 +19,21 @@ plume::RenderDescriptorSetDesc environment_desc() {
     return plume::RenderDescriptorSetDesc(&range, 1);
 }
 
+plume::RenderDescriptorSetDesc scene_input_desc() {
+    static const plume::RenderDescriptorRange ranges[] = {
+        {plume::RenderDescriptorRangeType::TEXTURE, 0, 1},
+        {plume::RenderDescriptorRangeType::TEXTURE, 1, 1},
+        {plume::RenderDescriptorRangeType::SAMPLER, 2, 1},
+        {plume::RenderDescriptorRangeType::CONSTANT_BUFFER, 3, 1}};
+    return plume::RenderDescriptorSetDesc(ranges, 4);
+}
+
 bool PipelineCache::initialize(plume::RenderDevice &dev, plume::RenderFormat format) {
     if (device_) return device_ == &dev && format_ == format;
-    const plume::RenderDescriptorSetDesc sets[] = {texture_desc(), environment_desc()};
+    const plume::RenderDescriptorSetDesc sets[] = {texture_desc(), environment_desc(), scene_input_desc()};
     const plume::RenderPushConstantRange push(0, 0, 0, sizeof(PushConstants),
         plume::RenderShaderStageFlag::VERTEX | plume::RenderShaderStageFlag::PIXEL);
-    layout_ = dev.createPipelineLayout(plume::RenderPipelineLayoutDesc(&push, 1, sets, 2, false, true));
+    layout_ = dev.createPipelineLayout(plume::RenderPipelineLayoutDesc(&push, 1, sets, 3, false, true));
     vs_ = dev.createShader(k_native_vs_main, sizeof k_native_vs_main, "vs_main", plume::RenderShaderFormat::SPIRV);
     ps_ = dev.createShader(k_native_ps_main, sizeof k_native_ps_main, "ps_main", plume::RenderShaderFormat::SPIRV);
     vs_modern_ = dev.createShader(k_native_vs_modern, sizeof k_native_vs_modern, "vs_modern", plume::RenderShaderFormat::SPIRV);
@@ -41,7 +50,12 @@ plume::RenderPipeline *PipelineCache::pipeline(uint32_t key) {
     if (!device_) return nullptr;
     auto it = pipelines_.find(key);
     if (it != pipelines_.end() && it->second) return it->second.get();
-    if ((key & 15) != B_SHADOW && !(key & K_BOOTSTRAP_QUAD)) make_pipeline((key ^ K_MODERN) & ~K_STATIC_QUEUE);
+    if (key & K_SCENE_INPUTS) {
+        pipeline(key & ~K_SCENE_INPUTS);
+        return make_pipeline(key);
+    }
+    if ((key & 15) != B_SHADOW && !(key & (K_BOOTSTRAP_QUAD | K_VFX_BILLBOARD)))
+        make_pipeline((key ^ K_MODERN) & ~K_STATIC_QUEUE);
     return make_pipeline(key);
 }
 plume::RenderPipeline *PipelineCache::make_pipeline(uint32_t key) {
@@ -72,6 +86,14 @@ plume::RenderPipeline *PipelineCache::make_pipeline(uint32_t key) {
     d.pipelineLayout = layout_.get();
     d.vertexShader = static_queue ? vs_static_queue_.get() : (key & K_MODERN) ? vs_modern_.get() : vs_.get();
     d.pixelShader = (key & K_MODERN) ? ps_modern_.get() : ps_.get();
+    if (key & K_SCENE_INPUTS) {
+        if (!ps_modern_scene_) {
+            ps_modern_scene_ = device_->createShader(k_native_ps_modern_scene, sizeof k_native_ps_modern_scene,
+                "ps_modern_scene", plume::RenderShaderFormat::SPIRV);
+            if (!ps_modern_scene_) return nullptr;
+        }
+        d.pixelShader = ps_modern_scene_.get();
+    }
     if (key & K_BOOTSTRAP_QUAD) {
         if (!vs_bootstrap_quad_) {
             vs_bootstrap_quad_ = device_->createShader(k_spv_vs_bootstrap_quad, sizeof k_spv_vs_bootstrap_quad,
@@ -87,6 +109,24 @@ plume::RenderPipeline *PipelineCache::make_pipeline(uint32_t key) {
     d.inputSlotsCount = static_queue ? 2 : 1;
     d.inputElements = el;
     d.inputElementsCount = static_queue ? 8 : 4;
+    const plume::RenderInputSlot billboard_slot(0, sizeof(EffectBillboard),
+        plume::RenderInputSlotClassification::PER_INSTANCE_DATA);
+    const plume::RenderInputElement billboard_inputs[] = {
+        plume::RenderInputElement("POSITION", 0, 0, plume::RenderFormat::R32G32B32A32_FLOAT, 0, 0),
+        plume::RenderInputElement("TEXCOORD", 0, 1, plume::RenderFormat::R32G32B32A32_FLOAT, 0, 16),
+        plume::RenderInputElement("TEXCOORD", 1, 2, plume::RenderFormat::R32G32_FLOAT, 0, 32),
+        plume::RenderInputElement("COLOR", 0, 3, plume::RenderFormat::R8G8B8A8_UNORM, 0, 40)};
+    if (key & K_VFX_BILLBOARD) {
+        if (!vs_vfx_billboard_)
+            vs_vfx_billboard_ = device_->createShader(k_native_vs_vfx_billboard, sizeof k_native_vs_vfx_billboard,
+                "vs_vfx_billboard", plume::RenderShaderFormat::SPIRV);
+        if (!vs_vfx_billboard_) return nullptr;
+        d.vertexShader = vs_vfx_billboard_.get();
+        d.inputSlots = &billboard_slot;
+        d.inputSlotsCount = 1;
+        d.inputElements = billboard_inputs;
+        d.inputElementsCount = 4;
+    }
     d.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
     d.cullMode = cull == 1 ? plume::RenderCullMode::BACK : cull == 2 ? plume::RenderCullMode::FRONT : plume::RenderCullMode::NONE;
     d.depthClipEnabled = (key & K_NOCLIP) == 0;

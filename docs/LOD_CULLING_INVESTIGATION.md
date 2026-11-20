@@ -100,8 +100,27 @@ submissions in 932 measured frames, with no lower-level leaves in the
 culling samples. The regular-menu Dennison 2P run reached ten world passes,
 a far plane of 9,200, and zero lower-level leaves in the sampled culling calls.
 Its last parity checkpoint matched 1,173,479 submitted leaves in 5,390
-measured frames. The nine `LODRuntime` checks passed. Live 4P, full camera
-sweeps and 6× timing still require verification.
+measured frames. The nine `LODRuntime` checks passed.
+
+R2.3 uses the v18 resource lookup outputs at `sp+0x30` (version) and
+`sp+0x3C` (relocation flag) from the native `00214678` frame. It scales
+thresholds on a fresh resource and preserves the scaled values on a resident
+load. The CPU contract exercises first load, repeated load and fresh bytes
+at the same guest address in Maximum and Original at DrawDistance 8.
+
+On Mac Plume Classic at 1×, the retail Dennison four-player lobby loaded
+mlist A before the race and then reused the same GRAF and mlist addresses.
+Group 98 retained its two squared cutoffs at 16,000,000 on reuse. A private
+diagnostic fed the same axial camera to the game's setter at 3,960 and 4,040
+guest units in each view. At 3,960, mask 0 selected leaf 835 and every traced
+EE submission joined by frame, serial, pass and part to a Plume indexed draw.
+At 4,040, mask 5 selected neither leaf even though the parent sphere passed
+and the far plane was 9,200. The same targeted result held in 1P. The 4P
+trace joined 12 draws across the four distinct 320×224 scissors.
+
+This covers one retail group and actual draw commands with a controlled
+camera. Silhouettes, whole-track sweeps, current-tree 2P and 6× timing retain
+their separate acceptance gates.
 
 `00212DB0` and `00212DC0` are identical getters for `00495D58`. The simple
 `tools/ee_dis.py -x` JAL search finds no callers; this is **not** proof that there

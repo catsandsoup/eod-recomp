@@ -23,6 +23,16 @@
 
 namespace fs = std::filesystem;
 static std::string config_path;
+static bool bundle_flag(NSString *key) {
+    return [[[NSBundle mainBundle] infoDictionary][key] isEqual:@YES];
+}
+
+void mac_app_apply_bundle_defaults() {
+#ifdef EOD_PLUME
+    if (bundle_flag(@"EODPreferNativeRenderer")) g_config.native_renderer = true;
+#endif
+}
+
 static NSString *ns(const std::string &s) { return [NSString stringWithUTF8String:s.c_str()]; }
 static void error(const std::string &s) {
     NSAlert *a = [NSAlert new]; a.messageText = @"Eve of Destruction"; a.informativeText = ns(s); [a runModal];
@@ -86,17 +96,34 @@ std::string mac_app_validate_integrated(const std::string &root) {
     return "";
 }
 
-bool mac_app_activate_integrated(std::string *why) {
+static bool activate_integrated(std::string *why, bool allow_missing, bool *loaded) {
+    if (loaded) *loaded = false;
     std::vector<fs::path> candidates;
-    if (NSString *resources = [NSBundle mainBundle].resourcePath) candidates.push_back(fs::path(resources.UTF8String) / "Mods" / "integrated");
+    if (NSString *resources = [NSBundle mainBundle].resourcePath)
+        candidates.push_back(fs::path(resources.UTF8String) / "Mods" / "integrated");
     candidates.push_back(fs::path(mac_app_support()) / "mods" / "integrated");
-    std::error_code ec;
     fs::path root = candidates.back();
-    for (const auto &candidate : candidates) if (fs::exists(candidate, ec)) { root = candidate; break; }
+    bool missing = true;
+    for (const auto &candidate : candidates) {
+        std::error_code ec;
+        const auto status = fs::symlink_status(candidate, ec);
+        if (ec == std::errc::no_such_file_or_directory || (!ec && status.type() == fs::file_type::not_found))
+            continue;
+        // A dangling symlink, unreadable path, or partial install still needs validation.
+        missing = false;
+        root = candidate;
+        break;
+    }
+    if (allow_missing && missing) return true;
     const std::string problem = mac_app_validate_integrated(root.string());
     if (!problem.empty()) { if (why) *why = problem; return false; }
     if (setenv("EOD_MOD_DIR", root.c_str(), 1) != 0) { if (why) *why = "Could not select the built-in game content."; return false; }
+    if (loaded) *loaded = true;
     return true;
+}
+
+bool mac_app_activate_integrated(std::string *why) {
+    return activate_integrated(why, false, nullptr);
 }
 
 bool mac_app_select_mods(bool headless) { return mac_app_select_mods(headless, nullptr); }
@@ -109,12 +136,14 @@ bool mac_app_select_mods(bool headless, std::string *problem) {
         fprintf(stderr, "EOD_NATIVE_ONLY=1: launching the retail game without the integrated content\n");
         return true;
     }
+    const bool allow_missing = bundle_flag(@"EODIntegratedContentOptional");
     std::string why;
-    if (mac_app_activate_integrated(&why)) {
+    bool loaded = false;
+    if (activate_integrated(&why, allow_missing, &loaded)) {
         // Everything lockable is unlocked by default in the player path, whatever eod.ini says; the
         // stored file is not rewritten. EOD_UNLOCK_ALL stays an explicit override. The native
         // mechanism (src/game_patches.cpp) writes global prize/feat/track flags, so Career shares them.
-        if (!getenv("EOD_UNLOCK_ALL")) g_config.unlock_all = true;
+        if (loaded && !getenv("EOD_UNLOCK_ALL")) g_config.unlock_all = true;
         return true;
     }
     fprintf(stderr, "Integrated content: %s\n", why.c_str());

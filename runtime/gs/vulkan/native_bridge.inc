@@ -150,6 +150,8 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
     out.scale = g_scale;
     out.width = (uint32_t)(rt->w * g_scale);
     out.height = (uint32_t)(rt->h * g_scale);
+    out.color_ownership = rt->ownership;
+    out.depth_ownership = ds ? ds->ownership : 0;
     return true;
 }
 
@@ -172,7 +174,7 @@ bool native_begin_depth_clear(const Env &e, NativeSurfaces &out) {
     ++ds->version;
     ds->last_use = g_frame_no;
     out = {(void *)g_ctx->cmd, 0, (uint64_t)ds->tex->image, (uint32_t)(ds->w * g_scale), (uint32_t)(ds->h * g_scale),
-           (uint32_t)ds->w, (uint32_t)ds->h, g_scale};
+           (uint32_t)ds->w, (uint32_t)ds->h, g_scale, 0, ds->ownership};
     return true;
 }
 

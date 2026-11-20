@@ -32,7 +32,7 @@
 #include "scene_emit.h"
 #include "vif.h"
 
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_PUBLIC_VU_INTERPRETER)
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 #endif
@@ -1245,7 +1245,8 @@ struct VuProg {
         sb.hi[sl] |= (whi);                        \
     } while (0)
 
-#if __has_include("vu_rec.inc")
+// Public binaries interpret the player's microcode without embedding capture tables.
+#if !defined(EOD_PUBLIC_VU_INTERPRETER) && __has_include("vu_rec.inc")
 #define VU_REC 1
 namespace {
 // Helpers for the compiled programs: upper FMAC results as SSE vectors
@@ -1469,12 +1470,6 @@ inline uint8_t *vu1_qword(VUState *vu, uint32_t addr_qw) { return vu->mem + ((ad
 
 #include "vu_rec.inc"
 }  // namespace
-#else
-namespace {
-const VuProg g_vu_progs[1] = {{-1, 0, nullptr, 0, nullptr}};
-const int g_vu_nprogs = 0;
-}  // namespace
-#endif
 
 namespace {
 struct RecSlot {
@@ -1521,6 +1516,11 @@ static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
     }
     return true;
 }
+#elif !defined(EOD_PUBLIC_VU_INTERPRETER)
+namespace {
+const VuProg *vu_rec_find(VUState *, uint32_t) { return nullptr; }
+}  // namespace
+#endif
 
 // EOD_VU_REC=file [EOD_VU_REC_AT=vblank] [EOD_VU_REC_N=n]: records the state
 // before each micro program run (n runs from that vblank on) for
@@ -1557,6 +1557,7 @@ void vu_rec_hook(VUState *vu, uint32_t pc) {
 }
 }  // namespace
 
+#ifndef EOD_PUBLIC_VU_INTERPRETER
 namespace {
 bool vu_dispatch_observed() {
     static const bool trace = getenv("EOD_VU_REC") || getenv("EOD_VU_DUMP") ||
@@ -1564,8 +1565,14 @@ bool vu_dispatch_observed() {
     return trace || g_log_enabled[LOG_VU] || scene_capture::g_on || scene_emit::observing_vu();
 }
 }  // namespace
+#endif
 
 bool vu_retire_camera_nop(VUState *vu, uint32_t pc) {
+#ifdef EOD_PUBLIC_VU_INTERPRETER
+    (void)vu;
+    (void)pc;
+    return false;
+#else
     constexpr uint32_t pairs[] = {0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu};
     if (vu_dispatch_observed() ||
         vu->index != 1 || pc != 0x24D8 || std::memcmp(vu->micro + pc, pairs, sizeof(pairs)) != 0)
@@ -1610,6 +1617,7 @@ bool vu_retire_camera_nop(VUState *vu, uint32_t pc) {
     }
     retire(vu);
     return true;
+#endif
 }
 
 #if defined(EOD_VULKAN) && defined(VU_REC)
@@ -1805,6 +1813,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     vu_dump(vu, pc);
     if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
     if (scene_emit::g_on && vu->index == 1 && scene_emit::vu1_start(vu, pc)) return;
+#ifdef VU_REC
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;
@@ -1878,6 +1887,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
         }
         return;
     }
+#endif
     // EOD_VU_STATS=1: which programs run interpreted (no compiled match), with their time
     static const bool stats = getenv("EOD_VU_STATS") != nullptr;
     if (stats) {
@@ -2011,6 +2021,7 @@ int vu_bench(const char *path, int repeat) {
         pass.push_back(ns[1] - before);
     }
     std::sort(pass.begin(), pass.end());
+#ifdef VU_REC
     if (!g_blk_stats.empty()) {
         std::vector<std::pair<uint64_t, std::string>> top;
         uint64_t total = 0;
@@ -2025,6 +2036,7 @@ int vu_bench(const char *path, int repeat) {
         for (size_t k = 0; k < top.size() && k < 40; k++)
             printf("  %5.1f%%  %s\n", 100.0 * top[k].first / total, top[k].second.c_str());
     }
+#endif
     printf("vu-bench: %zu records x %d: VU0 %zu runs %.3f ms, VU1 %zu runs %.3f ms; VU1 per pass: fastest %.3f ms, "
            "median %.3f ms (%.2f ns per VU1 cycle); result hash %016llx\n",
            recs.size(), repeat, calls[0], ns[0] / 1e6, calls[1], ns[1] / 1e6, pass.empty() ? 0 : pass[0] / 1e6,
