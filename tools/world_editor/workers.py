@@ -192,3 +192,16 @@ def editor_thread_pool() -> QThreadPool:
     target = max(2, min(4, cpus - 1))
     pool.setMaxThreadCount(target)
     return pool
+
+
+def shutdown_editor_workers() -> None:
+    """Cancel editor jobs and keep their Qt signal objects alive until they stop."""
+    with _LIVE_WORKERS_LOCK:
+        workers = tuple(_LIVE_WORKERS)
+    for worker in workers:
+        if isinstance(worker, (FunctionWorker, ThumbnailBatchWorker)):
+            worker.token.cancel()
+    if workers:
+        editor_thread_pool().waitForDone()
+        with _LIVE_WORKERS_LOCK:
+            _LIVE_WORKERS.difference_update(workers)

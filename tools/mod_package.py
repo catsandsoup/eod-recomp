@@ -2,7 +2,7 @@
 """EOD mod packages (docs/CREATION_KIT_TEXTURE_CONTRACTS.md section 5).
 
 A package is a directory (or `.eodmod` zip of it) holding `eodmod.json`, native
-member payloads under `native/<archive>/<member>` and host replacement PNGs
+member payloads under `native/<archive>/<member>` and host replacements
 under `host/`. Library functions return dicts and raise ValueError with
 user-facing messages; `main()` is the CLI.
 """
@@ -32,7 +32,7 @@ SEMVER_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
                        r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 HEX16 = re.compile(r"[0-9a-f]{16}")
-MAX_SIDE = 4096
+MAX_SIDE = 8192
 MAX_UNZIPPED = 4 << 30
 
 
@@ -188,6 +188,29 @@ def png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
+def check_eodhtx(data):
+    return _check_eodhtx_header(data[:16], len(data))
+
+
+def _check_eodhtx_header(header, file_size):
+    if len(header) != 16 or header[:8] != b"EODHTX1\0":
+        raise ValueError("Bad .eodhtx header")
+    width, height, levels, flags = struct.unpack_from("<4H", header, 8)
+    if not (1 <= width <= MAX_SIDE and 1 <= height <= MAX_SIDE):
+        raise ValueError("Bad .eodhtx dimensions")
+    if flags or levels != max(width, height).bit_length():
+        raise ValueError("Bad .eodhtx level chain")
+    size = sum(max(1, width >> i) * max(1, height >> i) * 4 for i in range(levels))
+    if file_size != 16 + size:
+        raise ValueError("Bad .eodhtx level chain")
+    return width, height, levels
+
+
+def _eodhtx_file_size(path):
+    with path.open("rb") as handle:
+        return _check_eodhtx_header(handle.read(16), os.fstat(handle.fileno()).st_size)[:2]
+
+
 def replacement_scale(width, height, orig_width, orig_height):
     k = width // orig_width if orig_width else 0
     if (k < 1 or k & (k - 1) or width != orig_width * k or height != orig_height * k
@@ -277,7 +300,7 @@ def validate_manifest(m):
         files.append((check_rel(_require(entry, "file", str, where)), entry["sha256"], "host/"))
     folded = set()
     for path, _, prefix in files:
-        if not path.startswith(prefix) or (prefix == "host/" and not path.lower().endswith(".png")):
+        if not path.startswith(prefix) or (prefix == "host/" and not path.lower().endswith((".png", ".eodhtx"))):
             raise ValueError(f"Package file must be under {prefix}: {path}")
         if path.lower() in folded:
             raise ValueError("Duplicate or case-colliding package file: " + path)
@@ -337,8 +360,10 @@ def verify(package, disc=None):
         if file_sha(package / path) != digest:
             raise ValueError("Package file hash mismatch (modified or corrupt): " + path)
     for entry in m["host"]:
-        if png_size(package / entry["file"]) != (entry["width"], entry["height"]):
-            raise ValueError(f"{entry['assetId']}: PNG size differs from eodmod.json")
+        path = package / entry["file"]
+        size = _eodhtx_file_size(path) if path.suffix.lower() == ".eodhtx" else png_size(path)
+        if size != (entry["width"], entry["height"]):
+            raise ValueError(f"{entry['assetId']}: texture size differs from eodmod.json")
     result = dict(id=m["id"], version=m["version"], name=m["name"], native=len(m["native"]),
                   host=len(m["host"]), dependencies=m["dependencies"], manifestSha256=file_sha(package / MANIFEST),
                   files=sorted(p for p, _, _ in listed) + [MANIFEST], path=str(package))
@@ -418,7 +443,6 @@ def init(out, disc, package_id, version, name=None):
 def from_project(project, disc, package_id, version, out, name=None):
     """Package only the members a Kit project's built overlay changed versus retail."""
     project = Path(project).expanduser().resolve()
-    out = _fresh_output(out, disc)
     try:
         data = json.loads(project.read_text())
     except (OSError, ValueError) as error:
@@ -426,23 +450,77 @@ def from_project(project, disc, package_id, version, out, name=None):
     if data.get("version") != 1 or not isinstance(data.get("archives"), dict) or not data["archives"]:
         raise ValueError("Not a built EOD Kit project (version 1)")
     overlay = project.parent / (project.name + ".assets") / "overlay"
+    archives = []
+    for rel, record in sorted(data["archives"].items()):
+        source, spelled = retail_archive(disc, rel)
+        source_sha = cached_file_sha(source)
+        if source_sha != record.get("sourceSha256"):
+            raise ValueError(f"Project was built from a different version of {spelled}")
+        built = (overlay / rel).resolve()
+        if overlay.resolve() not in built.parents or not built.is_file() or file_sha(built) != record.get("outputSha256"):
+            raise ValueError(f"Built archive missing or modified; rebuild it in the Kit: {rel}")
+        archives.append((source, spelled, built, source_sha))
+    return _package_archives(archives, disc, package_id, version, out, name)
+
+
+def from_overlay(overlay, disc, package_id, version, out, name=None):
+    """Package changed retail archive members and HOSTTEX from a baked mod layer."""
+    overlay = Path(overlay).expanduser().absolute()
+    files = set(scan_tree(overlay))
+    archives = []
+    for rel in sorted(files):
+        if not rel.upper().startswith("DATA/"):
+            continue
+        source, spelled = retail_archive(disc, rel)
+        archives.append((source, spelled, overlay / rel, cached_file_sha(source)))
+    return _package_archives(archives, disc, package_id, version, out, name, overlay, files)
+
+
+def _add_overlay_textures(stage, manifest, disc, overlay, files):
+    index = "HOSTTEX/replacements.tsv"
+    if index not in files:
+        return
+    lines = (overlay / index).read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] != "eod-host-textures 1":
+        raise ValueError("Invalid baked HOSTTEX index")
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 7:
+            raise ValueError("Invalid baked HOSTTEX entry")
+        index_key, palette_key, orig_w, orig_h, relative, asset, _ = fields
+        source_path = "HOSTTEX/" + check_rel(relative)
+        if source_path not in files or not relative.lower().endswith(".eodhtx"):
+            raise ValueError(f"Baked HOSTTEX texture missing: {relative}")
+        archive, member = split_asset(asset)
+        original, entry, _, spelled = retail_member(disc, archive, member)
+        canonical = f"{spelled}#{entry['name']}"
+        if entry["type"] != "TEX":
+            raise ValueError(f"{canonical} is not a TEX texture")
+        identity = host_identity(original, canonical)
+        if (index_key, orig_w, orig_h) != (identity["indexKey"], str(identity["width"]), str(identity["height"])) \
+                or palette_key not in ("*", identity["paletteKey"]):
+            raise ValueError(f"{canonical}: baked HOSTTEX identity differs from the retail texture")
+        texture = overlay / source_path
+        width, height = _eodhtx_file_size(texture)
+        data = texture.read_bytes()
+        filename = f"host/{spelled}/{entry['name']}.eodhtx"
+        atomic_write(stage / filename, data)
+        manifest["host"].append(dict(assetId=canonical, sourceMemberSha256=sha(original), indexKey=index_key,
+                                     paletteKey=palette_key, origWidth=identity["width"], origHeight=identity["height"],
+                                     file=filename, sha256=sha(data), width=width, height=height))
+
+
+def _package_archives(archives, disc, package_id, version, out, name, overlay=None, files=()):
+    out = _fresh_output(out, disc)
     m = new_manifest(disc, package_id, version, name)
     out.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=out.parent))
     report = []
     try:
-        for rel in sorted(data["archives"]):
-            record = data["archives"][rel]
-            source, spelled = retail_archive(disc, rel)
-            source_sha = cached_file_sha(source)
-            if source_sha != record.get("sourceSha256"):
-                raise ValueError(f"Project was built from a different version of {spelled}")
-            built = (overlay / rel).resolve()
-            if overlay.resolve() not in built.parents or not built.is_file() or file_sha(built) != record.get("outputSha256"):
-                raise ValueError(f"Built archive missing or modified; rebuild it in the Kit: {rel}")
+        for source, spelled, built, source_sha in archives:
             retail_entries, built_entries = directory(source), directory(built)
             if sorted(e["name"] for e in retail_entries) != sorted(e["name"] for e in built_entries):
-                raise ValueError(f"Built archive adds or removes members (unsupported): {rel}")
+                raise ValueError(f"Built archive adds or removes members (unsupported): {spelled}")
             changes = {}
             for entry in retail_entries:
                 old = payload(source, entry["name"], retail_entries, verify_crc=False)[0]
@@ -450,7 +528,7 @@ def from_project(project, disc, package_id, version, out, name=None):
                 if old == new:
                     continue
                 if eod_crc(new) != next(e["crc"] for e in built_entries if e["name"] == entry["name"]):
-                    raise ValueError(f"Built member has a bad CRC: {rel}#{entry['name']}")
+                    raise ValueError(f"Built member has a bad CRC: {spelled}#{entry['name']}")
                 changes[entry["name"]] = new
                 file = f"native/{spelled}/{entry['name']}"
                 (stage / file).parent.mkdir(parents=True, exist_ok=True)
@@ -458,9 +536,11 @@ def from_project(project, disc, package_id, version, out, name=None):
                 m["native"].append(dict(archive=spelled, member=entry["name"], sourceArchiveSha256=source_sha,
                                         sourceMemberSha256=sha(old), file=file, sha256=sha(new)))
             rebuilt = sha(build_archive(source, changes)[0]) if changes else source_sha
-            report.append(dict(archive=spelled, members=sorted(changes), reproducesProjectBuild=rebuilt == record["outputSha256"]))
-        if not m["native"]:
-            raise ValueError("Project's built archives do not differ from retail")
+            report.append(dict(archive=spelled, members=sorted(changes), reproducesProjectBuild=rebuilt == file_sha(built)))
+        if overlay is not None:
+            _add_overlay_textures(stage, m, disc, overlay, files)
+        if not m["native"] and not m["host"]:
+            raise ValueError("No archive changes or host texture replacements to package")
         write_manifest(stage, m)
         verify(stage, disc)
         _publish_dir(stage, out)
@@ -489,7 +569,7 @@ def add_host(package, disc, asset, image, any_palette=False):
     replacement_scale(width, height, ident["width"], ident["height"])
     from tex import read_png
     try:
-        decoded = read_png(str(image))
+        decoded = read_png(str(image), max_side=MAX_SIDE)
     except (ValueError, OSError, struct.error) as error:
         raise ValueError(f"Cannot read replacement PNG: {error}") from None
     if tuple(decoded[:2]) != (width, height):
@@ -602,10 +682,14 @@ def unzip(source, out):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Build, verify and pack EOD mod packages")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("from-project", help="Package a built Kit project's changed members")
-    p.add_argument("project"); p.add_argument("--disc", required=True)
-    p.add_argument("--id", required=True); p.add_argument("--version", required=True)
-    p.add_argument("--name"); p.add_argument("--out", required=True)
+    for command, help_text in (
+        ("from-project", "Package a built Kit project's changed archive members"),
+        ("from-overlay", "Package a baked World Editor mod layer's archive changes and HOSTTEX"),
+    ):
+        p = sub.add_parser(command, help=help_text)
+        p.add_argument("source"); p.add_argument("--disc", required=True)
+        p.add_argument("--id", required=True); p.add_argument("--version", required=True)
+        p.add_argument("--name"); p.add_argument("--out", required=True)
     p = sub.add_parser("init", help="Create an empty package")
     p.add_argument("package"); p.add_argument("--disc", required=True)
     p.add_argument("--id", required=True); p.add_argument("--version", required=True); p.add_argument("--name")
@@ -620,7 +704,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.cmd == "from-project":
-            result = from_project(args.project, args.disc, args.id, args.version, args.out, args.name)
+            result = from_project(args.source, args.disc, args.id, args.version, args.out, args.name)
+        elif args.cmd == "from-overlay":
+            result = from_overlay(args.source, args.disc, args.id, args.version, args.out, args.name)
         elif args.cmd == "init":
             result = init(args.package, args.disc, args.id, args.version, args.name)
         elif args.cmd == "add-host":

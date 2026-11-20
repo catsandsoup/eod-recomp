@@ -82,6 +82,36 @@ VOut vs_main(VIn i) {
     return o;
 }
 
+// VU1 0x02A8 unclipped loop (0x1BD8): take the same ordered FMAC, DIV and
+// MULQ steps as the GS reference before converting only XY to 12.4.
+float vu_dot(float4 row, float3 p) {
+    precise float result = row.x * p.x + row.y * p.y + row.z * p.z + row.w;
+    return result;
+}
+
+float2 static_queue_xy(float4 clip, float3 p, float4 sx, float4 sy, float4 sw, float4 window) {
+    const float w = vu_dot(sw, p);
+    if (!(w > 0.0) || !(clip.w > 0.0)) return clip.xy;
+    precise float reciprocal = 1.0 / w;
+    precise float2 projected = float2(vu_dot(sx, p), vu_dot(sy, p)) * reciprocal;
+    const float2 xy = trunc(projected * 16.0) * (1.0 / 16.0) - window.xy;
+    return ((xy + 0.5) * window.zw - 1.0) * clip.w;
+}
+
+// SignedZeroInfNanPreserve selects the precise mode for this vertex stage
+// on Vulkan portability drivers. NoContraction alone does not constrain DIV.
+[[vk::ext_extension("SPV_KHR_float_controls"), vk::ext_capability(4466)]]
+VOut vs_static_queue(VIn i,
+                     [[vk::location(4)]] float4 sx : SCREEN_X,
+                     [[vk::location(5)]] float4 sy : SCREEN_Y,
+                     [[vk::location(6)]] float4 sw : SCREEN_W,
+                     [[vk::location(7)]] float4 window : SCREEN_WINDOW) {
+    vk::ext_execution_mode(4461, 32);  // SignedZeroInfNanPreserve 32
+    VOut o = vs_main(i);
+    o.pos.xy = static_queue_xy(o.pos, i.p, sx, sy, sw, window);
+    return o;
+}
+
 struct POut {
     [[vk::location(0)]] float4 color : SV_Target0;
     [[vk::location(0), vk::index(1)]] float4 factor : SV_Target1;  // dual source: a = blend factor C (GS units / 128)

@@ -225,7 +225,8 @@ struct BatchEmitter {
             return P[3 * x] == P[3 * y] && P[3 * x + 1] == P[3 * y + 1] && P[3 * x + 2] == P[3 * y + 2];
         };
         auto push = [&](uint32_t a, uint32_t bb, uint32_t c) {
-            if (opt.drop_degenerate && (same(a, bb) || same(bb, c) || same(a, c))) return;
+            if (opt.drop_degenerate && !(shadow && opt.keep_shadow_extrusion_faces) &&
+                (same(a, bb) || same(bb, c) || same(a, c))) return;
             out.indices.push_back(a + base);
             out.indices.push_back(bb + base);
             out.indices.push_back(c + base);

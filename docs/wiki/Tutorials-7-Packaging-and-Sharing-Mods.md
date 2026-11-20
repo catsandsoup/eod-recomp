@@ -16,14 +16,23 @@ In this tutorial, you will export your custom track, 4K textures, and custom rac
 
 ### In the World Editor GUI
 1. Press **`Ctrl + Shift + E`** (or click **`File → Package Mod as .eodmod…`**).
-2. Enter your **Mod ID** (`woodly-mega-jumps`), **Display Name**, **Version** (`1.0.0`), and **Description**, then click **`Build .eodmod Package`**.
-3. The packager diffs your build against the retail `SLUS_209.10` disc and bundles **only**:
-   - Modified binary archive members (`native/DATA/TRACKS/AFTON.TRK/track.grf`, `track.sol`, `c_jump_race.va0`)
-   - 4K host texture replacements (`host/`)
-   - Structured sub-record deltas (`deltas/<track>.eodworld.json`)
-   - An auto-captured `preview.png` viewport thumbnail and SHA-256 provenance manifest.
+2. Enter a **Mod ID** (`woodly-mega-jumps`), **Display Name**, and **Version** (`1.0.0`). Choose where to save the `.eodmod`.
+3. The editor bakes a snapshot of the current world, including unsaved edits. The package contains changed retail archive members, indexed HOSTTEX replacements with their mip chains, and a manifest with SHA-256 hashes.
+
+Added archive members, structured sub-record deltas, and standalone environment or PIE settings are pending package support.
 
 ### Via CLI (`tools/mod_package.py`)
+For a baked World Editor layer, use the directory containing `DATA/` and optional `HOSTTEX/`.
+
+```sh
+python tools/mod_package.py from-overlay mods/WoodlyJumps \
+  --disc "/path/to/extracted-disc" --id woodly-mega-jumps \
+  --version 1.0.0 --name "Woodly Mega Jumps" --out build_pkgs/woodly-mega-jumps
+python tools/mod_package.py zip build_pkgs/woodly-mega-jumps Woodly-Mega-Jumps-v1.0.0.eodmod
+```
+
+For a Creation Kit project with a built overlay, use `from-project`.
+
 ```powershell
 python tools/mod_package.py from-project "mods\WoodlyJumps\project.eodproject" `
   --disc "D:\Test Drive - Eve of Destruction (USA)" `
@@ -38,8 +47,21 @@ python tools/mod_package.py zip "build_pkgs\woodly-mega-jumps" "Woodly-Mega-Jump
 
 ## Step 2: Install `.eodmod` Packages & Resolve Load-Order Conflicts
 
-### Drag-and-Drop GUI or CLI (`tools/mod_install.py`)
-Drag any `.eodmod` file onto the EOD World Editor window (or open **`File → Mod Manager & Profiles…`**), or use the CLI:
+### World Editor or CLI
+
+Open **File → Mod Manager & Profiles**, select or name a profile, and pick a
+local `.eodmod` with **Install Package**. The dialog installs it disabled.
+Enable the package when ready to compose the profile. The dialog also shows
+package conflicts, allows you to choose a winner, and displays the active
+overlay path.
+
+With a track open, choose **Play Free Roam in PIE** or **Play Event in PIE**
+for the selected profile. The editor bakes the current project into a private
+overlay for that session. Installed archive members carry through where the
+project leaves the retail member unchanged. Project edits take precedence for
+the same archive member or host texture. For a standalone launch with just
+the installed profile, use `launch-env` to get the value for `EOD_MOD_DIR`.
+
 ```powershell
 python tools/mod_install.py install "Woodly-Mega-Jumps-v1.0.0.eodmod" --disc "D:\Test Drive - Eve of Destruction (USA)"
 python tools/mod_install.py status
@@ -47,10 +69,15 @@ python tools/mod_install.py compose
 python tools/mod_install.py launch-env
 ```
 
-### How 3-Tier Hierarchical Conflict Merging Works
-1. **Tier 1 (Disjoint Members in the Same `.TRK`/`.RES`):** If Mod A edits `AFTON.TRK#track.grf` and Mod B edits `AFTON.TRK#track.sol` or `AFTON.TRK#oval.ild`, both members merge into `active/DATA/TRACKS/AFTON.TRK` automatically.
-2. **Tier 2 (Same Member, Disjoint Sub-Records via `deltas/*.eodworld.json`):** If Mod A moves a ramp in `AFTON.TRK#track.grf` and Mod B scatters buses in the infield, their non-overlapping object, barrier, ILIN, and VALT deltas merge cleanly on top of the retail base member!
-3. **Tier 3 (True Same-Record / Binary Collision):** Prompts you to pick a winner (`python tools/mod_install.py accept-conflict "DATA/TRACKS/AFTON.TRK#track.grf" woodly-mega-jumps`).
+### How conflicts are composed
+
+- **Different archive members.** If one mod edits `AFTON.TRK#track.grf`
+  and another edits `AFTON.TRK#track.sol`, both members appear in the
+  active Afton archive.
+- **Different payloads for the same member or host texture.** Choose a winner
+  in the dialog, or run `python tools/mod_install.py accept-conflict
+  "DATA/TRACKS/AFTON.TRK#track.grf" woodly-mega-jumps`. Same-member
+  sub-record merging is pending.
 
 ---
 

@@ -75,6 +75,12 @@ int main() {
     auto good = htx(8, 4, 4);
     check(parse_htx_header(good.data(), good.size(), h, why) && h.width == 8 && h.height == 4 && h.levels == 4,
           "valid header");
+    const auto wide = htx(8192, 128, 14);
+    check(parse_htx_header(wide.data(), wide.size(), h, why) && h.width == 8192 && h.height == 128 && h.levels == 14,
+          "8192-side rectangle accepts the complete 14-level chain");
+    check(!parse_htx_header(wide.data(), wide.size() - 1, h, why), "truncated 8192-side chain rejected");
+    const auto oversized = htx(16384, 1, 15);
+    check(!parse_htx_header(oversized.data(), oversized.size(), h, why), "dimensions above 8192 rejected");
     check(!parse_htx_header(good.data(), good.size() - 1, h, why), "truncated file rejected");
     auto partial = htx(8, 4, 2);
     check(!parse_htx_header(partial.data(), partial.size(), h, why), "partial chain rejected");
@@ -105,9 +111,11 @@ int main() {
     write(hosttex + "/sky/b.eodhtx", htx(48, 48, 6));     // 16x16 x3: not a power of two
     write(hosttex + "/sky/c.eodhtx", htx(32, 16, 6));     // 16x16 aspect changed
     write(hosttex + "/sky/w.eodhtx", htx(64, 64, 7, 9));  // wildcard
+    write(hosttex + "/sky/wide.eodhtx", wide);
     std::string m = "eod-host-textures 1\n";
     m += "b0dfc9176c7f868a\t205f0e8a058538d6\t16\t16\tsky/a.eodhtx\tDATA/TRACKS/ANOKA.TRK#sky01A.tex\tpkg\n";
     m += "b0dfc9176c7f868a\t*\t16\t16\tsky/w.eodhtx\tDATA/TRACKS/ANOKA.TRK#sky01A.tex\twild\n";
+    m += "7777777777777777\t*\t1024\t16\tsky/wide.eodhtx\tA#wide\tpkg\n";
     m += "1111111111111111\t*\t16\t16\tsky/missing.eodhtx\tA#missing\tpkg\n";
     m += "2222222222222222\t*\t16\t16\tsky/b.eodhtx\tA#b\tpkg\n";
     m += "3333333333333333\t*\t16\t16\tsky/c.eodhtx\tA#c\tpkg\n";
@@ -121,7 +129,7 @@ int main() {
     LogFn log = [&](const std::string &s) { logs.push_back(s); };
     Store st;
     size_t n = st.load(root, log);
-    check(n == 2, "two valid entries accepted");
+    check(n == 3, "three valid entries accepted");
     int skipped = 0;
     for (auto &l : logs) skipped += l.find("skipped") != std::string::npos;
     check(skipped == 7, "seven malformed lines logged as skipped");
@@ -133,6 +141,9 @@ int main() {
     why.clear();
     check(st.find(0xb0dfc9176c7f868aull, 0x205f0e8a058538d6ull, 16, 16, why) == 0, "exact palette wins");
     check(st.find(0xb0dfc9176c7f868aull, 0x1234ull, 16, 16, why) == 1, "wildcard for another palette");
+    const int wide_slot = st.find(0x7777777777777777ull, 0, 1024, 16, why);
+    check(wide_slot >= 0 && st.entries()[wide_slot].scale == 8 && st.entries()[wide_slot].levels == 14,
+          "8192-side file loads and resolves through its native dimensions");
     check(st.find(0xb0dfc9176c7f868aull, 0x205f0e8a058538d6ull, 32, 32, why) == -1, "dimensions are part of identity");
     check(st.find(0x9999ull, 0, 16, 16, why) == -1 && why.empty(), "unknown key is a plain miss");
 
@@ -161,7 +172,8 @@ int main() {
     write(hosttex + "/replacements.tsv", "eod-host-textures 2\n");
     check(st4.load(root, log) == 0, "unknown manifest version rejected");
 
-    for (const char *f : {"sky/a.eodhtx", "sky/b.eodhtx", "sky/c.eodhtx", "sky/w.eodhtx", "replacements.tsv"})
+    for (const char *f : {"sky/a.eodhtx", "sky/b.eodhtx", "sky/c.eodhtx", "sky/w.eodhtx", "sky/wide.eodhtx",
+                          "replacements.tsv"})
         unlink((hosttex + "/" + f).c_str());
     rmdir((hosttex + "/sky").c_str());
     rmdir(hosttex.c_str());

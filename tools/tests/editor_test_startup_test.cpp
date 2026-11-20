@@ -1,4 +1,5 @@
 #include "../../runtime/platform/editor_test_startup.h"
+#include "../../runtime/render/editor_environment.h"
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -6,6 +7,24 @@
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "failed: %s:%d: %s\n", __FILE__, __LINE__, #x); std::exit(1); } } while (0)
 
 int main() {
+    const std::string authored = "[environment]\ntrack=AFTON\nenabled=1\nsun_dir=0,1,0\n"
+        "sun_color=0.8,0.3,0.1\nambient_intensity=0.4\nfog_color=0.2,0.3,0.4\n"
+        "fog_start=10\nfog_end=80\nfog_density=0.75\n";
+    editor_environment::Override environment;
+    std::istringstream active_override(authored);
+    CHECK(editor_environment::parse(active_override, environment));
+    CHECK(environment.sun_dir[1] == -1 && environment.fog_end == 80 && environment.fog_density == .75f);
+    CHECK(editor_environment::applies(environment, "DATA\\TRACKS\\Afton.trk", true));
+    CHECK(!editor_environment::applies(environment, "Anoka.TRK", true));
+    CHECK(!editor_environment::applies(environment, "AFTON.TRK", false));
+    editor_environment::Override absent;
+    std::istringstream empty_override;
+    CHECK(!editor_environment::parse(empty_override, absent));
+    std::istringstream disabled_override(authored + "enabled=0\n");
+    CHECK(!editor_environment::parse(disabled_override, absent));
+    std::istringstream malformed_override(authored + "fog_density=nan\n");
+    CHECK(!editor_environment::parse(malformed_override, absent));
+
     using namespace editor_test_startup;
     CHECK(!requested(nullptr, "track=Anoka"));
     CHECK(!requested("0", "track=Anoka"));

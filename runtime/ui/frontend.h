@@ -106,6 +106,7 @@ struct Effects {
     bool close = false;
     bool save = false;           // write eod.ini now (the menu also saves on close when dirty)
     bool fullscreen = false;     // apply cfg.fullscreen to the window
+    bool toggle_plume_look = false;
     bool audio = false;          // volume / sound on-off changed
     bool keys = false;           // keyboard bindings changed
     bool input_layout = false;   // controller/keyboard layout, keyboard port, deadzones
@@ -116,12 +117,16 @@ struct Effects {
     std::string disc_path;
 };
 
+enum class PlumeLook { Unavailable, Classic, Modern };
+
 // Live facts the host supplies each frame (device names, mods root, version...).
 struct HostInfo {
     std::string version = "0.0.0";
     std::string device[2];          // "DualShock 4", "Keyboard", "None"
     std::string mods_root;          // where discover_mods looks
     bool pause_supported = true;
+    PlumeLook plume_look = PlumeLook::Unavailable;
+    bool legacy_modern_available = false;
 };
 
 class Menu {

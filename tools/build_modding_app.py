@@ -56,9 +56,13 @@ def bundle_info():
 
 
 def main():
+    from macos.kit_python import DEFAULT_FRAMEWORK, install_python
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--game-executable', required=True, type=Path)
     parser.add_argument('--project', type=Path, help='Project to open on first launch')
+    parser.add_argument('--python-framework', type=Path, default=DEFAULT_FRAMEWORK,
+                        help='arm64 python.org CPython framework version directory')
     args = parser.parse_args()
     layout = build_layout(ROOT)
     config = runtime_config(ROOT, args.game_executable, args.project)
@@ -78,6 +82,7 @@ def main():
     backend.mkdir(parents=True)
     shutil.copy2(Path(binary_dir) / 'EODModdingSuite', executable / 'EODModdingSuite')
     subprocess.run(['xcrun', 'strip', '-S', str(executable / 'EODModdingSuite')], check=True)
+    install_python(args.python_framework, stage / 'Contents')
     for name in ('modding_backend.py', 'rst0.py', 'valt.py', 'tex.py', 'texture_preview.py', 'texture_edit.py', 'vehicle_materials.py', 'vif_mesh.py',
                  'texture_export.py', 'asset_registry.py', 'texture_identity.py', 'mod_package.py', 'mod_install.py'):
         shutil.copy2(ROOT / 'tools' / name, backend / name)
@@ -103,8 +108,10 @@ def main():
     with (stage / 'Contents/Info.plist').open('wb') as handle:
         plistlib.dump(bundle_info(), handle)
     subprocess.run(['xattr', '-cr', str(stage)], check=True)
+    subprocess.run(['xattr', '-d', 'com.apple.FinderInfo', str(stage)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(['codesign', '--force', '--sign', '-', str(stage)], check=True)
-    subprocess.run(['codesign', '--verify', '--strict', str(stage)], check=True)
+    subprocess.run(['codesign', '--verify', '--deep', '--strict', str(stage)], check=True)
     legacy_previous = layout['output'] / 'EOD Creation Kit Development.previous.app'
     if legacy_previous.exists():
         if layout['previous'].exists():

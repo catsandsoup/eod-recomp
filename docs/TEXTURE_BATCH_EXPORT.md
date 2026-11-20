@@ -30,7 +30,7 @@ python3 tools/texture_export.py --reimport-check DIR/export-manifest.json ASSETI
   assetId, png)` reports eligibility only (it writes nothing):
   `native-same-size` needs equal dimensions and a natively editable indexed TEX;
   `host-replacement` needs an indexed TEX (runtime keys) and `origW*k` by `origH*k` with
-  `k` a power of two and each side at most 4096.
+  `k` a power of two and each side at most 8192 pixels.
 
 ## Manifest additions beyond the contract
 
@@ -69,4 +69,4 @@ sampled at their full size in game.
 
 Role is a name-based guess with a confidence value in the manifest; only `sky` (track member
 `skyNNA|B.tex`) is high. Direct-colour TEX (3 here) and non-indexed assets cannot be host
-replaced in contract v1. Replacements are capped at 4096 per side; validate any 4x or larger batch in game before extending it.
+replaced in contract v1. Replacements are capped at 8192 per side; validate any 4x or larger batch in game before extending it.

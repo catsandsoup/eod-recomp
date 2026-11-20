@@ -16,7 +16,7 @@ The same functions are importable (dict results, `ValueError` with user-facing t
 `from-project` diffs each built overlay archive against retail per member and stores only changed
 members (with source archive/member hashes); it reports whether re-composing reproduces the project's
 build byte for byte. `add-host` requires an indexed 4/8-bit retail TEX and a PNG of orig*k pixels
-(k a power of two, at most 4096/side); keys come from `texture_identity`. Direct-colour textures are refused.
+(k a power of two, at most 8192 pixels per side). Keys come from `texture_identity`. This format supports indexed TEX textures.
 Unzip rejects traversal, absolute paths, symlinks, case-folded duplicates and hash mismatches.
 
 ## Profile commands

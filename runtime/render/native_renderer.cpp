@@ -3,6 +3,7 @@
 #include "core/diff_harness.h"
 #include "core/trace.h"
 #include "native_renderer.h"
+#include "editor_environment.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +34,7 @@
 
 #ifdef EOD_PLUME
 #include "plume_device.h"
+#include "plume_scene.h"
 #include "plume_vulkan.h"
 #endif
 
@@ -81,6 +83,8 @@ struct Parity {
 };
 Parity g_parity;
 uint64_t g_only_dropped = 0;  // EOD_NATIVE_ONLY: GS primitives not drawn
+uint64_t g_scene_clear_count = 0;
+uint64_t g_frontend_depth_clear_count = 0;
 // EOD_NATIVE_ONLY: what the dropped GS primitives were, by (frame buffer, texture, primitive kind),
 // with their screen box (px), printed every EOD_NATIVE_LOG frames: geometry with no native owner.
 struct DropKey {
@@ -138,16 +142,10 @@ uint64_t context_xyoffset() {
 }
 
 #ifdef EOD_PLUME
-#include "native_shaders_spv.inc"
-#include "native_modern_spv.inc"
 #include "material_table.inc"
+using namespace scene;
 
-struct PushConstants {
-    float cx[4], cy[4], cz[4], cw[4];
-    float light[4], diffuse[4], ambient[4];
-    uint32_t mode[4];
-};
-static_assert(sizeof(PushConstants) == 128, "push constants");
+constexpr uint32_t kAuthoredEnvironment = 1u << 31; // Modern mode.z, above the material class
 enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
                   M_CFIX = 0x200, M_SPEC = 0x400, M_FGE = 0x800,
                   // stage R5 A2: GS texture addressing (TEX0 size, TEX1, CLAMP) and the AFAIL second pass
@@ -156,13 +154,8 @@ enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATS
 // mode.z bits 16..27: TEX1.K (signed 7.4), 28..29: TEX1.L, 30: TEX1.LCM
 enum : uint32_t { Z_K_SHIFT = 16, Z_L_SHIFT = 28, Z_LCM = 1u << 30 };
 
-// blend equations (GS ALPHA a, b, d with C in the shader's second output)
-enum Blend : uint32_t { B_OPAQUE, B_MIX, B_ADD, B_REVSUB, B_SCALE, B_DST_ADD, B_INV_MIX, B_KEEP, B_SHADOW, B_COUNT };
 // mode.w of a projected-shadow draw (native_shaders.hlsl shadow_ps, stage R5 A3)
 enum : uint32_t { S_ON = 1u << 31, S_COMPOSITE = 1u << 30 };
-// pipeline key bit 15: generic GS blend (bits 16..17 src factor, 18..19 dst factor, 20..21 op,
-// bit 22 C = destination alpha), see blend_classes
-enum : uint32_t { K_GENERIC = 1u << 15, K_CDST = 1u << 22, K_NOCLIP = 1u << 23, K_MODERN = 1u << 24 };  // K_MODERN: stage R6 shaders  // K_NOCLIP: depth clamp, no z clipping (GS)
 
 struct GpuMesh {
     std::unique_ptr<Mesh> cpu;
@@ -175,10 +168,11 @@ struct Texture {
     std::unique_ptr<plume::RenderBuffer> staging;  // until the upload is recorded
     std::unique_ptr<plume::RenderDescriptorSet> sets[16];  // per sampler (8..15: the Modern look, stage R6)
     uint32_t w = 0, h = 0, levels = 1;
-    uint64_t offset[7] = {};  // each level's place in the staging buffer
+    uint64_t offset[14] = {};  // a full 8192-pixel mip chain
     uint64_t bytes = 0;       // staging size (texture_bytes accounting)
     uint64_t key = 0, last_use = 0;
     bool pending_upload = false;
+    uint64_t replacement_id = 0;
     int32_t mat = -1;                 // material record (stage R6), -1: none
     uint32_t sky_top = 0, sky_hor = 0;  // a sky texture's mean upper / lower colour (RGBA8)
 };
@@ -201,6 +195,10 @@ struct Item {
     std::vector<int32_t> run_k;  // TEX1.K per VU1 run (Mesh::k_runs), when they differ
 };
 
+bool uses_static_queue_projection(const Packet &p, const Mesh &mesh) {
+    return p.kind == KIND_QUEUE && p.program == 0x02A8 && !(p.itop & 0x200) && !mesh.skinned && !mesh.posed;
+}
+
 struct Target {
     uint32_t fbp, fbw, fpsm, zbp, zpsm, rows;
     bool depth;
@@ -220,17 +218,20 @@ struct Trash {
 };
 
 struct Renderer {
-    bool tried = false, ok = false;
+    bool tried = false;
+    std::atomic<bool> ok{false};
     plume::VulkanDevice *dev = nullptr;
     std::unique_ptr<plume::RenderCommandQueue> queue;
     std::unique_ptr<plume::RenderCommandList> list;
-    std::unique_ptr<plume::RenderPipelineLayout> layout;
-    std::unique_ptr<plume::RenderShader> vs, ps, vs_modern, ps_modern;
+    PipelineCache scene;
+    bool static_queue_projection = false;
+    std::unique_ptr<plume::RenderBuffer> environment_buffer;
+    std::unique_ptr<plume::RenderDescriptorSet> environment_set;
     std::unique_ptr<plume::RenderSampler> samplers[16];
-    std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> pipelines;
     Texture white;
     std::unordered_map<uint32_t, GpuMesh> meshes;
     std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures;  // by content
+    std::unordered_map<uint64_t, Texture *> replacements;  // by package entry, material and alpha domain
     std::unordered_map<uint64_t, AddrEntry> by_addr;
     XXH3_state_t *hash_state = XXH3_createState();
     uint64_t texture_bytes = 0, decoded = 0;
@@ -505,37 +506,30 @@ void load_materials() {
                  g_mat_bound, g_modern ? "Modern" : "Classic");
 }
 
-// The record of a texture being decoded: indexKey / paletteKey from GS memory as the host-texture
-// path computes them (runtime/gs/gs_draw.cpp capture_texture), same size; else the same indexKey.
-int32_t material_of(const gs::Env &e) {
+// Read the original identity once for both material tags and HOSTTEX lookup.
+MatKey indexed_texture_key(const gs::Env &e) {
     const bool eight = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT8H;
-    const bool four = e.tpsm == gs::PSMT4 || e.tpsm == gs::PSMT4HL || e.tpsm == gs::PSMT4HH;
-    if (!eight && !four) return -1;
     g_textures_indexed++;
     static std::vector<uint8_t> plane;
     plane.resize((size_t)e.tw * e.th);
     for (uint32_t y = 0; y < e.th; y++)
         for (uint32_t x = 0; x < e.tw; x++)
             plane[(size_t)y * e.tw + x] = (uint8_t)gs::read_pixel(e.tpsm, (int)x, (int)y, e.mip_tbp[0], e.mip_tbw[0]);
-    const uint64_t ik = gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data());
-    auto it = g_mat_by_ik.find(ik);
+    return {gs::hosttex::index_key(eight ? 8 : 4, e.tw, e.th, plane.data()),
+            gs::hosttex::palette_key(e.pal, eight ? 256 : 16), e.tw, e.th};
+}
+
+int32_t material_of(const MatKey &key) {
+    auto it = g_mat_by_ik.find(key.ik);
     if (it == g_mat_by_ik.end()) return -1;
-    const uint64_t pk = gs::hosttex::palette_key(e.pal, eight ? 256 : 16);
     int32_t any = -1;
     for (const auto &q : it->second) {
-        if (q.first.w != e.tw || q.first.h != e.th) continue;
-        if (q.first.pk == pk) return q.second;
+        if (q.first.w != key.w || q.first.h != key.h) continue;
+        if (q.first.pk == key.pk) return q.second;
         if (any < 0) any = q.second;
     }
     if (any >= 0) g_pk_fallback++;
     return any;
-}
-
-plume::RenderDescriptorSetDesc set_desc() {
-    static plume::RenderDescriptorRange ranges[2] = {
-        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::TEXTURE, 0, 1),
-        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::SAMPLER, 1, 1)};
-    return plume::RenderDescriptorSetDesc(ranges, 2);
 }
 
 bool init() {
@@ -553,17 +547,34 @@ bool init() {
         return false;
     }
     g_r.dev = dev;
+    VkPhysicalDeviceFloatControlsProperties float_controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceProperties2 gpu_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    gpu_properties.pNext = &float_controls;
+    vkGetPhysicalDeviceProperties2(dev->physicalDevice, &gpu_properties);
+    g_r.static_queue_projection = gpu_properties.properties.apiVersion >= VK_API_VERSION_1_2 &&
+                                  float_controls.shaderSignedZeroInfNanPreserveFloat32;
     g_r.queue = dev->createCommandQueue(plume::RenderCommandListType::DIRECT);
-    g_r.list = g_r.queue->createCommandList();
-    const plume::RenderDescriptorSetDesc sd = set_desc();
-    plume::RenderPushConstantRange pcr(0, 0, 0, sizeof(PushConstants),
-                                       plume::RenderShaderStageFlag::VERTEX | plume::RenderShaderStageFlag::PIXEL);
-    plume::RenderPipelineLayoutDesc ld(&pcr, 1, &sd, 1, false, true);
-    g_r.layout = dev->createPipelineLayout(ld);
-    g_r.vs = dev->createShader(k_native_vs_main, sizeof k_native_vs_main, "vs_main", plume::RenderShaderFormat::SPIRV);
-    g_r.ps = dev->createShader(k_native_ps_main, sizeof k_native_ps_main, "ps_main", plume::RenderShaderFormat::SPIRV);
-    g_r.vs_modern = dev->createShader(k_native_vs_modern, sizeof k_native_vs_modern, "vs_modern", plume::RenderShaderFormat::SPIRV);
-    g_r.ps_modern = dev->createShader(k_native_ps_modern, sizeof k_native_ps_modern, "ps_modern", plume::RenderShaderFormat::SPIRV);
+    if (g_r.queue) g_r.list = g_r.queue->createCommandList();
+    if (!g_r.list || !g_r.scene.initialize(*dev)) {
+        std::fprintf(stderr, "[native] plume setup failed: the GS draws everything\n");
+        return false;
+    }
+    float environment[8]{};
+    if (const auto *authored = environment_override()) {
+        std::copy(authored->fog_color.begin(), authored->fog_color.end(), environment);
+        environment[4] = authored->fog_start;
+        environment[5] = authored->fog_end;
+        environment[6] = authored->fog_density;
+        environment[7] = authored->ambient_intensity;
+    }
+    g_r.environment_buffer = dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(sizeof environment, plume::RenderBufferFlag::CONSTANT));
+    g_r.environment_set = dev->createDescriptorSet(environment_desc());
+    if (!g_r.environment_buffer || !g_r.environment_set) return false;
+    void *mapped = g_r.environment_buffer->map();
+    if (!mapped) return false;
+    std::memcpy(mapped, environment, sizeof environment);
+    g_r.environment_buffer->unmap();
+    g_r.environment_set->setBuffer(0, g_r.environment_buffer.get(), sizeof environment);
     // the Modern look's samplers (8..15): trilinear, anisotropic, every level the texture holds;
     // bit 1 / 2 the GS CLAMP.WMS / WMT (clamp, else repeat)
     for (uint32_t i = 8; i < 16; i++) {
@@ -588,10 +599,6 @@ bool init() {
         s.maxLOD = 0;
         g_r.samplers[i] = dev->createSampler(s);
     }
-    if (!g_r.layout || !g_r.vs || !g_r.ps || !g_r.list || !g_r.vs_modern || !g_r.ps_modern) {
-        std::fprintf(stderr, "[native] plume setup failed: the GS draws everything\n");
-        return false;
-    }
     // 1x1 texture for untextured objects (the set layout has a texture)
     g_r.white.tex = dev->createTexture(plume::RenderTextureDesc::Texture2D(1, 1, 1, plume::RenderFormat::R8G8B8A8_UNORM));
     g_r.white.staging = dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(256));
@@ -602,7 +609,7 @@ bool init() {
     g_r.white.pending_upload = true;
     g_r.uploads.push_back(&g_r.white);
     gpu_timer_init();
-    g_r.ok = true;
+    g_r.ok.store(true, std::memory_order_release);
     std::fprintf(stderr, "[native] plume renderer ready (%s)\n", dev->description.name.c_str());
     return true;
 }
@@ -611,7 +618,7 @@ plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
     auto make = [&](uint32_t i) {
         auto &s = t->sets[i];
         if (!s) {
-            s = g_r.dev->createDescriptorSet(set_desc());
+            s = g_r.dev->createDescriptorSet(texture_desc());
             s->setTexture(0, t->tex.get(), plume::RenderTextureLayout::SHADER_READ);
             s->setSampler(1, g_r.samplers[i].get());
         }
@@ -623,98 +630,6 @@ plume::RenderDescriptorSet *texture_set(Texture *t, uint32_t sampler) {
     if (t != &g_r.shadow_mask && !t->sets[sampler])
         for (uint32_t i = sampler >= 8 ? 0 : 8; i < 16; i += 2) make(i == 0 ? 0 : i);  // and the Classic set 0
     return make(sampler);
-}
-
-plume::RenderPipeline *pipeline_make(uint32_t key);
-// stage R6: every pipeline is made with its Classic / Modern twin, so a look toggle compiles nothing
-// (P5); a projected-shadow pipeline (B_SHADOW) has no Modern twin
-plume::RenderPipeline *pipeline(uint32_t key) {
-    auto it = g_r.pipelines.find(key);
-    if (it != g_r.pipelines.end() && it->second) return it->second.get();
-    if ((key & 15) != B_SHADOW) pipeline_make(key ^ K_MODERN);
-    return pipeline_make(key);
-}
-plume::RenderPipeline *pipeline_make(uint32_t key) {
-    auto &slot = g_r.pipelines[key];
-    if (slot) return slot.get();
-    const uint32_t blend = key & 15, zfunc = (key >> 4) & 3, mask = (key >> 8) & 15;
-    const uint32_t cull = (key >> 12) & 3;
-    const bool zwrite = (key >> 6) & 1, depth = (key >> 7) & 1, blend_alpha = (key >> 14) & 1;
-    plume::RenderInputSlot in(0, sizeof(Vertex));
-    plume::RenderInputElement el[4] = {
-        plume::RenderInputElement("POSITION", 0, 0, plume::RenderFormat::R32G32B32_FLOAT, 0, 0),
-        plume::RenderInputElement("TEXCOORD", 0, 1, plume::RenderFormat::R32G32_FLOAT, 0, 12),
-        plume::RenderInputElement("NORMAL", 0, 2, plume::RenderFormat::R8G8B8A8_SINT, 0, 20),
-        plume::RenderInputElement("COLOR", 0, 3, plume::RenderFormat::R8G8B8A8_UNORM, 0, 24)};
-    plume::RenderGraphicsPipelineDesc d;
-    d.pipelineLayout = g_r.layout.get();
-    d.vertexShader = (key & K_MODERN) ? g_r.vs_modern.get() : g_r.vs.get();
-    d.pixelShader = (key & K_MODERN) ? g_r.ps_modern.get() : g_r.ps.get();
-    d.inputSlots = &in;
-    d.inputSlotsCount = 1;
-    d.inputElements = el;
-    d.inputElementsCount = 4;
-    d.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
-    d.cullMode = cull == 1 ? plume::RenderCullMode::BACK : cull == 2 ? plume::RenderCullMode::FRONT : plume::RenderCullMode::NONE;
-    d.depthClipEnabled = (key & K_NOCLIP) == 0;
-    d.renderTargetCount = 1;
-    d.renderTargetFormat[0] = plume::RenderFormat::R8G8B8A8_UNORM;
-    if (depth) {
-        d.depthTargetFormat = plume::RenderFormat::D32_FLOAT;
-        d.depthEnabled = true;
-        d.depthWriteEnabled = zwrite;
-        d.depthFunction = zfunc == 0   ? plume::RenderComparisonFunction::ALWAYS
-                          : zfunc == 1 ? plume::RenderComparisonFunction::GREATER_EQUAL
-                          : zfunc == 2 ? plume::RenderComparisonFunction::GREATER
-                                       : plume::RenderComparisonFunction::NEVER;
-    }
-    using B = plume::RenderBlend;
-    using O = plume::RenderBlendOperation;
-    plume::RenderBlendDesc &b = d.renderTargetBlend[0];
-    b.blendEnabled = blend != B_OPAQUE;
-    b.blendOp = (blend == B_REVSUB || blend == B_SHADOW) ? O::REV_SUBTRACT : O::ADD;
-    if (key & K_GENERIC) {
-        // GS (A - B) C + D as src * F(src) op dst * F(dst) (blend_classes): F 0 zero, 1 one, 2 C, 3 1 - C;
-        // C is the shader's second output (As or FIX), or the destination alpha when K_CDST
-        const bool cd = (key & K_CDST) != 0;
-        auto factor = [&](uint32_t f) {
-            switch (f & 3) {
-            case 0: return B::ZERO;
-            case 1: return B::ONE;
-            case 2: return cd ? B::DEST_ALPHA : B::SRC1_ALPHA;
-            default: return cd ? B::INV_DEST_ALPHA : B::INV_SRC1_ALPHA;
-            }
-        };
-        const uint32_t sf = (key >> 16) & 3, df = (key >> 18) & 3, op = (key >> 20) & 3;
-        b.blendEnabled = !(sf == 1 && df == 0 && op == 0);
-        b.srcBlend = factor(sf);
-        b.dstBlend = factor(df);
-        b.blendOp = op == 1 ? O::SUBTRACT : op == 2 ? O::REV_SUBTRACT : O::ADD;
-    } else
-    switch (blend) {
-    case B_MIX: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::INV_SRC1_ALPHA; break;
-    case B_ADD: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
-    case B_REVSUB: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
-    case B_SCALE: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ZERO; break;
-    case B_DST_ADD: b.srcBlend = B::ONE, b.dstBlend = B::SRC1_ALPHA; break;
-    case B_INV_MIX: b.srcBlend = B::INV_SRC1_ALPHA, b.dstBlend = B::SRC1_ALPHA; break;
-    case B_KEEP: b.srcBlend = B::ZERO, b.dstBlend = B::ONE; break;
-    case B_SHADOW: b.srcBlend = B::ONE, b.dstBlend = B::INV_SRC1_ALPHA; break;  // dst (1 - As/128) - src
-    default: b.srcBlend = B::ONE, b.dstBlend = B::ZERO; break;
-    }
-    // the GS writes the source alpha as it is; shadow accumulation blends alpha with the same op
-    if (blend_alpha) {
-        b.srcBlendAlpha = B::ONE;
-        b.dstBlendAlpha = B::ONE;
-        b.blendOpAlpha = b.blendOp;
-    } else {
-        b.srcBlendAlpha = B::ONE;
-        b.dstBlendAlpha = B::ZERO;
-        b.blendOpAlpha = O::ADD;
-    }
-    b.renderTargetWriteMask = (uint8_t)mask;
-    slot = g_r.dev->createGraphicsPipeline(d);
-    return slot.get();
 }
 
 // The object's texture from GS memory (TEX0 as its first draw had it). The texture manager
@@ -806,38 +721,95 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels) {
     }
     const uint64_t key = XXH3_64bits_digest(st);
     ae.stamp = gs::g_vram_clock;
-    std::unique_ptr<Texture> &slot = g_r.textures[key];
-    if (slot) {
-        ae.tex = slot.get();
-        slot->last_use = g_r.vb;
-        return slot.get();
+    if (const auto it = g_r.textures.find(key); it != g_r.textures.end()) {
+        ae.tex = it->second.get();
+        ae.tex->last_use = g_r.vb;
+        return ae.tex;
     }
-    slot = std::make_unique<Texture>();
-    Texture &t = *slot;
-    ae.tex = &t;
+    auto next = std::make_unique<Texture>();
+    Texture &t = *next;
     t.key = key;
     t.last_use = g_r.vb;
-    t.w = e.tw;
-    t.h = e.th;
-    t.levels = levels + 1;
-    uint64_t total = 0;
-    for (uint32_t l = 0; l < t.levels; l++) {
-        const uint32_t lw = std::max(1u, t.w >> l), lh = std::max(1u, t.h >> l);
-        t.offset[l] = total;
-        total += (uint64_t)((lw * 4 + 255) & ~255u) * lh;
-        total = (total + 511) & ~511ull;  // placed-footprint offsets
+    const auto *store = gs::hw::native_host_textures();
+    const gs::hosttex::Entry *replacement = nullptr;
+    const bool candidate = store && store->has_dims(e.tw, e.th);
+    int found = -1;
+    if (indexed && (!g_mats.empty() || candidate)) {
+        const MatKey id = indexed_texture_key(e);
+        t.mat = material_of(id);
+        if (candidate) {
+            std::string why;
+            found = store->find(id.ik, id.pk, id.w, id.h, why);
+            if (found >= 0) replacement = &store->entries()[(size_t)found];
+        }
     }
-    t.staging = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(total));
-    auto *dst = static_cast<uint8_t *>(t.staging->map());
+    bool gs_alpha = true;
+    uint64_t replacement_id = 0;
+    if (replacement) {
+        // Match the GS backend's choice from the used source texels, including decoded mips.
+        for (uint32_t l = 0; l <= levels && gs_alpha; l++) {
+            const uint32_t lw = std::max(1u, e.tw >> l), lh = std::max(1u, e.th >> l);
+            for (uint32_t y = 0; y < lh && gs_alpha; y++)
+                for (uint32_t x = 0; x < lw && gs_alpha; x++)
+                    gs_alpha = gs::hosttex::gs_alpha_domain(gs::tex_fetch(e, (int)x, (int)y, (int)l) >> 24);
+        }
+        // Distinct guest placements and mip selections can refer to the same large host image.
+        replacement_id = 1 + ((uint64_t)found << 33 | (uint64_t)(t.mat + 1) << 1 | (uint64_t)gs_alpha);
+        if (const auto it = g_r.replacements.find(replacement_id); it != g_r.replacements.end()) {
+            ae.tex = it->second;
+            ae.tex->last_use = g_r.vb;
+            return ae.tex;
+        }
+    }
+    const auto prepare_upload = [&](uint32_t w, uint32_t h, uint32_t mip_count) -> uint8_t * {
+        const uint32_t max_side = g_r.dev->physicalDeviceProperties.limits.maxImageDimension2D;
+        if (w > max_side || h > max_side || mip_count > std::size(t.offset)) return nullptr;
+        t.w = w;
+        t.h = h;
+        t.levels = mip_count;
+        t.bytes = 0;
+        for (uint32_t l = 0; l < t.levels; l++) {
+            const uint32_t lw = std::max(1u, w >> l), lh = std::max(1u, h >> l);
+            t.offset[l] = t.bytes;
+            t.bytes += (uint64_t)((lw * 4 + 255) & ~255u) * lh;
+            t.bytes = (t.bytes + 511) & ~511ull;
+        }
+        t.tex = g_r.dev->createTexture(plume::RenderTextureDesc::Texture2D(w, h, mip_count, plume::RenderFormat::R8G8B8A8_UNORM));
+        if (!t.tex || !static_cast<plume::VulkanTexture *>(t.tex.get())->imageView) return nullptr;
+        t.staging = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(t.bytes));
+        if (!t.staging || !static_cast<plume::VulkanBuffer *>(t.staging.get())->vk) return nullptr;
+        return static_cast<uint8_t *>(t.staging->map());
+    };
+    uint8_t *dst = replacement ? prepare_upload(replacement->w, replacement->h, replacement->levels) : nullptr;
+    if (dst) t.replacement_id = replacement_id;
+    else {
+        if (replacement)
+            std::fprintf(stderr, "[native] host texture %s %ux%u unavailable, keeping game texture\n",
+                         replacement->asset_id.c_str(), replacement->w, replacement->h);
+        t.staging.reset();
+        t.tex.reset();
+        dst = prepare_upload(e.tw, e.th, levels + 1);
+        if (!dst) {
+            ae.tex = nullptr;
+            return nullptr;
+        }
+    }
+    uint32_t alpha_lo = 255, alpha_hi = 0;
     for (uint32_t l = 0; l < t.levels; l++) {
         const uint32_t lw = std::max(1u, t.w >> l), lh = std::max(1u, t.h >> l), row = (lw * 4 + 255) & ~255u;
-        for (uint32_t v = 0; v < lh; v++) {
-            uint32_t *line = reinterpret_cast<uint32_t *>(dst + t.offset[l] + (size_t)v * row);
-            for (uint32_t u = 0; u < lw; u++) line[u] = gs::tex_fetch(e, (int)u, (int)v, (int)l);
+        uint8_t *level = dst + t.offset[l];
+        if (t.replacement_id) {
+            const uint8_t *src = replacement->data + gs::hosttex::htx_level_offset(t.w, t.h, l);
+            for (uint32_t v = 0; v < lh; v++)
+                gs::hosttex::convert_texels(src + (size_t)v * lw * 4, level + (size_t)v * row, lw, gs_alpha, alpha_lo, alpha_hi);
+        } else {
+            for (uint32_t v = 0; v < lh; v++) {
+                auto *line = reinterpret_cast<uint32_t *>(level + (size_t)v * row);
+                for (uint32_t u = 0; u < lw; u++) line[u] = gs::tex_fetch(e, (int)u, (int)v, (int)l);
+            }
         }
     }
     // stage R6: the material record, and a sky texture's upper / lower mean colour (the Modern IBL)
-    t.mat = g_mats.empty() ? -1 : material_of(e);
     if (t.mat >= 0) g_textures_material++;
     if (t.mat >= 0 && g_mats[(size_t)t.mat].surface == "sky") {
         const uint32_t row = (t.w * 4 + 255) & ~255u;
@@ -858,11 +830,16 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels) {
         t.sky_hor = pack(sum[1]);
     }
     t.staging->unmap();
-    t.tex = g_r.dev->createTexture(plume::RenderTextureDesc::Texture2D(t.w, t.h, t.levels, plume::RenderFormat::R8G8B8A8_UNORM));
     t.pending_upload = true;
     g_r.uploads.push_back(&t);
-    g_r.texture_bytes += total;
-    t.bytes = total;
+    g_r.texture_bytes += t.bytes;
+    if (t.replacement_id) {
+        g_r.replacements.emplace(t.replacement_id, &t);
+        std::fprintf(stderr, "[native] host texture bound %s (%s) %ux%u, %u mips, alpha %u..%u\n",
+                     replacement->asset_id.c_str(), replacement->package_id.c_str(), t.w, t.h, t.levels, alpha_lo, alpha_hi);
+    }
+    g_r.textures.emplace(key, std::move(next));
+    ae.tex = &t;
     if (levels) g_mip_textures.fetch_add(1);
     g_r.decoded++;
     return &t;
@@ -875,6 +852,7 @@ void evict_textures() {
     for (auto it = g_r.textures.begin(); it != g_r.textures.end();) {
         Texture *t = it->second.get();
         if (t->last_use + 120 < g_r.vb && !t->pending_upload) {
+            if (t->replacement_id) g_r.replacements.erase(t->replacement_id);
             for (auto a = g_r.by_addr.begin(); a != g_r.by_addr.end();)
                 a = a->second.tex == t ? g_r.by_addr.erase(a) : std::next(a);
             Trash tr{g_r.vb};
@@ -1061,7 +1039,7 @@ void flush_shadows() {
     plume::RenderTexture *depth = wrapper(s.depth, s.width, s.height, true);
     plume::RenderTexture *smask = g_r.shadow_mask.tex.get();
     // the main depth, read by the volume pass as 0x362968's Z copy
-    std::unique_ptr<plume::RenderDescriptorSet> zset = g_r.dev->createDescriptorSet(set_desc());
+    std::unique_ptr<plume::RenderDescriptorSet> zset = g_r.dev->createDescriptorSet(texture_desc());
     zset->setTexture(0, depth, plume::RenderTextureLayout::SHADER_READ);
     zset->setSampler(1, g_r.samplers[2 | 4].get());
     const uint32_t geo = S_ON | (uint32_t)(sc & 63) << 24 | (uint32_t)(rt_h & 0xFFF) << 12 | (uint32_t)(rt_w & 0xFFF);
@@ -1087,7 +1065,7 @@ void flush_shadows() {
                                            (float)(gh * ky * sc)));
     cl->setScissors(plume::RenderRect(0, 0, rt_w * sc, rt_h * sc));
     cl->clearColor(0, plume::RenderColor(0, 0, 0, 0));  // 0x362968's Z write clears the target to 0
-    cl->setGraphicsPipelineLayout(g_r.layout.get());
+    cl->setGraphicsPipelineLayout(g_r.scene.layout());
     cl->setGraphicsDescriptorSet(zset.get(), 0);
     uint32_t bound = ~0u;
     uint32_t intensity = 0;
@@ -1115,17 +1093,13 @@ void flush_shadows() {
         pc.mode[2] = view_wh;
         pc.mode[3] = geo;
         if (it.pipeline != bound) {
-            cl->setPipeline(pipeline(it.pipeline));
+            cl->setPipeline(g_r.scene.pipeline(it.pipeline));
             bound = it.pipeline;
         }
         cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
         const GpuMesh &m = *it.mesh;
-        const plume::RenderVertexBufferView vbv(m.buf->at(0), (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)));
-        const plume::RenderInputSlot slot(0, sizeof(Vertex));
-        cl->setVertexBuffers(0, &vbv, 1, &slot);
-        const plume::RenderIndexBufferView ibv(m.buf->at(m.index_offset), (uint32_t)(m.cpu->indices.size() * 4),
-                                               plume::RenderFormat::R32_UINT);
-        cl->setIndexBuffer(&ibv);
+        bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
+                          (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)));
         cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
         sh_draws++;
         fs.drawn++;
@@ -1152,9 +1126,9 @@ void flush_shadows() {
         }
         cl->setFramebuffer(cfb.get());
         cl->setViewports(plume::RenderViewport(0, 0, (float)s.width, (float)s.height));
-        cl->setGraphicsPipelineLayout(g_r.layout.get());
+        cl->setGraphicsPipelineLayout(g_r.scene.layout());
         // no depth, RGB write mask (0x7), no cull
-        cl->setPipeline(pipeline((shadow_off == 2 ? B_OPAQUE : B_SHADOW) | (0x7u << 8)));
+        cl->setPipeline(g_r.scene.pipeline((shadow_off == 2 ? B_OPAQUE : B_SHADOW) | (0x7u << 8)));
         cl->setGraphicsDescriptorSet(texture_set(&g_r.shadow_mask, 2 | 4), 0);
         PushConstants cpc{};
         cpc.cx[0] = 1.0f; cpc.cy[1] = 1.0f; cpc.cz[2] = 1.0f; cpc.cw[3] = 1.0f;
@@ -1169,11 +1143,7 @@ void flush_shadows() {
         const int32_t x1 = std::min({(int32_t)gw, comp_sc[2] + 1, vx + vw}) * sc;
         const int32_t y1 = std::min({(int32_t)gh, comp_sc[3] + 1, vy + vh}) * sc;
         cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
-        const plume::RenderVertexBufferView qvbv(g_r.quad_buf->at(0), (uint32_t)(4 * sizeof(Vertex)));
-        const plume::RenderInputSlot qslot(0, sizeof(Vertex));
-        cl->setVertexBuffers(0, &qvbv, 1, &qslot);
-        const plume::RenderIndexBufferView qibv(g_r.quad_buf->at(4 * sizeof(Vertex)), 6 * 4, plume::RenderFormat::R32_UINT);
-        cl->setIndexBuffer(&qibv);
+        bind_indexed_mesh(*cl, *g_r.quad_buf, 4 * sizeof(Vertex), 4 * sizeof(Vertex), 6 * sizeof(uint32_t));
         cl->drawIndexedInstanced(6, 1, 0, 0, 0);
         sh_draws++;
         cl->setFramebuffer(nullptr);
@@ -1303,12 +1273,25 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
         };
         top = scale(top), hor = scale(hor);
     }
-    if (prelit) {
+    const auto *authored = it.p.editor_environment && surface && cls != C_UNLIT && !em ? environment_override() : nullptr;
+    if (authored) {
+        out.mode[2] |= kAuthoredEnvironment;
+        static const bool trace = std::getenv("EOD_ENV_TRACE") != nullptr;
+        static bool traced = false;
+        if (trace && !traced) {
+            traced = true;
+            std::fprintf(stderr, "[environment] native world draw with authored lighting and fog for %s\n", authored->track.c_str());
+        }
+    }
+    if (prelit || authored) {
         for (int c = 0; c < 3; c++) {
             double l = 0;
-            for (int r = 0; r < 3; r++) l += (double)(has_m ? M[r * 4 + c] : (r == c ? 1.0f : 0.0f)) * g_sun_world[r];
+            for (int r = 0; r < 3; r++) {
+                const float axis = authored ? authored->sun_dir[r] : g_sun_world[r];
+                l += (double)(has_m ? M[r * 4 + c] : (r == c ? 1.0f : 0.0f)) * axis;
+            }
             out.light[c] = (float)l;
-            out.diffuse[c] = (float)(g_sun_col[c] * day);
+            out.diffuse[c] = authored ? authored->sun_color[c] * 128.0f : (float)(g_sun_col[c] * day);
         }
     }
     std::memcpy(&out.light[3], &top, 4);
@@ -1344,6 +1327,48 @@ void r6_lowconf(const Item &it, double gw, double gh) {
     std::fprintf(stderr, "[r6] lowconf %s %s conf %.2f vb %llu box %.4f %.4f %.4f %.4f key %08x mx %08x\n", m.id.c_str(),
                  m.surface.c_str(), m.conf, (unsigned long long)g_r.vb, x0 / gw, y0 / gh, x1 / gw, y1 / gh, it.pipeline,
                  it.pc.mode[0]);
+}
+
+// One instance record per participating draw, uploaded as a contiguous stream.
+std::unique_ptr<plume::RenderBuffer> bind_static_queue_projections(plume::RenderCommandList &cl,
+                                                                  double gw, double gh) {
+    std::vector<scene::StaticQueueProjection> projections;
+    for (const Item &it : g_r.pending) {
+        if (!it.mesh || !it.mesh->buf || !uses_static_queue_projection(it.p, *it.mesh->cpu)) continue;
+        double a[4][4];
+        screen_matrix(it.p, a, true);
+        scene::StaticQueueProjection p{};
+        for (int c = 0; c < 4; ++c) {
+            p.x[c] = (float)a[0][c];
+            p.y[c] = (float)a[1][c];
+            p.w[c] = (float)a[3][c];
+        }
+        p.viewport[0] = it.ox;
+        p.viewport[1] = it.oy;
+        p.viewport[2] = (float)(2.0 / gw);
+        p.viewport[3] = (float)(2.0 / gh);
+        projections.push_back(p);
+    }
+    if (projections.empty()) return nullptr;
+
+    const uint32_t bytes = (uint32_t)(projections.size() * sizeof(projections[0]));
+    auto buffer = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(bytes, plume::RenderBufferFlag::VERTEX));
+    void *mapped = buffer ? buffer->map() : nullptr;
+    if (!mapped) {
+        static const bool reported = [] {
+            std::fprintf(stderr, "[native] Classic static queue projection upload failed\n");
+            return true;
+        }();
+        (void)reported;
+        return nullptr;
+    }
+    std::memcpy(mapped, projections.data(), bytes);
+    buffer->unmap();
+    const plume::RenderVertexBufferView view(buffer->at(0), bytes);
+    const plume::RenderInputSlot slot(1, sizeof(scene::StaticQueueProjection),
+                                     plume::RenderInputSlotClassification::PER_INSTANCE_DATA);
+    cl.setVertexBuffers(1, &view, 1, &slot);
+    return buffer;
 }
 
 void flush() {
@@ -1390,9 +1415,14 @@ void flush() {
             g_only_clears.erase(cit);
         }
     }
-    cl->setGraphicsPipelineLayout(g_r.layout.get());
+    cl->setGraphicsPipelineLayout(g_r.scene.layout());
+    if (modern) cl->setGraphicsDescriptorSet(g_r.environment_set.get(), 1);
     const double gw = s.gs_width, gh = s.gs_height;
     const int sc = s.scale;
+    auto static_projections = !modern && g_r.static_queue_projection
+                                  ? bind_static_queue_projections(*cl, gw, gh)
+                                  : nullptr;
+    uint32_t static_projection_index = 0;
     uint32_t bound = ~0u;
     PushConstants mpc;
     for (Item &it : g_r.pending) {
@@ -1423,9 +1453,15 @@ void flush() {
             if (it.tex && it.tex->mat >= 0) g_draws_material++;
             r6_lowconf(it, gw, gh);
         }
-        const uint32_t key = modern ? it.pipeline | K_MODERN : it.pipeline;
+        const bool eligible = g_r.static_queue_projection && uses_static_queue_projection(it.p, *it.mesh->cpu);
+        // Warm the Classic variant if the object first appears while Modern is active.
+        if (modern && eligible) g_r.scene.pipeline(it.pipeline | scene::K_STATIC_QUEUE);
+        const bool static_queue = static_projections && eligible;
+        const uint32_t first_instance = static_queue ? static_projection_index++ : 0;
+        const uint32_t key = modern ? it.pipeline | K_MODERN :
+                             static_queue ? it.pipeline | scene::K_STATIC_QUEUE : it.pipeline;
         if (key != bound) {
-            cl->setPipeline(pipeline(key));
+            cl->setPipeline(g_r.scene.pipeline(key));
             bound = key;
         }
         Texture *t = it.tex ? it.tex : &g_r.white;
@@ -1441,12 +1477,8 @@ void flush() {
         const int32_t x1 = std::min((int32_t)gw, it.sc[2] + 1) * sc, y1 = std::min((int32_t)gh, it.sc[3] + 1) * sc;
         cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
         const GpuMesh &m = *it.mesh;
-        const plume::RenderVertexBufferView vbv(m.buf->at(0), (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)));
-        const plume::RenderInputSlot slot(0, sizeof(Vertex));
-        cl->setVertexBuffers(0, &vbv, 1, &slot);
-        const plume::RenderIndexBufferView ibv(m.buf->at(m.index_offset), (uint32_t)(m.cpu->indices.size() * 4),
-                                               plume::RenderFormat::R32_UINT);
-        cl->setIndexBuffer(&ibv);
+        bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
+                          (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)));
         static const bool no_runs = std::getenv("EOD_R5A2_OFF") && (std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) & 8);
         if (!modern && !no_runs && !it.run_k.empty() && it.run_k.size() == m.cpu->k_runs.size()) {
             // one draw per VU1 run: each has its own TEX1.K
@@ -1455,11 +1487,11 @@ void flush() {
                 if (kr.first + kr.count > m.cpu->indices.size()) break;
                 pc.mode[2] = (pc.mode[2] & ~(0xFFFu << Z_K_SHIFT)) | ((uint32_t)it.run_k[r] & 0xFFF) << Z_K_SHIFT;
                 cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
-                cl->drawIndexedInstanced(kr.count, 1, kr.first, 0, 0);
+                cl->drawIndexedInstanced(kr.count, 1, kr.first, 0, first_instance);
                 pass_draws++;
             }
         } else {
-            cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
+            cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, first_instance);
             pass_draws++;
         }
         if (it.second) continue;
@@ -1472,6 +1504,11 @@ void flush() {
     }
     cl->setFramebuffer(nullptr);  // ends the render pass
     gpu_timer_end((VkCommandBuffer)s.cmd, gpu_q, pass_draws);
+    if (static_projections) {
+        Trash retired{g_r.vb};
+        retired.buf = std::move(static_projections);
+        g_r.trash.push_back(std::move(retired));
+    }
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::GENERAL)};
     cl->barriers(plume::RenderBarrierStage::ALL, out, depth ? 2 : 1);
@@ -1627,7 +1664,9 @@ void compare_state(const EeState &r, const gs::Env &e, uint32_t kind) {
 }
 
 void state_report() {
-    static const char *names[KIND_COUNT] = {"queue", "world", "water", "shadow", "flare", "particle", "sprite", "immediate", "cockpit"};
+    static constexpr std::array names = {"queue", "world", "water", "shadow", "flare", "particle",
+                                         "sprite", "immediate", "cockpit", "hud"};
+    static_assert(names.size() == KIND_COUNT, "every native draw kind needs a state report name");
     std::lock_guard<std::mutex> lk(g_st_mutex);
     for (uint32_t k = 0; k < KIND_COUNT; k++) {
         if (!g_st_n[k]) continue;
@@ -1785,7 +1824,7 @@ void finalize() {
     Item it{};
     it.p = g_cur;
     it.mesh = mesh;
-    screen_matrix(g_cur, it.a);
+    screen_matrix(g_cur, it.a, kind == KIND_QUEUE && mesh && mesh->cpu->skinned);
     it.ox = (float)(xy & 0xFFFF) / 16.0f;
     it.oy = (float)((xy >> 32) & 0xFFFF) / 16.0f;
     it.zscale = (float)(1.0 / depth_range(e.zpsm));
@@ -1815,6 +1854,7 @@ void finalize() {
     }
     static const uint32_t ab = std::getenv("EOD_R5A2_OFF") ? (uint32_t)std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) : 0u;
     it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0);
+    const bool replacement = it.tex && it.tex->replacement_id;
     uint32_t m = 0;
     if (it.tex) {
         // TEX0 TCC/TFX as the texture manager's TEX0 (0x35F9A0) left them; size from the decoded texture
@@ -1822,18 +1862,22 @@ void finalize() {
         uint32_t lw = 0, lh = 0;
         while ((1u << lw) < it.tex->w) lw++;
         while ((1u << lh) < it.tex->h) lh++;
-        m |= lw << M_TW_SHIFT | lh << M_TH_SHIFT | (it.tex->levels - 1) << M_MXL_SHIFT | (rs.mmag ? M_MMAG : 0) |
+        m |= lw << M_TW_SHIFT | lh << M_TH_SHIFT | std::min(it.tex->levels - 1, 7u) << M_MXL_SHIFT | (rs.mmag ? M_MMAG : 0) |
              (uint32_t)rs.mmin << M_MMIN_SHIFT | (uint32_t)rs.wms << M_WMS_SHIFT | (uint32_t)rs.wmt << M_WMT_SHIFT;
         it.sampler = 0;  // the shader addresses and filters the texels itself (GS bilinear, 4-bit weights)
-        if (ab & 4) it.sampler = (e.bilinear_mag ? 1u : 0u) | (e.wms != 0 ? 2u : 0u) | (e.wmt != 0 ? 4u : 0u);
+        // Replacement UVs remain normalized. Use the existing hardware sampler path to
+        // preserve detail in the larger image and choose from its entire mip chain.
+        if (replacement) it.sampler = (rs.mmag ? 1u : 0u) | (rs.wms != 0 ? 2u : 0u) | (rs.wmt != 0 ? 4u : 0u);
+        else if (ab & 4) it.sampler = (e.bilinear_mag ? 1u : 0u) | (e.wms != 0 ? 2u : 0u) | (e.wmt != 0 ? 4u : 0u);
         if (it.tex->levels > 1) fs.mipmapped++;
     }
     if (rs.ate) m |= M_ATE | (uint32_t)(rs.atst & 7) << M_ATST_SHIFT | M_AFAIL_DISCARD;
     if (rs.bc == 2) m |= M_CFIX;
     if (g_cur.program == 0x2E0) m |= M_SPEC;  // car bodies: vertex alpha is the highlight
     pc.mode[1] = rs.aref & 0xFF;
-    pc.mode[2] = (rs.fix & 0xFF) | ((uint32_t)rs.k & 0xFFF) << Z_K_SHIFT | ((ab & 4) ? 0x80000000u : 0u);
-    if (it.tex && it.tex->levels > 1 && mesh && mesh->cpu->k_mixed && !mesh->cpu->k_runs.empty() &&
+    pc.mode[2] = (rs.fix & 0xFF) | ((uint32_t)rs.k & 0xFFF) << Z_K_SHIFT |
+                 ((replacement || (ab & 4)) ? 0x80000000u : 0u);
+    if (it.tex && !replacement && it.tex->levels > 1 && mesh && mesh->cpu->k_mixed && !mesh->cpu->k_runs.empty() &&
         (kind == KIND_QUEUE || kind == KIND_WORLD)) {
         int32_t k = rs.k;
         for (const Mesh::KRun &kr : mesh->cpu->k_runs) {
@@ -1944,12 +1988,10 @@ void end_vblank(uint64_t vb) {
     }
 }
 // ---- P2 vertex check (EOD_NATIVE_SKIN_CHECK=1, stage R3) ----
-// For an object whose mesh was posed (skinned palette or dents), every vertex of every triangle the
-// GS receives for it (the VU1 program's output, the GS reference) is compared with the nearest
-// posed vertex projected through the same model -> GS screen matrix: XYZ = ftoi4(X), so the GS
-// window coordinate is X * 16 - XYOFFSET in 1/16 px. The bind-pose mesh is measured the same way to
-// show the pose mattered. Clip-path records (ITOP 0x200) are counted apart: the clipper makes new
-// vertices on the guard band.
+// Each decoded queue object's GS vertices are compared against the closest projected native
+// vertices. The GS receives FTOI4(screen) - XYOFFSET in 1/16 px steps. For a posed mesh we also
+// project the bind pose to measure the effect of skinning. Clip-path records (ITOP 0x200) have a
+// separate count because the clipper creates vertices on the guard band.
 struct VertexCheck {
     uint64_t objects = 0, vertices = 0, within = 0, bind_off = 0;
     uint64_t clip_objects = 0, clip_vertices = 0, clip_within = 0;
@@ -2004,17 +2046,39 @@ bool vertex_check_on() {
     return on;
 }
 
-void project_into(const Mesh &m, const double a[4][4], double xo, double yo,
+template <typename T>
+T project_component(const double row[4], const Vertex &v) {
+    return static_cast<T>(row[0]) * v.p[0] + static_cast<T>(row[1]) * v.p[1] +
+           static_cast<T>(row[2]) * v.p[2] + static_cast<T>(row[3]);
+}
+
+// Project without FTOI4 so the check still measures the distance to the GS subpixel grid.
+// The ordered VU1 FMAC path uses the rounded DIV result for both the Classic static and posed checks.
+bool vertex_check_project(const Vertex &v, const double a[4][4], bool vu_rounding, double xo, double yo,
+                          double &x, double &y) {
+    if (vu_rounding) {
+        const float w = project_component<float>(a[3], v);
+        if (!(w > 0)) return false;
+        const float q = 1.0f / w;
+        x = (project_component<float>(a[0], v) * q) * 16.0 - xo;
+        y = (project_component<float>(a[1], v) * q) * 16.0 - yo;
+    } else {
+        const double w = project_component<double>(a[3], v);
+        if (!(w > 0)) return false;
+        x = project_component<double>(a[0], v) / w * 16.0 - xo;
+        y = project_component<double>(a[1], v) / w * 16.0 - yo;
+    }
+    return std::fabs(x) < 1e7 && std::fabs(y) < 1e7;
+}
+
+void project_into(const Mesh &m, const double a[4][4], bool vu_rounding, double xo, double yo,
                   std::unordered_map<uint64_t, std::vector<std::pair<double, double>>> &grid,
                   std::vector<std::pair<double, double>> *list = nullptr) {
     grid.clear();
     if (list) list->clear();
     for (const Vertex &v : m.vertices) {
-        double s[4];
-        for (int r = 0; r < 4; r++) s[r] = a[r][0] * v.p[0] + a[r][1] * v.p[1] + a[r][2] * v.p[2] + a[r][3];
-        if (!(s[3] > 0)) continue;
-        const double x = s[0] / s[3] * 16.0 - xo, y = s[1] / s[3] * 16.0 - yo;  // window, 1/16 px
-        if (!(std::fabs(x) < 1e7 && std::fabs(y) < 1e7)) continue;
+        double x, y;
+        if (!vertex_check_project(v, a, vu_rounding, xo, yo, x, y)) continue;
         const uint64_t k = (uint64_t)(uint32_t)(int32_t)std::floor(x / 16.0) << 32 | (uint32_t)(int32_t)std::floor(y / 16.0);
         grid[k].push_back({x, y});
         if (list) list->push_back({x, y});
@@ -2088,25 +2152,23 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
         if (g_cur.kind != KIND_QUEUE || !g_cur.mesh) return;
         auto it = g_r.meshes.find(g_cur.mesh);
         if (it == g_r.meshes.end() || !it->second.cpu) return;
+        const Mesh &m = *it->second.cpu;
+        const bool vu_rounding = m.skinned || (g_r.static_queue_projection && !g_modern.load(std::memory_order_relaxed) &&
+                                              uses_static_queue_projection(g_cur, m));
         double a[4][4];
-        screen_matrix(g_cur, a);
+        screen_matrix(g_cur, a, vu_rounding);
         const double xo = (double)(g_xyoffset & 0xFFFF), yo = (double)((g_xyoffset >> 32) & 0xFFFF);
-        project_into(*it->second.cpu, a, xo, yo, g_pg.mine, &g_pg.mine_list);
+        project_into(m, a, vu_rounding, xo, yo, g_pg.mine, &g_pg.mine_list);
         {
             // native triangles in GS window coordinates (1/16 px), indexed by the cell of each corner
-            const Mesh &m = *it->second.cpu;
             g_pg.ntri.clear();
             g_pg.nmatch.clear();
             g_pg.tgrid.clear();
             g_pg.gs_t = g_pg.gs_t_miss = 0;
             std::vector<std::pair<double, double>> scr(m.vertices.size(), {1e30, 1e30});
             for (uint32_t i = 0; i < m.vertices.size(); i++) {
-                const Vertex &v = m.vertices[i];
-                double s[4];
-                for (int r = 0; r < 4; r++) s[r] = a[r][0] * v.p[0] + a[r][1] * v.p[1] + a[r][2] * v.p[2] + a[r][3];
-                if (!(s[3] > 0)) continue;
-                const double x = s[0] / s[3] * 16.0 - xo, y = s[1] / s[3] * 16.0 - yo;
-                if (std::fabs(x) < 1e7 && std::fabs(y) < 1e7) scr[i] = {x, y};
+                double x, y;
+                if (vertex_check_project(m.vertices[i], a, vu_rounding, xo, yo, x, y)) scr[i] = {x, y};
             }
             const double x0 = (g_env.scx0 + 1) * 16.0, y0 = (g_env.scy0 + 1) * 16.0;
             const double x1 = (g_env.scx1 - 1) * 16.0, y1 = (g_env.scy1 - 1) * 16.0;
@@ -2137,7 +2199,8 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
         g_pg.posed = it->second.cpu->posed;
         if (g_pg.posed) {
             auto b = g_r.meshes.find(it->second.cpu->bind);
-            if (b != g_r.meshes.end() && b->second.cpu) project_into(*b->second.cpu, a, xo, yo, g_pg.bind);
+            if (b != g_r.meshes.end() && b->second.cpu)
+                project_into(*b->second.cpu, a, b->second.cpu->skinned, xo, yo, g_pg.bind);
         }
         g_pg.batch = g_cur.batch;
         g_pg.program = g_cur.program;
@@ -2245,7 +2308,9 @@ void begin_object(const Packet &p) {
     g_active = true;
     g_finalized = false;
     g_have_env = false;
+#ifdef EOD_PLUME
     g_gs_k.clear();
+#endif
     g_frames[p.frame].objects++;
     g_frames[p.frame].k_objects[p.kind % KIND_COUNT]++;
     g_newest_frame = std::max(g_newest_frame, p.frame);
@@ -2320,8 +2385,7 @@ void report(uint64_t vb) {
             g_parity.hud_submitted += hud;
             g_parity.hud_drawn += s.k_drawn[KIND_HUD];
             if (log_parity && !he)
-                std::fprintf(stderr, "[native] parity frame %llu hud %u/%u/%u
-", (unsigned long long)frame, hud,
+                std::fprintf(stderr, "[native] parity frame %llu hud %u/%u/%u\n", (unsigned long long)frame, hud,
                              s.k_objects[KIND_HUD], s.k_drawn[KIND_HUD]);
             if (log_parity && !qe)
                 std::fprintf(stderr, "[native] parity frame %llu queue records submitted %u objects %u drawn %u lost %u\n",
@@ -2372,6 +2436,12 @@ void report(uint64_t vb) {
                          (unsigned long long)g_parity.water_drawn, (unsigned long long)g_parity.water_submitted,
                          (unsigned long long)g_parity.skipped_frames, (unsigned long long)g_only_dropped);
             if (native_only()) report_drops(frame);
+            if (g_scene_clear_count)
+                std::fprintf(stderr, "[native] gs frame %llu EE scene clears %llu (20 strips each)\n",
+                             (unsigned long long)frame, (unsigned long long)g_scene_clear_count);
+            if (g_frontend_depth_clear_count)
+                std::fprintf(stderr, "[native] gs frame %llu EE front-end depth clears %llu (20 strips each)\n",
+                             (unsigned long long)frame, (unsigned long long)g_frontend_depth_clear_count);
             std::fprintf(stderr,
                          "[native] gs frame %llu shadows submitted %u drawn %u (lost %u) flares submitted %u drawn %u (lost %u) | "
                          "P1 frames shadow equal %llu/%llu flare equal %llu/%llu (shadows %llu of %llu, flares %llu of %llu)\n",
@@ -2403,6 +2473,161 @@ void report(uint64_t vb) {
 }
 
 }  // namespace
+
+bool prepare() {
+#ifdef EOD_PLUME
+    return enabled() && init();
+#else
+    return false;
+#endif
+}
+
+bool gs_shadow_boundary() {
+#ifdef EOD_PLUME
+    if (!prepare() || (modern::g_on && modern::live())) return false;
+    if (g_active) finalize();
+    flush();
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
+#ifdef EOD_PLUME
+    if (gs::g_skip_frame || !prepare() || (modern::g_on && modern::live())) return false;
+    if (g_active) finalize();
+    g_active = false;
+    flush();
+
+    gs::hw::NativeSurfaces surfaces{};
+    const bool depth_only = clear.target == SceneClearTarget::Depth;
+    const bool bootstrap = clear.target == SceneClearTarget::Bootstrap;
+    const uint32_t rows = bootstrap ? env.scy1 + 1 : 448;
+    if (depth_only ? !gs::hw::native_begin_depth_clear(env, surfaces)
+                   : !gs::hw::native_begin(env, true, surfaces, bootstrap)) return false;
+    if (!surfaces.depth || surfaces.gs_width < 640 || surfaces.gs_height < rows) {
+        gs::hw::native_end();
+        return false;
+    }
+
+    auto *list = g_r.list.get();
+    auto *vk_list = static_cast<plume::VulkanCommandList *>(list);
+    const VkCommandBuffer owned_cmd = vk_list->vk;
+    vk_list->vk = (VkCommandBuffer)surfaces.cmd;
+    auto *color = depth_only ? nullptr : wrapper(surfaces.color, surfaces.width, surfaces.height, false);
+    auto *depth = wrapper(surfaces.depth, surfaces.width, surfaces.height, true);
+    const uint32_t attachment_count = depth_only ? 1 : 2;
+    const plume::RenderTextureBarrier begin[] = {
+        {depth, plume::RenderTextureLayout::DEPTH_WRITE}, {color, plume::RenderTextureLayout::COLOR_WRITE}};
+    list->barriers(plume::RenderBarrierStage::GRAPHICS, begin, attachment_count);
+    auto &framebuffer = g_r.framebuffers[{surfaces.color, surfaces.depth}];
+    if (!framebuffer) {
+        const plume::RenderTexture *attachments[] = {color};
+        framebuffer = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(attachments, depth_only ? 0 : 1, depth));
+    }
+    list->setFramebuffer(framebuffer.get());
+    const plume::RenderRect rect(0, 0, 640 * surfaces.scale, rows * surfaces.scale);
+    if (!depth_only) {
+        const auto byte = [&clear](unsigned shift) { return ((clear.rgba >> shift) & 0xff) / 255.0f; };
+        list->clearColor(0, plume::RenderColor(byte(0), byte(8), byte(16), byte(24)), &rect, 1);
+    }
+    list->clearDepth(true, 0.0f, &rect, 1);
+    list->setFramebuffer(nullptr);
+    const plume::RenderTextureBarrier end[] = {
+        {depth, plume::RenderTextureLayout::GENERAL}, {color, plume::RenderTextureLayout::GENERAL}};
+    list->barriers(plume::RenderBarrierStage::ALL, end, attachment_count);
+    vk_list->vk = owned_cmd;
+    gs::hw::native_end();
+
+    if (bootstrap) gs::hw::native_mark_bootstrap_depth_clear(env);
+    if (depth_only) {
+        if (const auto it = g_only_clears.find(env.fbp); it != g_only_clears.end()) {
+            it->second.depth = false;
+            if (!it->second.color) g_only_clears.erase(it);
+        }
+        ++g_frontend_depth_clear_count;
+    } else {
+        g_only_clears.erase(env.fbp);
+        ++g_scene_clear_count;
+    }
+    return true;
+#else
+    (void)env;
+    (void)clear;
+    return false;
+#endif
+}
+
+bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]) {
+#ifdef EOD_PLUME
+    if (gs::g_skip_frame || !prepare()) return false;
+    if (g_active) finalize();
+    flush();
+
+    // The fixed UVs and bilinear taps stay within 0..31 on both axes.
+    // Decode just that CT32 region, using the packet's original TBW and
+    // swizzle. Other pages covered by TEX0 can alias unrelated draw targets.
+    gs::Env crop = env;
+    crop.tw = crop.th = 32;
+    FrameStats texture_stats{};
+    Texture *tex = texture(crop, texture_stats, 0);
+    if (!tex) return false;
+    auto *pipeline = g_r.scene.pipeline(K_BOOTSTRAP_QUAD | B_MIX | (0xfu << 8));
+    if (!pipeline) return false;
+
+    constexpr uint32_t indices[] = {0, 1, 2, 1, 2, 3};
+    auto buffer = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+        sizeof vertices + sizeof indices, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
+    if (!buffer) return false;
+    void *mapped = buffer->map();
+    if (!mapped) return false;
+    memcpy(mapped, vertices, sizeof vertices);
+    memcpy(static_cast<uint8_t *>(mapped) + sizeof vertices, indices, sizeof indices);
+    buffer->unmap();
+
+    gs::hw::NativeSurfaces surfaces{};
+    if (!gs::hw::native_begin(env, false, surfaces, true)) return false;
+    auto *vk_list = static_cast<plume::VulkanCommandList *>(g_r.list.get());
+    auto *list = g_r.list.get();
+    const VkCommandBuffer owned_cmd = vk_list->vk;
+    vk_list->vk = (VkCommandBuffer)surfaces.cmd;
+    record_uploads(list);
+    auto *color = wrapper(surfaces.color, surfaces.width, surfaces.height, false);
+    auto &framebuffer = g_r.framebuffers[{surfaces.color, 0}];
+    if (!framebuffer) {
+        const plume::RenderTexture *attachments[] = {color};
+        framebuffer = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(attachments, 1));
+    }
+    if (framebuffer) {
+        list->barriers(plume::RenderBarrierStage::GRAPHICS,
+                       plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE));
+        list->setFramebuffer(framebuffer.get());
+        list->setViewports(plume::RenderViewport(0, (float)surfaces.height, (float)surfaces.width, -(float)surfaces.height));
+        list->setScissors(plume::RenderRect(0, 0, 640 * surfaces.scale, 448 * surfaces.scale));
+        list->setGraphicsPipelineLayout(g_r.scene.layout());
+        list->setPipeline(pipeline);
+        list->setGraphicsDescriptorSet(texture_set(tex, 7), 0);  // bilinear clamp
+        const float scale_offset[] = {2.0f / surfaces.gs_width, -2.0f / surfaces.gs_height, -1.0f, 1.0f};
+        list->setGraphicsPushConstants(0, scale_offset, 0, sizeof scale_offset);
+        bind_indexed_mesh(*list, *buffer, sizeof vertices, sizeof vertices, sizeof indices);
+        list->drawIndexedInstanced(6, 1, 0, 0, 0);
+        list->setFramebuffer(nullptr);
+        list->barriers(plume::RenderBarrierStage::ALL,
+                       plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL));
+        Trash deferred{g_r.vb};
+        deferred.buf = std::move(buffer);
+        g_r.trash.push_back(std::move(deferred));
+    }
+    vk_list->vk = owned_cmd;
+    gs::hw::native_end();
+    return bool(framebuffer);
+#else
+    (void)env;
+    (void)vertices;
+    return false;
+#endif
+}
 
 void gs_command(uint32_t kind, const void *data, uint32_t size) {
     switch (kind) {
@@ -2531,10 +2756,12 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
         prims++;
     }
     g_frames[g_cur.frame].suppressed++;
+#ifdef EOD_PLUME
     if (e.tme && e.mmin >= 2) {  // the TEX1.K sequence the GS sees within the object (run check)
         const int32_t k = (int32_t)std::lround(e.k * 16.0f);
         if (g_gs_k.empty() || g_gs_k.back() != k) g_gs_k.push_back(k);
     }
+#endif
     return true;
 }
 
@@ -2575,6 +2802,7 @@ void gs_barrier() {
 }
 
 // ---- stage R6: look toggle, P5 numbers ------------------------------------------------------
+#ifdef EOD_PLUME
 namespace {
 struct LookTiming {
     std::chrono::steady_clock::time_point last{};
@@ -2628,32 +2856,40 @@ void r6_report() {
                          (unsigned long long)g_lt.n[l], g_lt.sum[l] / g_lt.n[l], g_lt.max[l]);
     std::fprintf(stderr, "[look] sets made for a texture that already had its Classic and Modern sets: %llu\n", (unsigned long long)g_sets_late);
     std::fprintf(stderr, "[look] toggles %u, worst frame after a toggle %.2f ms, pipelines %zu, sun world %.3f %.3f %.3f\n",
-                 g_look_toggles.load(), g_lt.after_toggle_max, g_r.pipelines.size(), g_sun_world[0], g_sun_world[1], g_sun_world[2]);
+                 g_look_toggles.load(), g_lt.after_toggle_max, g_r.scene.size(), g_sun_world[0], g_sun_world[1], g_sun_world[2]);
 }
 }  // namespace
 
 // any thread (F9 on the window thread): only flips the look; gs_vblank does the bookkeeping
-void toggle_look() {
-    g_modern = !g_modern.load();
+bool look_available() { return g_r.ok.load(std::memory_order_acquire); }
+bool toggle_look() {
+    bool modern = g_modern.load(std::memory_order_relaxed);
+    while (!g_modern.compare_exchange_weak(modern, !modern, std::memory_order_relaxed)) {}
     ++g_look_toggles;
+    return !modern;
 }
 namespace {
 void toggled(uint32_t n) {  // GS thread
     const bool m = g_modern.load();
     g_lt.pending_toggle = 2;
     if (n == 1) {
-        g_lt.pipes_at_first = g_r.pipelines.size();
+        g_lt.pipes_at_first = g_r.scene.size();
         g_lt.sets_at_first = (size_t)count_sets();
         g_lt.tex_bytes_first = g_r.texture_bytes;
     }
     if (n == 1 || n % 10 == 0)
         std::fprintf(stderr, "[look] toggle %u -> %s at vb %llu: pipelines %zu (first toggle %zu), sets %llu (first %zu), textures %.1f MB (first %.1f)\n",
-                     n, m ? "Modern" : "Classic", (unsigned long long)g_r.vb, g_r.pipelines.size(), g_lt.pipes_at_first,
+                     n, m ? "Modern" : "Classic", (unsigned long long)g_r.vb, g_r.scene.size(), g_lt.pipes_at_first,
                      (unsigned long long)count_sets(), g_lt.sets_at_first, g_r.texture_bytes / 1048576.0,
                      g_lt.tex_bytes_first / 1048576.0);
 }
 }  // namespace
 bool look_modern() { return g_modern.load(); }
+#else
+bool look_available() { return false; }
+bool toggle_look() { return false; }
+bool look_modern() { return false; }
+#endif
 
 bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm) {
 #ifdef EOD_PLUME
@@ -2674,6 +2910,7 @@ void gs_vblank(uint64_t frame) {
     flush();
     end_vblank(frame);
     report(frame);
+#ifdef EOD_PLUME
     // stage R6: frame time per look (GS thread, vblank to vblank), the test toggle (P5)
     {
         static const bool hooked = (diff_add_exit_report(r6_report), true);
@@ -2700,6 +2937,7 @@ void gs_vblank(uint64_t frame) {
         while (seen != g_look_toggles.load()) toggled(++seen);
         if (g_r.ok && frame % 1200 == 0) r6_report();
     }
+#endif
 }
 
 uint64_t fog_fge_draws() { return g_fge_draws.load(); }

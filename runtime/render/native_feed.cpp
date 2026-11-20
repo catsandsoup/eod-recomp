@@ -1,5 +1,6 @@
 // native_feed.cpp - EE and VIF1 side of the native renderer (native_renderer.h).
 #include "native_renderer.h"
+#include "editor_environment.h"
 
 #include <cmath>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <array>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -15,6 +17,8 @@
 #include <xxhash.h>
 
 #include "../core/config.h"
+#include "../core/diff_harness.h"
+#include "../core/host_file.h"
 #include "../core/limit_tracker.h"
 #include "../core/memory.h"
 #include "scene_tap.h"
@@ -40,7 +44,124 @@ bool enabled() {
     return on;
 }
 
+const editor_environment::Override *environment_override() {
+#ifdef EOD_PLUME
+    static const auto settings = [] {
+        editor_environment::Override out;
+        const char *root = std::getenv("EOD_MOD_DIR");
+        if (!root || !*root) return out;
+        const std::string path = std::string(root) + "/env_override.ini";
+        FILE *file = host_fopen(path.c_str(), "rb");
+        if (!file) return out;
+        char data[8192];
+        const size_t size = std::fread(data, 1, sizeof data, file);
+        const bool complete = std::feof(file) != 0 && !std::ferror(file);
+        std::fclose(file);
+        if (complete) {
+            std::istringstream stream(std::string(data, size));
+            editor_environment::parse(stream, out);
+        }
+        return out;
+    }();
+    if (!settings.track.empty()) return &settings;
+#endif
+    return nullptr;
+}
+
+bool scene_clear_enabled() {
+#ifdef EOD_PLUME
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_SCENE_CLEAR");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool bootstrap_raster_enabled() {
+#ifdef EOD_PLUME
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_BOOTSTRAP_RASTER");
+        return value && value[0] == '1';
+    }();
+    return enabled && native_only();
+#else
+    return false;
+#endif
+}
+
+bool display_copy_enabled() {
+#ifdef EOD_PLUME
+    static const bool enabled = [] {
+        const char *value = std::getenv("EOD_NATIVE_DISPLAY_COPY");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 namespace {
+
+bool shadow_pass_enabled() {
+#ifdef EOD_PLUME
+    static const bool on = [] {
+        const char *value = std::getenv("EOD_NATIVE_SHADOW_PASS");
+        return !value || value[0] != '0';
+    }();
+    return on && native_only();
+#else
+    return false;
+#endif
+}
+
+uint32_t shadow_direct_qwc(ShadowPass pass) {
+    return pass == ShadowPass::Prepare ? kShadowPrepareDirectQwc : kShadowCompositeDirectQwc;
+}
+
+ShadowPass shadow_reservation(uint32_t ra, uint32_t qwc) {
+    const ShadowPass pass = ra == 0x362a34 ? ShadowPass::Prepare
+                          : ra == 0x362f34 ? ShadowPass::Composite : ShadowPass::None;
+    if (pass == ShadowPass::None || qwc != shadow_direct_qwc(pass) + 1) return ShadowPass::None;
+    // In the full-screen layout, preparation aliases the shadow Z base as
+    // FRAME; the volume and composite use the saved color base instead.
+    constexpr uint32_t rt = 0x4d8bd8;
+    if (MEM_LW(rt) != 320 || MEM_LW(rt + 4) != 448 ||
+        MEM_LW(rt + 0x10) != 0x19f || MEM_LW(rt + 0x14) != 2 ||
+        MEM_LW(rt + 0x18) != 0x15f || MEM_LW(rt + 0x1c) != 0x32 ||
+        MEM_LW(rt + 0x28) || MEM_LW(rt + 0x2c) ||
+        MEM_LW(rt + 0x30) != 640 || MEM_LW(rt + 0x34) != 448)
+        return ShadowPass::None;
+    return pass;
+}
+
+bool g_editor_environment = false;
+
+#ifdef EOD_PLUME
+bool matches_loaded_graf(const editor_environment::Override &settings) {
+    const uint32_t graf = ee_r32(0x003D1C18); // 0x214678: loaded track.grf data
+    if (graf < 8 || graf >= EE_RAM_SIZE || (graf & 3) || ee_r32(graf - 4) != 0x4D474921) return false;
+    const uint32_t record = ee_r32(graf - 8); // 0x130D90: record back-pointer, before payload
+    constexpr uint32_t stride = 0x44;
+    for (const uint32_t list : {0x0043A0E0u, 0x0043A0E4u}) {
+        uint32_t archive = ee_r32(list);
+        for (unsigned i = 0; i < 256 && archive && !(archive & 3) && archive <= EE_RAM_SIZE - 0x144; ++i) {
+            const uint32_t entries = ee_r32(archive + 0x124), count = ee_r32(archive + 0x140);
+            if (entries && record >= entries && record < EE_RAM_SIZE && !(record & 3) &&
+                (record - entries) % stride == 0 && (record - entries) / stride < count) {
+                char name[64]{};
+                ee_read_string(archive, name, sizeof name);
+                return editor_environment::applies(settings, name, true);
+            }
+            archive = ee_r32(archive + 0x120);
+        }
+    }
+    return false;
+}
+#endif
 
 constexpr uint32_t kBatchPacketRa = 0x3613E0;  // reserve in 0x3613C0: the DMA REF to a batch's VIF data
 
@@ -107,10 +228,21 @@ std::vector<uint8_t> g_bytes;
 
 // ---- shared EE <-> VIF1 (g_mutex) ----
 std::mutex g_mutex;
+std::map<uint32_t, SceneClear> g_scene_clear_packets;
+std::map<uint32_t, DisplayCopy> g_display_copy_packets;
+std::map<uint32_t, ShadowPass> g_shadow_pass_packets;
+std::set<uint32_t> g_camera_packets;
+constexpr uint32_t kCameraPacketQwc = 18;
+
+bool camera_nop_enabled() {
+    static const char *setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
+    return setting && *setting && *setting != '0' && native_only();
+}
 struct Tagged {
     uint32_t end;
     Packet packet;
     bool range;  // any DMA tag in [start, end) (immediate geometry); else the REF to batch + 0x38
+    bool retire_world_leaf = false;
 };
 std::map<uint32_t, Tagged> g_tags;     // batch packet start -> record; latest writer wins
 std::vector<Mesh *> g_new_meshes;      // decoded, not yet in the GS stream
@@ -235,6 +367,7 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     g_scratch.clear();
     vifmesh::Options opt;
     opt.fix_winding = !world;
+    opt.keep_shadow_extrusion_faces = true;
     const vifmesh::Status st = g_decoder->decode_vif(g_bytes.data() + 0x38, qwc * 16, g_scratch, opt);
     auto *m = new Mesh();
     m->id = g_next_mesh++;
@@ -411,6 +544,7 @@ TexState g_tex;
 
 // The camera packet inputs (0x35B3D0) as they are now.
 void fill_camera(Packet &p) {
+    p.editor_environment = g_editor_environment;
     p.fge = (g_fog.flags >> 3) & 1;  // 0x3620A8: PRIM.FGE = (flags & 8) << 2
     p.flags = g_fog.flags;
     p.blend_sel = g_tex.blend_sel;
@@ -496,7 +630,7 @@ float bits_f(uint32_t u) {
     return f;
 }
 
-void screen_matrix(const Packet &p, double a[4][4]) {
+void screen_matrix(const Packet &p, double a[4][4], bool vu_rounding) {
     // 0x35B3D0, in its single-precision order
     const float n = p.near_z, f = p.far_z, w = p.viewport[2], h = p.viewport[3];
     const float fw = p.fov_scale * w * 0.5f;                                      // q5 x, y scale
@@ -505,6 +639,26 @@ void screen_matrix(const Packet &p, double a[4][4]) {
     const float sy = bits_f(0xBF6EEEF0u) / p.aspect;                              // -0.9333 / aspect
     const float zk = f * n * bits_f(0x477FDB00u) / (f - n);                       // depth: zk / z + zb
     const float zb = (n * bits_f(0xC77FDC00u) + f) / (f - n);
+    if (vu_rounding) {
+        // VU1 setup 0x0000 rounds V * M before multiplying by P. The double-precision
+        // (P * V) * M reconstruction can shift vertices across GS 12.4 fixed-point boundaries.
+        float vm[3][4];
+        for (int r = 0; r < 3; r++) {
+            const float *rot = &p.rotation[r * 3];
+            const float t = -(rot[0] * p.position[0] + rot[1] * p.position[1] + rot[2] * p.position[2]);
+            for (int c = 0; c < 4; c++)
+                vm[r][c] = rot[0] * p.model[c] + rot[1] * p.model[4 + c] + rot[2] * p.model[8 + c];
+            vm[r][3] += t;
+        }
+        const float yf = sy * fw;
+        for (int c = 0; c < 4; c++) {
+            a[0][c] = fw * vm[0][c] + cx * vm[2][c];
+            a[1][c] = yf * vm[1][c] + cy * vm[2][c];
+            a[2][c] = zb * vm[2][c] + (c == 3 ? zk : 0.0f);
+            a[3][c] = vm[2][c];
+        }
+        return;
+    }
     // view: R (x - c), rows of R at 0x3E57A8
     double V[4][4] = {};
     for (int r = 0; r < 3; r++) {
@@ -535,12 +689,24 @@ void screen_matrix(const Packet &p, double a[4][4]) {
         }
 }
 
+void ee_environment_world(bool drawing) {
+    g_editor_environment = false;
+#ifdef EOD_PLUME
+    if (drawing && enabled()) {
+        if (const auto *settings = environment_override())
+            g_editor_environment = matches_loaded_graf(*settings);
+    }
+#else
+    (void)drawing;
+#endif
+}
+
 void ee_frame_begin() {
     if (!enabled()) return;
     roll(kernel_vblank_count());
 }
 
-void ee_object(uint32_t record) {
+void ee_object(uint32_t batch) {
     if (!enabled()) return;
     const uint64_t vb = kernel_vblank_count();
     if (g_frame_vb == ~0ull) roll(vb);
@@ -549,7 +715,7 @@ void ee_object(uint32_t record) {
     std::memset(&p, 0, sizeof p);
     p.frame = g_frame_vb;  // frames run from one FrameBegin in a new vblank to the next (as EOD_RENDER_TRACE)
     p.serial = g_serial++;
-    p.batch = MEM_LW(record);
+    p.batch = batch;
     if (o) {
         std::memcpy(p.model, o->model, sizeof p.model);
         std::memcpy(p.colour_a, o->colour_a, 16);
@@ -571,7 +737,7 @@ void ee_object(uint32_t record) {
 
 void ee_object_end() { g_in_object = false; }
 
-void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
+void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneClear *clear) {
     if (!addr) return;
     const bool batch = g_in_object && ra == kBatchPacketRa;
     const bool is_imm_ra = (ra == kImmBeginRa || ra == kImmVertexRa || ra == kImmMoreRa);
@@ -582,6 +748,43 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     const bool spr = g_in_sprite && (ra == kSpriteReserveRa || ra == kAtlasReserveRa);
     const uint32_t end = addr + (qwc ? qwc : 1) * 16;
     std::lock_guard<std::mutex> lk(g_mutex);
+    if (camera_nop_enabled() && !diff_in_original_side()) {
+        auto camera = g_camera_packets.lower_bound(addr);
+        if (camera != g_camera_packets.begin() && *std::prev(camera) + kCameraPacketQwc * 16 > addr)
+            g_camera_packets.erase(std::prev(camera));
+        while (camera != g_camera_packets.end() && *camera < end)
+            camera = g_camera_packets.erase(camera);
+        if (ra == 0x35B428 && qwc == kCameraPacketQwc) g_camera_packets.insert(addr);
+    }
+    auto clear_it = g_scene_clear_packets.lower_bound(addr);
+    if (clear_it != g_scene_clear_packets.begin()) {
+        auto prev = std::prev(clear_it);
+        if (prev->first + (kSceneClearDirectQwc + 1) * 16 > addr)
+            g_scene_clear_packets.erase(prev);
+    }
+    while (clear_it != g_scene_clear_packets.end() && clear_it->first < end)
+        clear_it = g_scene_clear_packets.erase(clear_it);
+    if (clear) g_scene_clear_packets.emplace(addr, *clear);
+    auto copy_it = g_display_copy_packets.lower_bound(addr);
+    if (copy_it != g_display_copy_packets.begin()) {
+        auto prev = std::prev(copy_it);
+        if (prev->first + (kDisplayCopyDirectQwc + 1) * 16 > addr)
+            g_display_copy_packets.erase(prev);
+    }
+    while (copy_it != g_display_copy_packets.end() && copy_it->first < end)
+        copy_it = g_display_copy_packets.erase(copy_it);
+    if (shadow_pass_enabled() && !diff_in_original_side()) {
+        auto shadow_it = g_shadow_pass_packets.lower_bound(addr);
+        if (shadow_it != g_shadow_pass_packets.begin()) {
+            auto prev = std::prev(shadow_it);
+            if (prev->first + (shadow_direct_qwc(prev->second) + 1) * 16 > addr)
+                g_shadow_pass_packets.erase(prev);
+        }
+        while (shadow_it != g_shadow_pass_packets.end() && shadow_it->first < end)
+            shadow_it = g_shadow_pass_packets.erase(shadow_it);
+        const ShadowPass pass = shadow_reservation(ra, qwc);
+        if (pass != ShadowPass::None) g_shadow_pass_packets.emplace(addr, pass);
+    }
     if (!batch && !water && !flare && !imm && !part && !spr && g_tags.empty()) return;
     // trim or drop older entries this range overlaps (trimming preserves a committed packet whose
     // unused reserved tail was reclaimed by the next PacketReserve at `addr > prev->first`)
@@ -618,6 +821,49 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra) {
     if (!batch) return;  // any other packet there replaces a record's tag
     g_tags[addr] = Tagged{end, g_current, false};
     g_tagged++;
+}
+
+bool take_scene_clear(uint32_t dma_tag, uint32_t qwc, SceneClear &clear) {
+    if (qwc != kSceneClearDirectQwc || !scene_clear_enabled()) return false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const auto found = g_scene_clear_packets.find(dma_tag);
+    if (found == g_scene_clear_packets.end()) return false;
+    clear = found->second;
+    g_scene_clear_packets.erase(found);
+    return true;
+}
+
+void ee_tag_display_copy(uint32_t addr, const DisplayCopy &copy) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_display_copy_packets.insert_or_assign(addr, copy);
+}
+
+bool take_camera_packet(uint32_t dma_tag) {
+    if (!camera_nop_enabled() || diff_in_original_side()) return false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_camera_packets.erase(dma_tag) != 0;
+}
+
+bool take_display_copy(uint32_t dma_tag, uint32_t qwc, DisplayCopy &copy) {
+    if (qwc != kDisplayCopyDirectQwc || !display_copy_enabled()) return false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_display_copy_packets.find(dma_tag);
+    if (it == g_display_copy_packets.end()) return false;
+    copy = it->second;
+    g_display_copy_packets.erase(it);
+    return true;
+}
+
+ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc) {
+    if ((qwc != kShadowPrepareDirectQwc && qwc != kShadowCompositeDirectQwc) || !shadow_pass_enabled())
+        return ShadowPass::None;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const auto found = g_shadow_pass_packets.find(dma_tag);
+    if (found == g_shadow_pass_packets.end() || shadow_direct_qwc(found->second) != qwc)
+        return ShadowPass::None;
+    const ShadowPass pass = found->second;
+    g_shadow_pass_packets.erase(found);
+    return pass;
 }
 
 // ---- track world (0x358BD0, src/native_world.cpp) --------------------------------------------
@@ -897,7 +1143,7 @@ void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, ui
 }
 
 // The texture record's packet commit: its REFs are what VIF1 will read; tag each with its leaf.
-void ee_world_record(uint32_t, bool committed) {
+void ee_world_record(uint32_t slot, bool committed) {
     if (!enabled()) return;
     if (!committed) {
         g_wc.dropped_records++;
@@ -905,6 +1151,8 @@ void ee_world_record(uint32_t, bool committed) {
         g_leaves.clear();
         return;
     }
+    static const char *retire = std::getenv("EOD_NATIVE_WORLD_RETIRE");
+    const bool retire_slot = slot == 35 && retire && *retire && *retire != '0' && native_only();
     std::lock_guard<std::mutex> lk(g_mutex);
     for (auto &l : g_leaves) {
         const uint32_t a = l.first;
@@ -915,7 +1163,10 @@ void ee_world_record(uint32_t, bool committed) {
         }
         it = g_tags.lower_bound(a);
         while (it != g_tags.end() && it->first < a + 16) it = g_tags.erase(it);
-        g_tags[a] = Tagged{a + 16, l.second, false};
+        const Packet &leaf = l.second;
+        const bool eligible = retire_slot && leaf.kind == KIND_WORLD && leaf.pass == 0 &&
+                              leaf.batch == 0x0109D018 && leaf.itop == 0x80 && leaf.mesh != 0;
+        g_tags[a] = Tagged{a + 16, leaf, false, eligible};
         g_wc.leaves++;
     }
     g_leaves.clear();
@@ -1651,12 +1902,13 @@ void vu_check(uint64_t key, uint32_t program) {
     }
 }
 
-void vu1_start(uint32_t program, uint32_t itop) {
-    if (!enabled()) return;
+bool vu1_start(uint32_t program, uint32_t itop) {
+    if (!enabled()) return false;
     const uint32_t tag = g_vif1_dma_tag;
     std::vector<Mesh *> meshes;
     Packet p;
     bool found = false;
+    bool retire_world_leaf = false;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         auto it = g_tags.upper_bound(tag);
@@ -1666,6 +1918,12 @@ void vu1_start(uint32_t program, uint32_t itop) {
             if (tag < it->second.end &&
                 (it->second.range || (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38)) {
                 p = it->second.packet;
+                if (tag == it->first && it->second.retire_world_leaf) {
+                    // Consume the commit at its first MSCAL. A continuation or stale
+                    // reference may still use the marker but cannot retire another leaf.
+                    it->second.retire_world_leaf = false;
+                    retire_world_leaf = program == 0x0270 && itop == 0x80;
+                }
                 found = true;
             }
         }
@@ -1677,11 +1935,11 @@ void vu1_start(uint32_t program, uint32_t itop) {
             g_obj_active = false;
             g_sent_key = ~0ull;
         }
-        return;
+        return false;
     }
     for (Mesh *m : meshes) post(CMD_MESH, &m, sizeof m);
     const uint64_t key = p.frame << 32 | p.serial;
-    if (g_obj_active && key == g_sent_key) return;  // another program of the same record
+    if (g_obj_active && key == g_sent_key) return false;  // another program of the same record
     if (skin_check() && p.kind == KIND_QUEUE) vu_check(key, program);
     if (p.kind == KIND_QUEUE) p.itop = itop;  // world, water, shadow, flare carry the ITOP their EE packet sets
     p.program = program;
@@ -1689,6 +1947,7 @@ void vu1_start(uint32_t program, uint32_t itop) {
     post(CMD_OBJ, &p, sizeof p);
     g_obj_active = true;
     g_sent_key = key;
+    return retire_world_leaf;
 }
 
 }  // namespace native

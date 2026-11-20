@@ -10,6 +10,8 @@
 #include "core/config.h"
 #include "core/cpu.h"
 #include "core/log.h"
+#include "gs/modern_scene.h"
+#include "netplay_hooks.h"
 #include "platform/platform.h"
 
 EEState g_ee{};
@@ -28,10 +30,16 @@ bool g_log_enabled[LOG_CAT_COUNT] = {};
 void log_write(LogCat, const char *, ...) {}
 bool platform_find_file(const char *, const char *, char *, size_t) { return false; }
 
+namespace modern {
+int input_toggles = 0;
+bool look_switch_available() { return true; }
+void toggle_from_input() { ++input_toggles; }
+}
+
 // Mock native functions
 extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
-extern "C" void f_0018AFE0_orig() {}
+extern "C" void car_setup_damage_and_panels() { std::abort(); }
 extern "C" void f_0018AD20();
 extern "C" void f_0018CA98();
 extern "C" void f_001B5840();
@@ -59,7 +67,15 @@ extern "C" void f_0017E4D8_orig() {
 }
 static int native_driver_calls = 0;
 extern "C" void f_0018F2A8();
-extern "C" void f_0018F2A8_orig() { ++native_driver_calls; }
+extern "C" void f_0018F2A8_orig() {
+    ++native_driver_calls;
+    const uint32_t car = MEM_LW(g_ee.r[4].uw[0] + 0x38);
+    MEM_SW(car + 0x1B6C, 0); // native neutral steering and throttle
+    MEM_SW(car + 0x1B70, 0);
+}
+extern "C" void f_001A2D20_orig() {}
+extern "C" void f_001671E8() {}
+bool battle_bots_is_ai_slot(uint32_t) { return false; }
 extern "C" void f_0017DFA8() { g_ee.r[2].ud[0] = 0; }
 extern "C" void f_0034D328_orig() {}
 extern "C" void f_00179A08() {}
@@ -185,13 +201,44 @@ int main() {
     MEM_SW(0x003CF19C, 0x18000224);
     MEM_SW(0x003C41AC, 2);
     MEM_SW(0x0048522C, 4);
-    MEM_SW(0x00447458, 0x10000);
-    MEM_SW(0x0044745C, 0x14000);
+    MEM_SW(0x00447458, 0x14000);
+    MEM_SW(0x0044745C, 0x10000);
     MEM_SW(0x20000 + 0x38, 0x14000);
+    MEM_SW(0x20000 + 0x3C, 0x24000);
+    MEM_SW(0x24000 + 0x34, 1); // Local pad 2, regardless of starting grid slot
     MEM_SW(0x20000 + 0x40, 1);
+    setenv("EOD_AI_AUTODRIVE", "1", 1);
     g_ee.r[4].ud[0] = 0x20000;
     f_0018F2A8();
     check(native_driver_calls == 1, "Battle player 2 keeps native human input");
+    check(MEM_LW(0x14000 + 0x1B70) == 0, "Auto-Drive leaves player 2 input alone");
+
+    // Active oval ILIN, with a forward-right waypoint two nodes ahead of player 1.
+    constexpr uint32_t line = 0x28000, nodes = line + 48;
+    MEM_SW(0x003CD190, line);
+    MEM_SW(0x003CD194, 0x101);
+    MEM_SW(0x003CD198, 1);
+    MEM_SW(0x003CD1B4, 1);
+    MEM_SW(line, 0x104F128B);
+    MEM_SW(line + 4, 48);
+    MEM_SW(line + 8, 60);
+    MEM_SW(line + 28, 3 << 16);
+    MEM_SW(line + 32, nodes);
+    MEM_SW(nodes + 60 + 4, 0x41200000); // 10 m forward
+    MEM_SW(nodes + 120, 0x41A00000);    // 20 m right
+    MEM_SW(nodes + 124, 0x41F00000);    // 30 m forward
+    MEM_SW(0x10000 + 0x64, 0x3F800000); // Car right and forward basis
+    MEM_SW(0x10000 + 0x84, 0x3F800000);
+    MEM_SW(0x20000 + 0x38, 0x10000);
+    MEM_SW(0x24000 + 0x34, 0); // Local pad 1 starts behind another car
+    f_0018F2A8();
+    check(native_driver_calls == 2, "Auto-Drive preserves the native HumanDriver update");
+    check(MEM_LW(0x10000 + 0x1B6C) > 0 && MEM_LW(0x10000 + 0x1B70) == 0x3F800000,
+          "Auto-Drive installs ILIN steering and throttle after native HumanDriver overwrites input");
+    MEM_SW(0x0044744C, 1);
+    f_0018F2A8();
+    check(MEM_LW(0x10000 + 0x1B70) == 0, "Auto-Drive observes the native stopped state");
+    unsetenv("EOD_AI_AUTODRIVE");
     std::memset(g_ram, 0, EE_RAM_SIZE);
 
     g_config = Config{};
@@ -288,6 +335,29 @@ int main() {
 
     // ------------------------------------------------------------ 4. Live Controller Combos
     s_mock_pad.connected = true;
+
+    s_mock_pad.buttons = PAD_L1 | PAD_R1;
+    game_patches_vblank();
+    check(modern::input_toggles == 0, "Both shoulders alone leave graphics unchanged");
+    s_mock_pad.buttons |= PAD_R3;
+    game_patches_vblank();
+    check(modern::input_toggles == 1, "L1 + R1 + R3 switches the live graphics look");
+    check((game_patches_suppressed_buttons() & PAD_R3) != 0, "The graphics chord consumes R3");
+    game_patches_vblank();
+    check(modern::input_toggles == 1, "Holding R3 does not repeat the toggle");
+    s_mock_pad.buttons &= ~PAD_R3;
+    game_patches_vblank();
+    s_mock_pad.buttons |= PAD_R3;
+    game_patches_vblank();
+    check(modern::input_toggles == 2, "R3 release and press switches back");
+    s_mock_pad.buttons &= ~PAD_R3;
+    game_patches_vblank();
+    netplay_hooks::event_active = [] { return true; };
+    s_mock_pad.buttons |= PAD_R3;
+    game_patches_vblank();
+    check(modern::input_toggles == 2 && (game_patches_suppressed_buttons() & PAD_R3) == 0,
+          "Online events preserve the existing controller inputs");
+    netplay_hooks::event_active = nullptr;
 
     // Combo 1: L1 + R1 + D-Pad UP -> Toggle Chicken Fight
     g_config.cheat_chickens = false;

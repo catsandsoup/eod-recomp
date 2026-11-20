@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -45,6 +45,7 @@ from theme import (
     BG_ROOT,
     BORDER,
     BORDER_LIGHT,
+    ElidedLabel,
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
@@ -232,7 +233,9 @@ class RecentProjectCard(QFrame):
         super().__init__(parent)
         self.entry = entry
         self.project_path = str(entry.get("project_path", ""))
+        self.setAccessibleName(str(entry.get("project_name", "Untitled")))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setObjectName("RecentProjectCard")
         self.setFixedWidth(252)
         self.setStyleSheet(
@@ -242,7 +245,7 @@ class RecentProjectCard(QFrame):
                 border: 1px solid {BORDER};
                 border-radius: 7px;
             }}
-            QFrame#RecentProjectCard:hover {{
+            QFrame#RecentProjectCard:hover, QFrame#RecentProjectCard:focus {{
                 background: {BG_HOVER};
                 border: 1px solid {ACCENT_BLUE};
             }}
@@ -277,24 +280,22 @@ class RecentProjectCard(QFrame):
         thumb_lbl.setPixmap(pm)
         lay.addWidget(thumb_lbl)
 
-        title = QLabel(str(entry.get("project_name", "Untitled")))
-        title.setFont(QFont("Segoe UI", 9.5, QFont.Weight.DemiBold))
-        title.setStyleSheet(f"color: {TEXT_PRIMARY}; background: transparent; border: none;")
+        title = ElidedLabel(str(entry.get("project_name", "Untitled")))
+        title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-weight: 600; background: transparent; border: none;")
         lay.addWidget(title)
 
         meta = QHBoxLayout()
         meta.setContentsMargins(0, 0, 0, 0)
-        trk_lbl = QLabel(f"{entry.get('display_name') or entry.get('track_name', '')}")
+        trk_lbl = ElidedLabel(str(entry.get("display_name") or entry.get("track_name", "")))
         trk_lbl.setStyleSheet("color: #60a5fa; font-size: 8pt; background: transparent; border: none;")
         ts_lbl = QLabel(_format_timestamp(entry))
         ts_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 8pt; background: transparent; border: none;")
-        meta.addWidget(trk_lbl)
-        meta.addStretch(1)
+        meta.addWidget(trk_lbl, 1)
         meta.addWidget(ts_lbl)
         lay.addLayout(meta)
 
         exists = Path(self.project_path).is_file()
-        sub = QLabel(Path(self.project_path).name if exists else "Missing file")
+        sub = ElidedLabel(Path(self.project_path).name if exists else "Missing file")
         sub.setStyleSheet(
             f"color: {TEXT_SECONDARY if exists else '#f87171'}; font-size: 7.5pt; background: transparent; border: none;"
         )
@@ -304,6 +305,13 @@ class RecentProjectCard(QFrame):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.project_path)
         super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit(self.project_path)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +344,7 @@ class HomeHubDialog(QDialog):
         self.selected_project_file: Path | None = None
 
         self.setWindowTitle("EOD World Editor \u2013 Home Hub")
-        self.setMinimumSize(1020, 650)
+        self.setMinimumSize(800, 540)
         self.resize(1100, 700)
         self.setStyleSheet(f"QDialog {{ background: {BG_ROOT}; color: {TEXT_PRIMARY}; }}")
         enable_windows_dark_titlebar(self)
@@ -362,6 +370,7 @@ class HomeHubDialog(QDialog):
         lbl_brand.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         lbl_brand.setStyleSheet(f"color: {TEXT_PRIMARY};")
         lbl_sub = QLabel("Test Drive: Eve of Destruction \u2014 Non-Destructive World & Race Studio")
+        lbl_sub.setWordWrap(True)
         lbl_sub.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 9pt;")
         title_box.addWidget(lbl_brand)
         title_box.addWidget(lbl_sub)
@@ -421,7 +430,8 @@ class HomeHubDialog(QDialog):
 
         # --- Left Column: New World Project ---
         left_panel = QFrame()
-        left_panel.setFixedWidth(385)
+        left_panel.setMinimumWidth(330)
+        left_panel.setMaximumWidth(385)
         left_panel.setStyleSheet(
             f"QFrame {{ background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}"
         )
@@ -452,7 +462,7 @@ class HomeHubDialog(QDialog):
         l_lay.addWidget(lbl_trk)
 
         self.lst_tracks = QListWidget()
-        self.lst_tracks.setMinimumHeight(185)
+        self.lst_tracks.setMinimumHeight(72)
         self.lst_tracks.setStyleSheet(
             f"QListWidget {{ background: {BG_INPUT}; border: 1px solid {BORDER}; border-radius: 5px; padding: 2px; }}"
             f"QListWidget::item {{ padding: 5px 8px; border-radius: 4px; }}"
@@ -542,6 +552,9 @@ class HomeHubDialog(QDialog):
         self.recents_grid.setContentsMargins(2, 2, 2, 2)
         self.recents_grid.setSpacing(10)
         self.recents_scroll.setWidget(self.recents_container)
+        self.recents_scroll.viewport().installEventFilter(self)
+        self.recent_cards: list[RecentProjectCard] = []
+        self._recent_columns = 0
         r_lay.addWidget(self.recents_scroll, 1)
 
         body.addWidget(right_panel, 1)
@@ -549,7 +562,7 @@ class HomeHubDialog(QDialog):
 
         # Footer
         foot = QHBoxLayout()
-        self.lbl_game_dir = QLabel(f"Retail Disc: {self.game_dir}")
+        self.lbl_game_dir = ElidedLabel(f"Retail Disc: {self.game_dir}")
         self.lbl_game_dir.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 8pt;")
         foot.addWidget(self.lbl_game_dir, 1)
         btn_cancel = QPushButton("Close")
@@ -616,7 +629,8 @@ class HomeHubDialog(QDialog):
             if it and it.widget():
                 it.widget().deleteLater()
 
-        self.recent_cards: list[RecentProjectCard] = []
+        self.recent_cards.clear()
+        self._recent_columns = 0
         self.lbl_rec_count.setText(f"{len(self.recents)} saved")
         if not self.recents:
             empty = QLabel(
@@ -629,13 +643,33 @@ class HomeHubDialog(QDialog):
             self.recents_grid.addWidget(empty, 0, 0, 1, 2)
             return
 
-        cols = 2
-        for idx, entry in enumerate(self.recents):
+        for entry in self.recents:
             card = RecentProjectCard(entry, self.recents_container)
             card.clicked.connect(self._on_recent_card_clicked)
-            self.recents_grid.addWidget(card, idx // cols, idx % cols, Qt.AlignmentFlag.AlignTop)
             self.recent_cards.append(card)
-        self.recents_grid.setRowStretch((len(self.recents) // cols) + 1, 1)
+        self._fit_recent_cards()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.recents_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._fit_recent_cards()
+        return super().eventFilter(watched, event)
+
+    def _fit_recent_cards(self) -> None:
+        if not self.recent_cards:
+            return
+        grid = self.recents_grid
+        margins = grid.contentsMargins()
+        available = self.recents_scroll.viewport().width() - margins.left() - margins.right()
+        cols = 2 if available >= 2 * self.recent_cards[0].width() + grid.horizontalSpacing() else 1
+        if cols == self._recent_columns:
+            return
+        for row in range(grid.rowCount()):
+            grid.setRowStretch(row, 0)
+        for idx, card in enumerate(self.recent_cards):
+            grid.removeWidget(card)
+            grid.addWidget(card, idx // cols, idx % cols, Qt.AlignmentFlag.AlignTop)
+        grid.setRowStretch((len(self.recent_cards) - 1) // cols + 1, 1)
+        self._recent_columns = cols
 
     def _on_skip_pref_toggled(self, checked: bool) -> None:
         self.prefs["skip_home_hub"] = bool(checked)

@@ -14,23 +14,25 @@
 //   0x34AF98 RenderQueueFlush(layer, set): walk the layer's texture keys in order and emit each
 //                                      bucket's records (matrix / material / clip flag / batch DMA)
 //
-// A record (pool *(0x4C96C4), count *(0x4C96C8), capacity 0xC00):
+// A guest record (pool *(0x4C96C4), count *(0x4C96C8), capacity 0xC00):
 //   +0x00 batch, +0x04 next in bucket, +0x08 clip flag (0x365288: ITOP bit 0x200),
 //   +0x0C matrix packet (0x35CD28 result; 0 = identity), +0x10 material packet or -1.
 // Buckets: 0x4C96D0 + 0x800*set + 4*(key+1); the key is the batch's texture slot (table
 // *(0x4D2D30), 0x44 bytes per slot), so each bucket is one texture.
 //
-// Each replacement keeps the original's observable behaviour exactly: the same guest calls in the
-// same order with the same return addresses (wrappers and traces see the same callers), the same
-// stack frame size, the same memory writes and the same $v0. With EOD_DIFF=<addr> the diff harness
-// (runtime/core/diff_harness.h) runs the recompiled original beside it and compares.
+// Live native rendering extends each bucket with host records after the guest pool fills. Original
+// and EOD_DIFF use the guest layout and its original limit so the recompiled code can compare state.
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
 #include "render/native_renderer.h"
 #include "render/scene_tap.h"
 
+#include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 extern "C" {
 void f_0034BDA8_orig(void);
@@ -41,6 +43,10 @@ void f_0034C9C0_orig(void);
 void f_0034C930_orig(void);
 void f_0034C860_orig(void);
 void f_0034AF98_orig(void);
+void f_0034C828_orig(void);
+void f_0034C8C0_orig(void);
+void f_0034D1F8_orig(void);
+void f_0034D088_orig(void);
 
 // Called through their public symbols so wrappers (traces, LOD, nested diff checks) still apply.
 void f_0034E308(void);  // FrustumTestSphere(centre*, clip_out*, depth_out*; f12 radius) -> visible
@@ -75,8 +81,10 @@ constexpr uint32_t kCachedMatrix = 0x4CA6D8;   // last matrix packet sent by a f
 constexpr uint32_t kCachedMaterial = 0x4CA6DC; // last material packet sent by a flush
 constexpr uint32_t kLayerMask = 0x3DD634;      // batch layer bits accepted by 0x34B140
 constexpr uint32_t kSpecialKey = 0x3DD680;     // extra bucket for material batches (-2 = none)
-constexpr int32_t kPoolCapacity = 0xC00;
+constexpr uint32_t kLegacyRecordLimit = 0xC00 - 1;  // EE rejects an append when count + 1 reaches 0xC00.
 constexpr uint32_t kRecordSize = 0x14;
+constexpr uint32_t kBucketSetBytes = 0x800;
+constexpr uint32_t kBucketsPerSet = kBucketSetBytes / sizeof(uint32_t);
 
 // Guest register access. Values are written the way the EE leaves them: 32-bit results
 // sign-extended into the low doubleword.
@@ -98,6 +106,83 @@ inline void sf(uint32_t a, float v) {
     MEM_SW(a, f.u);
 }
 inline void set_f(int f, uint32_t bits) { g_ee.fpr[f].u = bits; }
+
+struct DrawRecord {
+    uint32_t batch, clip, matrix, material;
+};
+
+struct OverflowRecord {
+    DrawRecord draw;
+    uint32_t next;  // one-based index in its own bucket set; 0 ends the chain
+};
+
+struct OverflowQueue {
+    std::array<uint32_t, kBucketsPerSet> heads{};
+    std::vector<OverflowRecord> records;
+    unsigned pending_buckets = 0;
+    unsigned low_use_resets = 0;
+
+    void append(uint32_t bucket, DrawRecord draw) {
+        uint32_t &head = heads[bucket];
+        records.push_back({draw, head});
+        if (head == 0) ++pending_buckets;
+        head = static_cast<uint32_t>(records.size());
+    }
+
+    void clear_bucket(uint32_t bucket) {
+        heads[bucket] = 0;
+        --pending_buckets;
+    }
+
+    void reset() {
+        if (pending_buckets) heads.fill(0);
+        pending_buckets = 0;
+        // Reuse storage in a consistently dense scene. Release a sustained
+        // high-water surplus once the view or immediate queue is quiet again.
+        if (records.capacity() && records.size() <= records.capacity() / 4) {
+            if (++low_use_resets == 64) {
+                std::vector<OverflowRecord>().swap(records);
+                low_use_resets = 0;
+            }
+        } else {
+            low_use_resets = 0;
+        }
+        records.clear();
+    }
+};
+
+// The EE thread owns both sets. Set 0 may flush immediately while set 1 still holds layer 9.
+std::array<OverflowQueue, 2> g_overflow;
+
+bool adaptive_enabled() {
+    // A watched outer call can run the generated queue, and diff snapshots restore only guest state.
+    static const bool diff_off = [] {
+        const char *diff = std::getenv("EOD_DIFF");
+        return !diff || !*diff;
+    }();
+    return diff_off && native::enabled();
+}
+
+OverflowQueue *overflow_queue(uint32_t set_offset) {
+    const uint32_t set = set_offset / kBucketSetBytes;
+    return set < g_overflow.size() && adaptive_enabled() ? &g_overflow[set] : nullptr;
+}
+
+void reset_adaptive_queues() {
+    if (!adaptive_enabled()) return;
+    for (auto &queue : g_overflow) queue.reset();
+    // A pool count reset also invalidates guest links left behind by an interrupted view.
+    std::memset(g_ram + kBuckets, 0, kBucketSetBytes * g_overflow.size());
+}
+
+void release_adaptive_queues() {
+    if (!adaptive_enabled()) return;
+    g_overflow = {};
+    std::memset(g_ram + kBuckets, 0, kBucketSetBytes * g_overflow.size());
+    sw(kPoolCount, 0);
+    sw(kSetOpen, 0);
+    sw(kFrameActive, 0);
+}
 
 // Calls a guest function as the original's jal at `ra` does.
 inline void call(void (*fn)(void), uint32_t ra) {
@@ -173,33 +258,32 @@ void submit_model() {
 
 // ---------------------------------------------------------------------------------------------
 // 0x34B140 RenderQueueAppendBatches(model, matrix_packet, material, clip; f12 depth)
-struct Append {
-    uint32_t matrix_packet, clip;
-    uint64_t material;
-    uint32_t set_offset;
-
-    // One record for `batch` at the head of bucket `bucket` (key + 1). Records past the pool's
-    // capacity are dropped, as in the original.
-    void record(uint32_t batch, int32_t bucket, uint32_t material_ra) const {
-        const int32_t n = lw(kPoolCount);
-        if ((int64_t)n + 1 >= kPoolCapacity) return;
-        const uint32_t rec = lwu(kPool) + (uint32_t)n * kRecordSize;
-        sw(kPoolCount, (uint32_t)(n + 1));
-        sw(rec + 0x00, batch);
-        sw(rec + 0x08, clip);
-        sw(rec + 0x0C, matrix_packet);
-        uint32_t mat = 0xFFFFFFFFu;
-        if ((int64_t)material != -1) {
+void queue_record(uint32_t batch, uint32_t bucket, uint32_t set_offset, uint32_t matrix,
+                  uint32_t clip, uint64_t material, uint32_t material_ra) {
+    const uint32_t n = lwu(kPoolCount);
+    auto material_packet = [&] {
+        if (material != 0xFFFFFFFFFFFFFFFFull) {
             set(4, (int32_t)batch);
             call(f_0035DF40, material_ra);
-            if (reg64(2) != 0) mat = (uint32_t)material;
+            if (reg64(2) != 0) return (uint32_t)material;
         }
-        sw(rec + 0x10, mat);
-        const uint32_t head = kBuckets + set_offset + (uint32_t)bucket * 4;
+        return 0xFFFFFFFFu;
+    };
+    if (n < kLegacyRecordLimit) {
+        const uint32_t rec = lwu(kPool) + (uint32_t)n * kRecordSize;
+        sw(kPoolCount, n + 1);
+        sw(rec + 0x00, batch);
+        sw(rec + 0x08, clip);
+        sw(rec + 0x0C, matrix);
+        sw(rec + 0x10, material_packet());
+        const uint32_t head = kBuckets + set_offset + bucket * 4;
         sw(rec + 0x04, lwu(head));
         sw(head, rec);
+    } else if (OverflowQueue *queue = overflow_queue(set_offset); queue && bucket < kBucketsPerSet) {
+        queue->append(bucket, {batch, clip, matrix, material_packet()});
+        sw(kPoolCount, n + 1);
     }
-};
+}
 
 void note_distance(int32_t slot, uint32_t depth_bits, uint32_t batch, uint32_t ra) {
     set(4, slot);
@@ -210,10 +294,8 @@ void note_distance(int32_t slot, uint32_t depth_bits, uint32_t batch, uint32_t r
 
 void append_batches() {
     const uint64_t model = reg64(4);
-    Append a;
-    a.matrix_packet = reg(5);
-    a.material = reg64(6);
-    a.clip = reg(7);
+    const uint32_t matrix = reg(5), clip = reg(7);
+    const uint64_t material = reg64(6);
     const uint32_t depth = g_ee.fpr[12].u;
     Frame f(0xD0);
 
@@ -222,6 +304,10 @@ void append_batches() {
     const uint32_t header = reg(2);
 
     if (lw(kSetOpen) == 0 && lw(kFrameActive) == 0) {  // a draw outside a frame starts clean
+        if (auto *queue = overflow_queue(0); queue && queue->pending_buckets) {
+            queue->reset();
+            std::memset(g_ram + kBuckets, 0, kBucketSetBytes);
+        }
         sw(kCachedMatrix, 0xFFFFFFFFu);
         sw(kCachedMaterial, 0xFFFFFFFFu);
         sw(kPoolCount, 0);
@@ -233,7 +319,7 @@ void append_batches() {
     if (reg64(2) != 0) duplicate = lw(kSpecialKey) != -2;
 
     const int32_t open = lw(kSetOpen);
-    a.set_offset = (uint32_t)open << 11;
+    const uint32_t set_offset = (uint32_t)open << 11;
     const bool flush_now = ((int64_t)open ^ 1) != 0;  // no frame open: draw at once
 
     for (int32_t i = 0; i < lw(header); i++) {
@@ -243,12 +329,12 @@ void append_batches() {
             const uint32_t keys = lwu(lwu(kModelTable) + (uint32_t)((int32_t)model * 0x14) + 0x10);
             const int32_t key = lw(keys + (uint32_t)i * 4);
             note_distance(key, depth, batch, 0x34B284);
-            a.record(batch, key + 1, 0x34B2CC);
+            queue_record(batch, (uint32_t)key + 1, set_offset, matrix, clip, material, 0x34B2CC);
             if (duplicate) {
                 set(4, (int32_t)batch);
                 call(f_0035DF40, 0x34B320);
                 if (reg64(2) != 0) {
-                    a.record(batch, lw(kSpecialKey) + 1, 0x34B380);
+                    queue_record(batch, lwu(kSpecialKey) + 1, set_offset, matrix, clip, material, 0x34B380);
                     note_distance(lw(kSpecialKey), depth, batch, 0x34B3CC);
                 }
             }
@@ -280,19 +366,8 @@ void submit_model_key() {
 
     for (int32_t i = 0; i < lw(header); i++) {
         const uint32_t batch = lwu(lwu(header + 4) + (uint32_t)i * 4);
-        const uint32_t clip_flag = lwu(clip);
-        const int32_t n = lw(kPoolCount);
-        if ((int64_t)n + 1 < kPoolCapacity) {
-            const uint32_t head = kBuckets + ((uint32_t)lw(kSetOpen) << 11) + (uint32_t)(int32_t)(key + 1) * 4;
-            const uint32_t rec = lwu(kPool) + (uint32_t)n * kRecordSize;
-            sw(kPoolCount, (uint32_t)(n + 1));
-            sw(rec + 0x04, lwu(head));
-            sw(head, rec);
-            sw(rec + 0x00, batch);
-            sw(rec + 0x08, clip_flag);
-            sw(rec + 0x10, 0xFFFFFFFFu);
-            sw(rec + 0x0C, matrix_packet);
-        }
+        queue_record(batch, key + 1, lwu(kSetOpen) << 11, matrix_packet, lwu(clip),
+                     0xFFFFFFFFFFFFFFFFull, 0);
         IRQ_CHECK();
     }
     const int32_t open = lw(kSetOpen);
@@ -330,6 +405,7 @@ void submit_static() {
 void begin_frame() {
     native::ee_frame_begin();
     scene_tap::begin_view();
+    reset_adaptive_queues();
     sw(kSetOpen, 1);
     sw(kCachedMaterial, 0xFFFFFFFFu);
     sw(kFrameActive, 1);
@@ -358,6 +434,7 @@ void flush_layer_9() {
     set(4, 9);
     set(5, 1);
     call(f_0034AF98, 0x34C888);
+    reset_adaptive_queues();
     sw(kCachedMatrix, 0xFFFFFFFFu);
     sw(kFrameActive, 0);
     sw(kCachedMaterial, 0xFFFFFFFFu);
@@ -366,11 +443,33 @@ void flush_layer_9() {
 }
 
 // ---------------------------------------------------------------------------------------------
+void emit_record(DrawRecord record, int32_t key, int32_t layer) {
+    if (record.matrix != lwu(kCachedMatrix)) {
+        set(4, (int32_t)record.matrix);
+        call(f_0035E018, 0x34B07C);
+        sw(kCachedMatrix, record.matrix);
+    }
+    if (record.material != 0xFFFFFFFFu && record.material != lwu(kCachedMaterial)) {
+        set(4, (int32_t)record.material);
+        call(f_0035DDC8, 0x34B0A8);
+        sw(kCachedMaterial, record.material);
+    }
+    scene_tap::object(record.batch, record.clip, record.matrix, record.material, key, layer);
+    native::ee_object(record.batch);
+    set(4, (int32_t)record.clip);
+    call(f_00365288, 0x34B0B4);
+    set(4, (int32_t)record.batch);
+    call(f_0035CB88, 0x34B0BC);
+    native::ee_object_end();
+    IRQ_CHECK();
+}
+
 // 0x34AF98 RenderQueueFlush(layer, set): for each texture key of the layer, in the layer's order,
 // emit the bucket's records (most recently queued first) and empty the bucket.
 void flush() {
     const int64_t layer = (int64_t)reg64(4);
     const uint32_t set_offset = reg(5) << 11;
+    auto *overflow = overflow_queue(set_offset);
     Frame f(0xB0);
     const uint32_t list_out = f.sp(), count_out = f.sp() | 4;
     sw(count_out, 0);
@@ -386,38 +485,29 @@ void flush() {
     int32_t keys = lw(count_out);
     for (int32_t i = 0; i < keys; i++) {
         const int32_t key = lw(lwu(list_out) + (uint32_t)i * 4);
-        const uint32_t head = set_offset + kBuckets + (uint32_t)(key + 1) * 4;
-        if (lwu(head) != 0) {
+        const uint32_t bucket = (uint32_t)key + 1;
+        const uint32_t head = set_offset + kBuckets + bucket * 4;
+        const uint32_t extra = overflow && bucket < kBucketsPerSet ? overflow->heads[bucket] : 0;
+        if (extra || lwu(head) != 0) {
             if (key == lw(kSpecialKey)) {
                 set(4, 1);
                 call(f_0035A4D0, 0x34B04C);
             }
             set(4, key);
             call(f_0034F988, 0x34B054);
+            // Overflow contains only later submissions to this key. Both chains prepend records.
+            for (uint32_t link = extra; link != 0;) {
+                const OverflowRecord record = overflow->records[link - 1];
+                emit_record(record.draw, key, (int32_t)layer);
+                link = record.next;
+            }
             for (uint32_t rec = lwu(head); rec != 0; rec = lwu(rec + 4)) {
-                const int32_t matrix = lw(rec + 0x0C);
-                if (matrix != lw(kCachedMatrix)) {
-                    set(4, matrix);
-                    call(f_0035E018, 0x34B07C);
-                    sw(kCachedMatrix, (uint32_t)matrix);
-                }
-                const int32_t material = lw(rec + 0x10);
-                if (material != -1 && material != lw(kCachedMaterial)) {
-                    set(4, material);
-                    call(f_0035DDC8, 0x34B0A8);
-                    sw(kCachedMaterial, (uint32_t)material);
-                }
-                scene_tap::object(rec, key, (int32_t)layer);
-                native::ee_object(rec);
-                set(4, lw(rec + 0x08));
-                call(f_00365288, 0x34B0B4);
-                set(4, lw(rec + 0x00));
-                call(f_0035CB88, 0x34B0BC);
-                native::ee_object_end();
-                IRQ_CHECK();
+                emit_record({lwu(rec), lwu(rec + 0x08), lwu(rec + 0x0C), lwu(rec + 0x10)},
+                            key, (int32_t)layer);
             }
             call(f_0034F888, 0x34B0D0);
             const bool special = key == lw(kSpecialKey);
+            if (extra) overflow->clear_bucket(bucket);
             sw(head, 0);
             if (special) {
                 set(4, 0);
@@ -429,6 +519,7 @@ void flush() {
     }
     set(4, 1);
     call(f_00365288, 0x34B110);
+    if (overflow && set_offset == 0 && !overflow->pending_buckets) overflow->reset();
 }
 
 }  // namespace
@@ -442,3 +533,25 @@ extern "C" void eod_rq_0034C930(void) { diff_run(0x0034C930, flush_layers_0_to_8
 extern "C" void eod_rq_0034C860(void) { diff_run(0x0034C860, flush_layer_9, f_0034C860_orig); }
 extern "C" void eod_rq_0034AF98(void) { diff_run(0x0034AF98, flush, f_0034AF98_orig); }
 extern "C" void f_0034CC98(void) { diff_run(0x0034CC98, submit_static, f_0034CC98_orig); }
+
+// Retain the generated guest allocation and teardown for Original and D2.
+extern "C" void f_0034D1F8(void) {
+    release_adaptive_queues();
+    f_0034D1F8_orig();
+}
+extern "C" void f_0034D088(void) {
+    release_adaptive_queues();
+    f_0034D088_orig();
+}
+extern "C" void f_0034C828(void) {
+    if (adaptive_enabled()) {
+        reset_adaptive_queues();
+        sw(kPoolCount, 0);
+    }
+    f_0034C828_orig();
+}
+extern "C" void f_0034C8C0(void) {
+    const bool last_layer = reg64(4) == 9;
+    f_0034C8C0_orig();
+    if (last_layer) reset_adaptive_queues();
+}

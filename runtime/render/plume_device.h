@@ -12,6 +12,10 @@ struct RenderDevice;
 }
 
 namespace plume_device {
+#ifdef __APPLE__
+// Use SDL's loader for a window, or open the bundle/system loader for headless.
+bool initialize_loader(PFN_vkGetInstanceProcAddr getProc);
+#endif
 // plume's instance (created on the first call, API 1.3, surface extensions enabled), or
 // VK_NULL_HANDLE when plume cannot create one.
 VkInstance instance();

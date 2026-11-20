@@ -1,5 +1,57 @@
 # Scene capture: the game's 3D frame for a modern renderer
 
+## R7 original PS2 comparison
+
+Capture retail `SLUS-209.10` running on an original PS2 and native-only
+Classic (`EOD_NATIVE_ONLY=1`, `Look=Classic`, `RenderScale=1`). Use the same
+retail data, gameplay settings, recorded inputs, camera, viewport, and
+gameplay checkpoint. Keep the original hardware recordings and document the
+console output mode, capture equipment, RGB range, and any field
+reconstruction or conversion used to produce comparison PNGs. Pair each
+chosen hardware field or frame with the corresponding native GS scanout.
+Record the evidence for the pairing, such as the input event, HUD time, race
+state, and camera. Compare the full scene suite in the Master Spec.
+
+Save the paired inputs as single-frame 8-bit RGB PNGs and record them in a
+JSON manifest. The example below is a format example with illustrative
+field and vblank numbers.
+
+```json
+{
+  "source": "Retail SLUS-209.10 on original PS2, recording afton-race",
+  "capture_chain": "Record console output, capture path, levels and field reconstruction here",
+  "native_build": "Record the commit, build, renderer settings and native-only trace here",
+  "pairs": [
+    {
+      "id": "afton-jump-01",
+      "scene": "Afton Jump Race, 1P",
+      "ps2": "hardware/afton-field.png",
+      "native": "plume/afton-scanout.png",
+      "ps2_field": "afton-race, field 302",
+      "native_vblank": 456,
+      "sync": "Record the matching input, race state, camera and viewport here",
+      "ps2_crop": [0, 0, 640, 448]
+    }
+  ]
+}
+```
+
+Run `python tools/p3_hardware_compare.py capture.json --out comparison`
+with NumPy and Pillow installed. The optional crop selects a documented
+hardware active-picture rectangle. Coordinates are left, top, right, bottom,
+with the right and bottom excluded. The comparator scores the whole native
+frame and rejects unequal dimensions. It performs no scaling, color
+adjustment, interpolation, registration, or nearby-frame search. Keep
+different scenes and states as separate pairs in the same manifest.
+
+Each comparison sheet shows PS2, Plume, then absolute RGB difference
+amplified 4×, from left to right. The separate difference PNG contains raw
+per-channel absolute differences. The report retains input hashes, field
+and vblank identifiers, source and crop sizes, per-channel MAE, p99 maximum
+channel error per pixel, and luma SSIM. Use the images for hardware
+sign-off and retain the strict offline GS P3 and live S4 checks as separate
+R7 evidence.
+
 ## Player success
 
 A player turns on the modern renderer and sees the same race (same track pieces, cars,

@@ -62,7 +62,9 @@ extern bool g_on;  // the modern renderer can be used in this build (not EOD_MOD
 // with F9 or L1+R1+R3, read by the producer once per frame.
 bool live();
 bool available();  // the backend can draw it (Windows d3d11, shaders built)
+bool look_switch_available();  // native Plume or legacy GS
 void toggle();
+void toggle_from_input();
 void disable();  // the modern renderer cannot run here: Original from now on
 
 // The frame buffer the replaced draws of this frame went to (GS thread).

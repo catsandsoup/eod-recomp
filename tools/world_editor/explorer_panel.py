@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -57,14 +58,25 @@ class ModelGridWidget(QListWidget):
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setMovement(QListView.Movement.Static)
         self.setWrapping(True)
-        self.setSpacing(6)
+        self.setSpacing(0)
         self.setIconSize(QSize(THUMB_W, THUMB_H))
         self.setGridSize(QSize(THUMB_W + 18, THUMB_H + 34))
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setUniformItemSizes(True)
         self.setWordWrap(True)
         self.setDragEnabled(True)
         self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.itemDoubleClicked.connect(self._on_double_click)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # The icon view keeps a small inset around its first and last cells.
+        width = max(1, self.viewport().width() - 6)
+        columns = max(1, width // THUMB_W)
+        cell = QSize(width // columns, THUMB_H + 28)
+        if self.gridSize() != cell:
+            self.setGridSize(cell)
+            self.setIconSize(QSize(min(THUMB_W, max(1, cell.width() - 10)), THUMB_H))
 
     def _on_double_click(self, item: QListWidgetItem) -> None:
         mkey = item.data(Qt.ItemDataRole.UserRole)
@@ -132,9 +144,9 @@ class ExplorerPanel(QWidget):
         # Icon tabs: Scene Tree, Models, Sections/Mlists, Layers
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(False)
-        self.tabs.setUsesScrollButtons(False)
+        self.tabs.setUsesScrollButtons(True)
         self.tabs.tabBar().setExpanding(True)
-        self.tabs.setIconSize(QSize(14, 14))
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
         root.addWidget(self.tabs, 1)
 
         # Tab 0: Scene Tree
@@ -175,7 +187,7 @@ class ExplorerPanel(QWidget):
         self.scene_tree.itemClicked.connect(self._on_scene_tree_click)
         lay.addWidget(self.scene_tree, 1)
 
-        self.tabs.addTab(w, svg_icon("tree"), "Tree")
+        self.tabs.addTab(w, "Tree")
 
     def _build_models_tab(self) -> None:
         w = QWidget()
@@ -184,7 +196,8 @@ class ExplorerPanel(QWidget):
         lay.setSpacing(5)
 
         self.model_search = QLineEdit()
-        self.model_search.setPlaceholderText("Search models, cars, wrecks, textures...")
+        self.model_search.setPlaceholderText("Search assets")
+        self.model_search.setToolTip("Search models, cars, wrecks and textures")
         self.model_search.textChanged.connect(self._rebuild_model_grid)
         lay.addWidget(self.model_search)
 
@@ -197,7 +210,6 @@ class ExplorerPanel(QWidget):
         self.btn_cars_quick = QPushButton(" Cars")
         self.btn_cars_quick.setIcon(svg_icon("car", "#ff8a8a"))
         self.btn_cars_quick.setCheckable(True)
-        self.btn_cars_quick.setFixedHeight(26)
         self.btn_cars_quick.setToolTip("Show retail Cars & Wrecks (DATA/CAR/*.CAR)")
         self.btn_cars_quick.toggled.connect(self._on_cars_quick_toggled)
 
@@ -215,37 +227,33 @@ class ExplorerPanel(QWidget):
         self.model_grid.currentItemChanged.connect(self._on_model_item_changed)
         lay.addWidget(self.model_grid, 1)
 
-        act_row = QHBoxLayout()
+        act_row = QGridLayout()
         act_row.setSpacing(4)
-        btn_ghost = QPushButton(" Ghost")
+        btn_ghost = QPushButton("Ghost")
         btn_ghost.setIcon(svg_icon("place"))
-        btn_ghost.setFixedHeight(24)
         btn_ghost.setToolTip("Enter Ghost Placement Mode with selected model/car")
         btn_ghost.clicked.connect(self._ghost_place_selected_model)
 
-        btn_scat = QPushButton(" Scatter")
+        btn_scat = QPushButton("Scatter")
         btn_scat.setIcon(svg_icon("scatter"))
-        btn_scat.setFixedHeight(24)
         btn_scat.setToolTip("Paint / Scatter selected model or wrecked car across terrain")
         btn_scat.clicked.connect(self._scatter_selected_model)
 
-        btn_rep = QPushButton(" Swap")
+        btn_rep = QPushButton("Swap")
         btn_rep.setIcon(svg_icon("replace"))
-        btn_rep.setFixedHeight(24)
         btn_rep.setToolTip("Replace currently selected scene object with this model/car")
         btn_rep.clicked.connect(self._replace_with_selected_model)
 
         btn_place = QPushButton("Place")
-        btn_place.setFixedHeight(24)
         btn_place.clicked.connect(self._place_selected_model)
 
-        act_row.addWidget(btn_ghost)
-        act_row.addWidget(btn_scat)
-        act_row.addWidget(btn_rep)
-        act_row.addWidget(btn_place)
+        act_row.addWidget(btn_ghost, 0, 0)
+        act_row.addWidget(btn_scat, 0, 1)
+        act_row.addWidget(btn_rep, 1, 0)
+        act_row.addWidget(btn_place, 1, 1)
         lay.addLayout(act_row)
 
-        self.tabs.addTab(w, svg_icon("cube"), "Models")
+        self.tabs.addTab(w, "Models")
 
     def _build_sections_tab(self) -> None:
         w = QWidget()
@@ -270,7 +278,7 @@ class ExplorerPanel(QWidget):
         self.sections_tree.setColumnWidth(0, 185)
         lay.addWidget(self.sections_tree, 1)
 
-        self.tabs.addTab(w, svg_icon("sections"), "Mlists")
+        self.tabs.addTab(w, "Mlists")
 
     def _build_layers_tab(self) -> None:
         w = QWidget()
@@ -303,7 +311,7 @@ class ExplorerPanel(QWidget):
             self.layer_checks[key] = cb
 
         lay.addStretch(1)
-        self.tabs.addTab(w, svg_icon("layers"), "Layers")
+        self.tabs.addTab(w, "Layers")
 
     # -----------------------------------------------------------------------
     # Population & Refresh

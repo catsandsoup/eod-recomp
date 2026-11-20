@@ -124,9 +124,9 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "VSync")) c.vsync = to_bool(v);
             else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "16:10") ? "16:10" : ieq(v, "stretch") ? "stretch" : ieq(v, "4:3") ? "4:3" : "auto";
 #ifdef __APPLE__
-            else if (ieq(k, "RenderScale")) c.render_scale = num(0, 6);  // 0 = auto (Vulkan)
+            else if (ieq(k, "RenderScale")) c.render_scale = num(0, kMaxRenderScale);  // 0 = auto (Vulkan)
 #else
-            else if (ieq(k, "RenderScale")) c.render_scale = num(1, 6);
+            else if (ieq(k, "RenderScale")) c.render_scale = num(1, kMaxRenderScale);
 #endif
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);

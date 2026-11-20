@@ -49,6 +49,8 @@ extern char **environ;
 #include "../platform.h"
 #include "sdl_input.h"
 #ifndef EOD_DISPLAY_BACKEND_TEST
+#include "../../../src/netplay_hooks.h"
+#include "../../gs/modern_scene.h"
 #include "../../ui/frontend.h"
 #include "../../ui/overlay.h"
 #else  // the display composition test links this file without the front end
@@ -417,10 +419,19 @@ bool platform_pump() {
             break;
         case SDL_EVENT_KEY_DOWN:
             time_key_event(e.key);
+#ifndef EOD_DISPLAY_BACKEND_TEST
+            if (e.key.scancode == SDL_SCANCODE_F9 && g_window) {
+                if (!e.key.repeat && e.key.windowID == SDL_GetWindowID(g_window) &&
+                    SDL_GetKeyboardFocus() == g_window && !overlay_key(0x78, true))
+                    modern::toggle_from_input();
+                break;
+            }
+#endif
             if (!g_headless && !(e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_F && (e.key.mod & SDL_KMOD_GUI)))) {
                 // the in-game front end: F1 / Cmd+, open it (Esc stays the game's); while open it takes every key
                 const int vk = (e.key.scancode == SDL_SCANCODE_COMMA && (e.key.mod & SDL_KMOD_GUI)) ? 0x70 : scancode_to_vk(e.key.scancode);
                 const bool open = overlay_menu_open();
+                if (vk == 0x70 && e.key.repeat) break;
                 // clipboard in the menu: Cmd+V / Ctrl+V pastes into a text field, Cmd+C / Ctrl+C copies the Garage Code
                 if (open && (e.key.mod & (SDL_KMOD_GUI | SDL_KMOD_CTRL)) && !e.key.repeat) {
                     if (e.key.scancode == SDL_SCANCODE_V) { if (char *clip = SDL_GetClipboardText()) { overlay_paste(clip); SDL_free(clip); } break; }
@@ -677,7 +688,14 @@ std::string overlay_platform_mods_root() {
 
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
-    if (port < 0 || port >= kPorts) return;
+    if (port < 0) return;
+    if (port >= kPorts) {
+        if (pad_script_state(port, out) && overlay_captures_input()) {
+            *out = HostPadState();
+            out->connected = true;
+        }
+        return;
+    }
     if (overlay_captures_input()) {  // the front end has the input: the game sees a neutral pad
         out->connected = true;
         return;
@@ -685,7 +703,13 @@ void platform_get_pad(int port, HostPadState *out) {
     auto ctx = keyboard_context(); // also observed in headless/scripted tests
     if (port == sdl_input::keyboard_port()) read_keyboard(out, ctx);
     if (SDL_Gamepad *gp = sdl_input::port_gamepad(port)) {
-        sdl_input::read_gamepad(gp, out, g_headless || (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS)));
+        const bool focused = g_headless || (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS));
+        bool graphics_chord = false;
+#ifndef EOD_DISPLAY_BACKEND_TEST
+        graphics_chord = port == 0 && (!netplay_hooks::event_active || !netplay_hooks::event_active()) &&
+            modern::look_switch_available();
+#endif
+        sdl_input::read_gamepad(gp, out, focused, graphics_chord);
         // per-player stick shaping and trigger response (front end INPUTS tab): input mapping only
         const int p = port & 1;
         out->lx = frontend::shape_axis(out->lx, g_config.stick_deadzone[p], g_config.stick_outer[p], g_config.stick_curve[p]);

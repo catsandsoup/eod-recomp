@@ -43,6 +43,8 @@ Per [80.lv — UI Design for Game Dev Tools](https://80.lv/articles/ui-design-fo
   - **Shell:** Native **C++20 + Qt 6 (Widgets/Docking)** *or* **Custom GPU Retained-Mode UI (RmlUi / Clay / custom Plume 2D batcher)** rendered directly on `plume::VulkanDevice` (`runtime/render/plume_device.cpp`) — compiled with the exact same `llvm-mingw` + CMake + Ninja toolchain as `eod.exe`.
   - **Viewport:** Direct **Plume Vulkan** surface sharing `runtime/render/vif_mesh.cpp` and `runtime/render/native_renderer.cpp` — zero Python, zero OpenGL translation, native PS2 GS Fast Mode and Plume HQ Mode inside the same process!
 
+**Phase 2 progress.** The game and the `eod_editor_plume` viewport module share the `eod_plume_scene` pipelines and indexed mesh binding. In a Plume-enabled build, point `EOD_EDITOR_PLUME_LIBRARY` at the built `eod_editor_plume.dylib` or `eod_editor_plume.dll`, then select **Plume HQ** in the Qt editor. The module presents track geometry directly in a native child surface at the viewport's physical pixel size. It samples decoded RGBA textures at their mesh UVs with repeat addressing and base-level linear filtering. Track materials retain their opaque, cutout or translucent treatment, with authored fog. Replacing a texture from PNG and undoing the edit refresh the texture in the viewport. Mipmaps and native editor overlays are pending. Picking uses the editor's existing path. The default Qt preview and PIE remain available without loading the module.
+
 ---
 
 ## 2. Dual-Renderer Strategy & Power-Sipping ("Runs on a Shitbox")
@@ -54,7 +56,15 @@ A PS2 game from 2004 has ~50k–85k triangles per track. An editor for it should
 | Mode | Viewport Behaviour | PIE (`eod.exe`) Env Var | Target Hardware / Use Case |
 |---|---|---|---|
 | **PS2 Fast (`ps2`)** *(Default)* | Lightweight half-Lambert + hemisphere PS2-era shader, linear filtering, cached static VBOs, demand-driven redraw (**~2.3 ms/frame**, **0% idle CPU/GPU**). | `EOD_NATIVE=0` (PS2 GS renderer) | Low-end PCs ("shitboxes"), laptops on battery, rapid level-design iteration. |
-| **Plume HQ (`plume`)** | Enhanced sun + warm bounce + Fresnel/specular sheen + smoothstep aerial fog in viewport. | `EOD_NATIVE=1` (Plume Vulkan native renderer in `runtime/render/native_renderer.cpp`) | High-quality visual testing, HD `HOSTTEX` texture validation, lighting/atmosphere checks. |
+| **Plume HQ (`plume`)** | Enhanced sun, warm bounce, Fresnel/specular sheen and smoothstep aerial fog in the editor viewport. | `--renderer vulkan --require-plume` with `EOD_NATIVE=1`, `EOD_LOOK=modern` and `EOD_MODERN=0`. PIE waits for the native Vulkan renderer's readiness signal. | High-quality visual testing of native Plume materials and authored lighting. |
+
+#### Authored environment scope
+
+`env_override.ini` names the editor track by its `.TRK` archive stem and sets `enabled=1` when authored sun, ambient or fog values differ from Track Default. Plume Modern applies those values to material-lit native gameplay surfaces. Classic, Original, unlit materials, particles and UI use their existing lighting inputs. In-game Plume and the Vulkan GS backend both resolve the active overlay's validated HOSTTEX replacements. Native Plume Classic and Modern have rendered an installed Afton sky replacement at 8192×8192.
+
+Inside the world-frame render at `0x00214B68`, the native feed uses the loaded GRAF pointer at `0x003D1C18` (`0x00214678`). `0x00130D90` stores the GRAF resource record at `GRAF-8`. Its resource-set owner comes from the `0x0043A0E0` and `0x0043A0E4` archive lists (`0x00130AD0`), using links at `+0x120`, record pointer at `+0x124`, count at `+0x140` and `0x44`-byte record strides. Recorded draws carry a scope bit to the GS thread. Outside the world-frame render or when the matching owner is absent, the existing native render inputs apply.
+
+The authored shader uses the editor's two-sided wrap lighting and smoothstep fog over distance to the model-space camera already calculated by the Modern shader. Sun direction changes from the editor's Y-up coordinates to the native feed's Y-down coordinates. RGB is in the editor's `0..1` range. Fog density is the maximum blend factor. The shader clips the range width to at least one world unit, as in the editor.
 
 ### Power-Sipping Rules Enforced
 1. **Event-Driven Dirty Redraw (No 60Hz Spin Loop):** The viewport only calls `paintGL()` when the camera moves, an edit occurs, or the window resizes. When idle, **frame rate = 0 Hz, CPU = 0%, GPU = 0%**.

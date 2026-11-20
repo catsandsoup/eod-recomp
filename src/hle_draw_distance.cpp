@@ -1,10 +1,11 @@
 // Track draw distance (docs/LOD_CULLING_INVESTIGATION.md, "Draw distance").
 //
-// [Video] DrawDistance=1..8 (EOD_DRAW_DISTANCE overrides). 1 = native, no
-// guest writes. Above 1, two native rejection distances grow by the factor:
+// [Video] DrawDistance=1..8 (EOD_DRAW_DISTANCE overrides). Above 1, two
+// native rejection distances grow by the factor:
 //  * f_00214678 (GRAF load): the final cutoff of every mlist LOD group
 //    (squared, f_00357E60), so scenery groups stop vanishing at 100-1000 units.
-//    Level-transition distances stay native.
+//    At Detail=maximum, verified nested masks use the nearest mesh through
+//    the resulting cutoff. Other detail modes keep original transitions.
 //  * f_00212B58 (camera build, in hle_lod.cpp): the projection far plane that
 //    feeds the CPU sphere test 0034E308 and the VU0 mlist frustum test. The
 //    fog range written by the same call is put back to its native values.
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include "core/config.h"
 #include "core/cpu.h"
 #include "core/memory.h"
@@ -61,6 +63,21 @@ bool mlist(uint32_t m, Mlist &out) {
            (!out.nm || ram(out.models, out.nm * 32));
 }
 
+// The selector compares distance squared against three ordered thresholds
+// and returns masks 0, 1, 5, 21 as those thresholds are crossed. A retail
+// two/three-level group has meshes in each interval before its last finite
+// threshold, and no meshes in the final rejected interval.
+int last_lod_transition(const float distances[3], uint8_t occupied_masks) {
+    if (!(distances[0] > 0) || !std::isfinite(distances[0]) || distances[0] >= eod_draw::kOpenEnded ||
+        !std::isfinite(distances[1]) || !(distances[1] > distances[0]) ||
+        !std::isfinite(distances[2]) || distances[2] < distances[1]) return 0;
+    if (occupied_masks == 0x03 && distances[1] < eod_draw::kOpenEnded &&
+        distances[2] >= eod_draw::kOpenEnded) return 1;
+    if (occupied_masks == 0x23 && distances[2] > distances[1] &&
+        distances[2] < eod_draw::kOpenEnded) return 2;
+    return 0;
+}
+
 // Diagnostic replica of 0034E308 (no guest call): 1 when the sphere passes.
 bool in_view(const float c[3], float r) {
     float d[3], row[3][3];
@@ -92,25 +109,45 @@ void eod_draw_distance_native_fog(float source) {
 extern "C" void f_00214678() {
     f_00214678_orig();
     const float k = configured();
-    if (k == 1) return;
+    const bool maximum = g_config.detail == "maximum";
+    if (k == 1 && !maximum) return;
     const uint32_t graf = ee_r32(kGraf);
     if (!ram(graf, 12)) return;
     // Native relocation (f_00358F50) is unguarded, so each loader call works on
     // freshly loaded bytes: scaling once here cannot compound.
     for (unsigned which = 1; which <= 2; ++which) {
+        const uint32_t address = ee_r32(graf + which * 4);
+        if (which == 2 && address == ee_r32(graf + 4)) continue;
         Mlist m;
-        if (!mlist(ee_r32(graf + which * 4), m)) continue;
-        unsigned scaled = 0, kept = 0;
+        if (!mlist(address, m)) continue;
+        std::vector<uint8_t> occupied_masks;
+        if (maximum) {
+            occupied_masks.resize(m.ng);
+            const uint32_t first_group = 1 + m.ns;
+            for (uint32_t i = 0; i < m.nm; ++i) {
+                const uint32_t condition = ee_r32(m.models + i * 32 + 16);
+                const uint32_t parent = condition & 0xffff, mask = condition >> 16;
+                if (parent >= first_group && parent < first_group + m.ng)
+                    occupied_masks[parent - first_group] |= mask <= 5 ? 1u << mask : 0x80;
+            }
+        }
+        unsigned scaled = 0, maximum_groups = 0;
         for (uint32_t g = 0; g < m.ng; ++g) {
             const uint32_t rec = m.groups + g * 32;
             float t[3] = {loadf(rec), loadf(rec + 4), loadf(rec + 8)};
+            const int last = maximum ? last_lod_transition(t, occupied_masks[g]) : 0;
             const int slot = eod_draw::scale_cutoff(t, k);
-            if (slot < 0) { ++kept; continue; }
-            storef(rec + slot * 4, t[slot]);
-            ++scaled;
+            if (slot >= 0) {
+                storef(rec + slot * 4, t[slot]);
+                ++scaled;
+            }
+            if (last > 0) {
+                for (int i = 0; i < last; ++i) storef(rec + i * 4, t[last]);
+                ++maximum_groups;
+            }
         }
-        std::fprintf(stderr, "[draw] mlist%c groups=%u cutoff_scaled=%u unchanged=%u factor=%.9g\n",
-                     which == 1 ? 'A' : 'B', m.ng, scaled, kept, double(k));
+        std::fprintf(stderr, "[draw] mlist%c groups=%u cutoff_scaled=%u maximum_lod_groups=%u factor=%.9g\n",
+                     which == 1 ? 'A' : 'B', m.ng, scaled, maximum_groups, double(k));
     }
 }
 
@@ -121,7 +158,7 @@ extern "C" void f_00214678() {
 // writes every frame: guest vblank, interval since the previous calc (us), calc
 // time (us), camera position/heading and the per-test counts.
 namespace {
-struct Counts { unsigned sph, drawn, lod, cut, cut_view, cut_far, hidden, frustum; float cut_min; };
+struct Counts { unsigned sph, drawn, drawn_lower_lod, lod, cut, cut_view, cut_far, hidden, frustum; float cut_min; };
 FILE *frame_log() {
     static FILE *f = [] {
         const char *path = std::getenv("EOD_FRAME_LOG");
@@ -161,7 +198,11 @@ extern "C" void f_003582B8() {
     for (uint32_t i = 0; i < m.nm; ++i) {
         const uint32_t rec = m.models + i * 32;
         const uint32_t parent = ee_r32(rec + 16) & 0xffff, required = ee_r32(rec + 16) >> 16;
-        if (s[mbase + i]) { ++n.drawn; continue; }
+        if (s[mbase + i]) {
+            ++n.drawn;
+            n.drawn_lower_lod += parent >= gbase && parent < mbase && required != 0;
+            continue;
+        }
         const uint8_t pv = parent < mbase ? s[parent] & 0x7f : 0;
         if (pv == required) { ++n.frustum; continue; }
         if (parent < gbase) { ++n.hidden; continue; }
@@ -195,10 +236,10 @@ extern "C" void f_003582B8() {
     }
     if (!print) return;
     ++lines;
-    std::fprintf(stderr, "[cull] call=%u vblank=%llu mlist%c cam=%.1f,%.1f,%.1f heading=%.1f far=%.6g fog=%.6g..%.6g spheres=%u/%u models=%u drawn=%u lod_swap=%u "
+    std::fprintf(stderr, "[cull] call=%u vblank=%llu mlist%c cam=%.1f,%.1f,%.1f heading=%.1f far=%.6g fog=%.6g..%.6g spheres=%u/%u models=%u drawn=%u drawn_lower_lod=%u lod_swap=%u "
                  "group_cut=%u group_cut_in_view=%u group_cut_beyond_far=%u nearest_cut_in_view=%.1f parent_sphere_hidden=%u frustum=%u\n",
                  calls, (unsigned long long)ee_r32(kVblank), which, double(cam[0]), double(cam[1]), double(cam[2]), double(heading), double(far),
-                 double(loadf(kFog + 4)), double(loadf(kFog + 8)), n.sph, m.ns, m.nm, n.drawn, n.lod, n.cut, n.cut_view, n.cut_far,
+                 double(loadf(kFog + 4)), double(loadf(kFog + 8)), n.sph, m.ns, m.nm, n.drawn, n.drawn_lower_lod, n.lod, n.cut, n.cut_view, n.cut_far,
                  double(n.cut_min), n.hidden, n.frustum);
     for (unsigned i = 0; i < nn; ++i)
         std::fprintf(stderr, "[cull]   cut model=%u at=%.1f,%.1f,%.1f r=%.1f distance=%.1f group_cutoff=%.1f\n", nearest[i].idx,

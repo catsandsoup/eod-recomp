@@ -5,6 +5,8 @@
 #include "core/config.h"
 #include "core/cpu.h"
 #include "core/memory.h"
+#include "session_start.h"
+#include "visual_car_list.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +20,8 @@ EEState g_ee{};
 uint8_t *g_ram = nullptr;
 Config::Config() = default;
 Config g_config;
+int session_ai_override() { return -1; }
+extern "C" uint32_t eod_visual_car_slot_read(uint32_t address) { return ee_r32(address); }
 
 namespace {
 constexpr uint32_t battle = 0x18000224;

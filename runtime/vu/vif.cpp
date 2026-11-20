@@ -12,6 +12,8 @@
 #include <string>
 
 #include "../core/log.h"
+#include "../core/diff_harness.h"
+#include "ee.h"
 #include "../gs/gs.h"
 #include "../kernel/kernel.h"
 #include "vu.h"
@@ -19,9 +21,12 @@
 #include "../render/native_renderer.h"
 
 extern uint32_t g_vif1_top, g_vif1_itop;
+extern uint32_t g_vif1_dma_tag;
 extern uint8_t *g_ram;
-// VU1 program starts per program address (addr / 8), for EOD_RENDER_TRACE (src/render_trace.cpp).
+// VU1 execution dispatches per program address (addr / 8), for EOD_RENDER_TRACE.
 uint32_t g_vu1_program_starts[0x800];
+uint32_t g_vu1_camera_nops = 0;
+uint32_t g_vu1_world_leaf_retires = 0;
 // Called at each VU1 program start when set (EOD_RENDER_TRACE).
 void (*g_vu1_start_hook)(uint32_t addr) = nullptr;
 extern uint32_t g_vu_micro_gen[2];  // vu.cpp
@@ -44,17 +49,38 @@ Vif g_vif[2];
 
 uint32_t avail(const Vif &v) { return (uint32_t)(v.q.size() - v.qpos); }
 
-void start_micro(Vif &v, uint32_t addr) {
+bool matches_world_leaf_ref(const Vif &v, const uint32_t *payload) {
+    constexpr uint32_t source = 0x0109D050;  // leaf 0x0109D018 + the 0x38-byte batch header
+    const uint32_t tag = g_vif1_dma_tag;
+    return payload == reinterpret_cast<const uint32_t *>(g_ram + source) &&
+           !(tag & 15) && tag <= EE_RAM_SIZE - 16 &&
+           MEM_LW(tag) == 0x30000020 && MEM_LW(tag + 4) == source &&
+           MEM_LW(tag + 8) == 0x04000080 && MEM_LW(tag + 12) == 0x05000000 &&
+           v.base == 0xE0 && v.ofst == 0x190 && v.mode == 0 && v.cycle == 0x0101 &&
+           v.itop == 0x80 && v.top == (v.dbf ? 0xE0u : 0x270u) &&
+           v.tops == (v.dbf ? 0x270u : 0xE0u);
+}
+
+void start_micro(Vif &v, uint32_t addr, bool camera_nop = false, const uint32_t *ref_payload = nullptr) {
     if (v.n == 1) {
-        g_vu1_program_starts[(addr >> 3) & 0x7FF]++;
-        if (g_vu1_start_hook) g_vu1_start_hook(addr);
         v.itop = v.itops;
         v.top = v.tops;
         v.dbf = !v.dbf;
         v.tops = v.dbf ? v.base + v.ofst : v.base;
         g_vif1_top = v.top;
         g_vif1_itop = v.itop;
-        if (native::enabled()) native::vu1_start(addr, v.itop);
+        const bool retire_world_leaf = native::vu1_start(addr, v.itop);
+        if (camera_nop && vu_retire_camera_nop(v.vu, addr)) {
+            ++g_vu1_camera_nops;
+            return;
+        }
+        if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload) &&
+            vu_retire_world_leaf(v.vu, addr, ref_payload, v.top)) {
+            ++g_vu1_world_leaf_retires;
+            return;
+        }
+        g_vu1_program_starts[(addr >> 3) & 0x7FF]++;
+        if (g_vu1_start_hook) g_vu1_start_hook(addr);
     } else {
         v.itop = v.itops;
     }
@@ -355,6 +381,10 @@ void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
 // Executes the complete commands at the start of w[0..n); returns the
 // number of words consumed.
 size_t run(Vif &v, const uint32_t *w, size_t n) {
+    // The camera producer writes one CNT payload with both MSCALs and the matrix UNPACK.
+    constexpr uint32_t camera_header[] = {0x1400049B, 0x1400049B, 0x00006666, 0x6C104001};
+    const bool camera_packet = v.n == 1 && n == 68 && std::memcmp(w, camera_header, sizeof(camera_header)) == 0 &&
+                               native::take_camera_packet(g_vif1_dma_tag);
     size_t pos = 0;
     for (;;) {
         size_t left = n - pos;
@@ -399,7 +429,9 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
             break;
         case 0x14:  // MSCAL
             LOG(LOG_VIF, "VIF%d MSCAL %04x", v.n, imm * 8);
-            start_micro(v, imm * 8);
+            // The supported REF has a complete 32-qword VIF payload and MSCAL at dword 124.
+            start_micro(v, imm * 8, camera_packet && pos < 2,
+                        v.n == 1 && n == 128 && pos == 124 ? w : nullptr);
             break;
         case 0x15: start_micro(v, imm * 8); break;       // MSCALF
         case 0x17: start_micro(v, v.vu->tpc); break;     // MSCNT
@@ -422,9 +454,22 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
             break;
         }
         case 0x50:
-        case 0x51:  // DIRECT / DIRECTHL
-            gif_transfer(GIF_PATH2, reinterpret_cast<const uint8_t *>(d), imm ? imm : 65536);
+        case 0x51: {  // DIRECT / DIRECTHL
+            const uint32_t qwc = imm ? imm : 65536;
+            native::SceneClear clear;
+            native::DisplayCopy copy;
+            const bool has_clear = v.n == 1 && native::take_scene_clear(g_vif1_dma_tag, qwc, clear);
+            const bool has_copy = v.n == 1 && native::take_display_copy(g_vif1_dma_tag, qwc, copy);
+            const auto shadow = v.n == 1 ? native::take_shadow_pass(g_vif1_dma_tag, qwc) : native::ShadowPass::None;
+            // 0x35BE08 writes this CNT immediately after the 0x35BBD0
+            // history packet in the fixed boot display chain at 0x4D70C0.
+            const bool boot_quad = v.n == 1 && qwc == native::kBootstrapQuadDirectQwc &&
+                                  g_vif1_dma_tag == 0x4d7650 && native::bootstrap_raster_enabled() &&
+                                  !diff_in_original_side();
+            gif_transfer(GIF_PATH2, reinterpret_cast<const uint8_t *>(d), qwc,
+                         has_clear ? &clear : nullptr, has_copy ? &copy : nullptr, shadow, boot_quad);
             break;
+        }
         default:
             if ((cmd & 0x60) == 0x60) {
                 do_unpack(v, c, d);

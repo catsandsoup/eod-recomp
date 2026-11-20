@@ -5,6 +5,20 @@ import SwiftUI
 struct MainView: View {
     @ObservedObject var state: StudioState
     @State private var wireframe = false
+    @State private var assetPane: AssetPane = .sources
+
+    private enum AssetPane: String, CaseIterable, Identifiable {
+        case sources = "Game Sources"
+        case assets = "Assets"
+        case preview = "Preview"
+        case inspector = "Inspector"
+
+        var id: Self { self }
+    }
+
+    // Leave room for the split dividers and a usable editor between the three side panes.
+    private let splitViewMinimumWidth: CGFloat = 1_000
+
     var body: some View {
         content
         #if DEBUG || EOD_KIT_MEASURE
@@ -14,29 +28,7 @@ struct MainView: View {
 
     private var content: some View {
         VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("EVE OF DESTRUCTION").font(.system(size: 10, weight: .bold, design: .rounded)).tracking(2).foregroundStyle(.secondary)
-                    Text("Creation Kit").font(.system(size: 19, weight: .semibold))
-                }
-                Divider().frame(height: 28).padding(.horizontal, 8)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(URL(fileURLWithPath: state.project).deletingLastPathComponent().lastPathComponent).font(.headline)
-                    Text(state.editingAsset.isEmpty ? "Project" : "\(state.editingAsset)\(state.dirty ? " · Unsaved" : "")")
-                        .font(.caption).foregroundStyle(state.dirty ? .orange : .secondary)
-                }
-                Spacer()
-                Button("Open Project…") { state.openProject() }
-                Button("Game Folder…") { state.chooseDisc() }
-                Button("Export All Textures…") { state.exportAllTextures() }
-                Button("Save & Build") { state.save() }.disabled(!state.canSave)
-                if state.gameRunning {
-                    Button("Stop Test") { state.stopGame() }
-                } else {
-                    Button("Run Mod in Game") { state.testGame() }.disabled(!state.canTest)
-                }
-            }
-            .padding(12).disabled(state.busy)
+            projectHeader
             Divider()
             HStack(spacing: 6) {
                 ForEach(["Assets", "Mods"], id: \.self) { tab in
@@ -47,78 +39,69 @@ struct MainView: View {
                     }.buttonStyle(.plain)
                 }
                 Spacer()
-                Text(state.archive.isEmpty ? "No archive selected" : state.archive).font(.caption.monospaced()).foregroundStyle(.secondary)
-                if state.detail?.kind == "model" { Toggle("Wireframe", isOn: $wireframe).toggleStyle(.checkbox).font(.caption) }
+                Text(state.archive.isEmpty ? "No archive selected" : state.archive)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle).help(state.archive)
+                if state.detail?.kind == "model" { Toggle("Wireframe", isOn: $wireframe).toggleStyle(.checkbox).font(.caption).fixedSize() }
             }.padding(.horizontal, 12).padding(.vertical, 7).background(Color.black.opacity(0.15))
             Divider()
-            if state.studio == "Mods" { ModsView(state: state) } else {
-            HSplitView {
-                VStack(alignment: .leading, spacing: 0) {
-                    Label("Game Sources", systemImage: "externaldrive.fill").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(12)
-                    List(selection: Binding<String?>(get: { state.archive.isEmpty ? nil : state.archive },
-                        set: { if let value = $0 { state.selectArchive(value) } })) {
-                        ForEach(state.archives) { item in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.name).font(.system(.body, design: .monospaced))
-                                Text("\(item.count) assets · \(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file))")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }.tag(item.path).help(item.path)
+            if state.studio == "Mods" {
+                ModsView(state: state)
+            } else {
+                GeometryReader { geometry in
+                    if geometry.size.width >= splitViewMinimumWidth {
+                        HSplitView {
+                            gameSources.frame(minWidth: 150, idealWidth: 180, maxWidth: 240)
+                            assetList.frame(minWidth: 150, idealWidth: 180, maxWidth: 240)
+                            assetPreview.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
+                            inspector.frame(minWidth: 250, idealWidth: 280, maxWidth: 340)
                         }
-                    }.disabled(state.busy || state.gameRunning)
-                }.frame(minWidth: 150, idealWidth: 180, maxWidth: 240)
-                VStack(alignment: .leading, spacing: 0) {
-                    TextField("Find asset or type", text: $state.search).textFieldStyle(.roundedBorder).padding(10)
-                    List(selection: Binding<String?>(get: { state.asset.isEmpty ? nil : state.asset },
-                        set: { if let value = $0 { state.selectAsset(value) } })) {
-                        ForEach(state.filteredAssets) { item in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.name).font(.system(.body, design: .monospaced))
-                                Text("\(item.type) · \(item.size.formatted()) bytes").font(.caption).foregroundStyle(.secondary)
-                            }.tag(item.name)
-                        }
-                    }.disabled(state.busy || state.gameRunning)
-                }.frame(minWidth: 150, idealWidth: 180, maxWidth: 240)
-                VStack(alignment: .leading, spacing: 0) {
-                    if let detail = state.detail {
-                        HStack(alignment: .firstTextBaseline) {
-                            Text(detail.name).font(.title2.weight(.semibold))
-                            Text(detail.type).font(.caption.monospaced()).foregroundStyle(.secondary)
-                            Spacer()
-                            Button("Export File…") { state.exportNativeAsset() }.font(.caption).disabled(state.busy)
-                        }.padding(16)
-                        Divider()
-                        assetContent(detail)
-                        Divider()
-                        Text("\(detail.size.formatted()) bytes · SHA256 \(detail.sha256.prefix(16))")
-                            .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).padding(10)
                     } else {
-                        Spacer()
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(state.asset.isEmpty ? "Game Asset Workspace" : state.asset).font(.title2)
-                            Text("\(state.archives.count) archives · \(state.assetCount.formatted()) assets").foregroundStyle(.secondary)
-                        }.padding(24)
-                        Spacer()
+                        VStack(spacing: 0) {
+                            Picker("Asset workspace pane", selection: $assetPane) {
+                                ForEach(AssetPane.allCases) { pane in
+                                    Text(pane.rawValue).tag(pane)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .padding(8)
+                            Divider()
+                            Group {
+                                switch assetPane {
+                                case .sources: gameSources
+                                case .assets: assetList
+                                case .preview: assetPreview
+                                case .inspector: inspector
+                                }
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        }
                     }
-                }.frame(minWidth: 350, maxWidth: .infinity, maxHeight: .infinity)
-                inspector.frame(minWidth: 250, idealWidth: 280, maxWidth: 340)
-            }
+                }
             }
             if let error = state.error {
                 Divider()
                 HStack(alignment: .top) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text(error).font(.callout).textSelection(.enabled)
-                    Spacer()
-                    Button("Dismiss") { state.error = nil }
+                    ViewThatFits(in: .vertical) {
+                        Text(error).fixedSize(horizontal: false, vertical: true)
+                        ScrollView {
+                            Text(error).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .font(.callout).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, maxHeight: 80, alignment: .topLeading)
+                    Button("Dismiss") { state.error = nil }.fixedSize()
                 }.padding(10).background(Color.orange.opacity(0.08))
             }
             Divider()
             HStack {
                 if state.exportRunning, let export = state.exportStatus {
-                    ProgressView(value: Double(export.done), total: Double(max(export.total, 1))).frame(width: 220)
+                    ProgressView(value: Double(export.done), total: Double(max(export.total, 1))).frame(minWidth: 80, idealWidth: 120, maxWidth: 160)
                     Button("Cancel Export") { Task { await state.cancelExport() } }.font(.caption)
                 } else if state.loading || state.isWriting { ProgressView().controlSize(.small) }
-                Text(state.status).lineLimit(1).font(.caption).textSelection(.enabled)
+                Text(state.status).lineLimit(1).font(.caption).textSelection(.enabled).help(state.status)
                 Spacer()
                 if let path = state.logPath {
                     Button("Session Log") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }.font(.caption)
@@ -128,10 +111,121 @@ struct MainView: View {
         }
     }
 
+    private var projectHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack {
+                projectIdentity
+                Spacer()
+                projectActions
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                projectIdentity
+                projectActions
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .disabled(state.busy)
+    }
+
+    private var projectIdentity: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("EVE OF DESTRUCTION").font(.system(size: 10, weight: .bold, design: .rounded)).tracking(2).foregroundStyle(.secondary)
+                Text("Creation Kit").font(.system(size: 19, weight: .semibold))
+            }
+            .fixedSize()
+            Divider().frame(height: 28).padding(.horizontal, 8)
+            let projectName = URL(fileURLWithPath: state.project).deletingLastPathComponent().lastPathComponent
+            let editing = state.editingAsset.isEmpty ? "Project" : "\(state.editingAsset)\(state.dirty ? " · Unsaved" : "")"
+            VStack(alignment: .leading, spacing: 4) {
+                Text(projectName).font(.headline).help(projectName)
+                Text(editing).font(.caption).foregroundStyle(state.dirty ? .orange : .secondary).help(editing)
+            }
+            .lineLimit(1)
+            .truncationMode(.middle)
+        }
+    }
+
+    private var projectActions: some View {
+        HStack {
+            Button("Open Project…") { state.openProject() }
+            Button("Game Folder…") { state.chooseDisc() }
+            Button("Export All Textures…") { state.exportAllTextures() }
+            Button("Save & Build") { state.save() }.disabled(!state.canSave)
+            if state.gameRunning {
+                Button("Stop Test") { state.stopGame() }
+            } else {
+                Button("Run Mod in Game") { state.testGame() }.disabled(!state.canTest)
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var gameSources: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Label("Game Sources", systemImage: "externaldrive.fill").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(12)
+            List(selection: Binding<String?>(get: { state.archive.isEmpty ? nil : state.archive }, set: { value in
+                if let value { state.selectArchive(value) }
+            })) {
+                ForEach(state.archives) { item in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.name).font(.system(.body, design: .monospaced))
+                        Text("\(item.count) assets · \(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }.tag(item.path).help(item.path)
+                }
+            }.disabled(state.busy || state.gameRunning)
+        }
+    }
+
+    private var assetList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            TextField("Find asset or type", text: $state.search).textFieldStyle(.roundedBorder).padding(10)
+            List(selection: Binding<String?>(get: { state.asset.isEmpty ? nil : state.asset }, set: { value in
+                if let value { state.selectAsset(value) }
+            })) {
+                ForEach(state.filteredAssets) { item in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.name).font(.system(.body, design: .monospaced))
+                        Text("\(item.type) · \(item.size.formatted()) bytes").font(.caption).foregroundStyle(.secondary)
+                    }.tag(item.name)
+                }
+            }.disabled(state.busy || state.gameRunning)
+        }
+    }
+
+    private var assetPreview: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let detail = state.detail {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(detail.name).font(.title2.weight(.semibold))
+                        .lineLimit(2).truncationMode(.middle).help(detail.name)
+                    Text(detail.type).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .lineLimit(1).help(detail.type)
+                    Spacer()
+                    Button("Export File…") { state.exportNativeAsset() }.font(.caption).disabled(state.busy).fixedSize()
+                }.padding(16)
+                Divider()
+                assetContent(detail)
+                Divider()
+                Text("\(detail.size.formatted()) bytes · SHA256 \(detail.sha256.prefix(16))")
+                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).padding(10)
+            } else {
+                Spacer()
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(state.asset.isEmpty ? "Game Asset Workspace" : state.asset).font(.title2)
+                    Text("\(state.archives.count) archives · \(state.assetCount.formatted()) assets").foregroundStyle(.secondary)
+                }.padding(24)
+                Spacer()
+            }
+        }
+    }
+
     @ViewBuilder private func assetContent(_ detail: AssetDetail) -> some View {
         if detail.kind == "model", let parts = detail.parts {
             VStack(alignment: .leading, spacing: 0) {
-                RetailMeshView(parts: parts, identity: detail.sha256, wireframe: wireframe).frame(minHeight: 300)
+                RetailMeshView(parts: parts, identity: detail.sha256, wireframe: wireframe).frame(minHeight: 100, maxHeight: .infinity)
                 Text("\(parts.count) parts · \(parts.reduce(0) { $0 + $1.positions.count }.formatted()) vertices · \(parts.reduce(0) { $0 + $1.triangles.count }.formatted()) triangles")
                     .font(.caption).foregroundStyle(.secondary).padding(12)
                 if let paint = detail.paintDescription {
@@ -139,8 +233,12 @@ struct MainView: View {
                 }
                 let issues = Array(Set(parts.compactMap(\.textureError))).sorted()
                 if !issues.isEmpty {
-                    Text(issues.joined(separator: "\n") + "\nMissing textures appear gray.")
-                        .font(.caption).foregroundStyle(.secondary).padding([.horizontal, .bottom], 12)
+                    ScrollView {
+                        Text(issues.joined(separator: "\n") + "\nMissing textures appear gray.")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .font(.caption).foregroundStyle(.secondary).padding([.horizontal, .bottom], 12)
+                    }
+                    .frame(maxHeight: 80)
                 }
             }
         } else if detail.kind == "texture", let path = detail.image {
@@ -196,7 +294,10 @@ struct MainView: View {
                         Text(environment.track).font(.title3.weight(.semibold))
                         Text("Track Environment").font(.caption).foregroundStyle(.secondary)
                         Text("\(environment.skyTextures.count) sky tiles · \(environment.textures.count) textures").font(.caption)
-                        Button("Show Sky Textures") { state.search = "sky" }
+                        Button("Show Sky Textures") {
+                            state.search = "sky"
+                            assetPane = .assets
+                        }
                         Divider()
                         Text("Sky tint (red, green, blue multipliers)").font(.caption.weight(.semibold))
                         HStack {
@@ -280,30 +381,36 @@ struct ModsView: View {
                 Spacer()
             }
             Divider()
-            let packages = state.profile?.packages ?? []
-            if packages.isEmpty {
-                Text("No mods installed").foregroundStyle(.secondary)
-            }
-            ForEach(packages) { item in
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(item.id) \(item.version)").font(.system(.body, design: .monospaced))
-                        Text(item.error ?? "\(item.native ?? 0) changed files · \(item.host ?? 0) high-resolution textures")
-                            .font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    let packages = state.profile?.packages ?? []
+                    if packages.isEmpty {
+                        Text("No mods installed").foregroundStyle(.secondary)
                     }
-                    Spacer()
-                    Button(item.enabled ? "Disable" : "Enable") {
-                        Task { await state.profileOperation(item.enabled ? "profile_disable" : "profile_enable", id: item.id) }
+                    ForEach(packages) { item in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(item.id) \(item.version)").font(.system(.body, design: .monospaced))
+                                Text(item.error ?? "\(item.native ?? 0) changed files · \(item.host ?? 0) high-resolution textures")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(item.enabled ? "Disable" : "Enable") {
+                                Task { await state.profileOperation(item.enabled ? "profile_disable" : "profile_enable", id: item.id) }
+                            }
+                            Button("Uninstall") { Task { await state.profileOperation("profile_uninstall", id: item.id) } }
+                        }.disabled(state.busy || state.gameRunning)
                     }
-                    Button("Uninstall") { Task { await state.profileOperation("profile_uninstall", id: item.id) } }
-                }.disabled(state.busy || state.gameRunning)
+                    ForEach(state.profile?.conflicts.filter { !$0.accepted } ?? [], id: \.key) { conflict in
+                        Label("\(conflict.key) is changed by \(conflict.packages.joined(separator: ", "))", systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout).foregroundStyle(.orange)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            ForEach(state.profile?.conflicts.filter { !$0.accepted } ?? [], id: \.key) { conflict in
-                Label("\(conflict.key) is changed by \(conflict.packages.joined(separator: ", "))", systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout).foregroundStyle(.orange)
-            }
-            Spacer()
-        }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

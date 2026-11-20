@@ -25,7 +25,8 @@ C++ (src/render_queue.cpp, section "Readable replacement"); `0x35DBD8`/`0x35A810
 | 0x0C | matrix handle |
 | 0x10 | material/texture id (`a2`, or -1 when `0x35DF40` says the batch has none) |
 
-   Pool base `*(0x4C96C4)`, count `*(0x4C96C8)`, capacity `0xC00` records (a PS2-era fixed cap).
+   The original guest pool is at `*(0x4C96C4)`, with the count at `*(0x4C96C8)` and space for
+   `0xC00` records. Original rejects the append that would raise the count to `0xC00`.
    Buckets: `0x4C96D0 + 4*(key+1) + 0x800*(*(0x4CA6D0))` (two bucket sets, double-buffered by
    `0x4CA6D0`).
 5. Flush `0x34AF98(set, ...)` walks the buckets. Per record: matrix change -> `0x35E018`,
@@ -51,7 +52,7 @@ Source: Ghidra 12.2 decompile of SLUS_209.10 (EE module), callers from Ghidra re
 not yet confirmed with a runtime call trace.
 
 The three frame renderers have the same shape: `0x20F2D8` (race view; per split-screen viewport),
-`0x20F4A0` (up to 20 entries of `0x3D1C90`, each drawn by `0x21A9B0`) and `0x22D7F0` (list at
+`0x20F4A0` (visual-car slots from `0x3D1C90`, each drawn by `0x21A9B0`) and `0x22D7F0` (list at
 `*(0x3D2138)`, each drawn by `0x22ECB8`):
 
 ```
@@ -217,6 +218,21 @@ Correction to older docs: skin weights are floats biased by 32768 (`w - 32768`),
 Counts are the last power-of-two report (the game exits without the final summary). Each
 replacement makes the same guest calls in the same order with the same return addresses, the same
 frame size and the same `$v0`, so wrappers and traces behave as before.
+
+### Native draw-record capacity
+
+Both `0x34B140` and `0x34BF90` continue into an adaptive host list once the guest pool fills.
+Host links are indices within the immediate or view queue. A flush follows the layer's original
+texture key order and draws each key's newer host records before its older guest records. The
+scene tap gets the same batch, clip, matrix and material values for either storage location.
+
+Beginning a view and resetting after layer 9 clear pending links. Set 0 also retires its host
+records after the last pending immediate bucket is drained. Underused storage is released after
+64 resets at no more than one-quarter capacity. The guest allocation and teardown hooks
+(`0x34D1F8` and `0x34D088`) release native overflow when the model renderer changes lifetime.
+The alternate generated reset entry points, `0x34C828` and `0x34C8C0`, clear pending host links
+alongside the guest queue. Original and configured `EOD_DIFF` runs retain the guest pool and its
+original capacity so the generated EE readers and diff snapshots see the expected layout.
 
 Record fields in game terms: `+0x08` is the frustum test's "partly outside" flag (it selects the
 clipping path, ITOP bit 0x200), not a caller flag; `+0x0C` is the matrix packet pointer returned by

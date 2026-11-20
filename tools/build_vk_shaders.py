@@ -33,7 +33,7 @@ ENTRIES = [
     ("ps_readback_depth", "frag", "VK_PASS"),
     ("ps_copy", "frag", "VK_PASS"),
 ]
-DUAL_SOURCE = {"ps_draw"}
+DUAL_SOURCE = {"ps_draw", "ps_bootstrap_quad"}
 # The front-end overlay (runtime/ui) has its own source and output so the GS
 # shaders above are never rebuilt for it.
 OVERLAY_SRC = os.path.join(ROOT, "runtime", "gs", "vulkan", "overlay_vk.hlsl")
@@ -84,6 +84,21 @@ def emit(tmp, entries, out_path, src, origin):
 
 
 def main():
+    if "--bootstrap-quad" in sys.argv:
+        src = os.path.join(ROOT, "runtime", "render", "bootstrap_quad.hlsl")
+        out = os.path.join(ROOT, "runtime", "render", "bootstrap_quad_spv.inc")
+        with tempfile.TemporaryDirectory() as tmp:
+            emit(tmp, [("vs_bootstrap_quad", "vert", "VK_BOOTSTRAP"),
+                       ("ps_bootstrap_quad", "frag", "VK_BOOTSTRAP")], out, src,
+                 "runtime/render/bootstrap_quad.hlsl")
+        return
+    if "--display-history" in sys.argv:
+        src = os.path.join(ROOT, "runtime", "gs", "vulkan", "display_history_vk.hlsl")
+        out = os.path.join(ROOT, "runtime", "gs", "vulkan", "display_history_vk.inc")
+        with tempfile.TemporaryDirectory() as tmp:
+            emit(tmp, [("ps_display_history", "frag", "VK_PASS")], out, src,
+                 "runtime/gs/vulkan/display_history_vk.hlsl")
+        return
     if "--overlay" in sys.argv:
         tmp = tempfile.mkdtemp()
         emit(tmp, [(e, st, "VK_OVERLAY") for e, st in OVERLAY_ENTRIES], OVERLAY_OUT, OVERLAY_SRC,

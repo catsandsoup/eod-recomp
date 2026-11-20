@@ -15,6 +15,7 @@ import shutil
 import struct
 import tempfile
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,10 +33,12 @@ from world_loader import (
     WorldMarker,
     WorldObject,
     compose_transform,
+    load_track_world,
     parse_bppt,
     query_bppt_plane,
 )
 import modding_backend as mb
+import mod_package
 import rst0
 import texture_identity as tex_id
 import valt
@@ -699,7 +702,7 @@ class ModifyBarrierCommand(QUndoCommand):
 
 
 class SetAllWallsNoclipCommand(QUndoCommand):
-    """Undoable toggle flattening all vertical SOBL + obstacle.val walls while keeping SCOL/BPPT ground solid."""
+    """Undoable export setting independent of the project's individual barrier edits."""
 
     def __init__(
         self,
@@ -714,37 +717,12 @@ class SetAllWallsNoclipCommand(QUndoCommand):
         self.enabled = bool(enabled)
         self.prev_enabled = bool(world.all_walls_noclip)
         self.on_change = on_change
-        self.old_states: dict[int, dict[str, Any] | None] = {}
-        self.plan: dict[int, float] = {}
-        if self.enabled:
-            self.plan = plan_all_walls_noclip(world)
-            for idx in self.plan:
-                self.old_states[idx] = world.collision.snapshot_barrier_state(idx)
-        else:
-            for idx in list(world.collision.sobl_edits.keys()):
-                self.old_states[int(idx)] = world.collision.snapshot_barrier_state(int(idx))
-
     def redo(self) -> None:
         self.world.all_walls_noclip = self.enabled
-        if self.enabled:
-            for idx, top in self.plan.items():
-                if 0 <= idx < len(self.world.collision.sobl_records):
-                    try:
-                        ed = wc.plan_box_edit(self.world.collision.sobl_records[idx], top)
-                        self.world.collision.apply_barrier_edit(idx, ed)
-                    except Exception:
-                        pass
-        else:
-            for idx in list(self.old_states.keys()):
-                self.world.collision.restore_barrier_state(idx, None)
-        self.world.collision.rebuild_sobl_lines()
         self.on_change()
 
     def undo(self) -> None:
         self.world.all_walls_noclip = self.prev_enabled
-        for idx, st in self.old_states.items():
-            self.world.collision.restore_barrier_state(idx, st)
-        self.world.collision.rebuild_sobl_lines()
         self.on_change()
 
 
@@ -1020,7 +998,7 @@ def plan_clamp_sky_walls_to_assets(
             mask = (v_maxx >= rlo_x) & (v_minx <= rhi_x) & (v_maxz >= rlo_z) & (v_minz <= rhi_z)
             if np.any(mask):
                 max_vis_top = float(v_maxy[mask].max())
-                vis_h = max(0.8, min(12.0, (max_vis_top - gnd_y) + asset_clearance))
+                vis_h = max(0.8, (max_vis_top - gnd_y) + asset_clearance)
                 if cur_above > vis_h + 0.35:
                     plan[ridx] = vis_h
                     clamped_to_asset += 1
@@ -1040,26 +1018,22 @@ def plan_clamp_sky_walls_to_assets(
     }
 
 
-def plan_all_walls_noclip(world: TrackWorld, target_top: float = -0.5) -> dict[int, float]:
-    """Flatten all vertical SOBL barriers below ground while keeping horizontal SCOL/BPPT ground solid."""
-    plan: dict[int, float] = {}
-    for rec in world.collision.sobl_records:
-        if rec.get("kind") != "box" or not rec.get("vertical"):
-            continue
-        if float(rec.get("above_ground", 0.0)) > target_top + 0.05:
-            plan[int(rec["index"])] = float(target_top)
-    return plan
-
-
 # ---------------------------------------------------------------------------
 # Real In-Game Skybox (Presets + 4K/8K HDRI Equirectangular) + Bulk Texture Pack
 # ---------------------------------------------------------------------------
 def write_env_override_ini(world: TrackWorld, out_dir: Path) -> Path:
-    """Write `mods/<Project>/env_override.ini` so eod.exe renders matching sun, ambient & fog."""
+    """Write track-scoped lighting and fog settings for native Plume Modern."""
     env = world.environment
     sd = env.sun_direction()
+    defaults = EnvironmentState()
+    authored = any(getattr(env, field) != getattr(defaults, field) for field in (
+        "sun_azimuth", "sun_elevation", "sun_color", "ambient_intensity", "fog_color",
+        "fog_start", "fog_end", "fog_density",
+    ))
     lines = [
         "[environment]",
+        f"track={world.track_name}",
+        f"enabled={int(authored)}",
         f"preset={env.preset_name}",
         f"sun_azimuth={env.sun_azimuth:.3f}",
         f"sun_elevation={env.sun_elevation:.3f}",
@@ -1318,36 +1292,34 @@ def project_equirectangular_to_sky_tiles(
 
 def export_all_track_textures(world: TrackWorld, out_dir: Path | str) -> dict[str, Any]:
     """Export every decoded track texture to `<out_dir>/<tex_name>.png` + `manifest.json`."""
-    dest = Path(out_dir)
+    dest = Path(out_dir).resolve()
+    if dest.is_relative_to((world.game_dir / "DATA").resolve()):
+        raise ValueError("Choose a texture export folder outside the retail DATA directory.")
     dest.mkdir(parents=True, exist_ok=True)
     items: list[dict[str, Any]] = []
-    exported_count = 0
     for name, ta in sorted(world.textures.items()):
-        stem = Path(name).stem
-        out_png = dest / f"{stem}.png"
-        try:
-            write_png(str(out_png), ta.width, ta.height, ta.rgba)
-            ikey, _pkey = ta.ensure_identity()
-            items.append(
-                {
-                    "name": name,
-                    "file": out_png.name,
-                    "width": ta.width,
-                    "height": ta.height,
-                    "orig_width": ta.orig_width,
-                    "orig_height": ta.orig_height,
-                    "alpha_kind": ta.alpha_kind,
-                    "hosttex_eligible": bool(ikey),
-                    "asset_id": ta.asset_id,
-                }
-            )
-            exported_count += 1
-        except Exception:
+        if name.startswith("car/"):
             continue
+        out_png = dest / f"{Path(name).name}.png"
+        write_png(str(out_png), ta.width, ta.height, ta.rgba)
+        ikey, _pkey = ta.ensure_identity()
+        items.append(
+            {
+                "name": name,
+                "file": out_png.name,
+                "width": ta.width,
+                "height": ta.height,
+                "orig_width": ta.orig_width,
+                "orig_height": ta.orig_height,
+                "alpha_kind": ta.alpha_kind,
+                "hosttex_eligible": bool(ikey),
+                "asset_id": ta.asset_id,
+            }
+        )
     manifest = {
         "schema": "eod.texture_pack/1",
         "track": world.track_name,
-        "count": exported_count,
+        "count": len(items),
         "textures": items,
     }
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -1365,10 +1337,13 @@ def scan_import_texture_folder(
     by_stem: dict[str, str] = {}
     by_full: dict[str, str] = {}
     for name in world.textures:
+        if name.startswith("car/"):
+            continue
         by_full[name.lower()] = name
         by_stem[Path(name).stem.lower()] = name
 
     replacements: list[tuple[str, int, int, bytes, str | None]] = []
+    imported_targets: set[str] = set()
     skipped: list[str] = []
     for p in sorted(src.iterdir()):
         if not p.is_file() or p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".tga", ".bmp"):
@@ -1378,9 +1353,13 @@ def scan_import_texture_folder(
         if not target:
             skipped.append(p.name)
             continue
+        if target in imported_targets:
+            skipped.append(f"{p.name} (duplicate match for {target})")
+            continue
         try:
             w, h, rgba = load_png_rgba(p)
-            replacements.append((target, w, h, rgba, str(p)))
+            replacements.append((target, w, h, rgba, str(p.resolve())))
+            imported_targets.add(target)
         except Exception as exc:
             skipped.append(f"{p.name} ({exc})")
     return replacements, skipped
@@ -1390,9 +1369,11 @@ def scan_import_texture_folder(
 # Vulkan Host Texture Replacement (.eodhtx) Builder (Contract Section 4)
 # ---------------------------------------------------------------------------
 def _nearest_host_scale(orig_w: int, orig_h: int, src_w: int, src_h: int) -> int:
-    """Pick power-of-two scale factor k >= 1 such that orig*k <= 4096."""
+    """Pick a power-of-two scale within the shared HOSTTEX dimension limit."""
+    if not 1 <= orig_w <= mod_package.MAX_SIDE or not 1 <= orig_h <= mod_package.MAX_SIDE:
+        raise ValueError("Original texture dimensions are outside the HOSTTEX limit")
     max_k = 1
-    while orig_w * (max_k * 2) <= 4096 and orig_h * (max_k * 2) <= 4096:
+    while max(orig_w, orig_h) * (max_k * 2) <= mod_package.MAX_SIDE:
         max_k *= 2
     want = max(src_w / max(1, orig_w), src_h / max(1, orig_h))
     k = 1
@@ -3711,7 +3692,13 @@ def _patch_sobl_fast(
     spans: list[tuple[int, int]] = []
     patched = 0
     recs = world.collision.sobl_records
-    for rec_idx, ed in sorted(world.collision.sobl_edits.items()):
+    edits: dict[int, dict[str, Any] | None] = dict(world.collision.sobl_edits)
+    if world.all_walls_noclip:
+        edits.update(
+            (int(rec["index"]), None)
+            for rec in recs if rec.get("kind") == "box" and rec.get("vertical")
+        )
+    for rec_idx, ed in sorted(edits.items()):
         idx = int(rec_idx)
         if not (0 <= idx < len(recs)):
             continue
@@ -3719,6 +3706,13 @@ def _patch_sobl_fast(
         if rec.get("kind") != "box":
             continue
         off = int(rec["offset"])
+        if ed is None:
+            # The SOBL quadtree indexes only XZ. Move the wall below the playable world
+            # without changing its registered footprint or the original project edits.
+            struct.pack_into("<f", buf, off + 0x28, -5000.0)
+            spans.append((off + 0x28, off + 0x2C))
+            patched += 1
+            continue
         if "ry" in ed and "centre" in ed and "sphere_radius" in ed:
             new_ry = float(ed["ry"])
             new_centre = [float(v) for v in ed["centre"]]
@@ -4348,7 +4342,7 @@ def export_mod_layer(
         progress(55, "Patching SOBL collision barriers...")
     sobl_patched_count = 0
     sobl_spans_full: list[tuple[int, int]] = []
-    if world.collision.sobl_edits:
+    if world.collision.sobl_edits or world.all_walls_noclip:
         se = next((e for e in entries if e["name"].lower() == "track.sol"), None)
         if se is not None and retail_idx["clean_sol"]:
             try:
@@ -4494,7 +4488,8 @@ def export_mod_layer(
 
     # Record delta bake state for future <10 ms in-place delta bakes!
     if (
-        not custom_inject_objs
+        allow_delta
+        and not custom_inject_objs
         and not auto_sobl_boxes
         and not rebuilt_ild_members
         and not world.all_walls_noclip
@@ -4611,6 +4606,85 @@ def export_mod_layer(
     if progress:
         progress(100, f"Mod layer exported ({compile_ms:.1f} ms)")
     return manifest
+
+
+def snapshot_world_for_bake(world: TrackWorld) -> TrackWorld:
+    """Freeze editor state while sharing the immutable mesh and terrain backing data."""
+    collision = world.collision
+    read_only = (
+        collision._terrain,
+        collision.scol_line_verts,
+        collision.scol_base_line_verts,
+        collision.sobl_line_verts,
+        collision.sobl_line_colors,
+        collision.bppt_line_verts,
+    )
+    memo = {id(value): value for value in read_only if value is not None}
+    memo[id(world.models)] = dict(world.models)
+    return deepcopy(world, memo)
+
+
+def mark_road_edits_for_fresh_bake(world: TrackWorld, token: Any) -> None:
+    """Recover road edits whose dirty flag was cleared by an earlier export."""
+    retail = load_track_world(world.trk_path, world.game_dir, include_cars=False, token=token)
+    for line_name, graph in world.all_road_graphs.items():
+        original = retail.all_road_graphs.get(line_name)
+        if original is not None and (graph.nodes != original.nodes or graph.edges != original.edges):
+            graph.dirty = True
+
+
+def package_world_mod(
+    world: TrackWorld,
+    project_name: str,
+    package_id: str,
+    version: str,
+    name: str,
+    output: Path,
+    *,
+    token: Any,
+    progress: Callable[[int, str], None],
+) -> dict[str, Any]:
+    """Bake an editor snapshot, verify its package, and publish the zip atomically."""
+    output = output.expanduser().resolve()
+    disc = mod_package.disc_root(world.game_dir)
+    if output.is_relative_to(disc):
+        raise ValueError("Choose a package destination outside the retail disc folder.")
+    if token.is_cancelled:
+        raise InterruptedError("Packaging cancelled")
+
+    # A previous export can clear a graph's dirty flag. A fresh bake still needs
+    # to include road edits whose nodes or edges differ from the retail graph.
+    progress(5, "Checking racing lines against retail")
+    mark_road_edits_for_fresh_bake(world, token)
+    if token.is_cancelled:
+        raise InterruptedError("Packaging cancelled")
+
+    with tempfile.TemporaryDirectory(prefix="eod-world-package-") as directory:
+        root = Path(directory)
+        layer = root / "overlay"
+        package = root / "package"
+        report = export_mod_layer(
+            world, project_name, layer, token=token, allow_delta=False,
+            progress=lambda pct, message: progress(10 + pct * 6 // 10, message),
+        )
+        if token.is_cancelled:
+            raise InterruptedError("Packaging cancelled")
+        progress(75, "Building and verifying package contents")
+        contents = mod_package.from_overlay(layer, disc, package_id, version, package, name)
+        if token.is_cancelled:
+            raise InterruptedError("Packaging cancelled")
+        progress(90, "Compressing .eodmod archive")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".eodmod-", dir=output.parent) as publish_dir:
+            staged = Path(publish_dir) / output.name
+            result = mod_package.zip_package(package, staged)
+            if token.is_cancelled:
+                raise InterruptedError("Packaging cancelled")
+            os.replace(staged, output)
+    return {
+        **result, "path": str(output), "native": contents["native"], "host": contents["host"],
+        "warnings": report["warnings"],
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ inputs and later CPU visibility consumers. Defaults preserve native behavior.
 * `0021C6E0`: first 16 calls, then every 120th, maximum 128 lines: selected
   index/handle, scaled distance, minimum, current near/far and view-count global.
 * `00218E68`: before/after the entire native selection/submission call; first two
-  calls, then every 120th, at most 64 groups of up to 20 cars. After-call output
+  calls, then every 120th, at most 64 groups. After-call output
   observes the result; it does not alter submission already performed inside.
 * `0034E308`: actual CPU sphere visibility result, first 16 calls then every
   4096th, maximum 128 lines. Captures caller RA, centre/radius, camera position,
@@ -88,6 +88,41 @@ or call any guest helper. CPU tests check all bytes of EEState, including upper
 GPR halves, FPR/FACC/FCC/SP/RA, and native memory side effects after each wrapper.
 This is the local synchronous generator ABI; it does not use Road Trip's
 scheduler-resume wrapping API.
+
+## Visual-car roster and lifetime
+
+The scene-slot pointer list starts at `0x003D1C90`. Retail reserves 20 words.
+The adjacent `0x003D1CE0` word is a lifecycle flag set to 1 at `0x21DF68` and
+cleared at `0x21E080`. It holds no record count. The producer in `0x217DF0`
+stores the object at its scene slot from `object+0x40` after initializing the
+LOD table and wheels. Its callers are the scene factory `0x20FD48` and the
+two constructors at `0x21C2F8` and `0x21C338`. The destructor at `0x218038`
+clears the same index. `0x21DF40` and `0x21E070` bracket the scene lifetime.
+
+Live native rendering keeps guest slots 0–19 and stores additional registered
+slots in host memory. The three list traversals use a call-local snapshot
+ordered by slot, skip vacated slots, and release their temporary storage on
+return. Unregistering an object releases its overflow entry, and scene
+initialization and shutdown clear the entire roster. Original rendering and
+configured differential runs use the retail operations.
+
+| Consumer | Access |
+| --- | --- |
+| `0x20F4A0` | Opens one queue, submits each visual model through `0x21A9B0`, then flushes layers 0–8 and 9. Its two direct retail callers, `0x20F508` and `0x20F870`, have no inbound direct calls or aligned function-table references in SLUS_209.10. |
+| `0x218E68` | The race scene dispatcher calls the visual callback through its vtables, directly or through `0x21C108`. It selects LOD for all cars, then processes non-cockpit matrix, body and wheel passes in slot order. The viewport-specific cockpit still resolves by scene slot. The first registered slot owns the native batch so deletion of slot 0 leaves one batch callback. Its second array originally occupies 80 stack bytes, and only array elements beyond that use host scratch space. |
+| `0x21C370` | Per-car transform update through `0x21BDF0`, called at `0x20E6D4`. |
+| `0x21C130`, `0x20F508`, `0x21CA20` | Indexed shared chassis, auxiliary camera and slot accessor. The latter two have no observed inbound call or aligned function-table pointer. |
+| `0x227B18`, `0x227CA0`, `0x227FA0`, Battle bots | Weapon and launcher geometry resolves by owner slot. The first and third EE helpers have no observed inbound call or pointer. |
+| `0x2E7450`, `0x2E7748`, `0x306978`, `0x30CE28`, `0x31BFA0`, `0x32DB68` | Indexed audio, effects and water references retain the original scene slot. |
+| Projected shadow flush | The shadow caster list at `0x004AE988`, with count at `0x003DC058`, supplies visual transforms and model handles through virtual callbacks. Its storage is independent of the visual roster. |
+
+`tools/recomp.py` checks the original retail instruction at every redirected
+load, store, bound and call. The scene factory gets its input count from the
+session description at `+0x98C`. The world driver table at `0x00485230`
+contains 20 pointers, uses the count at `0x0048522C`, and is written by the
+driver factory `0x1B47E8`. The factories share description slot IDs. Running
+more than 20 simulated participants requires expanding the gameplay owner
+and its other indexed resources.
 
 ## Reuse research
 

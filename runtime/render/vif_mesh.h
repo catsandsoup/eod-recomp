@@ -110,6 +110,8 @@ struct Options {
     bool fix_winding = true;
     // drop triangles with two equal positions (tools/vif_mesh.py load_mesh/world_graf)
     bool drop_degenerate = true;
+    // Shadow side faces can have equal bind positions with different normals.
+    bool keep_shadow_extrusion_faces = false;
 };
 
 // Guest-memory reader: copy n bytes at guest address addr to dst; return false on failure.

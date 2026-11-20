@@ -59,6 +59,8 @@ def default_game_dir() -> Path:
         p = Path(env).expanduser()
         if p.is_dir():
             return p
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "TDEODRecomp" / "disc"
     local_app = os.environ.get("LOCALAPPDATA")
     if local_app:
         cand = Path(local_app) / "TDEODRecomp" / "disc"

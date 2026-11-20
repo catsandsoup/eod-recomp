@@ -62,15 +62,50 @@ Top-level state machine driving the main menu.
 Handles the initial entry into Action/Arcade mode.
 - Presents `s_and_m.lyt` via `MenuRun`.
 - Return codes: `1` = Single Player, `4` = Multiplayer, `-1` = Cancel / Return to Main Menu.
-- Transitions directly to `0x002C1100` (`arcade.lyt`), track select (`0x002C7AC4`), and driver/vehicle select (`0x002CB228`).
+- From `arcade.lyt`, the race flow enters the native car and track menus described below.
 
-### 1.5 `0x002CB228`: Arcade Vehicle Selection (`dd_chsr.lyt`)
-- Layout binds 4 rigid options: `opt1`, `opt2`, `opt3`, `opt4` with corresponding previews `photo_opt1` .. `photo_opt4`.
-- The native game presents only 4 options per page, forcing repetitive page-turning without any category filtering or quick jump.
+### 1.5 Arcade vehicle selection
+- Single-player uses `carchoose.lyt` at `0x002A4FC8`. Head-to-head uses a separate CarChooseWidget implementation with the same label layout.
+- The Champion challenge vehicle prompt separately calls MenuRun at `0x002CB228` with `dd_chsr.lyt` and options `opt1` through `opt4`.
 
-### 1.6 `0x002C7AC4`: Track Selection (`track1.lyt`, `track23.lyt`, `track4.lyt`)
+### 1.6 `0x002C7340`: Track Selection (`track1.lyt`, `track23.lyt`, `track4.lyt`)
 - Dynamically allocates two linear arrays: `ai_vals` and `ai_labels` via `f_0012E7D0`.
 - All tracks are rendered in a single un-categorized vertical list, requiring excessive scrolling to locate specific event formats (Figure 8, Derby, Jump Cross).
+
+#### Arcade mod badges
+
+In SLUS_209.10, `0x002C7AC4` is the call to MenuRun inside the track screen at
+`0x002C7340`. The same Eve roster builder `0x002C71B0` serves this screen and
+the `eves.lyt` and `mpeves.lyt` screens. It creates a separate 80-byte display
+buffer for each Eve, with parallel arrays of display pointers and Eve indices.
+
+| MenuRun return address | Labels in caller frame | Eve indices | Row count |
+|---|---|---|---|
+| `0x002C7ACC` | `sp+0x24` | `sp+0xC8` | `sp+0x16C` |
+| `0x002C8304` | `sp+0x10` | `sp+0xC0` | `sp+0x374` |
+| `0x002C8A20` | `sp+0x20` | `sp+0xD0` | `sp+0x264` |
+
+Eve records start at `0x003C4D08`, stride `0x84`. The load key is the internal
+track at `+0x08` (for example, Afton for Woodly). The display name is at
+`+0x28`. The badge goes on the temporary display buffer while MenuRun executes,
+after the retail default-row name lookup. Return values and Eve records stay
+available to the game by their original identity.
+
+The single-player vehicle chooser is `carchoose.lyt` (`0x002A4FC8`), and
+multiplayer has its own copy of CarChooseWidget. Both call the label setter
+`0x002A8EF0`. At paint-label call sites, return addresses `0x002A7FF4` and
+`0x002B9EAC`, the widget in `s3` has the chassis key at `+0x49` and a
+display-only paint label at `+0x6A`. The chosen paint at `+0x24` indexes
+eight-byte paint records at `s4+4`, whose first field is the vehicle number.
+The badge follows the paint label, leaving the chassis string available for
+stats and asset lookup.
+
+The process reads the selected `EOD_MOD_DIR` against retail. The badge checks
+effective .TRK and .CAR member contents, the track's own `<track>_eves.val`,
+the selected paint's numbered CT.RES and UICAR.RES entries, and the matching
+asset IDs from the validated HOSTTEX index. Repacking an archive with identical
+members does not badge it. HOSTTEX files are validated from their headers and
+sizes without loading mip data for attribution.
 
 ---
 

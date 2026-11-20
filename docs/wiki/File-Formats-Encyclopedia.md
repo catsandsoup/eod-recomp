@@ -101,7 +101,7 @@ This encyclopedia documents the binary layout, `SLUS_209.10` loader address, and
   - **Hi-Res `.tm0` Streamed Mip0 (`1,547` files):** Streamed dynamically from the archive's extractable partition into the 400 KB circular ring buffer at `0x004A9830` by `TextureLoadHiResTm0` (`0x003545B8`) and bound to the parent `TEX` descriptor via `0x003537F0`.
 - **Vulkan Host Texture Replacement (`.eodhtx` & `HOSTTEX/replacements.tsv`):**
   - Identity keys (`tools/texture_identity.py`): FNV-1a 64-bit **`indexKey`** (hashes PSM, width, height, and unswizzled mip-0 index plane) and **`paletteKey`** (hashes expanded 256×RGB CLUT, or `*` wildcard for CLUT-animated textures).
-  - `.eodhtx` binary container: stores power-of-two upscaled ($k \in \{1, 2, 4, 8, 16, 32\}$, up to `4096×4096`) straight-alpha `R8G8B8A8` pixels with a complete 2×2 box-filtered mipmap chain, memory-mapped and uploaded on demand under `EOD_HOST_TEXTURE_BUDGET_MB` (default `1536 MB`).
+  - `.eodhtx` binary container: stores straight-alpha `R8G8B8A8` pixels at a shared power-of-two scale, up to 8192 pixels per side, with a complete 2×2 box-filtered mipmap chain. Textures are uploaded on demand under `EOD_HOST_TEXTURE_BUDGET_MB` (default `1536 MB`).
 
 ---
 

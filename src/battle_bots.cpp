@@ -6,6 +6,7 @@
 #include "battle_events.h"
 #include "battle_layout.h"
 #include "session_start.h"
+#include "visual_car_list.h"
 
 #include "core/config.h"
 #include "core/cpu.h"
@@ -38,7 +39,6 @@ constexpr uint32_t kBattle = 0x18000224;
 constexpr uint32_t kEvent = 0x003CF19C;
 constexpr uint32_t kHumanCount = 0x00439858;
 constexpr uint32_t kWeaponCount = 0x003CE4B8;
-constexpr uint32_t kCarScenes = 0x003D1C90;
 constexpr uint32_t kWeaponScenes = 0x003D20A8;
 constexpr uint32_t kWorldCount = 0x00495CAC;
 constexpr uint32_t kWorldVisibleCount = 0x00495CB0;
@@ -132,7 +132,7 @@ extern "C" void f_0020FD48(void) {
         if (ee_r32(record) != 0x51) continue;
         ai_slots |= 1u << slot;
         if (suppressed || reserved_weapon_count >= 16 ||
-            !ram_object(ee_r32(kCarScenes + 4 * slot), 0x654) ||
+            !ram_object(eod_visual_car_slot_read(kVisualCarSlots + 4 * slot), 0x654) ||
             ee_r32(kWeaponScenes + 4 * slot) || !world_has_weapon_capacity()) continue;
 
         g_ee.r[4].ud[0] = slot;

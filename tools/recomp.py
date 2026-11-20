@@ -143,11 +143,65 @@ for _va, _word in _BATTLE_SITES.items():
     WORD_PATCHES[_va] = (_word, (_word & 0xFFFF0000) | _BATTLE_OFFSET[_word & 0xFFFF])
 
 
+
+# Visual-car list accesses. The first 20 slots stay in EE RAM for compatibility.
+# Indexed reads keep their slot IDs. Ordered reads use a scoped, dense view for
+# the two renderers and the per-car transform update. Original and EOD_DIFF
+# still execute the equivalent guest operations in the runtime helpers.
+VISUAL_CAR_TRAVERSALS = {0x0020F4A0, 0x00218E68, 0x0021C370}
+VISUAL_CAR_SLOT_READS = {
+    0x0020F5AC: 0x8C430000,  # orphan auxiliary camera
+    0x00218FF8: 0x8C540000,  # current viewport car
+    0x0021C148: 0x8C620000,  # shared chassis
+    0x0021CA34: 0x8C820000,  # orphan slot accessor
+    0x00227B48: 0x8C650000, 0x00227CDC: 0x8C660000, 0x00227FC0: 0x8CA40000,  # weapon helpers
+    0x002E7518: 0x8EA40000, 0x002E77F0: 0x8C420000,  # car audio
+    0x00307158: 0x8C450000, 0x0030CE70: 0x8CA40000,  # effects
+    0x0031C144: 0x8C640000, 0x0032DD48: 0x8C430000,  # water and effects
+}
+VISUAL_CAR_ORDERED_READS = {
+    0x0020F4CC: 0x8E040000,                                  # frame renderer
+    0x00218EA0: 0x8E421C90, 0x00218EBC: 0x8C500000,          # LOD pass
+    0x00218FB8: 0x8C620000, 0x00218FE8: 0x8CC41C90,
+    0x0021900C: 0x8C440000, 0x00219034: 0x8C620000,          # non-viewport cars
+    0x0021C38C: 0x8C441C90, 0x0021C3A8: 0x8E040000,          # transform update
+}
+VISUAL_CAR_LIMITS = {
+    0x0020F4C0: 0x2A220014, 0x00218FC4: 0x28A20014, 0x0021903C: 0x29620014,
+}
+# The LOD batch builds a second array (other cars) in the first 80 stack bytes.
+# Only accesses to that array can extend into host storage. Its saved registers
+# and all other guest stack accesses stay at their original offsets.
+VISUAL_CAR_BATCH_READS = {
+    0x0021909C: 0x8FA80000, 0x00219150: 0x8D480000, 0x002191F8: 0x8D480004,
+    0x002193AC: 0x8FA40000, 0x002193BC: 0x8E040000, 0x002193CC: 0x8E040000,
+    0x002193E8: 0x8E040000, 0x002193F8: 0x8E040004, 0x00219400: 0x8E040008,
+    0x00219404: 0x8E04000C, 0x00219414: 0x8E040000, 0x00219440: 0x8FA40000,
+    0x00219450: 0x8E040000, 0x00219460: 0x8E040000, 0x00219478: 0x8E040000,
+    0x00219488: 0x8E040004, 0x00219490: 0x8E040008, 0x00219494: 0x8E04000C,
+    0x002194A4: 0x8E040000, 0x002194C0: 0x8C500000,
+}
+VISUAL_CAR_REGISTER, VISUAL_CAR_UNREGISTER, VISUAL_CAR_BATCH_WRITE = 0x00217FD8, 0x00218290, 0x00219020
+VISUAL_CAR_RESETS = {0x0021DF68: 0xAC911CE0, 0x0021E080: 0xAC601CE0}
+VISUAL_CAR_BATCH_OWNER = 0x00218E8C
+VISUAL_CAR_COCKPIT_CALL = 0x00219520
+VISUAL_CAR_PATCH_SITES = {
+    **VISUAL_CAR_SLOT_READS, **VISUAL_CAR_ORDERED_READS, **VISUAL_CAR_LIMITS,
+    **VISUAL_CAR_BATCH_READS, **VISUAL_CAR_RESETS,
+    VISUAL_CAR_REGISTER: 0xAC710000, VISUAL_CAR_UNREGISTER: 0xAC400000,
+    VISUAL_CAR_BATCH_WRITE: 0xAC640000, VISUAL_CAR_BATCH_OWNER: 0x8C820040,
+    VISUAL_CAR_COCKPIT_CALL: 0x0C08630E,
+}
+
+
 def check_patch_sites(elf):
     """Refuse to translate a different executable with these addresses."""
     for va, (old, _new) in WORD_PATCHES.items():
         if elf.read32(va) != old:
             raise SystemExit("patch site %08x: expected %08x, found %08x" % (va, old, elf.read32(va)))
+    for va, old in VISUAL_CAR_PATCH_SITES.items():
+        if elf.read32(va) != old:
+            raise SystemExit("visual car site %08x: expected %08x, found %08x" % (va, old, elf.read32(va)))
     for va, old in CONTEST_TABLE_SITES.items():
         if elf.read32(va) != old:
             raise SystemExit("contest site %08x: expected %08x, found %08x" % (va, old, elf.read32(va)))
@@ -188,6 +242,24 @@ class Gen:
             # Absolute runtime-owned table: the paired lui of 0x003C0000 may be
             # shared with Eve-table accesses, so only this addiu changes.
             return set_s32(rt, hx(BATTLE["kContestTable"] + si - 0x61A8))
+        if va in VISUAL_CAR_PATCH_SITES:
+            if va in VISUAL_CAR_SLOT_READS:
+                return set_s32(rt, f"eod_visual_car_slot_read({ea})")
+            if va in VISUAL_CAR_ORDERED_READS:
+                return set_s32(rt, f"eod_visual_car_ordered_read(eod_visual_cars, {ea})")
+            if va in VISUAL_CAR_LIMITS:
+                return set64(rt, f"{S64(rs)} < eod_visual_car_order_limit(eod_visual_cars)")
+            if va in VISUAL_CAR_BATCH_READS:
+                return set_s32(rt, f"eod_visual_car_batch_read(eod_visual_cars, {ea})")
+            if va == VISUAL_CAR_BATCH_OWNER:
+                return set_s32(rt, f"eod_visual_car_batch_owner_slot({U32(rs)})")
+            if va == VISUAL_CAR_BATCH_WRITE:
+                return f"eod_visual_car_batch_write(eod_visual_cars, {ea}, {U32(rt)});"
+            if va == VISUAL_CAR_REGISTER:
+                return f"eod_visual_car_register({ea}, {U32(rt)});"
+            if va == VISUAL_CAR_UNREGISTER:
+                return f"eod_visual_car_unregister({ea}, {U32(16)});"
+            return "eod_visual_car_reset(); " + self.i_sw(w, va, rs, rt, rd, sa, imm, si, ea)
         if davmap_stack and rs == 29:
             # DAVMapMakeForEve's used-vehicle array begins at sp+A00 and
             # occupies320 words before locals at sp+F00. With >320 vehicle
@@ -861,7 +933,9 @@ class FuncEmitter:
             if name == "jal":
                 t = i.getInstrIndexAsVram()
                 body.append("  R[31].ud[0] = %s; %s" % (hx(after), dcode))
-                if t in g.funcs:
+                if va == VISUAL_CAR_COCKPIT_CALL:
+                    body.append(f"  if (!eod_visual_cars || {U32(4)}) {self.ref(t)}();")
+                elif t in g.funcs:
                     sym = g.syms.get(t)
                     comment = (" /* %s */" % sym[0]) if sym else ""
                     body.append("  %s();%s" % (self.ref(t), comment))
@@ -966,10 +1040,16 @@ def main():
                 addr, sname, tag_s, f["kind"], len(addrs), note_s)
         else:
             hdr_comment = "/* %08X  (%s, %d instructions) */" % (addr, f["kind"], len(addrs))
-        text = ["", hdr_comment,
-                "void %s(void) {" % fname, "  EE_FUNC_ENTRY(0x%08X);" % addr]
+        context = addr in VISUAL_CAR_TRAVERSALS
+        if context and mode != "wrap":
+            raise SystemExit("visual car traversal %08x requires a wrap" % addr)
+        signature = (f"f_{addr:08X}_cars(VisualCarTraversal *eod_visual_cars)"
+                     if context else f"{fname}(void)")
+        text = ["", hdr_comment, f"void {signature} {{", "  EE_FUNC_ENTRY(0x%08X);" % addr]
         text += [l for l in body if l.strip()]
         text.append("}")
+        if context:
+            text.append(f"void {fname}(void) {{ f_{addr:08X}_cars(NULL); }}")
         # bucket by address so that local changes only touch one file
         bucket = (addr - 0x100000) // args.bucket
         while len(files) <= bucket:
@@ -987,6 +1067,8 @@ def main():
 
     for n, chunk in enumerate(files):
         src = ["/* generated by tools/recomp.py - do not edit */", '#include "ee.h"', '#include "funcs.h"', ""]
+        if any("eod_visual_car_" in function for function in chunk):
+            src.insert(3, '#include "visual_car_list.h"')
         src += chunk
         write_if_changed(os.path.join(args.out, "rec_%03d.c" % n), "\n".join(src) + "\n")
     # remove stale files

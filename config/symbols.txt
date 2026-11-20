@@ -49,6 +49,7 @@
 0017A498 SceneObjectUpdateBounds [I]  # Propagates world transform to scene bounding sphere -> docs/BATTLE_RECOVERY.md
 0017AF80 SceneObjectSetPose [V]  # Copies 4x3 pose matrix into object+0x64 and updates scene bounds -> docs/BATTLE_RECOVERY.md
 0017B708 RigidBodyApplyImpulseAtOffset [V]  # Applies world force/impulse vector at offset on rigid body -> docs/GAMEPLAY_MODS_RE.md
+0017B918 ContactRecord [I]  # ContactRecord: contact pool 0x3CE3F0 + 16 per object (src/car_damage.cpp, readable C++; EOD_DIFF) -> docs/NATIVE_RENDERER.md
 0017DA58 ChickenExplosionApplyShockwave [V]  # Applies radial blast damage and physics impulse; wrapped for ChickenForceScale/RadiusScale -> docs/BATTLE_RECOVERY.md
 0017DE30 WeaponRegistryRegister [V]  # Registers (interface, owner_idx, slot) into g_WeaponRegistry -> docs/BATTLE_RECOVERY.md
 0017DE78 WeaponRegistryQuery [V]  # Looks up registered weapon interface for (owner_idx, slot) -> docs/BATTLE_RECOVERY.md
@@ -76,6 +77,8 @@
 001B2DD8 DetachedWheelPoolFreeAll [V]  # Frees all active detached wheel phobs in 0x00484E68 -> docs/INDEX.md
 001B2E78 DetachedWheelPhobUpdate [V]  # Steps detached wheel rigid body and settles after 40s lifetime -> docs/INDEX.md
 001B3068 DetachedWheelSpawn [V]  # Spawns flying wheel phob when a car hub shears off -> docs/INDEX.md
+001B3180 DetachedWheelDebrisResetCount [I]  # wheel debris count reset (src/debris_pool.cpp; EOD_DIFF) -> docs/NATIVE_RENDERER.md
+001B3190 DetachedWheelDebrisResetRing [I]  # wheel debris count and ring reset (src/debris_pool.cpp; EOD_DIFF) -> docs/NATIVE_RENDERER.md
 001B5840 TimedDamageFeatUpdate [V]  # Applies leader/timed damage feat; wrapped for Invincible -> docs/GAMEPLAY_MODS_RE.md
 001B8370 CarRecoveryCountdownUpdate [V]  # Updates rollover/wrong-way reset timer and SELECT manual recovery -> docs/MANUAL_RECOVERY.md
 001C31A0 CameraDirectorUpdate [V]  # CameraDirectorUpdate: injects 360 orbit & turntable in showroom/garage -> docs/CAREER_UNLOCKS.md
@@ -89,6 +92,8 @@
 00205218 FeatsUnlockAllCheats [V]  # Writes 0xFFFFFFFF to g_FeatCheatUnlockMask (0x003D18E4) -> docs/GAMEPLAY_MODS_RE.md
 00205368 FeatsGetCompletedUnion [V]  # Returns union of completed feat bits across career/profile -> docs/GAMEPLAY_MODS_RE.md
 0020D220 MRAnimCreate [V]  # Creates skeletal animation instance ("mrAnim: num_bones < 60"); checked by EOD_HEAP_CHECK -> docs/INDEX.md
+0020F2D8 ViewportRenderFinish [I]  # ViewportRenderFinish: lift single-viewport flare check for split-screen parity (src/native_shadows_flares.cpp) -> docs/NATIVE_RENDERER.md
+0020F4A0 VisualCarFrameRender [V]  # Ordered visual-car model pass between queue begin and flush -> docs/LOD_RUNTIME.md
 0020FD48 SceneCreateCarAndWeapons [V]  # Constructs visual/physics car scene and attaches weapons; wrapped for AI Battle bots -> docs/BATTLE_RECOVERY.md
 00211318 ViewGetLodDistanceFactor [V]  # Returns view-count LOD distance multiplier from 0x004062A8 ({1, 1, 2, 2}) -> docs/LOD_CULLING_INVESTIGATION.md
 00211378 ViewGetActiveViewportCount [V]  # Returns active split-screen viewport count (g_ActiveViewportCount at 0x003D1A74) -> docs/LOD_CULLING_INVESTIGATION.md
@@ -97,18 +102,23 @@
 00212DB0 DrawDistanceGetFar [V]  # Returns g_DrawDistanceFar (0x00495D58) -> docs/LOD_CULLING_INVESTIGATION.md
 00212DF0 ConfigGetHighDetailCar [V]  # Returns high_detail_car flag -> docs/LOD_CULLING_INVESTIGATION.md
 00214678 GrafTrackLoad [V]  # Loads track.grf and relocates its mlists; wrapped: DrawDistance scales each LOD group's final cutoff -> docs/LOD_CULLING_INVESTIGATION.md
+00214B68 WorldFrameRender [I]  # WorldFrameRender: mlist calc and world passes 0..4 around the queued frame -> docs/NATIVE_RENDERER.md
 00217DF0 VisualCarInit [V]  # Initializes visual car struct (+0x74 handles, +0xF8 LOD records, +0x21C/+0x220/+0x224 pointers) -> docs/LOD_RUNTIME.md
 002189C8 VisualCarSubmitModel [V]  # Selects active LOD handle from +0x21C[+0x54C] and submits to renderer -> docs/LOD_CULLING_INVESTIGATION.md
 00218C38 VisualCarSubmitWheelsAndParts [V]  # Submits car wheels, windows, and detachable parts for selected LOD -> docs/LOD_CULLING_INVESTIGATION.md
 00218E68 VisualCarBatchSelectAndSubmit [V]  # Selects LOD index and submits all active visual cars in g_VisualCarList (0x003D1C90) -> docs/LOD_RUNTIME.md
 0021ABF8 VisualCarLoadLodTable [V]  # Parses %s.car/lod.val, loads Low0..LowN.mod handles; wrapped for LOD threshold scaling -> docs/LOD_RUNTIME.md
 0021C130 VisualCarCloneShared [V]  # Clones visual car object aliasing shared model handles (+0x74) and LOD table (+0xF8) -> docs/LOD_RUNTIME.md
+0021C370 VisualCarUpdateTransforms [V]  # Walks the visual-car roster and updates each transform -> docs/LOD_RUNTIME.md
 0021C6E0 VisualCarSelectLodIndex [V]  # Computes camera distance and selects LOD index (+0x54C) for a single visual car -> docs/LOD_RUNTIME.md
 00220788 WheelSelectSlowOrFastModel [V]  # Chooses 3D slow wheel mesh vs card fast wheel by speed/LOD; wrapped for Cup wheels -> docs/NASCAR_CUP_WHEELS.md
+00223800 SkyDestroy [I]  # SkyDestroy (vtable 0x408318 slot 2) -> docs/NATIVE_RENDERER.md
+00223858 SkyDraw [I]  # SkyDraw: dome parts through the draw queue -> docs/NATIVE_RENDERER.md
 00227EE8 ChickenWeaponCreateForCar [V]  # Constructs and registers a chicken launcher for car slot -> docs/BATTLE_RECOVERY.md
 00270C10 MenuRun [I]  # Runs one menu screen to a result; wrapped to auto-answer the Arcade single/multi prompt for online events -> docs/NETPLAY_STATE_SYNC.md
 002A1298 MainMenuUpdate [V]  # Main menu state machine; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002A75E0 SinglePlayerCarSelectUpdate [V]  # Action/Single car selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
+002A8EF0 CarChooseSetLabel [V]  # Stores the text pointer at a0+4; wrapped for the Arcade paint-label badge -> docs/UI_MENU_ENGINE.md
 002B6DB8 CheatExecuteMasterUnlock [V]  # Master unlock helper calling track, feat, Eve, and Dare unlock routines -> docs/GAMEPLAY_MODS_RE.md
 002BEC08 TitleScreenUpdate [V]  # Title screen update; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002C0BB8 ArcadeSingleOrMultiPromptScreen [I]  # Main menu ACTION: s_and_m.lyt 'single / multi' prompt (MenuRun call at 0x2C0DC0 returns 1 = single, 4 = multi, -1 = back), then GameDoSingle; auto-answered single for online events -> docs/NETPLAY_STATE_SYNC.md
@@ -136,6 +146,11 @@
 002E5200 CareerIsEveRankEligible [V]  # Tests whether player rank qualifies for an Eve; wrapped by OpenCareer -> docs/CAREER_UNLOCKS.md
 002E5758 CareerLoadChallengesVal [V]  # Loads challenges.val / home_challenges.val into 0x003CD910; wrapped by OpenCareer -> docs/CAREER_UNLOCKS.md
 002E6C78 CareerApplyPostEveRank [V]  # Applies new player rank after an Eve; wrapped by CareerRank to prevent forced retirement -> docs/CAREER_UNLOCKS.md
+00304D50 FlareRender [I]  # FlareRender: sun glare & point-light flares (src/native_shadows_flares.cpp) -> docs/NATIVE_RENDERER.md
+00325728 WaterDraw [I]  # WaterDraw(surface): tiles through the immediate geometry API -> docs/NATIVE_RENDERER.md
+00325E40 WaterSimulate [I]  # WaterSimulate: car splashes -> docs/NATIVE_RENDERER.md
+00326168 WaterDrawIfPresent [I]  # WaterDrawIfPresent -> docs/NATIVE_RENDERER.md
+00326188 WaterCreate [I]  # WaterCreate(pos, axis a, axis b): only with one view; SplitScreenParity creates it in split screen too (P8) -> docs/NATIVE_RENDERER.md
 00331DF0 Panic [V]  # Fatal error handler panic(fmt, ...); logs message and halts -> docs/INDEX.md
 00331E48 DebugPrintf [V]  # Retail stripped debug printf(fmt, ...); replaced by runtime logger (--log game) -> docs/INDEX.md
 00337718 TimerGetMs [V]  # Returns elapsed timer milliseconds; wrapped to skip artificial post-load & memory card wait loops -> docs/INDEX.md
@@ -144,11 +159,30 @@
 0033D8E8 StrmOpenFile [V]  # Opens stream file handle by TOC index -> docs/INDEX.md
 0033EC78 FrameWaitAndService [V]  # Waits vblank/draw completion via 0035C3F8, services system work, then clears transient input; editor publication boundary -> docs/TRACK_ENVIRONMENT_WORKFLOW.md
 0033ECB8 FogConfigureRange [V]  # Sets scene fog start/end distances from camera far plane -> docs/LOD_CULLING_INVESTIGATION.md
+0034AF98 RenderQueueFlush [I]  # Flush(layer, set) -> docs/NATIVE_RENDERER.md
+0034B140 RenderQueueAppendModelBatches [I]  # append a model's batches to the queue -> docs/NATIVE_RENDERER.md
 0034BDA8 ModelSubmitVu1Packets [V]  # Submits loaded .mod VIF/VU1 packet chain to scene draw list -> docs/LOD_CULLING_INVESTIGATION.md
+0034BF90 RenderQueueAppendWithoutMaterial [I]  # queue draw records without material -> docs/NATIVE_RENDERER.md
+0034C208 ShadowSubmit [I]  # projected shadow submit (src/native_shadows_flares.cpp + render_trace.cpp) -> docs/NATIVE_RENDERER.md
+0034C4B0 ShadowSubmitMasked [I]  # projected shadow submit (layer mask, src/native_shadows_flares.cpp + render_trace.cpp) -> docs/NATIVE_RENDERER.md
+0034C798 ShadowEnd [I]  # ShadowEnd: close & composite shadow RT (src/native_shadows_flares.cpp) -> docs/NATIVE_RENDERER.md
+0034C7D0 ShadowBegin [I]  # ShadowBegin: copy dir, open shadow RT, snapshot main viewport (src/native_shadows_flares.cpp) -> docs/NATIVE_RENDERER.md
+0034C828 RenderQueueClearBuckets [I]  # Clears both bucket sets and frame flags -> docs/EE_RENDER_SUBMISSION.md
+0034C860 RenderQueueFlushLayer9AndReset [I]  # flush layer 9, reset queue -> docs/NATIVE_RENDERER.md
+0034C8C0 RenderQueueFlushSingleLayer [I]  # Flushes one layer of set 1 and resets the queue on layer 9 -> docs/EE_RENDER_SUBMISSION.md
+0034C930 RenderQueueFlushLayers0To8 [I]  # flush layers 0..8 -> docs/NATIVE_RENDERER.md
+0034C9C0 RenderQueueFrameBegin [I]  # FrameBegin: open queue set 1 -> docs/NATIVE_RENDERER.md
+0034C9F8 BonePaletteUpload [I]  # BonePaletteUpload: skinned pose to VU1 (src/bone_pose.cpp) -> docs/NATIVE_RENDERER.md
+0034CA18 DentOffsetUpload [I]  # DentOffsetUpload: forwards to 0x35DD28 (src/bone_pose.cpp, readable C++; EOD_DIFF) -> docs/NATIVE_RENDERER.md
+0034CC98 RenderQueueSubmitWorldModel [I]  # queue a world-space model (src/render_queue.cpp) -> docs/NATIVE_RENDERER.md
 0034CEF0 ModelLoadFromArchive [V]  # Parses .mod geometry from archive and returns model handle -> docs/LOD_CULLING_INVESTIGATION.md
+0034D088 RenderQueueFreePool [I]  # Releases the model table and draw-record pool -> docs/EE_RENDER_SUBMISSION.md
+0034D1F8 RenderQueueAllocatePool [I]  # Allocates the model table and draw-record pool and clears the buckets -> docs/EE_RENDER_SUBMISSION.md
 0034D328 DisplaySetAspectMode [V]  # Sets aspect mode (0=4:3, 1=16:9 widescreen, 2=letterbox) and xScale at 0x003DD658 -> docs/NATIVE_CAMERA_ASPECT.md
 0034E308 FrustumTestSphere [V]  # Tests world sphere (center $a0, radius $f12) against camera frustum -> docs/LOD_CULLING_INVESTIGATION.md
 0034E530 ProjectionSetPerspective [V]  # Computes perspective projection matrix, near/far (0x004CD370), and frustum tangents -> docs/NATIVE_CAMERA_ASPECT.md
+0034EE70 SphereImmSubmit [I]  # SphereImmSubmit(obj*) -> docs/NATIVE_RENDERER.md
+0034EEB8 SphereImmSubmitTransformed [I]  # SphereImmSubmitTransformed(obj*, mat*) -> docs/NATIVE_RENDERER.md
 0034F620 ProjectionGetFovLodScale [V]  # Returns tan(ref_fov/2)/tan(cur_fov/2) LOD distance compensation -> docs/LOD_CULLING_INVESTIGATION.md
 0034FA98 CameraCalcDistanceToPoint [V]  # Returns Euclidean distance from active camera (0x004CD31C) to world point -> docs/LOD_CULLING_INVESTIGATION.md
 00352D28 TextureSubsystemInit [V]  # Initializes GS texture manager and allocates mip0 streaming cache (0x64000 bytes) -> docs/TEXTURE_FORMAT_NOTES.md
@@ -157,9 +191,52 @@
 003545B8 TextureLoadHiResTm0 [V]  # Streams .tm0 high-res mip0 companion for a .tex texture -> docs/LOD_CULLING_INVESTIGATION.md
 00354838 TextureMip0PoolResize [V]  # Resizes on-demand .tm0 ring buffer allocation -> docs/TEXTURE_FORMAT_NOTES.md
 003582B8 MlistVisibilityCalc [V]  # Per-frame mlist sphere/group/model visibility into the scratchpad; wrapped for EOD_CULL_TRACE counts -> docs/LOD_CULLING_INVESTIGATION.md
+00358BD0 WorldRenderPass [I]  # WorldRenderPass(pass): DMA REFs to the visible world batches -> docs/NATIVE_RENDERER.md
+0035A810 VifWriteUnpackMscal [I]  # VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it) -> docs/NATIVE_RENDERER.md
+0035B3D0 Vu1WriteCameraPacket [I]  # camera packet (VU1 qwords 1..16) -> docs/NATIVE_RENDERER.md
+0035BBD0 DisplayCopyBuildPacket [V]  # Builds the display-history composition packet and updates its blend countdown -> docs/NATIVE_RENDERER.md
 0035C460 FrameWaitVblank [V]  # Idle busy-wait loop for vblank counter increment -> docs/INDEX.md
 0035C528 FrameWaitDrawDone [V]  # Idle busy-wait loop for GS draw-done state (1 or 7) -> docs/INDEX.md
+0035CAA0 ImmediateDrawIndexedTris [I]  # ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices) + cockpit quad (0x219C48) -> docs/NATIVE_RENDERER.md
+0035CB88 Vu1EmitQueuedBatch [I]  # emit one queued batch to the VU1 DMA chain -> docs/NATIVE_RENDERER.md
+0035CBB8 PacketCommit [I]  # PacketCommit(qwc) (0x366CD0) -> docs/NATIVE_RENDERER.md
+0035CD28 Vu1WriteMatrixPacket [I]  # matrix packet (VU1 TOPS+0..6) -> docs/NATIVE_RENDERER.md
+0035D170 ShadowEmitBatchPass [I]  # ShadowEmitBatchPass: emit matrix + shadow batch DMA REF (src/native_shadows_flares.cpp) -> docs/NATIVE_RENDERER.md
+0035D298 ShadowEmitBatch [I]  # emit one shadow batch -> docs/NATIVE_RENDERER.md
+0035DBD8 BonePaletteWrite [I]  # BonePaletteWrite (src/bone_pose.cpp, readable C++; EOD_DIFF checks it) -> docs/NATIVE_RENDERER.md
+0035DD28 DentOffsetWrite [I]  # DentOffsetWrite: car dent offsets to VU1 0x90 (src/bone_pose.cpp, readable C++; EOD_DIFF) -> docs/NATIVE_RENDERER.md
+0035DEE0 WorldPacketBegin [I]  # WorldPacketBegin(qwc) -> docs/NATIVE_RENDERER.md
+0035DF10 ImmediateBegin [I]  # ImmediateBegin(numVerts) (VU1 0x0270) -> docs/NATIVE_RENDERER.md
+00360E18 GsStateInit [I]  # GS state init: publishes its fog constants to the native feed (src/native_fog.cpp) -> docs/NATIVE_RENDERER.md
+00361468 ImmediatePacketBegin [I]  # ImmediatePacketBegin(numVerts) -> docs/NATIVE_RENDERER.md
+00361708 ImmediateVertex [I]  # ImmediateVertex: readable C++ (src/native_effects_imm.cpp, R4 A2; water/flare/cockpit/immediate) -> docs/NATIVE_RENDERER.md
+00361BC8 ImmediateEnd [I]  # ImmediateEnd() -> docs/NATIVE_RENDERER.md
+00361C30 ImmStaticEmitRef [I]  # ImmStaticEmitRef(bufObj*) -> docs/NATIVE_RENDERER.md
+00361ED8 ImmStaticDraw [I]  # ImmStaticDraw(bufObj*) -> docs/NATIVE_RENDERER.md
+003639D0 ParticleAdd [I]  # ParticleAdd(col_rgb, col_alpha, size, x, y, z, angle) -> docs/NATIVE_RENDERER.md
+00363B68 ParticleEnd [I]  # ParticleEnd() -> docs/NATIVE_RENDERER.md
+00363B98 ParticleBegin [I]  # ParticleBegin(count, scale) (VU1 0x08E0) -> docs/NATIVE_RENDERER.md
+00363C18 AtlasSpriteAdd [I]  # AtlasSpriteAdd(r128 col, tile, size, x, y, z) -> docs/NATIVE_RENDERER.md
+00363D48 AtlasSpriteEnd [I]  # AtlasSpriteEnd() -> docs/NATIVE_RENDERER.md
+00363D78 AtlasSpriteBegin [I]  # AtlasSpriteBegin(count, gridSize) (VU1 0x05E0) -> docs/NATIVE_RENDERER.md
+00363DE8 SpriteAdd [I]  # SpriteAdd(r128 col, flip, size, x, y, z) -> docs/NATIVE_RENDERER.md
+00363F18 SpriteEnd [I]  # SpriteEnd() -> docs/NATIVE_RENDERER.md
+00363F48 SpriteBegin [I]  # SpriteBegin(count) (VU1 0x01B8) -> docs/NATIVE_RENDERER.md
+00363FF8 ParticlePacketReserve [I]  # ParticlePacketReserve(state*) -> docs/NATIVE_RENDERER.md
+003642B8 AtlasSpritePacketReserve [I]  # AtlasSpritePacketReserve(state*) [RA 0x3642F4] -> docs/NATIVE_RENDERER.md
+00364548 SpritePacketReserve [I]  # SpritePacketReserve(state*) -> docs/NATIVE_RENDERER.md
+00364D18 ImmediateVertexContinue [I]  # ImmediateVertexContinue(state*, colour, strip, x, y, z, u, v) -> docs/NATIVE_RENDERER.md
+003652A8 TextureSetLodState [I]  # TextureSetLodState: TEX1 K template 0x4D8BAC / MXL 0x4D8BBC (src/native_texstate.cpp) -> docs/NATIVE_RENDERER.md
+00365308 LodBiasSet [I]  # LodBiasSet: sprite/particle K delta 0x4D8BB8, publishes after the original (src/native_texstate.cpp) -> docs/NATIVE_RENDERER.md
 003653F8 GsFogWriteTables [V]  # Computes and uploads GS FOG / fog-table values for current pass -> docs/LOD_CULLING_INVESTIGATION.md
+00365428 FogSetColour [I]  # FogSetColour: FOGCOL state 0x4D8B80 (src/native_fog.cpp) -> docs/NATIVE_RENDERER.md
+003654E0 BlendSelect [I]  # BlendSelect: ALPHA_1 select 0x4D8B78 (src/native_texstate.cpp) -> docs/NATIVE_RENDERER.md
+00365540 RenderFlagsCommit [I]  # RenderFlagsCommit: 0x4D8BC8, bit 3 = GS PRIM.FGE (src/native_fog.cpp) -> docs/NATIVE_RENDERER.md
+00365578 GsStateReset [I]  # GS state reset: publishes the LOD/blend values it stored (src/native_texstate.cpp) -> docs/NATIVE_RENDERER.md
+00366C88 DmaPacketReserveTop [I]  # packet reserve (top): tagged for VU1 start attribution (render_trace) -> docs/NATIVE_RENDERER.md
+00366D30 DmaPacketReserve [I]  # packet reserve: tagged for VU1 start attribution -> docs/NATIVE_RENDERER.md
+00366D78 DmaSecondManagerPacketReserve [I]  # packet reserve, second manager: tagged for VU1 start attribution -> docs/NATIVE_RENDERER.md
+00366DD8 DmaSecondManagerPacketReserveAlternate [I]  # packet reserve, second manager: tagged for VU1 start attribution -> docs/NATIVE_RENDERER.md
 003670C8 MoviePlay [V]  # Plays PSS/IPU full-motion video by name; wrapped for EOD_SKIP_MOVIES -> docs/INDEX.md
 003698E8 HomebaseBuildMenu [V]  # Builds Homebase hub / AutoShop / Garage / Challengers UI menu list -> docs/CAREER_UNLOCKS.md
 0036E9C0 DealerBuyScreen [V]  # Dealership Buy screen MenuRun execution loop -> docs/CAREER_UNLOCKS.md
@@ -241,7 +318,8 @@
 003D18E0 g_FeatCompletedMask [V]  # Bitmask of completed Career feats -> docs/GAMEPLAY_MODS_RE.md
 003D18E4 g_FeatCheatUnlockMask [V]  # Bitmask of unlocked feat cheats -> docs/GAMEPLAY_MODS_RE.md
 003D1A74 g_ActiveViewportCount [V]  # Active player/viewport count (1..4) -> docs/LOD_CULLING_INVESTIGATION.md
-003D1C90 g_VisualCarList [V]  # Array of up to 20 active visual car pointers (count at 0x003D1CE0) -> docs/LOD_RUNTIME.md
+003D1C90 g_VisualCarList [V]  # First 20 visual-car pointers indexed by scene slot -> docs/LOD_RUNTIME.md
+003D1CE0 g_VisualCarSystemActive [V]  # Boolean set on init and cleared on shutdown (0x21DF40/0x21E070) -> docs/LOD_RUNTIME.md
 003D73FC g_MainMenuHighlight [I]  # netplay state sync -> docs/NETPLAY_STATE_SYNC.md
 003D80E0 g_CheatMenuToggles [V]  # 8-entry int32 toggle array for the UI cheat menu -> docs/GAMEPLAY_MODS_RE.md
 003D8180 g_EventUnlockOverride [V]  # Non-zero unlocks all Action events in menus -> docs/GAMEPLAY_MODS_RE.md

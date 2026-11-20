@@ -11,10 +11,10 @@ yet).
 
 | limit | owner | size on the PS2 | state | evidence |
 | --- | --- | --- | --- | --- |
-| Draw record pool `0x4C96C4` / `0x4C96C8` | `0x34B140` (src/render_queue.cpp) | `0xC00` records | open | docs/EE_RENDER_SUBMISSION.md |
+| Draw record pool `0x4C96C4` / `0x4C96C8` | `0x34B140` and `0x34BF90` (src/render_queue.cpp) | `0xC00` records | removed for live native rendering. Original and `EOD_DIFF` retain the guest layout and limit. | docs/EE_RENDER_SUBMISSION.md |
 | Shadow render target `0x34C7D0` -> `0x363218` | `0x35DA30` | 320x512 | open (R4) | |
 | Plume texture cache | runtime/render/native_renderer.cpp | 256 MB soft limit | open | |
-| Frame renderer list `0x20F4A0` / `0x3D1C90` | `0x20F4A0` | 20 entries | open | |
+| Visual-car renderer list `0x3D1C90` | `0x217DF0` / `0x218038` (registration), `0x20F4A0` / `0x218E68` (render) | 20 pointers | removed for live native rendering. Original and `EOD_DIFF` use the original list. The 20-driver gameplay table is a separate owner. | docs/LOD_RUNTIME.md |
 | Engine pools (heap, mip ring, chassis, car pool, debris, weapons) | see docs/MASTER_SPEC.md 3.5 | | open | |
 | Contacts per object, obj+0x190 / count obj+0x1D0 | `0x17B918` ContactRecord (src/car_damage.cpp) | 16 | tracked (`[limit] contacts per object`): every reader of obj+0x190 must be decompiled before the list can move to host storage | docs/NATIVE_RENDERER.md R3 |
 | Contact record pool `0x3CE3F0` (used `0x3CE3EC`, size `0x3CE3E8`) | `0x17B918` (src/car_damage.cpp) | `*(0x3CE3E8)` records of 0x24 bytes | tracked (`[limit] contact records`) | same |

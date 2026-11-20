@@ -19,17 +19,18 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
-#ifdef _WIN32
-// Windows: the system loader (vulkan-1.dll) is opened at run time by volk, so the
-// build needs only the headers. No <windows.h> here: the D3D11-shaped names below
-// would collide with it.
+#if defined(_WIN32) || defined(EOD_PLUME)
+// Plume and the GS share Volk dispatch. No <windows.h> here: the D3D11-shaped
+// names below would collide with it.
 #include <volk.h>
-#include "../../platform/platform.h"
-#ifdef EOD_PLUME
-#include "../../render/plume_device.h"
-#endif
 #else
 #include <vulkan/vulkan.h>
+#endif
+#ifdef _WIN32
+#include "../../platform/platform.h"
+#endif
+#ifdef EOD_PLUME
+#include "../../render/plume_device.h"
 #endif
 #ifdef EOD_TRACY
 #include <tracy/TracyVulkan.hpp>
@@ -309,7 +310,7 @@ struct Context {
     // GPU timer (EOD_FPS or EOD_GPU_PROF): timestamp pairs per labelled zone, read when the
     // command buffer's flight completes, reported as GPU milliseconds per presented frame.
     enum GpuLabel : uint8_t { GPU_CMDBUF, GPU_M_SHADOW, GPU_M_SCENE, GPU_M_RESOLVE, GPU_M_POST, GPU_M_GSDEPTH,
-                              GPU_M_UPLOAD, GPU_LABELS };
+                              GPU_M_UPLOAD, GPU_DISPLAY_HISTORY, GPU_LABELS };
     static constexpr uint32_t kQueries = 256;
     int gpuProf = -1;
     double tsPeriod = 1;
@@ -370,7 +371,8 @@ struct Context {
         if (now - gpuReportUs < 5000000 || !gpuPresents)
             return;
         static const char *names[GPU_LABELS] = {"all GS command buffers", "modern shadows", "modern scene",
-                                                "modern resolve", "modern post", "modern GS depth", "modern uploads"};
+                                                "modern resolve", "modern post", "modern GS depth", "modern uploads",
+                                                "display history"};
         fprintf(stderr, "  GPU ms per presented frame:");
         for (int i = 0; i < GPU_LABELS; i++)
             fprintf(stderr, " %s %.2f%s", names[i], gpuNs[i] / 1e6 / (double)gpuPresents, i + 1 < GPU_LABELS ? "," : "\n");
@@ -849,7 +851,7 @@ struct Context {
         // A fence covers its submission and every earlier one on this queue.
         return retire(s);
     }
-    std::pair<HostBuffer *, VkDeviceSize> upload(const void *p, size_t bytes) {
+    std::pair<HostBuffer *, VkDeviceSize> allocate_upload(size_t bytes) {
         begin();
         while (chunkIndex < chunks.size() && chunks[chunkIndex].used + bytes > chunks[chunkIndex].size)
             ++chunkIndex;
@@ -858,8 +860,12 @@ struct Context {
         auto &c = chunks[chunkIndex];
         auto off = c.used;
         c.used = (off + bytes + 255) & ~VkDeviceSize(255);
-        memcpy((uint8_t *)c.map + off, p, bytes);
         return {&c, off};
+    }
+    std::pair<HostBuffer *, VkDeviceSize> upload(const void *p, size_t bytes) {
+        auto [buffer, offset] = allocate_upload(bytes);
+        memcpy(static_cast<uint8_t *>(buffer->map) + offset, p, bytes);
+        return {buffer, offset};
     }
     void transition(Texture *t, VkImageLayout old, VkImageLayout next) {
         EOD_ZONE("vk.transition");
@@ -1007,13 +1013,26 @@ struct Context {
         std::vector<uint8_t> tight((size_t)w * h * 4);
         for (UINT y = 0; y < h; y++)
             memcpy(tight.data() + (size_t)y * w * 4, (const uint8_t *)p + (size_t)y * pitch, (size_t)w * 4);
-        auto u = upload(tight.data(), tight.size());
+        auto [buffer, offset] = upload(tight.data(), tight.size());
+        copy_upload(t, level, *b, *buffer, offset);
+    }
+    // Fill a tightly packed RGBA8 region directly in the recycled flight arena.
+    template <class Fill>
+    void UpdateSubresourceDirect(Texture *t, UINT level, const D3D11_BOX &box, Fill fill) {
+        EOD_ZONE("vk.UpdateSubresourceDirect");
+        barrier(1);
+        const UINT w = box.right - box.left, h = box.bottom - box.top;
+        auto [buffer, offset] = allocate_upload((size_t)w * h * 4);
+        fill(reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(buffer->map) + offset));
+        copy_upload(t, level, box, *buffer, offset);
+    }
+    void copy_upload(Texture *t, UINT level, const D3D11_BOX &box, const HostBuffer &buffer, VkDeviceSize offset) {
         VkBufferImageCopy c{};
-        c.bufferOffset = u.second;
+        c.bufferOffset = offset;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-        c.imageOffset = {(int)b->left, (int)b->top, 0};
-        c.imageExtent = {w, h, 1};
-        vkCmdCopyBufferToImage(cmd, u.first->buffer, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        c.imageOffset = {(int)box.left, (int)box.top, 0};
+        c.imageExtent = {box.right - box.left, box.bottom - box.top, 1};
+        vkCmdCopyBufferToImage(cmd, buffer.buffer, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
     // Uploads every level of t through one dedicated staging buffer freed when
     // this command buffer completes. Large host replacement textures would
@@ -1511,11 +1530,6 @@ inline bool Context::init(bool withWindow) {
 #ifdef _WIN32
     if (volkInitialize() != VK_SUCCESS)
         throw std::runtime_error("no Vulkan loader (vulkan-1.dll)");
-#ifdef EOD_PLUME
-    // plume's instance has the surface extensions and API 1.3 this instance asks for.
-    instance = plume_device::instance();
-    const bool plumeInstance = instance != VK_NULL_HANDLE;
-#endif
     if (withWindow) {
         window = platform_native_window();
         exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
@@ -1529,6 +1543,19 @@ inline bool Context::init(bool withWindow) {
             throw std::runtime_error(SDL_GetError());
         exts.assign(names, names + n);
     }
+#endif
+#if defined(__APPLE__) && defined(EOD_PLUME)
+    // For a window, use SDL's already-loaded library so its surface and our
+    // instance always belong to the same loader.
+    const auto getProc = withWindow ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr())
+                                    : nullptr;
+    if (!plume_device::initialize_loader(getProc))
+        throw std::runtime_error("no Vulkan loader");
+#endif
+#ifdef EOD_PLUME
+    // Plume's instance includes the platform surface extensions and Vulkan 1.3.
+    instance = plume_device::instance();
+    const bool plumeInstance = instance != VK_NULL_HANDLE;
 #endif
     // portability enumeration (MoltenVK) only where the loader offers it
     bool portability = false;
@@ -1550,8 +1577,10 @@ inline bool Context::init(bool withWindow) {
     i.ppEnabledExtensionNames = exts.data();
     if (!instance)
         require(vkCreateInstance(&i, nullptr, &instance), "instance");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EOD_PLUME)
     volkLoadInstance(instance);
+#endif
+#ifdef _WIN32
     if (withWindow) {
         // VkWin32SurfaceCreateInfoKHR without <windows.h>: HINSTANCE and HWND are pointers
         struct Win32SurfaceInfo {
@@ -1661,8 +1690,10 @@ inline bool Context::init(bool withWindow) {
 #endif
     if (!device)
         require(vkCreateDevice(physical, &d, nullptr, &device), "device");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EOD_PLUME)
     volkLoadDevice(device);
+#endif
+#ifdef _WIN32
     if (!core13) {
         vkCmdBeginRendering = vkCmdBeginRenderingKHR;
         vkCmdEndRendering = vkCmdEndRenderingKHR;

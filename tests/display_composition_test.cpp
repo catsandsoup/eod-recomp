@@ -75,8 +75,12 @@ int main() {
     int fd=mkstemp(file.data());if(fd<0)return 2;close(fd);
     Config saved,loaded;
     if(saved.aspect!="auto") ++failures;  // upstream 1.0: the game's own widescreen option
-    saved.aspect="16:9";saved.render_scale=6;saved.width=1920;saved.height=1200;
-    if(!config_save(file,saved) || !config_load(file,loaded) || loaded.aspect!="16:9" || loaded.render_scale!=6) ++failures;
+    saved.aspect="16:9";saved.width=1920;saved.height=1200;
+    for(int scale:{6,7,8}) {
+        saved.render_scale=scale;
+        if(!config_save(file,saved) || !config_load(file,loaded) || loaded.aspect!="16:9" || loaded.render_scale!=scale)
+            ++failures;
+    }
     std::filesystem::remove(file);
     if(failures) { fprintf(stderr,"display composition: %d failure(s)\n",failures);return 1; }
     puts("4K/MBP aspect rectangles, output capture dimensions, and 16:10 config round-trip passed (CPU only)");

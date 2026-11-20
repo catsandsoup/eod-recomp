@@ -7,6 +7,7 @@
 #include "core/memory.h"
 #include "core/config.h"
 #include "lod_thresholds.h"
+#include "visual_car_list.h"
 
 extern "C" void f_0021ABF8_orig();
 extern "C" void f_0021C6E0_orig();
@@ -135,14 +136,28 @@ extern "C" void f_0021C6E0() {
     if (trace() && lines<128 && (++calls<=16 || calls%120==0)) { ++lines; selected("single",object,ra); }
 }
 extern "C" void f_00218E68() {
+    if (visual_car_adaptive_enabled() && eod_visual_car_batch_owner_slot(arg_u32(0))) {
+        f_00218E68_orig();
+        return;
+    }
+    VisualCarTraversal cars(true);
     const uint32_t ra=g_ee.r[31].uw[0];
     static unsigned calls,lines;
     const bool log=trace() && lines<64 && (++calls<=2 || calls%120==0);
-    uint32_t objects[20]{};
-    if (log) for (unsigned i=0;i<20;++i) { objects[i]=ee_r32(0x3d1c90+i*4); if (!objects[i]) break; selected("batch-before",objects[i],ra); }
+    if (log) {
+        for (unsigned i = 0; const uint32_t object = cars.entry(i); ++i)
+            selected("batch-before", object, ra);
+    }
     const uint32_t pool_before=ee_r32(0x4C96C8);  // draw record count (0x34B140 pool, 0x4C96C8)
-    f_00218E68_orig(); // native selection AND submission take place inside
-    if (log) { ++lines; for (auto object:objects) { if (!object) break; selected("batch-after",object,ra); } }
+    if (cars.adaptive())
+        f_00218E68_cars(&cars);
+    else
+        f_00218E68_orig();
+    if (log) {
+        ++lines;
+        for (unsigned i = 0; const uint32_t object = cars.entry(i); ++i)
+            selected("batch-after", object, ra);
+    }
     // per-view counts for EOD_CAMERA_TRACE (src/hle_camera.cpp): visual cars drawing Low0 (+0x54C = 0,
     // the parts-only cockpit model) and the draw records this batch added through 0x34BDA8
     g_lod_view.frames++;
@@ -152,9 +167,7 @@ extern "C" void f_00218E68() {
     static const bool selftest = std::getenv("EOD_LOD_SELFTEST") != nullptr;
     if (selftest) {
         const uint64_t a0 = g_ee.r[4].ud[0], ra = g_ee.r[31].ud[0], v0 = g_ee.r[2].ud[0];
-        for (unsigned i=0;i<20;++i) {
-            const uint32_t o=ee_r32(0x3d1c90+i*4);
-            if (!o) break;
+        for (unsigned i = 0; const uint32_t o = cars.entry(i); ++i) {
             if (!ram(o,0x554)) continue;
             const uint32_t d=ee_r32(o+0x548), idx=ee_r32(o+0x54c);
             g_ee.r[4].ud[0]=o; g_ee.r[31].ud[0]=0x218F00;
@@ -166,14 +179,13 @@ extern "C" void f_00218E68() {
     if (hist_on()) {
         static bool hooked = (diff_add_exit_report(hist_print), true);
         (void)hooked;
-        for (unsigned i=0;i<20;++i) { const uint32_t o=ee_r32(0x3d1c90+i*4); if (!o) break; hist_add(o); }
+        for (unsigned i = 0; const uint32_t object = cars.entry(i); ++i)
+            hist_add(object);
         if (g_lod_view.frames % 600 == 0) hist_print();
     }
     const uint32_t pool_after=ee_r32(0x4C96C8);
     if (pool_after>pool_before) g_lod_view.records+=pool_after-pool_before;
-    for (unsigned i=0;i<20;++i) {
-        const uint32_t object=ee_r32(0x3d1c90+i*4);
-        if (!object) break;
+    for (unsigned i = 0; const uint32_t object = cars.entry(i); ++i) {
         g_lod_view.cars++;
         if (ram(object,0x554) && ee_r32(object+0x54c)==0) g_lod_view.low0++;
     }
@@ -202,11 +214,12 @@ extern "C" void f_0034E308() {
 extern "C" void f_00212B58() {
     const uint32_t original=ee_r32(0x495d58);
     const float distance=loadf(0x495d58);
-    const bool extend=maximum() && ee_r32(0x3d1a74)==2 &&
-        std::isfinite(distance) && distance>0 && distance<=1150;
-    const float source=extend ? distance*2 : distance;
+    const uint32_t views=ee_r32(0x3d1a74); // 0x211378, divisor clamped to 1..4 by 0x212B58
+    const bool valid=std::isfinite(distance) && distance>0;
+    const bool extend=maximum() && views>=2 && views<=4 && valid && distance<=1150;
+    const float source=extend ? distance*float(views) : distance;
     const float far=eod_draw_distance();
-    const bool farther=far>1 && std::isfinite(source) && source>0 && source<=1150*2;
+    const bool farther=far>1 && valid && distance<=1150*2;
     const bool fog=farther && ee_r32(0x3d1b0c)==0; // the other branch sets no fog
     if (extend || farther) storef(0x495d58,farther ? source*far : source);
     f_00212B58_orig();

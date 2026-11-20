@@ -20,6 +20,25 @@ from home_hub import load_editor_prefs
 from main_window import EodWorldEditorWindow
 from perf_profiler import get_profiler
 from theme import apply_dark_theme
+from workers import shutdown_editor_workers
+
+
+def configure_bundled_runtime() -> None:
+    if sys.platform != "darwin" or not getattr(sys, "frozen", False):
+        return
+    contents = Path(sys.executable).resolve().parent.parent
+    runtime = contents / "Resources" / "GameRuntime.bundle" / "Contents"
+    game = runtime / "MacOS" / "eod"
+    viewport = contents / "Frameworks" / "eod_editor_plume.dylib"
+    manifest = runtime / "Resources" / "vulkan" / "icd.d" / "MoltenVK_icd.json"
+    loader = next(iter(sorted((runtime / "Frameworks").glob("libvulkan.*.dylib"))), None)
+    if game.is_file():
+        os.environ.setdefault("EOD_PIE_EXE", str(game))
+    if viewport.is_file() and loader and manifest.is_file():
+        os.environ.setdefault("EOD_EDITOR_PLUME_LIBRARY", str(viewport))
+        os.environ.setdefault("SDL_VULKAN_LIBRARY", str(loader))
+        os.environ.setdefault("VK_DRIVER_FILES", str(manifest))
+        os.environ.setdefault("VK_ICD_FILENAMES", str(manifest))
 
 
 def configure_opengl_format() -> None:
@@ -35,6 +54,7 @@ def configure_opengl_format() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     get_profiler().begin_phase("app_startup")
+    configure_bundled_runtime()
     parser = argparse.ArgumentParser(description="EOD World Editor (Qt 6 + OpenGL 3.3 Core)")
     parser.add_argument("--game-dir", type=Path, default=None, help="Game directory containing DATA/TRACKS")
     parser.add_argument("--track", type=str, default=None, help="Initial track stem (e.g. AFTON, DUNDAS) — skips Home Hub")
@@ -66,7 +86,10 @@ def main(argv: list[str] | None = None) -> int:
         show_home_hub=not skip_hub,
     )
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        shutdown_editor_workers()
 
 
 if __name__ == "__main__":

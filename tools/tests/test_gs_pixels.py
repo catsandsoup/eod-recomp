@@ -20,14 +20,15 @@ env.update(EOD_HEADLESS="1", EOD_MUTE="1", EOD_GS_RASTER="0")
 for key in ["EOD_GS_REPLAY_STOP", "EOD_GS_REPLAY_TRACE", "EOD_GS_DUMP", "EOD_GS_REPLAY_DUMP", "EOD_SCREENSHOT_SCALE", "EOD_SCREENSHOT_WIDTH", "EOD_SCREENSHOT_HEIGHT"]:
     env.pop(key, None)
 
-config6 = work / "pixels6.ini"
-config6.write_text("[Video]\nRenderScale=6\n")
-
 def render(case, renderer, scale=1):
     fixture = work / (case + ".gsd")
     subprocess.run([str(generator), case, str(fixture)], check=True)
     run_env = dict(env, EOD_SCREENSHOT_SCALE=str(scale)) if scale > 1 else env
-    result = subprocess.run([str(eod), "--headless", "--config", str(config6 if scale > 1 else config), "--renderer",
+    settings = config
+    if scale > 1:
+        settings = work / f"pixels{scale}.ini"
+        settings.write_text(f"[Video]\nRenderScale={scale}\n")
+    result = subprocess.run([str(eod), "--headless", "--config", str(settings), "--renderer",
                              renderer, "--gs-replay", str(fixture), "--repeat", "1"], env=run_env,
                             capture_output=True, text=True, timeout=30, cwd=work)
     tag = case + "-" + renderer + ("-%dx" % scale if scale > 1 else "")
@@ -37,6 +38,9 @@ def render(case, renderer, scale=1):
     if renderer == "vulkan" and "replaying with vulkan" not in result.stderr:
         print("SKIP: Vulkan device unavailable; software fallback is not GPU verification")
         sys.exit(77)
+    if scale > 6 and f"RenderScale={scale} limited" in result.stderr:
+        print(f"Vulkan {scale}x unavailable on this device")
+        return None
     data = Path(str(fixture) + ".ppm").read_bytes()
     Path(work / (tag + ".ppm")).write_bytes(data)
     size = 64 * scale
@@ -69,6 +73,11 @@ edge6 = render("edge_sliver", "vulkan", 6)
 for x, y in [(383, 200), (200, 383), (383, 383), (378, 378), (53, 53)]:
     assert edge6(x, y) == (200,40,40), ("vulkan 6x edge sub-pixel", x, y, edge6(x, y))
 assert edge6(47, 200) == (32,64,96), ("vulkan 6x: nothing before the first covered pixel", edge6(47, 200))
+for scale in (7, 8):
+    edge = render("edge_sliver", "vulkan", scale)
+    if edge is not None:
+        final = 64 * scale - 1
+        assert edge(final, final) == (200, 40, 40), (f"Vulkan {scale}x final pixel", edge(final, final))
 # A Z-only clear of a PSMZ16 buffer later shown as PSMCT16: the uncleared
 # sub-pixels of Z column 63 would appear as a line at colour column 31.
 for renderer in ["software", "vulkan"]:

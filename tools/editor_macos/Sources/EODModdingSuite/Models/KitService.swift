@@ -15,6 +15,17 @@ final class KitServiceClient: @unchecked Sendable {
     private let lock = NSLock()
     private var nextID = 0
     private var unavailableUntil = Date.distantPast
+    private var checkedServicePython: (service: ServiceInfo, compatible: Bool)?
+
+    private struct ServiceInfo: Decodable, Equatable {
+        let socket: String
+        let pid: Int
+        let started: Double
+    }
+
+    private struct ServicePing: Decodable {
+        let python: String
+    }
 
     static var workspace: URL {
         if let value = ProcessInfo.processInfo.environment["EOD_KIT_WORKSPACE"], !value.isEmpty {
@@ -36,9 +47,10 @@ final class KitServiceClient: @unchecked Sendable {
         let line = Data("{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\",\"params\":".utf8) + params + Data("}\n".utf8)
         let workspace = Self.workspace
         let fd = try await Task.detached(priority: .userInitiated) { () throws -> Int32 in
-            if let fd = try? Self.connect(workspace) { return fd }
-            try Self.start(workspace)
-            return try Self.connect(workspace)
+            if let fd = try self.connectIfRunning(workspace) { return fd }
+            try self.start(workspace)
+            guard let fd = try self.connectIfRunning(workspace) else { throw Failure.unavailable("not running") }
+            return fd
         }.value
         return try await withTaskCancellationHandler {
             let data = try await Task.detached(priority: .userInitiated) { () throws -> Data in
@@ -66,15 +78,36 @@ final class KitServiceClient: @unchecked Sendable {
 
     // MARK: Socket plumbing (blocking; always called off the main actor)
 
-    private static func socketPath(_ workspace: URL) -> String? {
+    private func connectIfRunning(_ workspace: URL) throws -> Int32? {
         let info = workspace.appendingPathComponent("service/service.json")
         guard let data = try? Data(contentsOf: info),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return object["socket"] as? String
+              let service = try? JSONDecoder().decode(ServiceInfo.self, from: data),
+              let fd = try? Self.openSocket(service.socket) else { return nil }
+
+        do {
+            if try supportsServicePython(service, fd: fd) { return fd }
+        } catch {
+            close(fd)
+            return nil
+        }
+        close(fd)
+        throw Failure.unavailable("the running asset service requires a compatible Python 3.10+ interpreter")
     }
 
-    private static func connect(_ workspace: URL) throws -> Int32 {
-        guard let path = socketPath(workspace) else { throw Failure.unavailable("not running") }
+    private func supportsServicePython(_ service: ServiceInfo, fd: Int32) throws -> Bool {
+        let checked = lock.withLock { checkedServicePython }
+        if let checked, checked.service == service { return checked.compatible }
+
+        // Check the live daemon so an existing service started under Python 3.9 can fall back safely.
+        try Self.send(fd, Data("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"service.ping\"}\n".utf8))
+        let reply = try JSONDecoder().decode(RPCResponse<ServicePing>.self, from: Self.receiveLine(fd))
+        let version = reply.result?.python.split(separator: ".") ?? []
+        let compatible = version.count >= 2 && version[0] == "3" && (Int(version[1]) ?? 0) >= 10
+        lock.withLock { checkedServicePython = (service, compatible) }
+        return compatible
+    }
+
+    private static func openSocket(_ path: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw Failure.unavailable("socket() failed") }
         var on: Int32 = 1
@@ -124,8 +157,8 @@ final class KitServiceClient: @unchecked Sendable {
     }
 
     /// Start `server.py --detach` once, even when several calls race (flock on service/start.lock).
-    private static func start(_ workspace: URL) throws {
-        guard let script = serverScript else { throw Failure.unavailable("kit_service is not installed") }
+    private func start(_ workspace: URL) throws {
+        guard let script = Self.serverScript else { throw Failure.unavailable("kit_service is not installed") }
         let folder = workspace.appendingPathComponent("service")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let lockFD = open(folder.appendingPathComponent("start.lock").path, O_CREAT | O_RDWR, 0o600)
@@ -137,9 +170,9 @@ final class KitServiceClient: @unchecked Sendable {
             usleep(50_000)
         }
         defer { flock(lockFD, LOCK_UN) }
-        if let fd = try? connect(workspace) { close(fd); return }
+        if let fd = try connectIfRunning(workspace) { close(fd); return }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.executableURL = try RuntimePaths.python.get()
         process.arguments = ["-I", script.path, "--workspace", workspace.path, "--detach"]
         var environment = ProcessInfo.processInfo.environment
         environment["EOD_KIT_WORKSPACE"] = workspace.path

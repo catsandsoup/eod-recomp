@@ -36,6 +36,7 @@ struct HtxHeader {
     uint32_t width = 0, height = 0, levels = 0, flags = 0;
 };
 constexpr size_t kHtxHeaderBytes = 16;
+constexpr uint32_t kHtxMaxSide = 8192;
 // Byte offset of each level after the header (levels entries) and the total.
 size_t htx_level_offset(uint32_t w, uint32_t h, uint32_t level);
 size_t htx_total_bytes(uint32_t w, uint32_t h, uint32_t levels);
@@ -86,6 +87,8 @@ public:
     // validated and opened (mapped). Malformed lines are logged and skipped.
     // Returns the number of accepted entries.
     size_t load(const std::string &root, const LogFn &log, const FindFn &find = FindFn());
+    // Validates the active entries for UI attribution without mapping or reading mip data.
+    static std::vector<std::string> active_asset_ids(const std::string &root, const FindFn &find);
     // Parses manifest text (exposed for tests). hosttex_dir resolves files.
     size_t parse(const std::string &text, const std::string &hosttex_dir, const LogFn &log, const FindFn &find);
     // Starts prefaulting mapped files into memory in manifest order until
@@ -107,6 +110,7 @@ public:
 private:
     bool open_file(Entry &e, std::string &why);
     void close_all();
+    bool metadata_only_ = false;
     std::vector<Entry> entries_;
     std::vector<uint64_t> dims_;
     std::atomic<uint64_t> prefetched_{0};

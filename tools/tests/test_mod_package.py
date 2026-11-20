@@ -88,6 +88,51 @@ class PackageCase(unittest.TestCase):
 
 
 class PackageTest(PackageCase):
+    def test_package_baked_overlay_without_kit_project_file(self):
+        overlay = self.root / "baked-world"
+        track = overlay / ANOKA
+        track.parent.mkdir(parents=True)
+        replacement = make_tex(11)
+        track.write_bytes(mp.build_archive(self.disc / ANOKA, {"sky.tex": replacement})[0])
+        (overlay / "PROFILE.TXT").write_text("World Editor export")
+
+        package = self.root / "packaged-world"
+        report = mp.from_overlay(overlay, self.disc, "baked-world", "1.0.0", package)
+
+        self.assertEqual(mp.inspect(package)["native"], [f"{ANOKA}#sky.tex"])
+        self.assertEqual((package / f"native/{ANOKA}/sky.tex").read_bytes(), replacement)
+        self.assertTrue(report["archiveReport"][0]["reproducesProjectBuild"])
+        self.assertTrue(mp.verify(package, self.disc)["gameCompatible"])
+
+    def test_package_baked_overlay_host_texture_without_native_edits(self):
+        import mod_install
+
+        overlay = self.root / "baked-world"
+        texture_dir = overlay / "HOSTTEX"
+        texture_dir.mkdir(parents=True)
+        image = make_png(self.root / "replacement.png", 32, 32)
+        eodhtx = mod_install.eodhtx(image)
+        (texture_dir / "replacement.eodhtx").write_bytes(eodhtx)
+        asset = f"{ANOKA}#sky.tex"
+        identity = mp.host_identity(mp.retail_member(self.disc, ANOKA, "sky.tex")[0], asset)
+        row = "\t".join((identity["indexKey"], "*", "16", "16", "replacement.eodhtx", asset, "editor"))
+        (texture_dir / "replacements.tsv").write_text(f"eod-host-textures 1\n{row}\n")
+
+        package = self.root / "packaged-world"
+        mp.from_overlay(overlay, self.disc, "baked-world", "1.0.0", package)
+        mod_install.install(package, self.disc, root=self.root / "profiles")
+        active = Path(mod_install.launch_env(root=self.root / "profiles")["EOD_MOD_DIR"])
+        restored = next((active / "HOSTTEX").rglob("*.eodhtx"))
+        self.assertEqual(restored.read_bytes(), eodhtx)
+
+    def test_baked_overlay_rejects_added_archive_members(self):
+        overlay = self.root / "baked-world"
+        pack(overlay / ANOKA, [("new.tex", "TEX", make_tex(15))])
+        package = self.root / "packaged-world"
+        with self.assertRaisesRegex(ValueError, "adds or removes members"):
+            mp.from_overlay(overlay, self.disc, "baked-world", "1.0.0", package)
+        self.assertFalse(package.exists())
+
     def test_verify_inspect_and_source_hashes(self):
         p = self.pkg()
         info = mp.verify(p, self.disc)
@@ -173,11 +218,26 @@ class PackageTest(PackageCase):
                 mp.add_host(p, self.disc, f"{ANOKA}#sky.tex", make_png(self.root / "b.png", w, h))
         big = self.root / "big.png"  # header only: the size check must fail before decoding
         import struct as st
-        big.write_bytes(b"\x89PNG\r\n\x1a\n" + st.pack(">I4sII", 13, b"IHDR", 8192, 8192) + b"\x08\x06\0\0\0" + bytes(8))
-        with self.assertRaisesRegex(ValueError, "at most 4096"):
+        big.write_bytes(b"\x89PNG\r\n\x1a\n" + st.pack(">I4sII", 13, b"IHDR", 16384, 16384) + b"\x08\x06\0\0\0" + bytes(8))
+        with self.assertRaisesRegex(ValueError, "at most 8192"):
             mp.add_host(p, self.disc, f"{ANOKA}#sky.tex", big)
         with self.assertRaisesRegex(ValueError, "not a TEX"):
             mp.add_host(p, self.disc, f"{ANOKA}#rules.val", make_png(self.root / "g.png", 32, 32))
+
+    def test_host_format_accepts_8192_with_full_mip_chain(self):
+        import struct
+        self.assertEqual(mp.replacement_scale(8192, 128, 1024, 16), 8)
+        header = b"EODHTX1\0" + struct.pack("<4H", 8192, 128, 14, 0)
+        size = 16 + sum(max(1, 8192 >> i) * max(1, 128 >> i) * 4 for i in range(14))
+        htx = self.root / "wide.eodhtx"
+        with htx.open("wb") as handle:
+            handle.write(header)
+            handle.truncate(size)
+        self.assertEqual(mp._eodhtx_file_size(htx), (8192, 128))
+        with htx.open("r+b") as handle:
+            handle.truncate(size - 1)
+        with self.assertRaisesRegex(ValueError, "level chain"):
+            mp._eodhtx_file_size(htx)
 
     def test_add_host_refuses_direct_colour(self):
         pack(self.disc / COMMON, [("stats.val", "VALT", b"s" * 40), ("pic.tex", "TEX", compile_tex(16, 16, bytes(range(256)) * 4))])

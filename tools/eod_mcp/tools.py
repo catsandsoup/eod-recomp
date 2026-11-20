@@ -549,7 +549,7 @@ def _host_json(ctx, name):
     return ctx.config.ws_path(f"projects/{name}/host.json", write=True, what="host.json")
 
 
-@tool("eod_texture_replace", "W:project", "Stage a replacement PNG for one TEX asset in a project. mode native = same size, edits the archive overlay; mode host = origW*k x origH*k (k power of two, <=4096) recorded for package_build as a host replacement.\nNext: eod_package_build.",
+@tool("eod_texture_replace", "W:project", "Stage a replacement PNG for one TEX asset in a project. mode native = same size, edits the archive overlay; mode host = origW*k x origH*k (k power of two, at most 8192 pixels per side) recorded for package_build as a host replacement.\nNext: eod_package_build.",
       dict(asset_id=dict(type="string"), png=dict(type="string", description="Workspace-relative path (or under EOD_KIT_IMPORT_DIRS)"),
            mode=dict(type="string", enum=["native", "host"]), project=dict(type="string")), ["asset_id", "png", "mode"],
       requires=("modding_backend", "mod_package"))
@@ -595,7 +595,7 @@ def texture_replace(ctx, a):
             try:
                 r = mp.add_host(pkg, disc, a["asset_id"], png)
             except ValueError as e:
-                raise ToolError("UNSUPPORTED", str(e), "Needs an indexed 4/8-bit TEX and PNG of orig*k pixels, k a power of two, <=4096")
+                raise ToolError("UNSUPPORTED", str(e), "Needs an indexed 4/8-bit TEX and PNG of orig*k pixels, k a power of two, at most 8192 pixels per side")
         h = r.get("host", [{}])
         return dict(path="host", assetId=a["asset_id"], original=[ow, oh], png=[pw, ph], scale=pw // ow if ow else None,
                     quantisationWarnings=[], note="Host replacement binds by runtime identity key; requires a build with host textures. Unverified until a capture shows it.", verified=False)

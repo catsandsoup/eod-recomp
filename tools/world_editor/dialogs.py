@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,15 +29,67 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QScrollArea,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from car_studio_handling import CarHandlingSheet
+from nascar_import_panel import NascarImportPanel
 from pie_host import ARCADE_MODES
 from theme import TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, enable_windows_dark_titlebar, svg_icon
 from thumbnails import THUMB_H, THUMB_W, ThumbnailCache
-from world_loader import CustomRaceConfig, REPO_ROOT, TrackWorld, discover_cars
+from world_loader import CustomRaceConfig, TrackWorld
+from mod_package import ID_RE, semver_key
+
+
+class PackageModDialog(QDialog):
+    """Collect the metadata supported by the EOD package format."""
+
+    def __init__(self, name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Package Mod as .eodmod")
+        package_id = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:64] or "world-mod"
+        self.id_edit = QLineEdit(package_id)
+        self.name_edit = QLineEdit(name)
+        self.version_edit = QLineEdit("1.0.0")
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        form = QFormLayout()
+        form.addRow("Mod ID", self.id_edit)
+        form.addRow("Display name", self.name_edit)
+        form.addRow("Version", self.version_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Build .eodmod Package")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        scope = QLabel("Includes changed retail archive members and indexed HOSTTEX textures.")
+        scope.setWordWrap(True)
+        layout.addWidget(scope)
+        layout.addLayout(form)
+        layout.addWidget(self.error)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[str, str, str]:
+        return self.id_edit.text().strip(), self.name_edit.text().strip(), self.version_edit.text().strip()
+
+    def accept(self) -> None:
+        package_id, name, version = self.values()
+        if not ID_RE.fullmatch(package_id):
+            self.error.setText("Use 1 to 64 lowercase letters, numbers, dots, underscores, or hyphens for the ID. Start with a letter or number.")
+            return
+        if not name:
+            self.error.setText("Enter a display name.")
+            return
+        try:
+            semver_key(version)
+        except ValueError as exc:
+            self.error.setText(str(exc))
+            return
+        super().accept()
 
 
 class ReplaceModelDialog(QDialog):
@@ -220,10 +273,11 @@ class CustomRaceDialog(QDialog):
         self.spn_laps = QSpinBox()
         self.spn_laps.setRange(1, 50)
         self.spn_laps.setValue(cfg.laps)
+        self.spn_laps.setToolTip("Applies to Play Event contests that finish by lap count.")
         form.addRow("Laps:", self.spn_laps)
 
         self.spn_ai = QSpinBox()
-        self.spn_ai.setRange(0, 15)
+        self.spn_ai.setRange(0, 12)
         self.spn_ai.setValue(cfg.ai_count)
         form.addRow("AI Opponents:", self.spn_ai)
 
@@ -318,7 +372,7 @@ class CustomRaceDialog(QDialog):
 
 
 class VehicleTunerDialog(QDialog):
-    """Live PIE Vehicle Boost / Handling Tuner & NASCAR / Custom Car Tooling Hub."""
+    """Car handling, live PIE speed controls and vehicle tools."""
 
     def __init__(
         self,
@@ -329,8 +383,8 @@ class VehicleTunerDialog(QDialog):
         super().__init__(parent)
         self.game_dir = Path(game_dir)
         self._on_live_boost = on_live_boost_changed
-        self.setWindowTitle("Vehicles — Live PIE Car Tuner & NASCAR / Custom Car Tools")
-        self.resize(520, 380)
+        self.setWindowTitle("Car Studio")
+        self.resize(670, 680)
         enable_windows_dark_titlebar(self)
 
         root = QVBoxLayout(self)
@@ -339,19 +393,13 @@ class VehicleTunerDialog(QDialog):
 
         tabs = QTabWidget()
 
-        # Tab 1: Live PIE Car Tuner
+        # Tab 1: Car Studio handling and session controls
         t_live = QWidget()
-        l_lay = QFormLayout(t_live)
+        l_lay = QVBoxLayout(t_live)
         l_lay.setSpacing(10)
-
-        info = QLabel(
-            "Adjust live PIE vehicle power/boost immediately while driving inside Play-In-Editor. "
-            "Permanent car handling edits live in <code>DATA/CAR/&lt;CAR&gt;.CAR#physics.val</code> "
-            "(legacy <code>SETU</code> <code>.gar</code> sheets are verified unused by SLUS_209.10)."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt;")
-        l_lay.addRow(info)
+        self.handling = CarHandlingSheet(self.game_dir)
+        self.cmb_car = self.handling.car_picker
+        l_lay.addWidget(self.handling, 1)
 
         self.sld_boost = QSlider(Qt.Orientation.Horizontal)
         self.sld_boost.setRange(50, 250)
@@ -359,35 +407,22 @@ class VehicleTunerDialog(QDialog):
         self.lbl_boost = QLabel("1.00 x")
         self.sld_boost.valueChanged.connect(self._on_boost_slider)
         b_row = QHBoxLayout()
+        b_row.addWidget(QLabel("Live PIE speed boost"))
         b_row.addWidget(self.sld_boost, 1)
         b_row.addWidget(self.lbl_boost)
-        l_lay.addRow("Live PIE Speed Boost:", b_row)
+        self.sld_boost.setToolTip("Adjust speed during PIE. This setting is separate from the saved car.")
+        l_lay.addLayout(b_row)
 
-        self.cmb_car = QComboBox()
-        for cp in discover_cars(self.game_dir):
-            self.cmb_car.addItem(cp.stem.replace("_1", "").title(), str(cp))
-        l_lay.addRow("Inspect Retail Car:", self.cmb_car)
+        tabs.addTab(t_live, "Handling")
 
-        tabs.addTab(t_live, "Live PIE Car Tuner")
-
-        # Tab 2: NASCAR & Custom Car CLI Bridge
-        t_nascar = QWidget()
-        n_lay = QVBoxLayout(t_nascar)
-        n_lay.setSpacing(8)
-        nascar_script = REPO_ROOT / "tools" / "import_nascar_cars.py"
-        custom_script = REPO_ROOT / "tools" / "create_custom_car.py"
-        lbl_n = QLabel(
-            f"<b>NASCAR: Dirt to Daytona &amp; Custom Car Pipelines</b><br>"
-            f"• NASCAR importer: <code>{nascar_script.name}</code> ({'available' if nascar_script.is_file() else 'not found'})<br>"
-            f"• Custom car cloner: <code>{custom_script.name}</code> ({'available' if custom_script.is_file() else 'not found'})<br><br>"
-            f"All imported/cloned <code>.CAR</code> archives placed under <code>mods/&lt;Project&gt;/DATA/CAR/</code> "
-            f"appear automatically in Explorer's Cars &amp; Wrecks catalog and PIE vehicle picker."
-        )
-        lbl_n.setWordWrap(True)
-        lbl_n.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt;")
-        n_lay.addWidget(lbl_n)
-        n_lay.addStretch(1)
-        tabs.addTab(t_nascar, "NASCAR & Custom Cars")
+        self.nascar = NascarImportPanel(self.game_dir, self)
+        nascar_scroll = QScrollArea()
+        nascar_scroll.setWidgetResizable(True)
+        nascar_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        nascar_scroll.setWidget(self.nascar)
+        self._nascar_index = tabs.addTab(nascar_scroll, "NASCAR Import")
+        self._vehicle_tabs = tabs
+        self.finished.connect(self.nascar.cancel)
 
         root.addWidget(tabs, 1)
 
@@ -395,6 +430,13 @@ class VehicleTunerDialog(QDialog):
         btns.rejected.connect(self.accept)
         btns.accepted.connect(self.accept)
         root.addWidget(btns)
+
+    def show_nascar_import(self) -> None:
+        self._vehicle_tabs.setCurrentIndex(self._nascar_index)
+
+    def done(self, result: int) -> None:
+        if not self.handling.saving and self.handling.confirm_discard():
+            super().done(result)
 
     def _on_boost_slider(self, val: int) -> None:
         mult = val / 100.0

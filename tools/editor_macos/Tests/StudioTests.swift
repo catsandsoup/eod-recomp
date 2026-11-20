@@ -3,6 +3,33 @@ import XCTest
 @testable import EODModdingSuite
 
 final class StudioTests: XCTestCase {
+    func testBundledPythonTakesPrecedenceOverHostConfiguration() throws {
+        let interpreter = try RuntimePaths.findPython(environment: ProcessInfo.processInfo.environment)
+        let selected = try RuntimePaths.findPython(
+            environment: ["EOD_PYTHON": "/usr/bin/true", "PATH": "/usr/bin:/bin"],
+            bundledRuntime: interpreter
+        )
+        XCTAssertEqual(selected, interpreter)
+    }
+
+    func testPythonOverrideUsesCompatibleInterpreterAtExplicitPath() throws {
+        let interpreter = try RuntimePaths.findPython(environment: ProcessInfo.processInfo.environment)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let override = directory.appendingPathComponent("Python Override")
+        try FileManager.default.createSymbolicLink(at: override, withDestinationURL: interpreter)
+
+        XCTAssertEqual(try RuntimePaths.findPython(environment: ["EOD_PYTHON": override.path]), override)
+    }
+
+    func testPythonOverrideRejectsExecutableThatIsNotPython() {
+        XCTAssertThrowsError(try RuntimePaths.findPython(environment: ["EOD_PYTHON": "/usr/bin/true"])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("EOD_PYTHON"))
+            XCTAssertTrue(error.localizedDescription.contains("Python 3.10"))
+        }
+    }
+
     @MainActor
     func testRealBackendAndProductionEditSaveReopenHandlers() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -12,7 +39,7 @@ final class StudioTests: XCTestCase {
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         let fixture = Process()
-        fixture.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        fixture.executableURL = try RuntimePaths.python.get()
         fixture.arguments = ["-c", """
         import sys,json,contextlib,io
         from pathlib import Path
@@ -74,7 +101,7 @@ final class StudioTests: XCTestCase {
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         let fixture = Process()
-        fixture.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        fixture.executableURL = try RuntimePaths.python.get()
         fixture.arguments = ["-c", """
         import sys,json,contextlib,io
         from pathlib import Path
@@ -129,7 +156,7 @@ final class StudioTests: XCTestCase {
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         let fixture = Process()
-        fixture.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        fixture.executableURL = try RuntimePaths.python.get()
         fixture.arguments = ["-c", """
         import sys,json,contextlib,io,random
         from pathlib import Path
@@ -239,7 +266,7 @@ final class StudioTests: XCTestCase {
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         let fixture = Process()
-        fixture.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        fixture.executableURL = try RuntimePaths.python.get()
         fixture.arguments = ["-c", """
         import sys,json,contextlib,io,random
         from pathlib import Path

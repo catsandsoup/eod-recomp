@@ -59,7 +59,7 @@ Profile composition writes `HOSTTEX/` inside the single active overlay root:
   max(1,h>>i) * 4` bytes. Alpha is straight 0..255 (PNG convention); the
   renderer converts to the GS domain observed for the native texture.
 - Replacement dimensions are `origWidth*k` by `origHeight*k` for one integer
-  power-of-two `k >= 1`, at most 4096 per side. Levels cover the full chain.
+  power-of-two `k >= 1`, at most 8192 pixels per side. Levels cover the full chain.
 - The renderer binds a replacement only on matching indexKey (and paletteKey
   unless `*`), keeps the native texture as fallback, and never changes GS
   memory, UV meaning or wrap/clamp modes. `EOD_HOST_TEXTURES=0` disables it.
@@ -68,12 +68,33 @@ Profile composition writes `HOSTTEX/` inside the single active overlay root:
   appends every newly decoded indexed texture's keys/psm/size for identity
   verification.
 
+Plume uses the active profile's same validated HOSTTEX manifest in Classic
+and Modern. The replacement keeps its normalized UVs and full mip chain.
+Modern inherits the original texture's material tags and derives sky lighting
+colors from the replacement sky when a sky material is tagged. Plume shares
+the GPU upload across equivalent source placements and keeps the game texture
+when the device cannot allocate the replacement. The Classic shader bytecode
+is shared with the unmodded path.
+
+On Apple M2 Pro, an installed Woodly (Afton) sky replacement with an
+8192×8192 base and 14 mip levels rendered in both looks with
+`EOD_NATIVE_ONLY=1`. Each look had a single native texture bind in a 420-vblank
+run. The diagnostic sky color appeared in both captured frames and in none of
+the disabled or older-build controls. The 357,913,956-byte mip chain remained
+byte-identical through package export, ZIP, and clean profile installation.
+An installed 4096×2048 Bus livery also rendered in both looks. The runtime
+resolved both numbered paint layers at their base and streamed resolutions
+from `CT.RES` (`790.tex`, `79a.tex`, `790.tm0`, `79a.tm0`) and uploaded
+all 13 mips per replacement. The test profiles uninstalled cleanly. Retail
+`AFTON.TRK` and `CT.RES` remained byte-identical. Native Windows rendering
+and the owner-reviewed car-and-track quality suite are pending.
+
 ## 5. Mod package (`eodmod.json`, schemaVersion 1)
 
 A package is a directory (or `.eodmod` zip of it):
 
 ```
-eodmod.json   native/<archive path>/<member>   host/<file>.png
+eodmod.json   native/<archive path>/<member>   host/<file>.png or host/<file>.eodhtx
 ```
 
 `eodmod.json`: `schemaVersion`, `id` (`[a-z0-9][a-z0-9._-]{0,63}`), `version`
@@ -82,10 +103,20 @@ eodmod.json   native/<archive path>/<member>   host/<file>.png
 `file`, `sha256`}], `host` [{`assetId`, `sourceMemberSha256`, `indexKey`,
 `paletteKey`, `origWidth`, `origHeight`, `file`, `sha256`, `width`, `height`}].
 All paths are relative POSIX, no `..`, no symlinks, no case-folded duplicates.
+The installer builds the mip chain for PNG replacements and preserves all
+levels when the package supplies a validated `.eodhtx` file.
+
+For a baked World Editor layer, run `tools/mod_package.py from-overlay` with
+the directory that contains `DATA/` and, when present, `HOSTTEX/`. The builder
+records retail member hashes and copies the indexed textures referenced by
+`HOSTTEX/replacements.tsv`. Native package entries replace existing archive
+members. Projects that add or remove archive members require a later package
+format extension.
 
 ## 6. Development profile
 
-Default root `~/Library/Application Support/EODCreationKit/profiles/<name>/`:
+Profiles default to `~/Library/Application Support/EODCreationKit/profiles/<name>/`
+on macOS and `%LOCALAPPDATA%\EODCreationKit\profiles\<name>\` on Windows.
 
 - `profile.json`: installed packages, `enabled`, explicit `order` (later wins
   for an explicitly accepted same-member conflict; otherwise conflicts block).

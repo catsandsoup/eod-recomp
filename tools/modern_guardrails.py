@@ -17,6 +17,7 @@ it prints (pairs whose halves are identical are skipped):
   row 8    [r6] GPU timing lines in *.log (EOD_GPU_TIMING=1, if present): Modern - Classic GPU ms
            <= 2.0 ms and Modern API draws/frame <= Classic + 5% (Classic splits items per TEX1.K run)
 """
+import argparse
 import sys, glob, os, re
 from collections import defaultdict
 import numpy as np
@@ -67,10 +68,15 @@ def check_native_only(path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Score recorded Classic and Modern guardrails")
+    parser.add_argument("directories", nargs="+", help="Capture and GPU log directories")
+    args = parser.parse_args()
     scenes = defaultdict(list)
     native_only_frames = defaultdict(list)
     gpu_rows = []
-    for d in sys.argv[1:]:
+    for d in args.directories:
+        if not os.path.isdir(d):
+            parser.error(f"Capture directory does not exist: {d}")
         for p in sorted(glob.glob(os.path.join(d, '*_classic_left_modern_right.png'))):
             r = check(p)
             if r is not None:
@@ -85,6 +91,9 @@ def main():
                     last = m
             if last:
                 gpu_rows.append((os.path.basename(lp), last))
+    if not (scenes or native_only_frames or gpu_rows):
+        print("No usable capture pairs, native-only frames, or GPU timing logs.", file=sys.stderr)
+        return 2
     ok_all = True
     for s, rows in sorted(scenes.items()):
         r = np.array(rows)

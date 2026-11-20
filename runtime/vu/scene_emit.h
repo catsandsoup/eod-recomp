@@ -22,6 +22,7 @@ namespace scene_emit {
 extern bool g_on;
 
 // Producer side (the thread that runs VU1 and queues GS commands).
+bool observing_vu();
 // true: the modern renderer redraws this run's batch from cached results, so the program is not
 // run and its GS packet not built (EOD_MODERN_SKIPVU=0 disables)
 bool vu1_start(const VUState *vu, uint32_t pc);

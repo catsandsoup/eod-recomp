@@ -41,6 +41,7 @@ void iop_modules_init();
 void iop_fileio_init();
 void iop_cdvd_init();
 void iop_pad_init();
+bool iop_port_has_multitap(unsigned port);
 void iop_mc_init();
 void iop_sound_init();
 void iop_sound_update();  // called often from the EE event loop

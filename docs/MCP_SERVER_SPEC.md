@@ -175,7 +175,7 @@ Search is over the cached census (never rescans the disc); if no cache,
 | Tool | Class | P | Input | Output |
 |---|---|---|---|---|
 | `eod_texture_export_start` | [W:project] job | P1 | `{asset_ids?[], role?, archive?, all?:bool, out?:"exports/<id>" (relative only), resume?:run_id, dry_run?:true}` | dry-run: counts, estimated bytes, collisions; apply: job handle; result = `export-manifest.json` link + summary counts by status |
-| `eod_texture_replace` | [W:project] | P1 | `{asset_id, png (workspace-relative path), mode:"native"\|"host", project?, dry_run, plan_id}` | plan: size check (native must match; host must be `orig*k`, k power of 2, <=4096), quantisation loss warning for indexed, alpha handling, identity keys; apply: staged edit in project |
+| `eod_texture_replace` | [W:project] | P1 | `{asset_id, png (workspace-relative path), mode:"native"\|"host", project?, dry_run, plan_id}` | plan: size check (native must match; host must be `orig*k`, k power of 2, at most 8192 per side), quantisation loss warning for indexed, alpha handling, identity keys; apply: staged edit in project |
 | `eod_texture_tint` | [W:project] | P1 | `{asset_id\|asset_ids[]\|sky:true+archive, rgb:[r,g,b], strength?, dry_run, plan_id}` | wraps `prepare_texture` (tint, `allSky`); returns before/after image |
 | `eod_texture_compare` | [R] | P1 | `{asset_id, png}` | image block side by side + PSNR; flags palette overflow |
 | `eod_sky_export_start` | [W:project] job | P2 | `{archive, out?}` | job; `sky_export` output |
@@ -383,7 +383,7 @@ Rules
 - Long jobs: poll eod_job_status with wait_seconds; report progress; offer cancel. Resume rather than restart.
 - Report only verified semantics. Fields flagged verified:false are experiments: say so.
 Recipes: /mcp__eod-creation-kit__texture_pack_workflow, remove_boundary, adjust_props, new_livery, tune_vehicle, share_mod.
-Texture rules: native replace must match size; host replace must be origW*k x origH*k (k = power of two, max 4096); indexed textures may quantise (check eod_texture_compare); sky tiles share palettes, change them as a set.
+Texture rules: native replace must match size; host replace must be origW*k x origH*k (k = power of two, at most 8192 per side); indexed textures may quantise (check eod_texture_compare); sky tiles share palettes, change them as a set.
 ```
 
 ## 12. Implementation plan

@@ -994,7 +994,9 @@ extern "C" void f_00214B68(void) {
     }();
     const bool force = gate && lw(0x439858) >= 2;
     if (force) sw(0x3D1B0C, 1);
+    native::ee_environment_world(true);
     diff_run(0x00214B68, world_frame_render, f_00214B68_orig);
+    native::ee_environment_world(false);
     if (force) sw(0x3D1B0C, 0);
 }
 // 0x3582B8 is reached through src/hle_draw_distance.cpp's wrapper (EOD_CULL_TRACE, frame log).

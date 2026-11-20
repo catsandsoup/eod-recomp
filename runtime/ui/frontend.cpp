@@ -1,6 +1,5 @@
 // frontend.cpp - the front end's model (see frontend.h).
 #include "frontend.h"
-#include "../gs/modern_scene.h"
 
 #include <algorithm>
 #include <cmath>
@@ -263,7 +262,8 @@ Row action(const char *id, const char *label, const std::string &value, const ch
 }
 
 const char *kScales[] = {"AUTO (WINDOW)", "1X 640x448 (PS2)", "2X 1280x896", "3X 1920x1344", "4X 2560x1792",
-                         "5X 3200x2240", "6X 3840x2688"};
+                         "5X 3200x2240", "6X 3840x2688", "7X 4480x3136", "8X 5120x3584"};
+static_assert(sizeof(kScales) / sizeof(kScales[0]) == kMaxRenderScale + 1);
 const char *kAspects[] = {"auto", "4:3", "16:9", "16:10", "stretch"};
 const char *kAspectLabels[] = {"AUTO (GAME OPTION)", "4:3 (ORIGINAL)", "16:9 WIDESCREEN", "16:10 WIDESCREEN", "STRETCH"};
 const char *kDetails[] = {"original", "high", "maximum"};
@@ -293,13 +293,14 @@ void Menu::rows_graphics(std::vector<Row> &r) {
     const char *scale_note = "NEXT LAUNCH";
     const char *vsync_note = "NEXT LAUNCH";
 #endif
-    int sc = std::clamp(cfg_.render_scale, 0, 6);
+    int sc = std::clamp(cfg_.render_scale, 0, kMaxRenderScale);
 #ifdef _WIN32
     if (sc == 0) sc = 1;
 #endif
     r.push_back(choice("scale", "RENDER SCALE", kScales[sc], scale_note,
                        "Internal resolution the 3D is drawn at. Higher is sharper and needs a faster GPU; it also "
-                       "supersamples (the anti-aliasing of this renderer). AUTO matches the display's pixel height."));
+                       "supersamples (the anti-aliasing of this renderer). AUTO matches the display's pixel height. "
+                       "7X and 8X require a compatible Vulkan GPU."));
     r.push_back(choice("aspect", "ASPECT RATIO", kAspectLabels[index_of(kAspects, 5, cfg_.aspect)], "NEXT LAUNCH",
                        "Display shape. 16:9 and 16:10 switch the game's own widescreen camera and HUD; menus and "
                        "movies keep their 4:3 composition. Camera and composition change together on the next launch."));
@@ -313,13 +314,17 @@ void Menu::rows_graphics(std::vector<Row> &r) {
     r.push_back(choice("detail", "DETAIL PRESET", upper(kDetails[index_of(kDetails, 3, cfg_.detail)]), "NEXT LAUNCH",
                        "Optional car and scenery level-of-detail preset (docs/DETAIL_PRESETS.md)."));
     r.push_back(toggle("fps", "SHOW FRAME RATE", cfg_.show_fps, "LIVE", "Frame counter in the top right corner."));
-#ifdef _WIN32
-    r.push_back(header("MODERN RENDERER"));
-    Row mr = choice("modern", "RENDERER", cfg_.modern_renderer ? "MODERN" : "ORIGINAL", "LIVE",
-                    "MODERN redraws the race's world and cars with real-time lighting, soft sun shadows, "
-                    "reflections and ambient occlusion; ORIGINAL is the PS2 look. F9 or L1+R1+R3 switch it in a race.");
-    if (!modern::available()) { mr.enabled = false; mr.note = "D3D11 ONLY"; }
-    r.push_back(mr);
+    if (host_.plume_look != PlumeLook::Unavailable) {
+        r.push_back(choice("plume_look", "PLUME LOOK", host_.plume_look == PlumeLook::Modern ? "MODERN" : "CLASSIC",
+                           "LIVE", "Switches between Classic PS2 styling and Modern lighting. F9 also changes the look. "
+                           "A paused race shows the new look when play resumes."));
+        return;
+    }
+    if (!host_.legacy_modern_available) return;
+    r.push_back(header("LEGACY GS RENDERER"));
+    r.push_back(choice("modern", "GS LOOK", cfg_.modern_renderer ? "MODERN" : "ORIGINAL", "LIVE",
+                       "MODERN redraws the race's world and cars with real-time lighting, soft sun shadows, "
+                       "reflections and ambient occlusion. ORIGINAL uses the PS2 graphics."));
     auto pc = [&](const char *id, const char *label, int v, const char *help) {
         Row row = choice(id, label, v == 0 ? std::string("OFF") : percent(v), "LIVE", help);
         row.enabled = cfg_.modern_renderer;
@@ -337,7 +342,6 @@ void Menu::rows_graphics(std::vector<Row> &r) {
     pc("m_haze", "DISTANCE HAZE", cfg_.modern_haze, "Atmospheric haze toward the horizon.");
     pc("m_grade", "COLOUR GRADE", cfg_.modern_grade, "Saturation and contrast of the filmic grade (OFF: neutral).");
     pc("m_vignette", "VIGNETTE", cfg_.modern_vignette, "Darkened screen corners.");
-#endif
 }
 
 void Menu::rows_settings(std::vector<Row> &r) {
@@ -743,10 +747,12 @@ void Menu::reset_tab(Tab t) {
     case Tab::Graphics:
         cfg_.render_scale = d.render_scale; cfg_.aspect = d.aspect; cfg_.fullscreen = d.fullscreen; cfg_.vsync = d.vsync;
         cfg_.smooth_display = d.smooth_display; cfg_.frame_skip = d.frame_skip; cfg_.detail = d.detail; cfg_.show_fps = d.show_fps;
-        cfg_.modern_shadows = d.modern_shadows; cfg_.modern_soft_shadows = d.modern_soft_shadows;
-        cfg_.modern_reflections = d.modern_reflections; cfg_.modern_ao = d.modern_ao; cfg_.modern_bloom = d.modern_bloom;
-        cfg_.modern_vignette = d.modern_vignette; cfg_.modern_exposure = d.modern_exposure;
-        cfg_.modern_haze = d.modern_haze; cfg_.modern_grade = d.modern_grade;
+        if (host_.legacy_modern_available && host_.plume_look == PlumeLook::Unavailable) {
+            cfg_.modern_shadows = d.modern_shadows; cfg_.modern_soft_shadows = d.modern_soft_shadows;
+            cfg_.modern_reflections = d.modern_reflections; cfg_.modern_ao = d.modern_ao; cfg_.modern_bloom = d.modern_bloom;
+            cfg_.modern_vignette = d.modern_vignette; cfg_.modern_exposure = d.modern_exposure;
+            cfg_.modern_haze = d.modern_haze; cfg_.modern_grade = d.modern_grade;
+        }
         break;
     case Tab::Settings:
         cfg_.audio = d.audio; cfg_.volume = d.volume; cfg_.music_volume = d.music_volume; cfg_.pause_in_menu = d.pause_in_menu; cfg_.unlock_all = d.unlock_all;
@@ -792,15 +798,21 @@ void Menu::move_selection(int dy) {
 
 void Menu::change(const Row &row, int dir, Effects &fx) {
     const std::string &id = row.id;
+    if (id == "plume_look") {
+        fx.toggle_plume_look = true;
+        fx.sound = Sound::Move;
+        return;
+    }
     auto step = [&](int &v, int lo, int hi, int by) { v = std::clamp(v + dir * by, lo, hi); };
     // cheat tuning moves in quarter steps, the same units a lobby shares
     auto stepq = [&](float &v, float lo, float hi) { v = std::clamp(std::round(v * 4.0f + (dir >= 0 ? 1 : -1)) / 4.0f, lo, hi); };
     auto cycle = [&](const char *const *list, int n, std::string &v) { v = list[(index_of(list, n, v) + dir + n) % n]; };
     if (id == "scale") {
 #ifdef _WIN32
-        cfg_.render_scale = std::clamp(cfg_.render_scale + dir, 1, 6);
+        cfg_.render_scale = std::clamp(cfg_.render_scale + dir, 1, kMaxRenderScale);
 #else
-        cfg_.render_scale = (cfg_.render_scale + dir + 7) % 7;
+        const int count = kMaxRenderScale + 1;
+        cfg_.render_scale = (cfg_.render_scale + dir + count) % count;
 #endif
     } else if (id == "aspect") cycle(kAspects, 5, cfg_.aspect);
     else if (id == "fullscreen") { cfg_.fullscreen = !cfg_.fullscreen; fx.fullscreen = true; }

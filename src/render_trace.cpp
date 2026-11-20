@@ -8,6 +8,7 @@
 // Checks it reports: whether batch emission (0x35CB88) ever happens outside a flush (0x34AF98), whether
 // queued records equal flushed records, and which callers queue through 0x34BDA8 / 0x34BF90.
 #include "core/cpu.h"
+#include "core/diff_harness.h"
 #include "core/memory.h"
 #include "kernel/kernel.h"
 #include "render/native_renderer.h"
@@ -22,10 +23,13 @@
 #include <vector>
 
 extern uint32_t g_vu1_program_starts[0x800];  // runtime/vu/vif.cpp
+extern uint32_t g_vu1_camera_nops;
+extern uint32_t g_vu1_world_leaf_retires;
 extern void (*g_vu1_start_hook)(uint32_t addr);  // runtime/vu/vif.cpp
 extern uint32_t g_vif1_dma_tag;                  // runtime/hw/hw.cpp: DMA tag VIF1 is reading
 
 extern "C" {
+void f_0035BBD0_orig(void);
 void f_0034C9C0_orig(void);  // FrameBegin
 void f_0034C930_orig(void);  // flush layers 0..8
 void f_0034C860_orig(void);  // flush layer 9 and reset the pool
@@ -188,6 +192,10 @@ void report(const Counts &c) {
             s += t;
         }
     std::fprintf(stderr, "[rtrace] vb %llu vu1 programs:%s\n", (unsigned long long)c.vb, s.c_str());
+    if (g_vu1_camera_nops)
+        std::fprintf(stderr, "[rtrace] vb %llu camera nops retired %u\n", (unsigned long long)c.vb, g_vu1_camera_nops);
+    if (g_vu1_world_leaf_retires)
+        std::fprintf(stderr, "[rtrace] vb %llu world leaves retired %u\n", (unsigned long long)c.vb, g_vu1_world_leaf_retires);
     // split-screen state (1P/2P comparison): track-pass gate, view count, 0x212DD0 source, 0x495D68
     std::fprintf(stderr, "[rtrace] vb %llu views: gate3D1B0C %u viewcount3D1A74 %u v495D64 %08x v495D68 %u v495D58 %08x\n",
                  (unsigned long long)c.vb, MEM_LW(0x3D1B0C), MEM_LW(0x3D1A74), MEM_LW(0x495D64), MEM_LW(0x495D68),
@@ -227,6 +235,8 @@ void roll() {
     g_c = Counts{};
     g_c.vb = vb;
     std::memset(g_vu1_program_starts, 0, sizeof g_vu1_program_starts);
+    g_vu1_camera_nops = 0;
+    g_vu1_world_leaf_retires = 0;
     g_vu1_by_sender.clear();
     g_vu1_unknown.clear();
     g_vu1_total = g_vu1_attributed = 0;
@@ -373,6 +383,43 @@ extern "C" void f_0034B140(void) {
     }
 }
 
+static bool scene_clear_inputs(uint32_t qwc, native::SceneClear &clear) {
+    // The aligned branch in 0x361098 has spilled the original rectangle/color
+    // into these registers before its sole reserve call at 0x361154.
+    if (!native::scene_clear_enabled() || diff_in_original_side() || qwc != native::kSceneClearDirectQwc + 1 ||
+        g_ee.r[17].uw[0] != 20)
+        return false;
+    const bool depth_only = g_ee.r[21].ud[0] == 0;
+    if (depth_only) {
+        static const bool frontend_depth_clear = [] {
+            const char *v = std::getenv("EOD_NATIVE_FRONTEND_DEPTH_CLEAR");
+            return v && v[0] == '1';
+        }();
+        if (!frontend_depth_clear || !native::native_only()) return false;
+        // 0x35BBAC -> 0x35B9F8 -> 0x365228. The helper at 0x361318
+        // tail-calls the aligned clear, so check the saved callers.
+        const uint32_t sp = g_ee.r[29].uw[0];
+        if (MEM_LW(sp + 176) != 0x365228 || MEM_LW(sp + 208) != 0x35B9F8 ||
+            MEM_LW(sp + 256) != 0x35BBAC)
+            return false;
+    }
+    const int32_t x = g_ee.r[18].sw[0], y0 = g_ee.r[19].sw[0], y1 = g_ee.r[20].sw[0];
+    const bool bootstrap = !depth_only && native::bootstrap_raster_enabled() &&
+        x == 1727 && y0 == 1823 && y1 == 2242 &&
+        MEM_LW(g_ee.r[29].uw[0] + 176) == 0x365228 &&
+        MEM_LW(g_ee.r[29].uw[0] + 208) == 0x35B9F8 &&
+        MEM_LW(g_ee.r[29].uw[0] + 256) == 0x35E264;
+    if (x < 0 || x > 4095 - 640 || y0 < 0 || y1 < y0 || y1 > 4095 || (y1 - y0 != 448 && !bootstrap))
+        return false;
+    const uint32_t rgba = (g_ee.r[22].uw[0] & 0xff) | ((g_ee.r[23].uw[0] & 0xff) << 8) |
+                          ((g_ee.r[30].uw[0] & 0xff) << 16) | ((g_ee.r[11].uw[0] & 0xff) << 24);
+    const uint32_t zbuf = (MEM_LW(0x4D8BD0) & 0x1ff) | ((MEM_LW(0x4D8BD4) & 0xf) << 24);
+    clear = {x, y0, x + 640, y1, rgba, zbuf,
+             bootstrap ? native::SceneClearTarget::Bootstrap :
+             depth_only ? native::SceneClearTarget::Depth : native::SceneClearTarget::ColorAndDepth};
+    return true;
+}
+
 // Packet reserves: tag the returned space with the reserving call (VU1 start attribution), and tell
 // the native renderer (render/native_renderer.h), which tags the batch packets of queue records.
 #define RESERVE_WRAPPER(addr)                                                     \
@@ -380,11 +427,29 @@ extern "C" void f_0034B140(void) {
         const bool nat = native::enabled();                                       \
         if (!g_on && !nat) return f_##addr##_orig();                              \
         const uint32_t qwc = arg(0), r = ra();                                    \
+        native::SceneClear clear{};                                               \
+        const bool scene_clear = nat && r == 0x361154 && scene_clear_inputs(qwc, clear); \
         f_##addr##_orig();                                                        \
         if (g_on && g_ee.r[2].uw[0]) tag_range(g_ee.r[2].uw[0], qwc * 16, r);     \
-        if (nat) native::ee_packet_reserved(g_ee.r[2].uw[0], qwc, r);             \
+        if (nat) native::ee_packet_reserved(g_ee.r[2].uw[0], qwc, r,              \
+                                            scene_clear ? &clear : nullptr);      \
     }
 RESERVE_WRAPPER(00366C88)
 RESERVE_WRAPPER(00366D30)
 RESERVE_WRAPPER(00366D78)
 RESERVE_WRAPPER(00366DD8)
+
+extern "C" void f_0035BBD0() {
+    const uint32_t addr = arg(0), caller = ra();
+    if (!native::enabled() || !native::display_copy_enabled() || diff_in_original_side() ||
+        caller != 0x0035e978 || !addr)
+        return f_0035BBD0_orig();
+    int32_t fix = static_cast<int32_t>(MEM_LW(0x3E57FC));
+    if (static_cast<int32_t>(MEM_LW(0x3E57A4)) > 0 && fix > 16)
+        fix = 16;
+    const native::DisplayCopy copy{(MEM_LW(0x3E57F8) << 5) & 0x3fe0,
+                                  static_cast<uint32_t>(fix) & 0xff, caller};
+    f_0035BBD0_orig();  // retain the original packet, EE return value and countdown
+    if (g_ee.r[2].uw[0] == native::kDisplayCopyDirectQwc + 1)
+        native::ee_tag_display_copy(addr & 0x0fffffffu, copy);  // EE RAM alias to VIF DMA address
+}

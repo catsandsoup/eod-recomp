@@ -276,16 +276,16 @@ class ReimportClassification(unittest.TestCase):
         self.assertEqual((r["nativeSameSize"], r["hostReplacement"], r["scale"]), (False, True, 4))
 
     def test_rejections(self):
-        for w, h, reason in ((48, 48, "power of two"), (64, 32, "uniform"), (8192 // 16 * 16, 8192, "4096")):
+        for w, h, reason in ((48, 48, "power of two"), (64, 32, "uniform")):
             r = self.check("A.CAR#x.tex", w, h)
             self.assertFalse(r["hostReplacement"], (w, h))
         self.assertIn("power of two", self.check("A.CAR#x.tex", 48, 48)["reasons"]["host-replacement"])
         self.assertIn("uniform", self.check("A.CAR#x.tex", 64, 32)["reasons"]["host-replacement"])
 
-    def test_cap_at_4096(self):
-        self.manifest["assets"][0].update(width=256, height=256)
-        self.assertTrue(self.check("A.CAR#x.tex", 4096, 4096)["hostReplacement"])
-        self.assertIn("4096", self.check("A.CAR#x.tex", 8192, 8192)["reasons"]["host-replacement"])
+    def test_cap_at_8192(self):
+        self.manifest["assets"][0].update(width=1024, height=16)
+        self.assertTrue(self.check("A.CAR#x.tex", 8192, 128)["hostReplacement"])
+        self.assertIn("8192", self.check("A.CAR#x.tex", 16384, 256)["reasons"]["host-replacement"])
 
     def test_direct_colour_qualifies_for_nothing(self):
         r = self.check("A.CAR#d.tex", 64, 64)
@@ -359,10 +359,10 @@ class ReadPngTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def read(self, png):
+    def read(self, png, **kwargs):
         path = Path(self.tmp.name) / "t.png"
         path.write_bytes(png)
-        return tex.read_png(str(path))
+        return tex.read_png(str(path), **kwargs)
 
     def rows(self, w, h, channels, top, seed=7):
         import random
@@ -374,6 +374,16 @@ class ReadPngTests(unittest.TestCase):
         want = bytes(v for row in rows for v in row)
         for interlace in (False, True):
             self.assertEqual(self.read(encode_png(11, 9, 6, 8, rows, interlace=interlace)), (11, 9, want))
+
+    def test_host_png_bounds_dimensions_and_inflated_length(self):
+        oversized = encode_png(8193, 1, 0, 8, [[0] * 8193])
+        with self.assertRaisesRegex(ValueError, "exceed 8192"):
+            self.read(oversized, max_side=8192)
+
+        small = encode_png(1, 1, 0, 8, [[0]])
+        extra_rows = encode_png(1, 2, 0, 8, [[0], [0]])
+        with self.assertRaisesRegex(ValueError, "scanline length"):
+            self.read(small[:33] + extra_rows[33:], max_side=8192)
 
     def test_rgb8_and_16(self):
         rows = self.rows(7, 5, 3, 255)

@@ -14,7 +14,9 @@
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
 0021C6E0 wrap     # VisualCarSelectLodIndex as readable C++ (src/native_lod.cpp; EOD_DIFF), Detail=maximum policy, trace
 00212808 wrap     # DrawDistanceApplyOption as readable C++ (src/native_lod.cpp; EOD_DIFF)
-00218E68 wrap     # bounded batch selection/submission trace
+0020F4A0 wrap     # frame renderer ordered visual-car traversal
+00218E68 wrap     # visual-car batch traversal and LOD diagnostics
+0021C370 wrap     # ordered visual-car transform update
 0034E308 wrap     # bounded actual CPU sphere visibility trace
 00214678 wrap     # GRAF load: optional DrawDistance scales each mlist LOD group final cutoff
 003582B8 wrap     # mlist calc: EOD_CULL_TRACE per-test rejection counts (diagnostic)
@@ -76,6 +78,7 @@
 002A75E0 wrap     # GameDoSingle car screen: answered once for a direct start
 002C7340 wrap     # GameDoSingle track screen: answered once for a direct start
 00270C10 wrap     # MenuRun: the Arcade 'single / multi' prompt is auto-answered (single) for online events
+002A8EF0 wrap     # CarChooseWidget label setter: decorate Arcade paint display text for overridden vehicles
 00120650 wrap     # per-event setup: pre-select the requested event once
 00120FB8 wrap     # EveHasMoreEvents: returns 0 after an online event completes so GameDoSingle unwinds to the main menu
 00177718 wrap     # default-off netplay world-step diagnostic boundary
@@ -161,10 +164,15 @@
 0035D298 wrap     # emit one shadow batch
 0034B140 wrap     # append a model's batches to the queue
 0034CC98 wrap     # queue a world-space model (src/render_queue.cpp)
+0034C828 wrap     # clear draw buckets and discard native overflow
+0034C8C0 wrap     # alternate single-layer flush, with a layer-9 reset
+0034D1F8 wrap     # allocate the guest draw pool and start a new native queue lifetime
+0034D088 wrap     # free the guest pool and the native overflow
 00366C88 wrap     # packet reserve (top): tagged for VU1 start attribution (render_trace)
 00366D30 wrap     # packet reserve: tagged for VU1 start attribution
 00366D78 wrap     # packet reserve, second manager: tagged for VU1 start attribution
 00366DD8 wrap     # packet reserve, second manager: tagged for VU1 start attribution
+0035BBD0 wrap     # display copy packet builder: attach 0x1180 -> 0 composition to its DMA tag
 
 # Track world, sky and water (src/native_world.cpp, readable C++; EOD_DIFF checks each; stage R2 of
 # docs/NATIVE_RENDERER.md). 0x3582B8 above is the mlist calc (hle_draw_distance.cpp forwards to it).

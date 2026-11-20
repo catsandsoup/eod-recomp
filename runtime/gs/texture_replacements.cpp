@@ -6,11 +6,16 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <thread>
+#include <tuple>
 
 #ifdef _WIN32
+#include <memory>
+#include <new>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -69,8 +74,8 @@ bool parse_htx_header(const uint8_t *p, size_t file_bytes, HtxHeader &out, std::
     out.height = rd16(p + 10);
     out.levels = rd16(p + 12);
     out.flags = rd16(p + 14);
-    if (!out.width || !out.height || out.width > 4096 || out.height > 4096) {
-        why = "dimensions outside 1..4096";
+    if (!out.width || !out.height || out.width > kHtxMaxSide || out.height > kHtxMaxSide) {
+        why = "dimensions outside 1.." + std::to_string(kHtxMaxSide);
         return false;
     }
     if (out.flags != 0) {
@@ -173,43 +178,85 @@ void Store::close_all() {
 }
 
 bool Store::open_file(Entry &e, std::string &why) {
-#ifndef _WIN32
-    int fd = ::open(e.path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        why = "file not found";
-        return false;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t)kHtxHeaderBytes) {
-        ::close(fd);
-        why = "file too small";
-        return false;
-    }
-    void *m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) {
-        why = "mmap failed";
-        return false;
-    }
-    e.data = static_cast<const uint8_t *>(m);
-    e.bytes = (size_t)st.st_size;
-    e.mapped = true;
-#else
-    std::ifstream f(e.path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        why = "file not found";
-        return false;
-    }
-    size_t n = (size_t)f.tellg();
-    f.seekg(0);
-    uint8_t *buf = new uint8_t[n ? n : 1];
-    f.read(reinterpret_cast<char *>(buf), (std::streamsize)n);
-    e.data = buf;
-    e.bytes = n;
-    e.mapped = false;
-#endif
+    const size_t max_bytes = htx_total_bytes(kHtxMaxSide, kHtxMaxSide, full_chain_levels(kHtxMaxSide, kHtxMaxSide));
     HtxHeader h;
-    if (!parse_htx_header(e.data, e.bytes, h, why)) return false;
+    if (metadata_only_) {
+        std::ifstream f(std::filesystem::u8path(e.path), std::ios::binary | std::ios::ate);
+        const auto size = f.tellg();
+        if (size < (std::streamoff)kHtxHeaderBytes || size > (std::streamoff)max_bytes) {
+            why = "file size outside supported bounds";
+            return false;
+        }
+        uint8_t header[kHtxHeaderBytes];
+        f.seekg(0);
+        if (!f.read(reinterpret_cast<char *>(header), sizeof header)) {
+            why = "could not read header";
+            return false;
+        }
+        e.bytes = static_cast<size_t>(size);
+        if (!parse_htx_header(header, e.bytes, h, why)) return false;
+    } else {
+#ifndef _WIN32
+        int fd = ::open(e.path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            why = "file not found";
+            return false;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < (off_t)kHtxHeaderBytes) {
+            ::close(fd);
+            why = "file too small";
+            return false;
+        }
+        if ((uintmax_t)st.st_size > max_bytes) {
+            ::close(fd);
+            why = "file exceeds the largest supported mip chain";
+            return false;
+        }
+        void *m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (m == MAP_FAILED) {
+            why = "mmap failed";
+            return false;
+        }
+        e.data = static_cast<const uint8_t *>(m);
+        e.bytes = (size_t)st.st_size;
+        e.mapped = true;
+        if (!parse_htx_header(e.data, e.bytes, h, why)) return false;
+#else
+        std::ifstream f(e.path, std::ios::binary | std::ios::ate);
+        if (!f) {
+            why = "file not found";
+            return false;
+        }
+        const auto size = f.tellg();
+        if (size < (std::streamoff)kHtxHeaderBytes || size > (std::streamoff)max_bytes) {
+            why = "file size outside supported bounds";
+            return false;
+        }
+        const size_t n = (size_t)size;
+        f.seekg(0);
+        uint8_t header[kHtxHeaderBytes];
+        if (!f.read(reinterpret_cast<char *>(header), sizeof header)) {
+            why = "could not read header";
+            return false;
+        }
+        if (!parse_htx_header(header, n, h, why)) return false;
+        auto buf = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[n]);
+        if (!buf) {
+            why = "could not allocate file contents";
+            return false;
+        }
+        memcpy(buf.get(), header, sizeof header);
+        if (!f.read(reinterpret_cast<char *>(buf.get() + sizeof header), (std::streamsize)(n - sizeof header))) {
+            why = "could not read file contents";
+            return false;
+        }
+        e.data = buf.release();
+        e.bytes = n;
+        e.mapped = false;
+#endif
+    }
     if (h.width % e.orig_w || h.height % e.orig_h || h.width / e.orig_w != h.height / e.orig_h ||
         !pow2(h.width / e.orig_w)) {
         why = std::to_string(h.width) + "x" + std::to_string(h.height) + " is not " + std::to_string(e.orig_w) +
@@ -245,7 +292,7 @@ size_t Store::load(const std::string &root, const LogFn &log, const FindFn &find
         log("host textures: no manifest " + hosttex + "/replacements.tsv");
         return 0;
     }
-    std::ifstream f(manifest, std::ios::binary);
+    std::ifstream f(std::filesystem::u8path(manifest), std::ios::binary);
     if (!f) {
         log("host textures: no manifest " + manifest);
         return 0;
@@ -253,6 +300,19 @@ size_t Store::load(const std::string &root, const LogFn &log, const FindFn &find
     std::stringstream ss;
     ss << f.rdbuf();
     return parse(ss.str(), hosttex, log, find);
+}
+
+std::vector<std::string> Store::active_asset_ids(const std::string &root, const FindFn &find) {
+    Store metadata;
+    metadata.metadata_only_ = true;
+    metadata.load(root, [](const std::string &) {}, find);
+    std::vector<std::string> assets;
+    std::set<std::tuple<uint64_t, bool, uint64_t, uint32_t, uint32_t>> keys;
+    for (const Entry &e : metadata.entries_) {
+        if (keys.emplace(e.index_key, e.any_palette, e.palette_key, e.orig_w, e.orig_h).second)
+            assets.push_back(e.asset_id);
+    }
+    return assets;
 }
 
 size_t Store::parse(const std::string &text, const std::string &hosttex_dir, const LogFn &log, const FindFn &find) {

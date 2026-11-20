@@ -13,6 +13,12 @@
 EEState g_ee{};
 uint8_t *g_ram;
 
+// The projection fixture has no running kernel, game key queue, or LOD feed.
+uint64_t kernel_vblank_count() { return 0; }
+extern "C" void f_0033C168() {}
+struct LodViewCounts { unsigned long long frames, cars, low0, records; };
+LodViewCounts g_lod_view{};
+
 extern "C" void f_0034E530();
 extern "C" void f_0034E530_orig() { g_ee.r[2].ud[1]++; }
 extern "C" uint32_t ee_read32_slow(uint32_t) { std::abort(); }

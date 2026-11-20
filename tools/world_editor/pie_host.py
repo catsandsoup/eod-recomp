@@ -13,10 +13,11 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -34,6 +36,66 @@ from PySide6.QtWidgets import (
 )
 
 from theme import ACCENT_GREEN, BG_ROOT, BORDER, TEXT_PRIMARY, TEXT_SECONDARY, svg_icon
+
+
+class _PlaybackControls(QLayout):
+    """Wrap the live controls to their natural size in a narrow viewport."""
+
+    def __init__(self):
+        super().__init__()
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(6)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < self.count() else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < self.count() else None
+
+    def hasHeightForWidth(self):
+        return True
+
+    def minimumSize(self):
+        size = QSize(0, 0)
+        for item in self._items:
+            if not item.isEmpty():
+                size = size.expandedTo(item.minimumSize())
+        return size
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def heightForWidth(self, width):
+        return self._arrange(QRect(0, 0, max(1, width), 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def _arrange(self, rect, *, apply):
+        x = y = row_height = 0
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            hint = item.sizeHint().expandedTo(item.minimumSize())
+            width = min(hint.width(), rect.width())
+            if x and x + width > rect.width():
+                x = 0
+                y += row_height + self.spacing()
+                row_height = 0
+            if apply:
+                item.setGeometry(QRect(rect.x() + x, rect.y() + y, width, hint.height()))
+            x += width + self.spacing()
+            row_height = max(row_height, hint.height())
+        return y + row_height
+
 
 # Win32 window style & message constants
 GWL_STYLE = -16
@@ -302,16 +364,29 @@ def canonicalize_car_name(car_name: str) -> str:
     return aliases.get(clean.lower(), clean or "Algar")
 
 
-def resolve_eod_exe(game_dir: Path | str) -> Path:
-    """Locate `eod.exe` across game_dir, repo build/, and %LOCALAPPDATA%\\TDEODRecomp."""
+def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = False) -> Path:
+    """Locate the PIE executable for the current platform and renderer."""
+    override = os.environ.get("EOD_PIE_EXE")
+    if override:
+        return Path(override).expanduser().resolve()
     gdir = Path(game_dir).resolve()
-    candidates = [
-        gdir / "eod.exe",
-        Path(__file__).resolve().parents[2] / "build" / "eod.exe",
-    ]
-    local_app = os.environ.get("LOCALAPPDATA")
-    if local_app:
-        candidates.append(Path(local_app) / "TDEODRecomp" / "eod.exe")
+    repository = Path(__file__).resolve().parents[2]
+    if sys.platform == "darwin":
+        bundle_executable = Path("Eve of Destruction.app/Contents/MacOS/eod")
+        builds = ["build-mac-plume", "build-mac"] if prefer_plume else ["build-mac", "build-mac-plume"]
+        candidates = [
+            gdir / "eod",
+            gdir / bundle_executable,
+            *(repository / build / "eod" for build in builds),
+            Path.home() / "Applications" / bundle_executable,
+            Path("/Applications") / bundle_executable,
+            gdir / "eod.exe",
+        ]
+    else:
+        candidates = [gdir / "eod.exe", repository / "build" / "eod.exe"]
+        local_app = os.environ.get("LOCALAPPDATA")
+        if local_app:
+            candidates.append(Path(local_app) / "TDEODRecomp" / "eod.exe")
     for c in candidates:
         if c.is_file():
             return c
@@ -332,6 +407,7 @@ def build_pie_launch_spec(
     arcade_mode: str = "free_roam",
     ai_autodrive: bool = False,
     free_cam: bool = False,
+    laps: int | None = None,
 ) -> dict[str, Any]:
     """Build exact process args and environment variables for `eod.exe` PIE launch.
 
@@ -344,17 +420,18 @@ def build_pie_launch_spec(
             Free Roam solo on the selected map variation!).
           * When default/`Battle (Free Roam)`/`All Templates` is chosen, launches
             `event=Battle` with `ai=<ai_count>` (0 = solo).
-      - Event / Race: launches the canonicalized contest name with `ai=<ai_count>`.
+      - Event / Race: launches the canonicalized contest name with `ai=<ai_count>`
+        and the optional `laps=<count>` for lap races.
       - Launches with `--windowed` so `eod.ini` `Fullscreen=1` never clips the embedded HUD.
       - Configures `EOD_PIE_CONTROL_FILE`, `EOD_OPT_TERRAIN_MASK`, `EOD_ARCADE_MODE`,
         `EOD_AI_AUTODRIVE`, `EOD_FREE_CAM`, and `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`.
     """
     gdir = Path(game_dir).resolve()
     mdir = Path(mod_dir).resolve()
-    exe = resolve_eod_exe(gdir)
     clean_car = canonicalize_car_name(car_name)
     trk_up = track_display_name.strip()
     rmode = "plume" if renderer_mode == "plume" else "ps2"
+    exe = resolve_eod_exe(gdir, prefer_plume=rmode == "plume")
     rtag = "Plume HQ" if rmode == "plume" else "PS2 Fast"
 
     raw_ev = (event_name or "").strip()
@@ -379,7 +456,7 @@ def build_pie_launch_spec(
             direct = f"mode=action;track={trk_up};event={canon_ev};car={clean_car};paint=0;humans=1;ai={roam_ai}"
             label = f"Free Roam ({canon_ev}, Solo) — {trk_up} ({clean_car}) [{rtag}]"
         else:
-            roam_ai = max(0, int(ai_count)) if ai_count is not None else 0
+            roam_ai = max(0, min(12, int(ai_count))) if ai_count is not None else 0
             direct = f"mode=action;track={trk_up};event=Battle;car={clean_car};paint=0;humans=1;ai={roam_ai}"
             label = f"Free Roam (Battle, {roam_ai} AI) — {trk_up} ({clean_car}) [{rtag}]"
     else:
@@ -397,6 +474,8 @@ def build_pie_launch_spec(
                 "humans=1",
                 f"ai={ev_ai}",
             ]
+            if laps is not None:
+                parts.append(f"laps={max(1, min(50, int(laps)))}")
             direct = ";".join(parts)
             label = f"Event — {trk_up} · {canon_ev} ({ev_ai} AI · {clean_car}) [{rtag}]"
 
@@ -411,18 +490,23 @@ def build_pie_launch_spec(
     env["EOD_ARCADE_MODE"] = (arcade_mode or "free_roam").strip().lower()
     env["EOD_AI_AUTODRIVE"] = "1" if ai_autodrive else "0"
     env["EOD_FREE_CAM"] = "1" if free_cam else "0"
+    env.pop("EOD_NATIVE_ONLY", None)
+    env["EOD_MODERN"] = "0"
+    args = [str(exe), "--windowed", "--data", str(gdir)]
     if sync_all_events:
         env["EOD_OPT_TERRAIN_MASK"] = "0xFFFF"
     if rmode == "plume":
-        env["EOD_MODERN"] = "1"
-        env["EOD_NATIVE"] = "0"
+        env["EOD_PLUME"] = "1"
+        env["EOD_NATIVE"] = "1"
+        env["EOD_LOOK"] = "modern"
+        args.extend(["--renderer", "vulkan", "--require-plume"])
     else:
         env["EOD_NATIVE"] = "0"
-        env["EOD_MODERN"] = "0"
+        env.pop("EOD_LOOK", None)
 
     return {
         "exe": str(exe),
-        "args": [str(exe), "--windowed"],
+        "args": args,
         "cwd": str(gdir),
         "mod_dir": str(mdir),
         "control_file": str(control_file),
@@ -576,6 +660,8 @@ class PieHostWidget(QWidget):
         self._last_embedded_size: tuple[int, int] = (0, 0)
         self._popped_out: bool = False
         self._last_spec: dict[str, Any] | None = None
+        self._plume_ready: threading.Event | None = None
+        self._plume_deadline = 0.0
         self._poll_attempts: int = 0
         self._control_file: Path | None = None
         self._live_state: dict[str, Any] = {
@@ -598,31 +684,33 @@ class PieHostWidget(QWidget):
         self.bar.setStyleSheet(
             f"QFrame {{ background: #142219; border-bottom: 1px solid #2b6e44; }}"
         )
-        bar_lay = QHBoxLayout(self.bar)
+        bar_lay = QVBoxLayout(self.bar)
         bar_lay.setContentsMargins(10, 5, 10, 5)
         bar_lay.setSpacing(6)
+        state_row = QHBoxLayout()
+        bar_lay.addLayout(state_row)
+        controls = _PlaybackControls()
+        bar_lay.addLayout(controls)
 
         self.lbl_state = QLabel("● PIE READY")
         self.lbl_state.setStyleSheet(
             f"color: {ACCENT_GREEN}; font-weight: 700; font-size: 9pt; background: transparent;"
         )
         self.lbl_detail = QLabel("")
+        self.lbl_detail.setWordWrap(True)
         self.lbl_detail.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.2pt; background: transparent;")
 
         self.btn_free_cam = QPushButton(" Free Cam")
         self.btn_free_cam.setCheckable(True)
-        self.btn_free_cam.setFixedHeight(25)
         self.btn_free_cam.setToolTip("Toggle Free / Elevated Camera View inside PIE live (hotkey C also cycles camera)")
         self.btn_free_cam.toggled.connect(self._on_free_cam_toggled)
 
         self.btn_ai_drive = QPushButton(" AI Auto-Drive")
         self.btn_ai_drive.setCheckable(True)
-        self.btn_ai_drive.setFixedHeight(25)
         self.btn_ai_drive.setToolTip("Let AI drive your player car along the edited ILIN racing line live!")
         self.btn_ai_drive.toggled.connect(self._on_ai_drive_toggled)
 
         self.cmb_arcade = QComboBox()
-        self.cmb_arcade.setFixedHeight(25)
         self.cmb_arcade.setMinimumWidth(128)
         self.cmb_arcade.setToolTip("Live Arcade / Custom Game Mode overlay")
         for key, title in ARCADE_MODES:
@@ -630,35 +718,33 @@ class PieHostWidget(QWidget):
         self.cmb_arcade.currentIndexChanged.connect(self._on_arcade_changed)
 
         self.btn_focus_game = QPushButton(" Focus Controls")
-        self.btn_focus_game.setFixedHeight(25)
         self.btn_focus_game.setToolTip("Give Win32 keyboard & controller focus to embedded eod.exe")
         self.btn_focus_game.clicked.connect(self.focus_embedded_game)
 
         self.btn_restart = QPushButton(" Restart")
         self.btn_restart.setIcon(svg_icon("rotate"))
-        self.btn_restart.setFixedHeight(25)
         self.btn_restart.clicked.connect(self.pieRestartRequested.emit)
 
         self.btn_popout = QPushButton(" Pop Out")
         self.btn_popout.setIcon(svg_icon("popout"))
-        self.btn_popout.setFixedHeight(25)
         self.btn_popout.clicked.connect(self.pop_out_window)
 
-        self.btn_stop = QPushButton(" Stop PIE (Shift+Esc)")
+        self.btn_stop = QPushButton("Stop PIE")
+        self.btn_stop.setToolTip("Stop Play In Editor (Shift+Esc)")
         self.btn_stop.setIcon(svg_icon("stop", "#ff99a2"))
         self.btn_stop.setProperty("danger", True)
-        self.btn_stop.setFixedHeight(25)
         self.btn_stop.clicked.connect(self.stop_pie)
 
-        bar_lay.addWidget(self.lbl_state)
-        bar_lay.addWidget(self.lbl_detail, 1)
-        bar_lay.addWidget(self.btn_free_cam)
-        bar_lay.addWidget(self.btn_ai_drive)
-        bar_lay.addWidget(self.cmb_arcade)
-        bar_lay.addWidget(self.btn_focus_game)
-        bar_lay.addWidget(self.btn_restart)
-        bar_lay.addWidget(self.btn_popout)
-        bar_lay.addWidget(self.btn_stop)
+        state_row.addWidget(self.lbl_state)
+        state_row.addWidget(self.lbl_detail, 1)
+        for button in (self.btn_stop, self.btn_restart, self.btn_free_cam, self.btn_ai_drive, self.cmb_arcade,
+                       self.btn_focus_game, self.btn_popout):
+            controls.addWidget(button)
+        if sys.platform != "win32":
+            self.btn_focus_game.setEnabled(False)
+            self.btn_popout.setEnabled(False)
+            self.btn_focus_game.setToolTip("Switch to the game window to give it keyboard focus.")
+            self.btn_popout.setToolTip("On this platform the game opens in a separate window.")
         root.addWidget(self.bar)
 
         # Native Win32 embed surface
@@ -672,6 +758,7 @@ class PieHostWidget(QWidget):
         c_lay.setContentsMargins(0, 0, 0, 0)
         c_lay.setSpacing(0)
         self.lbl_placeholder = QLabel("Launching eod.exe Vulkan viewport...")
+        self.lbl_placeholder.setWordWrap(True)
         self.lbl_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_placeholder.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 11pt; background: transparent;")
         c_lay.addWidget(self.lbl_placeholder)
@@ -737,6 +824,9 @@ class PieHostWidget(QWidget):
             return False
 
         self._last_spec = spec
+        plume_ready = threading.Event() if spec.get("renderer_mode") == "plume" else None
+        self._plume_ready = plume_ready
+        self._plume_deadline = time.monotonic() + 30.0 if plume_ready is not None else 0.0
         self._popped_out = False
         self._child_hwnd = 0
         self._attached_tid = 0
@@ -762,7 +852,7 @@ class PieHostWidget(QWidget):
             arcade_mode=amode,
         )
 
-        self.btn_popout.setEnabled(True)
+        self.btn_popout.setEnabled(sys.platform == "win32")
         self.lbl_state.setText("● PIE STARTING")
         self.lbl_detail.setText(f"{spec['label']}  |  EOD_MOD_DIR={Path(spec['mod_dir']).name}")
         self.lbl_placeholder.setText(
@@ -803,6 +893,8 @@ class PieHostWidget(QWidget):
                     for raw_line in proc_ref.stdout:
                         line = raw_line.rstrip("\r\n")
                         if line:
+                            if plume_ready is not None and line.startswith("[native] plume renderer ready ("):
+                                plume_ready.set()
                             self.pieLogLine.emit(f"[eod.exe] {line}")
             except Exception:
                 pass
@@ -826,11 +918,28 @@ class PieHostWidget(QWidget):
             code = self._proc.returncode
             self._proc = None
             self._child_hwnd = 0
-            self.pieStatusChanged.emit(f"PIE exited (code {code})")
+            if self._plume_ready is not None and not self._plume_ready.is_set():
+                self.pieStatusChanged.emit(f"Plume HQ failed to initialize (exit {code}). See the Output Log.")
+            else:
+                self.pieStatusChanged.emit(f"PIE exited (code {code})")
             self.pieStopped.emit()
             return
 
-        if sys.platform == "win32" and not self._popped_out:
+        if self._plume_ready is not None and not self._plume_ready.is_set():
+            if time.monotonic() >= self._plume_deadline:
+                self.stop_pie(emit_signal=False)
+                message = "Plume HQ did not initialize. Use a Plume-enabled game build with Vulkan."
+                self.pieLogLine.emit(f"[PIE][ERROR] {message}")
+                self.pieStatusChanged.emit(message)
+                self.pieStopped.emit()
+            return
+
+        if sys.platform != "win32":
+            if not self._popped_out:
+                self._popped_out = True
+                self.lbl_state.setText("● PIE RUNNING")
+                self.lbl_placeholder.setText("Play In Editor is running in the game window.\nClick Stop PIE to return.")
+        elif not self._popped_out:
             if not self._child_hwnd:
                 self._poll_attempts += 1
                 hwnd = _find_process_hwnd_win32(self._proc.pid)

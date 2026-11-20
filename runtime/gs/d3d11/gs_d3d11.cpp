@@ -1583,7 +1583,7 @@ bool start(bool with_window) {
         release(factory);
         return false;
     }
-    g_scale = std::max(1, std::min(6, g_config.render_scale));
+    g_scale = std::max(1, std::min(kLegacyMaxRenderScale, g_config.render_scale));
     if (with_window) {
         g_hwnd = (HWND)platform_native_window();
         RECT rc;

@@ -45,6 +45,7 @@
 #include "iop/sif.h"
 #include "kernel/kernel.h"
 #include "platform/platform.h"
+#include "render/native_renderer.h"
 #include "vu/vif.h"
 #include "vu.h"
 
@@ -321,6 +322,7 @@ int main(int argc, char **argv) {
     const char *vu_bench_file = nullptr;
     const char *import_card = nullptr;
     int repeat = 3;
+    bool require_plume = false;
 #ifndef _WIN32
     bool list_pads = false;
     int watch_pads = 0;
@@ -337,6 +339,7 @@ int main(int argc, char **argv) {
         if (a == "--data") data_dir = next();
         else if (a == "--config") next();
         else if (a == "--renderer") g_config.renderer = next();
+        else if (a == "--require-plume") require_plume = true;
         else if (a == "--fullscreen") cfg.fullscreen = true;
         else if (a == "--windowed") cfg.fullscreen = false;
         else if (a == "--log") log_spec = next();
@@ -365,7 +368,7 @@ int main(int argc, char **argv) {
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
-                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume]\n"
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
                    argv[0]);
@@ -373,7 +376,7 @@ int main(int argc, char **argv) {
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
-                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume]\n"
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
                    "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
@@ -381,6 +384,14 @@ int main(int argc, char **argv) {
 #endif
             return 0;
         }
+    }
+    if (require_plume) {
+#ifdef EOD_PLUME
+        g_config.native_renderer = true;
+#else
+        std::fprintf(stderr, "[native] Plume is required but was not compiled into this build\n");
+        return 2;
+#endif
     }
     log_init(log_spec);
 #ifndef _WIN32
@@ -489,6 +500,10 @@ int main(int argc, char **argv) {
         vif_init();
         ipu_init();
         gs_init();
+        if (require_plume && !native::prepare()) {
+            std::fprintf(stderr, "[native] Plume is required but could not initialize on the active Vulkan device\n");
+            app_exit(2);
+        }
         sif_init();
         kernel_init(argc, argv);
         entry = load_elf(elf);

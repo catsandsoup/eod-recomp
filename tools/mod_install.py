@@ -7,7 +7,6 @@ functions return dicts and raise ValueError with user-facing messages.
 """
 import argparse
 import contextlib
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -17,11 +16,20 @@ import struct
 import sys
 import tempfile
 
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from modding_backend import atomic_write, directory
 import mod_package as mp
 
-DEFAULT_ROOT = Path("~/Library/Application Support/EODCreationKit/profiles")
+if WINDOWS:
+    DEFAULT_ROOT = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData/Local")) / "EODCreationKit/profiles"
+else:
+    DEFAULT_ROOT = Path("~/Library/Application Support/EODCreationKit/profiles")
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
@@ -40,12 +48,20 @@ def profile_dir(root, name):
 @contextlib.contextmanager
 def locked(P):
     P.mkdir(parents=True, exist_ok=True)
-    with open(P / ".lock", "a+") as handle:
+    with open(P / ".lock", "a+b") as handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if WINDOWS:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise ValueError("Another Kit operation is changing this profile; try again when it finishes") from None
-        yield
+        try:
+            yield
+        finally:
+            if WINDOWS:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def load(P, name):
@@ -166,19 +182,12 @@ def box_levels(width, height, rgba):
 
 def eodhtx(png_path):
     from tex import read_png
-    w, h, rgba = read_png(str(png_path))
+    w, h, rgba = read_png(str(png_path), max_side=mp.MAX_SIDE)
     levels = box_levels(w, h, rgba)
     return b"EODHTX1\0" + struct.pack("<4H", w, h, len(levels), 0) + b"".join(levels)
 
 
-def check_eodhtx(data):
-    if data[:8] != b"EODHTX1\0":
-        raise ValueError("Bad .eodhtx header")
-    w, h, n, flags = struct.unpack_from("<4H", data, 8)
-    size = sum(max(1, w >> i) * max(1, h >> i) * 4 for i in range(n))
-    if flags or n != max(w, h).bit_length() or len(data) != 16 + size:
-        raise ValueError("Bad .eodhtx level chain")
-    return w, h, n
+check_eodhtx = mp.check_eodhtx
 
 
 # ------------------------------------------------------------------ composition
@@ -233,7 +242,8 @@ def compose_stage(P, prof):
             rows = ["eod-host-textures 1"]
             for n, (pid, e, folder) in enumerate(sorted(hosts, key=lambda h: h[1]["assetId"].lower())):
                 rel = f"{pid}/{n:04d}-{e['indexKey']}.eodhtx"
-                data = eodhtx(folder / e["file"])
+                source = folder / e["file"]
+                data = source.read_bytes() if source.suffix.lower() == ".eodhtx" else eodhtx(source)
                 check_eodhtx(data)
                 mp.atomic_write(stage / "HOSTTEX" / rel, data)
                 rows.append("\t".join((e["indexKey"], e["paletteKey"], str(e["origWidth"]), str(e["origHeight"]),

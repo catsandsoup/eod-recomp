@@ -32,6 +32,11 @@
 #include "scene_emit.h"
 #include "vif.h"
 
+#ifdef EOD_VULKAN
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+#endif
+
 VUState g_vu0, g_vu1;
 
 static uint8_t g_vu0_mem[0x1000 + 64], g_vu0_micro[0x1000 + 64];
@@ -1552,6 +1557,246 @@ void vu_rec_hook(VUState *vu, uint32_t pc) {
 }
 }  // namespace
 
+namespace {
+bool vu_dispatch_observed() {
+    static const bool trace = getenv("EOD_VU_REC") || getenv("EOD_VU_DUMP") ||
+                              getenv("EOD_VU_STATS") || getenv("EOD_VU_CHECK");
+    return trace || g_log_enabled[LOG_VU] || scene_capture::g_on || scene_emit::observing_vu();
+}
+}  // namespace
+
+bool vu_retire_camera_nop(VUState *vu, uint32_t pc) {
+    constexpr uint32_t pairs[] = {0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu};
+    if (vu_dispatch_observed() ||
+        vu->index != 1 || pc != 0x24D8 || std::memcmp(vu->micro + pc, pairs, sizeof(pairs)) != 0)
+        return false;
+
+    const VuProg *compiled = vu_rec_find(vu, pc);
+    const auto retire = [compiled, pc](VUState *state) {
+        if (compiled) {
+            // The generated NOP pairs advance cycles without per-pair pipe synchronization.
+            state->cycle += 2;
+        } else {
+            for (int pair = 0; pair < 2; ++pair) {
+                sync_pipes(state);
+                vu_flag_sync(state);
+                ++state->cycle;
+            }
+        }
+        flush_q(state);
+        flush_p(state);
+        vu_flag_flush(state);
+        state->flag_pipe = 0;
+        state->tpc = pc + 8;
+        state->running = 0;
+    };
+
+    static const bool check = getenv("EOD_NATIVE_CAMERA_NOP_CHECK") != nullptr;
+    if (check) {
+        VUState expected;
+        std::memcpy(&expected, vu, sizeof(expected));
+        const Scoreboard scoreboard = g_score[vu->index];
+        uint8_t memory[0x4000];
+        std::memcpy(memory, vu->mem, sizeof(memory));
+        retire(&expected);
+        if (compiled) compiled->fn(vu, pc);
+        else vu_interp(vu, pc);
+        if (std::memcmp(vu, &expected, sizeof(expected)) ||
+            std::memcmp(&g_score[vu->index], &scoreboard, sizeof(scoreboard)) ||
+            std::memcmp(vu->mem, memory, sizeof(memory)))
+            fatal("camera MSCAL retirement differs from VU1 execution at vblank %llu (%s)",
+                  (unsigned long long)kernel_vblank_count(), compiled ? "compiled" : "interpreted");
+        return true;
+    }
+    retire(vu);
+    return true;
+}
+
+#if defined(EOD_VULKAN) && defined(VU_REC)
+namespace {
+constexpr uint32_t kWorldLeafPc = 0x270;
+constexpr uint32_t kWorldLeafTpc = 0x920;
+constexpr unsigned kWorldStripOffset = 200;
+constexpr unsigned kWorldVertices = 20;
+constexpr unsigned kWorldStripQwords = 1 + 3 * kWorldVertices;
+constexpr uint64_t kWorldLeafCycles = 312;
+
+struct WorldLeafVertices {
+    // GS PACKED retains the raw fog/ADC word and the input ST padding word.
+    VUReg st[kWorldVertices]{}, rgba[kWorldVertices]{}, xyzf[kWorldVertices]{};
+    VUReg projection[kWorldVertices]{}, acc_last{};
+    VUReg last_input_position{}, last_st{}, last_unscaled_st{};
+    float q[kWorldVertices]{};
+    float last_header = 0, penultimate_header = 0;
+};
+
+struct WorldLeafRetirement {
+    VUState after{};
+    VUReg tex1[2]{}, strip[kWorldStripQwords]{};
+};
+
+VUReg world_qword(const VUState &vu, unsigned qw) {
+    VUReg reg;
+    std::memcpy(&reg, vu.mem + 16 * qw, sizeof reg);
+    return reg;
+}
+
+bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement &out) {
+    constexpr uint32_t kOne = 0x3F800000;
+    constexpr uint32_t kAlmostTwo = 0x3FFFFFFF;
+    if (before.vi[0] != 0 || before.vf[0].u[0] || before.vf[0].u[1] ||
+        before.vf[0].u[2] || before.vf[0].u[3] != kOne ||
+        before.q_busy || before.p_busy || before.fq_n || before.flag_pipe || before.running ||
+        before.cycle > UINT64_MAX - kWorldLeafCycles)
+        return false;
+
+    // q19/q20 are the live strip and TEX1 tag templates. q21 supplies the TEX1 address.
+    const VUReg source_tag = world_qword(before, top);
+    const VUReg tag_template = world_qword(before, 19);
+    const VUReg tex_base = world_qword(before, 22);
+    const VUReg st_base = world_qword(before, top + 198);
+    const VUReg pos_base = world_qword(before, top + 199);
+    out.tex1[0] = world_qword(before, 20);
+    out.tex1[1] = world_qword(before, 21);
+    if (source_tag.u[0] != 0x8014 || tag_template.u[1] != 0x300E4000 ||
+        (tag_template.u[2] & 0xFFF) != 0x412 ||
+        out.tex1[0].u[0] != 0x8001 || out.tex1[0].u[1] != 0x10000000 ||
+        (out.tex1[0].u[2] & 15) != 0xE || (out.tex1[1].u[2] & 0xFF) != 0x14 ||
+        (uint16_t)tex_base.u[1] != 112 || (int16_t)st_base.u[2] != -1060 ||
+        pos_base.u[0] || pos_base.u[1] || pos_base.u[2] ||
+        !std::isnormal(before.vf[3].f[3]))
+        return false;
+
+    out.tex1[1].u[1] = (uint16_t)(tex_base.u[1] + (int16_t)st_base.u[2] + 1000);
+    out.strip[0] = tag_template;
+    out.strip[0].u[0] = source_tag.u[0];
+
+    WorldLeafVertices vertices;
+    float fog_scale;
+    std::memcpy(&fog_scale, &kAlmostTwo, sizeof fog_scale);
+    for (unsigned i = 0; i < kWorldVertices; ++i) {
+        const unsigned src = top + 1 + 3 * i;
+        const VUReg color = world_qword(before, src);
+        const VUReg pos = world_qword(before, src + 1);
+        const VUReg uv = world_qword(before, src + 2);
+        if (pos.u[3] != kOne || color.u[0] != 0x80 || color.u[1] != 0x80 ||
+            color.u[2] != 0x80 || color.u[3] > 0xFFFF)
+            return false;
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            float acc = before.vf[4].f[lane] * pos.f[0];
+            acc += before.vf[5].f[lane] * pos.f[1];
+            acc += before.vf[6].f[lane] * pos.f[2];
+            vertices.acc_last.f[lane] = acc;
+            vertices.projection[i].f[lane] = acc + before.vf[7].f[lane];
+        }
+        const auto &p = vertices.projection[i];
+        if (!std::isnormal(p.f[3])) return false;
+        const float q = 1.f / p.f[3];
+        if (!std::isnormal(q)) return false;
+        vertices.q[i] = q;
+        // SQ.xyz leaves the current bank's ST W exactly as it was before the leaf.
+        vertices.st[i] = world_qword(before, top + kWorldStripOffset + 1 + 3 * i);
+        vertices.rgba[i] = color;
+        vertices.rgba[i].u[3] = 0x80;
+        vertices.xyzf[i].f[3] = static_cast<float>(color.u[3]) * fog_scale;
+        VUReg st_input{}, unscaled_st{};
+        for (unsigned lane = 0; lane < 3; ++lane) {
+            st_input.f[lane] = lane < 2 ? uv.f[lane] + st_base.f[lane] : 1.f;
+            unscaled_st.f[lane] = st_input.f[lane] * q;
+            vertices.st[i].f[lane] = unscaled_st.f[lane] * before.vf[3].f[3];
+            const float xyz = (p.f[lane] * q) * 16.f;
+            if (!std::isfinite(vertices.st[i].f[lane]) || !std::isfinite(xyz) ||
+                xyz < -2147483648.f || xyz >= 2147483648.f)
+                return false;
+            vertices.xyzf[i].s[lane] = static_cast<int32_t>(xyz);
+        }
+        out.strip[1 + 3 * i] = vertices.st[i];
+        out.strip[2 + 3 * i] = vertices.rgba[i];
+        out.strip[3 + 3 * i] = vertices.xyzf[i];
+        if (i == kWorldVertices - 2) vertices.penultimate_header = static_cast<float>(color.u[3]);
+        if (i == kWorldVertices - 1) {
+            vertices.last_header = static_cast<float>(color.u[3]);
+            vertices.last_input_position = pos;
+            vertices.last_st = st_input;
+            vertices.last_unscaled_st = unscaled_st;
+        }
+    }
+
+    // Preserve untouched lanes and pipeline fields for the next VU1 launch.
+    auto &vu = out.after;
+    vu = before;
+    vu.vf[1].u[3] = kAlmostTwo;
+    vu.vf[2].f[3] = vertices.penultimate_header;
+    std::memcpy(vu.vf[3].u, vertices.last_st.u, 12);
+    vu.vf[13] = st_base;
+    vu.vf[13].f[3] = vertices.last_header;
+    vu.vf[14].u[3] = world_qword(before, top + 8).u[3];
+    for (unsigned lane = 0; lane < 3; ++lane)
+        vu.vf[14].f[lane] = vertices.projection[18].f[lane] * vertices.q[18];
+    vu.vf[15] = vertices.last_input_position;
+    vu.vf[16] = vertices.xyzf[19];
+    vu.vf[17] = vertices.xyzf[17];
+    vu.vf[18] = vertices.xyzf[18];
+    vu.vf[19] = vertices.xyzf[17];
+    vu.vf[20] = vertices.st[19];
+    vu.vf[20].u[3] = world_qword(before, top + 5).u[3];
+    vu.vf[21] = vertices.last_unscaled_st;
+    vu.vf[21].u[3] = vertices.xyzf[0].u[3];
+    vu.vi[1] = 0x80;
+    vu.vi[2] = 20;
+    vu.vi[3] = top + kWorldStripOffset;
+    vu.vi[4] = 0;
+    vu.vi[5] = out.tex1[1].u[1];
+    vu.acc = vertices.acc_last;
+    vu.q = vu.q_pending = vertices.q[19];
+    vu.i = fog_scale;
+    vu.status &= ~0x30u;
+    vu.cycle += kWorldLeafCycles;
+    vu.q_ready = vu.cycle - 25;
+    vu.tpc = kWorldLeafTpc;
+    // The final scheduled VF result has aged out of the three live scoreboard slots.
+    return true;
+}
+
+void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsigned top) {
+    vu = result.after;
+    std::memcpy(vu.mem + 21 * 16 + 4, &result.tex1[1].u[1], 4);
+    std::memcpy(vu.mem + (top + kWorldStripOffset) * 16, result.strip, sizeof result.strip);
+    xgkick(&vu, 20);
+    xgkick(&vu, top + kWorldStripOffset);
+}
+
+}  // namespace
+#endif
+
+bool vu_retire_world_leaf(VUState *vu, uint32_t pc, const uint32_t *payload, uint32_t top) {
+#if defined(EOD_VULKAN) && defined(VU_REC)
+    // Portable capture and original-path diagnostics must see the original dispatch.
+    static const bool diagnostic = getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
+        getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
+        getenv("EOD_NATIVE_QCHECK") || getenv("EOD_VIF_CHECK");
+    if (diagnostic || vu_dispatch_observed() || !payload || pc != kWorldLeafPc ||
+        vu->index != 1 || vu->mem_mask != 0x3FFF || vu->micro_mask != 0x3FFF ||
+        (top != 0xE0 && top != 0x270) || !sb_same(g_score[1], Scoreboard{}, vu->cycle))
+        return false;
+
+    // Full 512-byte REF payload and 16 KiB live image from the supported Dundas
+    // leaf. The compiled lookup also validates the program's exact microcode ranges.
+    constexpr XXH128_hash_t payload_hash{0xE4E1E3A046E75426ull, 0x2494700AE9738E9Bull};
+    constexpr XXH128_hash_t image_hash{0x2329B43F09230E29ull, 0xC8C64EAE4BB1B7EBull};
+    if (!XXH128_isEqual(XXH3_128bits(payload, 512), payload_hash) ||
+        !XXH128_isEqual(XXH3_128bits(vu->micro, 0x4000), image_hash) || !vu_rec_find(vu, pc))
+        return false;
+
+    WorldLeafRetirement result;
+    if (!derive_world_leaf(*vu, top, result)) return false;
+    materialize_world_leaf(result, *vu, top);
+    return true;
+#else
+    return false;
+#endif
+}
+
 void vu_execute(VUState *vu, uint32_t start_pc) {
     EOD_ZONE("vu_execute");
     ProfScope prof(P_EE_VU);
@@ -1563,28 +1808,27 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;
-        if (stats && !check) {  // EOD_VU_STATS=1: time per compiled program (VU1 by entry and ITOP)
-            static uint64_t cnt[0x800], tk[0x800], last;
-            static uint32_t itops[0x800];
-            const uint64_t t0 = prof_ticks();
+        if (stats && !check) {  // EOD_VU_STATS=1: elapsed time per compiled VU1 entry
+            using Clock = std::chrono::steady_clock;
+            static uint64_t cnt[0x800], ns[0x800];
+            static auto last = Clock::now();
+            const auto start = Clock::now();
             p->fn(vu, pc);
-            const uint64_t t1 = prof_ticks();
+            const auto end = Clock::now();
             if (vu->index == 1) {
                 cnt[(pc >> 3) & 0x7FF]++;
-                tk[(pc >> 3) & 0x7FF] += t1 - t0;
-                itops[(pc >> 3) & 0x7FF] = g_vif1_itop;
+                ns[(pc >> 3) & 0x7FF] += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
             }
-            if (!last) last = t1;
-            if (t1 - last > 20000000000ull) {
-                last = t1;
+            if (end - last >= std::chrono::seconds(5)) {
+                last = end;
                 uint64_t total = 0;
-                for (int i = 0; i < 0x800; i++) total += tk[i];
+                for (const uint64_t entry : ns) total += entry;
                 for (int i = 0; i < 0x800; i++)
-                    if (tk[i] > total / 100)
+                    if (ns[i] > total / 100)
                         fprintf(stderr, "[vu-stats] VU1 %04x runs %llu, %.1f%% of VU1 time, %.2f us/run\n", i << 3,
-                                (unsigned long long)cnt[i], 100.0 * tk[i] / total, tk[i] / 3500.0 / (double)cnt[i]);
+                                (unsigned long long)cnt[i], 100.0 * ns[i] / total, ns[i] / 1000.0 / (double)cnt[i]);
                 std::fill(std::begin(cnt), std::end(cnt), 0);
-                std::fill(std::begin(tk), std::end(tk), 0);
+                std::fill(std::begin(ns), std::end(ns), 0);
             }
             return;
         }

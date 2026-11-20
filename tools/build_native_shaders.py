@@ -19,7 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "runtime", "render", "native_shaders.hlsl")
 OUT = os.path.join(ROOT, "runtime", "render", "native_shaders_spv.inc")
 
-ENTRIES = [("vs_main", "vs"), ("ps_main", "ps")]
+ENTRIES = [("vs_main", "vs"), ("ps_main", "ps"), ("vs_static_queue", "vs")]
 # stage R6: the Modern look, its own file so the Classic SPIR-V never changes with it
 MODERN_SRC = os.path.join(ROOT, "runtime", "render", "native_modern.hlsl")
 MODERN_OUT = os.path.join(ROOT, "runtime", "render", "native_modern_spv.inc")

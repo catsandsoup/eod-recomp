@@ -155,11 +155,12 @@ def _png_row_rgba(row, width, ctype, depth, palette, trns):
     return bytes(out)
 
 
-def read_png(filename: str) -> tuple:
+def read_png(filename: str, *, max_side: int | None = None) -> tuple:
     """Reads a PNG and returns (width, height, rgba_bytes), always 8-bit RGBA.
 
     Accepts colour types 0, 2, 3, 4, 6 at the depths PNG allows (16-bit samples
     are scaled to 8-bit with rounding), tRNS transparency and Adam7 interlace.
+    When supplied, max_side bounds both dimensions before inflating scanlines.
     """
     with open(filename, "rb") as f:
         data = f.read()
@@ -178,7 +179,11 @@ def read_png(filename: str) -> tuple:
         pos += length + 4  # skip crc
 
         if chunk_type == b"IHDR":
+            if pos != 33 or len(chunk_data) != 13:
+                raise ValueError("Invalid PNG IHDR chunk")
             width, height, bit_depth, color_type, method, filt, interlace = struct.unpack(">IIBBBBB", chunk_data[:13])
+            if max_side is not None and max(width, height) > max_side:
+                raise ValueError(f"PNG dimensions exceed {max_side} pixels per side")
             if method or filt or interlace > 1:
                 raise ValueError("Unsupported PNG compression, filter or interlace method")
         elif chunk_type == b"PLTE":
@@ -205,14 +210,16 @@ def read_png(filename: str) -> tuple:
             trns = None
     channels = _PNG_CHANNELS[color_type]
     bpp = max(1, channels * bit_depth // 8)
-    try:
-        raw = zlib.decompress(b"".join(idat_chunks))
-    except zlib.error as error:
-        raise ValueError(f"Invalid PNG image data: {error}") from error
     passes = _ADAM7 if interlace else ((0, 0, 1, 1),)
     sizes = [((width - x0 + dx - 1) // dx, (height - y0 + dy - 1) // dy) for x0, y0, dx, dy in passes]
     strides = [(pw * channels * bit_depth + 7) // 8 for pw, _ in sizes]
-    if len(raw) != sum((ph * (st + 1)) if pw and ph else 0 for (pw, ph), st in zip(sizes, strides)):
+    expected = sum((ph * (st + 1)) if pw and ph else 0 for (pw, ph), st in zip(sizes, strides))
+    try:
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(b"".join(idat_chunks), expected + 1)
+    except zlib.error as error:
+        raise ValueError(f"Invalid PNG image data: {error}") from error
+    if len(raw) != expected or not inflater.eof:
         raise ValueError("Invalid PNG scanline length")
 
     rgba = bytearray(width * height * 4)

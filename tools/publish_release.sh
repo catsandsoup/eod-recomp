@@ -24,7 +24,14 @@ codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
 [[ ! -e "$app/Contents/Resources/Mods" && ! -e "$app/Contents/Resources/DATA" ]]
 ditto -c -k --keepParent --norsrc "$app" "$stage/Eve-of-Destruction-macOS-arm64.zip"
-assets=("$stage/Eve-of-Destruction-macOS-arm64.zip")
+"$python" tools/package_macos_world_editor.py --game-executable "$build/eod" \
+  --plume-library "$build/eod_editor_plume.dylib" --output "$stage/world-editor"
+"$python" tools/package_creation_kit_release.py --game-executable "$build/eod" --output "$stage/creation-kit"
+mv "$stage/world-editor/EOD-World-Editor-macOS-arm64.zip" "$stage/"
+mv "$stage/creation-kit/EOD-Creation-Kit-Development-macOS-arm64.zip" "$stage/"
+assets=("$stage/Eve-of-Destruction-macOS-arm64.zip"
+        "$stage/EOD-World-Editor-macOS-arm64.zip"
+        "$stage/EOD-Creation-Kit-Development-macOS-arm64.zip")
 # Supply the matching, tested Windows package to publish both platforms together.
 if [[ -n ${EOD_WINDOWS_ARCHIVE:-} ]]; then
   cp "$EOD_WINDOWS_ARCHIVE" "$stage/Eve-of-Destruction-Windows-x64.zip"

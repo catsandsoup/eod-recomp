@@ -369,11 +369,43 @@ bool mem_read(void *ctx, uint64_t addr, void *dst, size_t n) {
     return true;
 }
 
+bool shadow_extrusion_faces() {
+    const uint32_t stream[] = {
+        0x6001c000, 0x8003,           // shadow strip header
+        0x01000102,                  // STCYCL 1:2, alternating normals and positions
+        0x20000000, 0x40404040,       // STMASK, position W comes from STROW
+        0x30000000, 0, 0, 0, 0x3f800000,
+        0x7803c002, 0, 0, 0, 0, 0, 0, 0x3f800000, 0, 0,
+        0x30000000, 0x47800000, 0x47800000, 0x47800000, 0,
+        0x05000001,                  // STMOD adds the normal encoding bias
+        0x6e03c001, 0x80808000, 0x808080ff, 0x00808080,  // distinct normals at the shared position
+        0x14000004,                  // MSCAL 4
+    };
+    Decoder decoder;
+    Mesh mesh;
+    auto decode = [&](const Options &options) {
+        mesh.clear();
+        return decoder.decode_vif(reinterpret_cast<const uint8_t *>(stream), sizeof stream,
+                                  mesh, options) == Status::Ok &&
+               mesh.vertices.size() == 3 && mesh.batches.size() == 1 && mesh.batches[0].shadow &&
+               mesh.vertices[0].normal[0] < 0 && mesh.vertices[1].normal[0] > 0;
+    };
+    Options options;
+    if (!decode(options) || !mesh.indices.empty()) return false;
+    options.keep_shadow_extrusion_faces = true;
+    return decode(options) && mesh.indices == std::vector<uint32_t>{0, 1, 2};
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+    if (!shadow_extrusion_faces()) {
+        fprintf(stderr, "shadow side face was lost or retained in the wrong mode\n");
+        return 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--shadow-extrusion")) return 0;
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <DISC/DATA> <ref.bin> [--verbose]\n", argv[0]);
+        fprintf(stderr, "usage: %s <DISC/DATA> <ref.bin> [--verbose] | --shadow-extrusion\n", argv[0]);
         return 2;
     }
     const fs::path data_dir = argv[1];

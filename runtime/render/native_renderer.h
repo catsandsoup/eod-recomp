@@ -21,6 +21,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include "native_scene_types.h"
 #include <utility>
 #include <vector>
 
@@ -28,21 +29,52 @@ namespace gs {
 struct Env;
 struct Vertex;
 }
+namespace editor_environment { struct Override; }
 
 namespace native {
 
 bool enabled();
 // stage R6 (docs/NATIVE_RENDERER.md "Stage R6"): Classic (R5 shaders, default) or Modern look;
-// EOD_LOOK=modern at start, F9 / L1+R1+R3 through modern::toggle; takes effect at the next flush
-void toggle_look();
+// EOD_LOOK=modern at start, F9 / L1+R1+R3 through modern::toggle_from_input.
+// The toggle returns the new look, which takes effect at the next flush.
+bool look_available();
+bool toggle_look();
 bool look_modern();
+// Prepare native pipelines after GS device creation and before the guest starts.
+bool prepare();
+const editor_environment::Override *environment_override();
+void ee_environment_world(bool drawing);
 
 // ---- EE thread (src/render_queue.cpp) -------------------------------------------------------
 void ee_frame_begin();                // RenderQueueBeginFrame
-void ee_object(uint32_t record);      // after scene_tap::object, before EmitBatch (0x35CB88)
+void ee_object(uint32_t batch);       // after scene_tap::object, before EmitBatch (0x35CB88)
 void ee_object_end();                 // after EmitBatch
 // packet manager reserve (src/render_trace.cpp wrappers): addr, qwc, return address
-void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra);
+// 0x361098's aligned clear inputs, in the EE's whole-pixel XY coordinates.
+enum class SceneClearTarget : uint32_t { ColorAndDepth, Depth, Bootstrap };
+struct SceneClear {
+    int32_t left, top, right, bottom;
+    uint32_t rgba, zbuf;
+    SceneClearTarget target;
+};
+constexpr uint32_t kSceneClearDirectQwc = 45;
+bool scene_clear_enabled();
+void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneClear *clear = nullptr);
+bool take_scene_clear(uint32_t dma_tag, uint32_t qwc, SceneClear &clear);
+bool take_camera_packet(uint32_t dma_tag);
+struct DisplayCopy {
+    uint32_t source, fix, caller;
+};
+constexpr uint32_t kDisplayCopyDirectQwc = 88;
+constexpr uint32_t kBootstrapQuadDirectQwc = 14;
+bool display_copy_enabled();
+bool bootstrap_raster_enabled();
+void ee_tag_display_copy(uint32_t addr, const DisplayCopy &copy);
+bool take_display_copy(uint32_t dma_tag, uint32_t qwc, DisplayCopy &copy);
+enum class ShadowPass : uint32_t { None, Prepare, Composite };
+constexpr uint32_t kShadowPrepareDirectQwc = 77;
+constexpr uint32_t kShadowCompositeDirectQwc = 89;
+ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc);
 
 // ---- EE thread, track world (src/native_world.cpp, stage R2) --------------------------------
 // WorldRenderPass 0x358BD0: the pass starts (its identity matrix packet), each world batch REF it
@@ -127,7 +159,9 @@ int native_only_level();  // EOD_NATIVE_ONLY value (2: the GS keeps drawing spri
 bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm);
 
 // ---- VIF1 thread (runtime/vu/vif.cpp) -------------------------------------------------------
-void vu1_start(uint32_t program, uint32_t itop);
+// Posts the object marker before its geometry. True once for a committed world-leaf REF
+// eligible for VIF and VU validation.
+bool vu1_start(uint32_t program, uint32_t itop);
 
 // ---- GS command stream ----------------------------------------------------------------------
 // One queue record as the GS receives it.
@@ -161,6 +195,7 @@ struct Packet {
     // fog in effect when it was queued (0x4D8BC8 bit 3, FOGCOL 0x4D8B80, range 0x4D8B84..8C)
     uint32_t fge, fogcol;
     float fog_range[3];
+    bool editor_environment;
     // the rest of the EE render state in effect when it was queued (stage R5 A2): render flags
     // *0x4D8BC8 (0x365540), blend select *0x4D8B78 (0x3654E0), TEX1 K template *0x4D8BAC and MXL
     // *0x4D8BBC (0x3652A8), the particle/sprite K delta *0x4D8BB8 (0x365308)
@@ -174,13 +209,7 @@ struct Packet {
     int32_t shadow_rt[6];
 };
 
-struct Vertex {                // GPU vertex (28 bytes)
-    float p[3];
-    float uv[2];
-    int8_t n[4];               // byte - 128 of the normal; [3] = 1 when present
-    uint8_t c[4];              // vertex colour bytes (0x80 = 1.0)
-};
-static_assert(sizeof(Vertex) == 28, "vertex layout");
+using Vertex = scene::Vertex;
 
 struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     uint32_t id;
@@ -206,19 +235,22 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     std::vector<uint32_t> indices;
 };
 
-enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2 };
+enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4, CMD_BOOTSTRAP_QUAD = 5 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),
 // the view matrix (q13..16) and the model matrix (TOPS+0..3), as the VU1 setup program 0x0000
 // combines them into vf4..vf7 (which are the columns of a).
-void screen_matrix(const Packet &p, double a[4][4]);
+void screen_matrix(const Packet &p, double a[4][4], bool vu_rounding = false);
 
 // producer of the GS command stream (VIF1 thread): queue a command in GS order (runtime/gs/gs.cpp)
 void post(uint32_t kind, const void *data, uint32_t size);
 
 // GS thread
 void gs_command(uint32_t kind, const void *data, uint32_t size);
+bool gs_clear_scene(const gs::Env &env, const SceneClear &clear);
+bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]);
+bool gs_shadow_boundary();
 // a primitive the GS is about to draw: true = it belongs to a native object (do not draw)
 // (b, c: the other vertices of a triangle, for the P2 vertex check EOD_NATIVE_SKIN_CHECK=1)
 bool gs_draw(const gs::Env &e, const gs::Vertex &first, const gs::Vertex *b = nullptr, const gs::Vertex *c = nullptr);

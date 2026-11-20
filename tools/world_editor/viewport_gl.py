@@ -5,7 +5,7 @@ Features:
     bright translucent green object selection highlight, unlit line/ribbon/gizmo shader.
   - Texture-batched static VBOs for >60 FPS on 2,000+ retail instances.
   - Native EOD Left-Handed camera (+X right, +Y up, +Z forward): right-drag look,
-    WASD move, Q/E down/up, wheel adjusts fly speed, Shift boost.
+    WASD move, Q/E down/up, two-finger pan, pinch to dolly, Shift boost.
   - Interactive 3D Move (R/G/B arrows), Rotate (R/G/B rings), and Scale (R/G/B cubes) gizmos.
   - 3D raycast picking of objects, road nodes, road segments, markers, and terrain.
   - Road Tool (ILIN) 3D ribbon, yellow/magenta diamond handles, Green/Cyan/White hover feedback.
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
 import random
 import time
 from typing import Any
@@ -25,8 +26,8 @@ import OpenGL
 OpenGL.ERROR_CHECKING = False
 OpenGL.ERROR_LOGGING = False
 from OpenGL import GL
-from PySide6.QtCore import QPoint, QPointF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QNativeGestureEvent, QPainter, QWheelEvent
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -39,8 +40,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from plume_viewport import PlumeViewport
 
 from perf_profiler import GpuPassTimer, PerfHudOverlay, get_profiler
+from project_state import build_eodhtx_from_rgba
 from theme import (
     ACCENT_BLUE,
     ACCENT_BLUE_HOVER,
@@ -718,6 +721,10 @@ class ViewportGL(QOpenGLWidget):
         self.cam_pitch = -22.0
         self.cam_fov = 58.0
         self.fly_speed = 45.0
+        self._native_camera_anchor: np.ndarray | None = None
+        self._scroll_camera_anchor: np.ndarray | None = None
+        self._drag_camera_anchor: np.ndarray | None = None
+        self._pan_dragging = False
 
         # Active mode & tool
         self.edit_mode = "object"     # "object" | "edit"
@@ -747,6 +754,10 @@ class ViewportGL(QOpenGLWidget):
 
         # View toggles & renderer mode ("ps2" = fast power-sipping PS2 mode, "plume" = high-quality mode)
         self.render_mode = "ps2"
+        self._plume_viewport: PlumeViewport | None = None
+        self._plume_module = os.environ.get("EOD_EDITOR_PLUME_LIBRARY")
+        self._plume_dirty = True
+        self._plume_retry = False
         self.show_wireframe = False
         self.show_collision = False
         self.show_markers = True
@@ -880,6 +891,9 @@ class ViewportGL(QOpenGLWidget):
     def set_render_mode(self, mode: str) -> None:
         """Switch viewport shading mode: 'ps2' (fast power-sipping) or 'plume' (high quality)."""
         self.render_mode = "plume" if mode == "plume" else "ps2"
+        if self.render_mode == "ps2" and self._plume_viewport:
+            self._plume_viewport.close_surface()
+            self._plume_dirty = True
         self.update()
 
     def set_perf_hud_visible(self, visible: bool) -> None:
@@ -896,6 +910,7 @@ class ViewportGL(QOpenGLWidget):
     # -----------------------------------------------------------------------
     def set_world(self, world: TrackWorld) -> None:
         self.world = world
+        self._plume_dirty = True
         self.selected_obj = None
         self.selected_objects = []
         self.selected_road_node_id = None
@@ -1045,6 +1060,7 @@ class ViewportGL(QOpenGLWidget):
         if self.world.active_event_template == template_name:
             return
         self.world.active_event_template = template_name
+        self._plume_dirty = True
         # Drop any selected objects no longer visible in this template
         vis = [o for o in self.selected_objects if self.world.object_visible_in_event_template(o)]
         if len(vis) != len(self.selected_objects):
@@ -1140,6 +1156,7 @@ class ViewportGL(QOpenGLWidget):
         """Fast O(k) dirty-mark for edited objects (avoids rebuilding 6,000-object static VBOs!)."""
         if self.world is None:
             return
+        self._plume_dirty = True
         for o in objs:
             if o is not None:
                 self._dynamic_obj_ids.add(o.obj_id)
@@ -1148,6 +1165,7 @@ class ViewportGL(QOpenGLWidget):
         self.update()
 
     def mark_scene_dirty(self, *, force_full: bool = False) -> None:
+        self._plume_dirty = True
         if force_full:
             self._force_full_static_rebuild = True
             self._static_dirty = True
@@ -1337,6 +1355,8 @@ class ViewportGL(QOpenGLWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if self._plume_viewport:
+            self._plume_viewport.setGeometry(self.rect())
         self._position_overlays()
 
     def _position_overlays(self) -> None:
@@ -1367,6 +1387,12 @@ class ViewportGL(QOpenGLWidget):
         batches.clear()
 
     def _upload_one_texture(self, name: str, ta: Any) -> None:
+        width, height = ta.width, ta.height
+        encoded = None
+        if ta.is_replaced:
+            encoded, width, height = build_eodhtx_from_rgba(
+                ta.rgba, width, height, ta.orig_width, ta.orig_height,
+            )
         old = self._gl_textures.get(name)
         if old is not None:
             tid = old[0]
@@ -1378,11 +1404,24 @@ class ViewportGL(QOpenGLWidget):
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexImage2D(
-            GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, ta.width, ta.height, 0,
-            GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ta.rgba,
-        )
-        GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+        levels = max(width, height).bit_length()
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAX_LEVEL, levels - 1)
+        if encoded is None:
+            GL.glTexImage2D(
+                GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, width, height, 0,
+                GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, ta.rgba,
+            )
+            GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+        else:
+            offset = 16  # EODHTX1 header, followed by tightly packed RGBA levels.
+            for level in range(levels):
+                w, h = max(1, width >> level), max(1, height >> level)
+                end = offset + w * h * 4
+                GL.glTexImage2D(
+                    GL.GL_TEXTURE_2D, level, GL.GL_RGBA8, w, h, 0,
+                    GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, encoded[offset:end],
+                )
+                offset = end
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         self._gl_textures[name] = (tid, ta.alpha_kind == "cutout")
 
@@ -2356,7 +2395,46 @@ class ViewportGL(QOpenGLWidget):
     # -----------------------------------------------------------------------
     # Paint Frame
     # -----------------------------------------------------------------------
+    def _paint_plume(self) -> bool:
+        if self.render_mode != "plume" or self._plume_module is None or self.world is None or not self.isVisible():
+            return False
+        try:
+            if self._plume_viewport is None:
+                self._plume_viewport = PlumeViewport(self, self._plume_module)
+                self._plume_viewport.setGeometry(self.rect())
+            child = self._plume_viewport
+            child.open_surface()
+            if not self._plume_dirty and self._pending_tex_updates:
+                self._plume_dirty = child.update_textures(self.world, self._pending_tex_updates)
+            if self._plume_dirty:
+                child.upload(self.world, self.layer_visibility)
+                self._plume_dirty = False
+            fwd, right, up = self.camera_vectors()
+            view = lh_look_matrix(self.cam_pos, fwd, right, up)
+            proj = lh_perspective(self.cam_fov, max(1, self.width()) / max(1, self.height()), 0.4, 4500.0)
+            first = child.presented == 0
+            if child.draw(proj @ view, self.world.environment):
+                self._plume_retry = False
+                if first:
+                    self.statusMessage.emit(f"Native Plume viewport presented {child.triangles:,} track triangles")
+                return True
+            if not self._plume_retry:
+                self._plume_retry = True
+                QTimer.singleShot(40, self, self.update)
+                return True
+            raise RuntimeError("Vulkan swapchain did not present")
+        except (OSError, RuntimeError, AttributeError) as error:
+            if self._plume_viewport:
+                self._plume_viewport.close_surface()
+            self._plume_module = None
+            self.statusMessage.emit(f"Native Plume viewport unavailable ({error}). OpenGL preview active.")
+            return False
+
     def paintGL(self) -> None:
+        if self._paint_plume():
+            if self._pending_tex_updates:
+                self._flush_pending_textures()
+            return
         t0 = time.perf_counter_ns()
         self.gpu_timer.begin_frame()
         if self._pending_tex_updates:
@@ -2956,9 +3034,18 @@ class ViewportGL(QOpenGLWidget):
         self._last_mouse = event.position().toPoint()
         self._press_mouse = self._last_mouse
 
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_dragging = True
+            self._drag_camera_anchor = self._camera_anchor(event.position())
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
         if event.button() == Qt.MouseButton.RightButton:
             self._rmb_down = True
             self._rmb_press_pos = self._last_mouse
+            if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                self._drag_camera_anchor = self._camera_anchor(event.position())
             self.setCursor(Qt.CursorShape.BlankCursor)
             return
 
@@ -3043,7 +3130,14 @@ class ViewportGL(QOpenGLWidget):
         dy = pos.y() - self._last_mouse.y()
         self._last_mouse = pos
 
+        if self._pan_dragging and self._drag_camera_anchor is not None:
+            self._pan_camera(dx, dy, self._drag_camera_anchor)
+            return
+
         if self._rmb_down:
+            if self._drag_camera_anchor is not None:
+                self._orbit_camera(dx * 0.22, -dy * 0.22, self._drag_camera_anchor)
+                return
             self.cam_yaw = (self.cam_yaw + dx * 0.22) % 360.0
             self.cam_pitch = max(-88.0, min(88.0, self.cam_pitch - dy * 0.22))
             self.update()
@@ -3204,11 +3298,19 @@ class ViewportGL(QOpenGLWidget):
                     self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_dragging = False
+            self._drag_camera_anchor = None
+            self.unsetCursor()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.RightButton:
             self._rmb_down = False
+            orbited = self._drag_camera_anchor is not None
+            self._drag_camera_anchor = None
             self.unsetCursor()
             moved = (event.position().toPoint() - self._rmb_press_pos).manhattanLength()
-            if moved <= 4 and self.selected_obj is not None and not self.selected_obj.deleted:
+            if not orbited and moved <= 4 and self.selected_obj is not None and not self.selected_obj.deleted:
                 self.contextMenuRequested.emit(event.globalPosition().toPoint())
             return
 
@@ -3459,13 +3561,90 @@ class ViewportGL(QOpenGLWidget):
         self.statusMessage.emit(f"Transform tool: {nxt.capitalize()} (Tab to cycle)")
         return nxt
 
+    def _camera_anchor(self, position: QPointF) -> np.ndarray:
+        origin, direction = self.screen_ray(position.x(), position.y())
+        target = self._raycast_terrain_point(origin, direction)
+        if target is not None and 2.0 <= float(np.linalg.norm(target - origin)) <= 1500.0:
+            return target
+        return origin + direction * 45.0
+
+    def _pan_camera(self, dx: float, dy: float, anchor: np.ndarray) -> None:
+        forward, right, up = self.camera_vectors()
+        depth = max(2.0, float(np.dot(anchor - self.cam_pos, forward)))
+        metres_per_pixel = 2.0 * depth * math.tan(math.radians(self.cam_fov) / 2) / max(1, self.height())
+        self.cam_pos += (up * dy - right * dx) * metres_per_pixel
+        self.update()
+
+    def _orbit_camera(self, yaw: float, pitch: float, anchor: np.ndarray) -> None:
+        offset = anchor - self.cam_pos
+        local = [float(np.dot(offset, axis)) for axis in self.camera_vectors()]
+        self.cam_yaw = (self.cam_yaw + yaw) % 360.0
+        self.cam_pitch = max(-88.0, min(88.0, self.cam_pitch + pitch))
+        self.cam_pos = anchor - sum(component * axis for component, axis in zip(local, self.camera_vectors()))
+        self.update()
+
+    def _dolly_camera(self, magnification: float, anchor: np.ndarray) -> None:
+        offset = self.cam_pos - anchor
+        distance = float(np.linalg.norm(offset))
+        if distance == 0.0:
+            return
+        target_distance = distance / magnification
+        nearest = min(distance, 0.75)
+        farthest = max(distance, 3200.0)
+        target_distance = min(farthest, max(nearest, target_distance))
+        self.cam_pos = anchor + offset * (target_distance / distance)
+        self.update()
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.NativeGesture and self._handle_camera_gesture(event):
+            return True
+        return super().event(event)
+
+    def _handle_camera_gesture(self, event: QNativeGestureEvent) -> bool:
+        kind = event.gestureType()
+        if kind in (Qt.NativeGestureType.BeginNativeGesture, Qt.NativeGestureType.EndNativeGesture):
+            self._native_camera_anchor = None
+        elif kind in (Qt.NativeGestureType.ZoomNativeGesture, Qt.NativeGestureType.RotateNativeGesture):
+            if not (self._lmb_down or self._rmb_down or self._pan_dragging):
+                if self._native_camera_anchor is None:
+                    self._native_camera_anchor = self._camera_anchor(event.position())
+                if kind == Qt.NativeGestureType.ZoomNativeGesture:
+                    self._dolly_camera(max(0.5, min(2.0, 1.0 + event.value())), self._native_camera_anchor)
+                else:
+                    self._orbit_camera(event.value(), 0.0, self._native_camera_anchor)
+        else:
+            return False
+        event.accept()
+        return True
+
     def wheelEvent(self, event: QWheelEvent) -> None:
-        steps = event.angleDelta().y() / 120.0
-        if steps > 0:
-            self.fly_speed = min(400.0, self.fly_speed * (1.18 ** steps))
-        elif steps < 0:
-            self.fly_speed = max(2.0, self.fly_speed / (1.18 ** (-steps)))
-        self._emit_stats()
+        phase = event.phase()
+        if phase in (Qt.ScrollPhase.ScrollBegin, Qt.ScrollPhase.ScrollEnd):
+            self._scroll_camera_anchor = None
+        event.accept()
+        if phase == Qt.ScrollPhase.ScrollMomentum or self._lmb_down or self._pan_dragging:
+            return
+        pixel, angle = event.pixelDelta(), event.angleDelta()
+        dx, dy = (float(pixel.x()), float(pixel.y())) if not pixel.isNull() else (
+            angle.x() / 3.0, angle.y() / 3.0)
+        if dx == 0.0 and dy == 0.0:
+            return
+        if self._rmb_down:
+            self.fly_speed = min(400.0, max(2.0, self.fly_speed * 1.18 ** (dy / 40)))
+            self._emit_stats()
+            return
+        if self._scroll_camera_anchor is None:
+            self._scroll_camera_anchor = self._camera_anchor(event.position())
+        anchor = self._scroll_camera_anchor
+        if phase == Qt.ScrollPhase.NoScrollPhase:
+            self._scroll_camera_anchor = None
+        modifiers = event.modifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            self._dolly_camera(1.15 ** (dy / 40), anchor)
+        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+            self._orbit_camera(-dx * 0.22, -dy * 0.22, anchor)
+        else:
+            self._pan_camera(dx, dy, anchor)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -3510,11 +3689,22 @@ class ViewportGL(QOpenGLWidget):
 
     def focusOutEvent(self, event) -> None:
         self._keys_down.clear()
+        self._native_camera_anchor = None
+        self._scroll_camera_anchor = None
+        self._drag_camera_anchor = None
+        if self._pan_dragging or self._rmb_down:
+            self._pan_dragging = False
+            self._rmb_down = False
+            self.unsetCursor()
         if self._timer.isActive():
             self._timer.stop()
         super().focusOutEvent(event)
 
     def hideEvent(self, event) -> None:
+        if self._plume_viewport:
+            self._plume_viewport.close_surface()
+            self._plume_dirty = True
+            self._plume_retry = False
         self._keys_down.clear()
         if self._timer.isActive():
             self._timer.stop()

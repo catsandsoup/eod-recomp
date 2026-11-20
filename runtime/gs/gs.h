@@ -4,12 +4,14 @@
 #include <cstdint>
 
 enum { GIF_PATH1 = 1, GIF_PATH2 = 2, GIF_PATH3 = 3 };
+namespace native { struct SceneClear; struct DisplayCopy; enum class ShadowPass : uint32_t; }
 
 void gs_init();
 // EE-thread shutdown: stop producers, drain GS/raster work, join all workers.
 void gs_shutdown();
 // Feeds qwc quadwords of GIF data on a path (packets may span calls).
-void gif_transfer(int path, const uint8_t *data, uint32_t qwc);
+void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::SceneClear *clear = nullptr,
+                  const native::DisplayCopy *copy = nullptr, native::ShadowPass shadow = {}, bool bootstrap_quad = false);
 uint32_t gif_reg_read(uint32_t off);
 void gif_reg_write(uint32_t off, uint32_t v);
 

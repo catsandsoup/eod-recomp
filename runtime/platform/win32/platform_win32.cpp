@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "../../../src/netplay_hooks.h"
 #include "../../core/config.h"
 #include "../../core/memory.h"
 #include "../../ui/overlay.h"
@@ -157,7 +158,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_F11) toggle_fullscreen();
-        if (wp == VK_F9 && !(lp & (1 << 30))) modern::toggle();  // renderer: modern <-> original
+        if (wp == VK_F9 && !(lp & (1 << 30)) && GetFocus() == h) modern::toggle_from_input();
         g_keys[wp & 255] = true;
         return 0;
     case WM_KEYUP:
@@ -393,6 +394,13 @@ void build_key_map() {
 
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
+    if (port >= 2) {
+        if (pad_script_state(port, out) && overlay_captures_input()) {
+            *out = HostPadState();
+            out->connected = true;
+        }
+        return;
+    }
     const keyboard_input::Context ctx = win32_keyboard_context();
     if (port == 0) {
         // keyboard (always available on port 0)
@@ -480,7 +488,14 @@ void platform_get_controller(int port, HostPadState *out) {
                 if (out->buttons & PAD_SQUARE) out->pressure[7] = 255;
                 const uint16_t clicks = out->buttons & (PAD_L3 | PAD_R3);
                 out->buttons &= ~(PAD_L3 | PAD_R3);
-                if (clicks & PAD_R3) { out->buttons |= PAD_L2; out->pressure[10] = 255; }
+                if (clicks & PAD_R3) {
+                    const bool graphics_chord = port == 0 &&
+                        (out->buttons & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1) &&
+                        (!netplay_hooks::event_active || !netplay_hooks::event_active()) &&
+                        modern::look_switch_available();
+                    if (graphics_chord) out->buttons |= PAD_R3;
+                    else { out->buttons |= PAD_L2; out->pressure[10] = 255; }
+                }
                 if (clicks & PAD_L3) { out->buttons |= PAD_R2; out->pressure[11] = 255; }
                 if (xs.Gamepad.bRightTrigger > 30) out->buttons |= PAD_CROSS;
                 if (xs.Gamepad.bLeftTrigger > 30) out->buttons |= PAD_SQUARE;

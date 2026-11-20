@@ -136,6 +136,53 @@ enum StudioError: LocalizedError {
 }
 
 enum RuntimePaths {
+    static let python = Result {
+        try findPython(
+            environment: ProcessInfo.processInfo.environment,
+            bundledRuntime: Bundle.main.url(forAuxiliaryExecutable: "eod-kit-python")
+        )
+    }
+
+    static func findPython(environment: [String: String], bundledRuntime: URL? = nil) throws -> URL {
+        if let bundledRuntime {
+            guard supportsBackendPython(bundledRuntime) else {
+                throw StudioError.message("The bundled asset runtime could not start. Reinstall the Creation Kit from its ZIP.")
+            }
+            return bundledRuntime
+        }
+        let directories = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
+            + ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
+        let override = environment["EOD_PYTHON"].flatMap { $0.isEmpty ? nil : $0 }
+        let executable = ((override ?? "python3") as NSString).expandingTildeInPath
+        let candidates = executable.contains("/")
+            ? [URL(fileURLWithPath: executable)]
+            : directories.map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(executable) }
+        var checked = Set<URL>()
+        for candidate in candidates where checked.insert(candidate).inserted {
+            if supportsBackendPython(candidate) { return candidate }
+        }
+        let guidance = "Install Python 3.10 or newer, or set EOD_PYTHON to the path of a compatible interpreter, then relaunch the Creation Kit."
+        if let override {
+            throw StudioError.message("Could not use '\(override)' from EOD_PYTHON. \(guidance)")
+        }
+        throw StudioError.message(guidance)
+    }
+
+    private static func supportsBackendPython(_ executable: URL) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else { return false }
+        let probe = Process()
+        let response = Pipe()
+        probe.executableURL = executable
+        probe.arguments = ["-I", "-c", "import sys; print((3, 10) <= sys.version_info < (4,))"]
+        probe.standardInput = FileHandle.nullDevice
+        probe.standardOutput = response
+        probe.standardError = FileHandle.nullDevice
+        do { try probe.run() } catch { return false }
+        let supported = response.fileHandleForReading.readDataToEndOfFile() == Data("True\n".utf8)
+        probe.waitUntilExit()
+        return probe.terminationStatus == 0 && supported
+    }
+
     static var repository: URL {
         if let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),
            let data = try? Data(contentsOf: resource),
@@ -155,15 +202,18 @@ enum RuntimePaths {
             .appendingPathComponent("Library/Application Support/EODCreationKit")
         #endif
     }
-    static var gameExecutable: String {
+    static func gameExecutable(saved: String? = nil) -> String {
         guard let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),
               let data = try? Data(contentsOf: resource),
               let config = try? JSONDecoder().decode([String: String].self, from: data)
-        else { return "" }
+        else { return saved ?? "" }
         if let relative = config["bundledGameExecutable"], let resources = Bundle.main.resourceURL {
+            // Preferences from earlier releases may contain the bundle's old absolute path.
+            if let saved, !saved.hasSuffix("/" + relative),
+               FileManager.default.isExecutableFile(atPath: saved) { return saved }
             return resources.appendingPathComponent(relative).path
         }
-        return config["gameExecutable"] ?? ""
+        return saved ?? config["gameExecutable"] ?? ""
     }
     static var initialProject: String? {
         guard let resource = Bundle.main.url(forResource: "studio-runtime", withExtension: "json"),
@@ -235,7 +285,7 @@ enum Backend {
         let helper = RuntimePaths.helper.path
         let data = try await Task.detached(priority: .userInitiated) {
             let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            task.executableURL = try RuntimePaths.python.get()
             task.arguments = ["-I", helper]
             let stdin = Pipe(), stdout = Pipe()
             task.standardInput = stdin
@@ -332,7 +382,7 @@ final class StudioState: ObservableObject {
         disc = prefs.string(forKey: "retailStudio.disc") ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/TDEODRecomp/disc").path
         let root = RuntimePaths.repository
-        executable = prefs.string(forKey: "retailStudio.executable") ?? RuntimePaths.gameExecutable
+        executable = RuntimePaths.gameExecutable(saved: prefs.string(forKey: "retailStudio.executable"))
         project = prefs.string(forKey: "retailStudio.project") ?? RuntimePaths.initialProject ?? root.appendingPathComponent("mods/CreationKitDevelopment/project.eodproject").path
         if let data = try? Data(contentsOf: URL(fileURLWithPath: project)),
            let saved = try? JSONDecoder().decode(LoadedProject.self, from: data) {
@@ -387,7 +437,11 @@ final class StudioState: ObservableObject {
     func remember() {
         preferences.set(disc, forKey: "retailStudio.disc")
         preferences.set(project, forKey: "retailStudio.project")
-        preferences.set(executable, forKey: "retailStudio.executable")
+        if executable == RuntimePaths.gameExecutable() {
+            preferences.removeObject(forKey: "retailStudio.executable")
+        } else {
+            preferences.set(executable, forKey: "retailStudio.executable")
+        }
     }
     func permitDiscard() -> Bool {
         guard dirty else { return true }

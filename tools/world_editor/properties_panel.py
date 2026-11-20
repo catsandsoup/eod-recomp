@@ -15,6 +15,7 @@ Pages:
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
@@ -121,12 +122,12 @@ class PropertiesPanel(QWidget):
     deleteMarkerRequested = Signal(object)
 
     # Environment / Skybox signals
-    environmentChanged = Signal()
+    environmentEdited = Signal(object)  # proposed EnvironmentState
     openEnvironmentRequested = Signal()
 
     # SOBL Barrier signals
     barrierHeightApplyRequested = Signal(int, float)  # rec_idx, target_top_above_ground
-    flattenAllBarriersRequested = Signal()
+    clampSkyWallsRequested = Signal()
 
     MARKER_KINDS = ["Spawn", "Start Grid", "Car", "Chicken", "Trigger", "Breaker", "Marker"]
 
@@ -154,7 +155,6 @@ class PropertiesPanel(QWidget):
         hdr.setProperty("sectionTitle", True)
         self.btn_env_shortcut = QPushButton(" Env / Sky")
         self.btn_env_shortcut.setIcon(svg_icon("sky", "#fbbf24"))
-        self.btn_env_shortcut.setFixedHeight(22)
         self.btn_env_shortcut.setToolTip("Open Environment, Skybox, Sun & Fog Inspector")
         self.btn_env_shortcut.clicked.connect(self.openEnvironmentRequested.emit)
         hdr_row.addWidget(hdr)
@@ -173,6 +173,13 @@ class PropertiesPanel(QWidget):
         self._build_barrier_page()      # 5
 
         self.show_nothing()
+
+    def _add_scrolling_page(self, page: QWidget) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        self.stack.addWidget(scroll)
 
     # -----------------------------------------------------------------------
     # Page 0: Nothing selected
@@ -194,9 +201,9 @@ class PropertiesPanel(QWidget):
         btn_env.setIcon(svg_icon("sky", "#fbbf24"))
         btn_env.clicked.connect(self.openEnvironmentRequested.emit)
 
-        btn_bar = QPushButton(" Flatten Track Barriers (SOBL)")
+        btn_bar = QPushButton(" Clamp Sky-Walls to Asset Height")
         btn_bar.setIcon(svg_icon("shield", "#f97316"))
-        btn_bar.clicked.connect(self.flattenAllBarriersRequested.emit)
+        btn_bar.clicked.connect(self.clampSkyWallsRequested.emit)
 
         lay.addWidget(title)
         lay.addWidget(sub)
@@ -204,7 +211,7 @@ class PropertiesPanel(QWidget):
         lay.addWidget(btn_env)
         lay.addWidget(btn_bar)
         lay.addStretch(2)
-        self.stack.addWidget(page)
+        self._add_scrolling_page(page)
 
     # -----------------------------------------------------------------------
     # Page 1: Object selected (+ Texture/Material Inspector + Replace With...)
@@ -217,7 +224,6 @@ class PropertiesPanel(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 2, 0)
@@ -450,7 +456,6 @@ class PropertiesPanel(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 2, 0)
@@ -601,7 +606,7 @@ class PropertiesPanel(QWidget):
         dk_lay.addLayout(row)
         lay.addWidget(dock)
 
-        self.stack.addWidget(page)
+        self._add_scrolling_page(page)
 
     # -----------------------------------------------------------------------
     # Page 4: Environment / Skybox / Fog / Sun Panel
@@ -614,7 +619,6 @@ class PropertiesPanel(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 2, 0)
@@ -643,7 +647,9 @@ class PropertiesPanel(QWidget):
 
         self.env_borrow_combo = QComboBox()
         self.env_borrow_combo.addItem("Keep Track's Retail Sky", "")
-        self.env_borrow_combo.currentIndexChanged.connect(self._on_env_value_changed)
+        self.env_borrow_combo.currentIndexChanged.connect(
+            lambda _index: self._edit_environment(borrowed_sky_track=self.env_borrow_combo.currentData() or None)
+        )
 
         sky_lay.addWidget(QLabel("Atmosphere Preset"))
         sky_lay.addWidget(self.env_preset_combo)
@@ -661,19 +667,19 @@ class PropertiesPanel(QWidget):
         self.env_sun_az.setRange(0.0, 360.0)
         self.env_sun_az.setSingleStep(5.0)
         self.env_sun_az.setSuffix(" °")
-        self.env_sun_az.valueChanged.connect(self._on_env_value_changed)
+        self.env_sun_az.valueChanged.connect(lambda value: self._edit_environment(sun_azimuth=value))
 
         self.env_sun_el = QDoubleSpinBox()
         self.env_sun_el.setRange(2.0, 89.0)
         self.env_sun_el.setSingleStep(2.0)
         self.env_sun_el.setSuffix(" °")
-        self.env_sun_el.valueChanged.connect(self._on_env_value_changed)
+        self.env_sun_el.valueChanged.connect(lambda value: self._edit_environment(sun_elevation=value))
 
         self.env_ambient = QDoubleSpinBox()
         self.env_ambient.setRange(0.15, 2.0)
         self.env_ambient.setSingleStep(0.05)
         self.env_ambient.setDecimals(2)
-        self.env_ambient.valueChanged.connect(self._on_env_value_changed)
+        self.env_ambient.valueChanged.connect(lambda value: self._edit_environment(ambient_intensity=value))
 
         sgrid = QGridLayout()
         sgrid.addWidget(QLabel("Sun Azimuth"), 0, 0)
@@ -695,19 +701,19 @@ class PropertiesPanel(QWidget):
         self.env_fog_start.setRange(10.0, 3000.0)
         self.env_fog_start.setSingleStep(25.0)
         self.env_fog_start.setSuffix(" m")
-        self.env_fog_start.valueChanged.connect(self._on_env_value_changed)
+        self.env_fog_start.valueChanged.connect(lambda value: self._edit_environment(fog_start=value))
 
         self.env_fog_end = QDoubleSpinBox()
         self.env_fog_end.setRange(50.0, 6000.0)
         self.env_fog_end.setSingleStep(50.0)
         self.env_fog_end.setSuffix(" m")
-        self.env_fog_end.valueChanged.connect(self._on_env_value_changed)
+        self.env_fog_end.valueChanged.connect(lambda value: self._edit_environment(fog_end=value))
 
         self.env_fog_density = QDoubleSpinBox()
         self.env_fog_density.setRange(0.0, 1.0)
         self.env_fog_density.setSingleStep(0.05)
         self.env_fog_density.setDecimals(2)
-        self.env_fog_density.valueChanged.connect(self._on_env_value_changed)
+        self.env_fog_density.valueChanged.connect(lambda value: self._edit_environment(fog_density=value))
 
         self.btn_fog_color = QPushButton("Pick Fog Color...")
         self.btn_fog_color.clicked.connect(self._pick_fog_color)
@@ -784,9 +790,8 @@ class PropertiesPanel(QWidget):
             and self.barrierHeightApplyRequested.emit(self._current_barrier_idx, -0.5)
         )
 
-        btn_flat_all = QPushButton("Flatten ALL Track Barriers")
-        btn_flat_all.setProperty("danger", True)
-        btn_flat_all.clicked.connect(self.flattenAllBarriersRequested.emit)
+        btn_flat_all = QPushButton("Clamp Sky-Walls to Asset Height")
+        btn_flat_all.clicked.connect(self.clampSkyWallsRequested.emit)
 
         e_lay.addWidget(QLabel("Target Top Above Ground (shrink-only):"))
         e_lay.addWidget(self.bar_target_spin)
@@ -797,7 +802,7 @@ class PropertiesPanel(QWidget):
         lay.addWidget(e_card)
 
         lay.addStretch(1)
-        self.stack.addWidget(page)
+        self._add_scrolling_page(page)
 
     # -----------------------------------------------------------------------
     # Context Switching API
@@ -1028,30 +1033,14 @@ class PropertiesPanel(QWidget):
     def _on_env_preset_changed(self, preset_name: str) -> None:
         if self._updating or self._current_env is None:
             return
-        self._current_env.apply_preset(preset_name)
-        self._updating = True
-        self.env_sun_az.setValue(self._current_env.sun_azimuth)
-        self.env_sun_el.setValue(self._current_env.sun_elevation)
-        self.env_ambient.setValue(self._current_env.ambient_intensity)
-        self.env_fog_start.setValue(self._current_env.fog_start)
-        self.env_fog_end.setValue(self._current_env.fog_end)
-        self.env_fog_density.setValue(self._current_env.fog_density)
-        self._update_fog_swatch(self._current_env.fog_color)
-        self._updating = False
-        self.environmentChanged.emit()
+        proposed = replace(self._current_env)
+        proposed.apply_preset(preset_name)
+        self.environmentEdited.emit(proposed)
 
-    def _on_env_value_changed(self, *_args: Any) -> None:
+    def _edit_environment(self, **changes: Any) -> None:
         if self._updating or self._current_env is None:
             return
-        self._current_env.sun_azimuth = float(self.env_sun_az.value())
-        self._current_env.sun_elevation = float(self.env_sun_el.value())
-        self._current_env.ambient_intensity = float(self.env_ambient.value())
-        self._current_env.fog_start = float(self.env_fog_start.value())
-        self._current_env.fog_end = float(self.env_fog_end.value())
-        self._current_env.fog_density = float(self.env_fog_density.value())
-        bval = str(self.env_borrow_combo.currentData() or "")
-        self._current_env.borrowed_sky_track = bval if bval else None
-        self.environmentChanged.emit()
+        self.environmentEdited.emit(replace(self._current_env, **changes))
 
     def _pick_fog_color(self) -> None:
         if self._current_env is None:
@@ -1059,6 +1048,4 @@ class PropertiesPanel(QWidget):
         r, g, b = (int(c * 255) for c in self._current_env.fog_color)
         col = QColorDialog.getColor(QColor(r, g, b), self, "Select Atmosphere Fog Color")
         if col.isValid():
-            self._current_env.fog_color = (col.redF(), col.greenF(), col.blueF())
-            self._update_fog_swatch(self._current_env.fog_color)
-            self.environmentChanged.emit()
+            self._edit_environment(fog_color=(col.redF(), col.greenF(), col.blueF()))

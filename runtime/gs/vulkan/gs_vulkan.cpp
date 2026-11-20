@@ -95,6 +95,7 @@ bool g_gs_thread_known;
 
 struct Stats {
     uint32_t draws, prims, flushes, uploads, readbacks, converts, tex_new, tex_hit, tex_rt, tex_bytes, presents;
+    uint32_t movie_uploads;
     uint32_t rb_reason[4]; // vram_needed from: 0 CPU (CLUT, transfers), 1
                            // textures, 2 acquire, 3 display
 } g_stats;
@@ -1627,6 +1628,7 @@ hosttex::Store g_host;
 bool g_host_on;   // replacements loaded
 FILE *g_host_log; // EOD_HOST_TEXTURE_LOG
 uint64_t g_host_budget = 1536ull << 20;
+uint32_t g_host_max_side;
 std::unordered_map<uint64_t, HostGpu> g_host_gpu; // (entry << 1 | GS alpha domain) + 1
 uint64_t g_host_gpu_bytes;
 std::unordered_set<uint64_t> g_host_logged, g_host_noted;
@@ -1952,6 +1954,12 @@ ID3D11ShaderResourceView *host_texture(int idx, uint32_t native_alpha_high, alph
     const hosttex::Entry &en = g_host.entries()[(size_t)idx];
     const bool gs_alpha = hosttex::gs_alpha_domain(native_alpha_high);
     id = ((uint64_t)idx << 1 | (gs_alpha ? 1 : 0)) + 1;
+    if (en.w > g_host_max_side || en.h > g_host_max_side) {
+        if (g_host_noted.insert(id ^ 0x4000000000000000ull).second)
+            WARN("host textures: %s %ux%u exceeds device limit %u, keeping game texture",
+                 en.asset_id.c_str(), en.w, en.h, g_host_max_side);
+        return nullptr;
+    }
     auto it = g_host_gpu.find(id);
     if (it != g_host_gpu.end()) {
         it->second.last_use = g_frame_no;
@@ -2050,6 +2058,9 @@ void host_textures_init() {
                 if (std::atoll(b) >= 0)
                     cpu_budget = (uint64_t)std::atoll(b) << 20;
             if (g_host_on) {
+                VkPhysicalDeviceProperties properties{};
+                vkGetPhysicalDeviceProperties(g_dev->physical, &properties);
+                g_host_max_side = properties.limits.maxImageDimension2D;
                 uint64_t total = 0;
                 for (const auto &en : g_host.entries())
                     total += en.bytes;
@@ -2560,8 +2571,20 @@ bool start(bool with_window) {
         // Auto (RenderScale=0): the scale nearest the display's pixel height
         // (e.g. 1800-pixel Retina 1440x900: 4, 2560x1792), not the next one up,
         // which would render ~1.6x the pixels only to downsample them.
-        int automatic_scale = with_window ? ((int)g_dev->extent.height + 224) / 448 : 1;
-        g_scale = std::clamp(g_config.render_scale > 0 ? g_config.render_scale : automatic_scale, 1, 6);
+        const int automatic_scale = with_window ? ((int)g_dev->extent.height + 224) / 448 : 1;
+        g_scale = std::clamp(automatic_scale, 1, kLegacyMaxRenderScale);
+        if (g_config.render_scale > 0) {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(g_dev->physical, &properties);
+            // GS color/depth surfaces can grow to 2048 native pixels per axis.
+            // Keep existing scale choices while guarding the new 7x and 8x modes.
+            const int max_scale = std::clamp((int)(properties.limits.maxImageDimension2D / 2048),
+                                             kLegacyMaxRenderScale, kMaxRenderScale);
+            g_scale = std::min(g_config.render_scale, max_scale);
+            if (g_scale < g_config.render_scale)
+                std::fprintf(stderr, "[vulkan] RenderScale=%d limited to %dx by max image dimension %u\n",
+                             g_config.render_scale, g_scale, properties.limits.maxImageDimension2D);
+        }
         if (!create_shaders() || !create_raw_textures())
             return false;
         host_textures_init();
@@ -2859,10 +2882,24 @@ Circuit read_circuit_regs(int n) {
 ID3D11Texture2D *g_disp_tex[2]; // CPU-side display images (movies), per circuit
 ID3D11ShaderResourceView *g_disp_srv[2];
 int g_disp_w, g_disp_h;
+bool g_native_display_history;
 // the last composition (what read_display shows)
 Circuit g_last[2];
 bool g_have_last;
 int g_last_aspect = -1;
+
+// The retail PSS player uploads CT32 tiles to alternating display buffers,
+// both with the same visible crop. Match the GS worker's ordered registers.
+bool direct_movie_upload(int n, const Circuit &c) {
+    static const bool enabled = [] {
+        const char *value = getenv("EOD_NATIVE_MOVIE_SCANOUT");
+        return value && value[0] == '1';
+    }();
+    return enabled && g_dev->queueMutex && native::native_only_level() == 1 &&
+           n == 1 && st.pmode == 0x66 && (c.fbp == 0 || c.fbp == 0x1680) &&
+           c.fbw == 12 && c.psm == PSMCT32 && c.x == 40 && c.y == 16 &&
+           c.w == 640 && c.h == 448 && c.lines == c.h;
+}
 
 // source of a display circuit: a surface or the CPU copy (uploaded)
 ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, float &y0, float &x1, float &y1, float &sw,
@@ -2871,7 +2908,8 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
     uint32_t page = (c.fbp >> 5) % kPages;
     // EOD_NATIVE_ONLY=1 drops the GS blit sprite from the 3D render target to DISPFB, so display
     // and headless capture read Plume's last 3D color target directly (guardrail row 1).
-    if (native::enabled() && native::native_only() && native::native_only_level() == 1) {
+    if ((!g_native_display_history || c.fbp != 0) &&
+        native::enabled() && native::native_only() && native::native_only_level() == 1) {
         uint32_t nfbp = 0, nfbw = 0, npsm = 0;
         if (native::last_target(nfbp, nfbw, npsm)) {
             Surface *d = find_surface(nfbp, nfbw ? nfbw : 1, npsm, false);
@@ -2924,25 +2962,38 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
         CHECK(g_dev->CreateShaderResourceView(g_disp_tex[n], nullptr, &g_disp_srv[n]));
         g_disp_w = g_disp_h = 2048;
     }
-    std::vector<uint32_t> img((size_t)c.w * c.lines);
     const SwizzleTab *T = swizzle_table(c.psm, c.fbw);
-    bool b16 = bpp_of(c.psm) == 16;
-    for (int y = 0; y < c.lines; y++) {
-        int py = (c.y + y) & 2047;
-        uint32_t rb = T->row_base(c.fbp, py), rc = T->rowC[py];
-        uint32_t *row = &img[(size_t)y * c.w];
-        for (int x = 0; x < c.w; x++) {
-            uint32_t a = T->addr_row(rb, rc, (c.x + x) & 2047);
-            if (b16) {
-                uint32_t v = half(a);
-                row[x] = ((v & 0x1F) << 3) | (((v >> 5) & 0x1F) << 11) | (((v >> 10) & 0x1F) << 19) | 0xFF000000u;
-            } else {
-                row[x] = word(a) | 0xFF000000u;
+    const bool b16 = bpp_of(c.psm) == 16;
+    auto unpack = [&](uint32_t *img) {
+        for (int y = 0; y < c.lines; y++) {
+            int py = (c.y + y) & 2047;
+            uint32_t rb = T->row_base(c.fbp, py), rc = T->rowC[py];
+            uint32_t *row = img + (size_t)y * c.w;
+            for (int x = 0; x < c.w; x++) {
+                uint32_t a = T->addr_row(rb, rc, (c.x + x) & 2047);
+                if (b16) {
+                    uint32_t v = half(a);
+                    row[x] = ((v & 0x1F) << 3) | (((v >> 5) & 0x1F) << 11) | (((v >> 10) & 0x1F) << 19) | 0xFF000000u;
+                } else {
+                    row[x] = word(a) | 0xFF000000u;
+                }
             }
         }
+    };
+    const D3D11_BOX box = {0, 0, 0, (UINT)c.w, (UINT)c.lines, 1};
+    if (direct_movie_upload(n, c)) {
+        g_ctx->UpdateSubresourceDirect(g_disp_tex[n], 0, box, unpack);
+        g_stats.movie_uploads++;
+        static bool logged;
+        if (!logged && g_log_enabled[LOG_GS]) {
+            LOG(LOG_GS, "vulkan: retail PSS scanout uses direct mapped staging");
+            logged = true;
+        }
+    } else {
+        std::vector<uint32_t> img((size_t)c.w * c.lines);
+        unpack(img.data());
+        g_ctx->UpdateSubresource(g_disp_tex[n], 0, &box, img.data(), (UINT)c.w * 4, 0);
     }
-    D3D11_BOX box = {0, 0, 0, (UINT)c.w, (UINT)c.lines, 1};
-    g_ctx->UpdateSubresource(g_disp_tex[n], 0, &box, img.data(), (UINT)c.w * 4, 0);
     x0 = 0;
     y0 = 0;
     x1 = (float)c.w;
@@ -3288,6 +3339,7 @@ bool read_display(std::vector<uint32_t> &rgba, int &w, int &h) {
 }
 
 void reset() {
+    g_native_display_history = false;
     if (!g_on)
         return;
     flush();
@@ -3372,6 +3424,10 @@ void stats_line(char *buf, size_t size) {
     g_dev->passes = 0;
     std::fill(std::begin(g_dev->pass_ends), std::end(g_dev->pass_ends), 0);
     g_dev->submit_count = g_dev->wait_us = g_dev->pipeline_us = g_dev->chunk_submits = 0;
+    if (g_stats.movie_uploads) {
+        used = strlen(buf);
+        snprintf(buf + used, size > used ? size - used : 0, "; movie scanout %u direct uploads", g_stats.movie_uploads);
+    }
     g_stats = Stats();
 }
 

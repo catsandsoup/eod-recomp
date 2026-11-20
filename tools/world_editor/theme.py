@@ -9,7 +9,7 @@ import sys
 from functools import lru_cache
 
 from PySide6.QtCore import QByteArray, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -298,7 +298,6 @@ QSS_STYLESHEET = f"""
 QMainWindow, QWidget {{
     background-color: {BG_PANEL};
     color: {TEXT_PRIMARY};
-    font-family: "Segoe UI", "Inter", sans-serif;
     font-size: 9pt;
 }}
 
@@ -385,18 +384,13 @@ QSplitter::handle:vertical {{
     height: 1px;
 }}
 
-QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{
+QLineEdit {{
     background-color: {BG_INPUT};
     color: {TEXT_PRIMARY};
     border: 1px solid {BORDER};
     border-radius: 4px;
     padding: 4px 7px;
     selection-background-color: {ACCENT_BLUE};
-}}
-QDoubleSpinBox::up-button, QDoubleSpinBox::down-button, QSpinBox::up-button, QSpinBox::down-button {{
-    subcontrol-origin: border;
-    width: 0px;
-    border: none;
 }}
 QDoubleSpinBox QLineEdit, QSpinBox QLineEdit {{
     border: none;
@@ -405,12 +399,8 @@ QDoubleSpinBox QLineEdit, QSpinBox QLineEdit {{
     background: transparent;
     color: {TEXT_PRIMARY};
 }}
-QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus {{
+QLineEdit:focus {{
     border-color: {ACCENT_BLUE};
-}}
-QComboBox::drop-down {{
-    border: none;
-    width: 20px;
 }}
 QComboBox QAbstractItemView {{
     background-color: {BG_ELEVATED};
@@ -618,10 +608,34 @@ QLabel[badge="world"] {{
 """
 
 
+class ElidedLabel(QLabel):
+    """Keep status text readable without imposing a width on its window."""
+
+    def __init__(self, text: str = ""):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self.setAccessibleName(text)
+        self.setToolTip(text)
+        self._fit_text()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_text()
+
+    def _fit_text(self) -> None:
+        available = max(0, self.contentsRect().width())
+        super().setText(self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, available))
+
+
 def apply_dark_theme(app: QApplication) -> None:
-    """Apply Fusion style, dark QPalette, Segoe UI font, and custom QSS."""
+    """Apply the shared palette with each platform's UI font."""
     app.setStyle("Fusion")
-    font = QFont("Segoe UI", 9)
+    font = (QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+            if sys.platform == "darwin" else QFont("Segoe UI", 9))
     font.setHintingPreference(QFont.HintingPreference.PreferDefaultHinting)
     app.setFont(font)
 

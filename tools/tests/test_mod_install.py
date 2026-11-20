@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import runpy
 import shutil
 import struct
 import sys
@@ -223,6 +224,19 @@ class AtomicityTest(InstallCase):
             with self.assertRaisesRegex(ValueError, "Another Kit operation"):
                 with mi.locked(self.P):
                     pass
+
+    def test_windows_profile_import_and_lock(self):
+        fake_msvcrt = mock.Mock(LK_NBLCK=2, LK_UNLCK=0)
+        local_appdata = self.root / "localappdata"
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"fcntl": None, "msvcrt": fake_msvcrt}), \
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local_appdata)}):
+            windows = runpy.run_path(mi.__file__)
+        self.assertEqual(windows["profile_dir"](None, "dev"), local_appdata.resolve() / "EODCreationKit/profiles/dev")
+        with self.assertRaisesRegex(RuntimeError, "test operation"):
+            with windows["locked"](self.P):
+                raise RuntimeError("test operation")
+        self.assertEqual([call.args[1:] for call in fake_msvcrt.locking.call_args_list], [(2, 1), (0, 1)])
 
 
 class HostTextureTest(InstallCase):

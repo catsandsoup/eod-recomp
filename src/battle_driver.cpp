@@ -304,7 +304,8 @@ void apply_live_car_tuner_and_arcade(uint32_t player_car) {
         ee_w32(0x3C411C, (uint32_t)g_pie_ctrl.camera_view);
         ee_w32(0x48CB90, (uint32_t)g_pie_ctrl.camera_view);
     }
-    const bool is_it = (g_pie_ctrl.arcade_mode == 1 && g_pie_ctrl.it_slot == 0);
+    const bool is_it = g_pie_ctrl.arcade_mode == 1 &&
+        ee_r32(0x447458 + g_pie_ctrl.it_slot * 4) == player_car;
     const bool is_juggernaut = (g_pie_ctrl.arcade_mode == 3);
     const float boost = g_pie_ctrl.speed_boost * (is_it ? 1.18f : (is_juggernaut ? 1.10f : 1.0f));
     if (std::fabs(boost - 1.0f) > 0.02f) {
@@ -344,20 +345,24 @@ void apply_live_car_tuner_and_arcade(uint32_t player_car) {
 }
 } // namespace
 
+void pie_update_player(uint32_t car) {
+    if (!valid(car, 0x1C34) || netplay_car::is_puppet(car)) return;
+    sync_opt_terrain_mask();
+    poll_pie_live_control();
+    // The HumanDriver writes the pedals and steering even when the pad is idle.
+    // Apply ILIN input here after those writes and before the next physics step.
+    if (g_pie_ctrl.ai_autodrive && !ee_r32(0x44744C) && !ee_r32(0x447454)) {
+        drive_player_along_ilin(car);
+    }
+    apply_live_car_tuner_and_arcade(car);
+}
+
 extern "C" void f_001A2D20(){
     uint32_t updated_car=g_ee.r[4].uw[0];
     if(netplay_car::is_puppet(updated_car)) return;  // remote player's car: state comes from the network
     f_001A2D20_orig();
     if(!valid(updated_car,0x1C34)) return;
     sync_opt_terrain_mask();
-    const uint32_t player0_car = ee_r32(0x447458);
-    if (updated_car == player0_car) {
-        poll_pie_live_control();
-        apply_live_car_tuner_and_arcade(updated_car);
-        if (g_pie_ctrl.ai_autodrive) {
-            drive_player_along_ilin(updated_car);
-        }
-    }
     if(ee_r32(0x3CF19C)!=0x18000224) return;
     uint32_t master=ee_r32(0x3CF194);
     if(!valid(master,battle_layout::kMasterSize) || ee_r32(master)!=battle_layout::kMasterVtable) return;

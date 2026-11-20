@@ -2,13 +2,14 @@
 //
 //   EOD_PAD_SCRIPT  = port 0 (player 1)
 //   EOD_PAD_SCRIPT1 = port 1 (player 2)
+//   EOD_PAD_SCRIPT_SLOT1/2/3 = slots 1/2/3 on a scripted multitap in port 0
+// In multitap mode the retail lobby uses port 0 slots 0–3. Port 1 keeps
+// its standalone pad identity, which the multitap lobby does not list.
 //
 // Each is "frame:buttons_hex[:lx:ly[:cross:square]],..." with
 // active-high PadButton bits and optional left stick bytes (0..255, 128 =
-// centre); each entry holds from its vblank on. Two scripts together drive
-// both player ports, which is how 2-player split screen is tested without
-// two physical pads. Optional Cross/Square pressures are independent of the
-// digital mask and must be 0..255; omitted fields retain digital 0/255.
+// centre); each entry holds from its vblank on. Optional Cross/Square pressures
+// are independent of the digital mask and must be 0..255. Omitted fields retain digital 0/255.
 // Invalid pressure fields reject that entry rather than wrapping the value.
 #pragma once
 #include <cstdint>
@@ -28,16 +29,24 @@ struct PadScriptEntry {
     int cross = -1, square = -1; // -1: derive pressure from the digital mask
 };
 
+inline constexpr int kPadScriptCount = 5;
+inline const char *pad_script_spec(int port) {
+    constexpr const char *names[kPadScriptCount] = {
+        "EOD_PAD_SCRIPT", "EOD_PAD_SCRIPT1", "EOD_PAD_SCRIPT_SLOT1",
+        "EOD_PAD_SCRIPT_SLOT2", "EOD_PAD_SCRIPT_SLOT3",
+    };
+    return port >= 0 && port < kPadScriptCount ? getenv(names[port]) : nullptr;
+}
+
 // Fills out (buttons, left stick, pressure) from the port's script; false
 // when no script is set for that port.
 inline bool pad_script_state(int port, HostPadState *out) {
-    static std::vector<PadScriptEntry> script[2];
-    static bool parsed, active[2];
+    static std::vector<PadScriptEntry> script[kPadScriptCount];
+    static bool parsed, active[kPadScriptCount];
     if (!parsed) {
         parsed = true;
-        const char *names[2] = {"EOD_PAD_SCRIPT", "EOD_PAD_SCRIPT1"};
-        for (int p = 0; p < 2; p++) {
-            const char *s = getenv(names[p]);
+        for (int p = 0; p < kPadScriptCount; p++) {
+            const char *s = pad_script_spec(p);
             if (!s) continue;
             active[p] = true;
             std::string str(s);
@@ -72,7 +81,7 @@ inline bool pad_script_state(int port, HostPadState *out) {
             }
         }
     }
-    if (port < 0 || port > 1 || !active[port]) return false;
+    if (port < 0 || port >= kPadScriptCount || !active[port]) return false;
     // Script frames are presented frames: game vblanks plus menu frames drawn while the menu holds the game,
     // so a script can drive the pausing menu.
     uint64_t f = kernel_vblank_count() + kernel_menu_hold_frames();

@@ -66,6 +66,43 @@ range consumers inconsistent. Two views can use a reduced native distance;
 verify actual values per view rather than assuming one-player settings carry
 unchanged into split screen.
 
+For `Detail=maximum`, the host projection wrapper preserves the 1P distance
+before `00212B58` divides it. With 2, 3 or 4 active views at `003D1A74`, the
+wrapper multiplies a valid native source (up to 1150) by the view count for that
+call and restores `00495D58` afterwards. An explicit DrawDistance multiplier
+then applies to the projection while preserving the unscaled 1P fog range. For a
+source of 1150 and DrawDistance 8, the expected projection far plane is 9200 in
+each view.
+
+### Maximum world LOD
+
+The relocated GRAF loader at `00214678` reads the model conditions before
+applying the host LOD policy. A scan of the retail track archives found 392
+two-level mlist groups with occupied masks 0 and 1, and 368 three-level groups
+with occupied masks 0, 1 and 5. Group `00357E60` compares squared distances
+against ordered thresholds. Mask 0 selects the closest, highest-detail
+geometry. Past the last finite threshold the selector returns a mask with no
+associated models.
+
+At `Detail=maximum`, both relocated mlists use the highest-detail models in
+those groups up to the existing last cutoff, including the independent
+`DrawDistance` multiplier. Frustum culling still runs on the selected models.
+Original and High retain authored transitions. Groups with missing or
+unexpected masks or unordered thresholds retain their authored selectors.
+`EOD_CULL_TRACE=1` reports `drawn_lower_lod` for visible group models with a
+nonzero mask. `lod_swap` still counts models rejected because another level won.
+
+The Apple M2 Pro acceptance run used Plume Classic at 1× and DrawDistance 8.
+Dennison 1P drew eight lower-level leaves in each Original culling sample
+and zero in Maximum. Plume drew all 727,497 submitted leaves in 928 measured
+Maximum frames. Woodly Maximum drew all 862,728 leaves and 930 water
+submissions in 932 measured frames, with no lower-level leaves in the
+culling samples. The regular-menu Dennison 2P run reached ten world passes,
+a far plane of 9,200, and zero lower-level leaves in the sampled culling calls.
+Its last parity checkpoint matched 1,173,479 submitted leaves in 5,390
+measured frames. The nine `LODRuntime` checks passed. Live 4P, full camera
+sweeps and 6× timing still require verification.
+
 `00212DB0` and `00212DC0` are identical getters for `00495D58`. The simple
 `tools/ee_dis.py -x` JAL search finds no callers; this is **not** proof that there
 are no tail-call/indirect/data references. A write after setup is a candidate
@@ -144,7 +181,7 @@ The visual car object passed as a0 to `0021ABF8` has these observed fields:
 | +0x550 | Minimum permitted index from selected detail table |
 
 `0021C6E0` performs a single-object selection. `00218E68` begins with an
-equivalent loop over the car pointers at `003D1C90`, up to 20 objects. Both:
+equivalent loop over the car pointers at `003D1C90` (20 slots on retail). Both:
 
 1. Compute Euclidean camera distance with `0034FA98` from object+0x28.
 2. Multiply by the FOV compensation returned by `0034F620` and the count-related

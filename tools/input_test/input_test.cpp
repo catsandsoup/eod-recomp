@@ -444,6 +444,17 @@ void test_modern_triggers() {
     set_button(a, SDL_GAMEPAD_BUTTON_RIGHT_STICK, true);
     s = read_port(1);
     CHECK(s.buttons == PAD_L2 && s.pressure[10] == 255, "modern right stick click is L2 (weapon)");
+    set_button(a, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
+    set_button(a, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, true);
+    s = read_port(1);
+    CHECK(s.buttons == (PAD_L1 | PAD_R1 | PAD_L2) && s.pressure[10] == 255,
+          "pads without the graphics shortcut keep the weapon mapping during the chord");
+    HostPadState chord;
+    sdl_input::read_gamepad(sdl_input::port_gamepad(1), &chord, true, true);
+    CHECK(chord.buttons == (PAD_L1 | PAD_R1 | PAD_R3) && chord.pressure[10] == 0,
+          "graphics shortcut delivers R3 without firing the weapon");
+    set_button(a, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, false);
+    set_button(a, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, false);
     set_button(a, SDL_GAMEPAD_BUTTON_RIGHT_STICK, false);
     set_button(a, SDL_GAMEPAD_BUTTON_LEFT_STICK, true);
     s = read_port(1);

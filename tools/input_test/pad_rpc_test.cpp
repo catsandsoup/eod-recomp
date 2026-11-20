@@ -5,6 +5,7 @@
 #include "kernel/vblank_input.h"
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <utility>
 
 static uint8_t ram[4096], iop[4096];
@@ -14,10 +15,16 @@ bool g_log_enabled[LOG_CAT_COUNT] = {};
 void log_write(LogCat, const char *, ...) {}
 void *ee_ptr(uint32_t a) { if (a >= sizeof ram) std::abort(); return ram + a; }
 void ee_write8_slow(uint32_t, uint8_t) { std::abort(); }
-uint32_t iop_alloc(uint32_t) { return 128; }
-static RpcHandler handler;
-void iop_register_server(uint32_t, const char *, RpcHandler h) { handler = std::move(h); }
-static HostPadState pads[2];
+uint32_t iop_alloc(uint32_t size) {
+    static uint32_t next = 128;
+    uint32_t address = next;
+    next += size;
+    if (next > sizeof iop) std::abort();
+    return address;
+}
+static std::map<uint32_t, RpcHandler> handlers;
+void iop_register_server(uint32_t sid, const char *, RpcHandler h) { handlers[sid] = std::move(h); }
+static HostPadState pads[5];
 static bool pending_input, quit_input;
 static uint16_t pending_buttons;
 bool platform_pump() {
@@ -34,19 +41,46 @@ void platform_set_vibration(int p, uint8_t s, uint8_t l) { rumble_port = p; smal
 extern void iop_pad_vblank();
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
-static void call(uint32_t cmd, int port, int slot, const uint8_t *payload = nullptr, size_t n = 0) {
+static uint32_t call(uint32_t cmd, int port, int slot, const uint8_t *payload = nullptr, size_t n = 0) {
     uint8_t buf[128] = {};
     uint32_t words[] = {cmd, (uint32_t)port, (uint32_t)slot};
     memcpy(buf, words, sizeof words);
     if (payload) memcpy(buf + 12, payload, n);
-    CHECK(handler(RpcCall{}, buf) == 128);
-    uint32_t offset = cmd == 0x0A ? 0x10 : cmd == 0x0B ? 0x1C : 0x14;
-    if (cmd == 6 || cmd == 7 || cmd == 8 || cmd == 0x0A || cmd == 0x0B) {
-        uint32_t result; memcpy(&result, buf + offset, 4); CHECK(result == 1);
-    }
+    CHECK(handlers.at(0x80000100)(RpcCall{}, buf) == 128);
+    uint32_t offset = 0xC;
+    if (cmd == 6 || cmd == 7 || cmd == 8) offset = 0x14;
+    if (cmd == 0x0A) offset = 0x10;
+    if (cmd == 0x0B) offset = 0x1C;
+    uint32_t result;
+    memcpy(&result, buf + offset, 4);
+    if (cmd == 6 || cmd == 7 || cmd == 8 || cmd == 0x0A || cmd == 0x0B) CHECK(result == 1);
+    return result;
+}
+static uint32_t tap_call(uint32_t sid, uint32_t port, uint32_t result_offset) {
+    uint8_t buf[128] = {};
+    memcpy(buf, &port, 4);
+    CHECK(handlers.at(sid)(RpcCall{sid, 1, buf, sizeof buf, 0, sizeof buf, 0}, buf) == sizeof buf);
+    uint32_t result;
+    memcpy(&result, buf + result_offset, 4);
+    return result;
 }
 int main() {
+    setenv("EOD_PAD_SCRIPT_SLOT1", "0:4000", 1);
+    setenv("EOD_PAD_SCRIPT_SLOT2", "0:8000", 1);
+    setenv("EOD_PAD_SCRIPT_SLOT3", "0:1000", 1);
+    iop_misc_init();
     iop_pad_init();
+    CHECK(tap_call(0x80000905, 0, 0) == 0x302);
+    CHECK(tap_call(0x80000903, 0, 4) == 0);
+    CHECK(call(0x0D, 0, 0) == 1);
+    CHECK(tap_call(0x80000901, 0, 4) == 1);
+    CHECK(tap_call(0x80000903, 0, 4) == 1);
+    CHECK(call(0x0C, 0, 0) == 2);
+    CHECK(call(0x0D, 0, 0) == 4);
+    CHECK(call(0x0D, 1, 0) == 1);
+    CHECK(tap_call(0x80000901, 1, 4) == 1);
+    CHECK(tap_call(0x80000903, 1, 4) == 0);
+    CHECK(tap_call(0x80000901, 4, 4) == 0);
     uint32_t open[] = {0, 512};  // OPEN's EE padArea is at +0x10
     pads[1].connected = true;
     pads[1].buttons = PAD_R2 | PAD_CROSS;
@@ -70,8 +104,10 @@ int main() {
     call(8, 1, 0, align, 6);
     call(7, 1, 0, motors, 6);
     CHECK(rumble_port == 1 && small == 1 && large == 173);
-    call(7, 0, 1, motors, 6);  // absent multitap cannot vibrate a host pad
+    const int standalone_rumble_calls = rumble_calls;
+    call(7, 0, 1, motors, 6);  // a scripted slot has no physical motor
     CHECK(rumble_port == 1 && small == 1 && large == 173);
+    CHECK(rumble_calls == standalone_rumble_calls);
     // SLUS_209.10's 0x00390678 (SDK 2.8) produces DMA, unlike current
     // open-source PS2SDK's RPC implementation. At +0 sequence, +4 command=1,
     // +8 length=6, +12 actuator bytes; 0x0038F878 increments the sequence and
@@ -144,6 +180,21 @@ int main() {
     quit_input = true;
     CHECK(!vblank_poll_input());
     CHECK(memcmp(before_quit, ram + 1024, sizeof before_quit) == 0);
+    for (int slot = 0; slot < 4; ++slot) {
+        const int host = slot ? slot + 1 : 0;
+        pads[host].connected = true;
+        pads[host].lx = 40 * (slot + 1);
+        uint32_t slot_open[] = {0, (uint32_t)(2048 + 256 * slot)};
+        call(1, 0, slot, (uint8_t *)slot_open, sizeof slot_open);
+        const uint8_t *packet = ram + slot_open[1] + 128;
+        CHECK(packet[0x70] == 6 && packet[6] == pads[host].lx);
+    }
+    CHECK(tap_call(0x80000902, 0, 4) == 1);
+    CHECK(tap_call(0x80000903, 0, 4) == 0);
+    CHECK(call(0x0D, 0, 0) == 1);
+    iop_pad_vblank();
+    CHECK(ram[2048 + 0x70] == 6);
+    CHECK(ram[2304 + 0x70] == 0);
     printf("pad RPC/EE pressure and actuator checks: %d failures\n", failures);
     return failures ? 1 : 0;
 }

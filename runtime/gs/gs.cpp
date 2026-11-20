@@ -5,6 +5,7 @@
 #include "modern_scene.h"
 #include "../render/native_renderer.h"
 #include "gs.h"
+#include "gs_env.h"
 #include "gs_hw.h"
 
 #include <algorithm>
@@ -46,6 +47,7 @@
 
 namespace gs {
 extern bool g_trace;
+extern bool g_skip_frame;
 
 State st;
 Stats stats;
@@ -603,7 +605,7 @@ void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog) {
 }
 
 // ------------------------------------------------------------ GIF packets
-void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
+void packed_reg(uint32_t r, uint64_t lo, uint64_t hi, bool draw_vertices = true) {
     switch (r) {
     case 0x0:  // PRIM
         write_reg(0x00, lo & 0x7FF);
@@ -630,14 +632,14 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
     case 0x4: {  // XYZF2
         uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF;
         uint64_t z = (hi >> 4) & 0xFFFFFF, f = (hi >> 36) & 0xFF;
-        bool adc = (hi >> 47) & 1;
+        bool adc = !draw_vertices || ((hi >> 47) & 1);
         uint64_t v = x | (y << 16) | (z << 32) | (f << 56);
         write_reg(adc ? 0x0C : 0x04, v);
         break;
     }
     case 0x5: {  // XYZ2
         uint64_t x = lo & 0xFFFF, y = (lo >> 32) & 0xFFFF, z = hi & 0xFFFFFFFF;
-        bool adc = (hi >> 47) & 1;
+        bool adc = !draw_vertices || ((hi >> 47) & 1);
         write_reg(adc ? 0x0D : 0x05, x | (y << 16) | (z << 32));
         break;
     }
@@ -667,7 +669,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi) {
     }
 }
 
-void gif_process(int path, const uint8_t *data, uint32_t qwc) {
+void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
     if (scene_capture::g_on) scene_capture::gs_packet(path);
     if (scene_emit::g_on) scene_emit::gs_packet(path);
     if (modern::g_on) modern::gs_packet(path);
@@ -700,7 +702,7 @@ void gif_process(int path, const uint8_t *data, uint32_t qwc) {
         switch (ps.flg) {
         case 0: {  // PACKED
             uint32_t r = (uint32_t)((ps.tag_hi >> (ps.reg * 4)) & 0xF);
-            packed_reg(r, lo, hi);
+            packed_reg(r, lo, hi, draw_vertices);
             if (++ps.reg == ps.nreg) {
                 ps.reg = 0;
                 ps.nloop--;
@@ -729,6 +731,298 @@ void gif_process(int path, const uint8_t *data, uint32_t qwc) {
         }
         if (ps.nloop == 0 && ps.eop) ps.in_packet = false;
     }
+}
+
+// This typed command is tagged by 0x361098 before DMA. The original DIRECT
+// packet remains available for fallback and for portable reference captures.
+constexpr uint64_t kDepthClearTest = 0x32001;  // NEVER, ZB_ONLY, Z always
+constexpr uint64_t kClearStripTag = 0x2000000000008014ull;
+constexpr uint64_t kClearStripRegs = 0x55;
+
+bool matches_clear_packet(const native::SceneClear &clear, const uint8_t *packet, uint32_t qwc) {
+    if (scene_capture::g_on || scene_emit::g_on || qwc != native::kSceneClearDirectQwc) return false;
+    const uint64_t header[][2] = {
+        {0x3003400000000001ull, 0x1ee},
+        {clear.target == native::SceneClearTarget::Depth ? kDepthClearTest : 0x30000, 0x47},
+        {clear.zbuf, 0x4e},
+        {(clear.rgba & 0xffu) | ((uint64_t)((clear.rgba >> 8) & 0xffu) << 32),
+         ((clear.rgba >> 16) & 0xffu) | ((uint64_t)(clear.rgba >> 24) << 32)},
+        {kClearStripTag, kClearStripRegs},
+    };
+    if (memcmp(packet, header, sizeof header) != 0) return false;
+    for (int x = clear.left; x < clear.right; x += 32) {
+        const uint64_t strip[][2] = {
+            {(uint64_t)(x * 16) | ((uint64_t)(clear.top * 16) << 32), 0},
+            {(uint64_t)((x + 32) * 16) | ((uint64_t)(clear.bottom * 16) << 32), 0},
+        };
+        const size_t offset = sizeof header + (size_t)((x - clear.left) / 32) * sizeof strip;
+        if (memcmp(packet + offset, strip, sizeof strip) != 0) return false;
+    }
+    return true;
+}
+
+bool apply_scene_clear(const native::SceneClear &clear, const uint8_t *packet, uint32_t qwc) {
+    const auto &ctx = st.ctx[0];
+    const bool depth_only = clear.target == native::SceneClearTarget::Depth;
+    const bool bootstrap = clear.target == native::SceneClearTarget::Bootstrap;
+    if (!native::enabled() || !hw::g_on || (g_path[GIF_PATH2].in_packet && g_path[GIF_PATH2].nloop) ||
+        !(st.prmodecont & 1) || ctx.frame != 0x000a008c || clear.zbuf != 0x0a000118 ||
+        bits(ctx.scissor, 0, 11) != 0 || bits(ctx.scissor, 16, 11) != 639 ||
+        bits(ctx.scissor, 32, 11) != 0 || (!bootstrap && bits(ctx.scissor, 48, 11) < 447) ||
+        (!depth_only && ctx.fba && !(clear.rgba & 0x80000000)))
+        return false;
+    const int ofx = bits(ctx.xyoffset, 0, 16), ofy = bits(ctx.xyoffset, 32, 16);
+    const auto pixel = [](int coord, int offset) { return (coord * 16 - offset + 15) >> 4; };
+    if (pixel(clear.left, ofx) != 0 || pixel(clear.top, ofy) != 0 ||
+        pixel(clear.right, ofx) != 640 || pixel(clear.bottom, ofy) != (bootstrap ? 419 : 448))
+        return false;
+    if ((depth_only || bootstrap) &&
+        (ctx.xyoffset != 0x71ff00006bffull || st.scanmsk || !matches_clear_packet(clear, packet, qwc)))
+        return false;
+    // The black color/depth initialization extends one pixel past the
+    // 418-row scissor. Its typed clear covers only the visible rectangle.
+    if (bootstrap && (ctx.scissor != 0x01a10000027f0000ull || clear.rgba != 0xff000000 ||
+                      (modern::g_on && modern::live())))
+        return false;
+
+    // Publish the register effects of the original PRE and packed A+D/RGBA.
+    // The draw-state refresh must precede the GPU clear for frame-skip logic.
+    write_reg(0x00, 6);
+    write_reg(0x47, depth_only ? kDepthClearTest : 0x30000);
+    write_reg(0x4e, clear.zbuf);
+    packed_reg(1, (clear.rgba & 0xffu) | ((uint64_t)((clear.rgba >> 8) & 0xffu) << 32),
+               ((clear.rgba >> 16) & 0xffu) | ((uint64_t)(clear.rgba >> 24) << 32));
+    const Env &env = current_env();
+    if (!native::gs_clear_scene(env, clear)) return false;
+    const int rows = bootstrap ? 418 : 448;
+    if (!depth_only) vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, rows);
+    vram_mark(env.zbp, env.fbw, env.zpsm, 0, 0, 640, rows);
+    if (bootstrap) {
+        gif_process(GIF_PATH2, packet, qwc, false);
+        fprintf(stderr, "[native] bootstrap color/depth initialization: 20 strips replaced\n");
+        return true;
+    }
+    auto &path = g_path[GIF_PATH2];
+    path = PathState{};
+    if (depth_only) {
+        // Preserve the last assembled strip and the EOP state for portable
+        // snapshots without kicking a raster primitive.
+        vertex_kick(false, (uint64_t)((clear.right - 32) * 16) | ((uint64_t)(clear.top * 16) << 16), false, 0);
+        vertex_kick(false, (uint64_t)(clear.right * 16) | ((uint64_t)(clear.bottom * 16) << 16), false, 0);
+        path.tag_lo = kClearStripTag;
+        path.tag_hi = kClearStripRegs;
+        path.nreg = 2;
+        path.eop = true;
+    }
+    return true;
+}
+
+bool matches_bootstrap_history(const native::DisplayCopy &copy, const uint8_t *packet, uint32_t qwc) {
+    if (qwc != native::kDisplayCopyDirectQwc ||
+        scene_capture::g_on || scene_emit::g_on || (modern::g_on && modern::live()))
+        return false;
+    const uint64_t header[][2] = {
+        {0x6000000000000001ull, 0xeeeeee},
+        {0x000a0000, 0x4c},
+        {0x10a000118, 0x4e},
+        {0x30000, 0x47},
+        {(uint64_t)copy.fix << 32 | 0x64, 0x42},
+        {0, 0x14},
+        {0x2000000e68028000ull | copy.source, 0x06},
+        {0x40ab400000008014ull, 0x5353},
+    };
+    if (memcmp(packet, header, sizeof header) != 0) return false;
+    // At zero XYOFFSET the entire packet starts at y = 1823, outside
+    // the retail bootstrap scissor. Allow a full pixel of margin.
+    for (uint64_t i = 0; i < 20; ++i) {
+        const uint64_t u = i * 0x200;
+        const uint64_t strip[][2] = {
+            {u, 0},
+            {0x000071f000006bf0ull + u, 0},
+            {0x00001c0000000200ull + u, 0},
+            {0x00008df000006df0ull + u, 0},
+        };
+        if (memcmp(packet + sizeof header + i * sizeof strip, strip, sizeof strip) != 0) return false;
+    }
+    return true;
+}
+
+bool apply_bootstrap_quad(const uint8_t *packet, uint32_t qwc) {
+    const auto &ctx = st.ctx[0];
+    const auto &path = g_path[GIF_PATH2];
+    if (qwc != native::kBootstrapQuadDirectQwc || !hw::g_on || !native::enabled() ||
+        scene_capture::g_on || scene_emit::g_on || (modern::g_on && modern::live()) ||
+        (path.in_packet && path.nloop) || !(st.prmodecont & 1) || st.scanmsk || st.pabe || ctx.fba ||
+        ctx.frame != 0x000a0000 || ctx.test != 0x30000 || ctx.zbuf != 0x10a000118 ||
+        ctx.clamp != 5 || ctx.scissor != 0x01bf0000027f0000ull || ctx.xyoffset != 0x71ff00006bffull)
+        return false;
+    // Fixed register writes and UVs from 0x35BE08. Only the four rotating
+    // XY pairs vary. Reject ADC, Z and any reserved fields.
+    constexpr uint64_t header[][2] = {
+        {0x4000000000000001ull, 0xeeee},
+        {0x8000000044ull, 0x42},
+        {0x60, 0x14},
+        {0x200000066802a300ull, 0x06},
+        {0x40808080, 0x01},
+        {0x80aa400000008001ull, 0x53535353},
+    };
+    if (memcmp(packet, header, sizeof header) != 0) return false;
+    native::Vertex vertices[4]{};
+    for (unsigned i = 0; i < 4; ++i) {
+        uint64_t pair[4];
+        memcpy(pair, packet + sizeof header + i * sizeof pair, sizeof pair);
+        const unsigned u = (i & 1) ? 496 : 16, v = (i & 2) ? 496 : 16;
+        if (pair[0] != (uint64_t(u) | (uint64_t(v) << 32)) || pair[1] != 0 ||
+            (pair[2] & ~0x0000ffff0000ffffull) || pair[3] != 0)
+            return false;
+        vertices[i].p[0] = (int32_t(bits(pair[2], 0, 16)) - 0x6bff) / 16.0f;
+        vertices[i].p[1] = (int32_t(bits(pair[2], 32, 16)) - 0x71ff) / 16.0f;
+        vertices[i].uv[0] = u / 16.0f;
+        vertices[i].uv[1] = v / 16.0f;
+    }
+
+    // Decode the draw environment without advancing PATH2. These fixed
+    // register writes are repeated verbatim by the original packet on fallback.
+    write_reg(0x42, header[1][0]);
+    write_reg(0x14, header[2][0]);
+    write_reg(0x06, header[3][0]);
+    write_reg(0x00, 0x154);
+    const auto &env = current_env();
+    if (!g_skip_frame && !native::gs_draw_bootstrap_quad(env, vertices)) return false;
+    gif_process(GIF_PATH2, packet, qwc, false);
+    if (g_skip_frame) return true;
+    vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, 448);
+    static unsigned quads;
+    ++quads;
+    if (quads == 1 || quads % 8 == 0)
+        fprintf(stderr, "[native] bootstrap alpha quads: %u (two triangles each)\n", quads);
+    return true;
+}
+
+bool apply_display_copy(const native::DisplayCopy &copy, const uint8_t *packet, uint32_t qwc) {
+#ifdef EOD_PLUME
+    if (!hw::g_on) return false;
+#ifdef EOD_HW_SELECT
+    if (!hw::vulkan_active()) return false;
+#endif
+    const auto &ctx = st.ctx[0];
+    const auto &path = g_path[GIF_PATH2];
+    if (native::bootstrap_raster_enabled() && copy.source == 0x1180 && copy.fix == 0x80 &&
+        !(path.in_packet && path.nloop) && (st.prmodecont & 1) && ctx.xyoffset == 0 &&
+        bits(ctx.scissor, 48, 11) < 1822 && matches_bootstrap_history(copy, packet, qwc)) {
+        hw::native_display_copy_fallback();
+        // Keep the packet state, assembled vertices and ordinary flip/skip accounting.
+        gif_process(GIF_PATH2, packet, qwc, false);
+        current_env();
+        static unsigned packets;
+        ++packets;
+        fprintf(stderr, "[native] bootstrap display history: %u clipped packets (20 strips each)\n", packets);
+        return true;
+    }
+    if (!native::prepare()) return false;
+    if (copy.source != 0x1180 || copy.fix > 255 || (path.in_packet && path.nloop) ||
+        !(st.prmodecont & 1) || st.scanmsk || !(st.pmode & 3) ||
+        bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 20) != 0x1400 ||
+        bits(ctx.xyoffset, 0, 16) != 0x6bff || bits(ctx.xyoffset, 32, 16) != 0x71ff ||
+        bits(ctx.scissor, 0, 11) != 0 || bits(ctx.scissor, 16, 11) != 639 ||
+        bits(ctx.scissor, 32, 11) != 0 || bits(ctx.scissor, 48, 11) < 447) {
+        hw::native_display_copy_fallback();
+        return false;
+    }
+
+    // Preserve the register updates around the first sprite. current_env()
+    // sees the FBP0 transition and performs the ordinary flip/skip accounting.
+    write_reg(0x4c, 0x000a0000);
+    write_reg(0x4e, 0x10a000118);
+    write_reg(0x47, 0x30000);
+    write_reg(0x42, ((uint64_t)copy.fix << 32) | 0x64);
+    write_reg(0x14, 0);
+    write_reg(0x06, 0x2000000e68028000ull | copy.source);
+    write_reg(0x00, 0x156);
+    const Env &env = current_env();
+    if (!hw::native_display_copy(env)) {
+        hw::native_display_copy_fallback();
+        return false;
+    }
+    write_reg(0x03, 0x1c002800);  // final UV of the last sprite
+    g_path[GIF_PATH2] = PathState{};
+    if (!g_skip_frame) {
+        vram_mark(env.fbp, env.fbw, env.fpsm_mem, 0, 0, 640, 448);
+        static unsigned copies;
+        if (++copies == 1 || copies % 120 == 0)
+            fprintf(stderr, "[native] EE display copies %u (20 strips each), caller %08x, FIX %02x\n",
+                    copies, copy.caller, copy.fix);
+    }
+    return true;
+#else
+    (void)copy;
+    (void)packet;
+    (void)qwc;
+    return false;
+#endif
+}
+
+bool apply_shadow_pass(native::ShadowPass pass, const uint8_t *packet, uint32_t qwc) {
+    if (pass == native::ShadowPass::None || !hw::g_on) return false;
+    const auto &path = g_path[GIF_PATH2];
+    const auto &ctx = st.ctx[0];
+    const bool prepare = pass == native::ShadowPass::Prepare;
+    const auto word = [&](uint32_t index, uint32_t half = 0) {
+        uint64_t value;
+        memcpy(&value, packet + index * 16 + half * 8, sizeof value);
+        return value;
+    };
+    const auto matches = [&](uint32_t index, uint64_t lo, uint64_t hi) {
+        return word(index) == lo && word(index, 1) == hi;
+    };
+    if ((path.in_packet && path.nloop) || !(st.prmodecont & 1) ||
+        ctx.xyoffset != 0x71ff00006bffull)
+        return false;
+    if (prepare) {
+        if (qwc != native::kShadowPrepareDirectQwc ||
+            !matches(0, 0x4000000000000001ull, 0x1eee) ||
+            !matches(1, 0x3205015f, 0x4c) ||
+            !matches(5, 0x200340000000000aull, 0x55) ||
+            !matches(31, 0x2000000e6ba2a300ull, 6) ||
+            !matches(32, 0x40ab40000000000aull, 0x5e5e) ||
+            !matches(73, 0x3000000000008001ull, 0xeeee))
+            return false;
+    } else {
+        if (qwc != native::kShadowCompositeDirectQwc || ctx.frame != 0x000a008c ||
+            !matches(0, 0x7000000000000001ull, 0x1eeeeee) ||
+            !matches(2, 0x10a000118, 0x4e) || !matches(3, 0x44, 0x42) ||
+            !matches(6, 0x20000006642173e0ull, 6) ||
+            !matches(8, 0x40ab400000008014ull, 0x5e5e))
+            return false;
+    }
+    if (!native::gs_shadow_boundary()) return false;
+    // Preserve the producer's packed A+D, RGBA and final PRE/UV state.
+    // Plume samples scene depth and composites its private accumulation
+    // surface, so the strips need no emulated local-memory writes.
+    const auto ad = [&](uint32_t first, uint32_t end) {
+        for (uint32_t i = first; i < end; i++)
+            packed_reg(0xe, word(i), word(i, 1));
+    };
+    if (prepare) {
+        ad(1, 4);
+        packed_reg(1, word(4), word(4, 1));
+        ad(27, 32);
+        write_reg(0x00, 0x156);
+        write_reg(0x03, word(71));
+        ad(74, 77);
+    } else {
+        ad(1, 7);
+        packed_reg(1, word(7), word(7, 1));
+        write_reg(0x00, 0x156);
+        write_reg(0x03, word(87));
+    }
+    g_path[GIF_PATH2] = PathState{};
+    static uint32_t preparations = 0, composites = 0;
+    auto &count = prepare ? preparations : composites;
+    if (++count == 1 || count % 120 == 0)
+        fprintf(stderr, "[native] EE shadow %s %u (20 strips each)\n",
+                prepare ? "preparations" : "composites", count);
+    return true;
 }
 
 // --------------------------------------------------------------- display
@@ -894,11 +1188,20 @@ namespace { void editor_preview_capture(uint64_t frame, bool offscreen, bool sof
 namespace {
 
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN, CMD_NATIVE };
+constexpr uint32_t kGifSceneClear = 1;  // CMD_GIF's live-only aux field
+constexpr uint32_t kGifDisplayCopy = 2;
+constexpr uint32_t kGifShadowPrepare = 3;
+constexpr uint32_t kGifShadowComposite = 4;
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
 std::thread g_gs_worker;
 bool g_shutdown_complete;
+native::SceneClear g_ordered_scene_clear;
+bool g_have_ordered_scene_clear;
+native::DisplayCopy g_ordered_display_copy;
+bool g_have_ordered_display_copy;
+bool g_have_ordered_bootstrap_quad;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
 // Keep the Mac input-to-display queue short. This is a pacing/backpressure
@@ -1066,6 +1369,7 @@ void gs_sync() {
 // EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count] records the GS
 // state and VRAM after that vblank, then the commands of the next `count`
 // vblanks; `eod --gs-replay file` replays them alone (renderer benchmarks).
+// EOD_GS_DUMP_LIVE=1 also captures the live scanout at the terminal GS vblank.
 // EOD_GS_DUMP_COLD_START=N instead records before the first queued command
 // through vblank N (1..6600), capped at 256 MiB, for packet-backend experiments.
 namespace {
@@ -1073,8 +1377,34 @@ FILE *g_dump;
 uint64_t g_dump_end;
 uint64_t g_cold_dump_bytes;
 bool g_cold_dump;
+std::string g_dump_pair_base;
 std::unique_ptr<capture::Writer> g_cold_zip;
 const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
+
+// This diagnostic samples depth before 0x35BBD0 copies the scene into the
+// fixed color-only display target. Later GS commands can clear or reuse
+// scene depth while the same color image remains on screen.
+bool g_replay_depth_capture;
+std::vector<uint32_t> g_replay_display_depth;
+constexpr int kReplayCopyWidth = 640, kReplayCopyHeight = 448;
+
+void replay_capture_display_depth(const uint8_t *data, uint32_t bytes) {
+    if (bytes != native::kDisplayCopyDirectQwc * 16) return;
+    uint64_t header[8][2];
+    memcpy(header, data, sizeof header);
+    if (header[0][0] != 0x6000000000000001ull || header[0][1] != 0xeeeeee ||
+        header[1][0] != 0xa0000 || header[1][1] != 0x4c ||
+        header[2][0] != 0x10a000118ull || header[2][1] != 0x4e ||
+        (header[4][0] & 0xffffffff) != 0x64 || !bits(header[4][0], 32, 8) || header[4][1] != 0x42 ||
+        header[6][0] != 0x2000000e68029180ull || header[6][1] != 6 ||
+        header[7][0] != 0x40ab400000008014ull || header[7][1] != 0x5353)
+        return;
+    raster_sync();
+    g_replay_display_depth.resize(kReplayCopyWidth * kReplayCopyHeight);
+    for (int y = 0; y < kReplayCopyHeight; y++)
+        for (int x = 0; x < kReplayCopyWidth; x++)
+            g_replay_display_depth[(size_t)y * kReplayCopyWidth + x] = read_pixel(PSMZ16S, x, y, 0x2300, 10);
+}
 
 void dump_state(FILE *f, capture::Writer *zip = nullptr) {
     clut_resolve();  // st.clut is serialized
@@ -1196,7 +1526,31 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     (unsigned long long)g_gs_vblanks.load(), (unsigned long long)g_flips.load(),
                     (unsigned long long)st.pmode, (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
             break;
-        case CMD_GIF: { EOD_ZONE("gs.gif_process"); gif_process((int)h[1], d, h[3] / 16); } break;
+        case CMD_GIF: {
+            EOD_ZONE("gs.gif_process");
+            if (!live && g_replay_depth_capture && h[1] == GIF_PATH2)
+                replay_capture_display_depth(d, h[3]);
+            if (live && h[1] == GIF_PATH2) {
+                if (g_have_ordered_bootstrap_quad) {
+                    g_have_ordered_bootstrap_quad = false;
+                    if (h[2] == 0 && apply_bootstrap_quad(d, h[3] / 16)) break;
+                }
+                if (g_have_ordered_scene_clear) {
+                    g_have_ordered_scene_clear = false;
+                    const uint32_t tag = g_ordered_scene_clear.target == native::SceneClearTarget::ColorAndDepth ? kGifSceneClear : 0;
+                    if (h[2] == tag && h[3] == native::kSceneClearDirectQwc * 16 &&
+                        apply_scene_clear(g_ordered_scene_clear, d, h[3] / 16)) break;
+                }
+                if (h[2] == kGifDisplayCopy && h[3] == native::kDisplayCopyDirectQwc * 16 && g_have_ordered_display_copy) {
+                    g_have_ordered_display_copy = false;
+                    if (apply_display_copy(g_ordered_display_copy, d, h[3] / 16)) break;
+                }
+                if (h[2] == kGifShadowPrepare && apply_shadow_pass(native::ShadowPass::Prepare, d, h[3] / 16)) break;
+                if (h[2] == kGifShadowComposite && apply_shadow_pass(native::ShadowPass::Composite, d, h[3] / 16)) break;
+            }
+            gif_process((int)h[1], d, h[3] / 16);
+            break;
+        }
         case CMD_MODERN:  // live only (never in dumps): a[1] 0 = batch marker (a[2]), 1 = frame pointer,
                           // 2 = batch state capture (a[2])
             if (!live) break;
@@ -1211,7 +1565,19 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
             }
             break;
         case CMD_NATIVE:  // live only (never in dumps): h[1] kind, payload in d
-            if (live) native::gs_command(h[1], d, h[3]);
+            if (live) {
+                if (h[1] == native::CMD_SCENE_CLEAR && h[3] == sizeof g_ordered_scene_clear) {
+                    memcpy(&g_ordered_scene_clear, d, sizeof g_ordered_scene_clear);
+                    g_have_ordered_scene_clear = true;
+                } else if (h[1] == native::CMD_DISPLAY_COPY && h[3] == sizeof g_ordered_display_copy) {
+                    memcpy(&g_ordered_display_copy, d, sizeof g_ordered_display_copy);
+                    g_have_ordered_display_copy = true;
+                } else if (h[1] == native::CMD_BOOTSTRAP_QUAD && h[3] == 0) {
+                    g_have_ordered_bootstrap_quad = true;
+                } else {
+                    native::gs_command(h[1], d, h[3]);
+                }
+            }
             break;
         case CMD_PRIV: {
             uint64_t v;
@@ -1242,8 +1608,20 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     return v;
                 }();
                 if (g_dump && h[1] >= g_dump_end) {
-                    fclose(g_dump);
+                    const bool dump_ok = fclose(g_dump) == 0;
                     g_dump = nullptr;
+                    if (!g_dump_pair_base.empty()) {
+                        const std::string image = g_dump_pair_base + ".live.png";
+                        const std::string marker = g_dump_pair_base + ".live.vblank";
+                        if (dump_ok && h[1] == g_dump_end && gs_screenshot(image.c_str())) {
+                            if (FILE *f = fopen(marker.c_str(), "wb")) {
+                                const int written = fprintf(f, "%u\n", h[1]);
+                                const int closed = fclose(f);
+                                if (written < 0 || closed != 0) std::remove(marker.c_str());
+                            }
+                        }
+                        g_dump_pair_base.clear();
+                    }
                     fprintf(stderr, "GS dump written\n");
                 }
                 if (dump && !g_dump && std::find(at_list.begin(), at_list.end(), h[1]) != at_list.end()) {
@@ -1254,10 +1632,14 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                         fprintf(stderr, "gzip capture requires EOD_GS_DUMP_COLD_START; snapshot capture not opened\n");
                         break;
                     }
+                    static const char *pair = getenv("EOD_GS_DUMP_LIVE");
+                    const bool want_pair = pair && strcmp(pair, "1") == 0;
+                    if (want_pair) std::remove((name + ".live.vblank").c_str());
                     g_dump = fopen(name.c_str(), "wb");
                     if (g_dump) {
                         g_cold_dump = false;
                         dump_state(g_dump);
+                        if (want_pair) g_dump_pair_base = name;
                     }
                     g_dump_end = h[1] + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
                 }
@@ -1323,8 +1705,11 @@ int gs_replay(const char *path, int repeat) {
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
     if (hw::g_on) n = 0;
     raster_start(n);
+    const char *zpath = getenv("EOD_GS_REPLAY_ZSHOT");
+    g_replay_depth_capture = zpath && !hw::g_on;
     double best = 1e30;
     for (int r = 0; r < repeat; r++) {
+        g_replay_display_depth.clear();
         if (streaming) {
             if (!input.rewind() || !load_state(input)) return 1;
         } else {
@@ -1462,9 +1847,8 @@ int gs_replay(const char *path, int repeat) {
     fprintf(stderr, "  sprites/lines: %u pixels\n", (stats.pixels - tri) / repeat);
     std::string shot = std::string(path) + ".ppm";
     gs_screenshot(shot.c_str());
-    // EOD_GS_REPLAY_ZSHOT=file: the final depth under the displayed picture (P3 sky mask,
-    // tools/p3_compare.py): "Z32" w h, then w*h little-endian words, same mapping as read_circuit.
-    if (const char *zpath = getenv("EOD_GS_REPLAY_ZSHOT")) {
+    // EOD_GS_REPLAY_ZSHOT=file: "Z32" w h, then w*h little-endian words.
+    if (zpath) {
         const int n = (st.pmode & 1) ? 0 : 1;
         const uint64_t fb = st.dispfb[n], disp = st.display[n];
         const uint32_t fbp = bits(fb, 0, 9), fbw = bits(fb, 9, 6);
@@ -1477,16 +1861,25 @@ int gs_replay(const char *path, int repeat) {
             if (bits(st.ctx[k].frame, 0, 9) == fbp) { c = k; break; }
         const uint64_t zb = st.ctx[c].zbuf;
         const uint32_t zbp = bits(zb, 0, 9) * 32, zpsm = bits(zb, 24, 4) | 0x30;
-        if (FILE *zf = fopen(zpath, "wb"); zf && w > 0 && h > 0 && w <= 2048 && h <= 2048) {
-            fprintf(zf, "Z32 %d %d\n", w, h);
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++) {
-                    const int sy = fieldy ? y / 2 : y;
-                    const uint32_t z = read_pixel(zpsm, (dbx + x) & 2047, (dby + sy) & 2047, zbp, fbw);
-                    fwrite(&z, 4, 1, zf);
+        if (w > 0 && h > 0 && w <= 2048 && h <= 2048) {
+            if (FILE *zf = fopen(zpath, "wb")) {
+                fprintf(zf, "Z32 %d %d\n", w, h);
+                if (!g_replay_display_depth.empty() && fbp == 0 && fbw == 10 && !dbx && !dby && !fieldy &&
+                    w == kReplayCopyWidth && h == kReplayCopyHeight) {
+                    fwrite(g_replay_display_depth.data(), sizeof(uint32_t), g_replay_display_depth.size(), zf);
+                } else {
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++) {
+                            const int sy = fieldy ? y / 2 : y;
+                            const uint32_t z = read_pixel(zpsm, (dbx + x) & 2047, (dby + sy) & 2047, zbp, fbw);
+                            fwrite(&z, 4, 1, zf);
+                        }
                 }
-            fclose(zf);
+                fclose(zf);
+            }
         }
+        g_replay_depth_capture = false;
+        g_replay_display_depth.clear();
     }
     return 0;
 }
@@ -1587,15 +1980,34 @@ void gs_init() {
     gs_thread_start();
 }
 
-void gif_transfer(int path, const uint8_t *data, uint32_t qwc) {
+void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::SceneClear *clear,
+                  const native::DisplayCopy *copy, native::ShadowPass shadow, bool bootstrap_quad) {
     ProfScope prof(P_EE_GIF);
     if (scene_capture::g_on) scene_capture::gif(path, data, qwc);
     if (scene_emit::g_on) scene_emit::gif(path, data, qwc);
     if (!g_threaded) {
-        gif_process(path, data, qwc);
+        if ((!clear || !apply_scene_clear(*clear, data, qwc)) && (!copy || !apply_display_copy(*copy, data, qwc)) &&
+            !apply_shadow_pass(shadow, data, qwc) && (!bootstrap_quad || !apply_bootstrap_quad(data, qwc)))
+            gif_process(path, data, qwc);
         return;
     }
-    push_cmd(CMD_GIF, (uint32_t)path, 0, data, qwc * 16);
+    uint32_t tag = 0;
+    if (clear) {
+        native::post(native::CMD_SCENE_CLEAR, clear, sizeof *clear);
+        // Depth clear metadata is adjacent and live-only. Leave its original
+        // GIF header and payload byte-for-byte portable in GS captures.
+        if (clear->target == native::SceneClearTarget::ColorAndDepth) tag = kGifSceneClear;
+    } else if (copy) {
+        native::post(native::CMD_DISPLAY_COPY, copy, sizeof *copy);
+        tag = kGifDisplayCopy;
+    } else if (bootstrap_quad) {
+        native::post(native::CMD_BOOTSTRAP_QUAD, nullptr, 0);
+    } else if (shadow == native::ShadowPass::Prepare) {
+        tag = kGifShadowPrepare;
+    } else if (shadow == native::ShadowPass::Composite) {
+        tag = kGifShadowComposite;
+    }
+    push_cmd(CMD_GIF, (uint32_t)path, tag, data, qwc * 16);
 }
 
 namespace {

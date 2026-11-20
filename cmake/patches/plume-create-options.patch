@@ -54,7 +54,14 @@
  
          res = vmaCreateAllocator(&allocatorInfo, &allocator);
          if (res != VK_SUCCESS) {
-@@ -4504,11 +4510,11 @@
+@@ -4498,17 +4504,17 @@
+     VulkanInterface::VulkanInterface() {
+ #endif
+-        VkResult res = volkInitialize();
++        VkResult res = vkGetInstanceProcAddr ? VK_SUCCESS : volkInitialize();
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+             return;
          }
  
          appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -68,3 +75,48 @@
  
          VkInstanceCreateInfo createInfo = {};
          createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+--- a/plume_apple.h
++++ b/plume_apple.h
+@@ -13,6 +13,7 @@
+
+ namespace plume {
+     RenderDeviceVendor getRenderDeviceVendor(uint64_t registryID);
++    bool getMetalDrawableSize(void* layer, uint32_t &width, uint32_t &height);
+
+     struct CocoaWindowAttributes {
+         int x, y;
+--- a/plume_apple.mm
++++ b/plume_apple.mm
+@@ -10,6 +10,7 @@
+ #import <AppKit/AppKit.h>
+ #import <Foundation/Foundation.h>
+ #import <IOKit/IOKitLib.h>
++#import <QuartzCore/CAMetalLayer.h>
+
+ static uint32_t plumeGetEntryProperty(io_registry_entry_t entry, CFStringRef propertyName) {
+     uint32_t value = 0;
+@@ -29,6 +30,14 @@
+ }
+
+ namespace plume {
++    bool getMetalDrawableSize(void* handle, uint32_t &width, uint32_t &height) {
++        const CGSize size = [(__bridge CAMetalLayer*)handle drawableSize];
++        if (size.width < 1 || size.height < 1) return false;
++        width = uint32_t(size.width);
++        height = uint32_t(size.height);
++        return true;
++    }
++
+     RenderDeviceVendor getRenderDeviceVendor(uint64_t registryID) {
+         io_service_t entry = IOServiceGetMatchingService(MACH_PORT_NULL, IORegistryEntryIDMatching(registryID));
+
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -2483,6 +2483,7 @@
+         dstWidth = attributes.width;
+         dstHeight = attributes.height;
+ #   elif defined(__APPLE__)
++        if (getMetalDrawableSize(desc.renderWindow.view, dstWidth, dstHeight)) return;
+         CocoaWindowAttributes attributes;
+         windowWrapper->getWindowAttributes(&attributes);
+         dstWidth = attributes.width;

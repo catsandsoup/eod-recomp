@@ -1,9 +1,13 @@
 // config.h - user settings (eod.ini next to the executable), shared by the
 // game and the setup program (eodsetup).
 #pragma once
+#include <atomic>
 #include <string>
 #include <utility>
 #include <vector>
+
+inline constexpr int kLegacyMaxRenderScale = 6;
+inline constexpr int kMaxRenderScale = 8;
 
 enum PadKey {
     KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
@@ -11,6 +15,27 @@ enum PadKey {
     KEY_L1, KEY_R1, KEY_L2, KEY_R2, KEY_L3, KEY_R3,
     KEY_START, KEY_SELECT,
     KEY_COUNT
+};
+
+// A saved preference read by the render threads and changed by live controls.
+class ModernRendererPreference {
+public:
+    ModernRendererPreference() = default;
+    ModernRendererPreference(const ModernRendererPreference &other) : value_(bool(other)) {}
+    ModernRendererPreference &operator=(const ModernRendererPreference &other) { return *this = bool(other); }
+    ModernRendererPreference &operator=(bool enabled) {
+        value_.store(enabled, std::memory_order_relaxed);
+        return *this;
+    }
+    operator bool() const { return value_.load(std::memory_order_relaxed); }
+    bool toggle() {
+        bool enabled = *this;
+        while (!value_.compare_exchange_weak(enabled, !enabled, std::memory_order_relaxed)) {}
+        return !enabled;
+    }
+
+private:
+    std::atomic<bool> value_{false};
 };
 
 struct Config {
@@ -39,7 +64,7 @@ struct Config {
     bool show_fps = false;           // frame rate in a corner (d3d11 renderer)
     // the modern renderer (Windows, d3d11): switched live in the Graphics panel, F9 or L1+R1+R3;
     // its effects in percent of the default look (docs/SCENE_CAPTURE.md "Modern renderer")
-    bool modern_renderer = false;
+    ModernRendererPreference modern_renderer;
     // the native renderer (docs/NATIVE_RENDERER.md, R1): queued 3D objects drawn by plume
     bool native_renderer = false;
     // split-screen views run the single-view track passes, mlist and water (P8; docs/NATIVE_RENDERER.md R2)

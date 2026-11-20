@@ -10,11 +10,17 @@ Explore the world of **Test Drive: Eve of Destruction**, customise supported gam
 
 ## Requirements
 
-Apple Silicon Mac running **macOS 27 or later**, Apple's Command Line Tools, and your own extracted North American PS2 game disc. Game assets are not included.
+An Apple Silicon Mac and your own extracted North American PS2 game disc. The download includes the asset-processing runtime. You can open the app directly from Finder without installing Python or developer tools.
+
+<!-- macOS minimum -->
 
 ## Get started
 
-Extract the ZIP, move the app to Applications, and choose your extracted game folder with **Game Folder**. Open or create a project, edit a supported asset, then use **Save & Build** and **Run Mod in Game**.
+Extract the ZIP, move **EOD Creation Kit Development.app** to Applications, and open it from Finder. Choose your extracted game folder with **Game Folder**. Open or create a project, edit a supported asset, then use **Save & Build** and **Run Mod in Game**.
+
+## Building the preview
+
+Build with Xcode and an Apple Silicon-capable Python.org Python 3.10 or newer. On the build Mac, run `python3 tools/package_creation_kit_release.py --game-executable /path/to/eod --output /path/to/new-release-folder`. The packager uses the current Python.org framework in `/Library/Frameworks/Python.framework/Versions/Current`. Use `--python-framework` to select a different installed framework version. It produces a locally signed app and ZIP with the included game runtime and its libraries. Supply the extracted game data at first launch.
 
 ## Preview limitations
 

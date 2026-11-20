@@ -69,13 +69,14 @@ void begin_view() {
     g_building.views.push_back(v);
 }
 
-void object(uint32_t record, int32_t texture_key, int32_t layer) {
+void object(uint32_t batch, uint32_t clip, uint32_t matrix_packet, uint32_t material_packet,
+            int32_t texture_key, int32_t layer) {
     if (!g_on) return;
     Object o{};
-    o.batch = MEM_LW(record + 0x00);
-    o.clip = MEM_LW(record + 0x08);
-    o.matrix_packet = MEM_LW(record + 0x0C);
-    o.material_packet = MEM_LW(record + 0x10);
+    o.batch = batch;
+    o.clip = clip;
+    o.matrix_packet = matrix_packet;
+    o.material_packet = material_packet;
     o.texture_key = texture_key;
     o.layer = layer;
     uint32_t packet = o.matrix_packet;

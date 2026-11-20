@@ -29,6 +29,45 @@ static int find(Menu &m, const std::string &id) {
 }
 
 int main() {
+    {
+        Config graphics;
+        graphics.modern_renderer = true;
+        graphics.modern_shadows = 40;
+        Menu menu(graphics);
+        menu.open();
+        CHECK(find(menu, "plume_look") < 0 && find(menu, "modern") < 0);
+        HostInfo host;
+        host.plume_look = PlumeLook::Classic;
+        menu.set_host(host);
+        const int look = find(menu, "plume_look");
+        CHECK(look >= 0 && menu.rows()[look].value == "CLASSIC");
+        CHECK(find(menu, "modern") < 0 && find(menu, "m_shadows") < 0);
+        if (look >= 0) {
+            menu.select(look);
+            Input change; change.dx = -1;
+            Effects fx = menu.update(change);
+            CHECK(fx.toggle_plume_look && !fx.save && !menu.dirty() && graphics.modern_renderer);
+            host.plume_look = PlumeLook::Modern;  // fresh renderer reading, including changes made outside the menu
+            menu.set_host(host);
+            CHECK(menu.selected() == look && menu.rows()[look].value == "MODERN");
+            change = none(); change.accept = true;
+            CHECK(menu.update(change).toggle_plume_look);
+            change = none(); change.reset = true;
+            CHECK(!menu.update(change).toggle_plume_look && graphics.modern_shadows == 40);
+        }
+        host.plume_look = PlumeLook::Unavailable;
+        host.legacy_modern_available = true;
+        menu.set_host(host);
+        const int legacy = find(menu, "modern"), shadows = find(menu, "m_shadows");
+        CHECK(find(menu, "plume_look") < 0 && legacy >= 0 && shadows >= 0);
+        if (legacy >= 0 && shadows >= 0) {
+            CHECK(menu.rows()[legacy].value == "MODERN" && menu.rows()[shadows].enabled);
+            menu.select(legacy);
+            Input change; change.accept = true;
+            CHECK(!menu.update(change).toggle_plume_look && !graphics.modern_renderer);
+            CHECK(menu.rows()[legacy].value == "ORIGINAL" && !menu.rows()[shadows].enabled);
+        }
+    }
     Config cfg;
     Menu m(cfg);
     m.open();

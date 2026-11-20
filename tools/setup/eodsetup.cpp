@@ -661,6 +661,8 @@ void build_ui(HWND w) {
     add(s, "4x (2560x1792)");
     add(s, "5x (3200x2240)");
     add(s, "6x (3840x2688)");
+    add(s, "7x (Vulkan)");
+    add(s, "8x (Vulkan)");
     check("Vertical sync", 28, y + 148, 140, w, ID_VSYNC);
     check("Smooth scaling", 175, y + 148, 140, w, ID_SMOOTH);
     check("Frame skipping", 330, y + 148, 150, w, ID_SKIP);

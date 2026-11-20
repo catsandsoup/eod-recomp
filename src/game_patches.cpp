@@ -29,6 +29,7 @@
 #include "core/memory.h"
 #include "funcs.h"
 #include "game_patches.h"
+#include "battle_driver.h"
 #include "battle_layout.h"
 #include "hle_career.h"
 #include "iop/iop.h"
@@ -354,6 +355,11 @@ extern "C" void f_0018F2A8(void) {
         }
     }
     f_0018F2A8_orig();
+    // The contestant table is in starting-grid order. Use the native human
+    // input device to identify local pad zero, regardless of grid position.
+    if (driver && !(driver & 3) && driver <= EE_RAM_SIZE - 0x38 && ee_r32(driver + 0x34) == 0) {
+        pie_update_player(car);
+    }
     if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
         driver && !(driver & 3) && driver <= EE_RAM_SIZE - 4) {
         uint32_t vtbl = ee_r32(driver);
@@ -625,9 +631,9 @@ void game_patches_vblank() {
             platform_audio_feedback(g_config.cheat_chickens);
             LOG(LOG_CORE, "[MOD COMBO L1+R1+SELECT] Chicken Fight: %s", g_config.cheat_chickens ? "ON" : "OFF");
         }
-        if ((pressed & PAD_R3) && modern::g_on) {  // renderer: modern <-> original (F9 on the keyboard)
-            modern::toggle();
-            platform_show_hud_banner(modern::live() ? "RENDERER: MODERN" : "RENDERER: ORIGINAL");
+        if ((b & PAD_R3) && modern::look_switch_available()) {
+            s_suppressed_pad0_buttons |= PAD_R3;
+            if (pressed & PAD_R3) modern::toggle_from_input();
         }
         if (pressed & PAD_SQUARE) {
             g_config.cheat_invincible = !g_config.cheat_invincible;

@@ -1,12 +1,18 @@
 // modern_scene.cpp - GS-thread side of EOD_MODERN (modern_scene.h).
 #include "modern_scene.h"
+#include "../platform/platform.h"
 #include "../render/native_renderer.h"
+#include "../ui/overlay.h"
+#ifdef EOD_PLUME
+#include "../render/plume_device.h"
+#endif
 #include "core/trace.h"
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "gs_env.h"
 #include "gs_hw.h"
@@ -39,24 +45,41 @@ void env_start() {
     (void)once;
 }
 }  // namespace
-bool available() { return g_on && gs::hw::g_on && !g_failed.load(std::memory_order_relaxed); }
+bool available() {
+#ifdef EOD_PLUME
+    // The legacy GS-traffic pass would claim the same batches before native Plume can draw them.
+    if (native::enabled() && plume_device::render_device()) return false;
+#endif
+    return g_on && gs::hw::g_on && !g_failed.load(std::memory_order_relaxed);
+}
 bool live() {
     if (!available()) return false;
     env_start();
     return g_config.modern_renderer;
 }
+bool look_switch_available() { return native::look_available() || available(); }
 void disable() {
     if (!g_failed.exchange(true)) fprintf(stderr, "[modern] renderer unavailable: original\n");
 }
-void toggle() {
-    if (native::enabled()) {  // stage R6: the native renderer's Classic / Modern look
-        native::toggle_look();
-        return;
-    }
-    if (!available()) return;
+namespace {
+std::optional<RendererLook> toggle_look() {
+    if (native::look_available())
+        return native::toggle_look() ? RendererLook::Modern : RendererLook::Classic;
+    if (!available()) return std::nullopt;
     env_start();
-    g_config.modern_renderer = !g_config.modern_renderer;
-    fprintf(stderr, "[modern] renderer: %s\n", g_config.modern_renderer ? "modern" : "original");
+    const bool enabled = g_config.modern_renderer.toggle();
+    fprintf(stderr, "[modern] renderer: %s\n", enabled ? "modern" : "original");
+    return enabled ? RendererLook::Modern : RendererLook::Original;
+}
+}  // namespace
+
+void toggle() { (void)toggle_look(); }
+
+void toggle_from_input() {
+    if (const auto look = toggle_look()) {
+        platform_show_hud_banner(overlay_renderer_look_label(*look));
+        overlay_show_renderer_look(*look);
+    }
 }
 
 namespace {

@@ -456,11 +456,14 @@ void setup_env(uint32_t attr) {
     e.z16 = e.zpsm == PSMZ16 || e.zpsm == PSMZ16S;
     uint32_t full = e.fpsm == PSMCT24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.write_none = ((e.fbmsk & full) == full && e.zmsk) || e.ztst == 0;
-    // EOD_GS_REPLAY_FORCE=nortt: drop the textured sprites that copy another frame buffer into this
-    // one (the projected shadow composite): its P3 breakdown mask
+    // The broad nortt diagnostic drops offscreen fixed-UV draws. The exact
+    // diagnostic drops only the 0x362E70 projected-shadow composite.
     if (g_replaying && e.tme && e.fst && e.fbp != bits(st.dispfb[(st.pmode & 2) ? 1 : 0], 0, 9) * 32) {
         static const char *force = getenv("EOD_GS_REPLAY_FORCE");
-        if (force && !strcmp(force, "nortt")) e.write_none = true;
+        if (force &&
+            (!strcmp(force, "nortt") ||
+             (!strcmp(force, "noshadowcomp") && e.fbp == 0x1180 && e.tbp == 0x33e0 && c.alpha == 0x44)))
+            e.write_none = true;
     }
     e.zmax = e.z16 ? 0xFFFFu : e.zpsm == PSMZ24 ? 0xFFFFFFu : 0xFFFFFFFFu;
     e.blend_kind = (e.ba == 0 && e.bb == 1 && e.bd == 1) ? BL_MIX : (e.ba == 0 && e.bb == 2 && e.bd == 1) ? BL_ADD

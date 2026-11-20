@@ -16,11 +16,12 @@ struct EODModdingSuiteApp: App {
     var body: some Scene {
         WindowGroup {
             MainView(state: state)
-                .frame(minWidth: 1040, minHeight: 700)
+                .frame(minWidth: 680, minHeight: 500)
                 .preferredColorScheme(.dark)
                 .onAppear { delegate.state = state }
                 .task { await state.startup() }
         }
+        .defaultSize(width: 1_240, height: 800)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Mod Project…") { state.newProject() }.keyboardShortcut("n")

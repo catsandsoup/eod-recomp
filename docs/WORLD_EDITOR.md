@@ -41,11 +41,32 @@ By default the editor auto-discovers all 15 retail `.TRK` archives in `D:\Test D
 
 ## Controls & Shortcuts
 
-- **Fly Camera:** RMB drag look, `W/A/S/D` fly, `Q/E` down/up, Wheel speed, `Shift` 2.8× boost, `F` frame selection.
+- **Trackpad:** Two-finger scroll pans. Shift + two-finger scroll orbits around the pointer. Pinch zooms toward the pointer. On macOS, twisting two fingers orbits horizontally where the system delivers a rotation gesture.
+- **Mouse and keyboard:** Middle-drag pans. Right-drag looks around and Alt + right-drag orbits. Command + scroll on macOS or Ctrl + scroll on Windows zooms. Hold right mouse and scroll to change fly speed. Use `W/A/S/D` to fly, `Q/E` for down/up, `Shift` for 2.8× boost, and `F` to frame the selection.
 - **Lumion / Twinmotion / UE Editing:** `G` Move, `R` Rotate (or +15° in Place Mode), `P` Ghost Place Mode, `B` Scatter Brush, `End` / `Ctrl+G` Drop to SCOL ground, Right-click selected object for quick menu (`Replace Selection With...`), `Ctrl+D` Duplicate, `F2` Edit in Blender (OBJ), `Del` Delete, `Ctrl+Z` / `Ctrl+Y` Undo / Redo.
 - **Mod Write-Back & PIE:** `Ctrl+S` Save overlay, `Ctrl+Shift+S` Write real Mod Layer to `mods\<Project>\`, `F5` **Play Free Roam (PIE)**, `Shift+F5` **Play Event / Race (PIE)**, `Esc` Stop PIE / Exit tool.
 
 ---
+
+## Vehicle handling and stock-car imports
+
+Open **Car Tuner** for the handling sheet or use **Vehicle / NASCAR Importer**
+from the Home Hub to open the import tab without loading a track. The handling
+sheet edits verified `physics.val` fields and saves an isolated archive.
+Live speed boost remains a session setting.
+
+In **NASCAR Import**, choose your *Dirt to Daytona* ISO or extracted folder,
+enter a new chassis name and vehicle number, and import a stock car. The EOD
+template provides the archive structure and required defaults for the new
+chassis. The importer converts the selected NASCAR model and livery and
+builds the EOD registration alongside it. Choose the registered entry and
+click **Test Drive in PIE**. This uses the exact numbered car and your current
+track, or asks for a track if the editor has none open.
+
+Local imports persist in the editor's registered car list. This test-drive
+workflow uses a private overlay. Installing add-on cars into shared profiles,
+packaging them for distribution and acquiring missing content online remain
+separate workflows under development.
 
 ## Running Tests
 

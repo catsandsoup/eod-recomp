@@ -29,7 +29,7 @@ bool overlay_wndproc(void *hwnd, unsigned msg, uintptr_t wp, intptr_t lp) {
     case WM_SYSKEYDOWN:
         // Alt+Enter and F11 still switch fullscreen
         if (wp == VK_F11 || (msg == WM_SYSKEYDOWN && wp == VK_RETURN)) return false;
-        if (lp & (1 << 30) && wp == VK_F1 && !overlay_menu_open()) return true;  // auto-repeat
+        if (lp & (1 << 30) && wp == VK_F1) return true;  // auto-repeat
         return overlay_key((int)wp, true);
     case WM_KEYUP:
     case WM_SYSKEYUP:

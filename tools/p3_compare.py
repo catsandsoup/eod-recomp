@@ -10,8 +10,9 @@ stream with EOD_GS_DUMP=BASE EOD_GS_DUMP_AT=V1,V2,... EOD_GS_DUMP_N=1 (files BAS
 only one V). For each V this tool replays BASE.V in the software GS (eod --gs-replay with
 Renderer=software) three times: plain (reference), with EOD_GS_REPLAY_FOGCOL changed (pixels that
 move are fog pixels) and with EOD_GS_REPLAY_ZSHOT (pixels whose final Z equals the frame's most
-common far value with no geometry are sky pixels). It then picks the live frame in V+search that
-matches best (GS presentation trails the EE vblank counter) and prints:
+common far value with no geometry are sky pixels). --exact-scanout uses a live screenshot
+captured by the GS worker at the replay's terminal vblank (EOD_GS_DUMP_LIVE=1). The diagnostic
+search otherwise picks the best-matching live frame in V+search. The tool prints:
   per-channel MAE (1/255 units), p99 of the per-pixel max channel error, SSIM (luma, 8x8 windows,
   stride 4), and the MAE over fog pixels and over sky pixels.
 --breakdown also replays with one GS feature turned off at a time (EOD_GS_REPLAY_FORCE=mip0, keep,
@@ -90,14 +91,18 @@ def main():
     ap.add_argument("--ini", required=True, help="eod.ini with Renderer=software for the replay")
     ap.add_argument("--region", help="x0,y0,x1,y1: report only this rectangle (display pixels)")
     ap.add_argument("--search", default="-2..3")
+    ap.add_argument("--exact-scanout", action="store_true",
+                    help="pair each dump with its GS-thread live scanout at the terminal vblank")
     ap.add_argument("--csv")
     ap.add_argument("--breakdown", action="store_true",
                     help="error share of the pixels each GS feature decides (EOD_GS_REPLAY_FORCE masks)")
     ap.add_argument("--shadow", action="store_true",
-                    help="projected-shadow parity: MAE on the pixels the GS shadow composite decides "
-                         "(replay vs EOD_GS_REPLAY_FORCE=nortt), against the reference and against nortt")
+                    help="projected-shadow parity: compare the pixels affected by the 0x362E70 composite "
+                         "(FBP 0x1180, TBP 0x33e0) against the reference and the composite-off replay")
     ap.add_argument("--min-tri-px", type=int, default=100000,
                     help="triangle pixels the replay must draw (replay stats) for the frame to count")
+    ap.add_argument("--require-pass", action="store_true",
+                    help="fail unless every requested frame is compared and passes the P3 gate")
     a = ap.parse_args()
     vbs = [int(v) for v in a.vblanks.split(",")]
     lo, hi = (int(x) for x in a.search.split(".."))
@@ -106,7 +111,17 @@ def main():
     sh_tot = []
     for v in vbs:
         dump = a.dump if len(vbs) == 1 else f"{a.dump}.{v}"
-        ref_p = replay(a.exe, a.ini, dump, {})
+        window = {}
+        if a.exact_scanout:
+            try:
+                with open(dump + ".live.vblank", encoding="ascii") as marker:
+                    terminal_vblank = int(marker.read())
+            except (OSError, ValueError) as error:
+                sys.exit(f"{dump}: missing or invalid live scanout vblank: {error}")
+            if terminal_vblank <= v or not os.path.isfile(dump + ".live.png"):
+                sys.exit(f"{dump}: missing live scanout or invalid terminal vblank {terminal_vblank}")
+            window = {"EOD_GS_REPLAY_MEASURE_AT": "0", "EOD_GS_REPLAY_STOP_AT": str(terminal_vblank)}
+        ref_p = replay(a.exe, a.ini, dump, window)
         ref = load_rgb(ref_p)
         os.replace(ref_p, dump + ".ref.ppm")  # kept: the later replays write the same file
         # The dump starts from VRAM as the live renderer left it. Unless the window holds a whole
@@ -117,20 +132,23 @@ def main():
             continue
         # FOGCOL complemented: fog pixels (F < 255 with FGE set) move, all others stay
         fog_p = dump + ".fog"
-        os.replace(replay(a.exe, a.ini, dump, {"EOD_GS_REPLAY_FOGCOL": "00FF00FF"}), fog_p + ".ppm")
+        os.replace(replay(a.exe, a.ini, dump, dict(window, EOD_GS_REPLAY_FOGCOL="00FF00FF")), fog_p + ".ppm")
         fog2 = load_rgb(fog_p + ".ppm")
-        os.replace(replay(a.exe, a.ini, dump, {"EOD_GS_REPLAY_FOGCOL": "0000FF00"}), fog_p + "2.ppm")
+        os.replace(replay(a.exe, a.ini, dump, dict(window, EOD_GS_REPLAY_FOGCOL="0000FF00")), fog_p + "2.ppm")
         fog3 = load_rgb(fog_p + "2.ppm")
         fog_mask = (np.abs(fog2 - ref).max(axis=2) > 0) | (np.abs(fog3 - ref).max(axis=2) > 0)
         z_p = dump + ".z"
-        replay(a.exe, a.ini, dump, {"EOD_GS_REPLAY_ZSHOT": z_p})
+        replay(a.exe, a.ini, dump, dict(window, EOD_GS_REPLAY_ZSHOT=z_p))
         z = load_z(z_p)
         sky_mask = np.zeros(ref.shape[:2], bool)
         if z.shape == ref.shape[:2]:
             sky_mask = z == 0  # cleared depth (GS: larger Z is nearer; the frame clears Z to 0)
+        if a.exact_scanout:
+            candidates = [(terminal_vblank - v, dump + ".live.png")]
+        else:
+            candidates = [(off, os.path.join(a.live, f"frame_{v + off:05d}.png")) for off in range(lo, hi + 1)]
         best = None
-        for off in range(lo, hi + 1):
-            lp = os.path.join(a.live, f"frame_{v + off:05d}.png")
+        for off, lp in candidates:
             if not os.path.exists(lp):
                 continue
             live = load_rgb(lp)
@@ -155,7 +173,7 @@ def main():
             parts = []
             for feat in ("mip0", "keep", "nearest", "noblend", "nortt"):
                 fp = f"{dump}.{feat}.ppm"
-                os.replace(replay(a.exe, a.ini, dump, {"EOD_GS_REPLAY_FORCE": feat}), fp)
+                os.replace(replay(a.exe, a.ini, dump, dict(window, EOD_GS_REPLAY_FORCE=feat)), fp)
                 alt = load_rgb(fp)
                 if a.region:
                     alt = alt[y0:y1, x0:x1]
@@ -165,8 +183,8 @@ def main():
                 bd_tot.setdefault(feat, []).append(off - base)
             print(f"  vb {v} breakdown (MAE {base:.2f}): " + "; ".join(parts))
         if a.shadow:
-            fp = f"{dump}.nortt.ppm"
-            os.replace(replay(a.exe, a.ini, dump, {"EOD_GS_REPLAY_FORCE": "nortt"}), fp)
+            fp = f"{dump}.noshadowcomp.ppm"
+            os.replace(replay(a.exe, a.ini, dump, dict(window, EOD_GS_REPLAY_FORCE="noshadowcomp")), fp)
             alt = load_rgb(fp)
             if a.region:
                 alt = alt[y0:y1, x0:x1]
@@ -176,11 +194,15 @@ def main():
                 off = float(np.abs(live[m] - alt[m]).mean())
                 gap = float(np.abs(alt[m] - r[m]).mean())
                 sh_tot.append((int(m.sum()), on, off, gap))
-                print(f"  vb {v} shadow: {int(m.sum())} px, live vs GS {on:.2f}, live vs no-shadow {off:.2f}, "
+                print(f"  vb {v} shadow: {int(m.sum())} px, live vs GS {on:.2f}, live vs composite-off {off:.2f}, "
                       f"GS shadow depth {gap:.2f}")
+            else:
+                print(f"  vb {v} shadow: no pixels affected by the selected composite")
         rows.append((v, best[1], mae, p99, ssim, fog, nfog, sky, nsky))
-        print(f"vb {v} (live offset {best[1]:+d}): MAE r/g/b {mae[0]:.2f}/{mae[1]:.2f}/{mae[2]:.2f} p99 {p99:.0f} "
+        pairing = f"exact GS scanout vb {terminal_vblank}" if a.exact_scanout else f"live offset {best[1]:+d}"
+        print(f"vb {v} ({pairing}): MAE r/g/b {mae[0]:.2f}/{mae[1]:.2f}/{mae[2]:.2f} p99 {p99:.0f} "
               f"SSIM {ssim:.4f} fog {fog:.2f} ({nfog} px) sky {sky:.2f} ({nsky} px)")
+    ok = False
     if rows:
         m = np.array([[x[2].mean(), x[3], x[4]] for x in rows])
         fog = [x[5] for x in rows if x[6]]
@@ -189,7 +211,8 @@ def main():
               f"(worst {m[:, 1].max():.0f}) SSIM {m[:, 2].mean():.4f} (worst {m[:, 2].min():.4f}) "
               f"fog {np.mean(fog) if fog else float('nan'):.2f} ({sum(x[6] for x in rows)} px) "
               f"sky {np.mean(sky) if sky else float('nan'):.2f} ({sum(x[8] for x in rows)} px)")
-        ok = m[:, 0].max() <= 1 and m[:, 1].max() <= 8 and m[:, 2].min() >= 0.98 and \
+        worst_channel = max(x[2].max() for x in rows)
+        ok = worst_channel <= 1 and m[:, 1].max() <= 8 and m[:, 2].min() >= 0.98 and \
             all(x <= 2 for x in fog) and all(x <= 2 for x in sky)
         print("P3 gate:", "PASS" if ok else "FAIL")
         if bd_tot:
@@ -198,7 +221,7 @@ def main():
     if sh_tot:
         n = sum(x[0] for x in sh_tot)
         print(f"shadow pixels over {len(sh_tot)} frames: {n} px, live vs GS "
-              f"{sum(x[0] * x[1] for x in sh_tot) / n:.2f}, live vs no-shadow {sum(x[0] * x[2] for x in sh_tot) / n:.2f}, "
+              f"{sum(x[0] * x[1] for x in sh_tot) / n:.2f}, live vs composite-off {sum(x[0] * x[2] for x in sh_tot) / n:.2f}, "
               f"GS shadow depth {sum(x[0] * x[3] for x in sh_tot) / n:.2f} (pixel-weighted MAE)")
     if a.csv and rows:
         with open(a.csv, "w") as f:
@@ -207,6 +230,10 @@ def main():
                 f.write(f"{x[0]},{x[1]},{x[2][0]:.3f},{x[2][1]:.3f},{x[2][2]:.3f},{x[3]:.0f},{x[4]:.4f},"
                         f"{x[5]:.3f},{x[6]},{x[7]:.3f},{x[8]}\n")
 
+    if a.require_pass and len(rows) != len(vbs):
+        print(f"P3 gate incomplete: compared {len(rows)} of {len(vbs)} requested frames", file=sys.stderr)
+    return int(a.require_pass and (not ok or len(rows) != len(vbs)))
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

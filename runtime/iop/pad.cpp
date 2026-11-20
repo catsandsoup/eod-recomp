@@ -79,13 +79,15 @@ void read_actuator_dma(int port, int slot) {
 void write_pad_data(int port, int slot) {
     Port &p = g_ports[port][slot];
     HostPadState hs;
-    platform_get_pad(port, &hs);
-    if (slot != 0) hs.connected = false;  // no multitap
+    // Host indices 0 and 1 are the standalone pads. The three extra
+    // scripted seats on physical port 0 use host indices 2 through 4.
+    if (slot == 0) platform_get_pad(port, &hs);
+    else if (iop_port_has_multitap(port)) platform_get_pad(slot + 1, &hs);
     uint8_t d[128] = {};
     uint8_t mode = !p.analog ? 0x41 : p.pressure ? 0x79 : 0x73;
     static chord_guard::Guard chord[2];   // Start+Select opens the in-game menu: the game never sees that chord
-    uint16_t b_clean = hs.connected && port >= 0 && port < 2 ? chord[port].filter(hs.buttons) : hs.buttons;
-    if (port == 0) b_clean &= ~game_patches_suppressed_buttons();
+    uint16_t b_clean = slot == 0 && hs.connected ? chord[port].filter(hs.buttons) : hs.buttons;
+    if (port == 0 && slot == 0) b_clean &= ~game_patches_suppressed_buttons();
     uint16_t btn = (uint16_t)~b_clean;  // active low
     d[0] = 0x00;
     d[1] = mode;
@@ -135,7 +137,7 @@ void set_actuators(int port, int slot, const uint8_t *data) {
         if (p.act_align[i] == 0) small = data[i];
         else if (p.act_align[i] == 1) large = data[i];
     }
-    if (slot != 0) return;  // no multitap
+    if (slot != 0) return;  // extra seats are scripted and have no physical motor
     LOG(LOG_PAD, "pad %d vibration small %d large %d", port, small, large);
     platform_set_vibration(port, small ? 1 : 0, large);
 }
@@ -176,7 +178,7 @@ void iop_pad_init() {
             p.analog = rd32(buf + 0xC) != 0;
             p.lock = (uint8_t)rd32(buf + 0x10);
             p.req_state = PAD_RSTAT_COMPLETE;
-            LOG(LOG_PAD, "pad %d main mode %s lock %d", port, p.analog ? "analog" : "digital", p.lock);
+            LOG(LOG_PAD, "pad port %d slot %d main mode %s lock %d", port, slot, p.analog ? "analog" : "digital", p.lock);
             break;
         }
         case 0x07:  // PS2SDK SET_ACTDIR(port, slot, data[6]): vibration
@@ -199,7 +201,7 @@ void iop_pad_init() {
             Port &p = g_ports[port][slot];
             p.pressure = rd32(buf + 0xC) != 0;
             p.req_state = PAD_RSTAT_COMPLETE;
-            LOG(LOG_PAD, "pad %d pressure mode %d", port, p.pressure);
+            LOG(LOG_PAD, "pad port %d slot %d pressure mode %d", port, slot, p.pressure);
             break;
         }
         case 0x0B:  // SET_VREF
@@ -209,7 +211,7 @@ void iop_pad_init() {
             result = 2;
             break;
         case 0x0D:  // GET_SLOTMAX
-            result = 1;
+            result = iop_port_has_multitap(port) ? 4 : 1;
             break;
         case 0x0E:  // CLOSE
             g_ports[port][slot].open = false;

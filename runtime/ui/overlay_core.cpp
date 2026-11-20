@@ -17,7 +17,9 @@
 #include "../../third_party/imgui/imgui.h"
 #include "../app/game_frontend.h"
 #include "../core/config.h"
+#include "../gs/modern_scene.h"
 #include "../platform/platform.h"
+#include "../render/native_renderer.h"
 #include "frontend.h"
 #include "frontend_draw.h"
 #include "menu_input.h"
@@ -43,6 +45,10 @@ std::atomic<bool> g_open{false};
 bool g_context;
 bool g_published_any;
 uint64_t g_last_time;
+// Keep the notice and its expiry together when input and overlay rendering run on different threads.
+std::atomic<uint64_t> g_renderer_notice{0};
+constexpr unsigned kRendererLookBits = 2;
+constexpr uint64_t kRendererLookMask = (1u << kRendererLookBits) - 1;
 std::unique_ptr<frontend::Menu> g_menu;
 std::shared_ptr<game_frontend::Network> g_net;
 ImFont *g_font_main;
@@ -144,10 +150,19 @@ public:
 
 void refresh_host();
 
+void load_menu_art() {
+    static bool loaded;
+    if (loaded) return;
+    ui_art::load(g_game_root, add_texture);
+    ui_preview::init(g_game_root, add_texture);
+    loaded = true;
+}
+
 void open_menu(bool open) {
     if (g_open == open) return;
     g_open = open;
     if (open) {
+        load_menu_art();
         if (g_menu) {
             refresh_host();  // the mods root and device names before the rescan
             g_menu->open();
@@ -217,8 +232,6 @@ void ensure_context() {
     }
     io.Fonts->SetTexID((ImTextureID)1);
     g_font_gen++;
-    ui_art::load(g_game_root, add_texture);
-    ui_preview::init(g_game_root, add_texture);
     g_menu = std::make_unique<frontend::Menu>(g_config);
     g_menu->set_music(std::make_shared<MusicAdapter>());
     g_net = std::shared_ptr<game_frontend::Network>(&netplay::session(), [](game_frontend::Network *) {});
@@ -242,6 +255,10 @@ void refresh_host() {
         hi.device[p] = overlay_platform_device(p, &xbox);
     }
     hi.mods_root = overlay_platform_mods_root();
+    if (native::look_available())
+        hi.plume_look = native::look_modern() ? frontend::PlumeLook::Modern : frontend::PlumeLook::Classic;
+    else
+        hi.legacy_modern_available = modern::available();
     g_menu->set_host(hi);
 }
 
@@ -344,6 +361,10 @@ frontend::Input gather_input(bool &toggled) {
 
 void apply(const frontend::Effects &fx) {
     play(fx.sound);
+    if (fx.toggle_plume_look && native::look_available()) {
+        modern::toggle_from_input();
+        refresh_host();
+    }
     if (fx.fullscreen) platform_set_fullscreen(g_config.fullscreen);
     if (fx.audio || fx.keys || fx.input_layout) overlay_platform_apply();
     if (fx.swap_ports) overlay_platform_swap_ports();
@@ -442,6 +463,19 @@ void pump_paused_audio() {
 
 // --------------------------------------------------------------------------- API
 void overlay_enable() { g_available = true; }
+const char *overlay_renderer_look_label(RendererLook look) {
+    switch (look) {
+    case RendererLook::Classic: return "RENDERER: CLASSIC";
+    case RendererLook::Modern: return "RENDERER: MODERN";
+    case RendererLook::Original: return "RENDERER: ORIGINAL";
+    }
+    return "";
+}
+void overlay_show_renderer_look(RendererLook look) {
+    if (!g_available) return;
+    const uint64_t until = platform_time_us() + 2500000;
+    g_renderer_notice.store((until << kRendererLookBits) | uint64_t(look), std::memory_order_relaxed);
+}
 bool overlay_menu_open() { return g_open; }
 bool overlay_captures_input() { return g_open || g_release_wait; }
 // Never hold the game when an online session is active (Hosting, Connecting, Lobby, or Racing): holding the EE
@@ -473,6 +507,9 @@ bool overlay_key(int vk, bool down) {
         if (!g_open) { open_menu(true); play(frontend::Sound::Select); return true; }
     }
     if (!g_open) return false;
+    // Let the platform's focused F9 shortcut through during ordinary menu navigation.
+    if (down && vk == 0x78 && g_menu && g_menu->rebinding() < 0 &&
+        !g_menu->editing_text() && !g_menu->error_active()) return false;
     g_keys.push_back({vk, down});
     return true;
 }
@@ -496,6 +533,7 @@ void overlay_mouse_wheel(float dy) { if (g_open) g_wheel += dy; }
 void overlay_show_error(const std::string &title, const std::string &message, bool offer_disc, OverlayDiscHandler handler) {
     g_available = true;
     ensure_context();
+    load_menu_art();
     g_disc_handler = handler;
     g_error_result = 0;
     g_menu->show_error(title, message, offer_disc);
@@ -505,6 +543,7 @@ bool overlay_fatal_screen(const std::string &title, const std::string &message) 
     g_fatal_screen = true;
     g_available = true;
     ensure_context();
+    load_menu_art();
     g_disc_handler = nullptr;
     g_error_result = 0;
     g_menu->show_error(title, message, false, true);
@@ -587,6 +626,8 @@ void overlay_frame() {
     if (menu_trace && platform_time_us() - poll_t0 > 50000)
         fprintf(stderr, "[menu] STALL: network pump held the game thread %llu ms\n", (unsigned long long)((platform_time_us() - poll_t0) / 1000));
     if (!g_available) return;
+    const uint64_t renderer_notice = g_renderer_notice.load(std::memory_order_relaxed);
+    const bool show_renderer_look = renderer_notice && (renderer_notice >> kRendererLookBits) > platform_time_us();
     if (!g_context) {
         // the chord before the first use (no context yet: nothing else to do)
         bool toggled = false;
@@ -596,7 +637,7 @@ void overlay_frame() {
             if (g_pads[p].update(s).toggle) toggled = true;
         }
         if (toggled || g_open) { ensure_context(); g_open = false; open_menu(true); play(frontend::Sound::Select); }
-        if (!g_open && !g_config.show_fps && netplay::session().strip().empty()) return;
+        if (!g_open && !g_config.show_fps && !show_renderer_look && netplay::session().strip().empty()) return;
     }
     ensure_context();
     refresh_host();
@@ -637,7 +678,7 @@ void overlay_frame() {
     }
     const std::string strip = netplay::session().strip();
     const std::vector<std::string> speakers = netplay::session().speakers();
-    if (!g_open && !g_config.show_fps && strip.empty() && speakers.empty()) {
+    if (!g_open && !g_config.show_fps && !show_renderer_look && strip.empty() && speakers.empty()) {
         if (g_published_any) {
             g_published_any = false;
             std::lock_guard<std::mutex> lk(g_pub_mtx);
@@ -667,6 +708,17 @@ void overlay_frame() {
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     if (g_open) frontend_draw::draw_menu(dl, *g_menu, c, g_hits);
     else g_hits.clear();
+    if (show_renderer_look && (!g_open || g_menu->tab() != frontend::Tab::Graphics)) {
+        const auto look = static_cast<RendererLook>(renderer_notice & kRendererLookMask);
+        const char *label = overlay_renderer_look_label(look);
+        const float scale = h / 720.f, px = 24.f * scale, pad = 12.f * scale;
+        const float width = g_font_main->CalcTextSizeA(px, (float)w, 0.f, label).x + 2.f * pad;
+        const ImVec2 a((w - width) * 0.5f, strip.empty() ? pad : 38.f + pad);
+        dl->AddRectFilled(a, ImVec2(a.x + width, a.y + px + pad),
+                          IM_COL32(24, 14, 8, 230), 4.f * scale);
+        dl->AddText(g_font_main, px, ImVec2(a.x + pad, a.y + pad * 0.5f),
+                    IM_COL32(255, 180, 80, 255), label);
+    }
     if (!strip.empty()) {
         dl->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, 38), IM_COL32(24, 14, 8, 215));
         dl->AddRectFilled(ImVec2(0, 36), ImVec2((float)w, 38), IM_COL32(230, 120, 30, 255));

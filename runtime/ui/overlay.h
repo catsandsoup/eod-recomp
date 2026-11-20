@@ -55,6 +55,10 @@ bool overlay_paused();
 void overlay_toggle();
 // Opens the menu on the ONLINE tab (the lobby comes back after an online event).
 void overlay_show_online();
+enum class RendererLook { Classic, Modern, Original };
+const char *overlay_renderer_look_label(RendererLook look);
+// Publishes the graphics look on the next overlay frame.
+void overlay_show_renderer_look(RendererLook look);
 
 // GS thread: the latest published overlay (false: nothing to draw).
 bool overlay_latest(OverlayDraw &out);

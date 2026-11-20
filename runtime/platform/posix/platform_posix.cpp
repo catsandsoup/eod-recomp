@@ -55,7 +55,7 @@ void platform_present(const uint32_t *pixels, int width, int height, int stride)
     g_last_h = height;
 }
 
-// Input: only scripted (EOD_PAD_SCRIPT / EOD_PAD_SCRIPT1, see pad_script.h).
+// Input: only scripted (see pad_script.h).
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
     out->connected = port == 0;

@@ -7,11 +7,12 @@
 // Only the colour of lit surfaces changes: Filament's standard model (Filament "Physically Based
 // Rendering in Filament", sections 4.4-4.9 and 5.3: D_GGX, V_SmithGGXCorrelated, F_Schlick,
 // Lambert, clear coat with V_Kelemen), with the material record's metalness and roughness, and
-// image-based light from the track's sky texture. No tone curve, grade, vignette or haze.
+// image-based light from the track's sky texture. An authored track may opt into editor lighting and fog.
 //
 // Modern-only fields (filled by the renderer at flush, native_renderer.cpp modern_patch):
 //   mode.z bits 16..19 metalness (4 bits), 20..23 roughness (4 bits), 24 emissive (Classic colour
-//   kept), 25 normal from height, 26 the texture has a material record, 27..30 class
+//   kept), 25 normal from height, 26 the texture has a material record, 27..30 class,
+//   31 authored environment applies to this gameplay surface
 //   light.xyz   model-space light direction times the light scale (lit draws: the VU1 vf12; prelit
 //               draws: this frame's sun), diffuse.rgb its colour (0..128)
 //   light.w     sky upper colour (RGBA8 bits), diffuse.w sky horizon colour (RGBA8 bits)
@@ -50,6 +51,10 @@ struct Object {
 
 [[vk::binding(0, 0)]] Texture2D tex;
 [[vk::binding(1, 0)]] SamplerState smp;
+[[vk::binding(0, 1)]] cbuffer AuthoredEnvironment {
+    float4 authored_fog_color;
+    float4 environment_params; // fog start, fog end, fog density, ambient intensity
+};
 
 struct VIn {
     [[vk::location(0)]] float3 p : POSITION;
@@ -188,6 +193,7 @@ float vfx_fbm(float2 x) {
 POut ps_modern(VOut i) {
     const uint m = obj.mode.x;
     const uint mz = obj.mode.z;
+    const bool authored = (mz & (1u << 31)) != 0;
     const float4 ts = round(tex.Sample(smp, i.uv) * 255.0);
     const float3 dpx = ddx(i.mp), dpy = ddy(i.mp);
     const float hgt = dot(ts.rgb, float3(0.2126, 0.7152, 0.0722)) / 255.0;
@@ -246,7 +252,15 @@ POut ps_modern(VOut i) {
         const float3 up = oct_decode(obj.mode.w);
         // irradiance the game gives this pixel, 1.0 = 0x80: the VU1 light of lit draws, the baked
         // vertex light of prelit draws (multiplies albedo once, never relit)
-        const float3 E = (tfx == 1) ? float3(1, 1, 1) : v / 128.0;
+        float3 E = (tfx == 1) ? float3(1, 1, 1) : v / 128.0;
+        if (authored) {
+            // Match the editor's two-sided fill for mixed strip winding, applied over baked light.
+            const float ndl = abs(dot(N, L));
+            const float hemi = saturate(abs(dot(N, up)) * 0.5 + 0.5);
+            const float3 fill = lerp(float3(0.38, 0.38, 0.40), float3(0.58, 0.65, 0.76), hemi) * environment_params.w;
+            const float3 direct = (obj.diffuse.rgb / 128.0) * (0.26 * (ndl * 0.65 + 0.35) + 0.42 * ndl);
+            E *= clamp(fill + direct, 0.30, 1.35);
+        }
         const float occl = saturate(dot(E, float3(0.2126, 0.7152, 0.0722)) * 1.5);
         const float3 sun = obj.diffuse.rgb / 128.0;
         const float NoV = max(dot(N, V), 1e-4);
@@ -335,6 +349,11 @@ POut ps_modern(VOut i) {
         const float3 fog = float3(obj.mode.y >> 8 & 0xFF, obj.mode.y >> 16 & 0xFF, obj.mode.y >> 24 & 0xFF);
         const float F = clamp(floor(i.f), 0.0, 255.0);
         rgb = fog + floor(((rgb - fog) * F + 128.0) / 256.0);
+    }
+    if (authored) {
+        const float t = saturate((length(i.mv) - environment_params.x) / max(1.0, environment_params.y - environment_params.x));
+        const float fog = t * t * (3.0 - 2.0 * t) * environment_params.z;
+        rgb = lerp(rgb, authored_fog_color.rgb * 255.0, fog);
     }
     if (m & M_ATE) {
         const bool pass = alpha_pass(is_vfx ? min(a_game, 255.0) : a, (m >> M_ATST_SHIFT) & 7, (float)(obj.mode.y & 0xFF));

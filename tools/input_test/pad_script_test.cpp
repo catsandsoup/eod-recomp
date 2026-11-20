@@ -15,6 +15,9 @@ int main() {
            "55:4000:128:128:12:1x,60:4000:128:128:12:,65:4000:128:128:12:2:3,"
            "70:0000:0:255:128,80:8000:1:254", 1);
     setenv("EOD_PAD_SCRIPT1", "0:4000,10:8000:32:224,20:0000", 1);
+    setenv("EOD_PAD_SCRIPT_SLOT1", "0:0020,80:1000:24:233:117", 1);
+    unsetenv("EOD_PAD_SCRIPT_SLOT2");
+    setenv("EOD_PAD_SCRIPT_SLOT3", "0:0400,80:2000:77:178:0:97", 1);
     HostPadState a, b;
     CHECK(pad_script_state(0, &a) && a.connected);
     CHECK(a.buttons == PAD_CROSS && a.pressure[6] == 0 && a.pressure[7] == 13);
@@ -35,7 +38,11 @@ int main() {
     CHECK(pad_script_state(0, &a) && a.buttons == PAD_SQUARE && a.pressure[6] == 0 && a.pressure[7] == 255);
     CHECK(a.lx == 1 && a.ly == 254);
     CHECK(pad_script_state(1, &b) && b.buttons == 0 && b.pressure[6] == 0 && b.pressure[7] == 0);
-    CHECK(!pad_script_state(-1, &a) && !pad_script_state(2, &a));
+    CHECK(pad_script_state(2, &a) && a.connected && a.buttons == PAD_TRIANGLE);
+    CHECK(a.lx == 24 && a.ly == 233 && a.pressure[6] == 117 && a.pressure[7] == 0);
+    CHECK(pad_script_state(4, &b) && b.connected && b.buttons == PAD_CIRCLE);
+    CHECK(b.lx == 77 && b.ly == 178 && b.pressure[6] == 0 && b.pressure[7] == 97);
+    CHECK(!pad_script_state(-1, &a) && !pad_script_state(3, &a) && !pad_script_state(5, &a));
     {   // Start+Select (the in-game menu chord) never reaches the game, in either order or on the same frame
         using chord_guard::Guard;
         const uint16_t ST = PAD_START, SE = PAD_SELECT, X = PAD_CROSS;

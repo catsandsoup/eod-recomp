@@ -28,7 +28,7 @@ the native decode remains the fallback.
 
 - `runtime/gs/texture_replacements.{h,cpp}`: manifest parsing, `.eodhtx`
   validation (magic, flags 0, full mip chain, exact size, `orig*k` with one
-  power-of-two `k`, at most 4096), path safety (relative, no `..`), identity
+  power-of-two `k`, at most 8192 pixels per side), path safety (relative, no `..`), identity
   keys, alpha conversion, CPU residency. Files are memory-mapped; a background
   thread prefaults them in manifest order within the CPU budget. Malformed
   lines and missing files are logged with the reason and skipped. Lines with
@@ -52,7 +52,7 @@ the native decode remains the fallback.
   reference, so the native 256 MB cache eviction never double-releases.
 - Shader: `F_TEX_HOST` (0x8000). The bound texture is `k` times the GS size with
   `c_tex_scale = k` and `c_tex_size` in GS texels. The existing path would keep
-  the GS mip level, which counts GS texels and would alias a 4096 texture, so the
+  the GS mip level, which counts GS texels and would alias the higher-resolution texture, so the
   host path selects the level from the screen footprint (`SampleGrad`, or
   nearest `Load` at the footprint level), keeping the GS mag/min filter choice
   and wrap modes.
@@ -70,6 +70,7 @@ the native decode remains the fallback.
   texture as a whole.
 - Upload happens on the GS thread at first use (measured ~23 ms CPU per
   4096x4096 chain), which can hitch the first frame showing new replacements.
+  An 8192×8192 RGBA8 replacement has 14 levels and needs about 341 MiB of GPU residency.
 - D3D11 renderer: not implemented.
 
 ## Verification (2026-11-10, Anoka, headless and muted)

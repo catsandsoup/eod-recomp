@@ -268,7 +268,7 @@ uint8_t trigger_byte(Sint16 v) {
     return (uint8_t)(a < 0 ? 0 : a > 255 ? 255 : a);
 }
 
-static void read_mapped_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused, bool modern) {
+static void read_mapped_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused, bool modern, bool graphics_chord) {
     if (!focused) { *out = HostPadState(); out->connected = true; return; }
     static const struct {
         SDL_GamepadButton b;
@@ -308,7 +308,10 @@ static void read_mapped_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused
         // bumpers and every face button keeps its PS2 meaning, so no native action is lost.
         const uint16_t clicks = out->buttons & (PAD_L3 | PAD_R3);
         out->buttons &= ~(PAD_L3 | PAD_R3);
-        if (clicks & PAD_R3) { out->buttons |= PAD_L2; out->pressure[10] = 255; }
+        if (clicks & PAD_R3) {
+            if (graphics_chord && (out->buttons & (PAD_L1 | PAD_R1)) == (PAD_L1 | PAD_R1)) out->buttons |= PAD_R3;
+            else { out->buttons |= PAD_L2; out->pressure[10] = 255; }
+        }
         if (clicks & PAD_L3) { out->buttons |= PAD_R2; out->pressure[11] = 255; }
     }
     if (lt > kTriggerDigital) out->buttons |= left_button;
@@ -327,11 +330,11 @@ static void read_mapped_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused
     if (ry != 128) out->ry = ry;
 }
 
-void read_gamepad(SDL_Gamepad *gp,HostPadState *out,bool focused){
-    read_mapped_gamepad(gp,out,focused,g_modern_layout);
+void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused, bool graphics_chord) {
+    read_mapped_gamepad(gp, out, focused, g_modern_layout, graphics_chord);
 }
 void read_menu_gamepad(SDL_Gamepad *gp,HostPadState *out,bool focused){
-    read_mapped_gamepad(gp,out,focused,false);
+    read_mapped_gamepad(gp, out, focused, false, false);
 }
 
 bool rumble(int port, uint8_t small_motor, uint8_t large_motor) {

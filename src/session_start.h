@@ -6,8 +6,12 @@
 // reaches its front-end loop (0x2A1298), answering only the two native menu screens
 // that GameDoSingle opens first (car select 0x2A75E0, track select 0x2C7340) and
 // pre-selecting the event in the native Eve tracker (object at 0x3C4BF8, via 0x120BE8).
+// Add ;laps=N to override the lap count of the first selected single-player race.
 // Everything else (human count, pad map, session description, roster, world load,
 // results, return to the native menus) is the unmodified native code.
+// With ;humans=N (2..4), GameDoHeadToHead registers the connected local seats.
+// The first player gets the requested paint and the other seats use distinct
+// paint records of the same model. The head-to-head tracker resolves the event.
 // See docs RACE_SETUP_MAP.md.
 //
 // EOD_DIRECT_START="mode=career;place=dealer" (or ;eve=3) starts a fresh Career straight from boot and
@@ -27,6 +31,7 @@ struct SessionRequest {
     int paint = 0;                 // 0-based paint index among the model's vehicle records
     int humans = 1;                // 2..4: head-to-head split screen (GameDoHeadToHead)
     int ai = -1;                   // Battle variant helper: event=Battle + ai=8 -> "Battle (8 AI)"
+    int laps = -1;                 // 1..50: first single-player race, or -1 for native rules
     std::string place;             // career: free-roam place (career_place_index); default home
     int eve = -1;                  // career: run this Career Eve (index) as soon as free roam starts
 };

@@ -21,13 +21,16 @@ Verifies:
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 EDITOR_DIR = Path(__file__).resolve().parent
 if str(EDITOR_DIR) not in sys.path:
@@ -35,7 +38,9 @@ if str(EDITOR_DIR) not in sys.path:
 
 from PIL import Image
 from PySide6 import __version__ as PYSIDE6_VERSION
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QNativeGestureEvent, QPointingDevice, QWheelEvent
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 import pie_host
 import project_state as ps
@@ -44,6 +49,7 @@ from app import configure_opengl_format
 from main_window import EodWorldEditorWindow
 from theme import apply_dark_theme
 from thumbnails import render_model_thumbnail, render_model_thumbnail_qimage
+from viewport_gl import ViewportGL
 from workers import CancelToken, FunctionWorker, editor_thread_pool
 
 
@@ -53,6 +59,169 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+class TestPieLaunchSpec(unittest.TestCase):
+    def test_trackpad_events_pan_orbit_and_zoom_without_editing(self) -> None:
+        configure_opengl_format()
+        app = QApplication.instance() or QApplication(["test-viewport-navigation"])
+        viewport = ViewportGL()
+        viewport.resize(800, 540)
+        position = QPointF(460, 310)
+        no_modifier = Qt.KeyboardModifier.NoModifier
+
+        def wheel(pixel, angle, modifiers=no_modifier, phase=Qt.ScrollPhase.NoScrollPhase):
+            event = QWheelEvent(position, position, QPoint(*pixel), QPoint(*angle),
+                                Qt.MouseButton.NoButton, modifiers, phase, False)
+            app.sendEvent(viewport, event)
+            self.assertTrue(event.isAccepted())
+
+        def gesture(kind, value=0.0):
+            event = QNativeGestureEvent(kind, QPointingDevice.primaryPointingDevice(), 2,
+                                        position, position, position, value, QPointF())
+            app.sendEvent(viewport, event)
+            self.assertTrue(event.isAccepted())
+
+        try:
+            original = viewport.camera_state()
+            wheel((24, -14), (0, 120), phase=Qt.ScrollPhase.ScrollUpdate)
+            panned = viewport.camera_state()
+            self.assertNotEqual(panned["pos"], original["pos"])
+            self.assertEqual(panned["yaw"], original["yaw"])
+            self.assertEqual(panned["fly_speed"], original["fly_speed"])
+            wheel((100, 50), (0, 0), phase=Qt.ScrollPhase.ScrollMomentum)
+            self.assertEqual(viewport.camera_state(), panned)
+            wheel((0, 0), (0, 0), phase=Qt.ScrollPhase.ScrollEnd)
+
+            wheel((0, 0), (30, -30), Qt.KeyboardModifier.ShiftModifier)
+            orbited = viewport.camera_state()
+            self.assertNotEqual(orbited["yaw"], panned["yaw"])
+            self.assertNotEqual(orbited["pitch"], panned["pitch"])
+            self.assertNotEqual(orbited["pos"], panned["pos"])
+
+            wheel((0, 0), (0, 120), Qt.KeyboardModifier.ControlModifier)
+            zoomed = viewport.camera_state()
+            self.assertNotEqual(zoomed["pos"], orbited["pos"])
+            self.assertEqual(zoomed["yaw"], orbited["yaw"])
+            self.assertEqual(zoomed["fly_speed"], original["fly_speed"])
+
+            gesture(Qt.NativeGestureType.BeginNativeGesture)
+            gesture(Qt.NativeGestureType.ZoomNativeGesture, 0.15)
+            pinched = viewport.camera_state()
+            self.assertNotEqual(pinched["pos"], zoomed["pos"])
+            self.assertEqual(pinched["yaw"], zoomed["yaw"])
+            gesture(Qt.NativeGestureType.RotateNativeGesture, 10.0)
+            self.assertAlmostEqual(viewport.cam_yaw, (pinched["yaw"] + 10.0) % 360.0)
+            gesture(Qt.NativeGestureType.EndNativeGesture)
+            self.assertIsNone(viewport._native_camera_anchor)
+
+            viewport._lmb_down = True
+            editing = viewport.camera_state()
+            wheel((0, 20), (0, 0))
+            self.assertEqual(viewport.camera_state(), editing)
+            viewport._lmb_down = False
+            viewport._rmb_down = True
+            wheel((0, 0), (0, 120))
+            self.assertGreater(viewport.fly_speed, original["fly_speed"])
+            self.assertEqual(viewport.camera_state()["pos"], editing["pos"])
+        finally:
+            viewport.close()
+
+    def test_compact_editor_exposes_panels_and_playback_controls(self) -> None:
+        configure_opengl_format()
+        app = QApplication.instance() or QApplication(["test-editor-layout"])
+        apply_dark_theme(app)
+        with tempfile.TemporaryDirectory() as directory:
+            window = EodWorldEditorWindow(game_dir=Path(directory), auto_load=False)
+            try:
+                window.resize(800, 540)
+                window.show()
+                app.processEvents()
+                self.assertEqual(window.size().toTuple(), (800, 540))
+                self.assertTrue(window.explorer.isVisible())
+                self.assertFalse(window.properties.isVisible())
+                self.assertTrue(window.cmb_pie_event.isVisible())
+                self.assertTrue(window.cmb_pie_car.isVisible())
+                self.assertTrue(window.cmb_renderer_mode.isVisible())
+                for toolbar in (window.main_toolbar, window.settings_toolbar):
+                    for action in toolbar.actions():
+                        if not action.isSeparator():
+                            self.assertTrue(toolbar.widgetForAction(action).isVisible(), action.text())
+                window.act_panel_inspector.trigger()
+                window.center_stack.setCurrentWidget(window.pie_host)
+                app.processEvents()
+                self.assertTrue(window.properties.isVisible())
+                self.assertFalse(window.explorer.isVisible())
+                self.assertGreaterEqual(window.center_stack.width(), window.viewport.minimumWidth())
+                for widget in (window.pie_host.btn_stop, window.pie_host.btn_restart,
+                               window.pie_host.btn_ai_drive, window.pie_host.cmb_arcade):
+                    self.assertTrue(widget.isVisible())
+                    corner = widget.mapTo(window.pie_host.bar, widget.rect().bottomRight())
+                    self.assertTrue(window.pie_host.bar.rect().contains(corner))
+                window._filter_explorer_category("car-wreck")
+                self.assertTrue(window.explorer.isVisible())
+                self.assertFalse(window.properties.isVisible())
+                window.resize(1440, 840)
+                app.processEvents()
+                self.assertTrue(window.explorer.isVisible())
+                self.assertTrue(window.properties.isVisible())
+            finally:
+                window.close()
+                app.processEvents()
+
+    def test_macos_editor_disc_discovery_matches_game_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            expected = home / "Library" / "Application Support" / "TDEODRecomp" / "disc"
+            (expected / "DATA" / "TRACKS").mkdir(parents=True)
+            with patch.dict("os.environ", {}, clear=True), patch.object(wl.sys, "platform", "darwin"), \
+                    patch.object(Path, "home", return_value=home):
+                self.assertEqual(wl.default_game_dir(), expected)
+
+    def test_macos_launch_resolves_native_binary_and_disc_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            disc = Path(directory).resolve()
+            binary = disc / "eod"
+            binary.touch()
+            with patch.dict("os.environ", {}, clear=True), patch.object(pie_host.sys, "platform", "darwin"):
+                spec = pie_host.build_pie_launch_spec(disc, disc / "mod", "Afton", renderer_mode="plume")
+            self.assertEqual(spec["exe"], str(binary))
+            self.assertEqual(spec["args"][1:4], ["--windowed", "--data", str(disc)])
+
+    def test_explicit_pie_executable_overrides_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "my-eod"
+            with patch.dict("os.environ", {"EOD_PIE_EXE": str(binary)}, clear=True):
+                self.assertEqual(pie_host.resolve_eod_exe("."), binary.resolve())
+
+    def test_renderer_options_select_distinct_backends(self) -> None:
+        with patch.dict("os.environ", {"EOD_NATIVE_ONLY": "1", "EOD_PLUME": "0", "EOD_LOOK": "modern"}, clear=True):
+            classic = pie_host.build_pie_launch_spec(".", "test", "Afton", renderer_mode="ps2")
+            plume = pie_host.build_pie_launch_spec(".", "test", "Afton", renderer_mode="plume")
+
+        self.assertEqual(classic["env"]["EOD_NATIVE"], "0")
+        self.assertEqual(classic["env"]["EOD_MODERN"], "0")
+        self.assertNotIn("EOD_NATIVE_ONLY", classic["env"])
+        self.assertNotIn("EOD_LOOK", classic["env"])
+        self.assertNotIn("--require-plume", classic["args"])
+        self.assertEqual(plume["env"]["EOD_NATIVE"], "1")
+        self.assertEqual(plume["env"]["EOD_LOOK"], "modern")
+        self.assertEqual(plume["env"]["EOD_MODERN"], "0")
+        self.assertEqual(plume["env"]["EOD_PLUME"], "1")
+        self.assertNotIn("EOD_NATIVE_ONLY", plume["env"])
+        self.assertEqual(plume["args"][-3:], ["--renderer", "vulkan", "--require-plume"])
+
+    def test_laps_are_forwarded_only_to_action_events(self) -> None:
+        for mode, track, event, expected in (
+            ("event", "Afton", "No-Rules Race", "laps=7"),
+            ("free_roam", "Afton", "No-Rules Race", None),
+            ("career_roam", "HomeBase", "No-Rules Race", None),
+            ("event", "HomeBase", "Career Overworld (Free Roam)", None),
+        ):
+            with self.subTest(mode=mode, event=event):
+                spec = pie_host.build_pie_launch_spec(".", "test", track, mode=mode, event_name=event, laps=7)
+                parts = spec["env"]["EOD_DIRECT_START"].split(";")
+                self.assertEqual(next((part for part in parts if part.startswith("laps=")), None), expected)
 
 
 class TestEodWorldEditor(unittest.TestCase):
@@ -75,6 +244,12 @@ class TestEodWorldEditor(unittest.TestCase):
         cls.afton_hash_before = _sha256_file(afton_path)
         cls.afton_world = wl.load_track_world(afton_path, cls.game_dir, include_cars=True)
         cls.dundas_world = wl.load_track_world(dundas_path, cls.game_dir, include_cars=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        from workers import shutdown_editor_workers
+
+        shutdown_editor_workers()
 
     def test_01_discover_retail_tracks_and_cars(self) -> None:
         tracks = wl.discover_tracks(self.game_dir)
@@ -430,8 +605,9 @@ class TestEodWorldEditor(unittest.TestCase):
         self.assertEqual(spec_ps2["env"]["EOD_MODERN"], "0")
         self.assertIn("event=Battle", spec_ps2["direct_start"])
         self.assertIn("ai=0", spec_ps2["direct_start"])
-        self.assertEqual(spec_plume["env"]["EOD_MODERN"], "1")
-        self.assertEqual(spec_plume["env"]["EOD_NATIVE"], "0")
+        self.assertEqual(spec_plume["env"]["EOD_MODERN"], "0")
+        self.assertEqual(spec_plume["env"]["EOD_NATIVE"], "1")
+        self.assertEqual(spec_plume["env"]["EOD_LOOK"], "modern")
         self.assertIn("event=No-Rules Race", spec_plume["direct_start"])
         self.assertIn("car=Bus", spec_plume["direct_start"])
 
@@ -815,6 +991,19 @@ class TestEodWorldEditor(unittest.TestCase):
                 hub = hh.HomeHubDialog(self.game_dir)
                 self.assertGreaterEqual(hub.lst_tracks.count(), 15)
                 self.assertEqual(len(hub.recent_cards), 1)
+                hub.recents.append(dict(recents[0], project_name="Another saved project"))
+                hub._populate_recents()
+                hub.resize(800, 540)
+                hub.show()
+                self.app.processEvents()
+                self.assertEqual(hub.size().toTuple(), (800, 540))
+                self.assertEqual(hub.recent_cards[0].x(), hub.recent_cards[1].x())
+                self.assertEqual(hub.recents_scroll.horizontalScrollBar().maximum(), 0)
+                self.assertTrue(hub.rect().contains(hub.btn_create.mapTo(hub, hub.btn_create.rect().bottomRight())))
+                hub.resize(1100, 700)
+                self.app.processEvents()
+                self.assertEqual(hub.recent_cards[0].y(), hub.recent_cards[1].y())
+                self.assertLess(hub.recent_cards[0].x(), hub.recent_cards[1].x())
                 hub.chk_skip_hub.setChecked(True)
                 self.assertTrue(hh.load_editor_prefs()["skip_home_hub"])
                 hub.chk_skip_hub.setChecked(False)
@@ -1161,6 +1350,308 @@ class TestEodWorldEditor(unittest.TestCase):
                 f"sobl_scaled={rep['sobl_scaled_barriers']}, sobl_synth={rep['sobl_boxes_synthesized']} "
                 f"(track.sol boxes {retail_sobl_count}->{mod_sobl['count']})"
             )
+
+    def test_18_bulk_texture_pack_actions_round_trip(self) -> None:
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        win._attach_loaded_world(world)
+        mesh_menu = next(action.menu() for action in win.menuBar().actions() if action.text() == "&Mesh")
+        actions = {action.text(): action for action in mesh_menu.actions()}
+        try:
+            self.assertIn("Export All Track Textures to Folder...", actions)
+            self.assertIn("Import Texture Folder (HOSTTEX)...", actions)
+            texture = next(asset for asset in world.textures.values() if asset.ensure_identity()[0])
+            before = texture.rgba
+            with tempfile.TemporaryDirectory() as folder:
+                export_dir = Path(folder) / "export"
+                import_dir = Path(folder) / "import"
+                export_dir.mkdir()
+                import_dir.mkdir()
+                with patch.object(QFileDialog, "getExistingDirectory", return_value=str(export_dir)):
+                    actions["Export All Track Textures to Folder..."].trigger()
+                manifest = json.loads((export_dir / "manifest.json").read_text())
+                record = next(item for item in manifest["textures"] if item["name"] == texture.name)
+                self.assertTrue((export_dir / record["file"]).is_file())
+                color = (12, 34, 56, 255)
+                Image.new("RGBA", (16, 16), color).save(import_dir / record["file"])
+                with patch.object(QFileDialog, "getExistingDirectory", return_value=str(import_dir)):
+                    actions["Import Texture Folder (HOSTTEX)..."].trigger()
+                self.assertEqual(texture.rgba, bytes(color) * 256)
+                self.assertTrue(texture.is_replaced)
+                mod_dir = Path(folder) / "mod"
+                report = ps.export_mod_layer(world, "Texture Pack Test", mod_dir)
+                self.assertEqual(report["host_textures_exported"], 1)
+                self.assertIn(texture.index_key, (mod_dir / "HOSTTEX" / "replacements.tsv").read_text())
+                win.undo_stack.undo()
+                self.assertEqual(texture.rgba, before)
+                self.assertFalse(texture.is_replaced)
+        finally:
+            win.close()
+
+    def test_19_smart_barrier_actions_preserve_manual_edits_and_bake_noclip(self) -> None:
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        win._attach_loaded_world(world)
+        col_menu = next(action.menu() for action in win.menuBar().actions() if action.text() == "C&ollision")
+        actions = {action.text(): action for action in col_menu.actions()}
+        try:
+            self.assertIn("Clamp Sky-Walls to Asset Height", actions)
+            self.assertIn("Walls Noclip (Keep Ground Solid)", actions)
+            before = dict(world.collision.sobl_edits)
+            actions["Clamp Sky-Walls to Asset Height"].trigger()
+            self.assertGreater(len(world.collision.sobl_edits), len(before))
+            self.assertFalse(world.all_walls_noclip)
+            clamped = dict(world.collision.sobl_edits)
+            noclip = actions["Walls Noclip (Keep Ground Solid)"]
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                control = ps.export_mod_layer(world, "Barrier Test", root / "clamped")
+                control_ground, _ = wl.payload(Path(control["mod_trk"]), "track.bsc")
+                noclip.trigger()
+                self.assertTrue(world.all_walls_noclip)
+                self.assertEqual(world.collision.sobl_edits, clamped)
+                report = ps.export_mod_layer(world, "Barrier Test", root / "noclip")
+                self.assertTrue(report["all_walls_noclip"])
+                out_track = Path(report["mod_trk"])
+                sol, _ = wl.payload(out_track, "track.sol")
+                baked = ps.wc.parse_sobl(sol)["records"]
+                index = next(iter(clamped))
+                self.assertLess(baked[index]["centre"][1], -1000.0)
+                mod_ground, _ = wl.payload(out_track, "track.bsc")
+                self.assertEqual(mod_ground, control_ground)
+            noclip.trigger()
+            self.assertFalse(world.all_walls_noclip)
+            self.assertEqual(world.collision.sobl_edits, clamped)
+            win.undo_stack.undo()
+            self.assertTrue(noclip.isChecked())
+            win.undo_stack.undo()
+            self.assertFalse(noclip.isChecked())
+            win.undo_stack.undo()
+            self.assertEqual(world.collision.sobl_edits, before)
+        finally:
+            win.close()
+
+    def test_20_shutdown_cancels_running_thumb_workers(self) -> None:
+        import workers
+
+        self.assertTrue(hasattr(workers, "shutdown_editor_workers"))
+        started = threading.Event()
+        finished = threading.Event()
+        token = CancelToken()
+
+        def render_thumb(_item, _textures):
+            started.set()
+            deadline = time.monotonic() + 2.0
+            while not token.is_cancelled and time.monotonic() < deadline:
+                time.sleep(0.001)
+            finished.set()
+
+        worker = workers.ThumbnailBatchWorker([("thumb", None)], {}, render_thumb, token)
+        workers.start_worker(worker)
+        self.assertTrue(started.wait(2.0))
+        workers.shutdown_editor_workers()
+        self.assertTrue(token.is_cancelled)
+        self.assertTrue(finished.is_set())
+        self.assertNotIn(worker, workers._LIVE_WORKERS)
+
+    def test_21_inspector_environment_and_marker_edits_can_be_undone(self) -> None:
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        win._attach_loaded_world(world)
+        try:
+            original_environment = world.environment.to_dict()
+            win.open_environment_panel()
+            win.properties.env_preset_combo.setCurrentText("Golden Sunset")
+            self.assertEqual(world.environment.preset_name, "Golden Sunset")
+            win.properties.env_ambient.setValue(0.45)
+            self.assertAlmostEqual(world.environment.ambient_intensity, 0.45)
+            win.undo_stack.undo()
+            self.assertEqual(world.environment.preset_name, "Golden Sunset")
+            self.assertNotAlmostEqual(win.properties.env_ambient.value(), 0.45)
+            win.undo_stack.undo()
+            self.assertEqual(world.environment.to_dict(), original_environment)
+
+            marker = world.markers[0]
+            win.viewport.select_marker(marker)
+            original_name = marker.name
+            win.properties.mk_name_ed.setText("Renamed marker")
+            win.properties.mk_name_ed.editingFinished.emit()
+            self.assertEqual(marker.name, "Renamed marker")
+            win.undo_stack.undo()
+            self.assertEqual(marker.name, original_name)
+            self.assertEqual(win.properties.mk_name_ed.text(), original_name)
+        finally:
+            win.close()
+
+    def test_22_file_action_packages_unsaved_mod_to_verified_eodmod(self) -> None:
+        import mod_package
+
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        win._attach_loaded_world(world)
+        win.project_name = "Track Package Test"
+        file_menu = next(action.menu() for action in win.menuBar().actions() if action.text() == "&File")
+        actions = {action.text(): action for action in file_menu.actions()}
+        try:
+            self.assertIn("Package Mod as .eodmod...", actions)
+            action = actions["Package Mod as .eodmod..."]
+            self.assertEqual(action.shortcut().toString(), "Ctrl+Shift+E")
+            barrier = next(rec for rec in world.collision.sobl_records if rec.get("vertical"))
+            win.apply_barrier_height(barrier["index"], -0.5)
+            graph = world.road_graph
+            next(iter(graph.nodes.values())).x += 2.0
+            graph.dirty = False  # Earlier mod bakes clear this flag.
+            project_written_state = [obj.written for obj in world.objects]
+            texture_name = next(name for name, texture in world.textures.items() if texture.ensure_identity()[0])
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                png = root / "replacement.png"
+                Image.new("RGBA", (16, 16), (12, 34, 56, 255)).save(png)
+                win.replace_texture_from_png(texture_name, png)
+                output = root / "test.eodmod"
+                with patch.object(QDialog, "exec", return_value=QDialog.DialogCode.Accepted), \
+                        patch.object(QFileDialog, "getSaveFileName", return_value=(str(output), "")), \
+                        patch.object(QMessageBox, "critical") as error:
+                    action.trigger()
+                    self.assertIsNotNone(win._active_token)
+                    deadline = time.monotonic() + 30.0
+                    while win._active_token is not None and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(0.005)
+                    self.assertIsNone(win._active_token)
+                    error.assert_not_called()
+                verified = mod_package.verify(output, self.game_dir)
+                self.assertEqual(verified["id"], "track-package-test")
+                self.assertEqual(verified["version"], "1.0.0")
+                self.assertEqual(verified["host"], 1)
+                self.assertIn("native/DATA/TRACKS/AFTON.TRK/track.sol", verified["files"])
+                self.assertIn(f"native/DATA/TRACKS/AFTON.TRK/{graph.line_name}", verified["files"])
+                self.assertNotIn("env_override.ini", verified["files"])
+                self.assertIsNone(win.project_path)
+                self.assertEqual([obj.written for obj in world.objects], project_written_state)
+                self.assertEqual(_sha256_file(world.trk_path), self.afton_hash_before)
+        finally:
+            win.close()
+
+    def test_23_mod_manager_launches_private_profile_pie_overlay(self) -> None:
+        import os
+
+        import mod_install
+        import mod_manager
+        import mod_package
+
+        win = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        win._attach_loaded_world(world)
+        real_dialog = mod_manager.ModManagerDialog
+        barrier = next(rec for rec in world.collision.sobl_records if rec.get("vertical"))
+        win.apply_barrier_height(barrier["index"], -0.5)
+        file_menu = next(action.menu() for action in win.menuBar().actions() if action.text() == "&File")
+        action = next(action for action in file_menu.actions() if action.text() == "Mod Manager && Profiles...")
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                profiles = root / "profiles"
+                base_sol, _ = wl.payload(world.trk_path, "track.sol")
+                # Profile intentionally edits the same archive in a conflicting and a nonconflicting member.
+                edited_sol = bytearray(base_sol)
+                edited_sol[100] ^= 1
+                line_name = "oval.ild"
+                base_line, _ = wl.payload(world.trk_path, line_name)
+                line = ps.ilin_fmt.encode(base_line, {"node.0.x": 123.0})
+                baked = root / "baked" / world.trk_rel
+                baked.parent.mkdir(parents=True)
+                baked.write_bytes(mod_package.build_archive(
+                    world.trk_path, {"track.sol": bytes(edited_sol), line_name: line}
+                )[0])
+                package = root / "package"
+                mod_package.from_overlay(root / "baked", self.game_dir, "pie-profile", "1.0.0", package)
+                indexed = [
+                    (name, asset) for name, asset in world.textures.items()
+                    if asset.asset_id.startswith(world.trk_rel + "#") and all(asset.ensure_identity())
+                ]
+                edited_name, edited_texture = indexed[0]
+                _, retained_texture = next(
+                    (name, asset) for name, asset in indexed[1:] if asset.index_key != edited_texture.index_key
+                )
+                for idx, asset in enumerate((edited_texture, retained_texture)):
+                    image = root / f"profile-{idx}.png"
+                    Image.new("RGBA", (asset.orig_width, asset.orig_height), (200, 30, 40, 255)).save(image)
+                    mod_package.add_host(package, self.game_dir, asset.asset_id, image)
+                project_image = root / "authored.png"
+                Image.new("RGBA", (edited_texture.orig_width, edited_texture.orig_height), (30, 40, 200, 255)).save(project_image)
+                win.replace_texture_from_png(edited_name, project_image)
+                mod_install.install(package, self.game_dir, profile="selected", root=profiles)
+                original_active = Path(mod_install.launch_env(profile="selected", root=profiles)["EOD_MOD_DIR"])
+                original_bytes = (original_active / world.trk_rel).read_bytes()
+                profile_rows = {
+                    row[5]: row for row in (
+                        line.split("\t") for line in (original_active / "HOSTTEX/replacements.tsv").read_text().splitlines()[1:]
+                    )
+                }
+
+                def choose_dialog(game_dir, parent=None, **kwargs):
+                    dialog = real_dialog(game_dir, parent, root=profiles, **kwargs)
+
+                    def choose():
+                        deadline = time.monotonic() + 5
+                        while dialog._token is not None and time.monotonic() < deadline:
+                            self.app.processEvents()
+                            time.sleep(0.005)
+                        dialog.profile_picker.setCurrentText("selected")
+                        while dialog._token is not None and time.monotonic() < deadline:
+                            self.app.processEvents()
+                            time.sleep(0.005)
+                        self.assertTrue(dialog.play_free_roam_button.isEnabled())
+                        dialog.play_free_roam_button.click()
+                        return dialog.result()
+
+                    dialog.exec = choose
+                    return dialog
+
+                with patch.object(mod_manager, "ModManagerDialog", side_effect=choose_dialog), \
+                        patch.object(win.pie_host, "start_pie", return_value=True) as spawn, \
+                        patch.object(QMessageBox, "critical") as error, \
+                        patch.dict(os.environ, {"EOD_MOD_DIR": str(root / "unrelated-overlay")}):
+                    action.trigger()
+                    deadline = time.monotonic() + 30
+                    while win._active_token is not None and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(0.005)
+                    error.assert_not_called()
+                    spawn.assert_called_once()
+                    self.assertEqual(os.environ["EOD_MOD_DIR"], str(root / "unrelated-overlay"))
+                    spec = spawn.call_args.args[0]
+                    overlay = Path(spec["env"]["EOD_MOD_DIR"])
+                    self.assertNotEqual(overlay, original_active)
+                    merged = overlay / world.trk_rel
+                    self.assertEqual(wl.payload(merged, line_name)[0], line)
+                    merged_sol = wl.payload(merged, "track.sol")[0]
+                    self.assertNotEqual(merged_sol, base_sol)
+                    self.assertNotEqual(merged_sol, bytes(edited_sol))
+                    self.assertEqual((original_active / world.trk_rel).read_bytes(), original_bytes)
+                    self.assertTrue((overlay / "env_override.ini").is_file())
+                    merged_rows = {
+                        row[5]: row for row in (
+                            line.split("\t") for line in (overlay / "HOSTTEX/replacements.tsv").read_text().splitlines()[1:]
+                        )
+                    }
+                    self.assertEqual(len(merged_rows), 2)
+                    retained = merged_rows[retained_texture.asset_id]
+                    self.assertEqual(retained[1], retained_texture.palette_key)
+                    self.assertEqual(
+                        (overlay / "HOSTTEX" / retained[4]).read_bytes(),
+                        (original_active / "HOSTTEX" / profile_rows[retained_texture.asset_id][4]).read_bytes(),
+                    )
+                    self.assertNotEqual(
+                        (overlay / "HOSTTEX" / merged_rows[edited_texture.asset_id][4]).read_bytes(),
+                        (original_active / "HOSTTEX" / profile_rows[edited_texture.asset_id][4]).read_bytes(),
+                    )
+                    win.stop_pie()
+                    self.assertFalse(overlay.exists())
+                self.assertEqual(_sha256_file(world.trk_path), self.afton_hash_before)
+        finally:
+            win.close()
 
     def test_17_stupid_angle_3d_ilin_ramps_and_pie_dpi_rect(self) -> None:
         import math

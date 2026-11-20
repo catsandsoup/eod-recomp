@@ -29,13 +29,13 @@ from rst0 import eod_crc
 from asset_registry import (analyze_tex, classify_role, inventory, link_records, link_runtime_keys,
                             member_record, run_tasks, sha256)
 from tex import write_png
+from mod_package import MAX_SIDE as MAX_HOST_SIDE
 
 SCHEMA_VERSION = 1
 TOOL = "texture_export"
 TOOL_VERSION = "1"
 MANIFEST = "export-manifest.json"
 ROLES = ("sky", "vehicle-paint", "vehicle", "track", "ui", "font", "other")
-MAX_HOST_SIDE = 4096
 
 
 class ExportError(Exception):
@@ -362,7 +362,7 @@ def classify_reimport(manifest, asset, png):
 
     native-same-size: dimensions equal the original and the texture is natively
     editable. host-replacement: indexed texture (has runtime keys) and
-    dimensions are origW*k by origH*k, k a power of two, each side <= 4096."""
+    dimensions are origW*k by origH*k, k a power of two, with at most 8192 pixels per side."""
     if not isinstance(manifest, dict):
         manifest = json.loads(Path(manifest).read_text())
     found = next((a for a in manifest["assets"] if _fold(a["assetId"]) == _fold(asset)), None)
@@ -384,7 +384,7 @@ def classify_reimport(manifest, asset, png):
         reasons["host-replacement"] = "not a uniform integer multiple of the original"
     else:
         k = width // ow
-        if k & (k - 1):
+        if k < 1 or k & (k - 1):
             reasons["host-replacement"] = f"scale {k} is not a power of two"
         elif max(width, height) > MAX_HOST_SIDE:
             reasons["host-replacement"] = f"{width}x{height} exceeds {MAX_HOST_SIDE} per side"

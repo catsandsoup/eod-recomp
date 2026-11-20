@@ -22,6 +22,47 @@ ninja -C build-mac
 
 Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless --data ... --frames N --screenshot-every 300 --screenshot-dir out`.
 
+For Plume development, configure a separate build with
+`-DEOD_PLUME=ON`. With `EOD_NATIVE=1`, Plume and the GS share one
+Vulkan device through MoltenVK. Confirm the runtime prints
+`[vulkan] device owned by plume`. Set `EOD_PLUME=0` to exercise the
+standalone Vulkan GS using the same executable. This build exercises the
+Vulkan rendering path on Apple Silicon. The master specification tracks
+the dedicated Metal backend and fullscreen performance separately.
+
+`RenderScale=7` and `RenderScale=8` request 4480×3136 and 5120×3584
+internal resolution on the Vulkan path. Vulkan limits the selected scale
+if the device cannot allocate the largest supported GS render target.
+Automatic scaling retains its existing ceiling of 6×.
+
+## World Editor and Creation Kit
+
+Extract `EOD-World-Editor-macOS-arm64.zip` and open **EOD World Editor.app**
+in Finder. The app includes Qt, Python, the Plume viewport library, and
+its Play In Editor game runtime. Play In Editor opens a separate game
+window on macOS and uses the editor's selected disc directory.
+The default disc location is
+`~/Library/Application Support/TDEODRecomp/disc`. Use **File → Set Game
+Data Directory** to select a different extracted disc.
+
+The separate native **EOD Creation Kit Development.app** opens from
+Finder and includes its own Python backend. See
+[Creation Kit release notes](CREATION_KIT_RELEASE.md) for setup.
+
+For a local World Editor package, use a Mac Python environment with
+PySide6, NumPy, Pillow, PyOpenGL and PyInstaller installed. Build
+`eod` and `eod_editor_plume` with `EOD_PLUME=ON`, then run:
+
+```bash
+python tools/package_macos_world_editor.py \
+  --game-executable build-mac-plume/eod \
+  --plume-library build-mac-plume/eod_editor_plume.dylib \
+  --output build/world-editor-package
+```
+
+The packager stages an ad hoc-signed app and ZIP. Public downloads
+need Developer ID signing and Apple notarization to pass Gatekeeper.
+
 ## What works (verified 2026-10-16, M2 Pro, headless)
 
 - Boot, intro movies, title screen, main menu, Action > Race > Multi.
@@ -42,6 +83,12 @@ Headless, muted test run: `EOD_HEADLESS=1 EOD_MUTE=1 ./build-mac/eod --headless 
 | Input ports | Automatic (`KeyboardPort=-1`, or `EOD_KEYBOARD_PORT=auto`) assigns the first pad to P1 and then the keyboard to P2; a second pad takes P2. Keyboard alone starts on P1. Existing connected pads keep their ports on hot-plug; known reconnects restore free remembered slots. Explicit INI ports 0 (off), 1, 2 retain legacy behavior; environment ports are `none`, 1, 2. Saved settings are preserved. |
 | Test input | `EOD_PAD_SCRIPT` (port 1) and `EOD_PAD_SCRIPT1` (port 2), optional left stick per entry: `frame:buttons:lx:ly`. |
 | Threads | EE, GS, raster and offload threads ask for user-interactive QoS (P-cores). `EOD_GS_RASTER=n` is no longer capped at 4 when given explicitly. |
+
+With Plume active, press **F9** (often **Fn + F9** on a Mac keyboard) to switch
+between Classic and Modern. In an offline race, player 1 can hold **L1 + R1**
+and click the right stick instead. The selected look appears on screen.
+`EOD_LOOK=modern` starts the game in Modern. The macOS launcher’s **Renderer**
+setting selects the graphics backend at startup.
 
 ## Remaining validation
 

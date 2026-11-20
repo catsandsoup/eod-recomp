@@ -55,7 +55,7 @@ int port_of(SDL_JoystickID id);  // -1 when not on a port
 // SDL gamepad -> DualShock 2: buttons, 0..255 sticks (dead zone), triggers as
 // L2/R2 pressure plus the digital bit (Original), or Cross/Square pressure
 // for analog throttle/brake (Modern).
-void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused = true);
+void read_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused = true, bool graphics_chord = false);
 // Menu input never converts RT/LT driving axes into confirm/delete buttons.
 void read_menu_gamepad(SDL_Gamepad *gp, HostPadState *out, bool focused = true);
 uint8_t stick_byte(Sint16 v);    // -32768..32767 -> 0..255, centre 128, dead zone

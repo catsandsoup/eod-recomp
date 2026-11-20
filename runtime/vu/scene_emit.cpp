@@ -861,8 +861,10 @@ bool is_sky_dome(const VUState *vu, uint32_t pc, uint32_t itop) {
     return false;
 }
 
+bool observing_vu() { return g_frame_active; }
+
 bool vu1_start(const VUState *vu, uint32_t pc) {
-    if (!g_frame_active) return false;
+    if (!observing_vu()) return false;
     EOD_ZONE("emit.vu1_start");
     const uint64_t t = now_ns();
     finish_pending();

@@ -37,17 +37,28 @@ void f_002C7340_orig(void);
 void f_00270C10_orig(void);
 }
 extern uint64_t kernel_vblank_count();
+void arcade_mod_badges_run_menu(uint32_t caller, void (*run_menu)());
 extern "C" {
 void f_00120650_orig(void);
 void f_00120FB8_orig(void);
 void f_002A2C98(void);
 void f_002A3220(void);
+void f_002B9858(void);
+void f_002E66B8(void);
+void f_002E66D8(void);
+void f_002E66F8(void);
+void f_00335110(void);
+void f_003356D0(void);
 void f_00119428(void);
 void f_00128CB0(void);
 void f_002C1338(void);
 void f_00120BE8(void);
 void f_001252C0(void);
 void f_00123958(void);
+void f_0012CC40(void);
+void f_002E06A0(void);
+void f_002E0AF8(void);
+void f_002E0098(void);
 }
 
 namespace {
@@ -57,6 +68,9 @@ constexpr uint32_t kVehicleTable = 0x003CBEE4, kVehicleCount = 0x00439704, kVehi
 constexpr uint32_t kTrackerPtr = 0x003C4BF8, kTrackerCount = 0xC, kTrackerList = 0x1798;
 constexpr uint32_t kFlags = 0x003C4190;  // bit 0 is held set for the duration of a single player session
 constexpr uint32_t kActionMode = 0x12F;
+constexpr uint32_t kHeadToHeadMode = 0x131;
+constexpr uint32_t kSessionEventType = 0x9A4, kSessionLaps = 0x9B0, kSessionContest = 0x9D0;
+constexpr uint32_t kLapRaceFlag = 0x100;
 
 bool ieq(const std::string &a, const std::string &b) {
     if (a.size() != b.size()) return false;
@@ -144,6 +158,45 @@ int find_eve(const std::string &track) {
             }
     }
     return -1;
+}
+
+bool has_active_contest(uint32_t eve) {
+    // The first contest lookup after the picker (0x1252F0) requires an
+    // enabled record for this Eve, even when the event is chosen manually.
+    const uint32_t n = std::min(ee_r32(kContestCount), battle_layout::kContestCapacity);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t record = battle_layout::kContestTable + i * battle_layout::kContestStride;
+        if (ee_r32(record + 4) == eve && ee_r32(record + 36)) return true;
+    }
+    return false;
+}
+
+bool head_to_head_track_visible(uint32_t eve_record) {
+    // The retail list builder (0x2C71B0) reads the Eve's "hidden" attribute
+    // through the section vtable before the picker tests the profile lock.
+    constexpr uint32_t kHiddenKey = 0x0041A660;
+    const uint32_t section = ee_r32(eve_record + 0x80);
+    if (!section) return false;
+    const uint32_t vtable = ee_r32(section);
+    const EEFunc get_string = ee_lookup_func(ee_r32(vtable + 0x18));
+    if (!get_string) return false;
+    const std::string hidden = guest_text(native(get_string, {section, kHiddenKey, 0}));
+    if (ieq(hidden, "yes")) return false;
+    if (!ieq(hidden, "until_career_done")) return true;
+    native(f_002E06A0);
+    const bool career_done = native(f_002E0AF8) != 0;
+    native(f_002E0098);
+    return career_done;
+}
+
+const char *head_to_head_track_unavailable(int eve) {
+    if (ee_r32(kMode) != kHeadToHeadMode) return "head-to-head catalog is inactive";
+    if (eve < 0) return "absent from head-to-head catalog";
+    if (!has_active_contest((uint32_t)eve)) return "no active contest";
+    const uint32_t record = kEves + (uint32_t)eve * kEveStride;
+    if (!head_to_head_track_visible(record)) return "hidden in native picker";
+    if (!native(f_0012CC40, {record + 0x28})) return "locked in native picker";
+    return nullptr;
 }
 
 std::string canonical_contest_alias(const std::string &name) {
@@ -338,6 +391,29 @@ long find_car(const std::string &car, int paint) {
     return first_match;
 }
 
+std::vector<uint32_t> split_vehicle_numbers(uint32_t selected, size_t seats) {
+    const uint32_t table = ee_r32(kVehicleTable), count = ee_r32(kVehicleCount);
+    if (!table || !count || count > 4096) return {};
+
+    std::string model;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t record = table + i * kVehicleStride;
+        if (ee_r32(record + 4) != selected) continue;
+        model = guest_text(record + 8, 32);
+        break;
+    }
+    if (model.empty()) return {};
+
+    std::vector<uint32_t> cars = {selected};
+    for (uint32_t i = 0; i < count && cars.size() < seats; ++i) {
+        const uint32_t record = table + i * kVehicleStride;
+        const uint32_t number = ee_r32(record + 4);
+        if (guest_text(record + 8, 32) == model &&
+            std::find(cars.begin(), cars.end(), number) == cars.end())
+            cars.push_back(number);
+    }
+    return cars;
+}
 
 }  // namespace
 namespace session_catalog {
@@ -420,23 +496,34 @@ void start() {
         log("mode is %x with %u Eves: selecting Action (0x123958)", ee_r32(kMode), ee_r32(kEveCount));
         native(f_00123958);
     }
-    const int eve = find_eve(P.req.track);
-    if (eve < 0) { std::fprintf(stderr, "[SESSION] unknown track '%s'\n", P.req.track.c_str()); return; }
+    // GameDoHeadToHead loads its own catalog (mode 0x131), which is only available
+    // after the join screen has registered the players.
+    const bool split = P.req.humans > 1;
+    const int eve = split ? -1 : find_eve(P.req.track);
+    if (!split && eve < 0) { std::fprintf(stderr, "[SESSION] unknown track '%s'\n", P.req.track.c_str()); return; }
     const std::string event = session_event_name(P.req);
-    const int contest = find_contest((uint32_t)eve, event);
-    if (contest < 0) { std::fprintf(stderr, "[SESSION] Eve %d has no event '%s'\n", eve, event.c_str()); return; }
+    const int contest = split ? -1 : find_contest((uint32_t)eve, event);
+    if (!split && contest < 0) { std::fprintf(stderr, "[SESSION] Eve %d has no event '%s'\n", eve, event.c_str()); return; }
     const long car = find_car(P.req.car, P.req.paint);
     if (car < 0) { std::fprintf(stderr, "[SESSION] no vehicle '%s' paint %d\n", P.req.car.c_str(), P.req.paint); return; }
-    P.eve = (uint32_t)eve; P.contest = (uint32_t)contest; P.car = (uint32_t)car;
-    std::fprintf(stderr, "[SESSION] start: Eve %d '%s' contest %d '%s' vehicle %ld humans %d\n", eve,
-                 guest_text(kEves + P.eve * kEveStride + 0x28, 40).c_str(), contest, event.c_str(), car, P.req.humans);
+    P.car = (uint32_t)car;
+    if (split)
+        std::fprintf(stderr, "[SESSION] head-to-head request: track '%s' event '%s' vehicle %ld humans %d\n",
+                     P.req.track.c_str(), event.c_str(), car, P.req.humans);
+    else {
+        P.eve = (uint32_t)eve;
+        P.contest = (uint32_t)contest;
+        const std::string track = guest_text(kEves + P.eve * kEveStride + 0x28, 40);
+        std::fprintf(stderr, "[SESSION] start: Eve %d '%s' contest %d '%s' vehicle %ld humans %d\n",
+                     eve, track.c_str(), contest, event.c_str(), car, P.req.humans);
+    }
     P.armed = true;
     // MenuDoRace's "single" branch (0x2C0E4C-0x2C0E74), minus the menu: bit 0 of the global
     // flags is held while the session runs, the profile name goes to human 0, then the
     // single player driver (which sets the human count and pad map itself).
     const uint32_t old = ee_r32(kFlags) & 1;
     ee_w32(kFlags, ee_r32(kFlags) | 1);
-    if (P.req.humans > 1) {
+    if (split) {
         // MenuDoRace's "multi" branch (0x2C0DF4-0x2C0E18) minus the menu and its pad-count prompt: the
         // head-to-head driver, whose join/car screen (0x2B7710 below) sets the human count and cars.
         native(f_002A3220);
@@ -496,11 +583,13 @@ bool session_parse(const char *text, SessionRequest &out, std::string &err) {
         else if (key == "paint") { if (!number(val, v) || v < 0 || v > 63) { err = "bad paint '" + val + "'"; return false; } r.paint = (int)v; }
         else if (key == "humans") { if (!number(val, v) || v < 1 || v > 4) { err = "bad humans '" + val + "'"; return false; } r.humans = (int)v; }
         else if (key == "ai") { if (!number(val, v) || v < 0 || v > 12) { err = "bad ai '" + val + "'"; return false; } r.ai = (int)v; }
+        else if (key == "laps") { if (!number(val, v) || v < 1 || v > 50) { err = "bad laps '" + val + "'"; return false; } r.laps = (int)v; }
         else if (key == "place") r.place = val;
         else if (key == "eve") { if (!number(val, v) || v < 0 || v > 63) { err = "bad eve '" + val + "'"; return false; } r.eve = (int)v; }
         else { err = "unknown key '" + key + "'"; return false; }
     }
     if (r.humans > 1 && r.ai >= 0) { err = "humans > 1 takes no ai= (head-to-head races have no AI roster choice)"; return false; }
+    if (r.laps >= 0 && (r.humans > 1 || r.mode != "action")) { err = "laps= requires single-player Action"; return false; }
     if (r.mode == "career") {
         if (!r.track.empty() || !r.event.empty() || !r.car.empty() || r.ai >= 0)
             { err = "career takes place= and eve=, not track/event/car/ai"; return false; }
@@ -651,7 +740,7 @@ extern "C" void f_00270C10(void) {
         if (caller == 0x003861B4 || caller == 0x00383C94) { log("career: note %08x closed", caller); ret_s32(-2); return; }
         if (caller == 0x0036AB8C) { P.career_driving = true; log("career: hub answered Drive Around (4)"); ret_s32(4); return; }
     }
-    f_00270C10_orig();
+    arcade_mod_badges_run_menu(caller, f_00270C10_orig);
     // Developer (EOD_MENU_RUN_TRACE=1): every native menu screen's caller and the answer it returned, the map
     // a direct start needs to answer a screen without showing it.
     static const bool trace = std::getenv("EOD_MENU_RUN_TRACE") != nullptr;
@@ -696,25 +785,49 @@ extern "C" void f_002A75E0(void) {
     f_002A75E0_orig();
 }
 
-// Head-to-head join/car screen: (i32 *players, i32 cars[]). Answered once with the requested human count,
-// every player in the requested car; when the race returns to it, "back" (1) ends the session.
-// The screen itself runs: only its menu loop (MenuRun, called at 0x2B8118) is answered, after the join
-// records the UI would fill are written. The screen's own "play" branch then registers every human (pad map
-// 0x13D448, name 0x1193B0, profile 0x119410, count 0x12A260) as the event rosters need.
-constexpr uint32_t kJoinRecords = 0x003D7B18, kJoinStride = 0x24, kJoinCount = 0x003D7BA8;
+// Head-to-head join/car screen: (i32 *players, i32 cars[]). Answered once with the requested human count.
+// The screen's play branch sorts active join records by pad and registers the pad,
+// vehicle, name and profile through the same path as the retail menu.
 bool head_to_head_menu() {
     if (P.players_done) { log("head-to-head: back to the front end"); ret_s32(1); return true; }
-    P.players_done = true;
-    for (int i = 0; i < P.req.humans; ++i) {
-        const uint32_t r = kJoinRecords + kJoinStride * (uint32_t)i;
-        for (uint32_t o = 0; o < kJoinStride; o += 4) ee_w32(r + o, 0);
-        ee_w32(r + 0x00, (uint32_t)i);  // pad port
-        ee_w32(r + 0x04, P.car);        // vehicle
-        const std::string name = guest_text(native(f_00119428, {(uint32_t)i}), 0x13);
-        for (size_t k = 0; k < name.size(); ++k) MEM_SB(r + 0x08 + (uint32_t)k, (uint8_t)name[k]);
+    const bool multitap = native(f_00335110) != 0;
+    const int capacity = multitap ? 4 : 2;
+    uint32_t pads[4];
+    int connected = 0;
+    for (int seat = 0; seat < capacity; ++seat) {
+        // Lobby conversion 0x2BAA78 maps panels to game pad IDs 0,4 or 0,1,2,3.
+        const uint32_t pad = multitap ? (uint32_t)seat : (uint32_t)seat * 4;
+        if (native(f_003356D0, {pad})) pads[connected++] = pad;
     }
-    ee_w32(kJoinCount, (uint32_t)P.req.humans);
-    log("head-to-head: %u players joined, vehicle %u each", (uint32_t)P.req.humans, P.car);
+    if (connected < P.req.humans || native(f_002E66F8) < (uint32_t)P.req.humans) {
+        log("head-to-head: %u seats available for %u requested, using native join lobby",
+            (uint32_t)connected, (uint32_t)P.req.humans);
+        P.armed = false;
+        return false;
+    }
+    // The native roster resolves human ownership by vehicle number. Reusing a
+    // number drops the earlier seat. Keep P1's paint and use other paints of
+    // the requested model for the other seats.
+    const auto cars = split_vehicle_numbers(P.car, (size_t)P.req.humans);
+    if (cars.size() < (size_t)P.req.humans) {
+        log("head-to-head: vehicle %u has too few paint records for %u seats, using native join lobby",
+            P.car, (uint32_t)P.req.humans);
+        P.armed = false;
+        return false;
+    }
+    P.players_done = true;
+    for (uint32_t i = 0; i < (uint32_t)P.req.humans; ++i) {
+        const uint32_t join = native(f_002B9858); // Sets active and increments the join count.
+        ee_w32(join, pads[i]);
+        ee_w32(join + 0x04, cars[i]);
+        const uint32_t name = native(f_002E66D8, {i});
+        char display_name[18]{};
+        ee_read_string(name, display_name, sizeof(display_name));
+        for (uint32_t k = 0; k < sizeof(display_name); ++k)
+            ee_w8(join + 0x08 + k, (uint8_t)display_name[k]);
+        ee_w32(join + 0x1C, native(f_002E66B8, {i}));
+        log("head-to-head: seat %u joined on pad %u, vehicle %u", i + 1, pads[i], cars[i]);
+    }
     ret_s32(0);
     return true;
 }
@@ -765,6 +878,19 @@ extern "C" void f_002C7340(void) {
         return;
     }
     if (P.armed && !P.track_done) {
+        if (P.players_done) {
+            const int eve = find_eve(P.req.track);
+            if (const char *reason = head_to_head_track_unavailable(eve)) {
+                std::fprintf(stderr, "[SESSION] head-to-head: track '%s' %s, using native track picker\n",
+                             P.req.track.c_str(), reason);
+                P.armed = false;
+                f_002C7340_orig();
+                return;
+            }
+            P.eve = (uint32_t)eve;
+            const std::string track = guest_text(kEves + P.eve * kEveStride + 0x28, 40);
+            std::fprintf(stderr, "[SESSION] head-to-head: live track Eve %u '%s'\n", P.eve, track.c_str());
+        }
         P.track_done = true;
         ee_w32(arg_u32(0), P.eve);
         ee_w32(arg_u32(1), 5);
@@ -779,11 +905,40 @@ extern "C" void f_002C7340(void) {
 // First event setup of the session: put the chosen event in the native tracker's pending slot
 // so 0x120650 starts it instead of the Eve's opening lobby event.
 extern "C" void f_00120650(void) {
-    // Head-to-head builds its rosters in its own event lobby: pre-selecting a contest there leaves player 0
-    // out of the event (game panic "Didn't find player 0 in event 0"), so its lobby runs natively.
-    if (P.armed && !P.event_done && P.req.humans > 1) {
+    const uint32_t session = g_ee.r[4].uw[0];
+    int laps = -1;
+    uint32_t selected_contest = 0;
+    if (P.armed && !P.event_done && P.players_done) {
         P.event_done = true;
-        log("head-to-head: event chosen in the native lobby");
+        const uint32_t tracker = ee_r32(kTrackerPtr);
+        const uint32_t count = tracker ? ee_r32(tracker + kTrackerCount) : 0;
+        const std::string wanted = session_event_name(P.req);
+        int pos = -1;
+        long requested_pos = -1;
+        if (!wanted.empty() && wanted[0] == '#') {
+            if (number(wanted.substr(1), requested_pos) && requested_pos >= 0 &&
+                static_cast<unsigned long>(requested_pos) < count)
+                pos = (int)requested_pos;
+        } else {
+            const std::string canonical = canonical_contest_alias(wanted);
+            for (uint32_t i = 0; i < count && i < 64; ++i) {
+                const uint32_t contest = ee_r32(tracker + kTrackerList + 4 * i);
+                const std::string name = guest_text(native(f_001252C0, {contest}), 40);
+                if (ieq(name, wanted)) { pos = (int)i; break; }
+                if (pos < 0 && ieq(canonical_contest_alias(name), canonical)) pos = (int)i;
+            }
+        }
+        if (pos >= 0) {
+            // Native EventSetupSelectInitial below builds the selected event's roster
+            // before GameDoHeadToHead can enter the race.
+            const uint32_t contest = ee_r32(tracker + kTrackerList + 4 * (uint32_t)pos);
+            native(f_00120BE8, {(uint32_t)pos});
+            log("head-to-head: selected tracker position %u (contest %u)", (uint32_t)pos, contest);
+        } else {
+            std::fprintf(stderr, "[SESSION] head-to-head: event '%s' unavailable, using native event lobby\n",
+                         wanted.c_str());
+            P.armed = false;
+        }
     }
     if (P.armed && !P.event_done) {
         P.event_done = true;
@@ -792,7 +947,7 @@ extern "C" void f_00120650(void) {
         int pos = -1;
         for (uint32_t i = 0; i < count && i < 64; ++i)
             if (ee_r32(tracker + kTrackerList + 4 * i) == P.contest) pos = (int)i;
-        // Head-to-head lists its own contests (other ids than single player): match the event by name.
+        // Match by name if the catalog ID does not appear in the active tracker.
         const std::string wanted = session_event_name(P.req);
         for (uint32_t i = 0; pos < 0 && i < count && i < 64; ++i)
             if (ieq(guest_text(native(f_001252C0, {ee_r32(tracker + kTrackerList + 4 * i)}), 40), wanted)) pos = (int)i;
@@ -803,7 +958,9 @@ extern "C" void f_00120650(void) {
             std::fprintf(stderr, "\n");
         }
         if (pos >= 0) {
+            selected_contest = ee_r32(tracker + kTrackerList + 4 * (uint32_t)pos);
             native(f_00120BE8, {(uint32_t)pos});
+            laps = P.req.laps;
             log("event pre-selected: tracker position %u (contest %u)", (uint32_t)pos, P.contest);
         } else {
             log("contest %u is not in the tracker list (%u entries): native lobby", P.contest, count);
@@ -824,6 +981,17 @@ extern "C" void f_00120650(void) {
         }
     }
     f_00120650_orig();
+    if (laps < 0 || ee_r32(session + kSessionContest) != selected_contest) return;
+    if (!(ee_r32(session + kSessionEventType) & kLapRaceFlag)) {
+        log("laps= ignored for contest %u (no lap race)", selected_contest);
+        return;
+    }
+    // Native setup scales the catalog lap count by the profile race length, then copies it here.
+    // 0x114860 uses this session descriptor to initialize the race. Override the final count
+    // for this race while keeping the catalog and profile available for later native events.
+    const uint32_t previous = ee_r32(session + kSessionLaps);
+    ee_w32(session + kSessionLaps, (uint32_t)laps);
+    log("race lap count set to %u (was %u, contest %u)", (uint32_t)laps, previous, selected_contest);
 }
 
 // EveHasMoreEvents (0x120FB8) is checked before each contest in GameDoSingle's inner loop

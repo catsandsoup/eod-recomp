@@ -227,6 +227,34 @@ Run: Dundas 'Battle (8 AI)', Hearse (`vehicle 502`), `EOD_CHICKENS=1` (L2 every 
 | Posed vertices vs GS (1x, non-clip) | 9,364 objects (4,672,296 vertices) | 4,667,998 within `1/16 px` (99.91%) | p99 `0.0625 px`, max `0.0672 px`, mean `0.0386 px` (bind pose off > `1/16 px` at 3,277,330 vertices) |
 | Posed vertices vs GS (1x, clip path) | 764 objects (247,134 vertices) | 232,170 within `1/16 px` (93.94%) | CPU frustum re-clip vs VU1 clipper |
 
+### R3.2a Classic static queue projection at 1×
+
+Identical recorded Dundas GS inputs and submitted transforms replayed on the
+Mac M2 Pro through MoltenVK. Red and green used the same forward samples and
+the same native vertex indices inside the original reverse scissor margin.
+
+| Input | Forward misses before / after | Reverse misses before / after | Max error after |
+| --- | ---: | ---: | ---: |
+| Moving camera | 4,087 / 0 of 3,689,031 | 1,981 / 0 of 1,954,037 | 0.00005261 px |
+| Batch `0x00924DD8` | 21 / 0 of 14,148 | 12 / 0 of 8,864 | 0.00003702 px |
+| Fixed-position TV camera | 905 / 0 of 728,688 | 457 / 0 of 358,704 | 0.00002758 px |
+
+The TV camera held its position within 0.000025 world units across 82 captured
+frames. Clip Z/W remained bit-identical across 2,035,964 moving GPU samples
+against the original default arithmetic. The Plume graphics fixture failed
+on the old projection and passed with the new vertex entry and a nonzero
+instance index. Existing Classic and Modern fixture colors matched in both
+builds. The excluded posed control had 0 of 118,680 forward and 0 of 76,679
+reverse misses. The clipped control still had 5,740 of 53,376 forward misses.
+Late dent-input integrity, clipping-generated geometry and topology remain
+open in R3.1 and R3.2.
+
+The exact shared Mac build passed 97/97 tests. The 1× live Classic TV and
+moving Dundas runs each recorded zero non-clip forward and reverse misses
+across 10,663,728 and 22,525,389 GS samples. A Modern-start smoke completed
+eight switches with 22 pipelines at first switch and exit. Windows x64
+cross-linked. Windows runtime verification remains open.
+
 ### P1: multi-scene suite (`EOD_NATIVE=1 EOD_DIFF=... EOD_HEAP_CHECK=1`)
 
 Special vehicles rotated without Venom or back-to-back repeats; camera views cycled via Triangle
@@ -398,9 +426,13 @@ Limo only (A5, Classic too), not on Dundas Bus.
 
 ### Open items (R6 -> R7)
 
-- Row 1 on a dark night track: Hampton native-only frames are 44..52% non-zero (bar 50%), Gilroy
-  night in A2 was 59..63%. Row 1's 50% bar is a daylight bar or Plume misses night geometry: decide
-  at the R7 image step (no image comparison before then).
+- Hampton night Row 1 passed on the Apple M2 Pro Vulkan/MoltenVK build with Modern native-only at
+  1×. The 48 race captures taken from vblank 400 onward had at least 58.20% non-black pixels and
+  mean luminance of 11.21 or greater. At GS frame 1501, Plume drew all 948,607 submitted world
+  leaves across 1,367 measured frames. A legacy `ModernRenderer=1` setting had drawn zero native
+  world geometry before the two rendering paths were made mutually exclusive. The passing run
+  kept the legacy setting and `EOD_MODERN=1` to exercise that fix. Native-only GS drops remained
+  and the full R6 and R7 scene gates still require separate runs.
 - 2P (`humans=2`): the pad Triangle did not change the camera (`[camera]` logs Cockpit only) and
   the textures stay at 32.0 MB; split-screen (view count `0x3D1A74` = 2) is not proven by this run.
 - `0x214B68` first-call field on Gilroy Limo (stride 0x70 at `0x772C60`): accepted, not fixed.

@@ -324,6 +324,34 @@ redlight (GILROY.TRK). Night run: Gilroy 'Battle (8 AI)', Ambulance.
 - Phase B: multi-scene suite (P2 within 1/16 px on every posed vertex, crashes, rollovers, 8
   panels, 16 wheels), split screen, docs/NATIVE_RENDERER_SUCCESS.md.
 
+### R3.2a Classic static queue projection
+
+On the `fd0ce30ab0ec263c` VU1 image, `0x02A8` reads ITOP bit 9 and enters
+the non-clipping loop at `0x1BD8` when the bit is clear. The first vertex adds
+TOP+199 to the decoded position at `0x1C28`. The loop applies vf4–vf7 in
+the MULAX, MADDAY, MADDAZ, MADDW order at `0x1C30–0x1C48`, followed by
+DIV, MULQ and FTOI4 at `0x1C60–0x1CA8`. Setup `0x0000` formed those rows
+from the camera and model packets (`0x35B3D0`, `0x35CD28`).
+
+On the same Dundas vertices, both the double-precision P2 check and the
+submitted float clip-space transform crossed fixed-point boundaries. The
+existing VU-ordered matrix construction matched 371,280 recorded vf4–vf7
+words in the moving trace, and 232,023 checked native source positions
+matched the VU inputs with homogeneous W equal to 1.
+
+For unskinned, unposed Classic queue draws with ITOP bit 9 clear,
+`vs_static_queue` reads the rounded X/Y/W rows and GS viewport mapping
+from a per-flush instance stream. It applies VU-order projection and
+FTOI4 to XY, retaining the existing vertex shader's clip Z/W, texture Q
+and shading. The draw order, indices, scissor and depth state use the
+same path. The pre-FTOI4 P2 comparison retains its 1/16 px threshold.
+The shader requires Vulkan 1.2 or higher and advertised float32
+signed-zero/Inf/NaN preservation. The SPIR-V execution mode selects
+precise arithmetic for this stage on MoltenVK, where NoContraction alone
+misses the GS grid. Modern first-use warms the Classic variant for later
+switches. See [R3.2a results](NATIVE_RENDERER_SUCCESS.md#r32a-classic-static-queue-projection-at-1).
+[MoltenVK shader float controls](https://github.com/KhronosGroup/MoltenVK/blob/main/Docs/MoltenVK_Configuration_Parameters.md#mvk_config_fast_math_enabled)
+
 ## Stage R2: track world, sky and water (specification)
 
 Written before the code (rule 6.2). Sources: PS2 Ghidra decompile and `tools/ee_dis.py` of
@@ -748,9 +776,9 @@ Built on the native Plume path only (never the old `ModernRenderer=1` GS-traffic
 
 | Item | Rule |
 |---|---|
-| `Look=Classic` (default) | the R5 shaders (`native_shaders.hlsl` `vs_main` / `ps_main`, SPIR-V unchanged) and the same pipeline keys: byte-identical to R5 |
+| `Look=Classic` (default) | the R5 shaders (`vs_main` / `ps_main`) and draw state, with the R3.2a vertex entry for supported unclipped, unskinned `0x02A8` queue draws |
 | `Look=Modern` | `native_modern.hlsl` `vs_modern` / `ps_modern` (own SPIR-V file); pipeline key bit 24 (`K_MODERN`) selects them; every other key bit (blend, z, mask, cull) is the Classic item's |
-| Switch | `EOD_LOOK=modern` at start; F9 / L1+R1+R3 (`modern::toggle`, routed to `native::toggle_look` when the native renderer runs); read once per flush, so the next frame is fully in the new look |
+| Switch | Set `EOD_LOOK=modern` to start in Modern. During play on macOS and Windows, press F9, or hold L1 + R1 and click the right stick on player 1's controller in an offline race. The game displays the selected look. Plume reads it once per flush. |
 | No stall on toggle | every pipeline is created with its twin (Classic and Modern) and every texture descriptor set with its Modern sampler set, so a toggle creates nothing |
 | Test hook | `EOD_LOOK_TOGGLE_EVERY=N` toggles every N vblanks and logs `[look]` frame times (P5) |
 
@@ -1187,6 +1215,72 @@ Particle emitters (0x2F2020, 0x2F2268, 0x2F24B0, 0x2F2AC8, ...)
 
 ## Stage R7: native 2D and emulator removal
 
+### Camera packet VU1 retirement (opt-in)
+
+`EOD_NATIVE_CAMERA_NOP=1` with `EOD_NATIVE_ONLY=1` bypasses VU1 dispatch for the
+two `0x24D8` launches in the camera packet. The EE producer at `0x35B3D0`
+reserves 18 qwords at return address `0x35B428`. Its CNT payload begins with
+two MSCALs, mark `0x6666`, and the 16-qword UNPACK. VIF checks the reservation
+and those four words before attempting retirement. Both microcode pairs must
+match `8000033c 400002ff` and `8000033c 000002ff` in lower/upper word order.
+
+TOP, ITOP, DBF and TOPS update through the normal MSCAL handler. The VU
+retirement advances two pairs, completes Q/P and flag updates, and leaves TPC
+at `0x24E0`. The interpreted path also synchronizes pending pipes per pair,
+matching the interpreter's behavior. The scoreboard and VU data memory are
+unmodified by these pairs. `EOD_NATIVE_CAMERA_NOP_CHECK=1` compares the entire
+VU state, scoreboard and data memory against live VU dispatch before accepting
+the retirement. VU recording, VU logging, VU check/stats, and active scene
+capture or emission continue through normal dispatch. An idle legacy emitter
+permits retirement. A live scene-emission window restored all 18 camera
+dispatches and produced its capture file. The render trace lists dispatches
+and camera retirements separately.
+
+On macOS, Dundas at 1× Classic with maximum detail and draw distance dispatched
+2,842 VU1 starts at vblank 841, down from 2,860. Normal-dispatch and forced-
+interpreter diagnostic runs validated 13,556 and 3,988 retirements respectively.
+Seven live scanout pairs at vblanks 598–604 were pixel-exact. At 838–844,
+121–219 near-field pixels per pair differed by at most two channel values.
+Separate reference runs also varied. Replaying the same retirement-on capture
+with the pre-change and current builds produced identical scanout bytes for
+each of the software and Vulkan backends. The Dennison retail-menu 2P run
+retired 34–68 launches per sampled trace interval with full VU-state checks
+and the idle legacy emitter enabled. Both Dundas 1P variants changed camera
+at vblanks 682 and 776. Independently timed live captures had different
+command streams. Pixel-exact comparison of those switches and the 2P race,
+and native Windows runtime validation, remain open. This optimization
+covers only the measured camera producer.
+
+`EOD_VU_STATS=1` reports elapsed microseconds per compiled VU1 entry in five-second
+windows. It uses the same wall-clock units on Apple Silicon and x86. In a 1,600-vblank
+Dundas Modern diagnostic at 6×, entries `0x0270` and `0x0618` together represented
+41.1–45.9% of measured compiled VU1 time across five windows. The known senders
+include world draws and the shared immediate path. Entry `0x0D48` represented
+14.5–16.0%, and `0x24B0` represented 13.6–16.4%. These are per-entry diagnostic
+shares. Interpreter time, surrounding VIF work, and frame presentation have
+separate measurements.
+
+### Dundas world-leaf VU1 retirement (opt-in)
+
+Set `EOD_NATIVE_WORLD_RETIRE=1` with `EOD_NATIVE_ONLY=1` to enable retirement
+for the Dundas opaque pass-0, slot-35 leaf at `0x0109D018`. The committed DMA
+REF is eligible once at its exact tag address, after the native object marker
+enters the ordered stream. VIF requires the 32-qword EE payload at `0x0109D050`,
+its exact tag words and MSCAL position, ITOP `0x080`, and the expected double
+buffer state. The VU checks XXH3-128 fingerprints of the full 512-byte payload
+(`2494700ae9738e9be4e1e3a046e75426`) and the live 16 KiB micro image
+(`c8c64eae4bb1b7eb2329b43f09230e29`). The existing recompiler lookup checks
+the compiled `0x0270` entry against its exact microcode ranges.
+
+The host derives TEX1 and the 20-vertex strip from live VU inputs. It restores
+the affected registers and VU data words, preserves the existing ST padding,
+and retires 312 cycles to TPC `0x0920`. The two original-format PATH1 packets
+follow the object marker through the same GIF submission routine. A mismatch,
+forced interpreter, portable GS/VU recording, or active VU diagnostics uses
+the original dispatcher. `EOD_RENDER_TRACE_EVERY` counts the host retirements
+separately from actual `0x0270` dispatches. GS still consumes the compatibility
+packets for ordered state and geometry.
+
 ### Phase A1: race HUD producer table (`SLUS_209.10`, Ghidra `DecompileAddrs`, 2026-11-20)
 
 `0x0011CA48(view)` (per player from `0x00101C00` at `0x00101D34`; full screen view -1 from
@@ -1218,12 +1312,230 @@ reaches the GS through the immediate path, which R4 already feeds to Plume as `K
   Not HUD-isolated: the dropped full-screen passes change every pixel, so these numbers do not
   measure HUD parity.
 
+### macOS R7 residue check
+
+Apple M2 Pro, Plume Vulkan over MoltenVK, Dundas Battle (8 AI), Bus, 725
+vblanks. The run used Classic at RenderScale 1, maximum detail, DrawDistance 8,
+`EOD_NATIVE_ONLY=1`, `EOD_NATIVE_LOG=120` and `EOD_RENDER_TRACE_EVERY=120`.
+It exited cleanly. At vblank 720, the EE trace listed 3,967 VU1 program starts.
+The native renderer reported 55,688 dropped GS primitives cumulatively and
+9,900 of 9,900 tagged HUD draws across 689 of 689 measured frames. The drop
+report still includes the five fullscreen or half-width sprite-strip groups
+targeting frame buffers 0, 0x1180 and 0x2BE0, plus triangles from two texture
+sources. HUD object counts and native-only draw suppression measure separate
+things. S4 still fails because VU1 runs and GS jobs remain unowned.
+
+### R7 6× readback trace on macOS
+
+Apple M2 Pro, Dundas Battle (8 AI), Bus, Modern, RenderScale 6, maximum
+detail, DrawDistance 8, 480 headless vblanks. The capture ran with
+`EOD_GS_READBACK_TRACE=50000` and logged GS counters every 60 vblanks.
+Two steady windows each recorded 420 deferred CPU-write preservations,
+120 merges and 300 overwrites, with zero waits in those windows.
+Later race windows recorded 300–420 preservations and 0–6 waits.
+The preservation counter includes copies that finish asynchronously and
+copies whose saved payload is discarded.
+
+The steady merge requests came from uploads to `0x2BE0` PSMZ32, the shadow
+storage already mapped in R7 A4. The common request rectangles were
+`(0,256,64,64)` and `(64,384,256,64)`. Texture uploads at `0x2BC4` and
+`0x2FC8` overlapped pages under the shadow owner. Native shadow preparation
+must keep its temporary depth storage out of the emulated texture ring
+to remove those preservation copies and waits.
+
+### R7 Classic scanout pairing
+
+`tools/p3_run.sh` pairs each replay window with the live image captured on
+its terminal GS vblank. `--exact-scanout` reads the boundary from the
+capture sidecar and requires the software replay to stop on that vblank.
+Strict mode checks every color channel against the 1/255 MAE limit.
+The capture readback is diagnostic and is off during performance runs.
+
+On the Mac Dundas Battle run at 1× with `EOD_NATIVE_ONLY=2`, exact pairs at
+vblanks 856 and 1056 gave mean MAE 4.73, median p99 52 and mean SSIM 0.9464.
+With `EOD_NATIVE_ONLY=1`, the vblank 856 pair failed with MAE 20.47, p99
+149 and SSIM 0.7442. These are software GS replay comparisons. Original
+PS2 photo-level sign-off and the rest of the scene suite remain open.
+
+With the typed scene clear enabled, a fresh display-copy off/on check on
+the same build paired Dundas Battle Classic at exact vblanks 856 and 1056.
+Enabling the native display copy reduced mean RGB MAE from 6.23 to 4.42 and
+raised mean SSIM from 0.9416 to 0.9536. Median p99 moved from 48 to 50.
+Each pair still fails strict P3.
+
+The original depth diagnostic read the GS context at the terminal vblank.
+That could be the next scene, even while FBP0 still held the prior display
+copy. Two replays cut after the display copy and after the next scene clear
+had identical color and different depth files. The software replay diagnostic
+now samples Z16S at the verified `0x35BBD0` copy boundary for this retail
+layout. The two cuts now have byte-identical depth, with 92,358 zero-depth
+pixels and 194,362 populated pixels. The corrected display-copy-on pairs
+had 123,873 and 92,358 sky-proxy pixels, measuring sky MAE 0.49 and 0.74.
+The full-frame P3 metrics and projected-shadow discrepancies remain.
+
+At vblank 1056, the broad `nortt` replay diagnostic reduced
+whole-frame MAE from 6.87 to 1.20. The narrower `--shadow` diagnostic
+then suppressed the `0x362E70` composite state (FBP `0x1180`, TBP
+`0x33e0`, ALPHA `0x44`) and reproduced the same 42,687 affected
+pixels. Within that mask, MAE was 39.05 against the normal replay
+and 0.95 against composite-off. At vblank 856 the narrower diagnostic
+isolated 2,509 pixels and MAE moved from 30.12 to 10.58. These capture
+pairs show that counting submitted Plume shadow draws is insufficient
+to prove shadow coverage.
+
 ### Open (R7 A1)
 
 - Readable C++ for `0x00119888` / `0x00119F40` under `diff_run` + `EOD_DIFF` (>= 1,000 calls, 0
   mismatches) not written yet; the leaves already reach Plume through `KIND_IMMEDIATE`.
 - Decide what the HUD 2D pass is: move HUD `KIND_IMMEDIATE` draws (RA inside `0x0011E730` /
   `0x0029E138` -> `0x0035CAA0`) to a new `KIND_HUD` orthographic pass after 3D in both looks.
-- Identify the EE producers of the five full-screen strip passes (fb 1180 / 2be0 / 0) and feed them.
+- Verify projected shadows in the remaining viewport layouts and scene suite.
 - HUD-only P3 needs a HUD pixel mask (for example a replay with `0x0011CA48` skipped) before parity can be scored.
 - Night flood-lit track, 2P split-screen, odd-vehicle rotation runs for A1 are not done yet.
+
+### R7 A4 strip producers
+
+The Dundas Classic `dundas-classic.gsd.850` capture repeats the five groups below. The
+order starts just after the GS vblank marker, with the display copy for the preceding
+scene. The clear starts the next scene, and that scene reaches the display copy after
+the next marker. All five groups arrive through VIF1 DIRECT on GIF PATH2. The trace
+matches exact GIF tags and register writes to their EE emitters. The strip numbers are
+32-pixel-wide sprites and exclude intervening geometry and register-only packets.
+
+| Order | Target and operation | EE packet evidence |
+|---|---|---|
+| 1 | `FBP 0 <- TBP 0x1180`, 20 × 32×448. Blend uses `FIX=0x60` in this capture. | `0x35BBD0`, `gen/rec_100.c`. 88 DIRECT qwords, `FRAME_1=0xA0000`, `ALPHA_1=0x6000000064`, tag `40ab400000008014/5353`. |
+| 2 | `FBP 0x1180` scene color and Z clear, 20 × 32×448. Observed RGBA `64 64 74 FF`, Z 0. | `0x361098` (aligned-width branch, reserve RA `0x361154`), `gen/rec_101.c`. 45 DIRECT qwords, initial tag `3003400000000001/01ee`, sprite tag `2000000000008014/0055`. The unaligned-width branch tails to `0x360EF0`. |
+| 3 | `FBP 0x2BE0` shadow target white clear, 10 × 32×448. Z writes masked. | `0x362968` (reserve RA `0x362A34`), called from shadow begin `0x363218` (RA `0x36356C`), `gen/rec_101.c`. `FRAME_1=0x3205015F`, tag `200340000000000a/0055` at qword 5. |
+| 4 | `FBP 0x2BE0 <- TBP 0x2300`, 10 × 32×448. This pass samples the scene Z area and enables writes to the shadow Z area. | Same 77-qword command as row 3, tag `40ab40000000000a/5e5e` at qword 32. `ALPHA_1=0x80000000A1` and the Z write mask clears before this subpass. Shadow volume draws follow. |
+| 5 | `FBP 0x1180 <- TBP 0x33E0`, 20 × 32×448. Shadow composite, `ALPHA_1=0x44`. | `0x362E70` (reserve RA `0x362F34`), called from shadow end `0x363640` (RA `0x3636DC`), `gen/rec_101.c`. 89 DIRECT qwords, tag `40ab400000008014/5e5e`. The native shadow pass already implements its own accumulation and composite, so retain a single owner for that output. |
+
+The capture carries GIF path and packet contents. The live Dundas copy called
+`0x35BBD0` from `0x35E948` (RA `0x35E978`). The EE wrote the tag via
+`0x204D70C0` and VIF1 consumed it at physical `0x004D70C0`. The other static
+caller `0x35C138` (RA `0x35C158`) remains on its original path. A bounded EE
+entry trace can establish the higher-level caller of `0x361098`; the existing
+`EOD_RENDER_TRACE` reserve attribution sees VU1 starts and misses DIRECT-only
+senders.
+
+**Aligned scene clear.** The EE reserve at `0x361154` tags a typed operation from
+`0x361098`'s saved rectangle and color inputs. The matching VIF1 DIRECT consumes
+it at the original DMA position. Plume clears only the 640×448 color and depth
+rectangle after checking the live target, registers and offsets. Unsupported cases,
+software and `EOD_NATIVE_SCENE_CLEAR=0` use the original packet. Portable GS dumps
+retain that packet for reference replay.
+
+On Apple M2 Pro in Dundas Battle at 1×, the five steady native-only groups totalled
+80 residual strips with the feature off and 60 with it on. A separate same-run
+diagnostic at GS vblank 120 started from populated buffers and compared this clear
+against the original sprite pass. All 1,146,880 CT32 bytes and 573,440 Z16S bytes
+matched, and each range changed from its pre-clear contents. This measures the
+clear boundary. The shadow preparation and composite strips still remain.
+
+**Display-copy contract.** `0x35BBD0` takes an EE packet destination in `r4`
+and returns `0x59` qwords in `r2`, including one DMA/VIF tag and `0x58`
+DIRECT qwords. Guest word `0x3E57F8` supplies the source base in pages,
+`TBP = (word << 5) & 0x3FE0`. The low byte of `0x3E57FC` supplies FIX.
+If signed word `0x3E57A4` is positive, the routine decrements it once and
+caps the signed FIX input to 16 before taking the low byte. Preserve this
+countdown, the builder's return contract or both caller contracts, the enclosing
+DMA submission and follow-on state, and the display-copy position in GS order.
+The observed packet sets `FRAME_1=0xA0000`, `ZBUF_1=0x10A000118`,
+`TEST_1=0x30000`, `ALPHA_1=0x6000000064`, `TEX1_1=0`,
+`TEX0_1=0x2000000E68029180` and `PRIM=0x156`. When hybrid draws follow,
+check which of these GS register values they inherit before removing the packet.
+The packet selects the fixed CT32 display framebuffer at base 0, width 640,
+with a 640×448 destination rectangle, point-sampled CT32 source, DECAL with
+source alpha, and no Z writes. For the observed state, each RGB byte is
+`Cd + (((Cs - Cd) * FIX) >> 7)`, using the previous display target contents.
+Reproduce GS clamp/wrap and output alpha rules. UNORM fixed-function blending
+can round differently from these integer operations.
+
+**Typed display copy.** The EE hook at the live caller retains the original
+builder for the guest countdown, return value and portable reference packets.
+The matching 88-qword VIF1 DIRECT executes a Vulkan composition command in its
+place. The 640×448 integer blend reads the scene texture and a GPU snapshot of
+the previous CT32 display target. It uses ordinary GS flip accounting and the
+existing `DISPFB` scanout. A skipped frame reuses existing display history.
+The original packet remains available for other callers, unsupported GS state
+or aliases, and `EOD_NATIVE_DISPLAY_COPY=0`. The scaled path also keeps the
+legacy packet if the scissor extends below the 448-row retail target.
+
+The original sprite's XYZ offset starts at −15/16 GS pixel with UV zero. The
+Vulkan vertex shader adds half a GS pixel, then nearest sampling floors the
+scaled interpolants at each physical pixel center. This reduces to an offset
+of `floor((8 + 7 * RenderScale) / 16)` texels on both axes. The final
+scissor-edge slivers clamp sampling to the last physical texel. Destination
+history always uses the unshifted physical pixel.
+
+Apple M2 Pro at 1×, Dundas Battle, native-only Classic, reported 60 residual
+strips before this pass and 40 after at GS frame 181. Frame 125 with FIX
+`0x60` had a same-live-pass comparison of source and previous destination
+readbacks against the composed bytes. All 1,146,880 CT32 bytes matched the
+integer equation. The previous destination differed in 1,025,873 bytes.
+Software replay of the original 88-qword copy separately matched the same
+equation for all 1,146,880 CT32 bytes. The live trace observed FIX `0x80` at
+boot and `0x60` in-race.
+
+The 6× run also reported 40 strips at frame 181. Same-pass GPU checks at 1×,
+2×, 3× and 6× used the GS sprite edge helper and the integer blend on readbacks
+of both inputs. Each checked CT32 byte matched at steady FIX `0x60` and during
+a forced countdown at FIX `0x10`. At 6× the check covered 41,287,680 bytes per
+pass, including the first copy after FIX returned to `0x60`. The original
+builder decremented the test countdown from 2 to 1 to 0. An actual skipped GS
+frame at 6× preserved all 41,287,680 display bytes from the previous frame.
+
+The fixed 640×512 scanout allocation now alternates its GPU attachments. The
+shader reads the previous display directly while writing the next one. Only
+the 64 rows outside the display rectangle are copied to preserve surrounding
+GS storage. The scanout surface keeps its logical page ownership. The prior
+full snapshot remains available with `EOD_NATIVE_DISPLAY_SNAPSHOT=1`.
+
+Two consecutive live copies at 1× and 6× matched the integer blend for every
+active pixel and preserved every trailing byte. At 6× the GPU-to-GPU history
+transfer fell from 41,287,680 to 5,898,240 bytes per copy. The last reported
+GPU-timing windows of two 960-vblank Dundas Modern runs measured 0.89 ms for
+the full snapshot and 0.69 ms for alternating attachments. Both drew 59.9
+frames per second in their last headless window. Fullscreen pacing and
+end-to-end efficiency remain open.
+
+**Ordered projected shadows.** The full-screen retail shadow pass uses
+320×448 shadow storage for the 640×448 scene. Its color base is `0x33E0`
+and its Z base is `0x2BE0`. During preparation, the guest temporarily
+binds the Z base as FRAME, then binds the color base as FRAME before
+shadow volumes. The EE reserve at `0x362A34` tags the 77-qword prepare
+DIRECT, and the reserve at `0x362F34` tags the 89-qword composite DIRECT.
+VIF1 carries each tag to its original PATH2 position. Plume flushes the
+scene at preparation and the accumulated shadow volumes at composite.
+The GS register writes and final RGBA, PRIM and UV state are retained.
+Plume samples scene depth into its private shadow pass and composites onto
+scene color without using the temporary GS pages. Portable replay retains
+both original DIRECT packets. Hybrid mode, unrecognized layouts, and
+`EOD_NATIVE_SHADOW_PASS=0` keep the original GS path.
+
+On Apple M2 Pro at 6×, Dundas Battle (8 AI), Bus, native-only Classic
+(`EOD_NATIVE_ONLY=2`), the four steady 60-vblank windows ending at
+180, 240, 300 and 360 each went from 2,400 emulated GS raster primitives
+and 180 Vulkan raster draws to zero. Deferred preservations went from
+353–361 to zero, merges from 120 to zero, and preservation waits from
+55–60 to zero. At level 1 the three shadow strip groups disappeared from
+the dropped-primitive report. These checks cover the full-screen race
+layout. VU1 execution and unsupported layouts still keep S4 open.
+
+At 1×, exact native-only Dundas Bus pairs at vblanks 856 and 1056 measured
+whole-frame RGB MAE 1.09, median p99 21 and mean SSIM 0.9805 against
+software GS replay. The replay diagnostic isolated 44,545 shadow pixels.
+Live MAE in that mask was 0.65 against normal replay and 33.29 against
+replay with the shadow composite disabled. Gilroy Battle (8 AI), Limo, at
+the same scanout boundaries measured whole-frame MAE 0.99. The blue channel
+exceeded the strict threshold in both pairs. Across its 22,423 replay shadow
+pixels, live MAE was 1.11 against normal replay and 31.67 against
+composite-off replay. Strict P3 and the original PS2 comparison are still
+open.
+
+The two-player Dundas No-Rules Race direct-start control reached the
+race and halted with `Didn't find player 0 in event 0` with the ordered
+replacement enabled and disabled. Kenyon Battle reached the same panic.
+The two-player lobby exercised both boundaries, but its replay showed no
+pixels affected by the selected composite, so the split-screen race
+shadow comparison remains open.

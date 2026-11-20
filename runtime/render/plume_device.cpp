@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#ifdef __APPLE__
+#include <dlfcn.h>
+#endif
 
 namespace plume {
 // Defined in plume_vulkan.cpp; no plume header declares it.
@@ -63,6 +66,26 @@ void add_gs_requirements(VkPhysicalDevice, std::vector<const char *> &extensions
         }
 }
 } // namespace
+
+#ifdef __APPLE__
+bool initialize_loader(PFN_vkGetInstanceProcAddr getProc) {
+    if (!getProc) {
+        const char *path = getenv("SDL_VULKAN_LIBRARY");
+        // Keep the loader open for the lifetime of its instance and dispatch.
+        static void *loader = dlopen(path && *path ? path : EOD_VULKAN_LOADER,
+                                     RTLD_NOW | RTLD_LOCAL | RTLD_FIRST);
+        if (!loader) {
+            fprintf(stderr, "[vulkan] could not open the loader: %s\n", dlerror());
+            return false;
+        }
+        getProc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(loader, "vkGetInstanceProcAddr"));
+        if (!getProc)
+            return false;
+    }
+    volkInitializeCustom(getProc);
+    return true;
+}
+#endif
 
 VkInstance instance() {
     if (!g_tried) {

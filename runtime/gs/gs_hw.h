@@ -16,6 +16,7 @@
 #include "modern_scene.h"
 
 namespace gs {
+namespace hosttex { class Store; }
 namespace hw {
 
 extern bool g_on;  // the hardware renderer is active
@@ -99,9 +100,14 @@ struct NativeSurfaces {
     uint32_t gs_width, gs_height;  // in GS pixels
     int scale;                     // RenderScale
 };
-bool native_begin(const Env &e, bool depth, NativeSurfaces &out);
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback = false);
+bool native_begin_depth_clear(const Env &e, NativeSurfaces &out);
+void native_mark_bootstrap_depth_clear(const Env &e);
 void native_end();
+bool native_display_copy(const Env &e);
+void native_display_copy_fallback();
 bool native_texture_on_cpu(uint32_t first_page, uint32_t count);
+const hosttex::Store *native_host_textures();
 #endif
 #ifdef EOD_HW_SELECT
 // Windows: the Vulkan backend (not Direct3D 11) is the one running
