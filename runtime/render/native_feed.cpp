@@ -1178,8 +1178,23 @@ void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, ui
     p.texture_key = -1;
     p.layer = -1;
     fill_camera(p);
+    // The world packet's 0x35BA10 call has committed these EE render-state
+    // inputs through 0x3620A8. Bases here use the renderer's 256-byte units.
+    p.world_surface = {
+        (ee_r32(0x4D8B90) & 0x1FF) * 32,
+        (ee_r32(0x4D8B98) >> 6) & 0x3F,
+        ee_r32(0x4D8B94) & 0x3F,
+        0,
+        (ee_r32(0x4D8BD0) & 0x1FF) * 32,
+        (ee_r32(0x4D8BD4) & 0xF) | 0x30,
+        {int32_t(ee_r32(0x4D8B9C) & 0x7FF), int32_t(ee_r32(0x4D8BA4) & 0x7FF),
+         int32_t(ee_r32(0x4D8BA0) & 0x7FF), int32_t(ee_r32(0x4D8BA8) & 0x7FF)},
+        0x6BFF, 0x71FF,
+    };
     CacheEntry *c = nullptr;
     p.mesh = mesh_for(part, vb, true, &c);
+    if (p.mesh && c && c->k_kick && !c->k_mixed)
+        p.world_lod = {uint16_t(p.tex_k + c->k_delta), uint8_t(p.tex_mxl & 7), true};
     if (!p.mesh) g_wc.nomesh++;
     if (c && !c->facing.empty() && p.mesh) {
         uint32_t alpha = 0x80;
@@ -1968,7 +1983,7 @@ void vu_check(uint64_t key, uint32_t program) {
     }
 }
 
-bool vu1_start(uint32_t program, uint32_t itop) {
+bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod) {
     if (!enabled()) return false;
     const uint32_t tag = g_vif1_dma_tag;
     std::vector<Mesh *> meshes;
@@ -2013,6 +2028,7 @@ bool vu1_start(uint32_t program, uint32_t itop) {
     post(CMD_OBJ, &p, sizeof p);
     g_obj_active = true;
     g_sent_key = key;
+    if (retire_world_leaf) world_lod = p.world_lod;
     return retire_world_leaf;
 }
 

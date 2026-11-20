@@ -2537,6 +2537,30 @@ EeState ee_state(const Packet &p, const Mesh *cpu) {
 // depends on it). Mismatches per kind: test, blend, clamp, z, K, MXL.
 uint64_t g_st_n[KIND_COUNT], g_st_mis[KIND_COUNT][6];
 std::mutex g_st_mutex;
+struct SurfaceCheck { uint64_t matched, mismatched, unobserved; };
+std::map<std::array<int32_t, 4>, SurfaceCheck> g_world_surfaces;
+
+const DrawSurface &draw_surface(const Packet &p, const DrawSurface &reference, bool observed) {
+    if (p.kind != KIND_WORLD || p.program != 0x0270 || p.itop != 0x80)
+        return reference;
+    const DrawSurface &ee = p.world_surface;
+    const bool matches = observed && ee.color_base == reference.color_base &&
+        ee.color_pitch == reference.color_pitch && ee.color_format == reference.color_format &&
+        ee.color_mask == reference.color_mask && ee.depth_base == reference.depth_base &&
+        ee.depth_format == reference.depth_format && ee.origin_x == reference.origin_x &&
+        ee.origin_y == reference.origin_y &&
+        std::equal(std::begin(ee.scissor), std::end(ee.scissor), std::begin(reference.scissor));
+    static const bool check = std::getenv("EOD_NATIVE_WORLD_SURFACE_CHECK") != nullptr;
+    if (check) {
+        std::lock_guard<std::mutex> lock(g_st_mutex);
+        auto &counts = g_world_surfaces[{ee.scissor[0], ee.scissor[1], ee.scissor[2], ee.scissor[3]}];
+        if (!observed) ++counts.unobserved;
+        else if (matches) ++counts.matched;
+        else ++counts.mismatched;
+    }
+    return matches ? ee : reference;
+}
+
 void compare_state(const EeState &r, const gs::Env &e, uint32_t kind) {
     std::lock_guard<std::mutex> lk(g_st_mutex);
     g_st_n[kind]++;
@@ -2559,6 +2583,11 @@ void state_report() {
                                          "sprite", "immediate", "cockpit", "hud"};
     static_assert(names.size() == KIND_COUNT, "every native draw kind needs a state report name");
     std::lock_guard<std::mutex> lk(g_st_mutex);
+    for (const auto &[rect, result] : g_world_surfaces)
+        std::fprintf(stderr, "[native] world EE surface %d,%d-%d,%d: %llu matched, %llu mismatched, %llu unobserved\n",
+                     rect[0], rect[1], rect[2], rect[3],
+                     (unsigned long long)result.matched, (unsigned long long)result.mismatched,
+                     (unsigned long long)result.unobserved);
     for (uint32_t k = 0; k < KIND_COUNT; k++) {
         if (!g_st_n[k]) continue;
         std::fprintf(stderr, "[native] EE state vs GS %s: %llu objects, mismatches test %llu blend %llu clamp %llu z %llu K %llu MXL/filter %llu\n",
@@ -2703,22 +2732,27 @@ void finalize() {
     }
     compare_state(rs, e, kind);
     const bool zwrite = rs.zwrite, ztest = rs.ztst >= 2;
-    Target tg{e.fbp, e.fbw, e.fpsm_mem, e.zbp, e.zpsm, (uint32_t)e.scy1 + 1, zwrite || ztest};
+    const DrawSurface reference{e.fbp, e.fbw, e.fpsm_mem, e.fbmsk, e.zbp, e.zpsm,
+                                {e.scx0, e.scy0, e.scx1, e.scy1}, uint16_t(xy), uint16_t(xy >> 32)};
+    const DrawSurface &surface = draw_surface(g_cur, reference, g_have_env);
+    const int32_t *scissor = surface.scissor;
+    Target tg{surface.color_base, surface.color_pitch, surface.color_format, surface.depth_base,
+              surface.depth_format, uint32_t(scissor[3]) + 1, zwrite || ztest};
     if (!g_r.pending.empty() && !(tg == g_r.target)) flush();
     g_r.target = tg;
     if (tg.depth) {
         g_r.main_target = tg;
         g_r.has_main_target = true;
         g_r.main_xy = xy;
-        g_r.main_sc[0] = e.scx0; g_r.main_sc[1] = e.scy0; g_r.main_sc[2] = e.scx1; g_r.main_sc[3] = e.scy1;
+        std::copy_n(scissor, 4, g_r.main_sc);
     }
     Item it{};
     it.p = g_cur;
     it.mesh = mesh;
     screen_matrix(g_cur, it.a, kind == KIND_QUEUE && mesh && mesh->cpu->skinned);
-    it.ox = (float)(xy & 0xFFFF) / 16.0f;
-    it.oy = (float)((xy >> 32) & 0xFFFF) / 16.0f;
-    it.zscale = (float)(1.0 / depth_range(e.zpsm));
+    it.ox = float(surface.origin_x) / 16.0f;
+    it.oy = float(surface.origin_y) / 16.0f;
+    it.zscale = (float)(1.0 / depth_range(surface.depth_format));
     PushConstants &pc = it.pc;
     // model-space light (VU1 vf12): the model axes . light, times light.w
     for (int c = 0; c < 3; c++) {
@@ -2794,16 +2828,16 @@ void finalize() {
     if (!(m & M_SPEC)) pc.mode[3] = 0;
     // pipeline key: blend | z function << 4 | z write << 6 | depth << 7 | colour mask << 8
     const uint32_t zf = !ztest ? (e.ztst == 0 ? 3u : 0u) : e.ztst == 2 ? 1u : 2u;
-    const uint32_t full = (e.fpsm & 0xF) == 0x1 ? 0xFFFFFFu : 0xFFFFFFFFu;
+    const uint32_t full = (surface.color_format & 0xF) == 0x1 ? 0xFFFFFFu : 0xFFFFFFFFu;
     uint32_t mask = 0;
     for (int ch = 0; ch < 4; ch++) {
         const uint32_t bits = 0xFFu << (ch * 8);
-        if ((full & bits) && (e.fbmsk & bits) != bits) mask |= 1u << ch;
+        if ((full & bits) && (surface.color_mask & bits) != bits) mask |= 1u << ch;
     }
     const uint32_t blend = blend_classes(rs.abe, rs.ba, rs.bb, rs.bc, rs.bd);
     if (rs.bc == 1) g_blend_ad.fetch_add(1);
     it.pipeline = blend | zf << 4 | (zwrite ? 1u : 0u) << 6 | (tg.depth ? 1u : 0u) << 7 | mask << 8;
-    it.sc[0] = e.scx0, it.sc[1] = e.scy0, it.sc[2] = e.scx1, it.sc[3] = e.scy1;
+    std::copy_n(scissor, 4, it.sc);
     // Alpha test (TEST.ATE/ATST/AREF/AFAIL): the pixels that pass are drawn as the state says; the
     // ones that fail write what AFAIL keeps (FB_ONLY: colour, ZB_ONLY: depth, RGB_ONLY: RGB), drawn
     // as a second pass over the same object with the test inverted.

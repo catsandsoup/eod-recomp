@@ -308,3 +308,25 @@ as the GS reference.
   GS compatibility packet dependencies through direct world state and
   native draw submission in stream order. Repeat the same packet,
   state and player-visible checks for the unsupported world entries.
+
+### R7 STAR — typed world surface and TEX1 transport (2026-11-21)
+
+- **Situation.** The guarded public world retirement already avoided VU1
+  dispatch but emitted two compatibility GIF kicks and acquired its draw
+  surface from the first GS triangle.
+- **Task.** Establish a typed EE surface source and remove the exact
+  single-register TEX1 packet while preserving the ordered latch.
+- **Action.** Read RenderStateCommit's EE inputs at the world REF and
+  compare them at the same object marker. Build the LOD command from the
+  EE mip selection and decoded REF data. Require byte equality with the
+  existing two-qword kick before substituting the typed command, and retain
+  the packet path during diagnostic capture or a partial PATH1 tag.
+- **Result.** The public scene suite matched all observed surfaces,
+  including both Kenyon split views. The 6× run used 46,361 exact typed
+  TEX1 writes and removed their 92,722 GIF qwords. Object parity and the
+  VU and GS end-to-end gaps are listed in NATIVE_RENDERER_SUCCESS.md.
+- **Next decisive test.** Track a texture allocation from the EE slot and
+  versioned level and palette upload through the native draw, using
+  `0x35F9A0` and `0x35F278`. Prove the correct palette lifetime and the
+  strip's surviving PRIM, RGBAQ, ST/Q, and vertex latch, then run an
+  isolated world slice without the remaining GIF strip.

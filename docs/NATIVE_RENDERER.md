@@ -1760,3 +1760,47 @@ frame. If preparation falls back, the native composite falls back too.
 Measured captures confirm all tagged pairs were completed. If a matching
 composite were corrupted after its prepare was accepted, its original
 scratch contents could not be reconstructed from the native target.
+
+### R7 typed world draw-surface state
+
+The world renderer at `0x358BD0` selects its texture record with
+`0x34F8D0` and calls WorldPacketBegin (`0x35DEE0`). This calls
+`0x35BA10` before reserving the DMA REF. If the viewport is dirty,
+`0x35BA10` passes the camera extents from `0x4D7C20` to `0x365350`.
+The latter stores the effective left, right, top and bottom (inclusive)
+and marks the scissor dirty. `0x35BA10` ends with RenderStateCommit
+`0x3620A8`. Snapshot the EE state at the REF producer after the
+commit, then carry it through the existing DMA tag and native draw command.
+
+| Inputs in EE RAM | Meaning in the world draw | Retail GS reference |
+| --- | --- | --- |
+| `0x4D8B90, 0x4D8B94, 0x4D8B98` | Color base, format, pitch in pixels from `0x3653C8`; base is already in 8 KiB pages | `0x362300`: FRAME base bits 0–8 in 8 KiB units, pitch divided by 64, format bits 24–29, zero write mask |
+| `0x4D8BD0, 0x4D8BD4` | Depth base in 8 KiB pages and depth format from `0x360E18` | `0x362284`: ZBUF base bits 0–8, depth format bits 24–27; ZMSK comes from render flags |
+| `0x4D8B9C, 0x4D8BA0, 0x4D8BA4, 0x4D8BA8` | Left, right, top, bottom from `0x365350` | `0x362408`: SCISSOR fields masked to 11 bits |
+| Constants at `0x3624B0` | World screen origin in sixteenths of a pixel, `0x6BFF, 0x71FF` | XYOFFSET_1 |
+
+The renderer puts the typed state into the draw's target, scissor and
+screen origin when it agrees with the observed first draw. The old state
+remains available at mismatched or unobserved boundaries during migration.
+The comparison reports counts by scissor, so both split-screen views can
+be checked independently. The texture/CLUT lifetime, ordered LOD latch and
+strip's final compatibility state still require separate typed producers.
+
+### R7 ordered world texture LOD
+
+For the verified `0x0270` non-clipped leaf, the first kick at `0x0908`
+sends one TEX1_1 A+D write before the strip. Only the known one-loop
+PACKED tag and its one register write are eligible. The existing EE
+packet has the K template and maximum mip level from `0x3652A8`. The
+world mesh's decoded EE REF gives the signed qword 198 z and hence its
+K delta. A single consistent non-positive delta forms the typed
+`WorldTextureLod` at the EE producer. The ordered VIF retirement accepts
+it only when all 32 bytes of the independently reconstructed TEX1 kick
+match. The typed command applies the same latch update before the strip.
+When PATH1 has a partial tag, retain the ordinary transfer. The explicit
+`EOD_NATIVE_WORLD_LOD=0` control, capture, and unsupported leaves retain
+the original TEX1 command.
+
+This retires the two LOD GIF qwords themselves. The compatibility latch
+still serves later legacy consumers. The strip packet, texture content
+and CLUT ownership still run through the compatibility bridge.

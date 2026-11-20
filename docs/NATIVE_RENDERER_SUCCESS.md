@@ -771,3 +771,62 @@ runs with the reference path enabled had a closest pair at 1.023.
 This visual check is supplementary to the same-slot kick differential.
 The reference and replacement both still need the VU scratch state
 and GS bridge for this stage. S4 and build-level elimination remain open.
+
+## R7 typed world surface and texture LOD transport (2026-11-21)
+
+The world REF now carries its color and depth targets, scissor, and
+screen origin from EE state. Compare that snapshot with the first
+primitive using `EOD_NATIVE_WORLD_SURFACE_CHECK=1`. The surface proof
+reported zero mismatches and zero unobserved objects in the following
+audited ordinary public runs.
+
+| Scene and mode | Observed typed surfaces | TEX1 updates sent as typed commands | PATH1 fallbacks |
+| --- | ---: | ---: | ---: |
+| Dundas 6× Modern | 51,641 | 46,361 | 0 |
+| Dundas 1× Modern | 54,115 | 48,580 | 0 |
+| Gilroy night 1× Classic | 46,255 | 42,471 | 0 |
+| Kenyon 2P 1× Classic | 56,257 upper plus 57,960 lower | 106,023 | 0 |
+
+The admitted TEX1 operation overwrites the same compatibility register
+and preserves PATH1's final tag state. It bypasses two GIF qwords per
+typed update. In bounded 6× Dundas, `EOD_NATIVE_WORLD_LOD=0` kept the
+ordinary TEX1 kick and counted 31,718,217 GIF qwords. Default counted
+31,654,029, with 92,722 qwords skipped specifically by the matched
+transport. These separate runs reached different render-frame counts,
+so the 64,188 total difference combines the transport change with the
+workload difference. Sampled world object parity showed 44,597 of
+44,597 leaves drawn on default and 45,777 of 45,777 on opt-out, with
+zero losses in both. The state comparison showed zero K/filter or
+other world-state mismatches. The 6× pair reported zero synchronous
+reads, deferred/CLUT waits, and suppressed draws.
+
+Night and split retained deferred waits. Gilroy was 2 on default and
+1 on opt-out in both the initial and traced pairs. The traces identify
+the same upload merge sources, including pages 360 and 382. Kenyon
+recorded 6 and 7 waits, respectively. All four runs still reported
+zero synchronous reads and suppression. A non-threaded GS added
+33,765 matched typed updates and a portable capture issued no typed
+updates and replayed in the software reference. The Dundas producer
+comparison checked 143 live `0x358BD0` calls with zero mismatches.
+Separately paced 640×448 screenshots gave closest-pair RGB MAE
+1.189/255 for opt-out versus typed and 0.722/255 for opt-out versus
+repeat opt-out. This image sample does not establish a pixel-exact
+same-pose comparison.
+
+The local compiled-VU control matched 322,505 observed draw surfaces
+and used 289,548 typed TEX1 updates with zero PATH1 fallbacks. The public
+and local Mac builds linked, all 99 macOS CTests passed, and the Windows
+public executable cross-linked. Windows runtime remains unverified.
+
+A separate public headless performance comparison kept this typed
+transport disabled in both arms and toggled only the already-committed
+world VU1 retirement. Four serial 810-vblank Dundas 6× Modern runs
+were run off, on, on, off. The 5–10 s game-draw samples were 12.9
+and 13.6 FPS off and 14.0 and 14.3 FPS on (13.25 → 14.15, +6.8%).
+Average whole-process CPU time was 13.525 → 13.620 s and wall time
+was 13.635 → 13.630 s. Mean native GPU time was 7.959 → 8.197 ms,
+within the spread of repeat off runs. These figures describe paced
+headless rendering only. The default public binary still executes
+VU1 and the GS bridge. The typed TEX1 work removes a packet rather
+than the renderer family. In particular the strip, texture/CLUT
+contents and remaining compatibility state still depend on GS.

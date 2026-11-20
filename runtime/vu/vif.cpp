@@ -74,7 +74,8 @@ void start_micro(Vif &v, uint32_t addr, bool mscal = false,
         v.tops = v.dbf ? v.base + v.ofst : v.base;
         g_vif1_top = v.top;
         g_vif1_itop = v.itop;
-        const bool retire_world_leaf = native::vu1_start(addr, v.itop);
+        native::WorldTextureLod world_lod{};
+        const bool retire_world_leaf = native::vu1_start(addr, v.itop, world_lod);
 #ifdef EOD_PLUME
         // The verified E-bit NOP pair is shared by ordinary MSCAL producers.
         static const char *nop_setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
@@ -87,7 +88,7 @@ void start_micro(Vif &v, uint32_t addr, bool mscal = false,
         (void)mscal;
 #endif
         if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload, ref_words) &&
-            vu_retire_world_leaf(v.vu, addr, v.top)) {
+            vu_retire_world_leaf(v.vu, addr, v.top, world_lod)) {
             ++g_vu1_world_leaf_retires;
             return;
         }

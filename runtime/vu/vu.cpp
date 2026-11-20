@@ -5,6 +5,7 @@
 // instruction, Q/P results become visible after their latency, branches
 // have a delay slot and the E bit ends the program after the next pair.
 #include "../core/r7_audit.h"
+#include "../render/native_renderer.h"
 #include "../render/world_visibility.h"
 #include "vu.h"
 #include "core/trace.h"
@@ -1876,10 +1877,19 @@ void write_world_leaf_memory(const WorldLeafRetirement &result, uint8_t *memory,
     std::memcpy(memory + (top + kWorldStripOffset) * 16, result.strip, result.strip_qwords * 16);
 }
 
-void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsigned top) {
+void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsigned top,
+                            const native::WorldTextureLod &lod) {
     vu = result.after;
     write_world_leaf_memory(result, vu.mem, top);
-    xgkick(&vu, 20);
+    static const char *transport = std::getenv("EOD_NATIVE_WORLD_LOD");
+    // Compare the complete packet, including ignored bits, before choosing the
+    // typed transport. A partial PATH1 packet can still need the original bytes.
+    const uint64_t kick[] = {0x1000000000008001ull, 0xE, native::world_tex1(lod), 0x14};
+    if ((!transport || transport[0] != '0') && lod.valid && !g_vu_mute_kick &&
+        !std::memcmp(kick, result.tex1, sizeof kick))
+        native::post(native::CMD_WORLD_TEXTURE_LOD, &lod, sizeof lod);
+    else
+        xgkick(&vu, 20);
     xgkick(&vu, top + kWorldStripOffset);
 }
 
@@ -1926,7 +1936,7 @@ bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned
 }  // namespace
 #endif
 
-bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top) {
+bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::WorldTextureLod &lod) {
 #ifdef EOD_VULKAN
     // Portable capture and original-path diagnostics must see the original dispatch.
     static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
@@ -1944,7 +1954,7 @@ bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top) {
     static const bool check = getenv("EOD_NATIVE_WORLD_RETIRE_CHECK") != nullptr;
     if (check && !check_world_leaf(result, *vu, top, true))
         fatal("world VU1 retirement differs at vblank %llu", (unsigned long long)kernel_vblank_count());
-    materialize_world_leaf(result, *vu, top);
+    materialize_world_leaf(result, *vu, top, lod);
     return true;
 #else
     return false;

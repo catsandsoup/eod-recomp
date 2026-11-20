@@ -178,7 +178,15 @@ bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm);
 // ---- VIF1 thread (runtime/vu/vif.cpp) -------------------------------------------------------
 // Posts the object marker before its geometry. True once for a committed world-leaf REF
 // eligible for VIF and VU validation.
-bool vu1_start(uint32_t program, uint32_t itop);
+struct WorldTextureLod {
+    uint16_t bias;       // signed 12-bit K in sixteenths, transported as the EE's 16-bit value
+    uint8_t max_level;
+    bool valid;
+};
+constexpr uint64_t world_tex1(const WorldTextureLod &lod) {
+    return 0x120 | (uint64_t(lod.max_level) << 2) | (uint64_t(lod.bias) << 32);
+}
+bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod);
 
 // ---- GS command stream ----------------------------------------------------------------------
 // One queue record as the GS receives it.
@@ -195,6 +203,13 @@ enum : uint32_t {
     KIND_HUD = 9,  // native 2D: race HUD rects, frame sprites, text (R7 A1b)
     KIND_COUNT = 10
 };
+struct DrawSurface {
+    uint32_t color_base, color_pitch, color_format, color_mask;
+    uint32_t depth_base, depth_format;
+    int32_t scissor[4];         // inclusive left, top, right, bottom
+    uint16_t origin_x, origin_y; // 12.4 screen origin
+};
+
 struct Packet {
     uint64_t frame;            // EE vblank of the frame it was queued in
     uint32_t kind;             // KIND_*: draw-queue record, track world leaf, water surface
@@ -225,6 +240,8 @@ struct Packet {
     // projected shadow target (stage R5 A3), as 0x363218 left it: width *0x4D8BD8, height *0x4D8BDC
     // (0x35DA30: min(view w, 320), min(view h, 512)) and the main view *0x4D8C00..0x4D8C0C (x, y, w, h)
     int32_t shadow_rt[6];
+    DrawSurface world_surface;  // EE RenderStateCommit inputs, sampled at the world REF
+    WorldTextureLod world_lod;
 };
 
 using Vertex = scene::Vertex;
@@ -255,7 +272,8 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     bool has_spark_age = false;
 };
 
-enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4, CMD_BOOTSTRAP_QUAD = 5 };
+enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4,
+                  CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),

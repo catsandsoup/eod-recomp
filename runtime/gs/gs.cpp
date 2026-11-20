@@ -736,6 +736,29 @@ void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices
     }
 }
 
+uint64_t g_world_lod_applied, g_world_lod_fallback;
+
+void apply_world_texture_lod(const void *data) {
+    native::WorldTextureLod lod;
+    std::memcpy(&lod, data, sizeof lod);
+    constexpr uint64_t tag = 0x1000000000008001ull, regs = 0xE;
+    const uint64_t tex1 = native::world_tex1(lod);
+    auto &path = g_path[GIF_PATH1];
+    if (path.in_packet && path.nloop) {
+        // Preserve continuation semantics if this is not a fresh PATH1 tag.
+        const uint64_t kick[] = {tag, regs, tex1, 0x14};
+        gif_process(GIF_PATH1, reinterpret_cast<const uint8_t *>(kick), 2);
+        ++g_world_lod_fallback;
+        return;
+    }
+    if (scene_capture::g_on) scene_capture::gs_packet(GIF_PATH1);
+    if (scene_emit::g_on) scene_emit::gs_packet(GIF_PATH1);
+    if (modern::g_on) modern::gs_packet(GIF_PATH1);
+    set_state(st.ctx[0].tex1, tex1);
+    path = PathState{false, tag, regs, 0, 1, 0, 0, true};
+    ++g_world_lod_applied;
+}
+
 // This typed command is tagged by 0x361098 before DMA. The original DIRECT
 // packet remains available for fallback and for portable reference captures.
 constexpr uint64_t kDepthClearTest = 0x32001;  // NEVER, ZB_ONLY, Z always
@@ -1339,7 +1362,11 @@ void modern::post_draw(Frame *f) {
 
 // Native renderer commands from the producer, in GS order (render/native_renderer.h).
 void native::post(uint32_t kind, const void *data, uint32_t size) {
-    if (!g_threaded) return gs_command(kind, data, size);
+    if (!g_threaded) {
+        if (kind == CMD_WORLD_TEXTURE_LOD && size == sizeof(WorldTextureLod))
+            return apply_world_texture_lod(data);
+        return gs_command(kind, data, size);
+    }
     push_cmd(CMD_NATIVE, kind, 0, data, size);
 }
 
@@ -1653,6 +1680,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                 } else if (h[1] == native::CMD_BOOTSTRAP_QUAD && h[3] == sizeof g_ordered_bootstrap_quad) {
                     memcpy(&g_ordered_bootstrap_quad, d, sizeof g_ordered_bootstrap_quad);
                     g_have_ordered_bootstrap_quad = true;
+                } else if (h[1] == native::CMD_WORLD_TEXTURE_LOD && h[3] == sizeof(native::WorldTextureLod)) {
+                    apply_world_texture_lod(d);
                 } else {
                     native::gs_command(h[1], d, h[3]);
                 }
@@ -2043,6 +2072,9 @@ void gs_shutdown() {
     close_cold_zip("closed at shutdown");
     if (g_dump) { fclose(g_dump); g_dump = nullptr; }
     raster_shutdown();
+    if (r7_audit::enabled() && (g_world_lod_applied || g_world_lod_fallback))
+        std::fprintf(stderr, "[native] world TEX1 typed: %llu applied, %llu PATH1 fallbacks\n",
+                     (unsigned long long)g_world_lod_applied, (unsigned long long)g_world_lod_fallback);
 }
 
 void gs_init() {
