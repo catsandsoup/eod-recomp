@@ -25,7 +25,7 @@ extern uint32_t g_vif1_dma_tag;
 extern uint8_t *g_ram;
 // VU1 execution dispatches per program address (addr / 8), for EOD_RENDER_TRACE.
 uint32_t g_vu1_program_starts[0x800];
-uint32_t g_vu1_camera_nops = 0;
+uint32_t g_vu1_nops_retired = 0;
 uint32_t g_vu1_world_leaf_retires = 0;
 // Called at each VU1 program start when set (EOD_RENDER_TRACE).
 void (*g_vu1_start_hook)(uint32_t addr) = nullptr;
@@ -61,7 +61,7 @@ bool matches_world_leaf_ref(const Vif &v, const uint32_t *payload) {
            v.tops == (v.dbf ? 0x270u : 0xE0u);
 }
 
-void start_micro(Vif &v, uint32_t addr, bool camera_nop = false, const uint32_t *ref_payload = nullptr) {
+void start_micro(Vif &v, uint32_t addr, bool mscal = false, const uint32_t *ref_payload = nullptr) {
     if (v.n == 1) {
         v.itop = v.itops;
         v.top = v.tops;
@@ -70,10 +70,17 @@ void start_micro(Vif &v, uint32_t addr, bool camera_nop = false, const uint32_t 
         g_vif1_top = v.top;
         g_vif1_itop = v.itop;
         const bool retire_world_leaf = native::vu1_start(addr, v.itop);
-        if (camera_nop && vu_retire_camera_nop(v.vu, addr)) {
-            ++g_vu1_camera_nops;
+#ifdef EOD_PLUME
+        // The verified E-bit NOP pair is shared by ordinary MSCAL producers.
+        static const char *nop_setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
+        if (mscal && addr == 0x24D8 && (!nop_setting || nop_setting[0] != '0') &&
+            native::enabled() && !diff_in_original_side() && vu_retire_mscal_nop(v.vu, addr)) {
+            ++g_vu1_nops_retired;
             return;
         }
+#else
+        (void)mscal;
+#endif
         if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload) &&
             vu_retire_world_leaf(v.vu, addr, ref_payload, v.top)) {
             ++g_vu1_world_leaf_retires;
@@ -381,10 +388,6 @@ void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
 // Executes the complete commands at the start of w[0..n); returns the
 // number of words consumed.
 size_t run(Vif &v, const uint32_t *w, size_t n) {
-    // The camera producer writes one CNT payload with both MSCALs and the matrix UNPACK.
-    constexpr uint32_t camera_header[] = {0x1400049B, 0x1400049B, 0x00006666, 0x6C104001};
-    const bool camera_packet = v.n == 1 && n == 68 && std::memcmp(w, camera_header, sizeof(camera_header)) == 0 &&
-                               native::take_camera_packet(g_vif1_dma_tag);
     size_t pos = 0;
     for (;;) {
         size_t left = n - pos;
@@ -430,7 +433,7 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         case 0x14:  // MSCAL
             LOG(LOG_VIF, "VIF%d MSCAL %04x", v.n, imm * 8);
             // The supported REF has a complete 32-qword VIF payload and MSCAL at dword 124.
-            start_micro(v, imm * 8, camera_packet && pos < 2,
+            start_micro(v, imm * 8, true,
                         v.n == 1 && n == 128 && pos == 124 ? w : nullptr);
             break;
         case 0x15: start_micro(v, imm * 8); break;       // MSCALF

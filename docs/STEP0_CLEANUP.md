@@ -139,3 +139,28 @@ Row 1 (native-only, Hampton night) FAIL at 44.3% non-zero vs the 50% bar.
 RenderScale 6), then the image step: decide the night row-1 bar, prove 2P split-screen camera
 cycling, and close the open list in Section 10 (`0x214B68` Gilroy first call, `EOD_DIFF=all`
 stall, `metal_painted`, R5 items).
+
+## R7 VU1 no-op handoff (2026-11-21)
+
+**Situation.** The native renderer's camera-only experiment retired the
+`0x24D8` VU1 no-op on an opt-in basis. Batch, world, shadow and state
+producers used the same verified instruction pairs.
+
+**Task.** Retire the ordinary MSCAL no-op in Plume modes and verify the
+interpreter and compiled state transitions.
+
+**Action.** Reused the exact instruction-pair check at the ordinary MSCAL
+boundary. Removed camera packet bookkeeping. Checked VU state and memory on
+Dundas, Gilroy night and two-view Kenyon, and compared dispatch counts on
+Dundas at 6×.
+
+**Result.** The sampled Dundas 6× frames retired 590–662 no-ops after
+vblank 120. The long Dundas differential run checked 1,337 calls with zero
+mismatches. See `docs/NATIVE_RENDERER_SUCCESS.md` for the remaining
+dispatch counts and GPU timing.
+
+**Next decisive test.** Identify which state and GIF output following world
+REFs at `0x35DEFC` still consume from `0x0270`, `0x0618` and
+`0x0920`. Prove equivalent output and state on full passes across day,
+night and split-screen before widening the single-leaf retirement. S4, the
+native menu and render-target cases, and the owner-PC S5 benchmark remain open.

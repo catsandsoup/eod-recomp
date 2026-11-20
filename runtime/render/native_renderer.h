@@ -62,7 +62,6 @@ constexpr uint32_t kSceneClearDirectQwc = 45;
 bool scene_clear_enabled();
 void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneClear *clear = nullptr);
 bool take_scene_clear(uint32_t dma_tag, uint32_t qwc, SceneClear &clear);
-bool take_camera_packet(uint32_t dma_tag);
 struct DisplayCopy {
     uint32_t source, fix, caller;
 };

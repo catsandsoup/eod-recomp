@@ -65,8 +65,8 @@ extern VUState g_vu1;
 /* Execute a micro program starting at tpc until the E bit retires. */
 void vu_execute(VUState *vu, uint32_t start_pc);
 #ifdef __cplusplus
-/* Retire the camera MSCAL's verified E-bit NOP and delay pair. */
-bool vu_retire_camera_nop(VUState *vu, uint32_t start_pc);
+/* Retire the verified VU1 MSCAL E-bit NOP and delay pair at 0x24D8. */
+bool vu_retire_mscal_nop(VUState *vu, uint32_t start_pc);
 /* Retire the supported 32-qword world REF after VIF validates its DMA ownership. */
 bool vu_retire_world_leaf(VUState *vu, uint32_t pc, const uint32_t *payload, uint32_t top);
 #endif

@@ -1215,7 +1215,25 @@ Particle emitters (0x2F2020, 0x2F2268, 0x2F24B0, 0x2F2AC8, ...)
 
 ## Stage R7: native 2D and emulator removal
 
-### Camera packet VU1 retirement (opt-in)
+### VU1 MSCAL no-op retirement
+
+The live VU1 instruction pairs at byte address `0x24D8` are identical in
+all four captured retail images. The first pair has the E bit and the
+second is its delay pair. Both are no-ops and have no GS output. The
+Dundas trace observed ordinary MSCALs from reserves at `0x35B428`
+(camera), `0x35BA6C` and `0x35BAE8` (batch), `0x35D1B4` (shadow),
+`0x35DEFC` (world) and `0x362104` (shared state flush).
+
+Check the two live pairs at the MSCAL boundary after VIF updates TOP,
+ITOP, DBF and TOPS. In Plume mode, exact matches can use the existing
+retirement regardless of the source packet. A different entry, changed
+instruction pair, or observed VU dispatch uses ordinary execution.
+MSCALF and MSCNT continue through ordinary execution.
+`EOD_NATIVE_CAMERA_NOP=0` retains the ordinary MSCAL path for comparison.
+Compare the full VU state, scoreboard and data memory against the
+compiled and interpreter paths using `EOD_NATIVE_CAMERA_NOP_CHECK=1`.
+
+### Original camera-only retirement evidence
 
 `EOD_NATIVE_CAMERA_NOP=1` with `EOD_NATIVE_ONLY=1` bypasses VU1 dispatch for the
 two `0x24D8` launches in the camera packet. The EE producer at `0x35B3D0`

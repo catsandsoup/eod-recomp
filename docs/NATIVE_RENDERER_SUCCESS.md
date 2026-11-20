@@ -466,3 +466,43 @@ on the guarded clear cases and preserved the portable original GIF packet.
 These results cover the tested Mac movie transitions and their ordering
 and readback counters. Physical audio-to-display latency, native Windows
 playback and the broader R7/S4 scene gates remain open.
+
+## R7 VU1 MSCAL no-op retirement (2026-11-21)
+
+The native renderer now retires the verified `0x24D8` VU1 no-op for ordinary
+MSCALs from all producers. The VIF command still updates the double-buffer
+registers. The live instruction check and the original dispatcher remain
+available for other programs and VU diagnostics. Set
+`EOD_NATIVE_CAMERA_NOP=0` for the reference dispatch.
+
+On Apple M2 Pro with Plume Vulkan, Dundas Battle with the Bus, 12 AI, maximum
+detail and draw distance at 6× Modern gave these render-trace samples:
+
+| Vblank | VU1 starts with retirement off | VU1 starts with retirement on | No-ops retired |
+|---|---:|---:|---:|
+| 120 | 4,902 | 4,292 | 612 |
+| 240 | 4,948 | 4,332 | 615 |
+| 360 | 4,888 | 4,217 | 662 |
+| 480 | 4,299 | 3,738 | 590 |
+
+Counts are per sampled render frame. The independent runs can reach slightly
+different simulation states at the same vblank. Native GPU time averaged
+9.39 ms over 567 measured frames with retirement on. A separate strict-native
+run at the same scale averaged 8.84 ms and still suppressed 226 cumulative GS
+primitives by GS frame 480. These are headless diagnostics. The owner-PC S5 run
+and fullscreen pacing remain open.
+
+Full VU state, scoreboard and data memory comparisons passed with
+`EOD_NATIVE_CAMERA_NOP_CHECK=1` on Dundas Modern, Gilroy night with the
+interpreter forced on, and Kenyon Classic with two active viewports.
+The Dundas `EOD_DIFF=00214B68` run checked 1,337 calls with zero mismatches.
+The Mac executable built and CTest passed 97 of 97 tests. An observer run
+on Woodly with `EOD_VU_STATS=1` kept `0x24D8` in normal dispatch.
+The changed Windows translation units cross-compiled. Windows runtime
+verification remains open.
+
+S4 remains open. At vblank 240 in strict-native Dundas, the dominant remaining
+world starts were `0x0270`, `0x0618` and `0x0920`, largely from the
+`0x35DEFC` reservation. Batch work from `0x3613E0` follows, especially
+`0x0D48` and `0x24B0`. The existing single-leaf retirement only covers
+one exact opaque payload and still emits compatibility GIF data.

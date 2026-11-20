@@ -1565,7 +1565,7 @@ bool vu_dispatch_observed() {
 }
 }  // namespace
 
-bool vu_retire_camera_nop(VUState *vu, uint32_t pc) {
+bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
     constexpr uint32_t pairs[] = {0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu};
     if (vu_dispatch_observed() ||
         vu->index != 1 || pc != 0x24D8 || std::memcmp(vu->micro + pc, pairs, sizeof(pairs)) != 0)
@@ -1604,7 +1604,7 @@ bool vu_retire_camera_nop(VUState *vu, uint32_t pc) {
         if (std::memcmp(vu, &expected, sizeof(expected)) ||
             std::memcmp(&g_score[vu->index], &scoreboard, sizeof(scoreboard)) ||
             std::memcmp(vu->mem, memory, sizeof(memory)))
-            fatal("camera MSCAL retirement differs from VU1 execution at vblank %llu (%s)",
+            fatal("MSCAL no-op retirement differs from VU1 execution at vblank %llu (%s)",
                   (unsigned long long)kernel_vblank_count(), compiled ? "compiled" : "interpreted");
         return true;
     }

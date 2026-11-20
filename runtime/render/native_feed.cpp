@@ -9,7 +9,6 @@
 #include <array>
 #include <map>
 #include <mutex>
-#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -248,13 +247,6 @@ std::mutex g_mutex;
 std::map<uint32_t, SceneClear> g_scene_clear_packets;
 std::map<uint32_t, DisplayCopy> g_display_copy_packets;
 std::map<uint32_t, ShadowPass> g_shadow_pass_packets;
-std::set<uint32_t> g_camera_packets;
-constexpr uint32_t kCameraPacketQwc = 18;
-
-bool camera_nop_enabled() {
-    static const char *setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
-    return setting && *setting && *setting != '0' && native_only();
-}
 struct Tagged {
     uint32_t end;
     Packet packet;
@@ -765,14 +757,6 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneCle
     const bool spr = g_in_sprite && (ra == kSpriteReserveRa || ra == kAtlasReserveRa);
     const uint32_t end = addr + (qwc ? qwc : 1) * 16;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (camera_nop_enabled() && !diff_in_original_side()) {
-        auto camera = g_camera_packets.lower_bound(addr);
-        if (camera != g_camera_packets.begin() && *std::prev(camera) + kCameraPacketQwc * 16 > addr)
-            g_camera_packets.erase(std::prev(camera));
-        while (camera != g_camera_packets.end() && *camera < end)
-            camera = g_camera_packets.erase(camera);
-        if (ra == 0x35B428 && qwc == kCameraPacketQwc) g_camera_packets.insert(addr);
-    }
     auto clear_it = g_scene_clear_packets.lower_bound(addr);
     if (clear_it != g_scene_clear_packets.begin()) {
         auto prev = std::prev(clear_it);
@@ -853,12 +837,6 @@ bool take_scene_clear(uint32_t dma_tag, uint32_t qwc, SceneClear &clear) {
 void ee_tag_display_copy(uint32_t addr, const DisplayCopy &copy) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_display_copy_packets.insert_or_assign(addr, copy);
-}
-
-bool take_camera_packet(uint32_t dma_tag) {
-    if (!camera_nop_enabled() || diff_in_original_side()) return false;
-    std::lock_guard<std::mutex> lk(g_mutex);
-    return g_camera_packets.erase(dma_tag) != 0;
 }
 
 bool take_display_copy(uint32_t dma_tag, uint32_t qwc, DisplayCopy &copy) {

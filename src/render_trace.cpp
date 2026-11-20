@@ -23,7 +23,7 @@
 #include <vector>
 
 extern uint32_t g_vu1_program_starts[0x800];  // runtime/vu/vif.cpp
-extern uint32_t g_vu1_camera_nops;
+extern uint32_t g_vu1_nops_retired;
 extern uint32_t g_vu1_world_leaf_retires;
 extern void (*g_vu1_start_hook)(uint32_t addr);  // runtime/vu/vif.cpp
 extern uint32_t g_vif1_dma_tag;                  // runtime/hw/hw.cpp: DMA tag VIF1 is reading
@@ -192,8 +192,8 @@ void report(const Counts &c) {
             s += t;
         }
     std::fprintf(stderr, "[rtrace] vb %llu vu1 programs:%s\n", (unsigned long long)c.vb, s.c_str());
-    if (g_vu1_camera_nops)
-        std::fprintf(stderr, "[rtrace] vb %llu camera nops retired %u\n", (unsigned long long)c.vb, g_vu1_camera_nops);
+    if (g_vu1_nops_retired)
+        std::fprintf(stderr, "[rtrace] vb %llu VU1 no-ops retired %u\n", (unsigned long long)c.vb, g_vu1_nops_retired);
     if (g_vu1_world_leaf_retires)
         std::fprintf(stderr, "[rtrace] vb %llu world leaves retired %u\n", (unsigned long long)c.vb, g_vu1_world_leaf_retires);
     // split-screen state (1P/2P comparison): track-pass gate, view count, 0x212DD0 source, 0x495D68
@@ -235,7 +235,7 @@ void roll() {
     g_c = Counts{};
     g_c.vb = vb;
     std::memset(g_vu1_program_starts, 0, sizeof g_vu1_program_starts);
-    g_vu1_camera_nops = 0;
+    g_vu1_nops_retired = 0;
     g_vu1_world_leaf_retires = 0;
     g_vu1_by_sender.clear();
     g_vu1_unknown.clear();
