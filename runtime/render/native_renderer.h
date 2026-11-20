@@ -78,7 +78,17 @@ bool display_copy_enabled();
 bool bootstrap_raster_enabled();
 void ee_tag_display_copy(uint32_t addr, const DisplayCopy &copy);
 bool take_display_copy(uint32_t dma_tag, uint32_t qwc, DisplayCopy &copy);
-enum class ShadowPass : uint32_t { None, Prepare, Composite };
+enum class ShadowPass : uint32_t {
+    None, Prepare, Composite, PrepareUpper, CompositeUpper, PrepareLower, CompositeLower
+};
+constexpr bool shadow_prepares(ShadowPass pass) {
+    return pass == ShadowPass::Prepare || pass == ShadowPass::PrepareUpper || pass == ShadowPass::PrepareLower;
+}
+constexpr int shadow_split_y(ShadowPass pass) {
+    if (pass == ShadowPass::PrepareUpper || pass == ShadowPass::CompositeUpper) return 0;
+    if (pass == ShadowPass::PrepareLower || pass == ShadowPass::CompositeLower) return 224;
+    return -1;
+}
 constexpr uint32_t kShadowPrepareDirectQwc = 77;
 constexpr uint32_t kShadowCompositeDirectQwc = 89;
 ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc);
@@ -117,7 +127,7 @@ uint64_t fog_fge_draws();             // native draws that had FGE set (retail: 
 // 0x365308 (*0x4D8BB8: the particle/sprite K delta, both halves), BlendSelect 0x3654E0 (*0x4D8B78).
 void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k);
 void ee_blend_select(uint32_t sel);
-void ee_shadow_begin(int32_t alpha, bool retail_single_view);
+void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y);
 void ee_shadow_opened(bool opened);
 void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword);
 void ee_shadow_end();

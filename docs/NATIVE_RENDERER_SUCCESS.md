@@ -660,3 +660,48 @@ tests. The Windows cross-build linked eod.exe.
 The change still uses the compatibility transfer and GS state bridge.
 Movie handoff, the full R7 release build, player visual parity, and
 performance remain open.
+
+## R7 split-screen shadow target experiment (2026-11-21)
+
+Apple M2 Pro, Kenyon Battle (8 AI), two players, headless normal Plume.
+At 1× Classic, the default run still recorded 90 deferred waits. The
+independent opt-in `EOD_NATIVE_SPLIT_SHADOW_PASS=1` drew 358 native
+prepare/composite pairs for each of the two views and recorded zero
+synchronous requests, deferred waits, and suppressed GS draws. At
+6× Modern, forcing both sun cascades and the full-screen shadow selector
+off also left all three counts at zero with 356 pairs per view. The
+default retains the original split path.
+
+Exact same-dump software GS replay and a composite-off replay establish
+shadowed regions in both views. At the stationary 1× pair ending at
+vblank 187, the live candidate's mask MAE (RGB code values) was 1.89
+versus GS shadows and 25.85 versus no shadows in the upper view, and
+4.62 versus 18.74 in the lower view. The original path at comparable
+stationary poses gave 1.98 versus 25.71 and 4.63 versus 18.71. At 6×,
+the candidate's 640×448 scanout at the same checkpoint gave 6.23 versus
+27.16 and 7.98 versus 19.46 respectively. Forcing only the native
+composite off inverted those comparisons in each view. In a moving
+lower-view control the off image measured 20.76 against GS shadows and
+1.44 against the no-shadow replay, demonstrating that the native
+composite accounts for the shadows in that view.
+
+Two moving 1× lower-view candidate masks remained closer to no-shadow
+than shadow replay (14.45 versus 14.00 at vblank 362, 13.98 versus 13.22
+at vblank 402), and a 6× moving lower-view mask had a similar result.
+Nearby original-path frames cover different poses and raster masks,
+leaving parity and regression status unresolved in those windows. A
+±5-pixel shift search did not explain the two 1× residuals. The captures and run logs support visible shadows in both
+views and cleaner memory ownership in this experiment. The moving
+lower-view parity, default retirement and cross-platform runtime gates
+remain open. A repeat using the EE camera-position watch found equivalent
+stationary positions and close moving positions sampled at different
+vblanks. At 362 and 402 the repeat candidate's moving lower-view MAE
+favored shadows (1.32 versus 18.84, and 1.31 versus 18.10), but the
+default arm's same-vblank replay windows had no shadow-affected pixels.
+Those repeats do not isolate the cause of the outliers.
+
+The 1,650-vblank differential run checked 1,044 calls each to ShadowBegin
+(0x34C7D0) and ShadowEnd (0x34C798) without a mismatch. Ordinary 1P
+Dundas day retained its native full-screen sun path. Gilroy night
+retained its original full-screen route. macOS CTest passed 99 of 99.
+The MinGW cross-build linked `eod.exe`. Windows runtime testing remains open.

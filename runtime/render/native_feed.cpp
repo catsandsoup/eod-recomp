@@ -151,7 +151,7 @@ bool sun_cascades_enabled() {
 
 namespace {
 
-bool shadow_pass_enabled() {
+bool full_shadow_pass_enabled() {
 #ifdef EOD_PLUME
     static const bool on = [] {
         const char *value = std::getenv("EOD_NATIVE_SHADOW_PASS");
@@ -163,28 +163,48 @@ bool shadow_pass_enabled() {
 #endif
 }
 
+bool split_shadow_pass_enabled() {
+#ifdef EOD_PLUME
+    static const bool on = [] {
+        const char *value = std::getenv("EOD_NATIVE_SPLIT_SHADOW_PASS");
+        return value && value[0] == '1';
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+bool shadow_pass_enabled() { return full_shadow_pass_enabled() || split_shadow_pass_enabled(); }
+
 // EE-thread selection, latched before ShadowTargetOpen for both ordered DIRECT packets.
 bool g_hybrid_shadow_cascades = false;
+int g_retail_split_y = -1;
 
 uint32_t shadow_direct_qwc(ShadowPass pass) {
-    return pass == ShadowPass::Prepare ? kShadowPrepareDirectQwc : kShadowCompositeDirectQwc;
+    return shadow_prepares(pass) ? kShadowPrepareDirectQwc : kShadowCompositeDirectQwc;
 }
 
 ShadowPass shadow_reservation(uint32_t ra, uint32_t qwc) {
-    if (!native_only() && !g_hybrid_shadow_cascades) return ShadowPass::None;
     const ShadowPass pass = ra == 0x362a34 ? ShadowPass::Prepare
                           : ra == 0x362f34 ? ShadowPass::Composite : ShadowPass::None;
     if (pass == ShadowPass::None || qwc != shadow_direct_qwc(pass) + 1) return ShadowPass::None;
-    // In the full-screen layout, preparation aliases the shadow Z base as
-    // FRAME; the volume and composite use the saved color base instead.
+    // 0x363218 saves the main viewport and the temporary target's format.
     constexpr uint32_t rt = 0x4d8bd8;
-    if (MEM_LW(rt) != 320 || MEM_LW(rt + 4) != 448 ||
-        MEM_LW(rt + 0x10) != 0x19f || MEM_LW(rt + 0x14) != 2 ||
+    if (MEM_LW(rt) != 320 || MEM_LW(rt + 0x10) != 0x19f || MEM_LW(rt + 0x14) != 2 ||
         MEM_LW(rt + 0x18) != 0x15f || MEM_LW(rt + 0x1c) != 0x32 ||
-        MEM_LW(rt + 0x28) || MEM_LW(rt + 0x2c) ||
-        MEM_LW(rt + 0x30) != 640 || MEM_LW(rt + 0x34) != 448)
+        MEM_LW(rt + 0x28) || MEM_LW(rt + 0x30) != 640)
         return ShadowPass::None;
-    return pass;
+
+    const uint32_t top = MEM_LW(rt + 0x2c);
+    const uint32_t height = MEM_LW(rt + 0x34);
+    if (MEM_LW(rt + 4) != height) return ShadowPass::None;
+    if (!top && height == 448 && full_shadow_pass_enabled() && (native_only() || g_hybrid_shadow_cascades))
+        return pass;
+    if (!split_shadow_pass_enabled() || height != 224 || int(top) != g_retail_split_y) return ShadowPass::None;
+    if (!top) return shadow_prepares(pass) ? ShadowPass::PrepareUpper : ShadowPass::CompositeUpper;
+    if (top == 224) return shadow_prepares(pass) ? ShadowPass::PrepareLower : ShadowPass::CompositeLower;
+    return ShadowPass::None;
 }
 
 bool g_editor_environment = false;
@@ -1304,12 +1324,13 @@ void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k) {
 }
 void ee_blend_select(uint32_t sel) { g_tex.blend_sel = sel; }
 
-void ee_shadow_begin(int32_t alpha, bool retail_single_view) {
+void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
     std::memset(&g_shadow_cam, 0, sizeof g_shadow_cam);
     fill_camera(g_shadow_cam);
     g_shadow_cam.retail_shadow_view = retail_single_view;
+    g_retail_split_y = retail_split_y;
     g_hybrid_shadow_cascades = sun_cascades_enabled() && look_modern() && retail_single_view &&
                               !g_shadow_cam.editor_environment && !g_shadow_cam.fge &&
                               sun_cascades::daylight(g_shadow_cam.fogcol);

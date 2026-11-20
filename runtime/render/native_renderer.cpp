@@ -312,6 +312,7 @@ struct Renderer {
     SunView sun_view;
     SunMaps sun_maps;
     bool hybrid_shadow_prepared = false;
+    int split_shadow_prepared_y = -1;
     Target main_target{};
     bool has_main_target = false;
     uint64_t main_xy = 0;
@@ -2842,6 +2843,7 @@ void finalize() {
 
 void end_vblank(uint64_t vb) {
     g_r.sun_view.reset();
+    g_r.split_shadow_prepared_y = -1;
     g_r.vb = vb;
     if (scene_capture_log()) {
         if (g_r.scene_draws[size_t(SceneStage::Reflection)]) {
@@ -3398,6 +3400,35 @@ bool gs_shadow_boundary(ShadowPass pass) {
     if (!prepare() || (modern::g_on && modern::live())) return false;
     if (g_active) finalize();
     SunView &view = g_r.sun_view;
+    const int split_y = shadow_split_y(pass);
+    if (split_y >= 0) {
+        if (shadow_prepares(pass)) {
+            // The preceding view's work must be complete before changing its target.
+            flush();
+            g_r.split_shadow_prepared_y = -1;
+            view.reset();
+            if (!g_r.has_main_target || g_r.main_sc[0] != 0 || g_r.main_sc[1] != split_y ||
+                g_r.main_sc[2] != 639 || g_r.main_sc[3] != split_y + 223)
+                return false;
+            g_r.split_shadow_prepared_y = split_y;
+        } else {
+            const bool prepared = g_r.split_shadow_prepared_y == split_y;
+            g_r.split_shadow_prepared_y = -1;
+            if (!prepared) return false;
+            const bool same_view = std::all_of(g_r.shadow_pending.begin(), g_r.shadow_pending.end(),
+                                              [split_y](const Item &item) {
+                                                  const auto &rt = item.p.shadow_rt;
+                                                  return rt[0] == 320 && rt[1] == 224 &&
+                                                         rt[2] == 0 && rt[3] == split_y &&
+                                                         rt[4] == 640 && rt[5] == 224;
+                                              });
+            if (!same_view) return false;
+            flush_shadows();
+            flush();
+        }
+        return true;
+    }
+    g_r.split_shadow_prepared_y = -1;
     if (pass == ShadowPass::Prepare) {
         flush();
         const bool ordered_scene = view.valid && view.target == g_r.main_target && view.xy == g_r.main_xy &&

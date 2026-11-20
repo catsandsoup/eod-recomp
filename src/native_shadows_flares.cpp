@@ -160,9 +160,11 @@ void shadow_begin() {
 
     // Snapshot main-viewport camera/projection BEFORE 0x35DA30 -> 0x363218 overwrites 0x4D7C20
     if (!diff_in_original_side()) {
-        const bool race_view = saved_ra == 0x30A59C && lwu(kViewCount) == 1 &&
-                               lwu(kViewIndex) == 0 && lwu(kPhyscamView) <= 18;
-        native::ee_shadow_begin(alpha, race_view);
+        const uint32_t view_count = lwu(kViewCount), view_index = lwu(kViewIndex);
+        const bool retail_view = saved_ra == 0x30A59C && lwu(kPhyscamView) <= 18;
+        const bool single_view = retail_view && view_count == 1 && view_index == 0;
+        const int split_y = retail_view && view_count == 2 && view_index < 2 ? int(view_index) * 224 : -1;
+        native::ee_shadow_begin(alpha, single_view, split_y);
     }
 
     set(4, alpha);

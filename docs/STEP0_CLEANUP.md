@@ -242,3 +242,27 @@ playback still has 210 synchronous readbacks in the A/B window.
 **Next decisive test.** Isolate the movie-path readbacks and validate
 the native movie transfer, crop and presentation at the same boundary
 as the GS reference.
+
+### 2026-11-21 R7 split-screen shadow ownership experiment (STAR)
+
+- **Situation.** The compatibility shadow-depth scratch at BP 0x2BE0
+  aliases texture uploads in a live 2P Kenyon race. The default path
+  waits for the GPU to restore the shadow owner.
+- **Task.** Draw both viewports from native scene depth and private
+  shadow storage, remove the proven waits, and preserve moving shadows.
+- **Action.** Tag the retail shadow begin/end reservations from the
+  decompiled scene using the saved upper or lower viewport. Match the
+  compatible packets and clipped rectangles, drain pending work before
+  changing the target, and consume only the composite paired with the
+  accepted same-frame prepare. Test the split route independently of
+  full-screen and cascade settings.
+- **Result.** The opt-in slice reached zero synchronous requests,
+  deferred waits, and suppressed GS draws in tested 2P cases. Replay
+  masks confirm visible shadows in both views with the native composite.
+  Some moving lower-view masks still disagree; the two live runs did
+  not repeat those exact poses. The normal split path remains the
+  default, so players do not inherit an unverified visual change.
+- **Next decisive test.** Replay the same moving lower-view inputs and
+  camera/geometry states on both paths, compare the shadow-affected
+  pixels in each view, then rerun the zero-wait audit before enabling
+  the candidate by default.

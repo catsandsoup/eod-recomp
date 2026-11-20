@@ -1708,3 +1708,48 @@ renderer is idle. The bootstrap selector checks for a live old renderer
 or an explicitly requested scene capture. Set EOD_NATIVE_BOOT_QUAD=0 to
 run the reference raster path. Bootstrap history and clear experiments
 retain their own selector.
+
+### R7 ordered 2P shadow targets
+
+The retail 640×224 views at y=0 and y=224 share the main frame and
+Z buffer. From the decompiled `0x34C7D0` / `0x34C798` boundary,
+`0x363218` saves the main viewport at `0x4D8C00` and sets the native
+shadow target dimensions at `0x4D8BD8`. The 2P target is 320×224.
+`0x362968` and `0x362E70` reserve the 77- and 89-qword DIRECTs at
+RA `0x362A34` and `0x362F34` respectively (generated retail decompile
+`gen/rec_101.c`). The stored main viewport tags both packets in order.
+
+| State | Upper 2P | Lower 2P |
+| --- | --- | --- |
+| Prepare depth-copy V at first strip | 0 | 224 |
+| Prepare scratch SCISSOR | 0,0–319,223 | 0,0–319,223 |
+| Composite TEX0 (shadow mask) | `0x20000006242173e0` | same |
+| Composite SCISSOR | 0,0–639,223 | 0,224–639,447 |
+| Composite first packed Y | `0x71F0` | `0x7FF0` |
+
+Both views use `XYOFFSET_1=0x71FF00006BFF`, and the prepare depth-copy
+TEX0 matches the 640×448 layout. These values were observed in three
+Kenyon split-screen captures and follow the register and strip formulas
+at the two packet producers. The native renderer can keep color
+accumulation private and sample main depth in place. It must match the
+current main scissor and pair a composite with the accepted prepare for
+the same view. The split path uses the existing projected volume math
+and supports Classic and Modern, including when sun cascades are off.
+Keep the existing 640×448 selection and unsupported packet fallback.
+
+Restrict this dispatch to the retail `0x30A59C` ShadowBegin return site
+with `0x3D1A74 == 2` and active viewport `0x3D1A78 == 0` or `1`.
+`0x363218` saves the view for both `0x362968` and `0x362E70`, so both
+reservations must target the same 224-row view. Drain pending shadow
+meshes before preparing a view and flush its composite before allowing
+the next view to change the main target. Distinct packet seals and
+per-view counts expose a missing or mismatched half.
+
+The 2P path is a diagnostic opt-in via `EOD_NATIVE_SPLIT_SHADOW_PASS=1`
+while the moving lower-view comparison remains open. The full-screen
+selector retains the original `EOD_NATIVE_SHADOW_PASS` and cascade gates.
+A valid pair is the two tagged retail producers in one view and one GS
+frame. If preparation falls back, the native composite falls back too.
+Measured captures confirm all tagged pairs were completed. If a matching
+composite were corrupted after its prepare was accepted, its original
+scratch contents could not be reconstructed from the native target.

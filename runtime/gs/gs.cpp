@@ -1013,7 +1013,8 @@ bool apply_shadow_pass(native::ShadowPass pass, const uint8_t *packet, uint32_t 
     if (pass == native::ShadowPass::None || !hw::g_on) return false;
     const auto &path = g_path[GIF_PATH2];
     const auto &ctx = st.ctx[0];
-    const bool prepare = pass == native::ShadowPass::Prepare;
+    const bool prepare = native::shadow_prepares(pass);
+    const int split_y = native::shadow_split_y(pass);
     const auto word = [&](uint32_t index, uint32_t half = 0) {
         uint64_t value;
         memcpy(&value, packet + index * 16 + half * 8, sizeof value);
@@ -1038,9 +1039,23 @@ bool apply_shadow_pass(native::ShadowPass pass, const uint8_t *packet, uint32_t 
         if (qwc != native::kShadowCompositeDirectQwc || ctx.frame != 0x000a008c ||
             !matches(0, 0x7000000000000001ull, 0x1eeeeee) ||
             !matches(2, 0x10a000118, 0x4e) || !matches(3, 0x44, 0x42) ||
-            !matches(6, 0x20000006642173e0ull, 6) ||
+            !matches(6, split_y >= 0 ? 0x20000006242173e0ull : 0x20000006642173e0ull, 6) ||
             !matches(8, 0x40ab400000008014ull, 0x5e5e))
             return false;
+    }
+    if (split_y >= 0) {
+        const uint64_t top = uint64_t(split_y);
+        if (prepare) {
+            if (ctx.frame != 0x000a008c || ctx.scissor != 0x00df0000013f0000ull ||
+                !matches(33, top << 20, 3) || !matches(35, ((top + 224) << 20) | 0x400, 3))
+                return false;
+        } else {
+            const uint64_t scissor = (top + 223) << 48 | top << 32 | 639ull << 16;
+            if (ctx.scissor != scissor ||
+                !matches(10, ((0x71f0 + top * 16) << 32) | 0x6bf0, 0) ||
+                !matches(12, ((0x7ff0 + top * 16) << 32) | 0x6df0, 0))
+                return false;
+        }
     }
     if (!native::gs_shadow_boundary(pass)) return false;
     // Preserve the producer's packed A+D, RGBA and final PRE/UV state.
@@ -1064,11 +1079,12 @@ bool apply_shadow_pass(native::ShadowPass pass, const uint8_t *packet, uint32_t 
         write_reg(0x03, word(87));
     }
     g_path[GIF_PATH2] = PathState{};
-    static uint32_t preparations = 0, composites = 0;
-    auto &count = prepare ? preparations : composites;
-    if (++count == 1 || count % 120 == 0)
-        fprintf(stderr, "[native] EE shadow %s %u (20 strips each)\n",
-                prepare ? "preparations" : "composites", count);
+    static uint32_t preparations[3] = {}, composites[3] = {};
+    const unsigned view = split_y < 0 ? 0 : split_y == 0 ? 1 : 2;
+    auto &count = prepare ? preparations[view] : composites[view];
+    if (++count == 1 || count % 120 == 0 || (split_y >= 0 && r7_audit::enabled()))
+        fprintf(stderr, "[native] EE shadow %s %u (20 strips each, view y=%d)\n",
+                prepare ? "preparations" : "composites", count, split_y);
     return true;
 }
 
@@ -1237,8 +1253,9 @@ namespace {
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW, CMD_EDITOR_RACE_FRAME, CMD_MODERN, CMD_NATIVE };
 constexpr uint32_t kGifSceneClear = 1;  // CMD_GIF's live-only aux field
 constexpr uint32_t kGifDisplayCopy = 2;
-constexpr uint32_t kGifShadowPrepare = 3;
-constexpr uint32_t kGifShadowComposite = 4;
+constexpr uint32_t kGifShadowFirst = 3;
+constexpr uint32_t kGifShadowLast =
+    kGifShadowFirst + uint32_t(native::ShadowPass::CompositeLower) - 1;
 
 bool g_threaded;
 bool g_gs_stop; // guarded by g_q_mtx
@@ -1605,8 +1622,9 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     g_have_ordered_display_copy = false;
                     if (apply_display_copy(g_ordered_display_copy, d, h[3] / 16)) break;
                 }
-                if (h[2] == kGifShadowPrepare && apply_shadow_pass(native::ShadowPass::Prepare, d, h[3] / 16)) break;
-                if (h[2] == kGifShadowComposite && apply_shadow_pass(native::ShadowPass::Composite, d, h[3] / 16)) break;
+                if (h[2] >= kGifShadowFirst && h[2] <= kGifShadowLast &&
+                    apply_shadow_pass(native::ShadowPass(h[2] - kGifShadowFirst + 1), d, h[3] / 16))
+                    break;
             }
             gif_process((int)h[1], d, h[3] / 16);
             break;
@@ -2081,10 +2099,8 @@ void gif_transfer(int path, const uint8_t *data, uint32_t qwc, const native::Sce
         tag = kGifDisplayCopy;
     } else if (bootstrap_quad) {
         native::post(native::CMD_BOOTSTRAP_QUAD, bootstrap_quad, sizeof *bootstrap_quad);
-    } else if (shadow == native::ShadowPass::Prepare) {
-        tag = kGifShadowPrepare;
-    } else if (shadow == native::ShadowPass::Composite) {
-        tag = kGifShadowComposite;
+    } else if (shadow != native::ShadowPass::None) {
+        tag = kGifShadowFirst + uint32_t(shadow) - 1;
     }
     push_cmd(CMD_GIF, (uint32_t)path, tag, data, qwc * 16);
 }
