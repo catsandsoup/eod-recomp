@@ -705,3 +705,35 @@ The 1,650-vblank differential run checked 1,044 calls each to ShadowBegin
 Dundas day retained its native full-screen sun path. Gilroy night
 retained its original full-screen route. macOS CTest passed 99 of 99.
 The MinGW cross-build linked `eod.exe`. Windows runtime testing remains open.
+
+## R7 integration with Remaster 1.1 source (2026-11-21)
+
+The upstream launcher defaults, package checks, and removal of tracked
+captured VU tables are integrated. The renderer conflicts were against
+files that already matched upstream before the R7 work. The merge keeps
+the R7 changes on those files and keeps split-screen shadow ownership
+opt-in. The upstream cleanup also removes the stale editor copies from
+the normal CMake source graph.
+
+A fresh macOS Plume build with `EOD_PUBLIC_VU_INTERPRETER=ON` and the
+matching MinGW build both linked. Neither VU object depended on
+`vu_rec.inc`. The private Mac comparison build still depended on it.
+The public Mac executable had the VU interpreter symbol and no captured
+dispatch table symbols. The known 0x24D8 no-op still retires against the
+live instruction pairs. In the public build the exact-state interpreter
+comparison passed and the trace reported 577 and 613 retirements at
+vblanks 123 and 241. Disabling retirement removed both entries.
+
+In headless EOD_DIFF smoke runs, the local and public Mac builds matched
+383 and 387 loading-quad calls, and 290 and 82 visibility calls. All four
+checks reported zero mismatches. Ordinary 6× Dundas Modern loads and
+races in both builds recorded zero synchronous requests, deferred
+waits, CLUT waits, suppressed draws and visibility VU0 executions.
+The opt-in 1× Classic Kenyon split-screen smoke also recorded zeros for
+those fields. The lifecycle gate correctly rejected both 6× Dundas
+logs because VU1 dispatches, GIF packets and GS raster work remained.
+The counters span each run, and the two binaries progressed through
+different numbers of rendered frames. The local Mac build passed all 99
+CTest cases. These are functional checks.
+Package identity, player visual parity, sustained presentation, the
+3.33 ms budget, and Windows runtime verification remain open.

@@ -266,3 +266,25 @@ as the GS reference.
   camera/geometry states on both paths, compare the shadow-affected
   pixels in each view, then rerun the zero-wait audit before enabling
   the candidate by default.
+
+### 2026-11-21 R7 upstream integration (STAR)
+
+- **Situation.** The development release source and Windows package smoke
+  arrived on the upstream branch during the R7 changes.
+- **Task.** Combine the upstream launcher and public-build settings
+  with the local renderer and keep the default visual controls.
+- **Action.** Preserve the checked renderer changes on files already
+  identical before the branch diverged. Adopt the upstream cleanup of
+  captured VU tables and stale editor copies. Keep the exact no-op
+  retirement usable with the interpreter, and update the isolated LOD
+  fixture to stub the current visibility entry point.
+- **Result.** Local and fresh public Mac builds passed the loading and
+  visibility probes. The public Mac and cross-built Windows VU objects
+  have no captured-table dependency. The public Mac executable still
+  links the interpreter, and both Mac 6× runs fail the lifecycle gate
+  for VU1, GIF and GS work. The Windows build linked without runtime
+  verification.
+- **Next decisive test.** Replace the remaining default compatibility
+  paths and rerun the same audit from the released-format executable.
+  Moving split-screen visual parity and release presentation still
+  need matched scenes and captures.

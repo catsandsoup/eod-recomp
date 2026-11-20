@@ -52,6 +52,12 @@ def package(game: Path, plume: Path, output: Path) -> Path:
         library = contents / "Frameworks" / "eod_editor_plume.dylib"
         shutil.copyfile(plume, library)
         run("xattr", "-cr", app)
+        # PyInstaller's initial deep sign can fail on cloud/Finder metadata.
+        # Renew resource seals on the real framework bundles before the parent.
+        frameworks = [path for path in (contents / "Frameworks").rglob("*.framework")
+                      if path.is_dir() and not path.is_symlink()]
+        for framework in sorted(frameworks, key=lambda path: len(path.parts), reverse=True):
+            run("codesign", "--force", "--sign", "-", framework)
         run("codesign", "--force", "--sign", "-", library)
         info_path = contents / "Info.plist"
         info = plistlib.loads(info_path.read_bytes())

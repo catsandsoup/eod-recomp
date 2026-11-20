@@ -34,7 +34,7 @@
 #include "scene_emit.h"
 #include "vif.h"
 
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_PUBLIC_VU_INTERPRETER)
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 #endif
@@ -1269,8 +1269,14 @@ struct VuProg {
         sb.hi[sl] |= (whi);                        \
     } while (0)
 
+// Public binaries interpret the player's microcode without embedding capture tables.
+#ifndef EOD_PUBLIC_VU_INTERPRETER
 #if __has_include("vu_rec.inc")
 #define VU_REC 1
+#endif
+#endif
+
+#ifdef VU_REC
 namespace {
 // Helpers for the compiled programs: upper FMAC results as SSE vectors
 // (same IEEE single operations as apply_t, lanes with an Inf/NaN result
@@ -1493,12 +1499,6 @@ inline uint8_t *vu1_qword(VUState *vu, uint32_t addr_qw) { return vu->mem + ((ad
 
 #include "vu_rec.inc"
 }  // namespace
-#else
-namespace {
-const VuProg g_vu_progs[1] = {{-1, 0, nullptr, 0, nullptr}};
-const int g_vu_nprogs = 0;
-}  // namespace
-#endif
 
 namespace {
 struct RecSlot {
@@ -1545,6 +1545,7 @@ static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
     }
     return true;
 }
+#endif
 
 // EOD_VU_REC=file [EOD_VU_REC_AT=vblank] [EOD_VU_REC_N=n]: records the state
 // before each micro program run (n runs from that vblank on) for
@@ -1595,7 +1596,13 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
         vu->index != 1 || pc != 0x24D8 || std::memcmp(vu->micro + pc, pairs, sizeof(pairs)) != 0)
         return false;
 
+    // Both paths recognize the live instruction pairs. Only reference builds
+    // can dispatch a compiled version of those pairs.
+#ifdef VU_REC
     const VuProg *compiled = vu_rec_find(vu, pc);
+#else
+    const VuProg *compiled = nullptr;
+#endif
     const auto retire = [compiled, pc](VUState *state) {
         if (compiled) {
             // The generated NOP pairs advance cycles without per-pair pipe synchronization.
@@ -1901,6 +1908,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
         }
         if (is_mlist) r7_audit::add(r7_audit::Counter::Vu0Mlist);
     }
+#ifdef VU_REC
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;
@@ -1974,6 +1982,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
         }
         return;
     }
+#endif
     // EOD_VU_STATS=1: which programs run interpreted (no compiled match), with their time
     static const bool stats = getenv("EOD_VU_STATS") != nullptr;
     if (stats) {
@@ -2169,6 +2178,7 @@ int vu_bench(const char *path, int repeat) {
     }
     if (checks_requested) return checks_passed ? 0 : 1;
     std::sort(pass.begin(), pass.end());
+#ifdef VU_REC
     if (!g_blk_stats.empty()) {
         std::vector<std::pair<uint64_t, std::string>> top;
         uint64_t total = 0;
@@ -2183,6 +2193,7 @@ int vu_bench(const char *path, int repeat) {
         for (size_t k = 0; k < top.size() && k < 40; k++)
             printf("  %5.1f%%  %s\n", 100.0 * top[k].first / total, top[k].second.c_str());
     }
+#endif
     printf("vu-bench: %zu records x %d: VU0 %zu runs %.3f ms, VU1 %zu runs %.3f ms; VU1 per pass: fastest %.3f ms, "
            "median %.3f ms (%.2f ns per VU1 cycle); result hash %016llx\n",
            recs.size(), repeat, calls[0], ns[0] / 1e6, calls[1], ns[1] / 1e6, pass.empty() ? 0 : pass[0] / 1e6,

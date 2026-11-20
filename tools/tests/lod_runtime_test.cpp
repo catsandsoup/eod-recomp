@@ -53,7 +53,7 @@ extern "C" void f_00214678_orig() {
     simulate_original();
 }
 extern "C" void f_00214678();
-extern "C" void f_003582B8_orig() { simulate_original(); }
+extern "C" void eod_world_003582B8() { simulate_original(); }
 extern "C" void f_0021ABF8();
 extern "C" void f_0021C6E0();
 extern "C" void f_00218E68();

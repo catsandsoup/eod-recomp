@@ -58,7 +58,8 @@ if(EOD_GEN_STALE)
   endif()
 endif()
 # compiled VU micro programs (optional: the interpreter runs everything without them)
-if(Python3_FOUND AND NOT EXISTS ${GEN_DIR}/vu_rec.inc)
+option(EOD_PUBLIC_VU_INTERPRETER "Use the interpreter without embedding captured VU instruction tables" OFF)
+if(Python3_FOUND AND NOT EOD_PUBLIC_VU_INTERPRETER AND NOT EXISTS ${GEN_DIR}/vu_rec.inc)
   execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/vurecomp.py
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
@@ -76,15 +77,6 @@ file(GLOB_RECURSE RUNTIME_SOURCES
   ${CMAKE_SOURCE_DIR}/runtime/spu/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/render/*.cpp
   ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.c)
-# These tracked editor copies are snapshots, not translation units.
-set(EOD_VULKAN_GS_EDITOR_COPY "${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/gs_vulkan 2.cpp")
-list(REMOVE_ITEM RUNTIME_SOURCES
-  "${CMAKE_SOURCE_DIR}/runtime/gs/gs 2.cpp"
-  "${EOD_VULKAN_GS_EDITOR_COPY}"
-  "${CMAKE_SOURCE_DIR}/runtime/hw/hw 2.cpp"
-  "${CMAKE_SOURCE_DIR}/runtime/render/native_renderer 2.cpp"
-  "${CMAKE_SOURCE_DIR}/runtime/render/native_renderer 3.cpp"
-  "${CMAKE_SOURCE_DIR}/src/hle_draw_distance 2.cpp")
 # The optional standalone Plume scene library owns this source.
 list(REMOVE_ITEM RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/render/plume_scene.cpp)
 list(APPEND RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/main.cpp)
@@ -174,7 +166,6 @@ if(WIN32)
   option(EOD_VULKAN "Build the Vulkan GS backend" ON)
   if(EOD_VULKAN)
     file(GLOB VULKAN_GS_SOURCES ${CMAKE_SOURCE_DIR}/runtime/gs/vulkan/*.cpp)
-    list(REMOVE_ITEM VULKAN_GS_SOURCES "${EOD_VULKAN_GS_EDITOR_COPY}")
     list(APPEND PLATFORM_SOURCES ${VULKAN_GS_SOURCES})
   endif()
 else()
@@ -262,6 +253,9 @@ endif()
 target_include_directories(eod_gen PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${GEN_DIR})
 
 add_executable(eod ${RUNTIME_SOURCES} ${PLATFORM_SOURCES} $<TARGET_OBJECTS:eod_gen>)
+if(EOD_PUBLIC_VU_INTERPRETER)
+  target_compile_definitions(eod PRIVATE EOD_PUBLIC_VU_INTERPRETER=1)
+endif()
 target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_SOURCE_DIR}/runtime ${GEN_DIR})
 
 # Optional standard gzip transport for bounded diagnostic cold captures.

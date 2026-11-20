@@ -1,0 +1,155 @@
+name: Windows x64 release package smoke
+run-name: Windows x64 package smoke · ${{ inputs.tag }} · release ${{ inputs.release_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact draft release tag
+        required: true
+        type: string
+      release_id:
+        description: Numeric draft release ID
+        required: true
+        type: string
+      source_sha:
+        description: Full Git commit SHA targeted by the draft
+        required: true
+        type: string
+      package_mode:
+        description: Which Windows ZIPs are expected
+        type: choice
+        default: combined
+        options:
+          - combined
+          - separate
+          - game-only
+          - editor-only
+      game_asset:
+        description: Exact Windows game or combined bundle ZIP name, if supplied
+        default: ''
+        type: string
+      game_sha256:
+        description: SHA-256 of the game or combined ZIP, if supplied
+        default: ''
+        type: string
+      editor_asset:
+        description: Exact standalone Windows editor ZIP name, if supplied
+        default: ''
+        type: string
+      editor_sha256:
+        description: SHA-256 of the separate editor ZIP, if supplied
+        default: ''
+        type: string
+
+permissions: {}
+
+jobs:
+  fetch:
+    if: github.repository == 'catsandsoup/eod-recomp'
+    runs-on: windows-2022
+    timeout-minutes: 6
+    # Draft release visibility requires a write-capable repository identity.
+    permissions:
+      contents: write
+    outputs:
+      test_script_sha256: ${{ steps.scripts.outputs.test_script_sha256 }}
+      editor_probe_sha256: ${{ steps.scripts.outputs.editor_probe_sha256 }}
+    env:
+      EOD_RELEASE_TAG: ${{ inputs.tag }}
+      EOD_RELEASE_ID: ${{ inputs.release_id }}
+      EOD_SOURCE_SHA: ${{ inputs.source_sha }}
+      EOD_PACKAGE_MODE: ${{ inputs.package_mode }}
+      EOD_GAME_ASSET: ${{ inputs.game_asset }}
+      EOD_GAME_SHA256: ${{ inputs.game_sha256 }}
+      EOD_EDITOR_ASSET: ${{ inputs.editor_asset }}
+      EOD_EDITOR_SHA256: ${{ inputs.editor_sha256 }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the smoke scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/windows-smoke
+      - name: Fetch and authenticate the exact draft assets
+        env:
+          EOD_DRAFT_TOKEN: ${{ github.token }}
+        run: ./tools/windows-smoke/Fetch-DraftAssets.ps1
+      - name: Stage the reviewed smoke scripts
+        id: scripts
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $scripts = @{
+            test_script_sha256 = 'Test-WindowsPackages.ps1'
+            editor_probe_sha256 = 'probe-editor.py'
+          }
+          foreach ($entry in $scripts.GetEnumerator()) {
+            $source = Join-Path 'tools/windows-smoke' $entry.Value
+            Copy-Item -LiteralPath $source -Destination $scratch
+            $digest = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "$($entry.Key)=$digest"
+          }
+      - name: Transfer the verified ZIPs and smoke scripts for this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/game.zip
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/editor.zip
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/Test-WindowsPackages.ps1
+            ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}/probe-editor.py
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  smoke:
+    needs: fetch
+    permissions: {}
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - name: Download this run's verified packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eod-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Run clean native package smoke
+        shell: pwsh
+        env:
+          EOD_RELEASE_TAG: ${{ inputs.tag }}
+          EOD_RELEASE_ID: ${{ inputs.release_id }}
+          EOD_SOURCE_SHA: ${{ inputs.source_sha }}
+          EOD_GAME_SHA256: ${{ inputs.game_sha256 }}
+          EOD_EDITOR_SHA256: ${{ inputs.editor_sha256 }}
+          EOD_TEST_SCRIPT_SHA256: ${{ needs.fetch.outputs.test_script_sha256 }}
+          EOD_EDITOR_PROBE_SHA256: ${{ needs.fetch.outputs.editor_probe_sha256 }}
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "eod-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $scripts = @{
+            'Test-WindowsPackages.ps1' = $env:EOD_TEST_SCRIPT_SHA256
+            'probe-editor.py' = $env:EOD_EDITOR_PROBE_SHA256
+          }
+          foreach ($entry in $scripts.GetEnumerator()) {
+            $path = Join-Path $scratch $entry.Key
+            $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $entry.Value) { throw "Unexpected transfer digest for $($entry.Key)." }
+          }
+
+          $receipt = Get-Content -LiteralPath (Join-Path $scratch 'receipt.json') -Raw | ConvertFrom-Json
+          if ($receipt.release_id.ToString() -cne $env:EOD_RELEASE_ID -or
+              $receipt.tag -cne $env:EOD_RELEASE_TAG -or $receipt.source_commit -cne $env:EOD_SOURCE_SHA) {
+            throw 'Transferred receipt does not match the requested prerelease and source.'
+          }
+          $requestedDigests = @{ game = $env:EOD_GAME_SHA256; editor = $env:EOD_EDITOR_SHA256 }
+          foreach ($entry in $requestedDigests.GetEnumerator()) {
+            $asset = $receipt.($entry.Key)
+            if (-not $entry.Value -and $null -eq $asset) { continue }
+            if (-not $entry.Value -or -not $asset -or $asset.sha256 -ne $entry.Value) {
+              throw "Transferred receipt does not match the requested archive digest for $($entry.Key)."
+            }
+          }
+          # The smoke script independently verifies the matching ZIP bytes before extraction.
+          & (Join-Path $scratch 'Test-WindowsPackages.ps1') -Scratch $scratch

@@ -298,6 +298,7 @@ int main(int argc, char **argv) {
     windows_utf8_arguments(argc, argv);
 #endif
 #ifdef __APPLE__
+    mac_app_apply_bundle_defaults(); // persisted settings are loaded below
     mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
 #endif
     signal(SIGINT, on_signal);

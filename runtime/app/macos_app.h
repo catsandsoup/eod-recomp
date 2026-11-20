@@ -2,6 +2,8 @@
 #include "disc_import.h"
 #include <string>
 std::string mac_app_support();
+// Set optional launcher defaults before reading persisted settings.
+void mac_app_apply_bundle_defaults();
 bool mac_app_prepare(std::string &data, const std::string &config, bool headless, const DiscId &id);
 // As above, but with problem set no Cocoa dialog opens: the reason is returned for the in-game
 // error screen (and its controller disc chooser).
