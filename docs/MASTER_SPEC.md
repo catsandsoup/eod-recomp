@@ -67,6 +67,11 @@ recompiled into `eod`. Quality bar: Halo 2 Anniversary (MCC).
   VRAM readback stalls.
 - **S4 no emulated graphics in the frame path:** 0 VU1 microprogram executions, 0 emulated
   GS rasterizations, 0 synchronous VRAM readbacks per frame across the scene suite.
+- **R7 release build (owner, 2026-11-21):** the game executable and its bundled
+  runtime libraries exclude the VU1 execution backend and the GS emulator. Verify
+  exclusion in the release build graph and link map as well as checking S4 live.
+  Classic uses the native renderer. The legacy graphics implementation can serve
+  as an offline reference in a separate tool during verification.
 - **S5 efficiency (owner, 2026-11-20):** on the owner's PC at RenderScale 6, max LOD, Modern,
   Dundas with max cars and draw distance, the per-frame cost is `<= 3.33 ms`. That is the
   300 fps budget: the mean of CPU frame work (EE + native feed + record/submit) and GPU frame

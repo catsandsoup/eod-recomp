@@ -585,7 +585,7 @@ void world_render_pass() {
                     if (!out) {  // no packet space: the rest of this record is not drawn
                         open = false;
                         call(f_0034F888, 0x358EA0);
-                        native::ee_world_record(slot, false);
+                        native::ee_world_record(false);
                         break;
                     }
                 }
@@ -612,7 +612,7 @@ void world_render_pass() {
             if (open) {
                 set(4, (int32_t)qwords);
                 call(f_0035CBB8, 0x358EB0);
-                native::ee_world_record(slot, reg(2) != 0);
+                native::ee_world_record(reg(2) != 0);
                 call(f_0034F888, 0x358EB8);
             }
             i = lw(sp + 0x70);

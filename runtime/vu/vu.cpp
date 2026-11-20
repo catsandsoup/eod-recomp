@@ -616,10 +616,32 @@ void lower_div(VUState *vu, uint32_t ins, int kind) {
     lower_div_f(vu, kind, vu->vf[FS(ins)].f[fsf], vu->vf[FT(ins)].f[ftf]);
 }
 
-bool g_vu_mute_kick;  // EOD_VU_CHECK: the second run of a program sends nothing
+bool g_vu_mute_kick;  // differential checks execute the reference without sending it to GS
+
+struct VuKickCheck {
+    struct Packet {
+        unsigned address, qwords;
+        const VUReg *data;
+    } expected[2];
+    unsigned seen = 0;
+    bool equal = true;
+};
+thread_local VuKickCheck *g_vu_kick_check;
 
 void xgkick(VUState *vu, uint32_t addr_qw) {
-    if (g_vu_mute_kick) return;
+    if (g_vu_mute_kick) {
+        if (auto *check = g_vu_kick_check) {
+            const unsigned index = check->seen++;
+            if (index >= 2 || check->expected[index].address != addr_qw) {
+                check->equal = false;
+            } else {
+                const auto &packet = check->expected[index];
+                if (memcmp(vu->mem + 16 * addr_qw, packet.data, 16 * packet.qwords))
+                    check->equal = false;
+            }
+        }
+        return;
+    }
     // send a GIF packet (possibly several tags) from VU1 memory via PATH1
     uint32_t a = addr_qw & 0x3FF;
     // walk tags until EOP to find the length (wrapping at 16KB)
@@ -1617,23 +1639,32 @@ namespace {
 constexpr uint32_t kWorldLeafPc = 0x270;
 constexpr uint32_t kWorldLeafTpc = 0x920;
 constexpr unsigned kWorldStripOffset = 200;
-constexpr unsigned kWorldVertices = 20;
-constexpr unsigned kWorldStripQwords = 1 + 3 * kWorldVertices;
-constexpr uint64_t kWorldLeafCycles = 312;
+constexpr unsigned kWorldMaxVertices = 60;
+constexpr unsigned kWorldStripQwords = 1 + 3 * kWorldMaxVertices;
+constexpr uint64_t kWorldFirstFourCycles = 104;
+constexpr uint64_t kWorldVertexLoopCycles = 13;
 
 struct WorldLeafVertices {
     // GS PACKED retains the raw fog/ADC word and the input ST padding word.
-    VUReg st[kWorldVertices]{}, rgba[kWorldVertices]{}, xyzf[kWorldVertices]{};
-    VUReg projection[kWorldVertices]{}, acc_last{};
+    VUReg st[kWorldMaxVertices]{}, rgba[kWorldMaxVertices]{}, xyzf[kWorldMaxVertices]{};
+    VUReg projection[kWorldMaxVertices]{}, acc_last{};
     VUReg last_input_position{}, last_st{}, last_unscaled_st{};
-    float q[kWorldVertices]{};
+    float q[kWorldMaxVertices]{};
     float last_header = 0, penultimate_header = 0;
 };
 
 struct WorldLeafRetirement {
     VUState after{};
     VUReg tex1[2]{}, strip[kWorldStripQwords]{};
+    unsigned strip_qwords = 0;
 };
+
+bool matches_world_leaf_program(VUState *vu, uint32_t pc) {
+    constexpr XXH128_hash_t image_hash{0x2329B43F09230E29ull, 0xC8C64EAE4BB1B7EBull};
+    return pc == kWorldLeafPc && vu->index == 1 &&
+           vu->mem_mask == 0x3FFF && vu->micro_mask == 0x3FFF &&
+           XXH128_isEqual(XXH3_128bits(vu->micro, 0x4000), image_hash) && vu_rec_find(vu, pc);
+}
 
 VUReg world_qword(const VUState &vu, unsigned qw) {
     VUReg reg;
@@ -1646,8 +1677,7 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
     constexpr uint32_t kAlmostTwo = 0x3FFFFFFF;
     if (before.vi[0] != 0 || before.vf[0].u[0] || before.vf[0].u[1] ||
         before.vf[0].u[2] || before.vf[0].u[3] != kOne ||
-        before.q_busy || before.p_busy || before.fq_n || before.flag_pipe || before.running ||
-        before.cycle > UINT64_MAX - kWorldLeafCycles)
+        before.q_busy || before.p_busy || before.fq_n || before.flag_pipe || before.running)
         return false;
 
     // q19/q20 are the live strip and TEX1 tag templates. q21 supplies the TEX1 address.
@@ -1658,30 +1688,36 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
     const VUReg pos_base = world_qword(before, top + 199);
     out.tex1[0] = world_qword(before, 20);
     out.tex1[1] = world_qword(before, 21);
-    if (source_tag.u[0] != 0x8014 || tag_template.u[1] != 0x300E4000 ||
+    const unsigned count = source_tag.u[0] & 0x7FFF;
+    const int16_t lod = static_cast<int16_t>(st_base.u[2]);
+    if ((source_tag.u[0] & ~0x7FFFu) != 0x8000 || count < 4 || count > kWorldMaxVertices ||
+        // PRIM.ABE may differ. Both strip templates use the same packed register list.
+        (tag_template.u[1] & ~0x00200000u) != 0x300E4000 ||
         (tag_template.u[2] & 0xFFF) != 0x412 ||
         out.tex1[0].u[0] != 0x8001 || out.tex1[0].u[1] != 0x10000000 ||
         (out.tex1[0].u[2] & 15) != 0xE || (out.tex1[1].u[2] & 0xFF) != 0x14 ||
-        (uint16_t)tex_base.u[1] != 112 || (int16_t)st_base.u[2] != -1060 ||
-        pos_base.u[0] || pos_base.u[1] || pos_base.u[2] ||
-        !std::isnormal(before.vf[3].f[3]))
+        lod > 0 || !std::isnormal(before.vf[3].f[3]))
         return false;
 
-    out.tex1[1].u[1] = (uint16_t)(tex_base.u[1] + (int16_t)st_base.u[2] + 1000);
+    const uint64_t cycles = kWorldFirstFourCycles + kWorldVertexLoopCycles * (count - 4);
+    if (before.cycle > UINT64_MAX - cycles) return false;
+
+    out.tex1[1].u[1] = static_cast<uint16_t>(tex_base.u[1] + lod + 1000u);
+    out.strip_qwords = 1 + 3 * count;
     out.strip[0] = tag_template;
     out.strip[0].u[0] = source_tag.u[0];
 
     WorldLeafVertices vertices;
     float fog_scale;
     std::memcpy(&fog_scale, &kAlmostTwo, sizeof fog_scale);
-    for (unsigned i = 0; i < kWorldVertices; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
         const unsigned src = top + 1 + 3 * i;
         const VUReg color = world_qword(before, src);
-        const VUReg pos = world_qword(before, src + 1);
+        VUReg pos = world_qword(before, src + 1);
         const VUReg uv = world_qword(before, src + 2);
-        if (pos.u[3] != kOne || color.u[0] != 0x80 || color.u[1] != 0x80 ||
-            color.u[2] != 0x80 || color.u[3] > 0xFFFF)
-            return false;
+        if (pos.u[3] != kOne || color.u[3] > 0xFFFF) return false;
+        for (unsigned lane = 0; lane < 3; ++lane)
+            pos.f[lane] += pos_base.f[lane];
         for (unsigned lane = 0; lane < 4; ++lane) {
             float acc = before.vf[4].f[lane] * pos.f[0];
             acc += before.vf[5].f[lane] * pos.f[1];
@@ -1713,8 +1749,8 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
         out.strip[1 + 3 * i] = vertices.st[i];
         out.strip[2 + 3 * i] = vertices.rgba[i];
         out.strip[3 + 3 * i] = vertices.xyzf[i];
-        if (i == kWorldVertices - 2) vertices.penultimate_header = static_cast<float>(color.u[3]);
-        if (i == kWorldVertices - 1) {
+        if (i == count - 2) vertices.penultimate_header = static_cast<float>(color.u[3]);
+        if (i == count - 1) {
             vertices.last_header = static_cast<float>(color.u[3]);
             vertices.last_input_position = pos;
             vertices.last_st = st_input;
@@ -1732,13 +1768,13 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
     vu.vf[13].f[3] = vertices.last_header;
     vu.vf[14].u[3] = world_qword(before, top + 8).u[3];
     for (unsigned lane = 0; lane < 3; ++lane)
-        vu.vf[14].f[lane] = vertices.projection[18].f[lane] * vertices.q[18];
+        vu.vf[14].f[lane] = vertices.projection[count - 2].f[lane] * vertices.q[count - 2];
     vu.vf[15] = vertices.last_input_position;
-    vu.vf[16] = vertices.xyzf[19];
-    vu.vf[17] = vertices.xyzf[17];
-    vu.vf[18] = vertices.xyzf[18];
-    vu.vf[19] = vertices.xyzf[17];
-    vu.vf[20] = vertices.st[19];
+    vu.vf[16] = vertices.xyzf[count - 1];
+    vu.vf[17] = vertices.xyzf[count - 3];
+    vu.vf[18] = vertices.xyzf[count - 2];
+    vu.vf[19] = vertices.xyzf[count - 3];
+    vu.vf[20] = vertices.st[count - 1];
     vu.vf[20].u[3] = world_qword(before, top + 5).u[3];
     vu.vf[21] = vertices.last_unscaled_st;
     vu.vf[21].u[3] = vertices.xyzf[0].u[3];
@@ -1748,48 +1784,84 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
     vu.vi[4] = 0;
     vu.vi[5] = out.tex1[1].u[1];
     vu.acc = vertices.acc_last;
-    vu.q = vu.q_pending = vertices.q[19];
+    vu.q = vu.q_pending = vertices.q[count - 1];
     vu.i = fog_scale;
     vu.status &= ~0x30u;
-    vu.cycle += kWorldLeafCycles;
+    vu.cycle += cycles;
     vu.q_ready = vu.cycle - 25;
     vu.tpc = kWorldLeafTpc;
     // The final scheduled VF result has aged out of the three live scoreboard slots.
     return true;
 }
 
+void write_world_leaf_memory(const WorldLeafRetirement &result, uint8_t *memory, unsigned top) {
+    std::memcpy(memory + 21 * 16 + 4, &result.tex1[1].u[1], 4);
+    std::memcpy(memory + (top + kWorldStripOffset) * 16, result.strip, result.strip_qwords * 16);
+}
+
 void materialize_world_leaf(const WorldLeafRetirement &result, VUState &vu, unsigned top) {
     vu = result.after;
-    std::memcpy(vu.mem + 21 * 16 + 4, &result.tex1[1].u[1], 4);
-    std::memcpy(vu.mem + (top + kWorldStripOffset) * 16, result.strip, sizeof result.strip);
+    write_world_leaf_memory(result, vu.mem, top);
     xgkick(&vu, 20);
     xgkick(&vu, top + kWorldStripOffset);
+}
+
+bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned top, bool verbose) {
+    uint8_t memory[0x4000];
+    memcpy(memory, vu.mem, sizeof memory);
+    write_world_leaf_memory(expected, memory, top);
+    const Scoreboard score = g_score[1];
+
+    VuKickCheck kicks{{{20, 2, expected.tex1},
+                       {top + kWorldStripOffset, expected.strip_qwords, expected.strip}}};
+    const bool already_muted = g_vu_mute_kick;
+    g_vu_mute_kick = true;
+    g_vu_kick_check = &kicks;
+    vu_rec_find(&vu, kWorldLeafPc)->fn(&vu, kWorldLeafPc);
+    g_vu_kick_check = nullptr;
+    g_vu_mute_kick = already_muted;
+
+    const size_t state_bytes = sizeof vu;
+    const bool same_state = memcmp(&vu, &expected.after, state_bytes) == 0;
+    const bool same_memory = memcmp(vu.mem, memory, sizeof memory) == 0;
+    const bool same_score = sb_same(g_score[1], score, vu.cycle);
+    const bool same_kicks = kicks.equal && kicks.seen == 2;
+    if (same_state && same_memory && same_score && same_kicks) return true;
+    if (verbose) {
+        const auto *state_data = reinterpret_cast<const uint8_t *>(&expected.after);
+        const auto *actual = reinterpret_cast<const uint8_t *>(&vu);
+        const auto state_diff = std::mismatch(state_data, state_data + state_bytes, actual).first;
+        const auto memory_diff = std::mismatch(memory, memory + sizeof memory, vu.mem).first;
+        fprintf(stderr, "world leaf: %u vertices, state byte %zu, memory byte %zu, scoreboard %s, kicks %s, cycles %llu/%llu\n",
+                (expected.strip_qwords - 1) / 3, static_cast<size_t>(state_diff - state_data),
+                static_cast<size_t>(memory_diff - memory), same_score ? "same" : "different",
+                same_kicks ? "same" : "different", (unsigned long long)expected.after.cycle,
+                (unsigned long long)vu.cycle);
+    }
+    return false;
 }
 
 }  // namespace
 #endif
 
-bool vu_retire_world_leaf(VUState *vu, uint32_t pc, const uint32_t *payload, uint32_t top) {
+bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top) {
 #if defined(EOD_VULKAN) && defined(VU_REC)
     // Portable capture and original-path diagnostics must see the original dispatch.
     static const bool diagnostic = getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
         getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
         getenv("EOD_NATIVE_QCHECK") || getenv("EOD_VIF_CHECK");
-    if (diagnostic || vu_dispatch_observed() || !payload || pc != kWorldLeafPc ||
+    if (diagnostic || vu_dispatch_observed() || pc != kWorldLeafPc ||
         vu->index != 1 || vu->mem_mask != 0x3FFF || vu->micro_mask != 0x3FFF ||
         (top != 0xE0 && top != 0x270) || !sb_same(g_score[1], Scoreboard{}, vu->cycle))
         return false;
 
-    // Full 512-byte REF payload and 16 KiB live image from the supported Dundas
-    // leaf. The compiled lookup also validates the program's exact microcode ranges.
-    constexpr XXH128_hash_t payload_hash{0xE4E1E3A046E75426ull, 0x2494700AE9738E9Bull};
-    constexpr XXH128_hash_t image_hash{0x2329B43F09230E29ull, 0xC8C64EAE4BB1B7EBull};
-    if (!XXH128_isEqual(XXH3_128bits(payload, 512), payload_hash) ||
-        !XXH128_isEqual(XXH3_128bits(vu->micro, 0x4000), image_hash) || !vu_rec_find(vu, pc))
-        return false;
+    if (!matches_world_leaf_program(vu, pc)) return false;
 
     WorldLeafRetirement result;
     if (!derive_world_leaf(*vu, top, result)) return false;
+    static const bool check = getenv("EOD_NATIVE_WORLD_RETIRE_CHECK") != nullptr;
+    if (check && !check_world_leaf(result, *vu, top, true))
+        fatal("world VU1 retirement differs at vblank %llu", (unsigned long long)kernel_vblank_count());
     materialize_world_leaf(result, *vu, top);
     return true;
 #else
@@ -1976,6 +2048,10 @@ int vu_bench(const char *path, int repeat) {
         for (size_t k = 0; k < n; k++) hash = (hash ^ b[k]) * 1099511628211ull;
     };
     std::vector<double> pass;  // VU1 time of each pass
+#if defined(EOD_VULKAN) && defined(VU_REC)
+    const bool world_check = getenv("EOD_NATIVE_WORLD_BENCH_CHECK") != nullptr;
+    size_t world_matched = 0, world_mismatched = 0, world_unsupported = 0;
+#endif
     for (int rep = 0; rep < repeat; rep++) {
         double before = ns[1];
         for (const Rec &r : recs) {
@@ -1992,6 +2068,22 @@ int vu_bench(const char *path, int repeat) {
             g_score[r.h.index] = r.sb;
             g_vif1_top = r.h.top;
             g_vif1_itop = r.h.itop;
+#if defined(EOD_VULKAN) && defined(VU_REC)
+            if (world_check && rep == 0 && r.h.index == 1 && r.h.pc == kWorldLeafPc &&
+                r.h.itop == 0x80 && (r.h.top == 0xE0 || r.h.top == 0x270)) {
+                WorldLeafRetirement expected;
+                if (!matches_world_leaf_program(vu, r.h.pc) ||
+                    !sb_same(r.sb, Scoreboard{}, vu->cycle) || !derive_world_leaf(*vu, r.h.top, expected)) {
+                    ++world_unsupported;
+                    continue;
+                }
+                if (check_world_leaf(expected, *vu, r.h.top, world_mismatched < 8))
+                    ++world_matched;
+                else
+                    ++world_mismatched;
+                continue;
+            }
+#endif
             uint64_t c0 = vu->cycle;
             auto t0 = std::chrono::steady_clock::now();
             vu_execute(vu, r.h.pc);
@@ -2010,6 +2102,13 @@ int vu_bench(const char *path, int repeat) {
         }
         pass.push_back(ns[1] - before);
     }
+#if defined(EOD_VULKAN) && defined(VU_REC)
+    if (world_check) {
+        fprintf(stderr, "world-bench: %zu matched, %zu mismatched, %zu unsupported\n",
+                world_matched, world_mismatched, world_unsupported);
+        return world_matched && !world_mismatched ? 0 : 1;
+    }
+#endif
     std::sort(pass.begin(), pass.end());
     if (!g_blk_stats.empty()) {
         std::vector<std::pair<uint64_t, std::string>> top;

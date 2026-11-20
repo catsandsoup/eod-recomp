@@ -1299,6 +1299,36 @@ the original dispatcher. `EOD_RENDER_TRACE_EVERY` counts the host retirements
 separately from actual `0x0270` dispatches. GS still consumes the compatibility
 packets for ordered state and geometry.
 
+### R7 opaque world-strip differential
+
+At the EE call `0x358E8C`, WorldRenderPass opens the texture record with
+`0x35DEE0`. It writes the leaf REF from `part + 0x38`. The VIF codes
+mark non-clipped leaves with ITOP `0x80` and clipped leaves with `0x280`.
+For `0x0270` and ITOP `0x80`, the live VU image branches to `0x0640`.
+It gets the vertex count from the tag at TOP, adds the position base at
+TOP+199 and uses the UV base at TOP+198. The vertex loop at `0x07B8`
+advances one vertex per iteration. For non-positive signed K, the
+epilogue writes the TEX1 word at q21 and sends q20 before the strip at
+TOP+200. The E-bit pair and delay at `0x0918` and `0x0920` retire
+this branch. An independent dispatch at `0x0920` has different control
+flow.
+
+For broader retirement, compare against the compiled reference offline
+with the same VU state, data memory, TOP, ITOP and active scoreboard.
+Compare final VU state, full data memory and the live scoreboard in
+`--vu-bench` before changing runtime admission. The recorded Dundas
+sample had 1,471 invocations of `0x0270`, including 400 four-vertex
+and 37 twenty-vertex invocations with ITOP `0x80`. A single payload
+address is insufficient to cover this producer.
+
+The opt-in dynamic admission uses a committed non-clipped world REF.
+It checks the actual DMA tag, source address, payload size, first
+MSCAL and top-bank layout. Later VIF commands remain in the stream. The candidate then checks the live VU image
+and strip layout before deriving the result. Other dispatches retain the
+reference path. During live verification, run the reference silently
+and compare both ordered kicks byte for byte as well as final state.
+Only then submit the compatibility packets to GS.
+
 ### Phase A1: race HUD producer table (`SLUS_209.10`, Ghidra `DecompileAddrs`, 2026-11-20)
 
 `0x0011CA48(view)` (per player from `0x00101C00` at `0x00101D34`; full screen view -1 from

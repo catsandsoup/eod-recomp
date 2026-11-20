@@ -164,3 +164,28 @@ REFs at `0x35DEFC` still consume from `0x0270`, `0x0618` and
 `0x0920`. Prove equivalent output and state on full passes across day,
 night and split-screen before widening the single-leaf retirement. S4, the
 native menu and render-target cases, and the owner-PC S5 benchmark remain open.
+
+## R7 non-clipped world REF handoff (2026-11-21)
+
+**Situation.** The original world retirement supported one 20-vertex
+payload at a fixed address. Live non-clipped world REFs vary in size,
+position base, color and texture LOD.
+
+**Task.** Retire the verified non-clipped `0x0270` branch and measure
+how many VU1 dispatches that removes.
+
+**Action.** Matched the committed world tag and live VIF layout. Derived
+the output and post-state from the input bank and compared both GIF
+kicks, memory, registers and the active scoreboard against the
+reference in recorded and live runs.
+
+**Result.** 1,128 recorded entries matched. The 6× Dundas A/B removed
+1,052 invocations at sampled vblank 240. Day, night and 2P live
+checks passed, as did 97 CTest tests. The path remains opt-in and still
+feeds compatibility state through GS. See
+`docs/NATIVE_RENDERER_SUCCESS.md` for the measurements.
+
+**Next decisive test.** Submit the matched world batch and its render
+state directly in native order. Compare the previous GS-visible
+state and output across the same scene rotation before removing the
+compatibility kick and its dependence on VU-local state.

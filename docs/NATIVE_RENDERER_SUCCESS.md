@@ -506,3 +506,27 @@ world starts were `0x0270`, `0x0618` and `0x0920`, largely from the
 `0x35DEFC` reservation. Batch work from `0x3613E0` follows, especially
 `0x0D48` and `0x24B0`. The existing single-leaf retirement only covers
 one exact opaque payload and still emits compatibility GIF data.
+
+## R7 non-clipped world REF retirement (2026-11-21)
+
+`EOD_NATIVE_WORLD_RETIRE=1 EOD_NATIVE_ONLY=1` now recognizes eligible
+committed world REFs by the live packet and strip layout. It covers
+variable vertex counts and origin/UV bases and retains the exact live
+micro-image guard. The opt-in path still emits the compatibility GS
+packets.
+
+With `EOD_NATIVE_WORLD_BENCH_CHECK=1`, a 7,000-call Dundas VU capture
+compared 1,128 non-clipped `0x0270` entries to the reference. All 1,128
+matched the entire VU state and memory, active scoreboard and the bytes
+and order of both GIF kicks. Live `EOD_NATIVE_WORLD_RETIRE_CHECK=1`
+also passed 670 vblanks of Dundas day, 550 of Gilroy night and 650 of
+two-view Kenyon. Sampled live retirements reached 1,080, 706 and 2,663
+per frame, respectively. The independent `EOD_DIFF=00358BD0` run
+checked 2,168 calls with zero mismatches.
+
+At 6× in strict-native Dundas, vblank 240 recorded 4,332 VU1 dispatches
+with retirement off and 3,280 with it on. The 1,052 difference equals
+the retirement counter. The GPU means were 9.21 and 9.83 ms in separate
+runs. This comparison measures removed VU1 dispatches and establishes
+no GPU time improvement. S4 and S5 remain open, as does the requirement
+to link the release without the VU1 and GS backends.

@@ -49,19 +49,24 @@ Vif g_vif[2];
 
 uint32_t avail(const Vif &v) { return (uint32_t)(v.q.size() - v.qpos); }
 
-bool matches_world_leaf_ref(const Vif &v, const uint32_t *payload) {
-    constexpr uint32_t source = 0x0109D050;  // leaf 0x0109D018 + the 0x38-byte batch header
+bool matches_world_leaf_ref(const Vif &v, const uint32_t *payload, size_t words) {
     const uint32_t tag = g_vif1_dma_tag;
-    return payload == reinterpret_cast<const uint32_t *>(g_ram + source) &&
-           !(tag & 15) && tag <= EE_RAM_SIZE - 16 &&
-           MEM_LW(tag) == 0x30000020 && MEM_LW(tag + 4) == source &&
-           MEM_LW(tag + 8) == 0x04000080 && MEM_LW(tag + 12) == 0x05000000 &&
+    if (!payload || !words || words > 0xFFFFu * 4 ||
+        (tag & 15) || tag > EE_RAM_SIZE - 16 ||
+        MEM_LW(tag) != (0x30000000u | (words / 4)) ||
+        MEM_LW(tag + 8) != 0x04000080 || MEM_LW(tag + 12) != 0x05000000)
+        return false;
+    // The native feed has already verified that this source is part + 0x38.
+    const uint32_t source = MEM_LW(tag + 4);
+    return !(source & 15) && source <= EE_RAM_SIZE - words * 4 &&
+           payload == reinterpret_cast<const uint32_t *>(g_ram + source) &&
            v.base == 0xE0 && v.ofst == 0x190 && v.mode == 0 && v.cycle == 0x0101 &&
            v.itop == 0x80 && v.top == (v.dbf ? 0xE0u : 0x270u) &&
            v.tops == (v.dbf ? 0x270u : 0xE0u);
 }
 
-void start_micro(Vif &v, uint32_t addr, bool mscal = false, const uint32_t *ref_payload = nullptr) {
+void start_micro(Vif &v, uint32_t addr, bool mscal = false,
+                 const uint32_t *ref_payload = nullptr, size_t ref_words = 0) {
     if (v.n == 1) {
         v.itop = v.itops;
         v.top = v.tops;
@@ -81,8 +86,8 @@ void start_micro(Vif &v, uint32_t addr, bool mscal = false, const uint32_t *ref_
 #else
         (void)mscal;
 #endif
-        if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload) &&
-            vu_retire_world_leaf(v.vu, addr, ref_payload, v.top)) {
+        if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload, ref_words) &&
+            vu_retire_world_leaf(v.vu, addr, v.top)) {
             ++g_vu1_world_leaf_retires;
             return;
         }
@@ -432,9 +437,8 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
             break;
         case 0x14:  // MSCAL
             LOG(LOG_VIF, "VIF%d MSCAL %04x", v.n, imm * 8);
-            // The supported REF has a complete 32-qword VIF payload and MSCAL at dword 124.
-            start_micro(v, imm * 8, true,
-                        v.n == 1 && n == 128 && pos == 124 ? w : nullptr);
+            // Admission checks the committed REF; later commands run from the same VIF stream.
+            start_micro(v, imm * 8, true, v.n == 1 && !(n & 3) ? w : nullptr, n);
             break;
         case 0x15: start_micro(v, imm * 8); break;       // MSCALF
         case 0x17: start_micro(v, v.vu->tpc); break;     // MSCNT

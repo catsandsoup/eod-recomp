@@ -82,7 +82,7 @@ ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc);
 // record's packet commit (0x35CBB8 result: false = no packet space, nothing is drawn), the end.
 void ee_world_pass(int32_t pass, uint32_t identity_packet);
 void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, uint32_t itop);
-void ee_world_record(uint32_t slot, bool committed);
+void ee_world_record(bool committed);
 void ee_world_pass_end();
 // WaterDraw 0x325728: begin (before ImmediateBegin 0x35DF10, whose packets are the water's), each
 // vertex ImmediateVertex 0x361708 accepted (colour word, strip flag = draws a triangle, guest

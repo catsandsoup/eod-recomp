@@ -1138,7 +1138,7 @@ void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, ui
 }
 
 // The texture record's packet commit: its REFs are what VIF1 will read; tag each with its leaf.
-void ee_world_record(uint32_t slot, bool committed) {
+void ee_world_record(bool committed) {
     if (!enabled()) return;
     if (!committed) {
         g_wc.dropped_records++;
@@ -1147,7 +1147,7 @@ void ee_world_record(uint32_t slot, bool committed) {
         return;
     }
     static const char *retire = std::getenv("EOD_NATIVE_WORLD_RETIRE");
-    const bool retire_slot = slot == 35 && retire && *retire && *retire != '0' && native_only();
+    const bool retire_enabled = retire && *retire && *retire != '0' && native_only() && !diff_in_original_side();
     std::lock_guard<std::mutex> lk(g_mutex);
     for (auto &l : g_leaves) {
         const uint32_t a = l.first;
@@ -1159,8 +1159,7 @@ void ee_world_record(uint32_t slot, bool committed) {
         it = g_tags.lower_bound(a);
         while (it != g_tags.end() && it->first < a + 16) it = g_tags.erase(it);
         const Packet &leaf = l.second;
-        const bool eligible = retire_slot && leaf.kind == KIND_WORLD && leaf.pass == 0 &&
-                              leaf.batch == 0x0109D018 && leaf.itop == 0x80 && leaf.mesh != 0;
+        const bool eligible = retire_enabled && leaf.itop == 0x80 && leaf.mesh != 0;
         g_tags[a] = Tagged{a + 16, leaf, false, eligible};
         g_wc.leaves++;
     }
