@@ -40,6 +40,7 @@ bool enabled();
 bool look_available();
 bool toggle_look();
 bool look_modern();
+bool sun_cascades_enabled();  // opt-in for the validated ordered scene path
 // Prepare native pipelines after GS device creation and before the guest starts.
 bool prepare();
 const editor_environment::Override *environment_override();
@@ -110,7 +111,7 @@ uint64_t fog_fge_draws();             // native draws that had FGE set (retail: 
 // 0x365308 (*0x4D8BB8: the particle/sprite K delta, both halves), BlendSelect 0x3654E0 (*0x4D8B78).
 void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k);
 void ee_blend_select(uint32_t sel);
-void ee_shadow_begin(int32_t alpha);
+void ee_shadow_begin(int32_t alpha, bool retail_single_view);
 void ee_shadow_opened(bool opened);
 void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword);
 void ee_shadow_end();
@@ -132,7 +133,7 @@ void ee_sprite_end(bool drawn);
 // text flush 0x29A2B8 -> 0x35DF10; drawn as KIND_HUD (never relit by Modern)
 void ee_imm_begin(bool cockpit, bool hud = false);
 bool ee_in_imm();
-void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
+void ee_imm_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip, float spark_age);
 void ee_imm_end(bool drawn);
 void ee_sphere_imm(uint32_t buf_obj, uint32_t ref_qword);
 // ---- EE thread, VU1 uploads (src/bone_pose.cpp, stage R3) ----------------------------------
@@ -196,6 +197,7 @@ struct Packet {
     uint32_t fge, fogcol;
     float fog_range[3];
     bool editor_environment;
+    bool retail_shadow_view;    // 0x30A580, one active retail viewport at ShadowBegin
     // the rest of the EE render state in effect when it was queued (stage R5 A2): render flags
     // *0x4D8BC8 (0x365540), blend select *0x4D8B78 (0x3654E0), TEX1 K template *0x4D8BAC and MXL
     // *0x4D8BBC (0x3652A8), the particle/sprite K delta *0x4D8BB8 (0x365308)
@@ -233,6 +235,8 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
     std::vector<KRun> k_runs;  // every VU1 run, when k_mixed
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<scene::EffectBillboard> billboards;  // retained for a live switch to Modern
+    bool has_spark_age = false;
 };
 
 enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4, CMD_BOOTSTRAP_QUAD = 5 };
@@ -250,12 +254,14 @@ void post(uint32_t kind, const void *data, uint32_t size);
 void gs_command(uint32_t kind, const void *data, uint32_t size);
 bool gs_clear_scene(const gs::Env &env, const SceneClear &clear);
 bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]);
-bool gs_shadow_boundary();
+bool gs_shadow_boundary(ShadowPass pass);
 // a primitive the GS is about to draw: true = it belongs to a native object (do not draw)
 // (b, c: the other vertices of a triangle, for the P2 vertex check EOD_NATIVE_SKIN_CHECK=1)
 bool gs_draw(const gs::Env &e, const gs::Vertex &first, const gs::Vertex *b = nullptr, const gs::Vertex *c = nullptr);
 // a VRAM transfer or other non-draw use of GS memory follows: draw what is pending first
 void gs_barrier();
+// The GS FIFO may overwrite movie pages when no earlier native work is queued.
+bool gs_movie_clear_ready();
 void gs_vblank(uint64_t frame);
 
 }  // namespace native

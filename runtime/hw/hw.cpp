@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "../core/cpu.h"
 #include "../core/diff_harness.h"
 #include "../core/log.h"
 #include "../core/memory.h"
@@ -714,7 +715,14 @@ void hw_write128(uint32_t p, const uint32_t v[4]) {
     }
     case 0x6000: {
         std::array<uint32_t, 4> q = {v[0], v[1], v[2], v[3]};
-        offload_run([q] { gif_transfer(GIF_PATH3, reinterpret_cast<const uint8_t *>(q.data()), 1); });
+        const uint32_t caller = g_ee.r[31].uw[0];
+        if (off == 0x6000 && gs::is_movie_clear_caller(caller) &&
+            std::memcmp(q.data(), gs::kMovieClearKick, sizeof gs::kMovieClearKick) == 0 &&
+            gs_native_movie_handoff_enabled()) {
+            offload_run([q, caller] { gif_movie_clear(reinterpret_cast<const uint8_t *>(q.data()), caller); });
+        } else {
+            offload_run([q] { gif_transfer(GIF_PATH3, reinterpret_cast<const uint8_t *>(q.data()), 1); });
+        }
         return;
     }
     case 0x7000:

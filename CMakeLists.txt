@@ -58,7 +58,8 @@ if(EOD_GEN_STALE)
   endif()
 endif()
 # compiled VU micro programs (optional: the interpreter runs everything without them)
-if(Python3_FOUND AND NOT EXISTS ${GEN_DIR}/vu_rec.inc)
+option(EOD_PUBLIC_VU_INTERPRETER "Use the interpreter without embedding captured VU instruction tables" OFF)
+if(Python3_FOUND AND NOT EOD_PUBLIC_VU_INTERPRETER AND NOT EXISTS ${GEN_DIR}/vu_rec.inc)
   execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/vurecomp.py
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
@@ -252,6 +253,9 @@ endif()
 target_include_directories(eod_gen PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${GEN_DIR})
 
 add_executable(eod ${RUNTIME_SOURCES} ${PLATFORM_SOURCES} $<TARGET_OBJECTS:eod_gen>)
+if(EOD_PUBLIC_VU_INTERPRETER)
+  target_compile_definitions(eod PRIVATE EOD_PUBLIC_VU_INTERPRETER=1)
+endif()
 target_include_directories(eod PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_SOURCE_DIR}/runtime ${GEN_DIR})
 
 # Optional standard gzip transport for bounded diagnostic cold captures.

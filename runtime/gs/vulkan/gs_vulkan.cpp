@@ -243,6 +243,7 @@ struct Surface {
     ID3D11DepthStencilView *dsv = nullptr;
     ID3D11ShaderResourceView *srv = nullptr;
     uint32_t version = 0; // bumped when drawn to
+    uint64_t ownership = 0;
     uint64_t last_use = 0;
 };
 
@@ -251,6 +252,7 @@ Surface *g_owner[kPages]; // nullptr: the CPU copy is current
 bool g_vram_ok[kPages];   // a surface owns the page and gs::vram also holds its
                           // contents
 uint64_t g_frame_no;
+uint64_t g_surface_ownership = 0;
 // Proof of CPU/GPU equality for every storage bit in these physical blocks.
 // Actual complete CPU uploads add bits; any later GPU draw acquisition clears
 // them conservatively. These are independent of diagnostic drawn footprints.
@@ -1512,9 +1514,11 @@ void acquire(Surface *s, int x0, int y0, int x1, int y1) {
     surface_pages_rect(s, x0, y0, x1, y1, pages);
     std::vector<PageRect> up;
     std::vector<std::pair<Surface *, std::vector<PageRect>>> conv;
+    bool reacquired = false;
     for (const PageRect &p : pages) {
         Surface *o = g_owner[p.page];
         if (o != s) {
+            reacquired = true;
             if (!o || g_vram_ok[p.page]) {
                 up.push_back(p);
             } else if (convertible(o, s)) {
@@ -1541,6 +1545,7 @@ void acquire(Surface *s, int x0, int y0, int x1, int y1) {
             convert_rect(c.first, s->rtv, s->dsv, s->psm, s->bw, s->w, s->h, x, y, w, h, false, nullptr);
         });
     for_rects(up, [&](int x, int y, int w, int h) { upload_rect(s, x, y, w, h); });
+    if (reacquired) s->ownership = ++g_surface_ownership;
     for (const PageRect &p : pages) {
         g_owner[p.page] = s;
         g_vram_ok[p.page] = false; // about to be drawn: the CPU copy goes stale

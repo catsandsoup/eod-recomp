@@ -441,3 +441,28 @@ Limo only (A5, Classic too), not on Dundas Bus.
 - `metal_painted` metalness (A4).
 - R5 open items: oval-track grandstand wedge, upper-right blurred rectangle (`FBP 0x1180`), 27 fps
   under `EOD_NATIVE_ONLY=1`, near-plane clip vs GS (depth clamp), P2 `0x318` back-face culling.
+
+## R7.1d retail movie framebuffer handoff (2026-11-20)
+
+On Apple M2 Pro with the borrowed Plume Vulkan device, the opt-in handoff
+was compared off and on in 1280×960 at 4:3 and 1×, and 1280×720 at 16:9
+and 3×. The runs used private saves, strict native level 1 and R7.1c
+direct movie scanout. In each natural and Start comparison, the first
+`logos.pss` crop at (40,16), 640×448 CT32, dropped from 165 synchronous
+display-page reads to zero. Both settings measured zero movie-window
+mid-frame submits. Enabled runs retired the two boundary commands in
+order for each movie that played. The wide runs restored 16:9 at the
+front end after presenting the movie at 4:3.
+
+Natural playback completed both `logos.pss` and `campsiz.pss`. Start
+ended `logos.pss` after about 2.8 seconds. Startup skip bypassed playback
+and issued no boundary commands. All twelve window runs reached the
+retail main menu. SDL opened the MacBook Pro speakers at 48 kHz, and
+the stereo mixer captures matched 512-frame PCM segments at 30 sampled
+positions in the 4:3 natural pair and 32 in the wide natural pair.
+Offline software GS replay also matched VRAM, decoded depth and scanout
+on the guarded clear cases and preserved the portable original GIF packet.
+
+These results cover the tested Mac movie transitions and their ordering
+and readback counters. Physical audio-to-display latency, native Windows
+playback and the broader R7/S4 scene gates remain open.

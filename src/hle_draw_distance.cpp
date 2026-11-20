@@ -107,14 +107,17 @@ void eod_draw_distance_native_fog(float source) {
 }
 
 extern "C" void f_00214678() {
+    const uint32_t frame = g_ee.r[29].uw[0] - 0xd0;
     f_00214678_orig();
     const float k = configured();
     const bool maximum = g_config.detail == "maximum";
     if (k == 1 && !maximum) return;
     const uint32_t graf = ee_r32(kGraf);
     if (!ram(graf, 12)) return;
-    // Native relocation (f_00358F50) is unguarded, so each loader call works on
-    // freshly loaded bytes: scaling once here cannot compound.
+    // f_00132638 writes the GRAF version and the fresh-resource flag to this
+    // call's stack frame. 0x214768 skips native relocation for resident GRAF
+    // bytes. Use the same flag so those mlist thresholds are only patched once.
+    if (!ram(frame, 0x40) || ee_r32(frame + 0x30) != 18 || ee_r32(frame + 0x3c) != 1) return;
     for (unsigned which = 1; which <= 2; ++which) {
         const uint32_t address = ee_r32(graf + which * 4);
         if (which == 2 && address == ee_r32(graf + 4)) continue;
