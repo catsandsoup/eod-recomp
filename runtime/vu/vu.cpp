@@ -34,7 +34,7 @@
 #include "scene_emit.h"
 #include "vif.h"
 
-#if defined(EOD_VULKAN) && !defined(EOD_PUBLIC_VU_INTERPRETER)
+#ifdef EOD_VULKAN
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 #endif
@@ -1269,7 +1269,7 @@ struct VuProg {
         sb.hi[sl] |= (whi);                        \
     } while (0)
 
-// Public binaries interpret the player's microcode without embedding capture tables.
+// The public interpreter build excludes the captured reference tables.
 #ifndef EOD_PUBLIC_VU_INTERPRETER
 #if __has_include("vu_rec.inc")
 #define VU_REC 1
@@ -1532,7 +1532,9 @@ const VuProg *vu_rec_find(VUState *vu, uint32_t pc) {
     return s.prog;
 }
 }  // namespace
+#endif
 
+#if defined(EOD_VULKAN) || defined(VU_REC)
 // Scoreboards that will stall later code the same way: the writes stamped
 // in the three cycles before `cycle` (older slots are never looked at).
 static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
@@ -1643,7 +1645,7 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
     return true;
 }
 
-#if defined(EOD_VULKAN) && defined(VU_REC)
+#ifdef EOD_VULKAN
 namespace {
 constexpr uint32_t kWorldLeafPc = 0x270;
 constexpr uint32_t kWorldLeafTpc = 0x920;
@@ -1670,9 +1672,16 @@ struct WorldLeafRetirement {
 
 bool matches_world_leaf_program(VUState *vu, uint32_t pc) {
     constexpr XXH128_hash_t image_hash{0x2329B43F09230E29ull, 0xC8C64EAE4BB1B7EBull};
-    return pc == kWorldLeafPc && vu->index == 1 &&
-           vu->mem_mask == 0x3FFF && vu->micro_mask == 0x3FFF &&
-           XXH128_isEqual(XXH3_128bits(vu->micro, 0x4000), image_hash) && vu_rec_find(vu, pc);
+    if (pc != kWorldLeafPc || vu->index != 1 || vu->mem_mask != 0x3FFF || vu->micro_mask != 0x3FFF)
+        return false;
+    static thread_local uint32_t generation;
+    static thread_local bool checked, matches;
+    if (!checked || generation != g_vu_micro_gen[1]) {
+        generation = g_vu_micro_gen[1];
+        matches = XXH128_isEqual(XXH3_128bits(vu->micro, 0x4000), image_hash);
+        checked = true;
+    }
+    return matches;
 }
 
 VUReg world_qword(const VUState &vu, unsigned qw) {
@@ -1681,7 +1690,16 @@ VUReg world_qword(const VUState &vu, unsigned qw) {
     return reg;
 }
 
-bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement &out) {
+bool world_leaf_interpreted(VUState *vu) {
+#ifdef VU_REC
+    return vu_rec_find(vu, kWorldLeafPc) == nullptr;
+#else
+    (void)vu;
+    return true;
+#endif
+}
+
+bool derive_world_leaf(const VUState &before, unsigned top, bool interpreted, WorldLeafRetirement &out) {
     constexpr uint32_t kOne = 0x3F800000;
     constexpr uint32_t kAlmostTwo = 0x3FFFFFFF;
     if (before.vi[0] != 0 || before.vf[0].u[0] || before.vf[0].u[1] ||
@@ -1717,6 +1735,16 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
     out.strip[0].u[0] = source_tag.u[0];
 
     WorldLeafVertices vertices;
+    uint32_t sticky = 0;
+    const auto record_mac = [&](const VUReg &value, int lanes) {
+        if (!interpreted) return;
+        const uint32_t mac = mac_for(value, lanes);
+        if (mac & 0x000F) sticky |= 0x001;
+        if (mac & 0x00F0) sticky |= 0x002;
+        if (mac & 0x0F00) sticky |= 0x004;
+        if (mac & 0xF000) sticky |= 0x008;
+    };
+    VUReg last_projected[2]{};
     float fog_scale;
     std::memcpy(&fog_scale, &kAlmostTwo, sizeof fog_scale);
     for (unsigned i = 0; i < count; ++i) {
@@ -1727,14 +1755,21 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
         if (pos.u[3] != kOne || color.u[3] > 0xFFFF) return false;
         for (unsigned lane = 0; lane < 3; ++lane)
             pos.f[lane] += pos_base.f[lane];
-        for (unsigned lane = 0; lane < 4; ++lane) {
-            float acc = before.vf[4].f[lane] * pos.f[0];
-            acc += before.vf[5].f[lane] * pos.f[1];
-            acc += before.vf[6].f[lane] * pos.f[2];
-            vertices.acc_last.f[lane] = acc;
-            vertices.projection[i].f[lane] = acc + before.vf[7].f[lane];
-        }
-        const auto &p = vertices.projection[i];
+        record_mac(pos, 0xE);  // ADD.xyz position + bank base
+        VUReg &acc = vertices.acc_last;
+        for (unsigned lane = 0; lane < 4; ++lane)
+            acc.f[lane] = before.vf[4].f[lane] * pos.f[0];
+        record_mac(acc, 0xF);  // MULAx
+        for (unsigned lane = 0; lane < 4; ++lane)
+            acc.f[lane] += before.vf[5].f[lane] * pos.f[1];
+        record_mac(acc, 0xF);  // MADDAy
+        for (unsigned lane = 0; lane < 4; ++lane)
+            acc.f[lane] += before.vf[6].f[lane] * pos.f[2];
+        record_mac(acc, 0xF);  // MADDAz
+        VUReg &p = vertices.projection[i];
+        for (unsigned lane = 0; lane < 4; ++lane)
+            p.f[lane] = acc.f[lane] + before.vf[7].f[lane];
+        record_mac(p, 0xF);  // MADDw
         if (!std::isnormal(p.f[3])) return false;
         const float q = 1.f / p.f[3];
         if (!std::isnormal(q)) return false;
@@ -1744,22 +1779,32 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
         vertices.rgba[i] = color;
         vertices.rgba[i].u[3] = 0x80;
         vertices.xyzf[i].f[3] = static_cast<float>(color.u[3]) * fog_scale;
-        VUReg st_input{}, unscaled_st{};
+        VUReg st_input{}, unscaled_st{}, projected{};
         for (unsigned lane = 0; lane < 3; ++lane) {
             st_input.f[lane] = lane < 2 ? uv.f[lane] + st_base.f[lane] : 1.f;
             unscaled_st.f[lane] = st_input.f[lane] * q;
             vertices.st[i].f[lane] = unscaled_st.f[lane] * before.vf[3].f[3];
-            const float xyz = (p.f[lane] * q) * 16.f;
+            projected.f[lane] = p.f[lane] * q;
+            const float xyz = projected.f[lane] * 16.f;
             if (!std::isfinite(vertices.st[i].f[lane]) || !std::isfinite(xyz) ||
                 xyz < -2147483648.f || xyz >= 2147483648.f)
                 return false;
             vertices.xyzf[i].s[lane] = static_cast<int32_t>(xyz);
         }
+        record_mac(st_input, 0xC);  // ADD.xy texture coordinates
+        record_mac(unscaled_st, 0xE);  // MULq.xyz texture coordinates
+        record_mac(projected, 0xE);  // MULq.xyz projected position
+        record_mac(vertices.st[i], 0xE);  // MULw.xyz texture scale
+        record_mac(vertices.xyzf[i], 1);  // MUL.w fog/ADC
         out.strip[1 + 3 * i] = vertices.st[i];
         out.strip[2 + 3 * i] = vertices.rgba[i];
         out.strip[3 + 3 * i] = vertices.xyzf[i];
-        if (i == count - 2) vertices.penultimate_header = static_cast<float>(color.u[3]);
+        if (i == count - 2) {
+            vertices.penultimate_header = static_cast<float>(color.u[3]);
+            last_projected[0] = projected;
+        }
         if (i == count - 1) {
+            last_projected[1] = projected;
             vertices.last_header = static_cast<float>(color.u[3]);
             vertices.last_input_position = pos;
             vertices.last_st = st_input;
@@ -1799,6 +1844,29 @@ bool derive_world_leaf(const VUState &before, unsigned top, WorldLeafRetirement 
     vu.cycle += cycles;
     vu.q_ready = vu.cycle - 25;
     vu.tpc = kWorldLeafTpc;
+
+    if (interpreted) {
+        // The interpreter records ten flag-producing operations per vertex.
+        // They are all drained on return. Keep their sticky flags and the
+        // exact final ring contents for the subsequent legacy programs.
+        vu.status |= sticky << 6;
+        const uint32_t last_macs[] = {
+            mac_for(vertices.last_st, 0xC),                      // 0x0848
+            mac_for(last_projected[0], 0xE),                  // 0x0850
+            mac_for(vertices.xyzf[count - 2], 1),           // 0x0858
+            mac_for(vertices.st[count - 2], 0xE),            // 0x0860
+            mac_for(vertices.last_unscaled_st, 0xE),         // 0x0868
+            mac_for(last_projected[1], 0xE),                  // 0x0870
+            mac_for(vertices.xyzf[count - 1], 1),           // 0x0878
+            mac_for(vertices.st[count - 1], 0xE),            // 0x0888
+        };
+        constexpr unsigned cycles_to_exit[] = {25, 24, 23, 22, 21, 20, 19, 17};
+        vu.fq_head = (vu.fq_head + 10 * count) & 7;
+        for (unsigned i = 0; i < 8; ++i)
+            vu.fq[(vu.fq_head + i) & 7] = {vu.cycle - cycles_to_exit[i], last_macs[i], 0};
+        vu.mac = last_macs[7];
+        set_status_from_mac(&vu, vu.mac);
+    }
     // The final scheduled VF result has aged out of the three live scoreboard slots.
     return true;
 }
@@ -1826,7 +1894,12 @@ bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned
     const bool already_muted = g_vu_mute_kick;
     g_vu_mute_kick = true;
     g_vu_kick_check = &kicks;
-    vu_rec_find(&vu, kWorldLeafPc)->fn(&vu, kWorldLeafPc);
+#ifdef VU_REC
+    if (const auto *compiled = vu_rec_find(&vu, kWorldLeafPc))
+        compiled->fn(&vu, kWorldLeafPc);
+    else
+#endif
+        vu_interp(&vu, kWorldLeafPc);
     g_vu_kick_check = nullptr;
     g_vu_mute_kick = already_muted;
 
@@ -1854,9 +1927,9 @@ bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned
 #endif
 
 bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top) {
-#if defined(EOD_VULKAN) && defined(VU_REC)
+#ifdef EOD_VULKAN
     // Portable capture and original-path diagnostics must see the original dispatch.
-    static const bool diagnostic = getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
+    static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
         getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
         getenv("EOD_NATIVE_QCHECK") || getenv("EOD_VIF_CHECK");
     if (diagnostic || vu_dispatch_observed() || pc != kWorldLeafPc ||
@@ -1867,7 +1940,7 @@ bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top) {
     if (!matches_world_leaf_program(vu, pc)) return false;
 
     WorldLeafRetirement result;
-    if (!derive_world_leaf(*vu, top, result)) return false;
+    if (!derive_world_leaf(*vu, top, world_leaf_interpreted(vu), result)) return false;
     static const bool check = getenv("EOD_NATIVE_WORLD_RETIRE_CHECK") != nullptr;
     if (check && !check_world_leaf(result, *vu, top, true))
         fatal("world VU1 retirement differs at vblank %llu", (unsigned long long)kernel_vblank_count());
@@ -2081,7 +2154,7 @@ int vu_bench(const char *path, int repeat) {
         for (size_t k = 0; k < n; k++) hash = (hash ^ b[k]) * 1099511628211ull;
     };
     std::vector<double> pass;  // VU1 time of each pass
-#if defined(EOD_VULKAN) && defined(VU_REC)
+#ifdef EOD_VULKAN
     const bool world_check = getenv("EOD_NATIVE_WORLD_BENCH_CHECK") != nullptr;
     size_t world_matched = 0, world_mismatched = 0, world_unsupported = 0;
 #endif
@@ -2103,12 +2176,12 @@ int vu_bench(const char *path, int repeat) {
             g_score[r.h.index] = r.sb;
             g_vif1_top = r.h.top;
             g_vif1_itop = r.h.itop;
-#if defined(EOD_VULKAN) && defined(VU_REC)
+#ifdef EOD_VULKAN
             if (world_check && rep == 0 && r.h.index == 1 && r.h.pc == kWorldLeafPc &&
                 r.h.itop == 0x80 && (r.h.top == 0xE0 || r.h.top == 0x270)) {
                 WorldLeafRetirement expected;
                 if (!matches_world_leaf_program(vu, r.h.pc) ||
-                    !sb_same(r.sb, Scoreboard{}, vu->cycle) || !derive_world_leaf(*vu, r.h.top, expected)) {
+                    !sb_same(r.sb, Scoreboard{}, vu->cycle) || !derive_world_leaf(*vu, r.h.top, world_leaf_interpreted(vu), expected)) {
                     ++world_unsupported;
                     continue;
                 }
@@ -2163,7 +2236,7 @@ int vu_bench(const char *path, int repeat) {
     }
     bool checks_requested = mlist_check;
     bool checks_passed = true;
-#if defined(EOD_VULKAN) && defined(VU_REC)
+#ifdef EOD_VULKAN
     if (world_check) {
         fprintf(stderr, "world-bench: %zu matched, %zu mismatched, %zu unsupported\n",
                 world_matched, world_mismatched, world_unsupported);

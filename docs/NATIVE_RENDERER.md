@@ -1321,13 +1321,20 @@ sample had 1,471 invocations of `0x0270`, including 400 four-vertex
 and 37 twenty-vertex invocations with ITOP `0x80`. A single payload
 address is insufficient to cover this producer.
 
-The opt-in dynamic admission uses a committed non-clipped world REF.
-It checks the actual DMA tag, source address, payload size, first
-MSCAL and top-bank layout. Later VIF commands remain in the stream. The candidate then checks the live VU image
-and strip layout before deriving the result. Other dispatches retain the
-reference path. During live verification, run the reference silently
-and compare both ordered kicks byte for byte as well as final state.
-Only then submit the compatibility packets to GS.
+Ordinary Plume admits a committed non-clipped world REF by default.
+It checks the actual DMA tag, source address, payload size, first MSCAL
+and top-bank layout. Later VIF commands remain in the stream. The host
+checks the strip layout and exact 16 KiB live VU image fingerprint. It
+revalidates the image after each microcode generation change. The public
+build has no compiled VU table. For interpreted execution, the host
+derives each vertex's ten FMAC flag contributions and preserves the
+final MAC, sticky flags and eight-entry flag ring from the epilogue
+at `0x0848..0x0888`. Both ordered kicks and the full state are compared
+against the reference in `EOD_NATIVE_WORLD_RETIRE_CHECK=1`. The layout
+guards, simulated VU state and GS compatibility packets still bridge
+to other legacy programs. `EOD_NATIVE_WORLD_RETIRE=0` restores the
+reference for ordinary draws. Forced interpretation and portable
+capture also retain the reference dispatch.
 
 ### Phase A1: race HUD producer table (`SLUS_209.10`, Ghidra `DecompileAddrs`, 2026-11-20)
 

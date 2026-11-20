@@ -288,3 +288,23 @@ as the GS reference.
   paths and rerun the same audit from the released-format executable.
   Moving split-screen visual parity and release presentation still
   need matched scenes and captures.
+
+### 2026-11-21 R7 public non-clipped world dispatch (STAR)
+
+- **Situation.** The existing native world leaf only ran in strict mode
+  with a compiled VU table. The public binary has no such table.
+- **Task.** Retire the guarded non-clipped world dispatch in ordinary
+  Plume while preserving state and draw order.
+- **Action.** Match the exact live image by generation. Reconstruct the
+  interpreter's flag side effects from the vertex arithmetic and the
+  epilogue. Keep full-state, data-memory, live-scoreboard and ordered-kick
+  reference checks.
+- **Result.** All 1,128 archived leaves matched the interpreter and the
+  compiled reference. In 6× Modern Dundas the verified leaf removed
+  1,033 of 1,237 sampled `0x0270` dispatches. Live checking also covered
+  Dundas day, Gilroy night and two actual Kenyon views. The public audit
+  still finds other VU1 dispatches, GIF packets and GS raster work.
+- **Next decisive test.** Remove the guarded leaf's VIF/VU scratch and
+  GS compatibility packet dependencies through direct world state and
+  native draw submission in stream order. Repeat the same packet,
+  state and player-visible checks for the unsupported world entries.

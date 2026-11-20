@@ -1200,7 +1200,7 @@ void ee_world_record(bool committed) {
         return;
     }
     static const char *retire = std::getenv("EOD_NATIVE_WORLD_RETIRE");
-    const bool retire_enabled = retire && *retire && *retire != '0' && native_only() && !diff_in_original_side();
+    const bool retire_enabled = (!retire || retire[0] != '0') && !diff_in_original_side();
     std::lock_guard<std::mutex> lk(g_mutex);
     for (auto &l : g_leaves) {
         const uint32_t a = l.first;

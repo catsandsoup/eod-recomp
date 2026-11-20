@@ -737,3 +737,37 @@ different numbers of rendered frames. The local Mac build passed all 99
 CTest cases. These are functional checks.
 Package identity, player visual parity, sustained presentation, the
 3.33 ms budget, and Windows runtime verification remain open.
+
+## R7 public non-clipped world dispatch (2026-11-21)
+
+The guarded `0x0270` world-leaf replacement runs by default in ordinary
+Plume, including public builds with no captured VU table. An archived
+capture exercised 1,128 admitted leaves. Public interpreter, compiled
+local reference, and forced interpreter in the local build each matched
+all 1,128. Each comparison covered both GIF kicks, the final registers
+and flags, all VU data memory and the live scoreboard slots. It failed
+all 1,128 cases before the interpreter flag reconstruction was added,
+even though both kicks already matched. Changing one byte of each
+recorded VU1 image rejected all 1,128 entries. The public live world-pass
+`EOD_DIFF=00358BD0` ran 835 checks with zero mismatches.
+
+Ordinary public runs with live checking accepted the guarded path in
+1× Modern Dundas day, 1× Classic Gilroy night and both views in 1× Classic
+Kenyon. These had no VU differential failures, synchronous reads or
+suppressed draws. A/B deferred-wait counts matched in Gilroy (1 each)
+and Kenyon (6 each). In the 6× Modern Dundas case, the reference at
+vblank 242 dispatched `0x0270` 1,237 times. With the shipping default
+at the same sampled vblank, it dispatched 204 times and retired
+1,033 leaves on the host. The 360-vblank reference audit reported
+212,973 VU1 dispatches. The default candidate reported 173,686,
+34,409,721 compatibility GIF qwords and 88 GS raster submissions.
+Both had zero synchronous reads, deferred waits, CLUT waits and
+suppressed draws. The independently paced runs progressed through
+different numbers of gameplay frames.
+
+The separately paced 640×448 Modern scanout comparison found a closest
+A/B pair at 0.755 mean RGB code values of difference. Two independent
+runs with the reference path enabled had a closest pair at 1.023.
+This visual check is supplementary to the same-slot kick differential.
+The reference and replacement both still need the VU scratch state
+and GS bridge for this stage. S4 and build-level elimination remain open.
