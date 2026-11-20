@@ -1,6 +1,7 @@
 // Vulkan GS renderer: the surface ownership, batching and texture cache
 // are ported from gs_d3d11.cpp; vk_compat.h maps its small state API to Vulkan.
 #ifdef EOD_VULKAN
+#include "../../core/r7_audit.h"
 #include <algorithm>
 #include "core/trace.h"
 #include <atomic>
@@ -862,6 +863,7 @@ void readback_rect(Surface *s, int x, int y, int w, int h) {
     EOD_ZONE("gs.readback_rect");
     if (w <= 0 || h <= 0)
         return;
+    r7_audit::add(r7_audit::Counter::SyncVram);
     readback_record(s, x, y, w, h);
     D3D11_BOX box = {0, 0, 0, (UINT)w, (UINT)h, 1};
     g_ctx->CopySubresourceRegion(g_rb_staging, 0, 0, 0, 0, g_rb_tex, 0, &box);
@@ -939,8 +941,10 @@ void deferred_resolve(uint32_t page, const char *why = "") {
         fprintf(stderr, "[gs-readback] frame=%llu deferred-merge %s page=%u pending=%08x serial=%llu current=%llu completed=%llu\n",
                 (unsigned long long)g_frame_no, why, page, d->pending_blocks, (unsigned long long)d->serial,
                 (unsigned long long)g_dev->serial, (unsigned long long)g_dev->completed);
-    if (g_dev->wait_serial(d->serial))
+    if (g_dev->wait_serial(d->serial)) {
+        r7_audit::add(r7_audit::Counter::DeferredWait);
         g_dstats.waited++;
+    }
     const uint8_t *base = (const uint8_t *)g_drb_staging->host.map;
     for (const DeferredPart &q : d->parts) {
         const SwizzleTab *T = swizzle_table(q.psm, q.bw);
@@ -1203,8 +1207,10 @@ void snapshot_complete(SnapshotPage &sp) {
     EOD_ZONE("gs.snapshot_complete");
     if (sp.complete)
         return;
-    if (sp.serial && g_dev->wait_serial(sp.serial))
+    if (sp.serial && g_dev->wait_serial(sp.serial)) {
+        r7_audit::add(r7_audit::Counter::ClutWait);
         ++g_clut_lazy_waits;
+    }
     const uint8_t *base = (const uint8_t *)g_drb_staging->host.map;
     auto store = [&](const DeferredPart &q, bool merge) {
         const SwizzleTab *T = swizzle_table(q.psm, q.bw);
@@ -2547,6 +2553,7 @@ bool push_sprite_slivers(const Env &e, const HwVertex &v0, const HwVertex &v1, c
     const int ny = sprite_axis_segments(a.y, b.y, v0.t, v1.t, std::max(0, e.scy0),
                                         std::min(e.scy1, g_state.rt->h - 1), g_scale, ys);
     if (nx == 1 && ny == 1) return false;
+    if (nx && ny) r7_audit::add(r7_audit::Counter::GsRaster);
     for (int j = 0; j < ny; j++)
         for (int i = 0; i < nx; i++) {
             HwVertex c[4];  // top left, top right, bottom left, bottom right
@@ -2672,6 +2679,7 @@ void draw_triangle(const Env &e, const Vertex &a, const Vertex &b, const Vertex 
     ensure_state(e, 0);
     if (!g_state.rt)
         return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     if (e.iip) {
         g_verts.push_back(hv(e, a, pack_rgba(a)));
         g_verts.push_back(hv(e, b, pack_rgba(b)));
@@ -2696,6 +2704,7 @@ void draw_sprite(const Env &e, const Vertex &a, const Vertex &b) {
         v0.q = v1.q;
     if (push_sprite_slivers(e, v0, v1, a, b))
         return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     HwVertex v2 = v0, v3 = v0;
     v2.x = v1.x; // top right
     v2.s = v1.s;
@@ -2713,6 +2722,7 @@ void draw_line(const Env &e, const Vertex &a, const Vertex &b) {
     ensure_state(e, 1);
     if (!g_state.rt)
         return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     uint32_t cb = pack_rgba(b);
     g_verts.push_back(hv(e, a, e.iip ? pack_rgba(a) : cb));
     g_verts.push_back(hv(e, b, cb));
@@ -2722,6 +2732,7 @@ void draw_point(const Env &e, const Vertex &a) {
     ensure_state(e, 2);
     if (!g_state.rt)
         return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     g_verts.push_back(hv(e, a, pack_rgba(a)));
 }
 

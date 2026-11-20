@@ -530,3 +530,57 @@ the retirement counter. The GPU means were 9.21 and 9.83 ms in separate
 runs. This comparison measures removed VU1 dispatches and establishes
 no GPU time improvement. S4 and S5 remain open, as does the requirement
 to link the release without the VU1 and GS backends.
+
+## R7 lifecycle audit baseline (2026-11-21)
+
+R7 and S4 remain open. A rebuilt macOS executable on Apple M2 Pro
+(Plume Vulkan over MoltenVK) logged these totals from boot through
+worker drain. The headless runs used private saves, direct race
+entry, movie skip, maximum detail, DrawDistance 8 and vsync off.
+Dundas used the Bus with 12 AI. Strict mode also enabled the opt-in
+non-clipped world REF retirement. Gilroy forced the VU interpreter.
+
+| Run | Vblanks | VU1 dispatches | Compatibility GIF qwords | GS raster | GS suppressed | Sync VRAM | Deferred waits | CLUT waits |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Dundas Modern 6× | 520 | 1,759,320 | 263,550,084 | 677 | 0 | 138 | 0 | 0 |
+| Dundas Modern 6×, strict | 520 | 1,341,365 | 268,029,890 | 0 | 657 | 0 | 0 | 0 |
+| Kenyon Classic 1×, 2P | 500 | 2,044,135 | 285,815,663 | 24,857 | 0 | 138 | 87 | 0 |
+| Gilroy Classic 1×, interpreted VU | 275 | 159,791 | 23,644,555 | 1,809 | 0 | 138 | 1 | 0 |
+
+All four game processes exited cleanly and emitted exactly one summary.
+The audit checker rejected all four. A 60-vblank game process with the
+audit flag unset exited cleanly and emitted no summary. A synthetic
+offline replay and a failed startup also emitted no audit summary
+with the flag set. Checker fixtures exercised all-zero, missing,
+malformed, duplicate, strict suppression and nonzero wait reports.
+
+The Mac build and all 97 CTest cases passed. With the audit flag unset,
+a separate Dundas `EOD_DIFF=00358BD0` smoke run checked 2,283 calls
+with zero mismatches. The renderer's separate EE/GS queue comparison
+reported one batch blend mismatch, a category also seen before this
+audit. The seven changed Windows translation units cross-compiled.
+Windows runtime behavior remains unverified.
+
+The periodic Vulkan stats recorded 73 of Kenyon's 87 deferred waits
+through vblank 480, with 2,330 preservation copies scheduled by that
+point. The shutdown count includes the final interval. Gilroy recorded
+33 lazy CLUT snapshots through vblank 240 with no CLUT wait, so these
+runs establish deferred wait detection. A positive CLUT wait remains
+unverified. The first 120 vblanks of normal Dundas logged 138 texture
+readbacks and two completed deferred preservation copies. Trace those
+boot and loading texture consumers to identify the next synchronous
+readback path to remove.
+
+These cases cover a limited boot, race and bounded shutdown sequence on
+one Mac. The wider lifecycle still requires fresh install and upgrade,
+movie playback and manual skip, menu transitions, Career save/load,
+4P and the rest of the split-screen rotation, netplay, player-driven
+quit and reopen. Graphics-specific VU0 work remains outside these
+counters. World visibility at `0x3582B8` still calls VU0 `vcallms 0x40`,
+which requires replacement and separate verification.
+
+Package gates remain open. The exact published binary and runtime
+libraries must exclude VU1 and GS in the build graph and link map and
+match the approved local Mac visuals, settings and content. Actual
+fullscreen 6× presentation at 60 FPS requires target-hardware runs.
+The independent unpaced S5 workload must also meet 3.33 ms.

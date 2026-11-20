@@ -3,6 +3,7 @@
 // Coverage: a pixel (x, y) is drawn when the point (x, y) of the 12.4
 // vertex space lies inside the primitive (top-left fill rule); sprites
 // cover [x0, x1) x [y0, y1).
+#include "../core/r7_audit.h"
 #include <algorithm>
 #include <atomic>
 #if defined(__SSE2__)
@@ -1527,6 +1528,7 @@ bool add_view(uint32_t bp, uint32_t bw, uint32_t psm, const PageSet &pages) {
 // Queues a job for the current env (or runs it now without workers).
 void submit(Job &j) {
     if (g_skip_frame) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     if (!g_nw || g_trace) {
         if (g_nw) barrier();
         j.env = &g_env;
@@ -1818,6 +1820,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
         return;
     }
     if (e.write_none) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     note_draw();
     barrier();
     double x0 = a.x / 16.0, y0 = a.y / 16.0, x1 = b.x / 16.0, y1 = b.y / 16.0;
@@ -1863,6 +1866,7 @@ void draw_point(const Vertex &a) {
         return;
     }
     if (e.write_none) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     note_draw();
     barrier();
     Frag f;

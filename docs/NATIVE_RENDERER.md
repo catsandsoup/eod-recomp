@@ -1587,3 +1587,37 @@ replacement enabled and disabled. Kenyon Battle reached the same panic.
 The two-player lobby exercised both boundaries, but its replay showed no
 pixels affected by the selected composite, so the split-screen race
 shadow comparison remains open.
+
+### R7 lifecycle counters
+
+Set `EOD_R7_AUDIT=1` to count compatibility work from boot through GS worker
+shutdown. The option defaults to off. A successful game exit emits one
+`[r7-audit]` line after the VIF/GIF, GS and raster workers drain. Run
+`python3 tools/r7_audit.py RUN.log [RUN.log ...]` on one combined-output log
+per successful game process. An absent, malformed, duplicate or nonzero
+summary fails the check.
+
+`vu1` counts dispatches to compiled or interpreted VU1 microprograms.
+`gif_qwords` counts qwords consumed by the compatibility parser.
+`gs_raster` counts primitives queued for hardware rasterization or
+submitted to the software rasterizer. `gs_suppressed` counts primitives
+that strict native mode would otherwise drop, including its compatibility
+clear interception. It remains a separate gate when raster submissions
+reach zero.
+
+`sync_vram` counts synchronous VRAM copy/map requests. `deferred_wait`
+and `clut_wait` count consumer paths that force a synchronous submission
+or a fence wait for an earlier copy. Copies already complete when consumed
+add no wait count. Run explicit screenshots and offline replay separately
+from ordinary shipped-play checks.
+
+Run the exact release candidate through fresh install and upgrade,
+startup and menus, movie play and skip, loading, Career including save/load,
+the race and split-screen rotation, netplay, return to menus, quit, and
+reopen. Require zero graphics audit counts and the separate release build
+graph, link map and package inspection for VU1 and GS exclusion. Verify
+the packaged visuals, settings and content against the approved local
+Mac build. Measure actual presented frame cadence on target displays at
+fullscreen 6× for the 60 FPS gate and run the independent unpaced S5
+workload for the 3.33 ms budget. Graphics-specific VU0 work, including
+the world visibility path at `0x3582B8`, requires separate verification.

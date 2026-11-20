@@ -1,5 +1,6 @@
 // native_renderer.cpp - GS-thread side of the native renderer (native_renderer.h): which GS draws
 // belong to native objects, the objects' GS state, and the plume renderer that draws them.
+#include "../core/r7_audit.h"
 #include "core/diff_harness.h"
 #include "core/trace.h"
 #include "native_renderer.h"
@@ -3644,6 +3645,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
             }
 #endif
             g_only_dropped++;
+            r7_audit::add(r7_audit::Counter::GsSuppressed);
             note_drop(e, v, b, c);
             return true;
         }
@@ -3654,6 +3656,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
     if (!g_r.ok || (modern::g_on && modern::live())) {  // no renderer: the GS draws the object
         if (native_only()) {
             g_only_dropped++;
+            r7_audit::add(r7_audit::Counter::GsSuppressed);
             note_drop(e, v, b, c);
             return true;
         }
@@ -3662,6 +3665,7 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
 #else
     if (native_only()) {
         g_only_dropped++;
+        r7_audit::add(r7_audit::Counter::GsSuppressed);
         note_drop(e, v, b, c);
         return true;
     }

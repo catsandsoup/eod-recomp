@@ -4,6 +4,7 @@
 // computed from the old register state and committed after the lower
 // instruction, Q/P results become visible after their latency, branches
 // have a delay slot and the E bit ends the program after the next pair.
+#include "../core/r7_audit.h"
 #include "vu.h"
 #include "core/trace.h"
 #include "../core/prof.h"
@@ -1877,6 +1878,7 @@ void vu_execute(VUState *vu, uint32_t start_pc) {
     vu_dump(vu, pc);
     if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
     if (scene_emit::g_on && vu->index == 1 && scene_emit::vu1_start(vu, pc)) return;
+    if (vu->index == 1) r7_audit::add(r7_audit::Counter::Vu1);
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;

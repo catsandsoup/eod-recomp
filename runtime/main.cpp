@@ -6,6 +6,7 @@
 // DIR is the root of the game disc (the directory that contains
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
+#include "core/r7_audit.h"
 #include "core/eod_tracy.h"
 #include "core/diff_harness.h"
 #include "core/host_file.h"
@@ -149,6 +150,8 @@ static int save_edit(int argc, char **argv) {
     return 0;
 }
 
+static bool g_game_started = false;
+
 [[noreturn]] void app_exit(int code) {
     gs_shutdown();  // drains and joins the GS worker (docs/WORKER_SHUTDOWN.md)
     if (const char *path = getenv("EOD_DUMP_RAM")) {  // EE main memory at exit (debugging)
@@ -161,6 +164,7 @@ static int save_edit(int argc, char **argv) {
     }
     platform_shutdown();
     diff_report();
+    if (g_game_started && code == 0) r7_audit::report();
     eod_profile::report("exit");
     fflush(nullptr);
     _exit(code);
@@ -514,6 +518,7 @@ int main(int argc, char **argv) {
     void debug_watch_init();
     debug_watch_init();
 #endif
+    g_game_started = true;
     kernel_run(entry);
     app_exit(0);
 }

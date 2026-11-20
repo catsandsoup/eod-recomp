@@ -25,6 +25,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "../../core/r7_audit.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -687,6 +688,7 @@ void readback_store(const D3D11_MAPPED_SUBRESOURCE &m, uint32_t bp, uint32_t bw,
 void readback_rect(Surface *s, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     ProfScope prof(P_GS_READBACK);
+    r7_audit::add(r7_audit::Counter::SyncVram);
     readback_gpu(s, x, y, w, h, g_rb_staging);
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(CHECK(g_ctx->Map(g_rb_staging, 0, D3D11_MAP_READ, 0, &m)))) return;
@@ -1533,6 +1535,7 @@ bool push_sprite_slivers(const Env &e, const HwVertex &v0, const HwVertex &v1, c
     const int ny = sprite_axis_segments(a.y, b.y, v0.t, v1.t, std::max(0, e.scy0),
                                         std::min(e.scy1, g_state.rt->h - 1), g_scale, ys);
     if (nx == 1 && ny == 1) return false;
+    if (nx && ny) r7_audit::add(r7_audit::Counter::GsRaster);
     for (int j = 0; j < ny; j++)
         for (int i = 0; i < nx; i++) {
             HwVertex c[4];  // top left, top right, bottom left, bottom right
@@ -1693,6 +1696,7 @@ bool start(bool with_window) {
 void draw_triangle(const Env &e, const Vertex &a, const Vertex &b, const Vertex &c) {
     ensure_state(e, 0);
     if (!g_state.rt) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     if (e.iip) {
         g_verts.push_back(hv(e, a, pack_rgba(a)));
         g_verts.push_back(hv(e, b, pack_rgba(b)));
@@ -1714,6 +1718,7 @@ void draw_sprite(const Env &e, const Vertex &a, const Vertex &b) {
     v0.fog = v1.fog;
     if (!e.fst) v0.q = v1.q;
     if (push_sprite_slivers(e, v0, v1, a, b)) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     HwVertex v2 = v0, v3 = v0;
     v2.x = v1.x;  // top right
     v2.s = v1.s;
@@ -1730,6 +1735,7 @@ void draw_sprite(const Env &e, const Vertex &a, const Vertex &b) {
 void draw_line(const Env &e, const Vertex &a, const Vertex &b) {
     ensure_state(e, 1);
     if (!g_state.rt) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     uint32_t cb = pack_rgba(b);
     g_verts.push_back(hv(e, a, e.iip ? pack_rgba(a) : cb));
     g_verts.push_back(hv(e, b, cb));
@@ -1738,6 +1744,7 @@ void draw_line(const Env &e, const Vertex &a, const Vertex &b) {
 void draw_point(const Env &e, const Vertex &a) {
     ensure_state(e, 2);
     if (!g_state.rt) return;
+    r7_audit::add(r7_audit::Counter::GsRaster);
     g_verts.push_back(hv(e, a, pack_rgba(a)));
 }
 

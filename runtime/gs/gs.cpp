@@ -1,4 +1,5 @@
 // gs.cpp - GIF front end, GS registers, local memory transfers and display.
+#include "../core/r7_audit.h"
 #include "core/trace.h"
 #include "../vu/scene_capture.h"
 #include "../vu/scene_emit.h"
@@ -671,6 +672,7 @@ void packed_reg(uint32_t r, uint64_t lo, uint64_t hi, bool draw_vertices = true)
 }
 
 void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
+    r7_audit::add(r7_audit::Counter::GifQwords, qwc);
     if (scene_capture::g_on) scene_capture::gs_packet(path);
     if (scene_emit::g_on) scene_emit::gs_packet(path);
     if (modern::g_on) modern::gs_packet(path);
