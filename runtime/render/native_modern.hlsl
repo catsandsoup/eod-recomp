@@ -16,6 +16,7 @@
 //               draws: this frame's sun), diffuse.rgb its colour (0..128)
 //   light.w     sky upper colour (RGBA8 bits), diffuse.w sky horizon colour (RGBA8 bits)
 //   mode.w      model-space up, octahedral 12 + 12 bits
+//   ambient.w   M_SPEC draws: ITOP alpha in bits 0..7, the game's q17 half vector in 8..31 (octahedral)
 
 struct Object {
     float4 cx, cy, cz, cw;
@@ -76,6 +77,13 @@ float3 model_eye() {
     return (r.x * bc + r.y * ca + r.z * ab) / det;
 }
 
+float3 oct_decode(uint v) {
+    float2 e = float2(v & 0xFFF, (v >> 12) & 0xFFF) / 4095.0 * 2.0 - 1.0;
+    float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0) n.xy = (1.0 - abs(n.yx)) * float2(n.x >= 0 ? 1 : -1, n.y >= 0 ? 1 : -1);
+    return normalize(n);
+}
+
 VOut vs_modern(VIn i) {
     VOut o;
     float4 q = float4(i.p, 1);
@@ -88,7 +96,15 @@ VOut vs_modern(VIn i) {
     } else {
         rgb = i.c.rgb * 255.0;
     }
-    o.c = floor(float4(rgb, obj.ambient.w));
+    float va = obj.ambient.w;
+    if (obj.mode.x & M_SPEC) {
+        // exactly Classic's alpha: ITOP alpha, or for lit vertices the VU1 0x948 highlight
+        // a = max(0, 1152 (n . h) - 1056) with the game's q17 half vector h (modern_patch packs it)
+        const uint pk = asuint(obj.ambient.w);
+        va = (float)(pk & 0xFF);
+        if (i.n.w != 0) va = max(0.0, 1152.0 * dot(float3(i.n.xyz) / 128.0, oct_decode(pk >> 8)) - 1056.0);
+    }
+    o.c = floor(float4(rgb, va));
     o.f = (float)((obj.mode.z >> 8) & 0xFF);
     o.uv = i.uv;
     o.mp = i.p;
@@ -144,13 +160,6 @@ float2 env_dfg(float NoV, float r) {
 
 float3 unpack_rgb(uint v) { return float3(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF) / 255.0; }
 
-float3 oct_decode(uint v) {
-    float2 e = float2(v & 0xFFF, (v >> 12) & 0xFFF) / 4095.0 * 2.0 - 1.0;
-    float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
-    if (n.z < 0) n.xy = (1.0 - abs(n.yx)) * float2(n.x >= 0 ? 1 : -1, n.y >= 0 ? 1 : -1);
-    return normalize(n);
-}
-
 // Image-based light from the track sky: the sky texture's upper and horizon colours over the
 // hemisphere; rougher lobes see more of the horizon (a pre-filtered radiance in two bands).
 float3 sky_radiance(float3 dir, float3 up, float r) {
@@ -198,11 +207,6 @@ POut ps_modern(VOut i) {
     }
     if (dot(N, V) < 0) N = -N;
     const float3 L = normalize(obj.light.xyz + float3(0, 1e-9, 0));
-    if ((m & M_SPEC) && i.mn.w > 0.5) {
-        // the VU1 0x948 highlight alpha with the half vector of this light and eye
-        const float3 h = normalize(L + V);
-        va = max(0.0, 1152.0 * dot(i.mn.xyz, h) - 1056.0);
-    }
     float3 rgb;
     float a;
     float3 albedo = float3(1, 1, 1);
@@ -256,7 +260,9 @@ POut ps_modern(VOut i) {
         float3 spec = PI * Fr * NoL * sun * occl;
         const float3 R = reflect(-V, N);
         const float2 dfg = env_dfg(NoV, rough);
-        spec += sky_radiance(R, up, rough) * (f0 * dfg.x + dfg.y) * occl;
+        // a metal mirrors its surroundings, whose light is the game's light here (E), not only the sky:
+        // at night the sky is dark but the baked / VU1 light is not (guardrails 4/5)
+        spec += lerp(sky_radiance(R, up, rough) * occl, E, metal) * (f0 * dfg.x + dfg.y);
         float3 col = diffuse + spec;
         if (cls == C_PAINT) {
             // clear coat (Filament 4.9): roughness 0.1, f0 0.04
@@ -266,6 +272,9 @@ POut ps_modern(VOut i) {
             const float Fcv = F_Schlick1(0.04, NoV);
             col = col * (1.0 - Fcv) + (PI * Frc * NoL * sun + sky_radiance(R, up, 0.1) * Fcv) * occl;
         }
+        // guardrails 4/5: never darker than the game's result. Baked (or VU1) light x albedo is the
+        // floor; the PBR terms only add on top of it (a metal's lost diffuse is not taken away)
+        col = max(col, albedo * E);
         rgb = min(col * 255.0, 255.0);
     } else if (is_vfx) {
         // Modern-only GPU procedural fire, smoke & sparks (stage R6 A2):

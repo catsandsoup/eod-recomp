@@ -840,12 +840,31 @@ same-look neighbour 5 vblanks away).
 | Classic P3, A1 window set | Gilroy night, Battle (8 AI), Limo (vehicle 136, as A1), 24 windows vb 700..2310 step 70, HEAD 7d43b3d: MAE 2.38 / SSIM 0.9640 over 16 windows (8 skipped: no whole GS frame in the replay window), worst 4.03 / 0.9389, vs A1 2.73 / 0.9533. Classic unchanged by A2: no bisect needed. (`tools/p3_run.sh` with a relative `EXE` fails at the compare step: pass an absolute `--exe`.) |
 | Night darkness, located | Gilroy night, Postal, cycled views (pairs T-5 / T+5 of toggles every 30 from vb 1500): Chase / Chassis / Bumper views have the top regions at 0.63..0.72 of Classic, the Cockpit view (vb 2101+) has whole 0.65, middle row 0.33 / 0.47 / 0.33 (uniform grey 84 -> 27 per channel). |
 
-### Open (R6 A3)
+### Results (R6 Phase A4)
 
-- Rows 4/5 at night, two causes found (`EOD_R6_DIAG_*` per-item dumps and class overrides, not committed):
-  1. Prelit world records with `metal4` 9..14 (e.g. T1119, T1082, T1058, T1075) lose `(1 - metal)` of the baked light and their indirect specular sees only the night-scaled sky. Tried in `ps_modern`: indirect radiance `lerp(sky_radiance * occl, E, metal)` (E = the game's light at the pixel): Chase / Chassis / Bumper top regions 0.63..0.72 -> 0.78..0.84 (still below 0.85). Not committed: Dundas / Career not rerun.
-  2. Cockpit view: forcing every lit (VU1, `n.w != 0`) draw to unlit gives 1.00 in every region, while forcing prelit draws or `metal4 > 4` draws to unlit changes nothing. So the cause is a lit queue draw with `metal4 <= 4` (cabin mesh `mz 0x04c3` metal 3 / rough 12, `M_SPEC`, TFX 0, TCC, a box over the whole screen; or paint `0x1452`). Keeping the game's q17 highlight (packed into `ambient.w`, `+va` for TFX 2/3, no double sun lobe) did not change it. Next: compare that item's alpha (`a = t.a * va / 128` under `M_SPEC`, used by its blend key `0x18fd0`) in Classic and Modern. Modern computes `va` per pixel from `L + V`, while Classic uses the game's q17 half vector per vertex, so the alpha and the blend weight may differ.
-- Dundas row 5 region 1.159 (limit 1.15): not rerun.
+Rows 4/5 at night. Headless, muted, `RenderScale=1`, `DrawDistance=8`, Battle (8 AI) + `EOD_CHICKENS=1`,
+Triangle at vb 900 / 1300 / 1700 / 2100 (Chase, Chassis, Bumper, Cockpit), look toggled every 30 vb
+from 1500, captures every vblank 1490..2210. Pair = last old-look frame and first new-look frame
+(1 vblank apart; the game draws a new frame every 3..4 vblanks, so T-5 / T+5 pairs mixed in up to
+0.66..1.75 of region motion); toggles within -10..+12 vb of a camera change are skipped.
+
+| Fix | What |
+|---|---|
+| Baked-light floor (`ps_modern`) | `col = max(col, albedo * E)`: the game's baked (prelit) or VU1 light times albedo is the floor; PBR only adds on top. Metal records lost `metal` of their diffuse before (T1119 / T1082 / T1058 / T1075 are fences, poles and railings, `metal_painted` 0.6..0.7, records not changed) |
+| Metal reflection | indirect radiance `lerp(sky * occl, E, metal)`: a metal mirrors the game's light here, not only the dark night sky; without it the floor alone left Chassis regions at 1.22 (bright pixels kept, dark ones raised) |
+| Cockpit alpha | the M_SPEC highlight alpha is Classic's exactly: VU1 0x948 per vertex with the game's q17 half vector (`modern_patch` packs it into `ambient.w` bits 8..31, octahedral 12+12, ITOP alpha in 0..7), not per pixel from `L + V` |
+
+| Scene | Before (A3) | After |
+|---|---|---|
+| Gilroy night, Postal, views cycled (2 runs, 18 + 5 pairs) | Chase / Chassis / Bumper top regions 0.63..0.72; Cockpit whole 0.65, middle row 0.33 / 0.47 / 0.33 | whole 0.98..1.02 (Cockpit 1.00..1.01), region worst 1.096; new 1.0 px 0; opaque blocks 0. PASS |
+| Dundas day, Hearse, views cycled (10 pairs) | region 1.159 | whole worst 1.023, region worst 0.914. PASS |
+| Career hub (`place=home`, 3 non-identical pairs) | - | whole 1.009, region 1.035. PASS (hub only, not free roam) |
+| Classic | - | Classic SPIR-V, pipelines and push constants untouched (all changes in `ps_modern` / `vs_modern` / `modern_patch`). P3 Gilroy night Limo, 4 windows vb 1050 / 1470 / 1750 / 2030: MAE 4.16, per window 2.1..8.1, inside A1's per-window range 1.18..8.82 |
+
+### Open (R6 A4)
+
+- `metal_painted` records at 0.6..0.7 metalness (paint is a dielectric): retag via `tools/material_runtime.py` if a day scene shows them too shiny; not needed for rows 4/5.
+- Career free roam (Time Challenge gate 1) rerun: only the hub was run in A4.
 - Modern VFX opaque blocks (row 7 with `EOD_MODERN_VFX=1`): not started; VFX stays opt-in.
 - `EOD_DIFF` mismatch in `0x214B68`: not started (check Classic and f0ef513, R2 split-screen parity-off gate).
 

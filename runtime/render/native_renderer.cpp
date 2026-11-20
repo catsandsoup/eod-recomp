@@ -1219,6 +1219,15 @@ uint32_t oct_encode(double x, double y, double z) {
 // (blend, tests, alpha, fog, FIX) stays as the Classic item has it.
 void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
     out = pc;
+    if (pc.mode[0] & M_SPEC) {
+        // the Classic highlight alpha (VU1 0x948 with the game's q17 half vector, guardrail rows 4/5):
+        // light.w / diffuse.w / mode.w are reused for the sky below, so the half vector goes into
+        // ambient.w bits 8..31 (octahedral 12 + 12) next to the ITOP alpha in bits 0..7
+        float hz;
+        std::memcpy(&hz, &pc.mode[3], 4);
+        const uint32_t pk = ((uint32_t)pc.ambient[3] & 0xFFu) | oct_encode(pc.light[3], pc.diffuse[3], hz) << 8;
+        std::memcpy(&out.ambient[3], &pk, 4);
+    }
     const uint32_t kind = it.p.kind;
     const bool surface = kind == KIND_QUEUE || kind == KIND_WORLD || kind == KIND_WATER;
     uint32_t cls = C_UNLIT, metal = 0, rough = 12, em = 0, height = 0, rec = 0;
