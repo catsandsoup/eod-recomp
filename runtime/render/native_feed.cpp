@@ -2,6 +2,7 @@
 #include "native_renderer.h"
 #include "editor_environment.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -21,8 +22,10 @@
 #include "../core/diff_harness.h"
 #include "../core/host_file.h"
 #include "../core/limit_tracker.h"
+#include "../core/log.h"
 #include "../core/memory.h"
 #include "../hw/offload.h"
+#include "../gs/gs_mem.h"
 #include "scene_tap.h"
 #include "sun_cascades.h"
 #include "vif_mesh.h"
@@ -270,6 +273,8 @@ struct SkinVertex {
     int8_t n[3];            // the attribute bytes - 128 (matrix: rotated with the palette)
     bool has_n;
 };
+using DentPart = std::vector<vifmesh::DentChunk>;
+
 struct CacheEntry {
     uint64_t hash = 0;
     uint64_t checked = ~0ull;  // vblank the hash was last compared
@@ -280,6 +285,7 @@ struct CacheEntry {
     std::vector<uint32_t> indices;
     std::vector<FacingVertex> facing;
     std::vector<SkinVertex> skin;
+    std::shared_ptr<const DentPart> dent;
     int32_t k_delta = 0;  // the decoded mesh's TEX1.K delta (Mesh::k_delta), for the transient copies
     bool k_kick = false, k_mixed = false;
     std::vector<Mesh::KRun> k_runs;
@@ -308,6 +314,8 @@ struct Tagged {
     bool range;  // any DMA tag in [start, end) (immediate geometry); else the REF to batch + 0x38
     bool retire_world_leaf = false;
     std::shared_ptr<const WorldTextureIndices> world_indices{};
+    std::shared_ptr<const DentPart> dent{};
+    std::unique_ptr<QueueMaterial> queue_material{};
 };
 std::map<uint32_t, Tagged> g_tags;     // batch packet start -> record; latest writer wins
 std::vector<Mesh *> g_new_meshes;      // decoded, not yet in the GS stream
@@ -315,6 +323,7 @@ std::vector<Mesh *> g_new_meshes;      // decoded, not yet in the GS stream
 // ---- EE state ----
 bool g_in_object = false;
 Packet g_current;
+std::shared_ptr<const DentPart> g_current_dent;
 uint64_t g_frame_vb = ~0ull;
 uint32_t g_serial = 0;
 // counters (EE frame)
@@ -432,8 +441,16 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     g_scratch.clear();
     vifmesh::Options opt;
     opt.fix_winding = !world;
+#ifdef EOD_PLUME
+    opt.keep_dent_chunks = !world;
+#else
+    opt.keep_dent_chunks = !world && queue_dent_check_enabled();
+#endif
     opt.keep_shadow_extrusion_faces = true;
     const vifmesh::Status st = g_decoder->decode_vif(g_bytes.data() + 0x38, qwc * 16, g_scratch, opt);
+    c.dent.reset();
+    if (!g_scratch.dent_chunks.empty())
+        c.dent = std::make_shared<const DentPart>(std::move(g_scratch.dent_chunks));
     auto *m = new Mesh();
     m->id = g_next_mesh++;
     m->replaces = c.id;
@@ -794,13 +811,21 @@ void ee_object(uint32_t batch) {
     fill_camera(p);
     CacheEntry *c = nullptr;
     p.mesh = mesh_for(p.batch, vb, false, &c);
+    g_current_dent = c && p.mesh ? c->dent : nullptr;
     if (c && p.mesh && !c->skin.empty()) p.mesh = posed_mesh(*c, p);
     else if (c && p.mesh && !c->facing.empty()) p.mesh = facing_queue_mesh(*c, p.batch);
     g_records++;
     g_in_object = true;
 }
 
-void ee_object_end() { g_in_object = false; }
+void ee_object_end() {
+    g_in_object = false;
+    g_current_dent.reset();
+}
+
+namespace {
+std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &chunks);
+}
 
 void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneClear *clear) {
     if (!addr) return;
@@ -876,7 +901,9 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneCle
         return;
     }
     if (!batch) return;  // any other packet there replaces a record's tag
-    g_tags[addr] = Tagged{end, g_current, false};
+    auto &tag = g_tags[addr] = Tagged{end, g_current, false, false, {}, g_current_dent};
+    if (tag.dent && tag.dent->size() >= 4)
+        tag.queue_material = queue_material(tag.packet, *tag.dent);
     g_tagged++;
 }
 
@@ -1208,6 +1235,169 @@ static std::shared_ptr<const WorldTextureIndices> snapshot_world_indices(uint32_
     cached = snapshot;
     return snapshot;
 }
+
+
+namespace {
+
+// Map the CT32 transfer words to the original linear eight-bit asset bytes.
+struct QueueIndexLayout {
+    std::array<uint16_t, queue_texture_offset(kQueueTextureLevels)> lanes{};
+    bool valid = false;
+
+    QueueIndexLayout() {
+        std::array<uint16_t, kQueueTextureWidth * kQueueTextureHeight / 4> words;
+        for (uint32_t l = 0; l < kQueueTextureLevels; ++l) {
+            const uint32_t width = kQueueTextureWidth >> l, height = kQueueTextureHeight >> l;
+            const auto first = queue_texture_offset(l);
+            if (height < 32) {
+                for (uint32_t i = 0; i < width * height; ++i) lanes[first + i] = uint16_t(first + i);
+                continue;
+            }
+            const uint32_t transfer_width = width / 2, transfer_height = height / 2;
+            const uint32_t pitch = (transfer_width + 63) / 64;
+            words.fill(UINT16_MAX);
+            for (uint32_t y = 0; y < transfer_height; ++y)
+                for (uint32_t x = 0; x < transfer_width; ++x) {
+                    const uint32_t word = gs::addr32(x, y, 0, pitch);
+                    if (word >= words.size()) return;
+                    words[word] = uint16_t(first + 4 * (y * transfer_width + x));
+                }
+            for (uint32_t y = 0; y < height; ++y)
+                for (uint32_t x = 0; x < width; ++x) {
+                    const uint32_t address = gs::addr8(x, y, 0, (width + 63) / 64);
+                    const uint32_t word = address / 4;
+                    if (word >= words.size() || words[word] == UINT16_MAX) return;
+                    lanes[first + y * width + x] = uint16_t(words[word] + (address & 3));
+                }
+        }
+        valid = true;
+    }
+};
+
+DrawSurface queue_draw_surface() {
+    return {
+        (ee_r32(0x4D8B90) & 0x1FF) * 32,
+        (ee_r32(0x4D8B98) >> 6) & 0x3F,
+        ee_r32(0x4D8B94) & 0x3F,
+        0,
+        (ee_r32(0x4D8BD0) & 0x1FF) * 32,
+        (ee_r32(0x4D8BD4) & 0xF) | 0x30,
+        {int32_t(ee_r32(0x4D8B9C) & 0x7FF), int32_t(ee_r32(0x4D8BA4) & 0x7FF),
+         int32_t(ee_r32(0x4D8BA0) & 0x7FF), int32_t(ee_r32(0x4D8BA8) & 0x7FF)},
+        0x6BFF, 0x71FF,
+    };
+}
+
+uint32_t queue_triangles(const vifmesh::DentChunk &chunk) {
+    return std::count_if(chunk.vertices.begin() + 2, chunk.vertices.end(),
+                         [](const auto &v) { return !(v.adc & 0x8000); });
+}
+
+std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &chunks) {
+#ifndef EOD_PLUME
+    (void)p;
+    (void)chunks;
+    return {};
+#else
+    if (!p.mesh || p.flags != 0x6C0 || p.texture_key < 0 || ee_r32(0x4D8BC8) != 0x6C0 ||
+        ee_r32(0x4D2D38) != uint32_t(p.texture_key))
+        return {};
+    const uint32_t table = ee_r32(0x4D2D30);
+    constexpr uint32_t stride = 0x44;
+    if (!table || table >= EE_RAM_SIZE || uint32_t(p.texture_key) >= (EE_RAM_SIZE - table) / stride)
+        return {};
+    const uint32_t entry = table + uint32_t(p.texture_key) * stride;
+    uint32_t texture = ee_r32(entry + 0x38);
+    if (!texture) texture = ee_r32(entry + 0x18);
+    if (!texture || texture > EE_RAM_SIZE - 0x44 || (texture & 3) ||
+        MEM_LB(texture + 0x0C) || ee_r32(texture + 0x10) != 4 || ee_r32(texture + 0x14) != 0 ||
+        ee_r32(texture + 0x18) != 0x00070008 || MEM_LB(texture + 0x1C) != kQueueTextureLevels)
+        return {};
+    const uint32_t palette = ee_r32(texture + 0x40);
+    if (!palette || palette > EE_RAM_SIZE - 256 * sizeof(uint32_t) || (palette & 3)) return {};
+    const uint32_t next_bank = ee_r32(0x3E5820);
+    if (next_bank >= 2) return {};
+    uint32_t base = ee_r32(0x4D7D64 + (1 - next_bank) * 12);
+    if (base >= 0x4000) return {};
+    static const QueueIndexLayout layout;
+    if (!layout.valid) fatal("invalid queue PSMT8 transfer layout");
+
+    struct Snapshot {
+        std::array<uint8_t, queue_texture_offset(kQueueTextureLevels)> bytes;
+        std::shared_ptr<const QueueTexture> decoded;
+    };
+    static std::unordered_map<uint32_t, Snapshot> snapshots;
+    std::array<uint32_t, kQueueTextureLevels> sources;
+    std::array<uint16_t, kQueueTextureLevels> bases;
+    for (uint32_t l = 0; l < kQueueTextureLevels; ++l) {
+        const uint32_t bytes = queue_texture_offset(l + 1) - queue_texture_offset(l);
+        sources[l] = ee_r32(texture + 0x24 + 4 * l);
+        if (!sources[l] || (sources[l] & 15) || sources[l] > EE_RAM_SIZE - bytes) return {};
+        bases[l] = uint16_t(base & 0x3FFF);
+        base += (bytes + 255) / 256;
+    }
+    std::array<uint32_t, 256> colors;
+    for (uint32_t i = 0; i < colors.size(); ++i) {
+        const uint32_t index = (i & ~0x18u) | ((i & 8u) << 1) | ((i & 16u) >> 1);
+        colors[i] = ee_r32(palette + 4 * index);
+    }
+    const uint8_t function = ee_r32(texture + 8) ? 3 : 0;
+    if (snapshots.size() >= 128 && !snapshots.count(texture)) snapshots.clear();
+    auto &snapshot = snapshots[texture];
+    bool equal = snapshot.decoded && snapshot.decoded->function == function && snapshot.decoded->colors == colors;
+    for (uint32_t l = 0; l < kQueueTextureLevels && equal; ++l) {
+        const auto begin = queue_texture_offset(l);
+        equal = !std::memcmp(snapshot.bytes.data() + begin, g_ram + sources[l], queue_texture_offset(l + 1) - begin);
+    }
+    if (!equal) {
+        for (uint32_t l = 0; l < kQueueTextureLevels; ++l) {
+            const auto begin = queue_texture_offset(l);
+            std::memcpy(snapshot.bytes.data() + begin, g_ram + sources[l], queue_texture_offset(l + 1) - begin);
+        }
+        auto decoded = std::make_shared<QueueTexture>();
+        decoded->colors = colors;
+        decoded->function = function;
+        decoded->palette_hash = 0x9E3779B97F4A7C15ull;
+        for (uint32_t color : colors) {
+            decoded->palette_hash = (decoded->palette_hash ^ color) * 0x100000001B3ull;
+            decoded->palette_hash ^= decoded->palette_hash >> 29;
+        }
+        for (size_t i = 0; i < decoded->indices.size(); ++i)
+            decoded->indices[i] = snapshot.bytes[layout.lanes[i]];
+        decoded->content_hash = XXH3_64bits(decoded->indices.data(), decoded->indices.size());
+        snapshot.decoded = std::move(decoded);
+    }
+    auto material = std::make_unique<QueueMaterial>();
+    material->texture = snapshot.decoded;
+    material->bases = bases;
+    material->surface = queue_draw_surface();
+    if (!chunks.front().ordered || int16_t(chunks.front().texture_k) > 0 || !queue_triangles(chunks.front()) ||
+        std::any_of(chunks.begin() + 1, chunks.end(), [](const auto &chunk) {
+            return int16_t(chunk.texture_k) <= 0;
+        }))
+        return material;
+    for (const auto &chunk : chunks) material->triangles += queue_triangles(chunk);
+    material->bias = uint32_t(p.tex_k + int16_t(chunks.front().texture_k) + 1000) & 0xFFF;
+    if (material->bias & 0x800) material->bias -= 0x1000;
+    const DrawSurface &d = material->surface;
+    // The token for a previous draw is reusable only for the same geometry,
+    // material, target, scissor and ordered LOD state.
+    const uint32_t surface[] = {d.color_base, d.color_pitch, d.color_format, d.color_mask,
+        d.depth_base, d.depth_format, uint32_t(d.scissor[0]), uint32_t(d.scissor[1]),
+        uint32_t(d.scissor[2]), uint32_t(d.scissor[3]), d.origin_x, d.origin_y};
+    const uint64_t key[] = {p.mesh, snapshot.decoded->content_hash, snapshot.decoded->palette_hash,
+        uint32_t(material->bias), XXH3_64bits(surface, sizeof surface), function};
+    static std::unordered_map<uint64_t, std::shared_ptr<QueueReady>> ready;
+    const uint64_t id = XXH3_64bits(key, sizeof key);
+    if (ready.size() >= 256 && !ready.count(id)) ready.clear();
+    auto &token = ready[id];
+    if (!token) token = std::make_shared<QueueReady>();
+    material->readiness = token;
+    return material;
+#endif
+}
+
+}  // namespace
 
 void ee_world_material(int32_t slot) {
     g_world_texture = {};
@@ -2076,13 +2266,147 @@ void vu_check(uint64_t key, uint32_t program) {
     }
 }
 
+namespace {
+
+struct DentInputChecks {
+    uint64_t matched[2][2]{};  // [TOP bank][MSCNT]
+    uint64_t unknown, vertices, nonpositive_k;
+};
+
+DentInputChecks g_dent_checks;
+
+struct QueueCandidate {
+    std::shared_ptr<const DentPart> chunks;
+    std::shared_ptr<QueueReady> readiness;
+    uint64_t frame = 0;
+    uint32_t serial = 0, dma = 0;
+    bool selected = false;
+};
+QueueCandidate g_queue_candidate;
+uint64_t g_queue_candidates, g_queue_ready, g_queue_selected[2], g_queue_removed_triangles, g_queue_removed_qwords;
+
+void queue_candidate_report() {
+    std::fprintf(stderr, "[native] queue dent producer: candidates=%llu ready=%llu low=%llu high=%llu "
+                 "triangles=%llu qwords=%llu\n",
+                 (unsigned long long)g_queue_candidates, (unsigned long long)g_queue_ready,
+                 (unsigned long long)g_queue_selected[0], (unsigned long long)g_queue_selected[1],
+                 (unsigned long long)g_queue_removed_triangles, (unsigned long long)g_queue_removed_qwords);
+}
+
+void report_dent_inputs() {
+    std::fprintf(stderr, "[native] queue dent input: TOP 0e0 MSCAL=%llu MSCNT=%llu, "
+                 "TOP 270 MSCAL=%llu MSCNT=%llu, vertices=%llu nonpositive_k=%llu unknown=%llu\n",
+                 (unsigned long long)g_dent_checks.matched[0][0], (unsigned long long)g_dent_checks.matched[0][1],
+                 (unsigned long long)g_dent_checks.matched[1][0], (unsigned long long)g_dent_checks.matched[1][1],
+                 (unsigned long long)g_dent_checks.vertices, (unsigned long long)g_dent_checks.nonpositive_k,
+                 (unsigned long long)g_dent_checks.unknown);
+}
+
+}  // namespace
+
+bool queue_dent_candidate(size_t launch_word, QueueDentChunk &candidate) {
+    auto &active = g_queue_candidate;
+    if (active.selected || active.dma != g_vif1_dma_tag || !active.readiness ||
+        !active.readiness->ready.load(std::memory_order_acquire))
+        return false;
+    const auto &chunks = *active.chunks;
+    for (size_t i = 1; i + 2 < chunks.size(); ++i) {
+        const auto &chunk = chunks[i];
+        if (chunk.launch_word != launch_word || !queue_triangles(chunk)) continue;
+        candidate.vertices = unsigned(chunk.vertices.size());
+        candidate.overwrite = unsigned(chunks[i + 2].vertices.size());
+        candidate.omission.frame = active.frame;
+        candidate.omission.serial = active.serial;
+        candidate.omission.reference = queue_dent_check_enabled();
+        return true;
+    }
+    return false;
+}
+
+void queue_dent_selected(uint32_t top, const QueueStripOmission &omission) {
+    g_queue_candidate.selected = true;
+    ++g_queue_selected[top == 0x270];
+    g_queue_removed_triangles += omission.terminal.triangle_attempts;
+    g_queue_removed_qwords += 1 + 3 * omission.terminal.vertices;
+    post(CMD_QUEUE_STRIP, &omission, sizeof omission);
+}
+
+bool queue_dent_check_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("EOD_NATIVE_QUEUE_DENT_CHECK");
+        return e && e[0] == '1' && !e[1];
+    }();
+    return on;
+}
+
+void check_queue_dent_input(uint32_t top, size_t launch_word, bool continuation) {
+    if (diff_in_original_side()) return;
+    static const bool reported = (diff_add_exit_report(report_dent_inputs), true);
+    (void)reported;
+    std::shared_ptr<const DentPart> part;
+    uint32_t batch = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        const auto found = g_tags.find(g_vif1_dma_tag);
+        if (found == g_tags.end() || found->second.packet.kind != KIND_QUEUE || found->second.range)
+            return;
+        batch = found->second.packet.batch;
+        if (MEM_LW(g_vif1_dma_tag + 4) != batch + 0x38) return;
+        part = found->second.dent;
+    }
+    if (!part) {
+        ++g_dent_checks.unknown;
+        return;
+    }
+    const auto found = std::lower_bound(part->begin(), part->end(), launch_word,
+        [](const vifmesh::DentChunk &c, size_t word) { return c.launch_word < word; });
+    if (found == part->end() || found->launch_word != launch_word || found->continuation != continuation)
+        fatal("queue dent launch does not match batch %08x word %zu TOP %03x", batch, launch_word, top);
+
+    const auto &c = *found;
+    const uint8_t *memory = g_vu1.mem + 16 * top;
+    const auto same = [&](uint32_t qword, const void *expected, size_t bytes) {
+        return std::memcmp(memory + 16 * qword, expected, bytes) == 0;
+    };
+    uint32_t k;
+    std::memcpy(&k, memory + 16 * 198 + 8, 4);
+    if (!same(0, &c.strip, sizeof c.strip) ||
+        !same(198, c.texture_origin, sizeof c.texture_origin) || k != c.texture_k ||
+        !same(199, c.position_origin, sizeof c.position_origin))
+        fatal("queue dent origins or strip differ for batch %08x word %zu TOP %03x", batch, launch_word, top);
+
+    for (size_t i = 0; i < c.vertices.size(); ++i) {
+        const auto &v = c.vertices[i];
+        uint32_t normal = 1 + 3 * i;
+        uint32_t skin_qword = 150 + c.vertices.size() - 1 - i;
+        uint16_t adc;
+        uint32_t skin[4];
+        std::memcpy(&adc, memory + 16 * normal + 12, sizeof adc);
+        std::memcpy(skin, memory + 16 * skin_qword, sizeof skin);
+        float weight[2];
+        std::memcpy(weight, skin + 2, sizeof weight);
+        weight[0] -= 32768.f;
+        weight[1] -= 32768.f;
+        if (!same(normal, v.normal, sizeof v.normal) || adc != v.adc ||
+            !same(normal + 1, v.position, sizeof v.position) || !same(normal + 2, v.texture, sizeof v.texture) ||
+            uint16_t(skin[0]) != v.bone[0] || uint16_t(skin[1]) != v.bone[1] ||
+            std::memcmp(weight, v.weight, sizeof weight))
+            fatal("queue dent vertex %zu differs for batch %08x word %zu TOP %03x", i, batch, launch_word, top);
+    }
+    ++g_dent_checks.matched[top == 0x270][continuation];
+    g_dent_checks.vertices += c.vertices.size();
+    g_dent_checks.nonpositive_k += int16_t(k) <= 0;
+}
+
 bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
                bool &clipped_world_continuation) {
     if (!enabled()) return false;
+    if (program != 0x0D48) g_queue_candidate = {};
     const uint32_t tag = g_vif1_dma_tag;
     std::vector<Mesh *> meshes;
     Packet p;
     std::shared_ptr<const WorldTextureIndices> world_indices;
+    std::unique_ptr<QueueMaterial> indexed_queue;
     bool found = false;
     bool retire_world_leaf = false;
     {
@@ -2098,6 +2422,16 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
                     p.kind == KIND_WORLD && tag == it->first && !it->second.range &&
                     !diff_in_original_side())
                     clipped_world_continuation = true;
+                if (p.kind == KIND_QUEUE && program == 0x02E0 && itop == 0x80 && tag == it->first) {
+                    indexed_queue = std::move(it->second.queue_material);
+                    if (indexed_queue && indexed_queue->readiness && !diff_in_original_side()) {
+                        static const bool hooked = (diff_add_exit_report(queue_candidate_report), true);
+                        (void)hooked;
+                        g_queue_candidate = {it->second.dent, indexed_queue->readiness, p.frame, p.serial, tag};
+                        ++g_queue_candidates;
+                        g_queue_ready += indexed_queue->readiness->ready.load(std::memory_order_acquire);
+                    }
+                }
                 if (program == 0x0270 && itop == 0x80) {
                     world_indices = std::move(it->second.world_indices);
                     if (!world_indices) p.world_texture.index_version = 0;
@@ -2135,6 +2469,10 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
         sent_index_version = world_indices->version;
     }
     post(CMD_OBJ, &p, sizeof p);
+    if (indexed_queue) {
+        auto *owned = indexed_queue.release();
+        post(CMD_QUEUE_MATERIAL, &owned, sizeof owned);
+    }
     g_obj_active = true;
     g_sent_key = key;
     if (retire_world_leaf) world_lod = p.world_lod;

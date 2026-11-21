@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -63,6 +64,7 @@ struct Decoder::State {
     // VU memory for the current batch. A qword exists when stamp == gen (vif_mesh.py's dict).
     uint32_t mem[kQwords][4];
     uint32_t raw[kQwords][4];     // unpacked value before STROW/mask (vif_mesh.py st.raw)
+    uint8_t written[kQwords];     // initialized in this chunk (including row/col writes)
     uint8_t rawmask[kQwords];     // lanes of raw[] that were written (others are None)
     uint32_t stamp[kQwords];
     uint32_t gen = 1;
@@ -111,6 +113,48 @@ void strip_triangles(const Vertex *v, uint32_t n, Emit emit) {
             else emit(i - 1, i - 2, i);
         }
     }
+}
+
+}  // namespace
+
+namespace {
+
+bool write_dent_chunk(const Decoder::State &s, bool continuation, uint32_t launch_word,
+                      std::vector<DentChunk> &out) {
+    const auto written = [&](uint32_t qword, uint8_t lanes) {
+        return s.has(qword) && (s.written[qword] & lanes) == lanes;
+    };
+    if (!written(0, 1) || !written(198, 7) || !written(199, 7)) return false;
+    const uint32_t strip = s.mem[0][0], count = strip & 0x7FFF;
+    if (strip != (0x8000 | count) || count < 3 || count > 48 || count != s.aux_n ||
+        ((s.aux_cmd & 0xF) != 0xE && (s.aux_cmd & 0xF) != 0x2))
+        return false;
+    DentChunk chunk{};
+    chunk.launch_word = launch_word;
+    chunk.continuation = continuation;
+    chunk.strip = strip;
+    std::memcpy(chunk.position_origin, s.mem[199], sizeof chunk.position_origin);
+    std::memcpy(chunk.texture_origin, s.mem[198], sizeof chunk.texture_origin);
+    chunk.texture_k = s.mem[198][2];
+    chunk.vertices.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t normal = 1 + 3 * i, position = normal + 1, texture = normal + 2;
+        const uint32_t skin = kSkinBase + count - 1 - i;
+        if (!written(normal, 15) || !written(position, 15) || !written(texture, 7) || !written(skin, 15))
+            return false;
+        DentVertex vertex{};
+        std::memcpy(vertex.normal, s.mem[normal], sizeof vertex.normal);
+        vertex.adc = s.mem[normal][3];
+        vertex.bone[0] = s.mem[skin][0];
+        vertex.bone[1] = s.mem[skin][1];
+        std::memcpy(vertex.position, s.mem[position], sizeof vertex.position);
+        std::memcpy(vertex.texture, s.mem[texture], sizeof vertex.texture);
+        vertex.weight[0] = as_f32(s.mem[skin][2]) - 32768.0f;
+        vertex.weight[1] = as_f32(s.mem[skin][3]) - 32768.0f;
+        chunk.vertices.push_back(vertex);
+    }
+    out.push_back(std::move(chunk));
+    return true;
 }
 
 }  // namespace
@@ -280,10 +324,17 @@ Status Decoder::decode_vif(const uint8_t *vif, size_t size, Mesh &out, const Opt
 
     Status st = Status::Ok;
     size_t p = 0;
+    const size_t first_dent = out.dent_chunks.size();
+    bool dent_part = opt.keep_dent_chunks;
+    bool dent_ordered = true;
     while (p + 4 <= size) {
         const uint32_t w = rd32(vif + p);
         const uint32_t cmd = (w >> 24) & 0x7F, num = (w >> 16) & 0xFF, imm = w & 0xFFFF;
         p += 4;
+        if (dent_part && ((w >> 31) ||
+            (cmd < 0x60 && cmd != 0x00 && cmd != 0x01 && cmd != 0x05 &&
+             cmd != 0x14 && cmd != 0x17 && cmd != 0x20 && cmd != 0x30 && cmd != 0x31)))
+            dent_ordered = false;
         if (cmd >= 0x60) {  // UNPACK
             const uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3;
             const bool masked = (cmd >> 4) & 1;
@@ -325,6 +376,7 @@ Status Decoder::decode_vif(const uint8_t *vif, size_t size, Mesh &out, const Opt
                     s.stamp[a] = s.gen;
                     memset(s.mem[a], 0, 16);
                     s.rawmask[a] = 0;
+                    s.written[a] = 0;
                 }
                 uint32_t *mq = s.mem[a];
                 // The lanes the VIF writes beyond the element's components (runtime/vu/vif.cpp, as
@@ -339,6 +391,7 @@ Status Decoder::decode_vif(const uint8_t *vif, size_t size, Mesh &out, const Opt
                 }
                 for (uint32_t c = 0; c < 4; c++) {
                     uint32_t m = masked ? (s.mask >> (std::min(cyc, 3u) * 8 + c * 2)) & 3 : 0;
+                    if (dent_part && m != 3) s.written[a] |= uint8_t(1u << c);
                     if (m == 0) {
                         uint32_t v = lane[c];
                         if (c < comps) {
@@ -382,6 +435,12 @@ Status Decoder::decode_vif(const uint8_t *vif, size_t size, Mesh &out, const Opt
         } else if (cmd == 0x14 || cmd == 0x15 || cmd == 0x17) {  // MSCAL / MSCALF / MSCNT
             const int64_t prog = cmd != 0x17 ? (int64_t)imm : s.last_prog;
             s.last_prog = prog;
+            if (dent_part) {
+                const bool first = out.dent_chunks.size() == first_dent;
+                const uint32_t expected = first ? 0x1400005C : 0x17000000;
+                dent_part = w == expected &&
+                            write_dent_chunk(s, !first, uint32_t(p / 4 - 1), out.dent_chunks);
+            }
             BatchEmitter::run(s, (uint32_t)prog, out, part, opt);
             s.next_batch();
         } else if (cmd == 0x02 || cmd == 0x03 || cmd == 0x04 || cmd == 0x06 || cmd == 0x07 || cmd == 0x10 ||
@@ -398,6 +457,9 @@ Status Decoder::decode_vif(const uint8_t *vif, size_t size, Mesh &out, const Opt
     part.batch_count = (uint32_t)out.batches.size() - part.first_batch;
     part.vertex_count = (uint32_t)out.vertices.size() - part.first_vertex;
     part.index_count = (uint32_t)out.indices.size() - part.first_index;
+    if (!dent_part || st != Status::Ok) out.dent_chunks.resize(first_dent);
+    else if (!dent_ordered)
+        for (size_t i = first_dent; i < out.dent_chunks.size(); ++i) out.dent_chunks[i].ordered = false;
     part.status = st;
     out.parts.push_back(part);
     return st;

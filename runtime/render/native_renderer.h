@@ -19,7 +19,10 @@
 // Off unless EOD_NATIVE=1 or [Video] NativeRenderer=1 (Vulkan backend only); when off no hook
 // does anything and the GS command stream is unchanged.
 #pragma once
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <map>
 #include "native_scene_types.h"
 #include <utility>
@@ -201,6 +204,23 @@ struct WorldStripTerminal {
     uint32_t prim, vertices, adc_vertices, triangle_attempts;
 };
 
+struct QueueStripOmission {
+    uint64_t frame;
+    uint32_t serial;
+    WorldStripTerminal terminal;
+    uint64_t tag_high;
+    bool reference;
+};
+struct QueueDentChunk {
+    unsigned vertices, overwrite;
+    QueueStripOmission omission;
+};
+bool queue_dent_candidate(size_t launch_word, QueueDentChunk &candidate);
+void queue_dent_selected(uint32_t top, const QueueStripOmission &omission);
+bool gs_queue_dent_accepted(const QueueStripOmission &omission, const gs::Env &env, uint64_t xy);
+bool queue_dent_check_enabled();
+void check_queue_dent_input(uint32_t top, size_t launch_word, bool continuation);
+
 bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
                bool &clipped_world_continuation);
 
@@ -250,6 +270,34 @@ struct WorldTextureIndices {
     uint64_t version, mip_hashes[kWorldTextureLevels];
     uint32_t levels;
     uint8_t data[world_texture_index_bytes(kWorldTextureLevels)];
+};
+
+constexpr uint32_t kQueueTextureWidth = 256;
+constexpr uint32_t kQueueTextureHeight = 128;
+constexpr uint32_t kQueueTextureLevels = 6;
+constexpr uint32_t queue_texture_offset(uint32_t level) {
+    uint32_t bytes = 0;
+    for (uint32_t l = 0; l < level; ++l)
+        bytes += (kQueueTextureWidth >> l) * (kQueueTextureHeight >> l);
+    return bytes;
+}
+
+struct QueueTexture {
+    std::array<uint32_t, 256> colors;
+    std::array<uint8_t, queue_texture_offset(kQueueTextureLevels)> indices;
+    uint64_t palette_hash, content_hash;
+    uint8_t function;
+};
+struct QueueReady {
+    std::atomic<bool> ready{false};
+};
+struct QueueMaterial {
+    std::shared_ptr<QueueReady> readiness;
+    std::shared_ptr<const QueueTexture> texture;
+    std::array<uint16_t, kQueueTextureLevels> bases;
+    DrawSurface surface;
+    uint32_t triangles = 0;
+    int32_t bias = 0;
 };
 
 struct Packet {
@@ -317,7 +365,7 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
 
 enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4,
                   CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7,
-                  CMD_WORLD_STRIP_CHECK = 8 };
+                  CMD_WORLD_STRIP_CHECK = 8, CMD_QUEUE_MATERIAL = 9, CMD_QUEUE_STRIP = 10 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),

@@ -84,6 +84,28 @@ struct Batch {
     uint8_t shadow;          // program 4 (shadow volume source: 2-qword stride, no UV)
 };
 
+// Source lanes of one dent strip before the per-object pose, projection and
+// lighting. XYZ origins and texture K belong to the chunk, not the part.
+struct DentVertex {
+    uint32_t normal[3];
+    uint16_t adc;
+    uint16_t bone[2];
+    float position[4];
+    float texture[3];
+    float weight[2];  // already unbiased
+};
+
+struct DentChunk {
+    bool ordered = true;
+    uint32_t launch_word;  // word offset in the relocated 4SPS payload
+    bool continuation;    // false: MSCAL 0x5C, true: MSCNT
+    uint32_t strip;
+    float position_origin[3];
+    float texture_origin[2];
+    uint32_t texture_k;
+    std::vector<DentVertex> vertices;  // source strip order, including ADC and degenerates
+};
+
 struct Part {
     char texture[17];        // part +8, NUL padded (16 chars max)
     uint32_t group;          // part +0x18: low 16 bits damage/visibility group, bit 16 body paint
@@ -100,7 +122,8 @@ struct Mesh {
     std::vector<uint32_t> indices;   // triangle list, 3 per triangle, part-relative
     std::vector<Batch> batches;
     std::vector<Part> parts;
-    void clear() { vertices.clear(); indices.clear(); batches.clear(); parts.clear(); }
+    std::vector<DentChunk> dent_chunks;
+    void clear() { vertices.clear(); indices.clear(); batches.clear(); parts.clear(); dent_chunks.clear(); }
 };
 
 struct Options {
@@ -112,6 +135,9 @@ struct Options {
     bool drop_degenerate = true;
     // Shadow side faces can have equal bind positions with different normals.
     bool keep_shadow_extrusion_faces = false;
+    // The native draw queue retains the exact per-launch source geometry.
+    // Offline visual export uses the flattened preview mesh.
+    bool keep_dent_chunks = false;
 };
 
 // Guest-memory reader: copy n bytes at guest address addr to dst; return false on failure.

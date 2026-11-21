@@ -207,6 +207,18 @@ struct PreparedWorldStrip {
     uint32_t sampler = 0;
 };
 PreparedWorldStrip g_world_strip_reference;
+std::unique_ptr<QueueMaterial> g_queue_material;
+bool g_queue_omitted, g_queue_reference;
+uint64_t g_queue_first_suppressed;
+uint64_t g_queue_objects_eligible, g_queue_draws_ready, g_queue_draws_omitted, g_queue_draws_reference;
+uint64_t g_queue_state_declines, g_queue_geometry_declines;
+struct QueueResources {
+    std::shared_ptr<GpuMesh> mesh;
+    std::shared_ptr<Texture> texture;
+};
+std::map<std::weak_ptr<QueueReady>, QueueResources, std::owner_less<>> g_queue_resources;
+uint64_t g_queue_mat_good, g_queue_mat_bad, g_queue_texels, g_queue_mismatch;
+std::map<std::tuple<uint64_t, uint64_t, uint16_t, int32_t>, bool> g_queue_verified;
 
 struct AddrEntry {
     Texture *tex = nullptr;
@@ -226,6 +238,8 @@ struct Item {
     bool second = false;   // the alpha-test-failed pass of the previous item (not counted again)
     PreparedWorldStrip world_strip;
     bool world_strip_reference = false;
+    std::shared_ptr<QueueReady> queue_ready;
+    bool queue_omitted = false, queue_reference = false;
     std::vector<int32_t> run_k;  // TEX1.K per VU1 run (Mesh::k_runs), when they differ
 };
 
@@ -323,8 +337,8 @@ struct Renderer {
     std::unique_ptr<plume::RenderDescriptorSet> environment_set;
     std::unique_ptr<plume::RenderSampler> samplers[16];
     Texture white;
-    std::unordered_map<uint32_t, GpuMesh> meshes;
-    std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures;  // by content
+    std::unordered_map<uint32_t, std::shared_ptr<GpuMesh>> meshes;
+    std::unordered_map<uint64_t, std::shared_ptr<Texture>> textures;  // by content
     std::unordered_map<uint64_t, Texture *> replacements;  // by package entry, material and alpha domain
     std::unordered_map<uint64_t, AddrEntry> by_addr;
     XXH3_state_t *hash_state = XXH3_createState();
@@ -333,6 +347,7 @@ struct Renderer {
     std::unordered_map<uint64_t, std::unique_ptr<plume::RenderTexture>> wrappers;
     std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
     std::deque<Trash> trash;
+    std::deque<std::pair<uint64_t, std::shared_ptr<GpuMesh>>> retired_meshes;
     uint64_t vb = 0;
     std::vector<Item> pending;
     Target target{};
@@ -813,7 +828,7 @@ uint8_t world_index(const WorldTextureIndices &indices, uint32_t x, uint32_t y, 
 // its MIPTBP address (0x35F9A0 writes MIPTBP1/2 from the level offsets 0x35F278 computes).
 Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_region = false,
                  const WorldTextureBinding *binding = nullptr, const WorldTextureIndices *indices = nullptr,
-                 bool cached_only = false) {
+                 bool cached_only = false, const QueueTexture *queue = nullptr) {
     if (!e.tme || e.tw == 0 || e.th == 0 || e.tw > 1024 || e.th > 1024) return nullptr;
     // the GS state decodes levels only as far as its own TEX1 asks (gs_draw.cpp setup_env)
     const uint32_t decodable = (e.mmin >= 2 && e.mxl > 0) ? (uint32_t)std::min(e.mxl, 6) : 0;
@@ -824,36 +839,42 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     const auto base = [&](uint32_t level) { return binding ? uint32_t(binding->bases[level]) : e.mip_tbp[level]; };
     const auto pitch = [&](uint32_t level) { return binding ? uint32_t(binding->pitches[level]) : e.mip_tbw[level]; };
     // Preserve the compatibility draw's available mip range while its GS bank is live.
-    uint32_t first, count;
-    gs::page_range(base(0), pitch(0), e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
-    if (!(exact_region ? gs::hw::native_texture_region_on_cpu(e) : gs::hw::native_texture_on_cpu(first, count))) {
-        if (!cached_only) fs.untextured_rt++;
-        return nullptr;
-    }
-    for (uint32_t l = 1; l <= levels; l++) {
-        uint32_t f2, c2;
-        gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
-        if (!gs::hw::native_texture_on_cpu(f2, c2)) {
-            if (!cached_only) g_mip_rt.fetch_add(1);
-            levels = l - 1;
-            break;
+    uint32_t first = 0, count = 0;
+    if (!queue) {
+        gs::page_range(base(0), pitch(0), e.tpsm, 0, 0, (int)e.tw, (int)e.th, first, count);
+        if (!(exact_region ? gs::hw::native_texture_region_on_cpu(e) : gs::hw::native_texture_on_cpu(first, count))) {
+            if (!cached_only) fs.untextured_rt++;
+            return nullptr;
+        }
+        for (uint32_t l = 1; l <= levels; l++) {
+            uint32_t f2, c2;
+            gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+            if (!gs::hw::native_texture_on_cpu(f2, c2)) {
+                if (!cached_only) g_mip_rt.fetch_add(1);
+                levels = l - 1;
+                break;
+            }
         }
     }
     const bool indexed = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT4 || e.tpsm == gs::PSMT8H ||
                          e.tpsm == gs::PSMT4HL || e.tpsm == gs::PSMT4HH;
-    const uint32_t *palette = binding ? binding->colors : e.pal;
-    const uint64_t palette_hash = binding ? binding->hash : e.pal_hash;
+    const uint32_t *palette = queue ? queue->colors.data() : binding ? binding->colors : e.pal;
+    const uint64_t palette_hash = queue ? queue->palette_hash : binding ? binding->hash : e.pal_hash;
     const auto read_index = [&](uint32_t u, uint32_t v, uint32_t level) -> uint8_t {
+        if (queue) return queue->indices[queue_texture_offset(level) + v * (kQueueTextureWidth >> level) + u];
         if (indices) return world_index(*indices, u, v, level);
         return uint8_t(gs::read_pixel(e.tpsm, int(u), int(v), base(level), pitch(level)));
     };
     const auto texel = [&](uint32_t u, uint32_t v, uint32_t level) {
-        if (binding) return palette[read_index(u, v, level)];
+        if (queue || binding) return palette[read_index(u, v, level)];
         return gs::tex_fetch(e, int(u), int(v), int(level));
     };
     AddrEntry *address = nullptr;
     uint64_t key;
-    if (indices) {
+    if (queue) {
+        const uint64_t identity[] = {queue->content_hash, palette_hash, levels};
+        key = XXH3_64bits_withSeed(identity, sizeof identity, 0x50534D5438ull);
+    } else if (indices) {
         static const bool report_use = std::getenv("EOD_NATIVE_WORLD_INDICES_CHECK") || std::getenv("EOD_R7_AUDIT");
         if (report_use && !cached_only) g_world_indices_used.fetch_add(1, std::memory_order_relaxed);
         // Equal asset bytes in either upload bank share the same native texture.
@@ -924,7 +945,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         return cached;
     }
     if (cached_only) return nullptr;
-    auto next = std::make_unique<Texture>();
+    auto next = std::make_shared<Texture>();
     Texture &t = *next;
     t.key = key;
     t.last_use = g_r.vb;
@@ -1049,7 +1070,7 @@ void evict_textures() {
     if (g_r.texture_bytes < (256ull << 20)) return;
     for (auto it = g_r.textures.begin(); it != g_r.textures.end();) {
         Texture *t = it->second.get();
-        if (t->last_use + 120 < g_r.vb && !t->pending_upload) {
+        if (t->last_use + 120 < g_r.vb && !t->pending_upload && it->second.use_count() == 1) {
             if (t->replacement_id) g_r.replacements.erase(t->replacement_id);
             for (auto a = g_r.by_addr.begin(); a != g_r.by_addr.end();)
                 a = a->second.tex == t ? g_r.by_addr.erase(a) : std::next(a);
@@ -1088,7 +1109,7 @@ void record_uploads(plume::RenderCommandList *cl) {
 GpuMesh *gpu_mesh(uint32_t id) {
     auto it = g_r.meshes.find(id);
     if (it == g_r.meshes.end()) return nullptr;
-    GpuMesh &m = it->second;
+    GpuMesh &m = *it->second;
     if (!m.buf && !m.cpu->indices.empty()) {
         const uint64_t vb = m.cpu->vertices.size() * sizeof(Vertex);
         m.index_offset = (vb + 15) & ~15ull;
@@ -2243,6 +2264,10 @@ void flush() {
     }
     if (!gs::hw::native_begin(e, tg.depth, s)) {
         if (strip_fb) fatal("prepared world strip target became unavailable");
+        if (std::any_of(g_r.pending.begin(), g_r.pending.end(), [](const Item &it) {
+                return it.queue_omitted || it.queue_reference;
+            }))
+            fatal("prepared queue dent target became unavailable");
         for (const Item &it : g_r.pending) g_frames[it.p.frame].lost++;
         g_r.pending.clear();
         return;
@@ -2461,6 +2486,32 @@ void flush() {
             }
         }
         if (strip.texture) ++g_world_strip_recorded_by_view[it.sc[1]];
+        if (it.queue_ready && !it.second) {
+            const bool ready = fb && depth && t && t->tex && !t->pending_upload &&
+                               g_queue_resources.count(it.queue_ready);
+            if (!ready && (it.queue_omitted || it.queue_reference))
+                fatal("queue dent draw lost a prepared resource");
+            if (ready) {
+                auto *classic = g_r.scene.pipeline(it.pipeline);
+                auto *modern_variant = g_r.scene.pipeline(it.pipeline | K_MODERN);
+                auto *classic_set = texture_set(t, it.sampler);
+                const uint32_t mx = pc.mode[0];
+                auto *modern_set = texture_set(t, 8 | (((mx >> M_WMS_SHIFT) & 3) ? 2u : 0u) |
+                                                        (((mx >> M_WMT_SHIFT) & 3) ? 4u : 0u));
+                const bool valid = classic && modern_variant && classic_set && modern_set &&
+                    static_cast<plume::VulkanGraphicsPipeline *>(classic)->vk &&
+                    static_cast<plume::VulkanGraphicsPipeline *>(modern_variant)->vk &&
+                    static_cast<plume::VulkanDescriptorSet *>(classic_set)->vk &&
+                    static_cast<plume::VulkanDescriptorSet *>(modern_set)->vk;
+                if (!valid && (it.queue_omitted || it.queue_reference))
+                    fatal("prepared queue dent pipeline or sampler became unavailable");
+                if (valid) {
+                    if (!it.queue_ready->ready.exchange(true, std::memory_order_acq_rel)) ++g_queue_draws_ready;
+                    g_queue_draws_omitted += it.queue_omitted;
+                    g_queue_draws_reference += it.queue_reference;
+                }
+            }
+        }
         if (capture_sun) observe_sun_caster(it, tg, s);
         if (modern && depth && !it.second && it.p.kind == KIND_WORLD && (it.pipeline & 0x40u) &&
             (it.p.pass == 0 || it.p.pass == 2) &&
@@ -2780,6 +2831,74 @@ bool same_surface(const DrawSurface &ee, const DrawSurface &reference) {
         std::equal(std::begin(ee.scissor), std::end(ee.scissor), std::begin(reference.scissor));
 }
 
+
+bool queue_draw_state(const QueueMaterial &material, const gs::Env &e, uint64_t xy) {
+    return same_surface(material.surface, reference_surface(e, xy)) &&
+           !e.write_none && !e.ate && !e.abe && !e.date && !e.fge && !e.fst && e.iip &&
+           !e.fbmsk && !e.zmsk && e.ztst == 2 && !e.lcm && !e.l && e.mmin == 4 && e.bilinear_mag &&
+           e.wms == 1 && e.wmt == 1 && e.mxl + 1 == kQueueTextureLevels &&
+           std::lround(e.k * 16.0f) == material.bias;
+}
+
+bool queue_texture_matches(const QueueMaterial &material, const gs::Env &e) {
+    const auto &texture = *material.texture;
+    bool matches = e.tme && e.tpsm == gs::PSMT8 && e.cpsm == gs::PSMCT32 &&
+                   e.tw == kQueueTextureWidth && e.th == kQueueTextureHeight && e.tcc &&
+                   e.tfx == texture.function && e.mxl + 1 == kQueueTextureLevels &&
+                   texture.palette_hash == e.pal_hash &&
+                   std::equal(texture.colors.begin(), texture.colors.end(), e.pal);
+    for (uint32_t l = 0; l < kQueueTextureLevels && matches; ++l)
+        matches = e.mip_tbp[l] == material.bases[l] &&
+                  e.mip_tbw[l] == ((kQueueTextureWidth >> l) + 63) / 64;
+    return matches;
+}
+
+const QueueTexture *draw_queue_material(const gs::Env &e) {
+    if (!g_queue_material || !g_have_env) return nullptr;
+    const auto &material = *g_queue_material;
+    const auto &texture = *material.texture;
+    if (!queue_texture_matches(material, e)) {
+        if (g_queue_mat_bad++ < 5)
+            std::fprintf(stderr, "[native] queue material mismatch: GS %u/%u %ux%u %d levels tfx %d "
+                         "base %x/%x palette %016llx/%016llx\n",
+                         e.tpsm, e.cpsm, e.tw, e.th, e.mxl + 1, e.tfx, e.tbp, material.bases[0],
+                         (unsigned long long)e.pal_hash, (unsigned long long)texture.palette_hash);
+        return nullptr;
+    }
+    ++g_queue_mat_good;
+    static const bool check = std::getenv("EOD_NATIVE_QUEUE_DENT_CHECK") != nullptr;
+    if (check) {
+        const auto key = std::make_tuple(texture.content_hash, texture.palette_hash, material.bases[0], e.scy0);
+        auto [checked, inserted] = g_queue_verified.emplace(key, true);
+        if (inserted) {
+            for (uint32_t l = 0; l < kQueueTextureLevels; ++l) {
+                gs::Env mip{};
+                mip.tpsm = gs::PSMT8;
+                mip.tw = kQueueTextureWidth >> l;
+                mip.th = kQueueTextureHeight >> l;
+                mip.tbp = material.bases[l];
+                mip.tbw = e.mip_tbw[l];
+                if (!gs::hw::native_texture_region_on_cpu(mip))
+                    fatal("queue material oracle cannot read current GS mip");
+                for (uint32_t y = 0; y < mip.th; ++y)
+                    for (uint32_t x = 0; x < mip.tw; ++x) {
+                        const uint8_t source = texture.indices[queue_texture_offset(l) + y * mip.tw + x];
+                        const auto reference = gs::read_pixel(gs::PSMT8, x, y, mip.tbp, mip.tbw);
+                        ++g_queue_texels;
+                        if (source != reference) {
+                            if (g_queue_mismatch++ < 5)
+                                std::fprintf(stderr, "[native] queue index mismatch: level %u pixel %u,%u EE %u GS %u\n",
+                                             l, x, y, source, reference);
+                            checked->second = false;
+                        }
+                    }
+            }
+        }
+        if (!checked->second) return nullptr;
+    }
+    return &texture;
+}
+
 const DrawSurface &draw_surface(const Packet &p, const DrawSurface &reference, bool observed) {
     if (p.kind != KIND_WORLD || p.program != 0x0270 || p.itop != 0x80)
         return reference;
@@ -2884,7 +3003,7 @@ void q_check(const gs::Env &e, const gs::Vertex &v) {
     if (!on || !e.tme || e.fst || g_qratio.size() >= 20000) return;
     if (g_cur.kind != KIND_QUEUE && g_cur.kind != KIND_WORLD) return;
     auto it = g_r.meshes.find(g_cur.mesh);
-    if (it == g_r.meshes.end() || !it->second.cpu || !(v.q > 0)) return;
+    if (it == g_r.meshes.end() || !it->second->cpu || !(v.q > 0)) return;
     static const bool hooked = (diff_add_exit_report([] {
         if (g_qratio.empty()) return;
         std::sort(g_qratio.begin(), g_qratio.end());
@@ -2897,7 +3016,7 @@ void q_check(const gs::Env &e, const gs::Vertex &v) {
     screen_matrix(g_cur, a);
     const double xo = (double)(g_xyoffset & 0xFFFF), yo = (double)((g_xyoffset >> 32) & 0xFFFF);
     double best = 1e30, bw = 0;
-    for (const Vertex &mv : it->second.cpu->vertices) {
+    for (const Vertex &mv : it->second->cpu->vertices) {
         double sc[4];
         for (int r = 0; r < 4; r++) sc[r] = a[r][0] * mv.p[0] + a[r][1] * mv.p[1] + a[r][2] * mv.p[2] + a[r][3];
         if (!(sc[3] > 0)) continue;
@@ -2938,7 +3057,10 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     }
     const gs::Env &e = g_have_env ? g_env : gs::current_env();
     const uint64_t xy = g_have_env ? g_xyoffset : context_xyoffset();
-    GpuMesh *mesh = strip ? strip->mesh : g_cur.mesh ? gpu_mesh(g_cur.mesh) : nullptr;
+    const auto ready = g_queue_material ? g_queue_material->readiness : nullptr;
+    const auto pinned = ready ? g_queue_resources.find(ready) : g_queue_resources.end();
+    GpuMesh *mesh = strip ? strip->mesh : pinned != g_queue_resources.end() ? pinned->second.mesh.get() :
+                    g_cur.mesh ? gpu_mesh(g_cur.mesh) : nullptr;
     if (g_cur.mesh && !mesh) {
         fs.lost++;
         fs.k_lost[kind]++;
@@ -2989,7 +3111,9 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     compare_state(rs, e, kind);
     const bool zwrite = rs.zwrite, ztest = rs.ztst >= 2;
     const DrawSurface reference = reference_surface(e, xy);
-    const DrawSurface &surface = draw_surface(g_cur, reference, g_have_env);
+    const bool queue_admitted = g_queue_omitted || g_queue_reference;
+    const DrawSurface &surface = queue_admitted ? g_queue_material->surface :
+                                 draw_surface(g_cur, reference, g_have_env);
     const int32_t *scissor = surface.scissor;
     Target tg{surface.color_base, surface.color_pitch, surface.color_format, surface.depth_base,
               surface.depth_format, uint32_t(scissor[3]) + 1, zwrite || ztest};
@@ -3038,12 +3162,19 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     static const uint32_t ab = std::getenv("EOD_R5A2_OFF") ? (uint32_t)std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) : 0u;
     const WorldTextureBinding *world_texture = g_have_env ? draw_world_texture(g_cur, e) : nullptr;
     const WorldTextureIndices *world_indices = draw_world_indices(world_texture, e);
+    const QueueTexture *queue_texture = draw_queue_material(e);
+    if (g_queue_omitted && (!queue_texture || pinned == g_queue_resources.end()))
+        fatal("queue dent omitted before its native inputs were ready");
     if (strip) {
         it.tex = strip->texture;
         static const bool report_use = std::getenv("EOD_NATIVE_WORLD_INDICES_CHECK") || std::getenv("EOD_R7_AUDIT");
         if (report_use) g_world_indices_used.fetch_add(1, std::memory_order_relaxed);
+    } else if (queue_texture && pinned != g_queue_resources.end()) {
+        it.tex = pinned->second.texture.get();
+        it.tex->last_use = g_r.vb;
     } else {
-        it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0, false, world_texture, world_indices);
+        it.tex = texture(e, fs, rs.mmin >= 2 && !(ab & 1) ? rs.mxl : 0, false, world_texture, world_indices,
+                         false, queue_texture);
     }
     const bool replacement = it.tex && it.tex->replacement_id;
     uint32_t m = 0;
@@ -3119,6 +3250,31 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
         it.world_strip_reference = true;
         g_world_strip_reference = {};
     }
+    if (ready && queue_texture && it.tex && mesh && mesh->buf) {
+        ++g_queue_objects_eligible;
+        const bool state = queue_draw_state(*g_queue_material, e, xy) &&
+                           rs.mxl + 1 == kQueueTextureLevels && rs.k_known && rs.k == g_queue_material->bias;
+        const bool geometry = mesh->cpu->indices.size() == 3 * size_t(g_queue_material->triangles) &&
+                              fs.suppressed - g_queue_first_suppressed == g_queue_material->triangles &&
+                              !mesh->cpu->transient &&
+                              std::all_of(it.run_k.begin(), it.run_k.end(),
+                                          [&](int32_t k) { return k == g_queue_material->bias; });
+        g_queue_state_declines += !state;
+        g_queue_geometry_declines += !geometry;
+        if (state && geometry) {
+            if (pinned == g_queue_resources.end()) {
+                const auto tex = g_r.textures.find(it.tex->key);
+                const auto geo = g_r.meshes.find(g_cur.mesh);
+                if (tex != g_r.textures.end() && geo != g_r.meshes.end())
+                    g_queue_resources.emplace(ready, QueueResources{geo->second, tex->second});
+            }
+            it.queue_ready = ready;
+            it.queue_omitted = g_queue_omitted;
+            it.queue_reference = g_queue_reference;
+        }
+    }
+    if (queue_admitted && !it.queue_ready)
+        fatal("prepared queue dent draw did not cover the complete ordered part");
     if (!rs.ate || rs.atst == 1) {
         it.pc.mode[0] &= ~(M_ATE | M_AFAIL_DISCARD);
         g_r.pending.push_back(it);
@@ -3167,6 +3323,17 @@ void end_vblank(uint64_t vb) {
         }
     }
     gpu_timer_end_vblank(vb);
+    for (auto it = g_queue_resources.begin(); it != g_queue_resources.end();) {
+        if (it->first.expired()) {
+            // The token can outlive cache replacement and then be used by a later item.
+            g_r.retired_meshes.emplace_back(vb, std::move(it->second.mesh));
+            it = g_queue_resources.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    while (!g_r.retired_meshes.empty() && g_r.retired_meshes.front().first + 8 <= vb)
+        g_r.retired_meshes.pop_front();
     evict_textures();
     if (log_every() > 1 && vb % log_every() == 0 && g_r.ok)
         std::fprintf(stderr, "[native] vb %llu textures decoded %llu (total), cached %zu (%llu MB), meshes %zu\n",
@@ -3195,9 +3362,7 @@ void end_vblank(uint64_t vb) {
     while (!g_r.transient.empty() && g_r.transient.front().second + 8 <= vb) {
         auto it = g_r.meshes.find(g_r.transient.front().first);
         if (it != g_r.meshes.end()) {
-            Trash t{vb};
-            t.buf = std::move(it->second.buf);
-            g_r.trash.push_back(std::move(t));
+            g_r.retired_meshes.emplace_back(vb, it->second);
             g_r.meshes.erase(it);
         }
         g_r.transient.pop_front();
@@ -3367,8 +3532,8 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
         g_pg.gs_n = g_pg.gs_miss = 0;
         if (g_cur.kind != KIND_QUEUE || !g_cur.mesh) return;
         auto it = g_r.meshes.find(g_cur.mesh);
-        if (it == g_r.meshes.end() || !it->second.cpu) return;
-        const Mesh &m = *it->second.cpu;
+        if (it == g_r.meshes.end() || !it->second->cpu) return;
+        const Mesh &m = *it->second->cpu;
         const bool vu_rounding = m.skinned || (g_r.static_queue_projection && !g_modern.load(std::memory_order_relaxed) &&
                                               uses_static_queue_projection(g_cur, m));
         double a[4][4];
@@ -3412,11 +3577,11 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
             }
         }
         g_pg.bind.clear();
-        g_pg.posed = it->second.cpu->posed;
+        g_pg.posed = it->second->cpu->posed;
         if (g_pg.posed) {
-            auto b = g_r.meshes.find(it->second.cpu->bind);
-            if (b != g_r.meshes.end() && b->second.cpu)
-                project_into(*b->second.cpu, a, b->second.cpu->skinned, xo, yo, g_pg.bind);
+            auto b = g_r.meshes.find(it->second->cpu->bind);
+            if (b != g_r.meshes.end() && b->second->cpu)
+                project_into(*b->second->cpu, a, b->second->cpu->skinned, xo, yo, g_pg.bind);
         }
         g_pg.batch = g_cur.batch;
         g_pg.program = g_cur.program;
@@ -3530,6 +3695,9 @@ void begin_object(const Packet &p) {
     g_have_env = false;
 #ifdef EOD_PLUME
     g_gs_k.clear();
+    g_queue_material.reset();
+    g_queue_omitted = g_queue_reference = false;
+    g_queue_first_suppressed = g_frames[p.frame].suppressed;
 #endif
     g_frames[p.frame].objects++;
     g_frames[p.frame].k_objects[p.kind % KIND_COUNT]++;
@@ -3913,6 +4081,17 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
         finalize();
         g_active = false;
         break;
+    case CMD_QUEUE_MATERIAL: {
+        QueueMaterial *owner;
+        if (size != sizeof owner) return;
+        std::memcpy(&owner, data, sizeof owner);
+#ifdef EOD_PLUME
+        g_queue_material.reset(owner);
+#else
+        delete owner;
+#endif
+        break;
+    }
     case CMD_WORLD_TEXTURE_INDICES: {
 #ifdef EOD_PLUME
         constexpr uint32_t header = offsetof(WorldTextureIndices, data);
@@ -3935,22 +4114,22 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
             auto it = g_r.meshes.find(m->replaces);
             if (it != g_r.meshes.end()) {
                 for (const Item &pi : g_r.pending)
-                    if (pi.mesh == &it->second) {
+                    if (pi.mesh == it->second.get()) {
                         flush();  // an object still to be drawn uses the old geometry
                         break;
                     }
                 for (const Item &pi : g_r.shadow_pending)
-                    if (pi.mesh == &it->second) {
+                    if (pi.mesh == it->second.get()) {
                         flush_shadows();
                         break;
                     }
-                Trash t{g_r.vb};
-                t.buf = std::move(it->second.buf);
-                g_r.trash.push_back(std::move(t));
+                g_r.retired_meshes.emplace_back(g_r.vb, it->second);
                 g_r.meshes.erase(it);
             }
         }
-        g_r.meshes[m->id].cpu.reset(m);
+        auto mesh = std::make_shared<GpuMesh>();
+        mesh->cpu.reset(m);
+        g_r.meshes[m->id] = std::move(mesh);
 #else
         delete m;
 #endif
@@ -3958,6 +4137,28 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
     }
     default: break;
     }
+}
+
+bool gs_queue_dent_accepted(const QueueStripOmission &omission, const gs::Env &env, uint64_t xy) {
+#ifdef EOD_PLUME
+    if (gs::g_skip_frame) return true;
+    if (!g_active || g_finalized || !g_have_env || !g_queue_material ||
+        !g_queue_material->readiness || g_cur.frame != omission.frame || g_cur.serial != omission.serial ||
+        g_cur.kind != KIND_QUEUE || g_cur.program != 0x02E0 || g_cur.itop != 0x80 ||
+        !queue_draw_state(*g_queue_material, env, xy) || !queue_draw_state(*g_queue_material, g_env, g_xyoffset) ||
+        !queue_texture_matches(*g_queue_material, env))
+        return false;
+    g_queue_omitted = !omission.reference;
+    g_queue_reference = omission.reference;
+    if (g_queue_omitted)
+        g_frames[g_cur.frame].suppressed += omission.terminal.triangle_attempts;
+    return true;
+#else
+    (void)omission;
+    (void)env;
+    (void)xy;
+    return false;
+#endif
 }
 
 bool gs_world_strip_ready() {
@@ -4001,12 +4202,12 @@ bool gs_submit_world_strip(const gs::Env &env, uint64_t xy, uint32_t triangles, 
         return decline_world_strip(StripDecline::State);
 
     const auto mesh = g_r.meshes.find(g_cur.mesh);
-    if (mesh == g_r.meshes.end() || !mesh->second.buf || !mesh->second.cpu ||
-        !static_cast<plume::VulkanBuffer *>(mesh->second.buf.get())->vk ||
-        mesh->second.cpu->indices.size() != size_t(triangles) * 3 || !mesh->second.cpu->k_kick ||
-        mesh->second.cpu->k_mixed)
+    if (mesh == g_r.meshes.end() || !mesh->second->buf || !mesh->second->cpu ||
+        !static_cast<plume::VulkanBuffer *>(mesh->second->buf.get())->vk ||
+        mesh->second->cpu->indices.size() != size_t(triangles) * 3 || !mesh->second->cpu->k_kick ||
+        mesh->second->cpu->k_mixed)
         return decline_world_strip(StripDecline::Mesh);
-    if (sext12((g_cur.tex_k & 0xFFF) + mesh->second.cpu->k_delta) != sext12(lod.bias) ||
+    if (sext12((g_cur.tex_k & 0xFFF) + mesh->second->cpu->k_delta) != sext12(lod.bias) ||
         (g_cur.tex_mxl & 7) != lod.max_level)
         return decline_world_strip(StripDecline::State);
 
@@ -4040,7 +4241,7 @@ bool gs_submit_world_strip(const gs::Env &env, uint64_t xy, uint32_t triangles, 
     // Opaque, GEQUAL, full writable channels, with the typed target depth buffer.
     const uint32_t mask = (surface.color_format & 0xF) == 1 ? 7 : 15;
     const uint32_t key = blend_classes(false, 0, 0, 0, 0) | 0xD0u | (mask << 8);
-    PreparedWorldStrip strip{tex, &mesh->second, {}, {tex->sets[classic_sampler].get(), tex->sets[modern_sampler].get()},
+    PreparedWorldStrip strip{tex, mesh->second.get(), {}, {tex->sets[classic_sampler].get(), tex->sets[modern_sampler].get()},
                              key, classic_sampler};
     for (bool modern : {false, true}) {
         auto *pipeline = g_r.scene.pipeline(key | (modern ? K_MODERN : 0));
@@ -4107,6 +4308,20 @@ bool gs_check_world_strip_draw(uint64_t xy, uint32_t triangles) {
 }
 
 void gs_report_world_strips(uint64_t expected) {
+#ifdef EOD_PLUME
+    if (g_queue_mat_good || g_queue_mat_bad)
+        std::fprintf(stderr, "[native] queue indexed material: matched=%llu mismatched=%llu checks=%zu texels=%llu texel_mismatch=%llu\n",
+                     (unsigned long long)g_queue_mat_good, (unsigned long long)g_queue_mat_bad,
+                     g_queue_verified.size(), (unsigned long long)g_queue_texels, (unsigned long long)g_queue_mismatch);
+#endif
+#ifdef EOD_PLUME
+    if (g_queue_objects_eligible)
+        std::fprintf(stderr, "[native] queue dent draws: eligible=%llu state_declined=%llu geometry_declined=%llu "
+                     "ready=%llu recorded=%llu reference=%llu\n",
+                     (unsigned long long)g_queue_objects_eligible, (unsigned long long)g_queue_state_declines,
+                     (unsigned long long)g_queue_geometry_declines, (unsigned long long)g_queue_draws_ready,
+                     (unsigned long long)g_queue_draws_omitted, (unsigned long long)g_queue_draws_reference);
+#endif
     uint64_t total = 0;
     for (const auto &[view_y, count] : g_world_strip_recorded_by_view) {
         std::fprintf(stderr, "[native] world strip native view y=%d: %llu recorded\n",

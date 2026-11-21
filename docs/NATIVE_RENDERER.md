@@ -2058,3 +2058,38 @@ runs the interpreter muted on the same state and compares the kick,
 all VU data memory, the register and flag state, and the live scoreboard.
 The VU execution census counts the retired calls under
 `retired_world_clipped`. The strip still reaches the ordered GS path.
+
+### R7 queued vehicle indexed material
+
+The queued part REF reserved at `0x3613E0` follows material slot selection
+at `0x3514F0`, which prefers the entry's +0x38 pointer over +0x18. The
+narrow opaque candidate uses EE flags 0x6c0, a transient type-4 image
+with a CT32 palette, dimensions 256×128 and six levels. The texture
+record uses +0x0c for residency, +0x10 for type, +0x14 for palette
+type, +0x18/+0x1a for log dimensions and +0x1c for level count.
+Relocation at `0x360408` commits mip pointers at +0x24 and the palette
+pointer at +0x40.
+
+`0x35F278/0x35F350` round each eight-bit level to 256-byte blocks.
+`0x35EEA8/0x35F0E4` transfer levels at least 32 pixels high as CT32
+at half width and height with pitch ceil(transfer width / 64).
+`0x35F140/0x35F16C` transfer the smaller levels as linear PSMT8
+source. `0x35EF24` transfers the CT32 palette as 16×16. The CSM1
+logical lookup swaps bits 3 and 4 of the source color index.
+`0x35F4F4/0x35F57C` rotate the transfer bank, and `0x35F9A0` binds
+TEX0 and the mip offsets. Bank bases are carried for the ordered oracle.
+The native material is identified by immutable image and palette bytes.
+The Xbox export identifies indexed draw and texture state entry points
+at `0x001CD710` and `0x001C8FF0`. The transfer layout above comes
+from the PS2 asset upload path.
+
+For the narrow continuation cutover, only an interior positive-K MSCNT
+at `0x0D48` is considered. The complete REF must contain only the
+typed UNPACK/setup and launch commands, with no intervening DIRECT,
+MPG, interrupt, or flush. A retained opposite-bank successor restores
+the live VU execution state and a retained same-bank successor covers
+the discarded scratch prefix. A surviving scratch suffix and the
+ordered GS terminal attributes are compatibility state. The native
+queue draw remains a single item in the same target batch. Readiness
+may be published after a prior successful draw of the same immutable
+mesh/material/state. Unready resources retain the original MSCNT.

@@ -49,14 +49,14 @@ Vif g_vif[2];
 
 uint32_t avail(const Vif &v) { return (uint32_t)(v.q.size() - v.qpos); }
 
-bool matches_world_ref(const Vif &v, const uint32_t *payload, size_t words, uint32_t itop) {
+bool matches_draw_ref(const Vif &v, const uint32_t *payload, size_t words, uint32_t itop) {
     const uint32_t tag = g_vif1_dma_tag;
     if (!payload || !words || words > 0xFFFFu * 4 ||
         (tag & 15) || tag > EE_RAM_SIZE - 16 ||
         MEM_LW(tag) != (0x30000000u | (words / 4)) ||
         MEM_LW(tag + 8) != (0x04000000u | itop) || MEM_LW(tag + 12) != 0x05000000)
         return false;
-    // The native feed has already verified that this source is part + 0x38.
+    // The native feed independently binds this source to the committed part + 0x38.
     const uint32_t source = MEM_LW(tag + 4);
     return !(source & 15) && source <= EE_RAM_SIZE - words * 4 &&
            payload == reinterpret_cast<const uint32_t *>(g_ram + source) &&
@@ -115,16 +115,29 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
             return;
         }
 #endif
-        if (retire_world_leaf && matches_world_ref(v, ref_payload, ref_words, 0x80) &&
+        if (retire_world_leaf && matches_draw_ref(v, ref_payload, ref_words, 0x80) &&
             vu_retire_world_leaf(v.vu, addr, v.top, world_lod)) {
             ++g_vu1_world_leaf_retires;
             return;
         }
         if (launch == VuLaunch::Mscnt && clipped_world_continuation &&
-            matches_world_ref(v, ref_payload, ref_words, 0x280)) {
+            matches_draw_ref(v, ref_payload, ref_words, 0x280)) {
             const unsigned count = clipped_world_chunk_vertices(v, ref_payload, offset);
             if (count && vu_retire_clipped_world_strip(v.vu, v.top, count))
                 return;
+        }
+        if (((launch == VuLaunch::Mscal && addr == 0x02E0) ||
+             (launch == VuLaunch::Mscnt && addr == 0x0D48)) &&
+            native::queue_dent_check_enabled() && matches_draw_ref(v, ref_payload, ref_words, 0x80))
+            native::check_queue_dent_input(v.top, offset, launch == VuLaunch::Mscnt);
+        if (launch == VuLaunch::Mscnt && addr == 0x0D48 &&
+            matches_draw_ref(v, ref_payload, ref_words, 0x80)) {
+            native::QueueDentChunk candidate{};
+            if (native::queue_dent_candidate(offset, candidate) &&
+                vu_retire_queue_dent(v.vu, v.top, candidate)) {
+                native::queue_dent_selected(v.top, candidate.omission);
+                if (!candidate.omission.reference) return;
+            }
         }
         g_vu1_program_starts[(addr >> 3) & 0x7FF]++;
         if (g_vu1_start_hook) g_vu1_start_hook(addr);
@@ -473,7 +486,7 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         case 0x14:  // MSCAL
             LOG(LOG_VIF, "VIF%d MSCAL %04x", v.n, imm * 8);
             // Admission checks the committed REF; later commands run from the same VIF stream.
-            start_micro(v, imm * 8, VuLaunch::Mscal, v.n == 1 && !(n & 3) ? w : nullptr, n);
+            start_micro(v, imm * 8, VuLaunch::Mscal, v.n == 1 && !(n & 3) ? w : nullptr, n, pos);
             break;
         case 0x15: start_micro(v, imm * 8, VuLaunch::Mscalf); break;
         case 0x17:

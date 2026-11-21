@@ -738,6 +738,10 @@ void parse_gif(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices) 
 
 native::WorldStripTerminal g_world_strip_check{};
 bool g_have_world_strip_check;
+native::QueueStripOmission g_queue_strip_reference{};
+bool g_have_queue_strip_check;
+uint64_t g_queue_strips_checked, g_queue_strips_omitted, g_queue_strips_qwords;
+uint64_t g_queue_strips_triangles, g_queue_reference_triangles;
 uint64_t g_world_strips_checked, g_world_strips_partial, g_world_strips_empty;
 uint64_t g_world_strip_triangles, g_world_strip_adc, g_world_strip_qwords;
 uint64_t g_world_strips_omitted, g_world_strips_forwarded, g_world_qwords_omitted, g_world_qwords_forwarded;
@@ -760,9 +764,7 @@ bool check_strip_vertex(const Vertex &got, const native::WorldStripTerminal::Ver
            got.v == int32_t(bits(uv, 16, 14));
 }
 
-void check_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices) {
-    g_have_world_strip_check = false;
-    const auto &tail = g_world_strip_check;
+void check_strip(const native::WorldStripTerminal &tail, const uint8_t *data, uint32_t qwc, bool draw_vertices) {
     if (qwc != 1 + 3 * tail.vertices) fatal("world strip check expected the next PATH1 kick");
     const PathState &path = g_path[GIF_PATH1];
     if (path.in_packet && path.nloop) {
@@ -795,11 +797,78 @@ void check_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices) {
     if (!boundary || !latches || !fifo || stats.prims - prims != triangles)
         fatal("world strip terminal mismatch: PATH1 %d, latches %d, FIFO %d, triangle attempts %llu/%u",
               boundary, latches, fifo, (unsigned long long)(stats.prims - prims), triangles);
+}
+
+void check_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices) {
+    g_have_world_strip_check = false;
+    const auto &tail = g_world_strip_check;
+    check_strip(tail, data, qwc, draw_vertices);
     ++g_world_strips_checked;
+    const uint32_t triangles = draw_vertices ? tail.triangle_attempts : 0;
     g_world_strips_empty += triangles == 0;
     g_world_strip_triangles += triangles;
     g_world_strip_adc += tail.adc_vertices;
     g_world_strip_qwords += qwc;
+}
+
+void commit_strip_terminal(const native::WorldStripTerminal &tail, PathState &path, uint64_t xy,
+                           uint64_t tag_lo, uint64_t tag_hi) {
+    // Commit compatibility latches only after the native object owns the draw.
+    const auto &last = tail.fifo[2];
+    st.prim = tail.prim;
+    st.vcount = 3;
+    st.st = uint64_t(last.t) << 32 | last.s;
+    st.rgbaq = uint64_t(last.q) << 32 | last.rgba;
+    memcpy(&st.q, &last.q, sizeof st.q);
+    constexpr uint32_t writes = TAINT_ST | TAINT_Q | TAINT_RGBA;
+    g_attr_taint &= ~writes;
+    g_attr_written |= writes;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto &src = tail.fifo[i];
+        Vertex &dst = st.vq[i];
+        dst.x = int32_t(src.x) - int32_t(bits(xy, 0, 16));
+        dst.y = int32_t(src.y) - int32_t(bits(xy, 32, 16));
+        dst.z = src.z;
+        dst.f = src.fog;
+        dst.r = uint8_t(src.rgba);
+        dst.g = uint8_t(src.rgba >> 8);
+        dst.b = uint8_t(src.rgba >> 16);
+        dst.a = uint8_t(src.rgba >> 24);
+        dst.u = int32_t(bits(st.uv, 0, 14));
+        dst.v = int32_t(bits(st.uv, 16, 14));
+        memcpy(&dst.s, &src.s, sizeof dst.s);
+        memcpy(&dst.t, &src.t, sizeof dst.t);
+        memcpy(&dst.q, &src.q, sizeof dst.q);
+    }
+    path = PathState{false, tag_lo, tag_hi, 0, 3, 0, 0, true};
+    stats.prims += tail.triangle_attempts;
+}
+
+void apply_queue_strip(const void *data) {
+    native::QueueStripOmission omission;
+    memcpy(&omission, data, sizeof omission);
+    const auto &tail = omission.terminal;
+    auto &path = g_path[GIF_PATH1];
+    if (path.nloop || !(st.prmodecont & 1) || tail.prim != 0x1C || g_stale_prim ||
+        g_have_queue_strip_check || g_have_world_strip_check ||
+        (modern::g_on && (modern::live() || modern::gs_path1_has_replacement())))
+        fatal("queue dent continuation reached an unexpected ordered PATH1 boundary");
+    const uint64_t xy = st.ctx[0].xyoffset;
+    if (!native::gs_queue_dent_accepted(omission, world_strip_env(tail.prim), xy))
+        fatal("queue dent continuation did not match the prepared native draw");
+    if (omission.reference) {
+        g_queue_strip_reference = omission;
+        g_have_queue_strip_check = true;
+        return;
+    }
+    if (scene_emit::g_on) scene_emit::gs_packet(GIF_PATH1);
+    if (modern::g_on) modern::gs_packet(GIF_PATH1);
+    constexpr uint64_t header = 0x300E400000008000ull;
+    commit_strip_terminal(tail, path, xy, header | tail.vertices, omission.tag_high);
+    if (!g_skip_frame) note_world_strip_draw();
+    ++g_queue_strips_omitted;
+    g_queue_strips_qwords += 1 + 3 * tail.vertices;
+    g_queue_strips_triangles += tail.triangle_attempts;
 }
 
 bool try_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices, bool reference) {
@@ -834,41 +903,28 @@ bool try_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices, bool
     if (scene_emit::g_on) scene_emit::gs_packet(GIF_PATH1);
     if (modern::g_on) modern::gs_packet(GIF_PATH1);
 
-    // Commit compatibility latches only after the native object owns the draw.
-    const auto &last = tail.fifo[2];
-    st.prim = tail.prim;
-    st.vcount = 3;
-    st.st = uint64_t(last.t) << 32 | last.s;
-    st.rgbaq = uint64_t(last.q) << 32 | last.rgba;
-    memcpy(&st.q, &last.q, sizeof st.q);
-    constexpr uint32_t writes = TAINT_ST | TAINT_Q | TAINT_RGBA;
-    g_attr_taint &= ~writes;
-    g_attr_written |= writes;
-    for (unsigned i = 0; i < 3; ++i) {
-        const auto &src = tail.fifo[i];
-        Vertex &dst = st.vq[i];
-        dst.x = int32_t(src.x) - int32_t(bits(xy, 0, 16));
-        dst.y = int32_t(src.y) - int32_t(bits(xy, 32, 16));
-        dst.z = src.z;
-        dst.f = src.fog;
-        dst.r = uint8_t(src.rgba);
-        dst.g = uint8_t(src.rgba >> 8);
-        dst.b = uint8_t(src.rgba >> 16);
-        dst.a = uint8_t(src.rgba >> 24);
-        dst.u = int32_t(bits(st.uv, 0, 14));
-        dst.v = int32_t(bits(st.uv, 16, 14));
-        memcpy(&dst.s, &src.s, sizeof dst.s);
-        memcpy(&dst.t, &src.t, sizeof dst.t);
-        memcpy(&dst.q, &src.q, sizeof dst.q);
-    }
-    path = PathState{false, tag[0], tag[1], 0, 3, 0, 0, true};
-    stats.prims += tail.triangle_attempts;
+    commit_strip_terminal(tail, path, xy, tag[0], tag[1]);
     g_world_triangles_omitted += tail.triangle_attempts;
     note_world_strip_draw();
     return true;
 }
 
 void gif_process(int path, const uint8_t *data, uint32_t qwc, bool draw_vertices = true) {
+    if (path == GIF_PATH1 && g_have_queue_strip_check) {
+        g_have_queue_strip_check = false;
+        const auto &expected = g_queue_strip_reference;
+        uint64_t tag[2];
+        if (qwc != 1 + 3 * expected.terminal.vertices) fatal("queue dent oracle did not receive its PATH1 strip");
+        memcpy(tag, data, sizeof tag);
+        if (tag[0] != (0x300E400000008000ull | expected.terminal.vertices) || tag[1] != expected.tag_high)
+            fatal("queue dent original PATH1 header differs");
+        check_strip(expected.terminal, data, qwc, draw_vertices);
+        if (!g_skip_frame && !world_strip_draw_dirty())
+            fatal("queue dent original PATH1 strip did not mark the draw target");
+        ++g_queue_strips_checked;
+        g_queue_reference_triangles += expected.terminal.triangle_attempts;
+        return;
+    }
     if (path == GIF_PATH1 && g_have_world_strip_check) {
         const int mode = native::world_strip_mode();
         if (mode) {
@@ -1523,6 +1579,8 @@ void native::post(uint32_t kind, const void *data, uint32_t size) {
             return apply_world_texture_lod(data);
         if (kind == CMD_WORLD_STRIP_CHECK && size == sizeof(WorldStripTerminal))
             return arm_world_strip_check(data);
+        if (kind == CMD_QUEUE_STRIP && size == sizeof(QueueStripOmission))
+            return apply_queue_strip(data);
         return gs_command(kind, data, size);
     }
     push_cmd(CMD_NATIVE, kind, 0, data, size);
@@ -1842,6 +1900,8 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     apply_world_texture_lod(d);
                 } else if (h[1] == native::CMD_WORLD_STRIP_CHECK && h[3] == sizeof(native::WorldStripTerminal)) {
                     arm_world_strip_check(d);
+                } else if (h[1] == native::CMD_QUEUE_STRIP && h[3] == sizeof(native::QueueStripOmission)) {
+                    apply_queue_strip(d);
                 } else {
                     native::gs_command(h[1], d, h[3]);
                 }
@@ -2233,6 +2293,13 @@ void gs_shutdown() {
     if (g_dump) { fclose(g_dump); g_dump = nullptr; }
     raster_shutdown();
     if (g_have_world_strip_check) fatal("world strip check did not receive PATH1 before shutdown");
+    if (g_have_queue_strip_check) fatal("queue dent oracle did not finish");
+    if (g_queue_strips_omitted || g_queue_strips_checked)
+        std::fprintf(stderr, "[native] queue dent ordered: omitted=%llu qwords=%llu triangles=%llu "
+                     "reference=%llu reference_triangles=%llu\n",
+                     (unsigned long long)g_queue_strips_omitted, (unsigned long long)g_queue_strips_qwords,
+                     (unsigned long long)g_queue_strips_triangles, (unsigned long long)g_queue_strips_checked,
+                     (unsigned long long)g_queue_reference_triangles);
     if (native::world_strip_mode() == 1) {
         std::fprintf(stderr, "[native] world strip omission: %llu admitted, %llu declined, %llu qwords avoided, %llu forwarded\n",
                      (unsigned long long)g_world_strips_omitted, (unsigned long long)g_world_strips_forwarded,

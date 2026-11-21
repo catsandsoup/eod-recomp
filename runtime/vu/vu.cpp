@@ -2316,6 +2316,109 @@ bool vu_retire_clipped_world_strip(VUState *vu, uint32_t top, unsigned vertices)
 #endif
 }
 
+bool vu_retire_queue_dent(VUState *vu, unsigned top, native::QueueDentChunk &candidate) {
+#ifdef EOD_PLUME
+    static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") ||
+        getenv("EOD_NATIVE_CHECK") || getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
+        getenv("EOD_NATIVE_QCHECK") || getenv("EOD_VIF_CHECK") ||
+        getenv("EOD_GS_DUMP_COLD_START") || getenv("EOD_GS_CENSUS") || getenv("EOD_GS_TRACE") ||
+        getenv("EOD_NATIVE_PASSES") || getenv("EOD_R5A2_OFF") || getenv("EOD_GS_SKIPALL") ||
+        getenv("EOD_MODERN");
+    if (diagnostic || vu_dispatch_observed() || native::native_only() || scene_emit::capture_requested()) return false;
+    const auto tag = world_qword(*vu, 19);
+    const unsigned vertices = candidate.vertices, overwrite = candidate.overwrite;
+    const auto origin = world_qword(*vu, top + 199);
+    const auto uv_origin = world_qword(*vu, top + 198);
+    if (g_vu_mute_kick || !matches_world_image(vu) ||
+        vu->running || vu->flag_pipe || vu->fq_n || vu->p_busy || vu->q_busy || (vu->status & 0x30) ||
+        !sb_same(g_score[1], Scoreboard{}, vu->cycle) || vu->tpc != 0x0D48 ||
+        tag.u[1] != 0x300E4000 || (tag.u[2] & 0xFFF) != 0x412 ||
+        int16_t(uv_origin.u[2]) <= 0 || vertices < 3 || vertices > 48 ||
+        world_qword(*vu, top).u[0] != (0x8000u | vertices))
+        return false;
+#ifdef VU_REC
+    if (vu_rec_find(vu, 0x0D48)) return false;
+#endif
+    VUReg output[48][3];
+    for (unsigned i = std::min(overwrite, vertices - 3); i < vertices; ++i) {
+        auto p = world_qword(*vu, top + 2 + 3 * i);
+        const auto n = world_qword(*vu, top + 1 + 3 * i);
+        const auto st = world_qword(*vu, top + 3 + 3 * i);
+        const auto skin = world_qword(*vu, top + 149 + vertices - i);
+        const auto dent0 = world_qword(*vu, 143 + uint16_t(skin.u[0]));
+        const auto dent1 = world_qword(*vu, 143 + uint16_t(skin.u[1]));
+        const float w0 = skin.f[2] - 32768.f, w1 = skin.f[3] - 32768.f;
+        float light[3], halfway[3];
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            p.f[axis] = (dent0.f[axis] * w0 + dent1.f[axis] * w1) + (p.f[axis] + origin.f[axis]);
+            const float normal = n.f[axis] - vu->vf[13].f[0];
+            light[axis] = normal * vu->vf[12].f[axis];
+            halfway[axis] = normal * vu->vf[14].f[axis];
+        }
+        float screen[4];
+        for (unsigned axis = 0; axis < 4; ++axis)
+            screen[axis] = ((vu->vf[4].f[axis] * p.f[0] + vu->vf[5].f[axis] * p.f[1]) +
+                            vu->vf[6].f[axis] * p.f[2]) + vu->vf[7].f[axis] * p.f[3];
+        if (!std::isnormal(screen[3])) return false;
+        const float q = 1.f / screen[3], scale = vu->vf[3].f[3];
+        const float shade = (light[0] + light[1]) + light[2];
+        const float half = (halfway[0] + halfway[1]) + halfway[2];
+        const float alpha = std::max(0.f, (std::max(1.f, shade) * 1152.f) * half - 1056.f);
+        auto &out = output[i];
+        out[0] = VUReg{{((st.f[0] + uv_origin.f[0]) * q) * scale,
+                        ((st.f[1] + uv_origin.f[1]) * q) * scale,
+                        (st.f[2] * q) * scale, 0.f}};
+        const auto convertible = [](float a) { return -2147483648.f <= a && a < 2147483648.f; };
+        if (!convertible(alpha)) return false;
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            const float color = std::min(vu->vf[1].f[axis] + std::max(0.f, shade) * vu->vf[2].f[axis],
+                                         vu->vf[1].f[3]);
+            const float xy = (screen[axis] * q) * 16.f;
+            if (!convertible(color) || !convertible(xy) || !std::isfinite(out[0].f[axis])) return false;
+            out[1].s[axis] = int32_t(color);
+            out[2].s[axis] = int32_t(xy);
+        }
+        out[1].s[3] = int32_t(alpha);
+        out[2].u[3] = n.u[3];
+    }
+    auto &tail = candidate.omission.terminal;
+    tail.prim = (tag.u[1] >> 15) & 0x7FF;
+    tail.vertices = vertices;
+    candidate.omission.tag_high = uint64_t(tag.u[3]) << 32 | tag.u[2];
+    for (unsigned i = 0; i < vertices; ++i) {
+        const auto attr = world_qword(*vu, top + 1 + 3 * i);
+        const bool adc = (attr.u[3] & 0x8000) != 0;
+        tail.adc_vertices += adc;
+        tail.triangle_attempts += i >= 2 && !adc;
+    }
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto *vertex = output[vertices - 3 + i];
+        const auto &stq = vertex[0], &rgba = vertex[1], &xyzf = vertex[2];
+        const uint32_t color = (rgba.u[0] & 255) | ((rgba.u[1] & 255) << 8) |
+                               ((rgba.u[2] & 255) << 16) | ((rgba.u[3] & 255) << 24);
+        tail.fifo[i] = {uint16_t(xyzf.u[0]), uint16_t(xyzf.u[1]), (xyzf.u[2] >> 4) & 0xFFFFFF, color,
+                        stq.u[0], stq.u[1], stq.u[2], uint8_t(xyzf.u[3] >> 4)};
+    }
+    if (!tail.triangle_attempts) return false;
+    if (!candidate.omission.reference) {
+        // The opposite-bank successor replaces temporary registers. Preserve
+        // only the scratch suffix the later same-bank continuation cannot cover.
+        for (unsigned i = overwrite; i < vertices; ++i) {
+            auto *dst = vu->mem + 16 * (top + 201 + 3 * i);
+            std::memcpy(dst, output[i], 12);
+            std::memcpy(dst + 16, output[i] + 1, 32);
+        }
+        census_retire(*vu, 0x0D48, "retired_queue_dent");
+    }
+    return true;
+#else
+    (void)vu;
+    (void)top;
+    (void)candidate;
+    return false;
+#endif
+}
+
 static constexpr uint32_t kMlistVisibilityPc = 0x40;
 
 static bool is_mlist_visibility_image(const VUState &vu) {
