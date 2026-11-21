@@ -201,7 +201,8 @@ struct WorldStripTerminal {
     uint32_t prim, vertices, adc_vertices, triangle_attempts;
 };
 
-bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod);
+bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
+               bool &clipped_world_continuation);
 
 // ---- GS command stream ----------------------------------------------------------------------
 // One queue record as the GS receives it.

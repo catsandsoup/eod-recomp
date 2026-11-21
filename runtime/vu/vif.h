@@ -6,6 +6,7 @@ struct VUState;
 namespace native { struct WorldTextureLod; }
 // Retire a supported non-clipped world REF after VIF validates its DMA ownership.
 bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::WorldTextureLod &lod);
+bool vu_retire_clipped_world_strip(VUState *vu, uint32_t top, unsigned vertices);
 
 void vif_init();
 // Feeds `count` 32-bit words to VIF n (commands may span calls).

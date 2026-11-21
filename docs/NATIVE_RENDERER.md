@@ -1333,7 +1333,7 @@ at `0x0848..0x0888`. Both ordered kicks and the full state are compared
 against the reference in `EOD_NATIVE_WORLD_RETIRE_CHECK=1`. The layout
 guards, simulated VU state and GS compatibility packets still bridge
 to other legacy programs. `EOD_NATIVE_WORLD_RETIRE=0` restores the
-reference for ordinary draws. Forced interpretation and portable
+reference for these leaves. Forced interpretation and portable
 capture also retain the reference dispatch.
 
 ### Phase A1: race HUD producer table (`SLUS_209.10`, Ghidra `DecompileAddrs`, 2026-11-20)
@@ -2023,3 +2023,38 @@ SQ.xyz preserves. Masked UNPACKs overwrite only enabled lanes. VIF1
 MSCNT uses the previous TPC, including `0x0920`, with the new TOP. The
 interpreter, compiled VU code and the EE mapping at `0x1100C000` can
 also access the data memory.
+
+### R7 clipped world-strip continuations
+
+WorldRenderPass at EE `0x358BD0` sets the leaf ITOP to `0x280` when
+visibility bit 7 requires clipping. Its committed REF points to
+`part + 0x38` and carries `ITOP 0x280; STMOD 0` in the tag. In the
+retail world image, subsequent chunks resume with `MSCNT` at
+`0x0618`. The branch at `0x0630` reaches `0x0388` for either world
+TOP bank. The VIF chunk preceding MSCNT unpacks the source GIF tag
+to TOP, vertex positions to TOP+2, packed colors to TOP+1,
+texture coordinates to TOP+3, and both strip bases to TOP+198.
+Its VIF cycle is restored to `0x0101` before MSCNT.
+
+A positive signed K at TOP+198.z skips the TEX1 kick at `0x0438`.
+The clip loop at `0x0450` projects XYZ using vf4–vf7 and computes
+frustum codes using vf8–vf11. The last three codes select inside,
+common-plane rejection, or triangle expansion at `0x2630`. The
+incoming color W can skip the triangle classification and preserve
+the prior rejection latch. For the inside and common-plane cases
+there is a single PACKED strip kick at `0x0608`, with original
+color/ADC, ST padding and GS ordering. The compatibility state
+includes q23 copied from q18, the entire strip store at TOP+200,
+the final clip/flag state and TPC `0x0618`. Intersecting triangles
+require additional strips and scratch stores. They stay on the
+reference path along with initial MSCALs and other chunk layouts.
+
+Ordinary Plume uses the host path for verified positive-K continuations
+without triangle expansion. Initial MSCALs, unverified payloads, foreign
+micro images, older compiled dispatch and portable captures keep their
+original path. `EOD_NATIVE_WORLD_CLIPPED=0` restores the interpreter
+for the admitted continuations. `EOD_NATIVE_WORLD_CLIPPED_CHECK=1`
+runs the interpreter muted on the same state and compares the kick,
+all VU data memory, the register and flag state, and the live scoreboard.
+The VU execution census counts the retired calls under
+`retired_world_clipped`. The strip still reaches the ordered GS path.

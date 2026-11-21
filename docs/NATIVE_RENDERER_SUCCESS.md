@@ -1223,3 +1223,92 @@ mapped graphics follow-on is the exact `0x35CB88 → 0x3613C0` queue class
 with `0x02E0 → MSCNT 0x0D48`. Prove TOP ownership, posed/dented geometry
 and terminal effects before dropping its packet. Treat `0x24B0` and
 the other queue variants as separate admissions.
+
+## Bounded clipped-world continuation at `0x0618`
+
+The public interpreter build on Apple M2 Pro had SHA-256
+`ef24d201625a193c958d52765e214a580373bd950c90c98c50d7484bac22b0b9`.
+These were 6× headless checks of the exact positive-K MSCNT class.
+Each verified retirement ran the muted interpreter on the same incoming
+VU state and compared the single ordered PATH1 kick, full VU data memory,
+registers, accumulator, flags, cycle and live scoreboard.
+
+| Race | Vblanks | Retired and exact | Remaining `0x0618` dispatches |
+| --- | ---: | ---: | ---: |
+| Classic Dundas day | 360 | 7,899 | 4,412 |
+| Modern Dundas day | 360 | 7,529 | 4,180 |
+| Classic Gilroy night | 475 | 9,992 | 3,176 |
+| Modern Gilroy night | 475 | 9,996 | 3,174 |
+| Classic Kenyon 2P | 485 | 13,175 | 6,587 |
+| Modern Kenyon 2P | 485 | 13,120 | 6,583 |
+
+All 61,711 admitted race comparisons matched. Each Kenyon run showed
+both stacked 640×224 viewports and the counts combine both views.
+The earlier offline replay covered 122 low-TOP and 141 high-TOP
+admissions. A separate Modern Dundas run with the oracle unset retired
+9,909 continuations. The disabled 360-vblank control dispatched 11,524
+at this entry and retired zero. Each checked race admitted 64–76% of
+its own launches at this entry. The remaining count includes every
+guard decline and does not classify the declines by cause.
+
+The Modern Dundas world producer differential matched all 1,133 live
+calls with zero replayed. That run also verified 25,589 same-state
+continuations. A 1× Classic copied-save Career Home run verified
+27,032, for 114,332 exact comparisons across the race matrix, the
+differential run and Career Home. All 12 census runs reconciled with
+actual launch totals while continuing to fail the strict R7 gate.
+Modern Dundas day still counted 161,666 actual VU1 launches, 33,671,354
+GIF qwords, 97 GS raster submissions and 2,600 VU0 micro dispatches.
+The six race runs reported 0–13 deferred waits each, with zero
+suppressions, synchronous VRAM reads, CLUT waits or VU0 matrix-list
+dispatches.
+
+Local macOS build SHA-256
+`442c7a94938cd7ce90900bd638a0e76f62549c45d9954a09add2220fd685da05`
+linked and passed 99/99 CTests. Its retained compiled `0x0618` entry
+kept the compatibility path in two headless races. The census parser
+regression test passed after the allowlist update. Windows cross-linked
+SHA-256 `65250369655c74508ee8e8e38150ae7e95da34fe1f713bebae3ac1622a8eb66b`.
+Windows installation and runtime were unavailable.
+
+Initial MSCALs at `0x0270`, polygon expansion at `0x2630`, other
+chunk layouts and exceptional inputs retain dispatch. The next clipped
+world boundary is to verify the initial MSCAL's reaching definitions
+and exact VIF shape with a same-state oracle. The expansion path needs
+independent corner-order, scratch and output-strip evidence. The
+retired portion still reads VU state and writes the ordered GS strip.
+The existing intermittent cockpit geometry remains a separate
+unresolved visual issue.
+
+### 6× Modern maximum-detail fullscreen sample
+
+The same public executable ran isolated Dennison No-Rules Race, three
+laps, 14 cars, Hurricane #296, Cockpit, acceleration held, 4:3, FIFO
+VSync and frame skipping enabled. `Detail=maximum` enabled maximum
+car detail and the track log showed eight LOD groups patched in each of
+the two track lists. The track draw-distance factor stayed at 1.
+
+| Completed run | Drawn FPS in two Cockpit windows | Guest vblanks/s | GS GPU timestamps, ms per present |
+| --- | --- | --- | --- |
+| Control A | 8.5, 8.6 | 60.0, 60.2 | 7.99, 8.23 |
+| Default A | 8.6, 8.7 | 60.0, 60.2 | 8.93, 8.31 |
+| Default B | 8.5, 8.7 | 60.0, 60.1 | 6.81, 7.11 |
+
+The control averaged 8.55 drawn FPS and the default averaged 8.63.
+The difference was within the variation among reported windows.
+EE busy reported 100% throughout, with 13–16% in the separately
+reported EE waiting field. The last control was stopped when the
+foreground test overlapped the owner's desktop use. Tracy and the
+original-detail repeat were canceled. GPU timestamps are interval
+means and the game's counters measure guest vblanks and drawn frames.
+Physical scanout, display misses, CPU/GPU frame p99 and the unpaced
+budget were unmeasured.
+
+Phase A's single 6× Modern pair used original track and car detail,
+the same 1× draw-distance factor, FIFO and frame skipping, on
+`fabd9cc689e2c4d962edbb809e670ea0b5c9fc160c241d206fea7a15c00c995a`.
+It measured 29.2 and 31.2 drawn FPS with retirement disabled and 38.6
+and 37.5 with retirement enabled. Guest vblanks/s ranged from 53.2 to
+60.0, and the GS GPU timestamps were 6.46–7.95 ms per present across
+those windows. That result applies to its original-detail fixture.
+Neither sample isolates the cause of the maximum-detail slowdown.

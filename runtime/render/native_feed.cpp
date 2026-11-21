@@ -2076,7 +2076,8 @@ void vu_check(uint64_t key, uint32_t program) {
     }
 }
 
-bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod) {
+bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
+               bool &clipped_world_continuation) {
     if (!enabled()) return false;
     const uint32_t tag = g_vif1_dma_tag;
     std::vector<Mesh *> meshes;
@@ -2093,6 +2094,10 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod) {
             if (tag < it->second.end &&
                 (it->second.range || (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38)) {
                 p = it->second.packet;
+                if (program == 0x0618 && itop == 0x280 && p.itop == itop &&
+                    p.kind == KIND_WORLD && tag == it->first && !it->second.range &&
+                    !diff_in_original_side())
+                    clipped_world_continuation = true;
                 if (program == 0x0270 && itop == 0x80) {
                     world_indices = std::move(it->second.world_indices);
                     if (!world_indices) p.world_texture.index_version = 0;

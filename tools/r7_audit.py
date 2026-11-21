@@ -51,7 +51,7 @@ def check_vu_census(lines, audit):
             field = "vu1" if unit == "1" else "vu0_micro"
         elif unit == "0" and kind in {"macro", "cfc2", "ctc2"}:
             field = "vu0_macro" if kind == "macro" else "vu0_control"
-        elif unit == "1" and kind in {"retired_nop", "retired_world"}:
+        elif unit == "1" and kind in {"retired_nop", "retired_world", "retired_world_clipped"}:
             continue
         else:
             raise ValueError(f"unknown VU census kind {kind} for VU{unit}")

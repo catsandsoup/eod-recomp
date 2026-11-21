@@ -1731,6 +1731,7 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
 namespace {
 constexpr uint32_t kWorldLeafPc = 0x270;
 constexpr uint32_t kWorldLeafTpc = 0x920;
+constexpr uint32_t kClippedWorldContinuation = 0x618;
 constexpr unsigned kWorldStripOffset = 200;
 constexpr unsigned kWorldMaxVertices = 60;
 constexpr unsigned kWorldStripQwords = 1 + 3 * kWorldMaxVertices;
@@ -1759,9 +1760,9 @@ struct WorldLeafRetirement {
     unsigned strip_qwords = 0;
 };
 
-bool matches_world_leaf_program(VUState *vu, uint32_t pc) {
+bool matches_world_image(VUState *vu) {
     constexpr XXH128_hash_t image_hash{0x2329B43F09230E29ull, 0xC8C64EAE4BB1B7EBull};
-    if (pc != kWorldLeafPc || vu->index != 1 || vu->mem_mask != 0x3FFF || vu->micro_mask != 0x3FFF)
+    if (vu->index != 1 || vu->mem_mask != 0x3FFF || vu->micro_mask != 0x3FFF)
         return false;
     static thread_local uint32_t generation;
     static thread_local bool checked, matches;
@@ -1771,6 +1772,10 @@ bool matches_world_leaf_program(VUState *vu, uint32_t pc) {
         checked = true;
     }
     return matches;
+}
+
+bool matches_world_leaf_program(VUState *vu, uint32_t pc) {
+    return pc == kWorldLeafPc && matches_world_image(vu);
 }
 
 VUReg world_qword(const VUState &vu, unsigned qw) {
@@ -2059,6 +2064,190 @@ bool check_world_leaf(const WorldLeafRetirement &expected, VUState &vu, unsigned
     return false;
 }
 
+struct ClippedWorldStrip {
+    VUState after;
+    VUReg triangle_tag;
+    VUReg strip[kWorldStripQwords];
+    unsigned qwords;
+};
+
+VUReg world_transform(const VUReg *matrix, const VUReg &position,
+                      VUReg &acc, uint32_t *macs) {
+    for (unsigned lane = 0; lane < 4; ++lane)
+        acc.f[lane] = matrix[0].f[lane] * position.f[0];
+    macs[0] = mac_for(acc, 0xF);
+    for (unsigned column = 1; column <= 2; ++column) {
+        for (unsigned lane = 0; lane < 4; ++lane)
+            acc.f[lane] += matrix[column].f[lane] * position.f[column];
+        macs[column] = mac_for(acc, 0xF);
+    }
+    VUReg projected;
+    for (unsigned lane = 0; lane < 4; ++lane)
+        projected.f[lane] = acc.f[lane] + matrix[3].f[lane];
+    macs[3] = mac_for(projected, 0xF);
+    return projected;
+}
+
+bool derive_clipped_world_strip(const VUState &before, unsigned top, unsigned count,
+                                ClippedWorldStrip &out) {
+    const VUReg &zero = before.vf[0];
+    if (before.vi[0] || zero.u[0] || zero.u[1] || zero.u[2] || zero.u[3] != 0x3F800000 ||
+        before.q_busy || before.p_busy || before.fq_n || before.flag_pipe || before.running ||
+        !std::isnormal(before.vf[3].f[3]) || before.cycle > UINT64_MAX - (25 + 57 * count))
+        return false;
+    const VUReg st_base = world_qword(before, top + 198);
+    const VUReg position_base = world_qword(before, top + 199);
+    const VUReg tag = world_qword(before, 19);
+    if (static_cast<int16_t>(st_base.u[2]) <= 0 ||
+        (tag.u[1] & ~kWorldStripBlend) != 0x300E4000 || (tag.u[2] & 0xFFF) != 0x412)
+        return false;
+
+    const unsigned output = top + kWorldStripOffset;
+    out.qwords = 1 + 3 * count;
+    out.strip[0] = tag;
+    out.strip[0].u[0] = 0x8000 | count;
+    out.triangle_tag = world_qword(before, 18);
+
+    auto &vu = out.after;
+    vu = before;
+    // Positive K bypasses TEX1. Both projections use the same position
+    // base, and ST retains the world matrix packet's scale in vf3.w.
+    std::memcpy(vu.vf[3].u, position_base.u, 12);
+    std::memcpy(vu.vf[13].u, st_base.u, 12);
+    vu.vf[14] = vu.vf[15] = {};
+    vu.clip = 0xFFFFFF;
+    vu.vi[2] = 0;
+    uint64_t cycle = before.cycle + 22;  // 0x0618 through 0x0448
+    uint32_t sticky_macs = 0xF;  // the zero subtraction at 0x0440
+    for (unsigned i = 0; i < count; ++i) {
+        const unsigned vertex = 1 + 3 * i;
+        const VUReg rgba = world_qword(before, top + vertex);
+        VUReg position = world_qword(before, top + vertex + 1);
+        const VUReg texcoord = world_qword(before, top + vertex + 2);
+        if (position.u[3] != 0x3F800000) return false;
+        for (unsigned lane = 0; lane < 3; ++lane)
+            position.f[lane] += position_base.f[lane];
+        const VUReg st_input{{texcoord.f[0] + st_base.f[0],
+                              texcoord.f[1] + st_base.f[1], 1.f, 0.f}};
+        uint32_t macs[14];
+        macs[0] = mac_for(position, 0xE);
+        macs[1] = mac_for(st_input, 0xC);
+        const VUReg screen = world_transform(vu.vf + 4, position, vu.acc, macs + 2);
+        const VUReg clip = world_transform(vu.vf + 8, position, vu.acc, macs + 6);
+        if (!std::isnormal(screen.f[3]) || !std::isfinite(clip.f[3])) return false;
+        const float q = 1.f / screen.f[3];
+        if (!std::isnormal(q)) return false;
+
+        const float extent = std::fabs(clip.f[3]);
+        uint32_t code = 0;
+        for (unsigned lane = 0; lane < 3; ++lane) {
+            if (!std::isfinite(clip.f[lane])) return false;
+            code |= uint32_t(clip.f[lane] > extent) << (lane * 2);
+            code |= uint32_t(clip.f[lane] < -extent) << (lane * 2 + 1);
+        }
+        vu.clip = ((vu.clip << 6) | code) & 0xFFFFFF;
+        macs[10] = code;
+
+        unsigned vertex_cycles = 39;
+        const uint16_t input_adc = uint16_t(rgba.u[3]);
+        if (!input_adc) {
+            vertex_cycles += 3;
+            const uint32_t planes = vu.clip & 0x3FFFF;
+            vu.vi[2] = planes ? 0x8000 : 0x7FFF;
+            if (planes) {
+                const uint32_t shared = planes & (planes >> 6) & (planes >> 12);
+                if (!shared) return false;  // 0x05B8 requires polygon expansion
+                // VI4 accumulates the first five FCOR results, excluding +X.
+                vu.vi[4] = __builtin_popcount(shared & 0x3E);
+                vertex_cycles += 15;
+            }
+        }
+
+        auto &st = out.strip[vertex];
+        auto &color = out.strip[vertex + 1];
+        auto &xyzf = out.strip[vertex + 2];
+        st.u[3] = world_qword(before, output + vertex).u[3];  // SQ.xyz leaves W
+        color = rgba;
+        color.s[3] = int16_t(0x280 + uint16_t(texcoord.u[2]));
+        vu.vi[13] = uint16_t(input_adc + 0x7F80) | vu.vi[2];
+        xyzf.s[3] = int16_t(vu.vi[13]);
+        VUReg projected{}, unscaled{};
+        for (unsigned lane = 0; lane < 3; ++lane) {
+            unscaled.f[lane] = st_input.f[lane] * q;
+            st.f[lane] = unscaled.f[lane] * before.vf[3].f[3];
+            projected.f[lane] = screen.f[lane] * q;
+            const float pixel = projected.f[lane] * 16.f;
+            if (!std::isfinite(st.f[lane]) || !std::isfinite(pixel) ||
+                pixel < -2147483648.f || pixel >= 2147483648.f)
+                return false;
+            xyzf.s[lane] = static_cast<int32_t>(pixel);
+        }
+        macs[11] = mac_for(unscaled, 0xE);
+        macs[12] = mac_for(projected, 0xE);
+        macs[13] = mac_for(st, 0xE);
+        for (unsigned flag = 0; flag < 14; ++flag)
+            if (flag != 10) sticky_macs |= macs[flag];
+        vu.vf[20] = vu.vf[15];  // Older homogeneous positions for the clipping branch.
+        vu.vf[15] = vu.vf[14];
+        vu.vf[14] = clip;
+
+        if (i + 1 == count) {
+            vu.vf[16] = xyzf;
+            vu.vf[17] = st;
+            vu.vf[17].u[3] = screen.u[3];
+            vu.vf[18] = unscaled;
+            vu.vf[18].u[3] = color.u[3];
+            vu.q = vu.q_pending = q;
+            vu.q_ready = cycle + 22;  // DIV at 0x04b8, seven cycles to arrive
+            vu.fq_head = (vu.fq_head + 1 + 14 * count) & 7;
+            constexpr unsigned ready[] = {16, 17, 18, 19, 23, 26, 29, 30};
+            for (unsigned flag = 0; flag < 8; ++flag)
+                vu.fq[(vu.fq_head + flag) & 7] = {cycle + ready[flag], macs[flag + 6], flag == 4};
+            vu.mac = macs[13];
+        }
+        cycle += vertex_cycles;
+    }
+    vu.vi[1] = 0x7F80;
+    vu.vi[3] = output;
+    vu.vi[7] = 0;
+    vu.vi[12] = top + out.qwords;
+    vu.cycle = cycle + 3;  // 0x0608 kick, E bit and its delay
+    vu.tpc = kClippedWorldContinuation;
+    vu.status &= ~0x30u;
+    set_status_from_mac(&vu, sticky_macs);
+    set_status_from_mac(&vu, vu.mac);
+    return true;
+}
+
+void write_clipped_world_strip(const ClippedWorldStrip &strip, uint8_t *memory, unsigned top) {
+    std::memcpy(memory + 23 * 16, &strip.triangle_tag, 16);
+    std::memcpy(memory + (top + kWorldStripOffset) * 16, strip.strip, strip.qwords * 16);
+}
+
+void check_clipped_world_strip(const ClippedWorldStrip &strip, VUState &vu, unsigned top) {
+    uint8_t memory[0x4000];
+    std::memcpy(memory, vu.mem, sizeof memory);
+    write_clipped_world_strip(strip, memory, top);
+    const Scoreboard score = g_score[1];
+    VuKickCheck kicks{{{top + kWorldStripOffset, strip.qwords, strip.strip}, {}}};
+    const bool muted = g_vu_mute_kick;
+    g_vu_mute_kick = true;
+    g_vu_kick_check = &kicks;
+    vu_interp(&vu, kClippedWorldContinuation);
+    g_vu_kick_check = nullptr;
+    g_vu_mute_kick = muted;
+    if (memcmp(&vu, &strip.after, sizeof vu) || memcmp(vu.mem, memory, sizeof memory) ||
+        !sb_same(score, g_score[1], vu.cycle) || !kicks.equal || kicks.seen != 1) {
+        const auto *expected = reinterpret_cast<const uint8_t *>(&strip.after);
+        const auto *actual = reinterpret_cast<const uint8_t *>(&vu);
+        const auto state_diff = std::mismatch(expected, expected + sizeof vu, actual).first - expected;
+        const auto mem_diff = std::mismatch(memory, memory + sizeof memory, vu.mem).first - memory;
+        fatal("clipped world VU1 mismatch at vblank %llu, TOP %x, state byte %u, memory byte %u, cycles %llu/%llu, kicks %u (%d)",
+              (unsigned long long)kernel_vblank_count(), top, unsigned(state_diff), unsigned(mem_diff),
+              (unsigned long long)strip.after.cycle, (unsigned long long)vu.cycle, kicks.seen, kicks.equal);
+    }
+}
+
 }  // namespace
 #endif
 
@@ -2093,6 +2282,34 @@ bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::
         fatal("world VU1 retirement differs at vblank %llu", (unsigned long long)kernel_vblank_count());
     materialize_world_leaf(result, *vu, top, lod);
     census_retire(*vu, pc, "retired_world");
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool vu_retire_clipped_world_strip(VUState *vu, uint32_t top, unsigned vertices) {
+#ifdef EOD_VULKAN
+    static const char *setting = getenv("EOD_NATIVE_WORLD_CLIPPED");
+    static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
+        getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
+        getenv("EOD_NATIVE_QCHECK") || getenv("EOD_VIF_CHECK");
+    if ((setting && setting[0] == '0') || diagnostic || vu_dispatch_observed() ||
+        vu->tpc != kClippedWorldContinuation || g_vif1_itop != 0x280 ||
+        (top != 0xE0 && top != 0x270) || vertices < 4 || vertices > kWorldMaxVertices ||
+        !matches_world_image(vu) || !sb_same(g_score[1], Scoreboard{}, vu->cycle))
+        return false;
+#ifdef VU_REC
+    if (vu_rec_find(vu, kClippedWorldContinuation)) return false;
+#endif
+    ClippedWorldStrip strip;
+    if (!derive_clipped_world_strip(*vu, top, vertices, strip)) return false;
+    static const bool check = getenv("EOD_NATIVE_WORLD_CLIPPED_CHECK") != nullptr;
+    if (check) check_clipped_world_strip(strip, *vu, top);
+    *vu = strip.after;
+    write_clipped_world_strip(strip, vu->mem, top);
+    xgkick(vu, top + kWorldStripOffset);
+    census_retire(*vu, kClippedWorldContinuation, "retired_world_clipped");
     return true;
 #else
     return false;

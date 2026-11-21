@@ -45,6 +45,8 @@ class AuditParserTest(unittest.TestCase):
         launch_end = "[r7-vu] vu=0 rows=1 dropped=0"
         launch_audit = self.ZERO.replace("vu0_micro=0", "vu0_micro=17")
         retirement = "[r7-vu] vu=1 kind=retired_world address=00000270 image=0123456789012345 context=00000080 count=13"
+        clipped_retirement = ("[r7-vu] vu=1 kind=retired_world_clipped address=00000618 "
+                              "image=fd0ce30ab0ec263c context=00000280 count=13")
         executed = "[r7-vu] vu=1 kind=mscnt address=00000618 image=0123456789012345 context=00000280 count=9"
         vu1_end = "[r7-vu] vu=1 rows=1 dropped=0"
         cases = [
@@ -52,6 +54,7 @@ class AuditParserTest(unittest.TestCase):
             ([empty_vu0, self.ZERO, empty_vu1], 1, "after the R7 shutdown summary"),
             ([self.ZERO, empty_vu0, empty_vu1], 1, "after the R7 shutdown summary"),
             ([empty_vu0, retirement, vu1_end, self.ZERO], 0, "reconciles"),
+            ([empty_vu0, clipped_retirement, vu1_end, self.ZERO], 0, "reconciles"),
             ([launch, launch_end, empty_vu1, launch_audit], 1, "vu0_micro=17"),
             ([empty_vu0, executed, vu1_end, self.ZERO], 1, "vu1 differs"),
             ([launch, launch_end, empty_vu1, self.ZERO], 1, "vu0_micro differs"),

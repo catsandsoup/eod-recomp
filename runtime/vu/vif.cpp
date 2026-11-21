@@ -49,24 +49,53 @@ Vif g_vif[2];
 
 uint32_t avail(const Vif &v) { return (uint32_t)(v.q.size() - v.qpos); }
 
-bool matches_world_leaf_ref(const Vif &v, const uint32_t *payload, size_t words) {
+bool matches_world_ref(const Vif &v, const uint32_t *payload, size_t words, uint32_t itop) {
     const uint32_t tag = g_vif1_dma_tag;
     if (!payload || !words || words > 0xFFFFu * 4 ||
         (tag & 15) || tag > EE_RAM_SIZE - 16 ||
         MEM_LW(tag) != (0x30000000u | (words / 4)) ||
-        MEM_LW(tag + 8) != 0x04000080 || MEM_LW(tag + 12) != 0x05000000)
+        MEM_LW(tag + 8) != (0x04000000u | itop) || MEM_LW(tag + 12) != 0x05000000)
         return false;
     // The native feed has already verified that this source is part + 0x38.
     const uint32_t source = MEM_LW(tag + 4);
     return !(source & 15) && source <= EE_RAM_SIZE - words * 4 &&
            payload == reinterpret_cast<const uint32_t *>(g_ram + source) &&
            v.base == 0xE0 && v.ofst == 0x190 && v.mode == 0 && v.cycle == 0x0101 &&
-           v.itop == 0x80 && v.top == (v.dbf ? 0xE0u : 0x270u) &&
+           v.itop == itop && v.top == (v.dbf ? 0xE0u : 0x270u) &&
            v.tops == (v.dbf ? 0x270u : 0xE0u);
 }
 
+unsigned clipped_world_chunk_vertices(const Vif &v, const uint32_t *payload, size_t offset) {
+    // The same REF can carry many chunks. Check the one ending at this MSCNT,
+    // including the NUM field and relative location of each vertex UNPACK.
+    uint32_t source_tag;
+    std::memcpy(&source_tag, v.vu->mem + 16 * v.top, sizeof source_tag);
+    const unsigned count = source_tag & 0x7FFF;
+    const unsigned color_words = (count + 1) / 2;
+    const size_t chunk_words = 34 + 4 * count + color_words;
+    if ((source_tag & ~0x7FFFu) != 0x8000 || count < 4 || count > 60 ||
+        offset <= chunk_words || payload[offset] != 0x17000000)
+        return 0;
+    const uint32_t *chunk = payload + offset - chunk_words;
+    const uint32_t num = count << 16;
+    const uint32_t *color = chunk + 12 + 3 * count;
+    const uint32_t *uv = color + 2 + color_words;
+    const uint32_t *bases = uv + 9 + count;
+    return chunk[0] == 0x6001C000 && chunk[1] == source_tag &&
+           chunk[2] == 0x01000103 && chunk[3] == 0x30000000 &&
+           chunk[4] == 0 && chunk[5] == 0 && chunk[6] == 0 && chunk[7] == 0x3F800000 &&
+           chunk[8] == 0x05000001 && chunk[9] == 0x20000000 && chunk[10] == 0x40404040 &&
+           chunk[11] == (0x7800C002 | num) &&
+           color[0] == 0x05000000 && color[1] == (0x6F00C001 | num) &&
+           uv[0] == 0x05000001 && uv[1] == 0x20000000 && uv[2] == 0x50505050 &&
+           uv[3] == 0x30000000 && uv[6] == 0 && uv[7] == 0x8000 &&
+           uv[8] == (0x7500C003 | num) &&
+           bases[0] == 0x05000000 && bases[1] == 0x01000101 && bases[2] == 0x6C02C0C6
+        ? count : 0;
+}
+
 void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
-                 const uint32_t *ref_payload = nullptr, size_t ref_words = 0) {
+                 const uint32_t *ref_payload = nullptr, size_t ref_words = 0, size_t offset = 0) {
     if (v.n == 1) {
         v.itop = v.itops;
         v.top = v.tops;
@@ -75,7 +104,8 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
         g_vif1_top = v.top;
         g_vif1_itop = v.itop;
         native::WorldTextureLod world_lod{};
-        const bool retire_world_leaf = native::vu1_start(addr, v.itop, world_lod);
+        bool clipped_world_continuation = false;
+        const bool retire_world_leaf = native::vu1_start(addr, v.itop, world_lod, clipped_world_continuation);
 #ifdef EOD_PLUME
         // The verified E-bit NOP pair is shared by ordinary MSCAL producers.
         static const char *nop_setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
@@ -85,10 +115,16 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
             return;
         }
 #endif
-        if (retire_world_leaf && matches_world_leaf_ref(v, ref_payload, ref_words) &&
+        if (retire_world_leaf && matches_world_ref(v, ref_payload, ref_words, 0x80) &&
             vu_retire_world_leaf(v.vu, addr, v.top, world_lod)) {
             ++g_vu1_world_leaf_retires;
             return;
+        }
+        if (launch == VuLaunch::Mscnt && clipped_world_continuation &&
+            matches_world_ref(v, ref_payload, ref_words, 0x280)) {
+            const unsigned count = clipped_world_chunk_vertices(v, ref_payload, offset);
+            if (count && vu_retire_clipped_world_strip(v.vu, v.top, count))
+                return;
         }
         g_vu1_program_starts[(addr >> 3) & 0x7FF]++;
         if (g_vu1_start_hook) g_vu1_start_hook(addr);
@@ -440,7 +476,9 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
             start_micro(v, imm * 8, VuLaunch::Mscal, v.n == 1 && !(n & 3) ? w : nullptr, n);
             break;
         case 0x15: start_micro(v, imm * 8, VuLaunch::Mscalf); break;
-        case 0x17: start_micro(v, v.vu->tpc, VuLaunch::Mscnt); break;
+        case 0x17:
+            start_micro(v, v.vu->tpc, VuLaunch::Mscnt, v.n == 1 && !(n & 3) ? w : nullptr, n, pos);
+            break;
         case 0x20: v.mask = d[0]; break;                 // STMASK
         case 0x30: memcpy(v.row, d, 16); break;          // STROW
         case 0x31: memcpy(v.col, d, 16); break;          // STCOL

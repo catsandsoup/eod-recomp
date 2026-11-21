@@ -480,3 +480,29 @@ as the GS reference.
   contract at `0x00187E08`. Measure its actual dispatch, macro, control
   and direct-state removals across race and Career. For VU1, trace the
   bounded queue REF at reserve `0x003613E0` through `0x02E0 → 0x0D48`.
+
+### R7 STAR — bounded clipped-world continuation (2026-11-21)
+
+- **Situation.** The public interpreter spent about 26% of its sampled
+  VU time in `0x0618` in the dense Dennison race. The path performs
+  both ordinary strip output and frustum polygon expansion.
+- **Task.** Retire the positively identified continuation class without
+  changing the live VIF bank progression, native object ordering,
+  emitted strip or VU state consumed by the next producer.
+- **Action.** Verify the exact retail image, typed world REF, raw MSCNT
+  chunk, both TOPs, positive K and compatible strip header. Compute
+  inside and common-plane rejection cases and decline before effects
+  when a triangle needs expansion. Compare the muted reference kick,
+  all VU memory and register state, flags and live scoreboard.
+- **Result.** Six 6× races verified 61,711 retirements, including
+  Classic and Modern day, night and both 2P views. The live world
+  producer differential matched 1,133/1,133 calls. The default path
+  retired continuations with the oracle unset and the disabled control
+  retired zero. Local Mac passed 99/99 CTests and Windows cross-linked.
+  Residual VU and GS work still fails the release gate.
+- **Next decisive test.** Prove the initial clipped `0x0270` MSCAL's
+  inputs and final state, then recover `0x2630`'s plane-intersection
+  order, scratch state and per-triangle strips. Keep the VU and GS
+  release gate open until compatibility storage and ordered strip
+  transport leave the product. Investigate the separate cockpit
+  geometry regression at its emitting draw.
