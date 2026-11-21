@@ -155,7 +155,7 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
     return true;
 }
 
-bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth) {
+bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth, bool check_ownership) {
     if (!e.fbw || e.scy1 < 0) return false;
     const int rows = e.scy1 + 1;
     const int allocation_rows = rows <= 512 ? 512 : rows <= 1024 ? 1024 : 2048;
@@ -164,6 +164,15 @@ bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth) {
     if (!rt || !ds || !rt->tex || !ds->tex || rt->w != ds->w || rt->h != ds->h ||
         rt->h < allocation_rows || e.scx1 >= rt->w || e.scy1 >= rt->h)
         return false;
+    if (check_ownership) {
+        if (!g_verts.empty() || !g_ctx->cmd) return false;
+        std::vector<PageRect> pages;
+        for (const Surface *target : {rt, ds}) {
+            surface_pages_rect(target, 0, 0, std::min(int(e.fbw * 64), target->w), rows, pages);
+            for (const auto &page : pages)
+                if (g_owner[page.page] != target || g_deferred[page.page]) return false;
+        }
+    }
     color = (uint64_t)rt->tex->image;
     depth = (uint64_t)ds->tex->image;
     return color && depth;

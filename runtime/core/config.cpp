@@ -16,6 +16,9 @@ const char *const kPadKeyLabels[KEY_COUNT] = {"Up / steer", "Down", "Left / stee
                                               "L1", "R1", "L2", "R2", "L3", "R3", "Start", "Select"};
 
 Config::Config() {
+#ifdef EOD_PLUME
+    native_renderer = true;
+#endif
     static const char *const defaults[KEY_COUNT] = {"Up", "Down", "Left", "Right", "X,Space", "C", "Z", "V",
                                                     "Q", "E", "A,1", "D,3", "", "", "Enter", "Backspace"};
     for (int i = 0; i < KEY_COUNT; i++) keys[i] = defaults[i];

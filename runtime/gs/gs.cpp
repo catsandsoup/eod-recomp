@@ -807,9 +807,7 @@ bool try_world_strip(const uint8_t *data, uint32_t qwc, bool draw_vertices, bool
     auto &path = g_path[GIF_PATH1];
     static const bool capture_mode = std::getenv("EOD_GS_DUMP") || std::getenv("EOD_GS_DUMP_COLD_START") ||
                                      std::getenv("EOD_GS_CENSUS");
-    static const char *frame_skip = std::getenv("EOD_FRAMESKIP");
-    const bool skip_enabled = frame_skip ? std::atoi(frame_skip) != 0 : g_config.frame_skip;
-    if (skip_enabled || !draw_vertices || !tail.triangle_attempts || qwc != 1 + 3 * tail.vertices ||
+    if (!draw_vertices || !tail.triangle_attempts || qwc != 1 + 3 * tail.vertices ||
         path.nloop || !(st.prmodecont & 1) || tail.prim != 0x1C || !hw::g_on || g_trace ||
         capture_mode || g_stale_prim || (modern::g_on && (modern::live() || modern::gs_path1_has_replacement())) ||
         scene_capture::g_on || scene_emit::capture_requested() || !native::gs_world_strip_ready())

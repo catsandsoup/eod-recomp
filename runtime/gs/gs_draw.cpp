@@ -340,9 +340,10 @@ void setup_env(uint32_t attr) {
         } else if (fbp != shown && presenting) {
             presenting = false;
             uint64_t lag = g_ee_vblanks.load() - g_gs_vblanks.load();
-            g_skip_frame = enabled && !g_replaying && lag >= 2 && lag < (1u << 30) && skipped < 7;
             static const bool skip_all = getenv("EOD_GS_SKIPALL") != nullptr;  // benchmarks: GS parsing only
-            if (skip_all) g_skip_frame = true;
+            const bool next_skip = skip_all || (enabled && !g_replaying && lag >= 2 && lag < (1u << 30) && skipped < 7);
+            if (next_skip && !g_skip_frame) native::gs_before_frame_skip();
+            g_skip_frame = next_skip;
             skipped = g_skip_frame ? skipped + 1 : 0;
             if (g_skip_frame) stats.skipped++;
         }

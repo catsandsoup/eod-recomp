@@ -334,6 +334,7 @@ bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]);
 bool gs_shadow_boundary(ShadowPass pass);
 // GS worker: conditionally accepts the verified strip as one native world object.
 bool gs_world_strip_ready();
+void gs_before_frame_skip();
 bool gs_submit_world_strip(const gs::Env &env, uint64_t xy, uint32_t triangles, bool reference);
 bool gs_check_world_strip_draw(uint64_t xy, uint32_t triangles);
 int world_strip_mode();  // 0: original, 1: omit when admitted, 2: verify the original path when admitted
