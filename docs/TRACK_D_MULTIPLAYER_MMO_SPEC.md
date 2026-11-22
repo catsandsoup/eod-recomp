@@ -529,3 +529,213 @@ static_assert(sizeof(EodnVoiceOpusFrame) == 30, "EodnVoiceOpusFrame header must 
 ```
 
 #pragma pack(pop)
+
+
+---
+
+## 5. Stage 1 (Private 16-Player Lobbies & Co-Op Career Eves) Implementation Blueprint
+
+### 5.1 Dedicated I/O Thread & Lock-Free SPSC Queues (`runtime/net/net_io_thread.cpp`)
+
+To eliminate main-thread stalls (`P2`), all socket, QUIC, and HTTPS CAS mod-streaming operations are isolated inside `runtime/net/net_io_thread.{h,cpp}`:
+
+```mermaid
+flowchart LR
+    subgraph EESimThread["EE Simulation Thread (60 Hz Deterministic)"]
+        StepBegin["netplay::step_begin()\nDrain NetToSimQueue (<25 µs)"]
+        WorldStep["WorldSimulationStep (0x00177718)\nFinite-Mass Puppet Collision + Hooks"]
+        StepEnd["netplay::step_end()\nPush EodnCarPoseRecord & Impulses to SimToNetQueue (<25 µs)"]
+        StepBegin --> WorldStep --> StepEnd
+    end
+
+    subgraph Queues["Wait-Free SPSC Ring Buffers"]
+        N2S["NetToSimQueue (4096 slots)"]
+        S2N["SimToNetQueue (4096 slots)"]
+    end
+
+    subgraph NetIoThread["Dedicated NetIoThread (QUIC / UDP + Opus + CAS)"]
+        QuicPoll["quiche / msquic Event Loop\n1 ms epoll/kqueue tick"]
+        CasFetcher["HTTPS /v1/blobs/<blake3>\nAsync Worker Pool"]
+        OpusCodec["libopus 48kHz Codec\n3D Spatial Panner"]
+    end
+
+    QuicPoll --> N2S --> StepBegin
+    StepEnd --> S2N --> QuicPoll
+    QuicPoll <--> CasFetcher
+    QuicPoll <--> OpusCodec
+```
+
+1. **Wait-Free SPSC Ring Buffers:**
+   - `NetToSimQueue`: Carries parsed `EodnCarPoseRecord`, `EodnCarDamageDelta`, `EodnCollisionImpulse`, `EodnEventModeState`, and `EodnCareerEveProgression` structs from `NetIoThread` to the EE thread.
+   - `SimToNetQueue`: Carries local `EodnCarPoseRecord` (`60 Hz`), local outgoing `EodnCollisionImpulse` / `EodnCarDamageDelta`, and contest events from the EE thread to `NetIoThread`.
+2. **Non-Blocking Pre-Race Barrier (`0x00124F48` Replacement):**
+   - Instead of spinning inside `wait_until()` for up to `300,000 ms` on the EE thread ([src/netplay_session.cpp](file:///Users/monty/Documents/GitHub/eod-recomp/src/netplay_session.cpp#L949-L959)), `f_00124F48` yields a single guest frame per vblank while rendering the ImGui live lobby overlay (showing per-player `.eodmod` download progress bars and ping telemetry) until `EODN_PKT_HANDSHAKE_MANIFEST (sub_cmd = START_LOCK)` arrives.
+
+---
+
+### 5.2 Finite-Mass Puppet Physics & Bilateral Collision Impulse Arbitration (`src/netplay_car.cpp`, `src/car_damage.cpp`)
+
+To solve Problem **P3** (brick-wall puppets) and **P4–P5** (missing damage/dent/panel/wheel replication):
+
+1. **Finite-Mass RigidBody Step (`netplay_car::step_begin` & `step_end`):**
+   - In `netplay::step_begin()` (called immediately before `WorldSimulationStep` `0x00177718`):
+     - For each remote puppet (`slot != my_slot`), evaluate the Hermite-interpolated target pose $(\vec{p}_{\text{target}}, \mathbf{q}_{\text{target}}, \vec{v}_{\text{target}}, \vec{\omega}_{\text{target}})$ from the jitter buffer (`target delay = 2 ticks = 33.3 ms`, adaptive up to `6 ticks = 100 ms`).
+     - Instead of teleporting `rb->pos` and zeroing forces, apply a critically damped velocity spring toward $\vec{v}_{\text{target}}$ while leaving `rb->inv_mass` and `rb->inv_inertia` at the vehicle's authentic physical values (`~1,400–2,800 kg`).
+   - During `WorldSimulationStep (0x00177718)`:
+     - When the local human car (`my_slot`) collides with a remote puppet (`remote_slot`), the native PS2 contact solver (`0x00189B00..0x00189CD8`) computes realistic finite-mass recoil on **both** vehicles!
+   - In `netplay::step_end()` (called immediately after `0x00177718`):
+     - Do **not** overwrite the remote puppet's post-collision velocity with stale pre-step values! If a contact occurred between `my_slot` and `remote_slot` during this tick, preserve the puppet's post-impact recoil velocity for the next `4` ticks (`66 ms`) while our `EODN_PKT_COLLISION_IMPULSE (0x04)` travels to `eod-server` and updates the remote owner.
+
+2. **Bilateral Impulse Arbitration on `eod-server`:**
+   - When Client A (`slot_a`) and Client B (`slot_b`) collide, either or both clients emit `EodnCollisionImpulse (0x04)` upon entering `0x00189CD0`.
+   - `eod-server` matches collision reports within a `±3 tick` (`50 ms`) window by `(min(slot_a, slot_b), max(slot_a, slot_b))`:
+     - Computes the latency-compensated midpoint contact normal $\hat{n}$ and relative closing velocity $\vec{v}_{\text{rel}} = \vec{v}_a(t_{\text{impact}}) - \vec{v}_b(t_{\text{impact}})$ using its 16-tick (`266 ms`) authoritative pose history ring buffer.
+     - Broadcasts the single authoritative `EodnCollisionImpulse (0x04)` and `EodnCarDamageDelta (0x03)` to all 16 clients.
+     - On receipt, each client adds the authoritative $\Delta \vec{v}$ and $\Delta \vec{\omega}$ to its local rigid body (`*(0x00494D30) + rb_idx * 0xB0 + 0x30` / `+0x44`), applies the bone/panel/wheel deltas, and calls `ContestAwardDamageCredit (0x00202DA8)`.
+
+3. **Full `EodnCarDamageDelta` Application (`netplay_car::apply_damage_delta`):**
+   - Writes `delta.damage_scalar` to `car + 0x1BEC` and `delta.wreck_state` to `car + 0x1BE8`.
+   - Unpacks each 5-byte `EodnBoneDentDelta` into `car + 0x4B8 + bone_idx * 12`:
+     ```cpp
+     float dx = delta_bone.dx_mm4 * 0.003f;
+     float dy = delta_bone.dy_mm4 * 0.003f;
+     float dz = delta_bone.dz_mm4 * 0.003f;
+     uint32_t dz_bits = (std::bit_cast<uint32_t>(dz) & 0xFFFFFF00u) | uint32_t(delta_bone.crease_shade);
+     mem::write<float>(rdram, car + 0x4B8 + idx * 12 + 0, dx);
+     mem::write<float>(rdram, car + 0x4B8 + idx * 12 + 4, dy);
+     mem::write<uint32_t>(rdram, car + 0x4B8 + idx * 12 + 8, dz_bits);
+     ```
+   - Compares the incoming `panel_states_2bit` against `car + 0x13E8 + p * 0x18 + 0x14`. If any panel transitions to `3` (detached), sets `car + 0x2AC = delta.part_vis_mask` and invokes `SpawnPanelDebris (0x001E0DC8)` with `delta.last_hit_local_pos` and `delta.last_hit_local_force` so the hood/door/trunk flies off along the exact impact trajectory on all 16 screens!
+   - Compares `wheel_toss_mask` against `car + 0x1A00 + w * 0x54 + 0x50`. If bit `w` transitions to `1`, sets bit `0x80` in `wheel + 0x50`, calls `HalveSuspensionStiffness (0x001E06A8)` on `*(car + 0x1AC) + w * 0x80`, and invokes `SpawnWheelDebris (0x001B3068)`.
+
+---
+
+### 5.3 Expanding Battle Mode (`0x003CF194`), Weapon Registry (`0x003CE3F8`) & Unique Chassis Limit (`0x00123EE0`) to 16 Players
+
+1. **16-Player `BattleMaster` Expansion ([src/battle_layout.h](file:///Users/monty/Documents/GitHub/eod-recomp/src/battle_layout.h#L19-L65)):**
+   - Update `battle_layout::kCapacity` from `12` to `16` and `kMaxCars` from `10` to `16`:
+     - `kKillsOff = 0x14` (`16 × 4 B = 0x40`)
+     - `kDeathsOff = 0x54` (`16 × 4 B = 0x40`)
+     - `kSuicidesOff = 0x94` (`16 × 4 B = 0x40`)
+     - `kOrderOff = 0xD4` (`16 × 4 B = 0x40`)
+     - `kPlayersOff = 0x114` (`16 × 0x1C B = 0x1C0`)
+     - `kTimerOff = 0x2D4`, `kActiveCount = 0x2F4`, `kOrderCount = 0x2F8`, `kField5A8 = 0x2FC`, `kTotalSize = 0x300` (allocated in relocated Battle arena `0x01C20000`).
+2. **64-Slot `g_WeaponRegistry` Relocation (`0x003CE3F8` -> `0x01C30000`):**
+   - Redirect all reads/writes of `0x003CE3F8` (weapon table) and `0x003CE4B8` (weapon count) in `0x0017D600..0x0017EB00` and [src/game_patches.cpp](file:///Users/monty/Documents/GitHub/eod-recomp/src/game_patches.cpp#L306-L330) to `0x01C30000` (`64 × 12 B`), raising the hard cap from `16` to `64` weapon pods.
+   - Extend the `f_0020FD48` (`SceneCreateCarAndWeapons`) hook so **all** 16 human/bot cars in Battle or Chicken-enabled custom lobbies instantiate weapon pods.
+3. **Bypassing the 7-Unique-Chassis Cap (`0x00123EE0`):**
+   - `EveRosterPopulate (0x00123EA0)` enforces a 7-unique-chassis cap at `0x00123EE0` solely to fit within the PS2's 32 MB RAM budget (`~1.1 MB` per unique 4SPS car archive). Because `eod-recomp` maps an expanded 128 MB guest heap (`0x02000000..0x07FFFFFF`), we patch the branch at `0x00123EE0` (`slti $v0, $s2, 7` -> `slti $v0, $s2, 32`) so all 16 players in a lobby can drive 16 completely distinct retail or `.eodmod` custom vehicles simultaneously!
+
+---
+
+### 5.4 Co-Op & Adversarial 5-Event Career Eves (`src/session_start.cpp`, `src/hle_career.cpp`)
+
+1. **Unblocking Multi-Event Progression (`f_00120FB8` in [src/session_start.cpp](file:///Users/monty/Documents/GitHub/eod-recomp/src/session_start.cpp#L1000-L1007)):**
+   - Replace the unconditional `if (netplay::active()) { ctx.ret_s32(0); return; }` with:
+     ```cpp
+     if (netplay::active()) {
+         ctx.ret_s32(netplay::eve_has_more_heats(rdram) ? 1 : 0);
+         return;
+     }
+     ```
+2. **Inter-Heat Standings, Pit Repair & Grid Ordering (`0x06 CareerEveProgression`):**
+   - At the end of each heat (`0..total_heats-1`), `eod-server` collects the verified finish order and wreck bonuses, updates `EveTracker.participant_points[16]` (`0x003C4C18`), and enters a synchronized 20-second **Inter-Heat Pit Window** (`phase = PIT_REPAIR_WINDOW`).
+   - During the Pit Window, players can spend Career cash (`0x00448008`) to repair carryover chassis damage (`car + 0x1BEC`) before the final Demolition Derby / Gauntlet heat.
+   - Upon completion of Heat `total_heats - 1`, `eod-server` emits `phase = EVE_FINAL_PAYOUT`, writing verified prize money to `0x00448008`, Respect Points to `0x0044800C`, and unlocking the corresponding Career Rank / trophy / video in `CareerSaveInfo` (`0x00447F4C`), followed by an optimistic-concurrency cloud save sync to `PUT /v1/vault`.
+
+---
+
+## 6. Stage 2 (64+ Player Forza Horizon / GTA Online / `nfsu2.xyz` Style MMO Free-Roam Hub & Instant Event Instancing) Implementation Blueprint
+
+```mermaid
+flowchart TB
+    subgraph Client["eod-recomp Client (Stage 2 Free-Roam Mode)"]
+        HomeMaster["Native HomeMaster (0x0016EF58, Event ID 38)\nRelocated 64-Car Pool @ 0x02400000"]
+        AoiInterp["AOI Stream & Smart Ghosting\n32 Solid/Physics Peers + 16 Visual Peers"]
+        PortalUI["In-World Event Gate & Wreck Duel Prompts\n(Drive-In Beacon + Crew Radio)"]
+        ModMount["Async CAS Mod Mounter\n/v1/blobs/<blake3> -> VirtualDisc"]
+    end
+
+    subgraph Server["eod-server (Rust/C++ Authoritative Hub & Shard Manager)"]
+        WorldHub["Free-Roam World Shard (Up to 2,048 Players/Shard)\n500 ms Spatial Grid + Overpass-Aware Linker (links.rs)"]
+        EventInst["Instant Event Instance Manager\nSpawns 16-Player Stage 1 Match Shards on Demand"]
+        CasCdn["HTTPS CAS Mod CDN (/v1/blobs/<blake3>)\n+ Cloud Career Vault (/v1/vault)"]
+    end
+
+    HomeMaster <-->|"0x02 CarPose60Hz + 0x08 FreeRoamMmoAoi"| WorldHub
+    AoiInterp <-->|"0x03 DamageDelta + 0x04 Impulse"| WorldHub
+    PortalUI <-->|"Seamless Shard Handoff (Zero Title Reload)"| EventInst
+    ModMount <-->|"zstd .eodmod v2 chunks"| CasCdn
+```
+
+### 6.1 Expanding `HomeMaster` (`0x0016EF58`, Event ID `38`) to a 64-Car Open-World MMO Hub
+
+Retail `SLUS_209.10` already includes a dedicated free-roam controller: **Event ID 38 (`home` / `"Driving Around"`)**, instantiated by `HomeMaster (0x0016EF58, size 0xC04, vtable 0x003F8390)`!
+To scale `HomeMaster` from a single-player test-drive playground into a 64-player persistent MMO hub:
+
+1. **64-Car Pool Relocation (`0x02400000..0x0243FFFF`):**
+   - Relocate `g_ParticipantCarTable` (`0x00447458`), `g_DriverTable` (`0x00485230`), `g_CarEntityList` (`0x003CE4F8`), `g_RigidBodyPool` (`*(0x00494D30)`), and the `phoblist` spatial broadphase grid (`0x0048D2B4`) to the `0x02400000` MMO Arena with `N = 64` active `Car` slots (`slot 0` = local player, `slots 1..48` = dynamically bound remote AOI peers, `slots 49..63` = ambient traffic / roaming Hearse & School Bus event AI).
+2. **Dynamic Peer Slot Binding & Asynchronous `.eodmod` Hot-Swapping:**
+   - Following the `nfsu2.xyz` `runtime/roam_game.c` (`NSLOT = 64`) pattern, remote players entering the local player's Area of Interest (AOI) are dynamically assigned an available local car slot (`1..48`).
+   - If the entering peer drives a custom `.eodmod` v2 vehicle or livery whose BLAKE3 hash is not yet in `~/.local/share/eod/mod_cache/blobs/`, the client initially renders a fallback stock proxy chassis (`car_id = 0`) with a roof spinner icon while `NetIoThread` streams the compressed `.eodmod` blob from `https://<eod-server>/v1/blobs/<blake3>` and hot-swaps the 4SPS mesh + `Bone.mvl` in-place without dropping a single frame.
+
+---
+
+### 6.2 Spatial Interest Management (AOI) & Smart Ghosting (`EODN_PKT_FREEROAM_MMO_AOI = 0x08`)
+
+Directly adapting and enhancing `nfsu2.xyz`'s `crates/roam/src/links.rs` and `runtime/roam_game.c`:
+
+1. **500 ms Overpass-Aware Spatial Linker (`eod-server`):**
+   - Partitions the free-roam map (Fairgrounds Hub, Redwood County, or custom `.eodmod` open-world map) into `20 m × 20 m` cells with a `25.0x` vertical height penalty (`slack = 4.0 m`, `grade = 0.25`) so figure-8 cross-under bridges and dirt jump overpasses don't steal peer links from ground-level cars.
+   - Evaluates distance across current position, `1.0 s` and `3.5 s` velocity projection, and `120 m` forward camera lookahead.
+   - Assigns each player up to `32` full-rate (`60 Hz`) two-way physics peers + `16` half-rate (`20 Hz`) one-way visual peers (`degree = 48`), prioritized by:
+     1. Active **Head-to-Head Wreck Duel** opponent (`duel_slot`)
+     2. Active **In-World Eve Queue / Beacon** members (`lobby_id`)
+     3. **Demolition Crewmates** (up to 4 crew tags per player, matched server-side via keyed HMAC without leaking crew hashes)
+     4. Nearest kinematic neighbors.
+   - Simultaneously streams `EOD_MSG_MAPD` (`2 Hz` compressed delta positions of up to `2,048` players on the full-screen county map, flagging stationary cars `>= 45 s` at the Swap Meet / Dirt Oval bleachers as **Car Meet** pins).
+
+2. **Context-Sensitive Smart Ghosting:**
+   - Unlike `nfsu2.xyz` (where collisions are passive), EOD is a vehicular destruction game. Stage 2 Free-Roam shards divide the world into two dynamic collision rulesets encoded in `EodnCarPoseRecord::physics_flags (Bit 1 = ghosted)`:
+     - **Safe Zones (Auto-Ghosted):** Within `25 m` of the Garage / Paint & Upgrade Barn, Swap Meet Car-Meet parking stalls, and Drive-In Eve Entry Portals, or for `5.0 s` / `6 m` clearance after spawning or exiting an event.
+     - **Full-Contact Zones & Opt-In Wrecking:** Inside the Open Demolition Pit, Figure-8 Practice Track, and Dirt Jump Bowl—or anywhere on the county roads when two players both enable **Full-Contact Roam** or accept an instant **Head-to-Head Wreck Duel** (honk horn `L3` within `15 m` of a rival to trigger a `$500` first-to-wreck-or-total street duel!).
+
+---
+
+### 6.3 Organic Drive-In Event Portals & Instant Stage 1 Match Instancing
+
+1. **In-World Event Gates & Player-Dropped Eve Beacons:**
+   - Around the Stage 2 Free-Roam Hub sit neon fairground entrance arches for every venue and mode (Demolition Derby Arena, Figure-8 Jump Track, Trailer Race Oval, Chain Race Speedway, Gauntlet Canyon, Downtown Capture the Flag, Soccer Stadium).
+   - Driving into an arch (or pressing `R1` to drop a custom **Free-Roam Eve Beacon**, modeled on `nfsu2.xyz`'s `RC_MSG_LOBBY`) broadcasts a live join ticker (`"Redwood 5-Event Eve starting in 20s — 7/16 Drivers Joined [Press SELECT to Join]"`).
+2. **Seamless Shard Handoff & Return:**
+   - When the countdown expires, `eod-server` spins up an isolated 16-player Stage 1 match instance (`room_code = EVE-XXXX`), transitions the joined human drivers (plus optional server-authoritative bots to fill to 16) into the event grid, and—upon completion of the event or 5-event Eve—credits their Career cash/respect (`0x00448008` / `0x0044800C`) and returns all survivors directly to their free-roam coordinates with their battle scars, missing hoods, and smoking engines intact!
+
+---
+
+## 7. Adversarial 16-Player Test Harness & Acceptance Gates
+
+### 7.1 Heterogeneous Latency, Jitter & Packet-Loss Test Harness (`tools/tests/netplay_adversarial_16p.py`)
+
+To prove deterministic convergence under hostile real-world internet conditions, `tools/tests/netplay_adversarial_16p.py` launches an local `eod-server` instance alongside **16 headless `eod-recomp` client processes** routed through an in-process UDP/QUIC impairment proxy with heterogeneous per-client network profiles:
+
+| Client Cohort | Slots | Simulated One-Way Delay (RTT) | Jitter ( Pareto / Gaussian ) | Packet Loss & Reordering | Simulated NAT / Transport Profile |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Cohort A (Fiber / LAN)** | `0..3` | `5 ms` (`10 ms` RTT) | `±1 ms` | `0.0%` loss, `0%` reorder | Direct QUIC v1 + RFC 9221 Datagrams |
+| **Cohort B (Cable / Docsis)** | `4..7` | `25 ms` (`50 ms` RTT) | `±8 ms` | `0.5%` random loss, `1%` reorder | Full-Cone NAT, QUIC Datagrams |
+| **Cohort C (Transcontinental)** | `8..11` | `65 ms` (`130 ms` RTT) | `±20 ms` | `2.0%` bursty Gilbert-Elliott loss | Port-Restricted NAT, QUIC + Stream Fallback |
+| **Cohort D (Cellular / CGNAT Adversarial)** | `12..15` | `125 ms` (`250 ms` RTT) | `±45 ms` | `5.0%` loss + `2s` link drop & token resume | Symmetric CGNAT (forced `eod-server` relay + `/lan?resume` reconnect) |
+
+### 7.2 Automated Verification Scenarios & Quantitative Acceptance Gates
+
+Every commit touching `src/netplay_*`, `runtime/net/*`, `src/car_damage.cpp`, or `eod-server` must pass all 8 automated scenarios in `netplay_adversarial_16p.py`:
+
+| Gate ID | Scenario Under Test (All 16 Clients Across Cohorts A–D) | Quantitative Pass / Fail Acceptance Criteria |
+| :--- | :--- | :--- |
+| **GATE-D1** | **Symmetric CGNAT & Zero-Port-Forwarding Join + Reconnect** | All 16 clients (including Cohort D behind simulated Symmetric CGNAT with `EOD_NETPLAY_NO_MAPPING=1`) complete `0x01 Handshake` in `< 1,500 ms`. Simulated `2.0 s` socket drop on Slot 15 resumes seamlessly via 64-bit `reconnect_token` without dropping Slot 15 from the active match. Zero BEP 15 tracker packets emitted. |
+| **GATE-D2** | **On-Demand `.eodmod` v2 CAS Auto-Streaming** | Slot 0 mounts a custom `.eodmod` v2 car + livery (`12 MB` `zstd` blob). Slots `1..15` start with an empty mod cache, fetch `/v1/blobs/<blake3>` concurrently, verify the 256-bit BLAKE3 digest & Ed25519 signature, and mount into `VirtualDisc` in `< 3,000 ms` with zero EE main-thread frame stalls (`max frame time < 18.0 ms`). |
+| **GATE-D3** | **16-Car Mass Demolition Derby Pileup (Bilateral Impulse & Wreck Sync)** | 16 cars converge at `95 km/h` into the center of the Demolition Derby bowl (`Event ID 30`).<br>1. Zero "brick-wall" asymmetric collisions: mutual head-on impact between Slot 0 (`10 ms` RTT) and Slot 15 (`250 ms` RTT) produces symmetric center-of-mass recoil within `±4.5%` impulse tolerance.<br>2. Scalar health (`car + 0x1BEC`) and wreck state (`car + 0x1BE8`) across all 16 clients converge to `0.000` RMS error within `250 ms` of each collision.<br>3. All 16 clients agree 100% on every wreck attribution (`0x00202DA8`) and final survivor ranking. |
+| **GATE-D4** | **100% Bone Dent (`Bone.mvl`), Panel (`Panl`) & Wheel (`WHLP`) Replication** | After 120 seconds of 16-car combat:<br>1. `car + 0x4B8` (157-bone deformation arrays) across all 16 clients match within quantization tolerance (`<= 3.0 mm` per axis, `0` shade byte mismatch).<br>2. `car + 0x13E8` (8 panel states), `car + 0x2AC` (`part_vis_mask`), and `car + 0x1A00` (4 wheel toss flags + halved suspension stiffness) are 100% bit-identical across all 16 clients (`64-slot` panel pool and `32-slot` wheel pool active online without overflow). |
+| **GATE-D5** | **16-Player Battle Mode & Chicken Projectile / Shockwave Sync** | 16 cars in `battle` (`Event ID 36`, expanded `BattleMaster` `kCapacity = 16`, `64-slot` `g_WeaponRegistry` at `0x01C30000`) fire and detonate 64 chicken rockets (`0x0017E000` -> `0x0017E718` -> `0x0017DA58`). Every explosion shockwave impulse, kill, death, suicide, and `2.5 s` respawn state matches identically across all 16 clients. |
+| **GATE-D6** | **Special Constraint & Entity Modes (Trailer Race, Chain Race, Soccer, CTF, Gauntlet)** | Automated 60-second runs of:<br>- `trailer_race` (`ID 2`): All 16 trailer poses and hitch break-offs (`TrailerMaster + 0x08`) converge across all clients; unhitched cars are denied lap credit on all clients.<br>- `chain_race` (`ID 37`): 8 chained pairs (`16` human clients) maintain `< 0.15 m` tether divergence under `250 ms` RTT.<br>- `soccer` (`ID 21`) & `capture` (`ID 34`) & `gauntlet` (`ID 20`): Ball position (`< 0.25 m` RMS), goal count, flag carrier slot, and Hearse health are 100% consistent across all 16 clients. |
+| **GATE-D7** | **Full 5-Event Co-Op / Adversarial Career Eve Completion** | 16 clients run a complete 5-event Career Eve (`RaceDayDo` `0x0011F640`: No-Rules Race -> Figure-8 -> Trailer Race -> Gauntlet -> Demolition Derby). `EveHasMoreEvents (0x00120FB8)` advances cleanly through all 5 heats, pit-window repairs deduct identical Career cash, and final `EveTracker` standings (`0x003C4C18`), Career cash (`0x00448008`), and Respect Points (`0x0044800C`) match 100% across all 16 clients and persist to `/v1/vault`. |
+| **GATE-D8** | **Stage 2 64-Client MMO Free-Roam Hub & Instant Event Portal Handoff** | 64 simulated clients roam the Stage 2 `HomeMaster` (`ID 38`) shard. `eod-server` spatial AOI linker maintains `<= 500 µs` tick time, smart ghosting activates within `25 m` of Garage/Portals, 16 clients drive into an in-world Demolition Derby portal, transition into an instanced match, and return to free roam with zero memory leaks or crashes. |
