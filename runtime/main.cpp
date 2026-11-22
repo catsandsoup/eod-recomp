@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -232,6 +233,59 @@ std::string dir_of(const char *path) {
     return s == std::string::npos ? "." : p.substr(0, s);
 }
 
+// Standalone ActiveProfile resolution: if EOD_MOD_DIR is not explicitly set and
+// EOD_NATIVE_ONLY != "1", read <TDEODRecomp>/profiles/active_profile.txt so mods
+// installed from World Studio or Mod Manager automatically load in standalone play.
+void apply_active_profile_if_unset(bool headless) {
+    if (headless) return;
+    if (const char *cur = getenv("EOD_MOD_DIR"); cur && *cur) return;
+    if (const char *native = getenv("EOD_NATIVE_ONLY"); native && native[0] == '1') return;
+
+    std::filesystem::path support_dir;
+#ifdef __APPLE__
+    support_dir = std::filesystem::u8path(mac_app_support());
+#elif defined(_WIN32)
+    if (const char *local_app = getenv("LOCALAPPDATA"); local_app && *local_app) {
+        support_dir = std::filesystem::u8path(local_app) / "TDEODRecomp";
+    }
+#else
+    if (const char *xdg = getenv("XDG_DATA_HOME"); xdg && *xdg) {
+        support_dir = std::filesystem::u8path(xdg) / "TDEODRecomp";
+    } else if (const char *home = getenv("HOME"); home && *home) {
+        support_dir = std::filesystem::u8path(home) / ".local" / "share" / "TDEODRecomp";
+    }
+#endif
+    if (support_dir.empty()) return;
+
+    std::filesystem::path pointer_file = support_dir / "profiles" / "active_profile.txt";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pointer_file, ec)) return;
+    FILE *f = host_fopen(pointer_file.string().c_str(), "rb");
+    if (!f) return;
+    char buf[1024] = {};
+    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    std::string line(buf, got);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+        line.pop_back();
+    size_t start = 0;
+    while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) ++start;
+    line = line.substr(start);
+    if (line.empty()) return;
+
+    std::filesystem::path target = std::filesystem::u8path(line);
+    if (target.is_relative()) target = support_dir / "profiles" / target;
+    if (!std::filesystem::is_directory(target, ec)) return;
+    char data_check[1024] = {};
+    if (!platform_find_file(target.string().c_str(), "DATA", data_check, sizeof(data_check))) return;
+#ifdef _WIN32
+    _putenv_s("EOD_MOD_DIR", target.string().c_str());
+#else
+    setenv("EOD_MOD_DIR", target.string().c_str(), 1);
+#endif
+    fprintf(stderr, "[profile] Active standalone mod profile: %s\n", target.string().c_str());
+}
+
 }  // namespace
 
 int g_opt_frames = 0;           // exit after N frames (testing)
@@ -312,11 +366,12 @@ int main(int argc, char **argv) {
 #endif
     PlatformConfig cfg;
     std::string data_dir;
-    // settings: eod.ini next to the executable (--config overrides the path)
+    // settings: eod.ini next to the executable (--config or EOD_CONFIG_PATH overrides the path)
     std::string config_path = dir_of(argv[0]) + "/eod.ini";
 #ifdef __APPLE__
     config_path = mac_app_support() + "/eod.ini";
 #endif
+    if (const char *env_cfg = getenv("EOD_CONFIG_PATH"); env_cfg && *env_cfg) config_path = env_cfg;
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
     config_load(config_path);
@@ -433,8 +488,11 @@ int main(int argc, char **argv) {
         } else if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32}, (headless || data_dir.empty()) ? nullptr : &problem)) {
             if (problem.empty()) return 1;
             disc_problem = true;
-        } else if (!mac_app_select_mods(headless, headless ? nullptr : &problem)) {
-            if (problem.empty()) return 1;
+        } else {
+            apply_active_profile_if_unset(headless);
+            if (!mac_app_select_mods(headless, headless ? nullptr : &problem)) {
+                if (problem.empty()) return 1;
+            }
         }
         if (!problem.empty()) return run_setup_screen(cfg, config_path, problem, disc_problem, argv, setup_test);
     }
@@ -458,6 +516,10 @@ int main(int argc, char **argv) {
     }
     const bool disc_headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
     if (!windows_prepare_disc(data_dir, dir_of(argv[0]), disc_headless, {ee_elf_size, ee_elf_crc32})) return 1;
+    apply_active_profile_if_unset(disc_headless);
+#elif !defined(__APPLE__)
+    const bool disc_headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
+    apply_active_profile_if_unset(disc_headless);
 #endif
     // locate the game data
     std::vector<std::string> roots;

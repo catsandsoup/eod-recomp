@@ -364,33 +364,104 @@ def canonicalize_car_name(car_name: str) -> str:
     return aliases.get(clean.lower(), clean or "Algar")
 
 
+GAME_EXE_LABEL = "eod.exe" if sys.platform == "win32" else "eod"
+
+
+def tdeod_support_dir() -> Path:
+    """Return the shared TDEODRecomp user support directory (outside retail disc/)."""
+    override = os.environ.get("EOD_SUPPORT_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "TDEODRecomp"
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA")
+        if local_app:
+            return Path(local_app) / "TDEODRecomp"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg) / "TDEODRecomp"
+    return Path.home() / ".local" / "share" / "TDEODRecomp"
+
+
+def pie_staging_root() -> Path:
+    """Return ephemeral PIE staging directory (never inside retail disc/)."""
+    override = os.environ.get("EOD_EDITOR_STAGING_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return tdeod_support_dir() / "editor" / "pie_staging"
+
+
 def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = False) -> Path:
     """Locate the PIE executable for the current platform and renderer."""
     override = os.environ.get("EOD_PIE_EXE")
     if override:
         return Path(override).expanduser().resolve()
     gdir = Path(game_dir).resolve()
-    repository = Path(__file__).resolve().parents[2]
+    here = Path(__file__).resolve()
+    bundle_root = here.parents[1]
+    repository = here.parents[2]
     if sys.platform == "darwin":
         bundle_executable = Path("Eve of Destruction.app/Contents/MacOS/eod")
-        builds = ["build-mac-plume", "build-mac"] if prefer_plume else ["build-mac", "build-mac-plume"]
+        builds = (
+            ["build-mac-plume", "build-mac", "build-mac-release", "build"]
+            if prefer_plume
+            else ["build-mac-plume", "build-mac", "build-mac-release", "build"]
+        )
+        if not prefer_plume:
+            builds = ["build-mac", "build-mac-plume", "build-mac-release", "build"]
         candidates = [
             gdir / "eod",
             gdir / bundle_executable,
+            bundle_root / "eod",
+            bundle_root / bundle_executable,
             *(repository / build / "eod" for build in builds),
+            *(repository / build / bundle_executable for build in builds),
+            tdeod_support_dir() / "local-build" / bundle_executable,
             Path.home() / "Applications" / bundle_executable,
             Path("/Applications") / bundle_executable,
+        ]
+    elif sys.platform == "win32":
+        candidates = [
+            bundle_root / "eod.exe",
             gdir / "eod.exe",
+            repository / "build" / "eod.exe",
+            repository / "build-win" / "eod.exe",
+            tdeod_support_dir() / "eod.exe",
         ]
     else:
-        candidates = [gdir / "eod.exe", repository / "build" / "eod.exe"]
-        local_app = os.environ.get("LOCALAPPDATA")
-        if local_app:
-            candidates.append(Path(local_app) / "TDEODRecomp" / "eod.exe")
+        candidates = [
+            gdir / "eod",
+            bundle_root / "eod",
+            repository / "build" / "eod",
+            tdeod_support_dir() / "eod",
+        ]
     for c in candidates:
         if c.is_file():
             return c
     return candidates[0]
+
+
+def _render_pie_ini(pie_memcard_dir: Path, *, render_scale: int = 2, renderer_mode: str = "ps2") -> str:
+    """Build an isolated pie.ini so PIE never inherits RenderScale=6 (>4K) or touches real saves."""
+    rs = max(1, min(6, int(render_scale)))
+    renderer = "vulkan" if (renderer_mode == "plume" or sys.platform != "win32") else "vulkan"
+    return (
+        "; Isolated Play-In-Editor (PIE) configuration — keeps global eod.ini & memcard untouched\n\n"
+        "[Video]\n"
+        f"Renderer={renderer}\n"
+        "Fullscreen=0\n"
+        "Width=1280\n"
+        "Height=720\n"
+        "VSync=0\n"
+        f"RenderScale={rs}\n"
+        "DrawDistance=2\n\n"
+        "[System]\n"
+        f"MemoryCard={pie_memcard_dir}\n"
+        "FastBoot=1\n"
+        "SkipIntros=1\n"
+        "SkipMemcard=1\n"
+    )
 
 
 def build_pie_launch_spec(
@@ -408,8 +479,10 @@ def build_pie_launch_spec(
     ai_autodrive: bool = False,
     free_cam: bool = False,
     laps: int | None = None,
+    pie_render_scale: int = 2,
+    spawn_pos: tuple[float, float, float, float] | None = None,
 ) -> dict[str, Any]:
-    """Build exact process args and environment variables for `eod.exe` PIE launch.
+    """Build exact process args and environment variables for PIE launch.
 
     Matches `src/session_start.h`, `src/battle_bots.cpp`, `src/battle_driver.cpp`, and
     `runtime/render/native_renderer.cpp`:
@@ -422,9 +495,10 @@ def build_pie_launch_spec(
             `event=Battle` with `ai=<ai_count>` (0 = solo).
       - Event / Race: launches the canonicalized contest name with `ai=<ai_count>`
         and the optional `laps=<count>` for lap races.
-      - Launches with `--windowed` so `eod.ini` `Fullscreen=1` never clips the embedded HUD.
+      - Isolates PIE settings (`pie.ini`, `pie_memcard/`, configurable `RenderScale`) so global
+        `eod.ini` (`RenderScale=6` >4K) and real Career saves are never touched or inherited.
       - Configures `EOD_PIE_CONTROL_FILE`, `EOD_OPT_TERRAIN_MASK`, `EOD_ARCADE_MODE`,
-        `EOD_AI_AUTODRIVE`, `EOD_FREE_CAM`, and `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`.
+        `EOD_AI_AUTODRIVE`, `EOD_FREE_CAM`, `EOD_SPAWN_POS`, and background joystick events.
     """
     gdir = Path(game_dir).resolve()
     mdir = Path(mod_dir).resolve()
@@ -480,9 +554,21 @@ def build_pie_launch_spec(
             label = f"Event — {trk_up} · {canon_ev} ({ev_ai} AI · {clean_car}) [{rtag}]"
 
     control_file = mdir / "pie_live_control.ini"
+    pie_ini = mdir / "pie.ini"
+    pie_memcard = mdir / "pie_memcard"
+    rs = max(1, min(6, int(pie_render_scale)))
+    pie_ini_text = _render_pie_ini(pie_memcard, render_scale=rs, renderer_mode=rmode)
+
     env = dict(os.environ)
     env["EOD_MOD_DIR"] = str(mdir)
     env["EOD_SKIP_MOVIES"] = "1"
+    env["EOD_SKIP_INTROS"] = "1"
+    env["EOD_SKIP_MEMCARD"] = "1"
+    env["EOD_FAST_BOOT"] = "1"
+    env["EOD_CONFIG_PATH"] = str(pie_ini)
+    env["EOD_MEMCARD_DIR"] = str(pie_memcard)
+    env["EOD_RENDER_SCALE"] = str(rs)
+    env["EOD_VSYNC"] = "0"
     env["EOD_DIRECT_START"] = direct
     env["EOD_SESSION"] = direct  # alias for diagnostics/scripts
     env["SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
@@ -490,9 +576,14 @@ def build_pie_launch_spec(
     env["EOD_ARCADE_MODE"] = (arcade_mode or "free_roam").strip().lower()
     env["EOD_AI_AUTODRIVE"] = "1" if ai_autodrive else "0"
     env["EOD_FREE_CAM"] = "1" if free_cam else "0"
+    if spawn_pos is not None:
+        sx, sy, sz, syaw = spawn_pos
+        env["EOD_SPAWN_POS"] = f"{float(sx):.3f},{float(sy):.3f},{float(sz):.3f},{float(syaw):.2f}"
+    else:
+        env.pop("EOD_SPAWN_POS", None)
     env.pop("EOD_NATIVE_ONLY", None)
     env["EOD_MODERN"] = "0"
-    args = [str(exe), "--windowed", "--data", str(gdir)]
+    args = [str(exe), "--windowed", "--data", str(gdir), "--config", str(pie_ini)]
     if sync_all_events:
         env["EOD_OPT_TERRAIN_MASK"] = "0xFFFF"
     if rmode == "plume":
@@ -506,15 +597,21 @@ def build_pie_launch_spec(
 
     return {
         "exe": str(exe),
+        "exe_label": GAME_EXE_LABEL,
         "args": args,
         "cwd": str(gdir),
         "mod_dir": str(mdir),
+        "pie_ini": str(pie_ini),
+        "pie_ini_text": pie_ini_text,
+        "pie_memcard": str(pie_memcard),
+        "pie_render_scale": rs,
         "control_file": str(control_file),
         "direct_start": direct,
         "renderer_mode": rmode,
         "arcade_mode": env["EOD_ARCADE_MODE"],
         "ai_autodrive": bool(ai_autodrive),
         "free_cam": bool(free_cam),
+        "spawn_pos": spawn_pos,
         "label": label,
         "env": env,
     }
@@ -667,8 +764,10 @@ class PieHostWidget(QWidget):
         self._live_state: dict[str, Any] = {
             "ai_autodrive": 0,
             "free_cam": 0,
-            "camera_mode": -1,
+            "camera_view": -1,
             "speed_boost": 1.0,
+            "grip_boost": 1.0,
+            "ride_height_delta": 0.0,
             "arcade_mode": "free_roam",
         }
         self._app_filter_installed = False
@@ -700,9 +799,11 @@ class PieHostWidget(QWidget):
         self.lbl_detail.setWordWrap(True)
         self.lbl_detail.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.2pt; background: transparent;")
 
-        self.btn_free_cam = QPushButton(" Free Cam")
+        self.btn_free_cam = QPushButton(" Free Cam (6-DOF)")
         self.btn_free_cam.setCheckable(True)
-        self.btn_free_cam.setToolTip("Toggle Free / Elevated Camera View inside PIE live (hotkey C also cycles camera)")
+        self.btn_free_cam.setToolTip(
+            "Toggle true 6-DOF Free Camera inside PIE (F4 in-game, WASD + Q/E + arrows/mouse to fly)"
+        )
         self.btn_free_cam.toggled.connect(self._on_free_cam_toggled)
 
         self.btn_ai_drive = QPushButton(" AI Auto-Drive")
@@ -718,7 +819,7 @@ class PieHostWidget(QWidget):
         self.cmb_arcade.currentIndexChanged.connect(self._on_arcade_changed)
 
         self.btn_focus_game = QPushButton(" Focus Controls")
-        self.btn_focus_game.setToolTip("Give Win32 keyboard & controller focus to embedded eod.exe")
+        self.btn_focus_game.setToolTip(f"Give keyboard & controller focus to embedded {GAME_EXE_LABEL}")
         self.btn_focus_game.clicked.connect(self.focus_embedded_game)
 
         self.btn_restart = QPushButton(" Restart")
@@ -757,7 +858,7 @@ class PieHostWidget(QWidget):
         c_lay = QVBoxLayout(self.embed_container)
         c_lay.setContentsMargins(0, 0, 0, 0)
         c_lay.setSpacing(0)
-        self.lbl_placeholder = QLabel("Launching eod.exe Vulkan viewport...")
+        self.lbl_placeholder = QLabel(f"Launching {GAME_EXE_LABEL} Vulkan viewport...")
         self.lbl_placeholder.setWordWrap(True)
         self.lbl_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_placeholder.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 11pt; background: transparent;")
@@ -815,13 +916,36 @@ class PieHostWidget(QWidget):
             self._app_filter_installed = False
 
     def start_pie(self, spec: dict[str, Any]) -> bool:
-        """Start `eod.exe` using `spec` from `build_pie_launch_spec` and begin Win32 embedding."""
+        """Start the game executable using `spec` from `build_pie_launch_spec`."""
         self.stop_pie(emit_signal=False)
         exe = Path(spec["exe"])
+        exe_label = str(spec.get("exe_label") or GAME_EXE_LABEL)
         if not exe.is_file():
-            self.lbl_placeholder.setText(f"eod.exe not found at:\n{exe}")
-            self.pieStatusChanged.emit(f"PIE failed: {exe} not found")
+            hint = (
+                "Build build-mac-plume/eod, install Eve of Destruction.app, or set EOD_PIE_EXE."
+                if sys.platform == "darwin"
+                else "Place eod.exe beside the editor, build/eod.exe, or set EOD_PIE_EXE."
+            )
+            self.lbl_placeholder.setText(f"{exe_label} not found at:\n{exe}\n\n{hint}")
+            self.pieStatusChanged.emit(f"PIE failed: {exe_label} not found at {exe}")
             return False
+
+        # Materialize isolated pie.ini and pie_memcard/ before launch so global eod.ini is untouched
+        pie_ini_path = spec.get("pie_ini")
+        pie_ini_text = spec.get("pie_ini_text")
+        pie_memcard = spec.get("pie_memcard")
+        if pie_memcard:
+            try:
+                Path(pie_memcard).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        if pie_ini_path and pie_ini_text:
+            try:
+                p_ini = Path(pie_ini_path)
+                p_ini.parent.mkdir(parents=True, exist_ok=True)
+                p_ini.write_text(str(pie_ini_text), encoding="utf-8")
+            except OSError:
+                pass
 
         self._last_spec = spec
         plume_ready = threading.Event() if spec.get("renderer_mode") == "plume" else None
@@ -856,7 +980,7 @@ class PieHostWidget(QWidget):
         self.lbl_state.setText("● PIE STARTING")
         self.lbl_detail.setText(f"{spec['label']}  |  EOD_MOD_DIR={Path(spec['mod_dir']).name}")
         self.lbl_placeholder.setText(
-            f"Starting eod.exe in viewport...\n\n{spec['label']}\nEOD_DIRECT_START = {spec['direct_start']}"
+            f"Starting {exe_label} in viewport...\n\n{spec['label']}\nEOD_DIRECT_START = {spec['direct_start']}"
         )
         self.lbl_placeholder.show()
 
@@ -878,13 +1002,13 @@ class PieHostWidget(QWidget):
                 bufsize=1,
             )
         except Exception as exc:
-            self.lbl_placeholder.setText(f"Failed to launch eod.exe:\n{exc}")
-            self.pieLogLine.emit(f"[PIE][ERROR] Failed to launch eod.exe: {exc}")
+            self.lbl_placeholder.setText(f"Failed to launch {exe_label}:\n{exc}")
+            self.pieLogLine.emit(f"[PIE][ERROR] Failed to launch {exe_label}: {exc}")
             self.pieStatusChanged.emit(f"PIE launch error: {exc}")
             self._proc = None
             return False
 
-        # Stream eod.exe stdout/stderr on a lightweight daemon thread into Output Log
+        # Stream game stdout/stderr on a lightweight daemon thread into Output Log
         proc_ref = self._proc
 
         def _pump_stdout() -> None:
@@ -895,7 +1019,7 @@ class PieHostWidget(QWidget):
                         if line:
                             if plume_ready is not None and line.startswith("[native] plume renderer ready ("):
                                 plume_ready.set()
-                            self.pieLogLine.emit(f"[eod.exe] {line}")
+                            self.pieLogLine.emit(f"[{exe_label}] {line}")
             except Exception:
                 pass
 
@@ -948,7 +1072,7 @@ class PieHostWidget(QWidget):
                 elif self._poll_attempts > 250:
                     # 15 seconds fallback: keep monitoring process without blocking
                     self.lbl_placeholder.setText(
-                        "eod.exe is running in an external window.\nClick Stop PIE (Shift+Esc) to return."
+                        f"{GAME_EXE_LABEL} is running in an external window.\nClick Stop PIE (Shift+Esc) to return."
                     )
             else:
                 # Re-sync automatically if Qt layout/splitter/DPI changed the embed container size
@@ -1185,7 +1309,7 @@ class PieHostWidget(QWidget):
         self.btn_popout.setEnabled(False)
         self.lbl_state.setText("● PIE POPPED OUT")
         self.lbl_placeholder.setText(
-            "eod.exe is running in its popped-out window.\nClick Stop PIE (Shift+Esc) to return to the 3D editor."
+            f"{GAME_EXE_LABEL} is running in its popped-out window.\nClick Stop PIE (Shift+Esc) to return to the 3D editor."
         )
         self.lbl_placeholder.show()
         self.pieStatusChanged.emit("PIE popped out to standalone window")

@@ -247,6 +247,14 @@ bool config_load(const std::string &path, Config &c) {
     if (const char *e = getenv("EOD_SKIP_INTROS")) c.skip_intros = to_bool(e);
     if (const char *e = getenv("EOD_SKIP_MOVIES")) c.skip_intros = to_bool(e);
     if (const char *e = getenv("EOD_SKIP_MEMCARD")) c.skip_memcard = to_bool(e);
+    if (const char *e = getenv("EOD_RENDER_SCALE")) {
+        int rs = atoi(e);
+        if (rs < 0) rs = 0;
+        if (rs > kMaxRenderScale) rs = kMaxRenderScale;
+        c.render_scale = rs;
+    }
+    if (const char *e = getenv("EOD_VSYNC")) c.vsync = to_bool(e);
+    if (const char *e = getenv("EOD_MEMCARD_DIR")) if (*e) c.memcard_dir = e;
 
     return file_loaded;
 }
