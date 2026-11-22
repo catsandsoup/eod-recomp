@@ -15,6 +15,7 @@
 #include "core/log.h"
 #include "core/memory.h"
 #include "funcs.h"
+#include "hle_nascar_class.h"
 #include "platform/platform.h"
 
 extern "C" {
@@ -363,6 +364,17 @@ bool AutoShopIsPartCompatible(uint32_t chassis_class, uint32_t part_key) {
     // If Universal Parts toggle is active, any part fits any chassis!
     if (g_config.career_universal_parts) {
         return true;
+    }
+
+    // Extended standalone classes (Class 4 NASCAR and custom mod classes >= 4):
+    // query the native 64-bit upgrade compatibility mask without wrapping `% 4` to Compact.
+    if (chassis_class >= eod::nascar::kClassNascar) {
+        const uint64_t allowed_mask =
+            eod::nascar::VehicleClassRegistry::instance().resolve_part_compatibility_mask(chassis_class);
+        if (part_key >= 64) {
+            return false;
+        }
+        return (allowed_mask & (1ull << part_key)) != 0;
     }
 
     // Native class bitmask lookup (f_002DFDF8)
