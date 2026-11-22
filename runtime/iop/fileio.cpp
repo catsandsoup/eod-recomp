@@ -21,6 +21,7 @@
 #include "../core/eod_tracy.h"
 #include "../core/log.h"
 #include "../platform/platform.h"
+#include "../vfs/layered_vfs.h"
 #include "iop.h"
 
 namespace {
@@ -62,6 +63,12 @@ std::string strip_device(const char *path, std::string *dev) {
 bool resolve(const char *ps2path, std::string &host, bool for_write) {
     std::string rel = strip_device(ps2path, nullptr);
     char found[1024];
+
+    // Live hot-mountable VFS overlay layers (EphemeralPie > ServerSession > ActiveProfile)
+    // take precedence over legacy EOD_MOD_DIR while remaining strictly read-only.
+    if (!for_write && eod::vfs::global_vfs().resolve_overlay_only(rel, host)) {
+        return true;
+    }
 
     // A selected overlay is read-only. Never scan every staged mod: unrelated
     // builds can contain mutually exclusive COMMON.RES/track replacements.

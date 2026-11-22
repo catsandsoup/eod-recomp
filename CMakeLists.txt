@@ -74,6 +74,7 @@ file(GLOB_RECURSE RUNTIME_SOURCES
   ${CMAKE_SOURCE_DIR}/runtime/gs/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/vu/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/iop/*.cpp
+  ${CMAKE_SOURCE_DIR}/runtime/vfs/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/spu/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/render/*.cpp
   ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.c)
@@ -300,7 +301,7 @@ if(BUILD_TESTING)
   set_tests_properties(NascarClass4 PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   if(UNIX)
     foreach(overlay_kind fileio stream)
-      add_executable(eod_${overlay_kind}_overlay_test tools/tests/mod_overlay_test.cpp)
+      add_executable(eod_${overlay_kind}_overlay_test tools/tests/mod_overlay_test.cpp runtime/vfs/layered_vfs.cpp)
       target_include_directories(eod_${overlay_kind}_overlay_test PRIVATE runtime runtime/include)
       target_compile_options(eod_${overlay_kind}_overlay_test PRIVATE -ffunction-sections -fdata-sections)
       if(APPLE)
@@ -315,6 +316,10 @@ if(BUILD_TESTING)
       set_tests_properties(ModOverlay-${overlay_kind} PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
     endforeach()
   endif()
+  add_executable(layered_vfs_test tools/tests/layered_vfs_test.cpp runtime/vfs/layered_vfs.cpp)
+  target_include_directories(layered_vfs_test PRIVATE runtime runtime/include)
+  add_test(NAME LayeredVfs COMMAND layered_vfs_test)
+  set_tests_properties(LayeredVfs PROPERTIES ENVIRONMENT "EOD_HEADLESS=1;EOD_MUTE=1")
   if(ZLIB_FOUND)
     add_executable(eod_gs_capture_io_test tools/tests/gs_capture_io_test.cpp)
     target_link_libraries(eod_gs_capture_io_test PRIVATE ZLIB::ZLIB)
