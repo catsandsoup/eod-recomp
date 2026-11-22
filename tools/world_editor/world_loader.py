@@ -1371,21 +1371,23 @@ class TrackWorld:
         assigned: set[int] = set()
         group_seq = 0
 
-        # 1. Multi-part Ramp Assemblies (connected components of overlapping ramp + top-cap leaves)
+        # 1. Multi-part Ramp Assemblies (connected components of overlapping ramp + top-cap/decal leaves)
         for seed in ramp_seeds:
             if seed in assigned:
                 continue
             so = self.objects[seed]
             sb = aabbs[seed]
+            seed_cx = 0.5 * (sb[0] + sb[3])
+            seed_cz = 0.5 * (sb[2] + sb[5])
             comp = [seed]
             queue = [seed]
             visited = {seed}
-            while queue:
+            while queue and len(comp) < 8:
                 cur = queue.pop()
                 cb = aabbs[cur]
                 co = self.objects[cur]
                 for nb in _neighbors(cur, pad=1.5):
-                    if nb in visited or nb in assigned:
+                    if nb in visited or nb in assigned or len(comp) >= 8:
                         continue
                     no = self.objects[nb]
                     if no.category not in ("optional-terrain", "static"):
@@ -1398,16 +1400,24 @@ class TrackWorld:
                     ):
                         continue
                     nb_box = aabbs[nb]
+                    # Keep every part tightly anchored near the seed ramp so we never chain across the map
+                    nb_cx = 0.5 * (nb_box[0] + nb_box[3])
+                    nb_cz = 0.5 * (nb_box[2] + nb_box[5])
+                    if math.hypot(nb_cx - seed_cx, nb_cz - seed_cz) > 24.0:
+                        continue
                     nb_span = max(nb_box[3] - nb_box[0], nb_box[5] - nb_box[2])
                     cur_span = max(cb[3] - cb[0], cb[5] - cb[2], 4.0)
-                    # Same-scale cap/side leaf overlapping ramp footprint
-                    if nb_span <= max(cur_span * 1.85, 28.0) and _overlaps(cb, nb_box, 1.2, 2.2):
-                        # Require either same opt_terrain_mode or ramp/dirt cap texture/name overlap
+                    # Same-scale cap/side/road-wear decal overlapping seed ramp footprint
+                    if nb_span <= max(cur_span * 1.85, 28.0) and _overlaps(sb, nb_box, 1.2, 2.5):
                         nl = no.name.lower()
+                        same_opt_mode = (
+                            co.opt_terrain_mode is not None
+                            and no.opt_terrain_mode == co.opt_terrain_mode
+                        )
                         is_cap = (
-                            no.opt_terrain_mode == co.opt_terrain_mode
-                            or any(k in nl for k in ("ramp", "jump", "stunt", "top", "cap", "dirt"))
-                            or (set(no.textures) & set(co.textures))
+                            same_opt_mode
+                            or any(k in nl for k in ("ramp", "jump", "stunt", "top", "cap", "rdwr", "wear"))
+                            or (so.opt_terrain_mode is not None and bool(set(no.textures) & set(so.textures)))
                         )
                         if is_cap:
                             visited.add(nb)
@@ -1791,9 +1801,15 @@ def _load_textures(track_dict: dict[str, Any], tex_names: set[str]) -> dict[str,
         is_water_tex = any(tok in low_name for tok in _WATER_TEX_TOKENS)
         max_a = max(alphas) if alphas else 255
         min_a = min(alphas) if alphas else 255
-        # PS2 water/ripple overlays (e.g. Afton's `sween.tex`, raw alpha 18..73, zero==0%)
+        avg_a = (sum(alphas) / len(alphas)) if alphas else 255.0
+        is_decal_blend = (
+            min_a < 120
+            and avg_a < 170.0
+            and any(tok in low_name for tok in ("rdwr", "wear", "skid", "decal", "tire", "shadow", "shad", "shd"))
+        )
+        # PS2 water/ripple & road-wear decal overlays (e.g. `sween.tex`, `af_rdwr.tex`)
         # carry genuine translucent blend alpha rather than opaque road detail weight.
-        if is_water_tex or (0 < max_a <= 128 and min_a < 120):
+        if is_water_tex or (0 < max_a <= 128 and min_a < 120) or is_decal_blend:
             kind = "blend"
             arr_w = np.frombuffer(rgba, dtype=np.uint8).reshape(-1, 4).copy()
             if is_water_tex:
@@ -1807,8 +1823,8 @@ def _load_textures(track_dict: dict[str, Any], tex_names: set[str]) -> dict[str,
                     arr_w[:, 1] = np.clip(78.0 + norm_l * 145.0, 0, 255).astype(np.uint8)
                     arr_w[:, 2] = np.clip(112.0 + norm_l * 135.0, 0, 255).astype(np.uint8)
                 arr_w[:, 3] = np.clip(arr_w[:, 3].astype(np.float32) * 2.1, 45.0, 185.0).astype(np.uint8)
-            else:
-                arr_w[:, 3] = np.clip(arr_w[:, 3].astype(np.float32) * 2.0, 24.0, 225.0).astype(np.uint8)
+            elif max_a <= 132:
+                arr_w[:, 3] = np.clip(arr_w[:, 3].astype(np.float32) * 2.0, 0.0, 225.0).astype(np.uint8)
             rgba_clean = arr_w.tobytes()
             arr = arr_w
         else:
@@ -2163,7 +2179,7 @@ def _load_road_graphs(
 # Uncompressed numpy + struct buffers for ~50-100x faster repeat track opens.
 # ---------------------------------------------------------------------------
 _CACHE_MAGIC = b"EODCACHE"
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 _CACHE_HEADER_FMT = "<8sIIIQQ"
 _CACHE_HEADER_SIZE = struct.calcsize(_CACHE_HEADER_FMT)
 _TRK_SHA_STAT_CACHE: dict[str, tuple[int, int, str]] = {}
