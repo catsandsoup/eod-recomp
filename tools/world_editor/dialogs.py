@@ -35,7 +35,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from car_studio_graphs import CarTelemetryGraphsPanel
 from car_studio_handling import CarHandlingSheet
+from car_studio_showroom import CarShowroomPanel
 from nascar_import_panel import NascarImportPanel
 from pie_host import ARCADE_MODES
 from theme import TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, enable_windows_dark_titlebar, svg_icon
@@ -372,7 +374,7 @@ class CustomRaceDialog(QDialog):
 
 
 class VehicleTunerDialog(QDialog):
-    """Car handling, live PIE speed controls and vehicle tools."""
+    """Unified Car Studio: 3D Showroom, Handling Sheet, Dyno & Telemetry, and NASCAR Import."""
 
     def __init__(
         self,
@@ -383,8 +385,9 @@ class VehicleTunerDialog(QDialog):
         super().__init__(parent)
         self.game_dir = Path(game_dir)
         self._on_live_boost = on_live_boost_changed
+        self._syncing_car = False
         self.setWindowTitle("Car Studio")
-        self.resize(670, 680)
+        self.resize(860, 740)
         enable_windows_dark_titlebar(self)
 
         root = QVBoxLayout(self)
@@ -393,7 +396,11 @@ class VehicleTunerDialog(QDialog):
 
         tabs = QTabWidget()
 
-        # Tab 1: Car Studio handling and session controls
+        # Tab 0: 3D Assembled Showroom, Bone.mvl Damage Slider & Texture/HOSTTEX Studio
+        self.showroom = CarShowroomPanel(self.game_dir, self)
+        tabs.addTab(self.showroom, "3D Showroom && Paint")
+
+        # Tab 1: Car Studio handling and live PIE session controls
         t_live = QWidget()
         l_lay = QVBoxLayout(t_live)
         l_lay.setSpacing(10)
@@ -415,6 +422,14 @@ class VehicleTunerDialog(QDialog):
 
         tabs.addTab(t_live, "Handling")
 
+        # Tab 2: Live Dyno, Gearbox Sawtooth & Pacejka Tyre Telemetry
+        self.telemetry = CarTelemetryGraphsPanel(
+            self.showroom.assembly.physics_fields if self.showroom.assembly else None,
+            self,
+        )
+        tabs.addTab(self.telemetry, "Dyno && Telemetry")
+
+        # Tab 3: NASCAR Import
         self.nascar = NascarImportPanel(self.game_dir, self)
         nascar_scroll = QScrollArea()
         nascar_scroll.setWidgetResizable(True)
@@ -424,12 +439,65 @@ class VehicleTunerDialog(QDialog):
         self._vehicle_tabs = tabs
         self.finished.connect(self.nascar.cancel)
 
+        # Keep Showroom, Handling Sheet, and Telemetry Dyno Graphs synchronized
+        self.showroom.carChanged.connect(self._on_showroom_car_changed)
+        self.handling.car_picker.currentIndexChanged.connect(self._on_handling_car_changed)
+        self.handling._undo.indexChanged.connect(lambda _idx: self._sync_telemetry_from_handling())
+        self.handling.archiveSaved.connect(lambda _res: self._sync_telemetry_from_handling())
+        tabs.currentChanged.connect(self._on_tab_changed)
+
         root.addWidget(tabs, 1)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(self.accept)
         btns.accepted.connect(self.accept)
         root.addWidget(btns)
+
+    def _on_showroom_car_changed(self, archive_rel: str, physics_fields: dict[str, Any]) -> None:
+        if physics_fields:
+            self.telemetry.set_physics(physics_fields)
+        if self._syncing_car:
+            return
+        self._syncing_car = True
+        try:
+            if not self.handling.dirty and not self.handling._busy:
+                idx = self.handling.car_picker.findData(archive_rel)
+                if idx >= 0 and idx != self.handling.car_picker.currentIndex():
+                    self.handling.car_picker.setCurrentIndex(idx)
+        finally:
+            self._syncing_car = False
+
+    def _on_handling_car_changed(self, _index: int) -> None:
+        if self._syncing_car:
+            return
+        archive_rel = self.handling.current_archive
+        if not archive_rel:
+            return
+        self._syncing_car = True
+        try:
+            self.showroom.select_car_by_archive(archive_rel)
+        finally:
+            self._syncing_car = False
+
+    def _sync_telemetry_from_handling(self) -> None:
+        merged: dict[str, Any] = {}
+        if self.showroom.assembly and self.showroom.assembly.physics_fields:
+            for sec, kv in self.showroom.assembly.physics_fields.items():
+                merged[sec] = dict(kv) if isinstance(kv, dict) else kv
+        for field_id, field in getattr(self.handling, "_fields", {}).items():
+            sec = str(field.get("section", ""))
+            key = str(field.get("key", ""))
+            if not sec or not key:
+                continue
+            val = self.handling._values.get(field_id, field.get("value", field.get("original")))
+            if val is not None:
+                merged.setdefault(sec, {})[key] = val
+        if merged:
+            self.telemetry.set_physics(merged)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == 2:
+            self._sync_telemetry_from_handling()
 
     def show_nascar_import(self) -> None:
         self._vehicle_tabs.setCurrentIndex(self._nascar_index)
