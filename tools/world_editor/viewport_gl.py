@@ -18,7 +18,9 @@ import ctypes
 import math
 import os
 import random
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -254,7 +256,8 @@ uniform int uCutout;
 out vec4 FragColor;
 void main() {
     if (uHasTex != 0 && uCutout != 0) {
-        if (texture(uTex, vUv).a < 0.35) {
+        float thresh = (uCutout == 2) ? 0.15 : 0.45;
+        if (texture(uTex, vUv).a < thresh) {
             discard;
         }
     }
@@ -343,7 +346,7 @@ def ray_aabb_hit(origin: np.ndarray, inv_dir: np.ndarray, lo: np.ndarray, hi: np
     tmin = float(np.max(np.minimum(t1, t2)))
     tmax = float(np.min(np.maximum(t1, t2)))
     if tmax >= max(0.0, tmin):
-        return tmin if tmin >= 0.0 else tmax
+        return tmin if tmin >= 0.0 else 0.0
     return None
 
 
@@ -454,11 +457,10 @@ class ModePillOverlay(QFrame):
         self.btn_edit.setCheckable(True)
         self.btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self.btn_shield = QPushButton()
+        self.btn_shield = QPushButton(" Collision")
         self.btn_shield.setIcon(svg_icon("shield"))
         self.btn_shield.setCheckable(True)
-        self.btn_shield.setToolTip("Toggle Collision / Shield Overlay")
-        self.btn_shield.setFixedWidth(30)
+        self.btn_shield.setToolTip("Toggle Terrain & Barrier Collision Overlay")
         self.btn_shield.setCursor(Qt.CursorShape.PointingHandCursor)
 
         pill_css = (
@@ -470,8 +472,9 @@ class ModePillOverlay(QFrame):
         for b in (self.btn_object, self.btn_edit, self.btn_shield):
             b.setStyleSheet(pill_css)
 
-        layout.addWidget(self.btn_object)
-        layout.addWidget(self.btn_edit)
+        # Hide legacy Potemkin Object/Edit mode toggles until real vertex editing is wired
+        self.btn_object.hide()
+        self.btn_edit.hide()
         layout.addWidget(self.btn_shield)
 
         self.btn_object.clicked.connect(lambda: self.set_mode("object", emit=True))
@@ -755,7 +758,7 @@ class ViewportGL(QOpenGLWidget):
         # View toggles & renderer mode ("ps2" = fast power-sipping PS2 mode, "plume" = high-quality mode)
         self.render_mode = "ps2"
         self._plume_viewport: PlumeViewport | None = None
-        self._plume_module = os.environ.get("EOD_EDITOR_PLUME_LIBRARY")
+        self._plume_module = self._discover_plume_library()
         self._plume_dirty = True
         self._plume_retry = False
         self.show_wireframe = False
@@ -771,7 +774,7 @@ class ViewportGL(QOpenGLWidget):
             "event-prop": True,
             "billboard": True,
             "optional-terrain": True,
-            "display-object": False,
+            "display-object": True,
             "prop-catalog": True,
             "car-wreck": True,
         }
@@ -1888,13 +1891,22 @@ class ViewportGL(QOpenGLWidget):
             GL.glUniform1i(uid["uTex"], 0)
             GL.glActiveTexture(GL.GL_TEXTURE0)
 
-            for batch_list in (self._terrain_batches, self._prop_batches, self._dynamic_batches, self._blend_batches, self._dynamic_blend_batches):
+            for is_blend_list, batch_list in (
+                (False, self._terrain_batches),
+                (False, self._prop_batches),
+                (False, self._dynamic_batches),
+                (True, self._blend_batches),
+                (True, self._dynamic_blend_batches),
+            ):
                 for b in batch_list:
                     tex_entry = self._gl_textures.get(b["tex"])
                     if tex_entry is not None:
                         GL.glBindTexture(GL.GL_TEXTURE_2D, tex_entry[0])
                         GL.glUniform1i(uid["uHasTex"], 1)
-                        GL.glUniform1i(uid["uCutout"], 1 if tex_entry[1] else 0)
+                        if is_blend_list:
+                            GL.glUniform1i(uid["uCutout"], 2)
+                        else:
+                            GL.glUniform1i(uid["uCutout"], 1 if tex_entry[1] else 0)
                     else:
                         GL.glUniform1i(uid["uHasTex"], 0)
                         GL.glUniform1i(uid["uCutout"], 0)
@@ -2392,6 +2404,195 @@ class ViewportGL(QOpenGLWidget):
                 pts.append([*c[i1], *col])
         return self._draw_flat_verts(np.array(pts, dtype=np.float32), GL.GL_LINES, view_proj)
 
+    @staticmethod
+    def _discover_plume_library() -> str | None:
+        override = os.environ.get("EOD_EDITOR_PLUME_LIBRARY")
+        if override and Path(override).expanduser().is_file():
+            return str(Path(override).expanduser().resolve())
+        here = Path(__file__).resolve()
+        bundle_root = here.parents[1]
+        repo_root = here.parents[2]
+        if sys.platform == "darwin":
+            name = "eod_editor_plume.dylib"
+            candidates = [
+                here.parent / name,
+                bundle_root / name,
+                bundle_root / "Frameworks" / name,
+                repo_root / "build-mac-plume" / name,
+                repo_root / "build-mac" / name,
+                repo_root / "build" / name,
+            ]
+        elif sys.platform == "win32":
+            name = "eod_editor_plume.dll"
+            candidates = [
+                here.parent / name,
+                bundle_root / name,
+                repo_root / "build" / name,
+                repo_root / "build-win" / name,
+            ]
+        else:
+            name = "eod_editor_plume.so"
+            candidates = [here.parent / name, bundle_root / name, repo_root / "build" / name]
+        for c in candidates:
+            if c.is_file():
+                return str(c)
+        return override
+
+    @staticmethod
+    def _append_ribbon_seg(
+        out: list[list[float]],
+        p0: np.ndarray,
+        p1: np.ndarray,
+        cam_pos: np.ndarray,
+        half_w: float,
+        rgba: tuple[float, float, float, float],
+    ) -> None:
+        d = p1 - p0
+        dlen = float(np.linalg.norm(d))
+        if dlen < 1e-5:
+            return
+        mid = 0.5 * (p0 + p1)
+        view_dir = cam_pos - mid
+        side = np.cross(d, view_dir)
+        slen = float(np.linalg.norm(side))
+        if slen < 1e-5:
+            side = np.cross(d, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+            slen = float(np.linalg.norm(side))
+            if slen < 1e-5:
+                side = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                slen = 1.0
+        off = (side / slen) * float(half_w)
+        a0, b0 = p0 - off, p0 + off
+        a1, b1 = p1 - off, p1 + off
+        r, g, b, al = rgba
+        out.append([float(a0[0]), float(a0[1]), float(a0[2]), r, g, b, al])
+        out.append([float(b0[0]), float(b0[1]), float(b0[2]), r, g, b, al])
+        out.append([float(b1[0]), float(b1[1]), float(b1[2]), r, g, b, al])
+        out.append([float(a0[0]), float(a0[1]), float(a0[2]), r, g, b, al])
+        out.append([float(b1[0]), float(b1[1]), float(b1[2]), r, g, b, al])
+        out.append([float(a1[0]), float(a1[1]), float(a1[2]), r, g, b, al])
+
+    def _build_plume_overlay_verts(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Collect 3D triangle overlays for Plume HQ: gizmos (always-on-top) + selection/roads/markers/collision."""
+        if self.world is None:
+            return None, None
+        top_pts: list[list[float]] = []
+        depth_pts: list[list[float]] = []
+        cam = self.cam_pos
+
+        def _box_edges(target: list[list[float]], lo: np.ndarray, hi: np.ndarray, col: tuple[float, float, float, float], w: float) -> None:
+            x0, y0, z0 = float(lo[0]), float(lo[1]), float(lo[2])
+            x1, y1, z1 = float(hi[0]), float(hi[1]), float(hi[2])
+            corners = [
+                np.array([x0, y0, z0], dtype=np.float32), np.array([x1, y0, z0], dtype=np.float32),
+                np.array([x1, y1, z0], dtype=np.float32), np.array([x0, y1, z0], dtype=np.float32),
+                np.array([x0, y0, z1], dtype=np.float32), np.array([x1, y0, z1], dtype=np.float32),
+                np.array([x1, y1, z1], dtype=np.float32), np.array([x0, y1, z1], dtype=np.float32),
+            ]
+            for i0, i1 in ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)):
+                self._append_ribbon_seg(target, corners[i0], corners[i1], cam, w, col)
+
+        # 1. Selected objects highlight bounding boxes (always visible in Plume HQ!)
+        sel_list = [o for o in self.selected_objects if not o.deleted]
+        if not sel_list and self.selected_obj is not None and not self.selected_obj.deleted:
+            sel_list = [self.selected_obj]
+        for obj in sel_list:
+            model = self.world.models.get(obj.model_key)
+            if model is not None:
+                lo, hi = obj.world_aabb(model)
+                dist = max(4.0, float(np.linalg.norm(0.5 * (lo + hi) - cam)))
+                bw = max(0.05, min(0.45, dist * 0.0035))
+                col = (1.0, 0.78, 0.18, 0.95) if obj is self.selected_obj else (0.35, 0.85, 1.0, 0.90)
+                _box_edges(top_pts, lo, hi, col, bw)
+
+        # 2. Active 3D Transform Gizmo (Move / Rotate / Scale) on top_pts
+        origin, _gkind = self._active_gizmo_origin()
+        if origin is not None:
+            sc = self._gizmo_scale(origin)
+            ax_w = max(0.06, sc * 0.028)
+            axes = [
+                (0, np.array([1.0, 0.0, 0.0], dtype=np.float32), (1.0, 0.28, 0.28, 1.0)),
+                (1, np.array([0.0, 1.0, 0.0], dtype=np.float32), (0.28, 1.0, 0.42, 1.0)),
+                (2, np.array([0.0, 0.0, 1.0], dtype=np.float32), (0.32, 0.62, 1.0, 1.0)),
+            ]
+            for ax_idx, ax_vec, base_col in axes:
+                hl = (ax_idx == self._gizmo_hover_axis or ax_idx == self._gizmo_drag_axis)
+                col = (1.0, 0.95, 0.25, 1.0) if hl else base_col
+                if self.active_tool == "rotate":
+                    u = _normalize(np.cross(ax_vec, np.array([0.0, 1.0, 0.0], dtype=np.float32) if ax_idx != 1 else np.array([1.0, 0.0, 0.0], dtype=np.float32)))
+                    v = _normalize(np.cross(ax_vec, u))
+                    rad = sc * 0.85
+                    segs = 28
+                    for k in range(segs):
+                        a0 = 2.0 * math.pi * k / segs
+                        a1 = 2.0 * math.pi * (k + 1) / segs
+                        p0 = origin + (u * math.cos(a0) + v * math.sin(a0)) * rad
+                        p1 = origin + (u * math.cos(a1) + v * math.sin(a1)) * rad
+                        self._append_ribbon_seg(top_pts, p0, p1, cam, ax_w * (1.4 if hl else 1.0), col)
+                else:
+                    tip = origin + ax_vec * sc
+                    self._append_ribbon_seg(top_pts, origin, tip, cam, ax_w * (1.5 if hl else 1.0), col)
+                    # Tip cap (arrow/cube indicator)
+                    cap = sc * 0.12
+                    _box_edges(top_pts, tip - cap, tip + cap, col, ax_w * 0.85)
+
+        # 3. Road spline overlay (depth-tested)
+        if self.show_roads and self.world.road_graph.nodes:
+            nodes = self.world.road_graph.nodes
+            for edge in self.world.road_graph.edges:
+                na, nb = nodes.get(edge.a), nodes.get(edge.b)
+                if na is None or nb is None:
+                    continue
+                p0 = np.array([na.x, na.y + 0.55, na.z], dtype=np.float32)
+                p1 = np.array([nb.x, nb.y + 0.55, nb.z], dtype=np.float32)
+                col = (0.85, 0.45, 1.0, 0.85) if edge.two_way else (0.20, 0.85, 1.0, 0.85)
+                self._append_ribbon_seg(depth_pts, p0, p1, cam, 0.35, col)
+            if self.selected_road_node_id is not None and self.selected_road_node_id in nodes:
+                sn = nodes[self.selected_road_node_id]
+                sp = np.array([sn.x, sn.y + 0.65, sn.z], dtype=np.float32)
+                _box_edges(top_pts, sp - 1.1, sp + 1.1, (1.0, 0.90, 0.2, 1.0), 0.14)
+
+        # 4. World Markers (spawns, start grids, triggers, car spots)
+        if self.show_markers and self.world.markers:
+            for mk in self.world.markers:
+                mp = np.array(mk.position, dtype=np.float32)
+                is_sel = mk is self.selected_marker
+                col = (1.0, 0.92, 0.25, 1.0) if is_sel else (0.20, 0.95, 0.48, 0.92)
+                self._append_ribbon_seg(depth_pts, mp, mp + np.array([0.0, 3.6, 0.0], dtype=np.float32), cam, 0.22 if is_sel else 0.15, col)
+                rad = math.radians(mk.heading_deg)
+                fwd = np.array([math.sin(rad), 0.0, math.cos(rad)], dtype=np.float32) * 3.0
+                self._append_ribbon_seg(depth_pts, mp + np.array([0.0, 1.8, 0.0], dtype=np.float32), mp + np.array([0.0, 1.8, 0.0], dtype=np.float32) + fwd, cam, 0.14, col)
+
+        # 5. Ghost placement / Scatter brush ring
+        if self.active_tool == "place" and self.ghost_pos is not None:
+            gp = self.ghost_pos
+            _box_edges(top_pts, gp + np.array([-2.2, 0.0, -2.2], dtype=np.float32), gp + np.array([2.2, 2.5, 2.2], dtype=np.float32), (0.2, 1.0, 0.65, 0.95), 0.12)
+        elif self.active_tool == "scatter" and self.scatter_hover_pos is not None:
+            sp = self.scatter_hover_pos
+            rad = float(self.scatter_hud.spn_radius.value())
+            segs = 28
+            for k in range(segs):
+                a0 = 2.0 * math.pi * k / segs
+                a1 = 2.0 * math.pi * (k + 1) / segs
+                p0 = np.array([sp[0] + math.cos(a0) * rad, sp[1] + 0.5, sp[2] + math.sin(a0) * rad], dtype=np.float32)
+                p1 = np.array([sp[0] + math.cos(a1) * rad, sp[1] + 0.5, sp[2] + math.sin(a1) * rad], dtype=np.float32)
+                self._append_ribbon_seg(top_pts, p0, p1, cam, 0.25, (0.2, 0.95, 0.55, 0.95))
+
+        # 6. Collision SOBL barriers when Collision overlay is ON
+        if self.show_collision and self.world.collision.sobl_records:
+            for rec in self.world.collision.sobl_records[:600]:
+                if rec.get("kind") != "box":
+                    continue
+                c = np.array(rec["centre"], dtype=np.float32)
+                r = np.array(rec["radii"], dtype=np.float32)
+                is_sel = int(rec.get("index", -1)) == self.selected_barrier_idx
+                col = (1.0, 0.95, 0.2, 0.95) if is_sel else (1.0, 0.42, 0.15, 0.72)
+                _box_edges(top_pts if is_sel else depth_pts, c - r, c + r, col, 0.16 if is_sel else 0.09)
+
+        top_arr = np.array(top_pts, dtype=np.float32) if top_pts else None
+        depth_arr = np.array(depth_pts, dtype=np.float32) if depth_pts else None
+        return top_arr, depth_arr
+
     # -----------------------------------------------------------------------
     # Paint Frame
     # -----------------------------------------------------------------------
@@ -2409,6 +2610,8 @@ class ViewportGL(QOpenGLWidget):
             if self._plume_dirty:
                 child.upload(self.world, self.layer_visibility)
                 self._plume_dirty = False
+            top_v, depth_v = self._build_plume_overlay_verts()
+            child.upload_overlay(top_v, depth_v)
             fwd, right, up = self.camera_vectors()
             view = lh_look_matrix(self.cam_pos, fwd, right, up)
             proj = lh_perspective(self.cam_fov, max(1, self.width()) / max(1, self.height()), 0.4, 4500.0)
@@ -2890,11 +3093,11 @@ class ViewportGL(QOpenGLWidget):
             ray_o, ray_d, np.array([0.0, plane_y, 0.0], dtype=np.float32), np.array([0.0, 1.0, 0.0], dtype=np.float32)
         )
 
-    def _pick_road_node(self, ray_o: np.ndarray, ray_d: np.ndarray, max_rad: float = 3.2) -> int | None:
+    def _pick_road_node_with_t(self, ray_o: np.ndarray, ray_d: np.ndarray, max_rad: float = 3.2) -> tuple[int | None, float]:
         if self.world is None or not self.show_roads:
-            return None
+            return None, 1e9
         best_id = None
-        best_score = max_rad
+        best_t = 1e9
         for nid, n in self.world.road_graph.nodes.items():
             p = np.array([n.x, n.y + 0.65, n.z], dtype=np.float32)
             v = p - ray_o
@@ -2902,15 +3105,19 @@ class ViewportGL(QOpenGLWidget):
             if t < 0.5:
                 continue
             perp = float(np.linalg.norm(v - ray_d * t))
-            tol = max(max_rad, t * 0.025)
-            if perp < tol and perp < best_score + t * 0.025:
-                best_score = perp
+            tol = max(max_rad, min(14.0, t * 0.022))
+            if perp < tol and t < best_t:
+                best_t = t
                 best_id = nid
-        return best_id
+        return best_id, best_t
 
-    def _pick_marker(self, ray_o: np.ndarray, ray_d: np.ndarray) -> WorldMarker | None:
+    def _pick_road_node(self, ray_o: np.ndarray, ray_d: np.ndarray, max_rad: float = 3.2) -> int | None:
+        nid, _t = self._pick_road_node_with_t(ray_o, ray_d, max_rad=max_rad)
+        return nid
+
+    def _pick_marker_with_t(self, ray_o: np.ndarray, ray_d: np.ndarray) -> tuple[WorldMarker | None, float]:
         if self.world is None or not self.show_markers:
-            return None
+            return None, 1e9
         best = None
         best_t = 1e9
         for m in self.world.markers:
@@ -2920,23 +3127,27 @@ class ViewportGL(QOpenGLWidget):
             if t < 0.5:
                 continue
             perp = float(np.linalg.norm(v - ray_d * t))
-            if perp < max(2.2, t * 0.025) and t < best_t:
+            if perp < max(2.2, min(12.0, t * 0.022)) and t < best_t:
                 best_t = t
                 best = m
-        return best
+        return best, best_t
+
+    def _pick_marker(self, ray_o: np.ndarray, ray_d: np.ndarray) -> WorldMarker | None:
+        mk, _t = self._pick_marker_with_t(ray_o, ray_d)
+        return mk
 
     def _pick_object_at_screen(self, sx: float, sy: float) -> WorldObject | None:
-        """Primary pixel-exact picker: GPU Object-ID FBO (1x1/3x3 readback) with exact ray-triangle fallback."""
-        if self._gl_ready and self._prog_id:
+        """Primary pixel-exact picker: GPU Object-ID FBO (PS2 Fast) or exact CPU ray-triangle (Plume HQ / fallback)."""
+        if self.render_mode != "plume" and self._gl_ready and self._prog_id and not self._static_dirty:
             gpu_hit = self._pick_object_gpu(sx, sy)
             if gpu_hit is not None:
                 return gpu_hit
         ray_o, ray_d = self.screen_ray(sx, sy)
         return self._pick_object(ray_o, ray_d)
 
-    def _pick_object(self, ray_o: np.ndarray, ray_d: np.ndarray) -> WorldObject | None:
+    def _pick_object_with_t(self, ray_o: np.ndarray, ray_d: np.ndarray) -> tuple[WorldObject | None, float]:
         if self.world is None:
-            return None
+            return None, 1e9
         inv_d = np.where(np.abs(ray_d) > 1e-8, 1.0 / ray_d, 1e12).astype(np.float32)
         candidates: list[tuple[float, WorldObject]] = []
         for obj in self.world.objects:
@@ -2974,7 +3185,11 @@ class ViewportGL(QOpenGLWidget):
                     if t_world < best_t:
                         best_t = t_world
                         best_obj = obj
-        return best_obj
+        return best_obj, best_t
+
+    def _pick_object(self, ray_o: np.ndarray, ray_d: np.ndarray) -> WorldObject | None:
+        obj, _t = self._pick_object_with_t(ray_o, ray_d)
+        return obj
 
     def _update_road_hover(self, ray_o: np.ndarray, ray_d: np.ndarray) -> None:
         if self.world is None:
@@ -3198,19 +3413,45 @@ class ViewportGL(QOpenGLWidget):
                     s_ref = max(1.0, self._gizmo_scale(origin))
                     factor = max(0.05, 1.0 + (t_now - self._gizmo_drag_start_t) / s_ref)
                     uniform = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-                    for so, sop, _sor, sos, base_min_y in drag_list:
-                        new_s = [v * factor for v in sos] if uniform else list(sos)
+                    if len(drag_list) > 1:
+                        # Scale compound assemblies (e.g. ramp + top wear decal) around shared group pivot
+                        # so sub-parts remain locked together with zero detachment!
+                        pivot = np.array(self._gizmo_drag_orig_pos, dtype=np.float32)
+                        group_base_min_y = min(bmy for _so, _sop, _sor, _sos, bmy in drag_list)
+                        sf = np.array([factor, factor, factor], dtype=np.float32) if uniform else np.array([1.0, 1.0, 1.0], dtype=np.float32)
                         if not uniform:
-                            new_s[ax_idx] = sos[ax_idx] * factor
-                        so.scale = (new_s[0], new_s[1], new_s[2])
-                        # Anchor bottom base on ground during Y-scale so ramps grow UP instead of sinking!
-                        if (uniform or ax_idx == 1) and self.world is not None and so.model_key in self.world.models:
-                            so.position = sop
-                            lo, _hi = so.world_aabb(self.world.models[so.model_key])
-                            dy_anchor = base_min_y - float(lo[1])
-                            so.position = (sop[0], sop[1] + dy_anchor, sop[2])
+                            sf[ax_idx] = factor
+                        new_group_min_y = 1e9
+                        for so, sop, _sor, sos, _bmy in drag_list:
+                            new_s = (sos[0] * float(sf[0]), sos[1] * float(sf[1]), sos[2] * float(sf[2]))
+                            so.scale = new_s
+                            rel = np.array(sop, dtype=np.float32) - pivot
+                            sp = pivot + rel * sf
+                            so.position = (float(sp[0]), float(sp[1]), float(sp[2]))
+                            if self.world is not None and so.model_key in self.world.models:
+                                lo, _hi = so.world_aabb(self.world.models[so.model_key])
+                                new_group_min_y = min(new_group_min_y, float(lo[1]))
+                        if (uniform or ax_idx == 1) and new_group_min_y < 1e8:
+                            dy_anchor = group_base_min_y - new_group_min_y
+                            for so, _sop, _sor, _sos, _bmy in drag_list:
+                                px_, py_, pz_ = so.position
+                                so.position = (px_, py_ + dy_anchor, pz_)
+                    else:
+                        for so, sop, _sor, sos, base_min_y in drag_list:
+                            new_s = [v * factor for v in sos] if uniform else list(sos)
+                            if not uniform:
+                                new_s[ax_idx] = sos[ax_idx] * factor
+                            so.scale = (new_s[0], new_s[1], new_s[2])
+                            # Anchor bottom base on ground during Y-scale so ramps grow UP instead of sinking!
+                            if (uniform or ax_idx == 1) and self.world is not None and so.model_key in self.world.models:
+                                so.position = sop
+                                lo, _hi = so.world_aabb(self.world.models[so.model_key])
+                                dy_anchor = base_min_y - float(lo[1])
+                                so.position = (sop[0], sop[1] + dy_anchor, sop[2])
                 if len(drag_list) > 1:
                     self._sel_dirty = True
+                if self.render_mode == "plume":
+                    self._plume_dirty = True
                 if self.show_collision:
                     self._col_dirty = True
                 self.objectSelected.emit(self.selected_obj)
@@ -3453,15 +3694,21 @@ class ViewportGL(QOpenGLWidget):
                     )
                 return
 
-            # Normal picking: Road Node -> Marker -> SOBL Barrier (if Collision ON) -> World Object
+            # Depth-aware picking: compute object hit first so occluded road nodes / markers behind
+            # foreground ramps or buildings never steal clicks!
+            cpu_obj, obj_t = self._pick_object_with_t(ray_o, ray_d)
+            hit_obj = self._pick_object_at_screen(event.position().x(), event.position().y())
+            if hit_obj is None:
+                hit_obj = cpu_obj
+
             if self.show_roads:
-                hit_nid = self._pick_road_node(ray_o, ray_d, max_rad=2.8)
-                if hit_nid is not None:
+                hit_nid, road_t = self._pick_road_node_with_t(ray_o, ray_d, max_rad=2.4)
+                if hit_nid is not None and (hit_obj is None or road_t <= obj_t + 3.0):
                     self.select_road_node(hit_nid)
                     return
 
-            hit_marker = self._pick_marker(ray_o, ray_d)
-            if hit_marker is not None:
+            hit_marker, marker_t = self._pick_marker_with_t(ray_o, ray_d)
+            if hit_marker is not None and (hit_obj is None or marker_t <= obj_t + 3.0):
                 self.select_marker(hit_marker)
                 return
 
@@ -3471,7 +3718,6 @@ class ViewportGL(QOpenGLWidget):
                     self.select_barrier(hit_b)
                     return
 
-            hit_obj = self._pick_object_at_screen(event.position().x(), event.position().y())
             if hit_obj is not None:
                 gid = self.world.get_active_group_id(hit_obj) if self.world is not None else ""
                 if self._drilled_group_id and gid != self._drilled_group_id:
@@ -3598,6 +3844,11 @@ class ViewportGL(QOpenGLWidget):
     def event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.NativeGesture and self._handle_camera_gesture(event):
             return True
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Tab and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                self.cycle_transform_tool()
+                event.accept()
+                return True
         return super().event(event)
 
     def _handle_camera_gesture(self, event: QNativeGestureEvent) -> bool:
@@ -3648,6 +3899,19 @@ class ViewportGL(QOpenGLWidget):
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
+        mods = event.modifiers()
+        # Never hijack OS/menu modifier chords (Ctrl+S, Cmd+Shift+S, Ctrl+Shift+S, Alt+...) for camera fly!
+        if mods & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.MetaModifier
+            | Qt.KeyboardModifier.AltModifier
+        ):
+            super().keyPressEvent(event)
+            return
+        if key == Qt.Key.Key_Tab:
+            self.cycle_transform_tool()
+            event.accept()
+            return
         self._keys_down.add(key)
         move_keys = {Qt.Key.Key_W, Qt.Key.Key_S, Qt.Key.Key_A, Qt.Key.Key_D, Qt.Key.Key_Q, Qt.Key.Key_E}
         if key in move_keys and not self._timer.isActive():
@@ -3658,7 +3922,7 @@ class ViewportGL(QOpenGLWidget):
                 self.end_current_road_chain()
                 return
         if key == Qt.Key.Key_R and self.active_tool == "place":
-            step = -self.angle_snap_step if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else self.angle_snap_step
+            step = -self.angle_snap_step if (mods & Qt.KeyboardModifier.ShiftModifier) else self.angle_snap_step
             self.ghost_yaw = (self.ghost_yaw + step) % 360.0
             self.statusMessage.emit(f"Ghost rotation: {self.ghost_yaw:.0f}°")
             self.update()

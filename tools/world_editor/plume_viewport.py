@@ -81,6 +81,9 @@ class PlumeViewport(QWidget):
         self.lib.eod_plume_view_texture.restype = ctypes.c_bool
         self.lib.eod_plume_view_clear_textures.argtypes = [ptr]
         self.lib.eod_plume_view_clear_textures.restype = None
+        if hasattr(self.lib, "eod_plume_view_overlay"):
+            self.lib.eod_plume_view_overlay.argtypes = [ptr, ptr, u32, ptr, u32]
+            self.lib.eod_plume_view_overlay.restype = ctypes.c_bool
         self.lib.eod_plume_view_draw.argtypes = [ptr, u32, u32, ptr, ptr, ptr]
         self.lib.eod_plume_view_draw.restype = ctypes.c_int
         self.handle = None
@@ -160,6 +163,26 @@ class PlumeViewport(QWidget):
                                             indices.ctypes.data, len(indices), batches.ctypes.data, len(batches)):
             raise RuntimeError("could not upload the current track geometry")
         self.triangles = len(indices) // 3
+
+    def upload_overlay(self, top_verts: np.ndarray | None, depth_verts: np.ndarray | None) -> bool:
+        """Upload 3D triangle overlays (gizmos, selection boxes, roads, markers, collision)."""
+        if not self.handle or not hasattr(self.lib, "eod_plume_view_overlay"):
+            return False
+        t_arr = (
+            np.ascontiguousarray(top_verts, dtype=np.float32).reshape(-1, 7)
+            if top_verts is not None and len(top_verts) >= 3
+            else None
+        )
+        d_arr = (
+            np.ascontiguousarray(depth_verts, dtype=np.float32).reshape(-1, 7)
+            if depth_verts is not None and len(depth_verts) >= 3
+            else None
+        )
+        t_ptr = t_arr.ctypes.data if t_arr is not None else 0
+        t_cnt = int(len(t_arr)) if t_arr is not None else 0
+        d_ptr = d_arr.ctypes.data if d_arr is not None else 0
+        d_cnt = int(len(d_arr)) if d_arr is not None else 0
+        return bool(self.lib.eod_plume_view_overlay(self.handle, t_ptr, t_cnt, d_ptr, d_cnt))
 
     def draw(self, view_proj, env):
         matrix = clip_matrix(view_proj)
