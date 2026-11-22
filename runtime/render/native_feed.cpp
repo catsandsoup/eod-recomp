@@ -1323,7 +1323,12 @@ std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &c
     if (!layout.valid) fatal("invalid queue PSMT8 transfer layout");
 
     struct Snapshot {
-        std::array<uint8_t, queue_texture_offset(kQueueTextureLevels)> bytes;
+        uint64_t last_frame = ~0ull;
+        uint64_t fingerprint = 0;
+        uint32_t entry = 0;
+        uint32_t palette = 0;
+        uint8_t function = 0xFF;
+        std::array<uint32_t, kQueueTextureLevels> sources{};
         std::shared_ptr<const QueueTexture> decoded;
     };
     static std::unordered_map<uint32_t, Snapshot> snapshots;
@@ -1336,37 +1341,81 @@ std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &c
         bases[l] = uint16_t(base & 0x3FFF);
         base += (bytes + 255) / 256;
     }
-    std::array<uint32_t, 256> colors;
-    for (uint32_t i = 0; i < colors.size(); ++i) {
-        const uint32_t index = (i & ~0x18u) | ((i & 8u) << 1) | ((i & 16u) >> 1);
-        colors[i] = ee_r32(palette + 4 * index);
-    }
     const uint8_t function = ee_r32(texture + 8) ? 3 : 0;
-    if (snapshots.size() >= 128 && !snapshots.count(texture)) snapshots.clear();
+    if (snapshots.size() >= 2048 && !snapshots.count(texture)) {
+        auto oldest = snapshots.begin();
+        for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
+            if (it->second.last_frame < oldest->second.last_frame) oldest = it;
+        }
+        snapshots.erase(oldest);
+    }
     auto &snapshot = snapshots[texture];
-    bool equal = snapshot.decoded && snapshot.decoded->function == function && snapshot.decoded->colors == colors;
-    for (uint32_t l = 0; l < kQueueTextureLevels && equal; ++l) {
-        const auto begin = queue_texture_offset(l);
-        equal = !std::memcmp(snapshot.bytes.data() + begin, g_ram + sources[l], queue_texture_offset(l + 1) - begin);
+    const bool same_binding = snapshot.decoded && snapshot.entry == entry &&
+                              snapshot.palette == palette && snapshot.function == function &&
+                              snapshot.sources == sources;
+    bool equal = same_binding && snapshot.last_frame == p.frame;
+    uint64_t fp = snapshot.fingerprint;
+    if (!equal) {
+        auto mix_u64 = [](uint64_t h, uint64_t v) -> uint64_t {
+            h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            return h * 0x100000001B3ull;
+        };
+        fp = 0x9E3779B97F4A7C15ull;
+        fp = mix_u64(fp, (uint64_t(entry) << 32) | texture);
+        fp = mix_u64(fp, (uint64_t(palette) << 32) | (uint32_t(function) << 16) | kQueueTextureLevels);
+        fp = mix_u64(fp, (uint64_t(ee_r32(texture + 0x10)) << 32) | ee_r32(texture + 0x18));
+        for (uint32_t l = 0; l < kQueueTextureLevels; ++l) fp = mix_u64(fp, sources[l]);
+        // Fast O(1) strided sample: 16 uint64 words across the 1024-byte palette
+        const uint8_t *pal_ptr = g_ram + palette;
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint64_t w = 0;
+            std::memcpy(&w, pal_ptr + i * 64, sizeof(w));
+            fp = mix_u64(fp, w);
+        }
+        // Fast O(1) strided sample: 32 uint64 words across 32 KB mip0 + head/tail words of mip1..mip5
+        const uint8_t *mip0_ptr = g_ram + sources[0];
+        for (uint32_t i = 0; i < 32; ++i) {
+            uint64_t w = 0;
+            std::memcpy(&w, mip0_ptr + i * 1024 + ((i * 24) & 56), sizeof(w));
+            fp = mix_u64(fp, w);
+        }
+        for (uint32_t l = 1; l < kQueueTextureLevels; ++l) {
+            const uint32_t bytes = queue_texture_offset(l + 1) - queue_texture_offset(l);
+            uint64_t w0 = 0, w1 = 0;
+            std::memcpy(&w0, g_ram + sources[l], sizeof(w0));
+            std::memcpy(&w1, g_ram + sources[l] + bytes - sizeof(w1), sizeof(w1));
+            fp = mix_u64(fp, w0 ^ w1);
+        }
+        equal = same_binding && snapshot.fingerprint == fp;
     }
     if (!equal) {
-        for (uint32_t l = 0; l < kQueueTextureLevels; ++l) {
-            const auto begin = queue_texture_offset(l);
-            std::memcpy(snapshot.bytes.data() + begin, g_ram + sources[l], queue_texture_offset(l + 1) - begin);
-        }
         auto decoded = std::make_shared<QueueTexture>();
-        decoded->colors = colors;
+        for (uint32_t i = 0; i < decoded->colors.size(); ++i) {
+            const uint32_t index = (i & ~0x18u) | ((i & 8u) << 1) | ((i & 16u) >> 1);
+            decoded->colors[i] = ee_r32(palette + 4 * index);
+        }
         decoded->function = function;
         decoded->palette_hash = 0x9E3779B97F4A7C15ull;
-        for (uint32_t color : colors) {
+        for (uint32_t color : decoded->colors) {
             decoded->palette_hash = (decoded->palette_hash ^ color) * 0x100000001B3ull;
             decoded->palette_hash ^= decoded->palette_hash >> 29;
         }
-        for (size_t i = 0; i < decoded->indices.size(); ++i)
-            decoded->indices[i] = snapshot.bytes[layout.lanes[i]];
+        for (uint32_t l = 0; l < kQueueTextureLevels; ++l) {
+            const uint32_t begin = queue_texture_offset(l);
+            const uint32_t end = queue_texture_offset(l + 1);
+            const uint8_t *src = g_ram + sources[l];
+            for (uint32_t i = begin; i < end; ++i)
+                decoded->indices[i] = src[layout.lanes[i] - begin];
+        }
         decoded->content_hash = XXH3_64bits(decoded->indices.data(), decoded->indices.size());
         snapshot.decoded = std::move(decoded);
+        snapshot.fingerprint = fp;
+        snapshot.entry = entry;
+        snapshot.palette = palette;
+        snapshot.function = function;
+        snapshot.sources = sources;
     }
+    snapshot.last_frame = p.frame;
     auto material = std::make_unique<QueueMaterial>();
     material->texture = snapshot.decoded;
     material->bases = bases;
@@ -1389,7 +1438,7 @@ std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &c
         uint32_t(material->bias), XXH3_64bits(surface, sizeof surface), function};
     static std::unordered_map<uint64_t, std::shared_ptr<QueueReady>> ready;
     const uint64_t id = XXH3_64bits(key, sizeof key);
-    if (ready.size() >= 256 && !ready.count(id)) ready.clear();
+    if (ready.size() >= 4096 && !ready.count(id)) ready.clear();
     auto &token = ready[id];
     if (!token) token = std::make_shared<QueueReady>();
     material->readiness = token;
