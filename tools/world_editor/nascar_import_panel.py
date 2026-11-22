@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import nascar_firstparty
 from nascar_scanner import (
     SERIES_ORDER,
     EphemeralTestDriveSession,
@@ -48,6 +50,7 @@ class NascarImportPanel(QWidget):
         self.active_session: EphemeralTestDriveSession | None = None
         self.token: CancelToken | None = None
         self._active_series: str = "All"
+        self.last_import_timings: dict[str, float] = {}
 
         root = QVBoxLayout(self)
         root.setSpacing(10)
@@ -136,6 +139,29 @@ class NascarImportPanel(QWidget):
             td_row.addWidget(btn)
         root.addLayout(td_row)
 
+        # --- First-party additive lifecycle options (all default ON) ---
+        opts_row = QHBoxLayout()
+        opts_row.setSpacing(10)
+        self.chk_firstparty_icons = QCheckBox("Generate 3D HUD & Showroom Icons")
+        self.chk_firstparty_icons.setChecked(True)
+        self.chk_firstparty_icons.setToolTip(
+            "Render 256x256 alpha-masked 3D showroom and HUD mini-icons for every imported car."
+        )
+        self.chk_sweeneys_skins = QCheckBox("Add 5 Unpainted Sweeney's Dealership Skins")
+        self.chk_sweeneys_skins.setChecked(True)
+        self.chk_sweeneys_skins.setToolTip(
+            "Generate 5 clean unpainted primer colors (Gray, White, Red, Blue, Black) for Career dealership."
+        )
+        self.chk_paintkit_support = QCheckBox("Enable Full-Panel Paint Shop Support")
+        self.chk_paintkit_support.setChecked(True)
+        self.chk_paintkit_support.setToolTip(
+            "Map all 7 body panels (hood, roof, doors, fenders, decklid) and canvas for in-game Paint Shop."
+        )
+        for chk in (self.chk_firstparty_icons, self.chk_sweeneys_skins, self.chk_paintkit_support):
+            opts_row.addWidget(chk)
+        opts_row.addStretch(1)
+        root.addLayout(opts_row)
+
         # --- Batch / Permanent import controls ---
         import_row = QHBoxLayout()
         self.btn_import_selected = QPushButton("Import Selected")
@@ -172,10 +198,15 @@ class NascarImportPanel(QWidget):
         saved_row.addWidget(self.drive_saved_button)
         root.addLayout(saved_row)
 
-        # --- Status line ---
+        # --- Status line & Tracy telemetry summary ---
         self.status = QLabel("Ready. Ephemeral test drives leave zero permanent files until you click Keep.")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
+
+        self.lbl_profile_summary = QLabel("Tracy profile: idle")
+        self.lbl_profile_summary.setWordWrap(True)
+        self.lbl_profile_summary.setStyleSheet("color: #94a3b8; font-family: monospace; font-size: 11px;")
+        root.addWidget(self.lbl_profile_summary)
 
         self._refresh_imported()
         self._update_button_states()
@@ -183,6 +214,13 @@ class NascarImportPanel(QWidget):
     # ------------------------------------------------------------------
     # Public browser helpers
     # ------------------------------------------------------------------
+    @property
+    def firstparty_options(self) -> dict[str, bool]:
+        return {
+            "enable_icons": self.chk_firstparty_icons.isChecked(),
+            "enable_sweeneys": self.chk_sweeneys_skins.isChecked(),
+            "enable_paintkit": self.chk_paintkit_support.isChecked(),
+        }
     @property
     def active_series(self) -> str:
         return self._active_series
@@ -203,7 +241,11 @@ class NascarImportPanel(QWidget):
         self.source_path_label.setText(target.name)
         self.source_path_label.setToolTip(str(target))
         if synchronous:
-            result = scan_nascar_source(target)
+            scan_ms: dict[str, float] = {}
+            with nascar_firstparty.span("scan", timings=scan_ms):
+                result = scan_nascar_source(target)
+            self.last_import_timings = dict(scan_ms)
+            self.lbl_profile_summary.setText(nascar_firstparty.format_profile_summary(scan_ms))
             self._apply_scan_result(result)
             return result
         if self.token is not None:
@@ -266,7 +308,8 @@ class NascarImportPanel(QWidget):
     @staticmethod
     def _scan_worker_fn(path: Path, *, token: CancelToken, progress) -> NascarScanResult:
         progress(15, f"Reading NASCAR catalog from {path.name}")
-        result = scan_nascar_source(path, cancelled=lambda: token.is_cancelled)
+        with nascar_firstparty.span("scan"):
+            result = scan_nascar_source(path, cancelled=lambda: token.is_cancelled)
         progress(100, result.summary_text)
         return result
 
@@ -431,11 +474,13 @@ class NascarImportPanel(QWidget):
         self.token = CancelToken()
         self._update_button_states()
         self.status.setText(f"{label}…")
+        opts = self.firstparty_options
         worker = FunctionWorker(
             self._batch_import_worker,
             self.source,
             self.game_dir,
             entries,
+            opts,
             token=self.token,
             label=label,
         )
@@ -447,21 +492,56 @@ class NascarImportPanel(QWidget):
 
     @staticmethod
     def _batch_import_worker(
-        source: Path, game_dir: Path, entries: list[NascarCatalogEntry], *, token: CancelToken, progress
-    ) -> list[RegisteredVehicle]:
-        return import_nascar_entries(
+        source: Path,
+        game_dir: Path,
+        entries: list[NascarCatalogEntry],
+        firstparty_opts: dict[str, bool],
+        *,
+        token: CancelToken,
+        progress,
+    ) -> tuple[list[RegisteredVehicle], dict[str, float], str]:
+        vehicles = import_nascar_entries(
             source,
             game_dir,
             entries,
             cancelled=lambda: token.is_cancelled,
             progress=progress,
         )
+        agg_timings: dict[str, float] = {}
+        any_fp = any(firstparty_opts.values())
+        eod_data = game_dir / "DATA"
+        if any_fp and (eod_data / "RES" / "UIBIG.RES").is_file():
+            for veh, entry in zip(vehicles, entries):
+                if token.is_cancelled:
+                    raise InterruptedError("Vehicle import cancelled")
+                res = nascar_firstparty.apply_firstparty_to_overlay(
+                    eod_data=eod_data,
+                    overlay_dir=veh.layer,
+                    chassis=veh.chassis,
+                    livery_id=veh.number,
+                    driver_name=entry.driver,
+                    display_number=entry.car_number,
+                    **firstparty_opts,
+                )
+                for k, v in res.get("timings_ms", {}).items():
+                    agg_timings[k] = agg_timings.get(k, 0.0) + float(v)
+        summary = nascar_firstparty.format_profile_summary(agg_timings) if agg_timings else "Tracy: import complete"
+        return vehicles, agg_timings, summary
 
-    def _on_import_finished(self, _generation: int, vehicles: list[RegisteredVehicle]) -> None:
+    def _on_import_finished(self, _generation: int, payload: object) -> None:
         self.token = None
+        if isinstance(payload, tuple) and len(payload) == 3:
+            vehicles, timings_ms, summary = payload
+        else:
+            vehicles, timings_ms, summary = payload, {}, ""
         selected = vehicles[-1] if vehicles else None
         self._refresh_imported(selected=selected)
-        self.status.setText(f"Imported {len(vehicles)} NASCAR vehicle(s) to local library.")
+        self.last_import_timings = dict(timings_ms)
+        if summary:
+            self.lbl_profile_summary.setText(summary)
+        total_ms = timings_ms.get("total_ms", 0.0)
+        suffix = f" in {total_ms:.0f} ms" if total_ms > 0.0 else ""
+        self.status.setText(f"Imported {len(vehicles)} NASCAR vehicle(s) to local library{suffix}.")
         self._update_button_states()
 
     # ------------------------------------------------------------------
@@ -504,6 +584,9 @@ class NascarImportPanel(QWidget):
         self.btn_import_selected.setEnabled(not busy and has_scan and has_selection)
         self.btn_import_series.setEnabled(not busy and has_series_target)
         self.btn_import_all.setEnabled(not busy and has_scan)
+        self.chk_firstparty_icons.setEnabled(not busy)
+        self.chk_sweeneys_skins.setEnabled(not busy)
+        self.chk_paintkit_support.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
         self.drive_saved_button.setEnabled(not busy and self.imported.currentData() is not None)
 
