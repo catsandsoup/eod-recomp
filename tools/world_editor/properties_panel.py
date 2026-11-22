@@ -239,8 +239,8 @@ class PropertiesPanel(QWidget):
             "color: #4ade80; font-size: 8.2pt; font-weight: 600; background: transparent;"
         )
         self.lbl_multi_sel.hide()
-        self.obj_written_lbl = QLabel("Written: No — Ctrl+Shift+S writes it")
-        self.obj_written_lbl.setStyleSheet(f"color: {ACCENT_AMBER}; font-size: 8.5pt; font-weight: 600; background: transparent;")
+        self.obj_written_lbl = QLabel("Status: Unsaved Changes")
+        self.obj_written_lbl.setStyleSheet("color: #fbbf24; font-size: 8.5pt; font-weight: 600; background: transparent;")
         h_lay.addWidget(self.obj_title)
         h_lay.addWidget(self.lbl_multi_sel)
         h_lay.addWidget(self.obj_written_lbl)
@@ -276,18 +276,21 @@ class PropertiesPanel(QWidget):
 
         lbl_pos = QLabel("Position (m)")
         lbl_pos.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt; background: transparent;")
-        self.obj_pos_ed = Vec3Editor(("X", "Y", "Z"), decimals=2, step=0.5)
+        self.obj_pos_ed = Vec3Editor(("X", "Y", "Z"), decimals=4, step=0.5)
         self.obj_pos_ed.editingFinished.connect(self._on_obj_transform_edited)
+        self.pos_edit = self.obj_pos_ed
 
         lbl_rot = QLabel("Rotation (H / P / R deg)")
         lbl_rot.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt; background: transparent;")
-        self.obj_rot_ed = Vec3Editor(("H", "P", "R"), decimals=1, step=5.0, minimum=-360.0, maximum=360.0)
+        self.obj_rot_ed = Vec3Editor(("H", "P", "R"), decimals=2, step=5.0, minimum=-360.0, maximum=360.0)
         self.obj_rot_ed.editingFinished.connect(self._on_obj_transform_edited)
+        self.rot_edit = self.obj_rot_ed
 
         lbl_scl = QLabel("Scale")
         lbl_scl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 8.5pt; background: transparent;")
-        self.obj_scl_ed = Vec3Editor(("X", "Y", "Z"), decimals=2, step=0.1, minimum=0.05, maximum=200.0)
+        self.obj_scl_ed = Vec3Editor(("X", "Y", "Z"), decimals=4, step=0.1, minimum=0.05, maximum=200.0)
         self.obj_scl_ed.editingFinished.connect(self._on_obj_transform_edited)
+        self.scale_edit = self.obj_scl_ed
 
         t_lay.addWidget(lbl_pos)
         t_lay.addWidget(self.obj_pos_ed)
@@ -486,8 +489,9 @@ class PropertiesPanel(QWidget):
         lbl_p = QLabel("POSITION (X / Y / Z)")
         lbl_p.setProperty("sectionTitle", True)
         lbl_p.setStyleSheet("background: transparent;")
-        self.road_pos_ed = Vec3Editor(("X", "Y", "Z"), decimals=2, step=0.5)
+        self.road_pos_ed = Vec3Editor(("X", "Y", "Z"), decimals=4, step=0.5)
         self.road_pos_ed.editingFinished.connect(self._on_road_pos_edited)
+        self.road_pos_edit = self.road_pos_ed
         p_lay.addWidget(lbl_p)
         p_lay.addWidget(self.road_pos_ed)
         lay.addWidget(p_card)
@@ -580,9 +584,12 @@ class PropertiesPanel(QWidget):
         lbl_p = QLabel("TRANSFORM (DRAG 3D GIZMO OR EDIT)")
         lbl_p.setProperty("sectionTitle", True)
         lbl_p.setStyleSheet("background: transparent;")
-        self.mk_pos_ed = Vec3Editor(("X", "Y", "Z"), decimals=2, step=0.5)
+        self.mk_pos_ed = Vec3Editor(("X", "Y", "Z"), decimals=4, step=0.5)
         self.mk_pos_ed.editingFinished.connect(self._on_marker_edited)
-        self.mk_hdg_ed = AxisSpinBox("H", "#43b564", decimals=1, step=5.0, minimum=-360.0, maximum=360.0)
+        self.marker_pos_edit = self.mk_pos_ed
+        self.sobl_pos_edit: Vec3Editor | None = None
+        self.sobl_ext_edit: Vec3Editor | None = None
+        self.mk_hdg_ed = AxisSpinBox("H", "#43b564", decimals=2, step=5.0, minimum=-360.0, maximum=360.0)
         self.mk_hdg_ed.editingFinished.connect(self._on_marker_edited)
         t_lay.addWidget(lbl_p)
         t_lay.addWidget(self.mk_pos_ed)
@@ -841,11 +848,11 @@ class PropertiesPanel(QWidget):
             self.lbl_multi_sel.hide()
             self.btn_delete.setText(" Delete")
         if obj.written:
-            self.obj_written_lbl.setText("Written: Yes (matches retail / exported layer)")
-            self.obj_written_lbl.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 8.5pt; font-weight: 600; background: transparent;")
+            self.obj_written_lbl.setText("Status: Saved in Mod Layer")
+            self.obj_written_lbl.setStyleSheet("color: #34d399; font-size: 8.5pt; font-weight: 600; background: transparent;")
         else:
-            self.obj_written_lbl.setText("Written: No — Ctrl+Shift+S writes it")
-            self.obj_written_lbl.setStyleSheet(f"color: {ACCENT_AMBER}; font-size: 8.5pt; font-weight: 600; background: transparent;")
+            self.obj_written_lbl.setText("Status: Unsaved Changes")
+            self.obj_written_lbl.setStyleSheet("color: #fbbf24; font-size: 8.5pt; font-weight: 600; background: transparent;")
 
         self.val_source.setText(obj.source)
         self.val_section.setText(obj.section_mlist)
@@ -999,6 +1006,28 @@ class PropertiesPanel(QWidget):
     # -----------------------------------------------------------------------
     # Commit Handlers
     # -----------------------------------------------------------------------
+    def set_object(self, obj: WorldObject | None) -> None:
+        self.show_object(obj, self._current_textures)
+
+    def flush_pending_edits(self) -> None:
+        """Flush any in-progress spinbox/text edits so Save/Write Mod/PIE never misses uncommitted values."""
+        if self._updating:
+            return
+        for ed in (
+            getattr(self, "pos_edit", None),
+            getattr(self, "rot_edit", None),
+            getattr(self, "scale_edit", None),
+            getattr(self, "road_pos_edit", None),
+            getattr(self, "marker_pos_edit", None),
+            getattr(self, "mk_hdg_ed", None),
+            getattr(self, "sobl_pos_edit", None),
+            getattr(self, "sobl_ext_edit", None),
+        ):
+            if ed is not None and hasattr(ed, "flush"):
+                ed.flush()
+        if self._current_marker is not None and hasattr(self, "mk_name_ed"):
+            self._on_marker_meta_edited()
+
     def _on_obj_transform_edited(self) -> None:
         if self._updating or self._current_obj is None:
             return

@@ -8,7 +8,7 @@ import ctypes
 import sys
 from functools import lru_cache
 
-from PySide6.QtCore import QByteArray, QSize, Qt, Signal
+from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -712,8 +712,13 @@ class AxisSpinBox(QWidget):
         layout.addWidget(self.badge)
         layout.addWidget(self.spin, 1)
 
+        self._last_committed: float | None = None
         self.spin.valueChanged.connect(self.valueChanged.emit)
-        self.spin.editingFinished.connect(self.editingFinished.emit)
+        self.spin.editingFinished.connect(self._on_spin_editing_finished)
+
+    def _on_spin_editing_finished(self) -> None:
+        self._last_committed = self.value()
+        self.editingFinished.emit()
 
     def value(self) -> float:
         return float(self.spin.value())
@@ -722,6 +727,14 @@ class AxisSpinBox(QWidget):
         self.spin.blockSignals(True)
         self.spin.setValue(float(val))
         self.spin.blockSignals(False)
+        self._last_committed = float(self.spin.value())
+
+    def flush(self) -> None:
+        self.spin.interpretText()
+        cur = self.value()
+        if self._last_committed is None or abs(cur - self._last_committed) > 1e-6:
+            self._last_committed = cur
+            self.editingFinished.emit()
 
 
 class Vec3Editor(QWidget):
@@ -733,7 +746,7 @@ class Vec3Editor(QWidget):
     def __init__(
         self,
         labels: tuple[str, str, str] = ("X", "Y", "Z"),
-        decimals: int = 2,
+        decimals: int = 4,
         step: float = 0.25,
         minimum: float = -100000.0,
         maximum: float = 100000.0,
@@ -744,22 +757,68 @@ class Vec3Editor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
+        self._setting_values = False
+        self._last_committed: tuple[float, float, float] | None = None
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(150)
+        self._debounce_timer.timeout.connect(self.flush)
+
         colors = (AXIS_X_COLOR, AXIS_Y_COLOR, AXIS_Z_COLOR)
         self.boxes: list[AxisSpinBox] = []
         for lbl, col in zip(labels, colors):
             box = AxisSpinBox(lbl, col, decimals=decimals, step=step, minimum=minimum, maximum=maximum)
             box.valueChanged.connect(self._on_any_changed)
-            box.editingFinished.connect(self.editingFinished.emit)
+            box.editingFinished.connect(self._on_box_editing_finished)
             layout.addWidget(box, 1)
             self.boxes.append(box)
+        self.x = self.boxes[0].spin
+        self.y = self.boxes[1].spin
+        self.z = self.boxes[2].spin
 
     def _on_any_changed(self, _val: float) -> None:
+        if self._setting_values:
+            return
         self.valuesChanged.emit(self.boxes[0].value(), self.boxes[1].value(), self.boxes[2].value())
+        self._debounce_timer.start()
+
+    def _on_box_editing_finished(self) -> None:
+        if self._setting_values:
+            return
+        if self._debounce_timer.isActive():
+            self._debounce_timer.stop()
+        cur = self.values()
+        self._last_committed = cur
+        self.editingFinished.emit()
+
+    def flush(self) -> None:
+        """Interpret any pending spinbox text and commit immediately if modified."""
+        if self._debounce_timer.isActive():
+            self._debounce_timer.stop()
+        for sb in (self.x, self.y, self.z):
+            sb.interpretText()
+        cur = self.values()
+        if self._last_committed is None or any(abs(a - b) > 1e-6 for a, b in zip(cur, self._last_committed)):
+            self._last_committed = cur
+            self.editingFinished.emit()
 
     def values(self) -> tuple[float, float, float]:
         return (self.boxes[0].value(), self.boxes[1].value(), self.boxes[2].value())
 
+    def value(self) -> tuple[float, float, float]:
+        return self.values()
+
     def setValues(self, x: float, y: float, z: float) -> None:
-        self.boxes[0].setValue(x)
-        self.boxes[1].setValue(y)
-        self.boxes[2].setValue(z)
+        self._setting_values = True
+        if self._debounce_timer.isActive():
+            self._debounce_timer.stop()
+        try:
+            self.boxes[0].setValue(x)
+            self.boxes[1].setValue(y)
+            self.boxes[2].setValue(z)
+            self._last_committed = self.values()
+        finally:
+            self._setting_values = False
+
+    def set_value(self, x: float, y: float, z: float) -> None:
+        self.setValues(x, y, z)
