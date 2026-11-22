@@ -171,21 +171,35 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
     }
 }
 } // namespace
-void battle_driver_reset(){states={};navigation.reset();}
 
 namespace {
 struct PieLiveControl {
     bool ai_autodrive = false;
+    bool free_cam = false;
     int camera_view = -1;
     float speed_boost = 1.0f;
     float grip_boost = 1.0f;
     float ride_height_delta = 0.0f;
+    float applied_ride_height = 0.0f;
+    uint32_t ride_height_car = 0;
     int arcade_mode = 0; // 0=none, 1=tag, 2=cat_mouse, 3=juggernaut
     uint32_t it_slot = 0;
     float last_tag_time = 0.0f;
 };
 PieLiveControl g_pie_ctrl{};
 uint32_t g_pie_poll_counter = 0;
+bool g_spawn_pos_applied = false;
+
+int parse_arcade_mode_value(const char *v) {
+    if (!v) return 0;
+    while (*v == ' ' || *v == '\t') ++v;
+    if (std::strncmp(v, "tag", 3) == 0) return 1;
+    if (std::strncmp(v, "cat_mouse", 9) == 0) return 2;
+    if (std::strncmp(v, "juggernaut", 10) == 0) return 3;
+    if (std::strncmp(v, "off", 3) == 0 || std::strncmp(v, "none", 4) == 0 ||
+        std::strncmp(v, "free_roam", 9) == 0) return 0;
+    return std::clamp(std::atoi(v), 0, 3);
+}
 
 void poll_pie_live_control() {
     static bool init_done = false;
@@ -193,12 +207,10 @@ void poll_pie_live_control() {
         init_done = true;
         if (const char *ad = std::getenv("EOD_AI_AUTODRIVE")) g_pie_ctrl.ai_autodrive = (ad[0] == '1');
         if (const char *fc = std::getenv("EOD_FREE_CAM")) {
-            if (fc[0] == '1') g_pie_ctrl.camera_view = 9; // TV / Free overview cam
+            g_pie_ctrl.free_cam = (fc[0] == '1');
         }
         if (const char *am = std::getenv("EOD_ARCADE_MODE")) {
-            if (std::strcmp(am, "tag") == 0) g_pie_ctrl.arcade_mode = 1;
-            else if (std::strcmp(am, "cat_mouse") == 0) g_pie_ctrl.arcade_mode = 2;
-            else if (std::strcmp(am, "juggernaut") == 0) g_pie_ctrl.arcade_mode = 3;
+            g_pie_ctrl.arcade_mode = parse_arcade_mode_value(am);
         }
     }
     const char *ctrl_path = std::getenv("EOD_PIE_CONTROL_FILE");
@@ -218,11 +230,43 @@ void poll_pie_live_control() {
         return p;
     };
     if (const char *v = parse_kv("ai_autodrive")) g_pie_ctrl.ai_autodrive = (std::atoi(v) != 0);
+    if (const char *v = parse_kv("free_cam")) g_pie_ctrl.free_cam = (std::atoi(v) != 0);
     if (const char *v = parse_kv("camera_view")) g_pie_ctrl.camera_view = std::atoi(v);
     if (const char *v = parse_kv("speed_boost")) g_pie_ctrl.speed_boost = std::clamp((float)std::atof(v), 0.3f, 3.0f);
     if (const char *v = parse_kv("grip_boost")) g_pie_ctrl.grip_boost = std::clamp((float)std::atof(v), 0.3f, 3.0f);
     if (const char *v = parse_kv("ride_height_delta")) g_pie_ctrl.ride_height_delta = std::clamp((float)std::atof(v), -1.5f, 2.5f);
-    if (const char *v = parse_kv("arcade_mode")) g_pie_ctrl.arcade_mode = std::atoi(v);
+    if (const char *v = parse_kv("arcade_mode")) g_pie_ctrl.arcade_mode = parse_arcade_mode_value(v);
+}
+
+void maybe_apply_spawn_pos_override(uint32_t car) {
+    if (g_spawn_pos_applied) return;
+    const char *sp = std::getenv("EOD_SPAWN_POS");
+    if (!sp || !*sp) {
+        g_spawn_pos_applied = true;
+        return;
+    }
+    float sx = 0.0f, sy = 0.0f, sz = 0.0f, heading_deg = 0.0f;
+    const int got = std::sscanf(sp, "%f,%f,%f,%f", &sx, &sy, &sz, &heading_deg);
+    if (got < 3 || !std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(sz)) {
+        g_spawn_pos_applied = true;
+        return;
+    }
+    g_spawn_pos_applied = true;
+    // Car transform matrix (3x3 rows + pos at +0x64..+0x90) and linear velocity (+0x104..+0x10C)
+    wf(car + 0x88, sx);
+    wf(car + 0x8C, sy);
+    wf(car + 0x90, sz);
+    wf(car + 0x104, 0.0f);
+    wf(car + 0x108, 0.0f);
+    wf(car + 0x10C, 0.0f);
+    if (got >= 4 && std::isfinite(heading_deg)) {
+        const float rad = heading_deg * 0.01745329252f;
+        const float c = std::cos(rad), s = std::sin(rad);
+        // Right = (c, 0, -s), Up = (0, 1, 0), Forward = (s, 0, c)
+        wf(car + 0x64, c);  wf(car + 0x68, 0.0f); wf(car + 0x6C, -s);
+        wf(car + 0x70, 0.0f); wf(car + 0x74, 1.0f); wf(car + 0x78, 0.0f);
+        wf(car + 0x7C, s);  wf(car + 0x80, 0.0f); wf(car + 0x84, c);
+    }
 }
 
 void sync_opt_terrain_mask() {
@@ -321,6 +365,29 @@ void apply_live_car_tuner_and_arcade(uint32_t player_car) {
             }
         }
     }
+    if (std::fabs(g_pie_ctrl.grip_boost - 1.0f) > 0.02f) {
+        const float rx = rf(player_car + 0x64), rz = rf(player_car + 0x6C);
+        const float vx = rf(player_car + 0x104), vz = rf(player_car + 0x10C);
+        if (std::isfinite(rx) && std::isfinite(rz) && std::isfinite(vx) && std::isfinite(vz)) {
+            const float lat = vx * rx + vz * rz;
+            // grip_boost > 1 damps lateral slip; < 1 increases drift slip slightly
+            const float damp = std::clamp((g_pie_ctrl.grip_boost - 1.0f) * 0.08f, -0.04f, 0.20f);
+            wf(player_car + 0x104, vx - rx * lat * damp);
+            wf(player_car + 0x10C, vz - rz * lat * damp);
+        }
+    }
+    if (g_pie_ctrl.ride_height_car != player_car) {
+        g_pie_ctrl.ride_height_car = player_car;
+        g_pie_ctrl.applied_ride_height = 0.0f;
+    }
+    const float rh_diff = g_pie_ctrl.ride_height_delta - g_pie_ctrl.applied_ride_height;
+    if (std::fabs(rh_diff) > 0.01f) {
+        const float y = rf(player_car + 0x8C);
+        if (std::isfinite(y)) {
+            wf(player_car + 0x8C, y + rh_diff);
+            g_pie_ctrl.applied_ride_height = g_pie_ctrl.ride_height_delta;
+        }
+    }
     // Tag / Infected contact check across active cars
     if (g_pie_ctrl.arcade_mode == 1) {
         const float now = rf(0x3CDACC);
@@ -345,10 +412,24 @@ void apply_live_car_tuner_and_arcade(uint32_t player_car) {
 }
 } // namespace
 
+void battle_driver_reset(){
+    states={};
+    navigation.reset();
+    g_spawn_pos_applied=false;
+    g_pie_ctrl.applied_ride_height=0.0f;
+    g_pie_ctrl.ride_height_car=0;
+}
+
+bool battle_driver_is_free_cam() {
+    poll_pie_live_control();
+    return g_pie_ctrl.free_cam;
+}
+
 void pie_update_player(uint32_t car) {
     if (!valid(car, 0x1C34) || netplay_car::is_puppet(car)) return;
     sync_opt_terrain_mask();
     poll_pie_live_control();
+    maybe_apply_spawn_pos_override(car);
     // The HumanDriver writes the pedals and steering even when the pad is idle.
     // Apply ILIN input here after those writes and before the next physics step.
     if (g_pie_ctrl.ai_autodrive && !ee_r32(0x44744C) && !ee_r32(0x447454)) {

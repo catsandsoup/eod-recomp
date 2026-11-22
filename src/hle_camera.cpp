@@ -7,15 +7,19 @@
 // (docs/NATIVE_CAMERA_ASPECT.md) is retired. The aspect the GS command stream
 // carries per frame is the one game_patches_vblank reports through
 // platform_set_aspect.
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
+#include "battle_driver.h"
 #include "core/config.h"
 #include "core/cpu.h"
 #include "core/memory.h"
 #include "platform/display_rect.h"
+#include "platform/platform.h"
 #include "platform/presentation.h"
 
 extern "C" void f_0034E530_orig();
@@ -99,6 +103,105 @@ static void camera_keys() {
     }
 }
 
+namespace {
+struct FreeCamState {
+    bool active = false;
+    uint64_t last_vblank = 0;
+    float pos[3] = {0.0f, 15.0f, 0.0f};
+    float yaw = 0.0f;
+    float pitch = -0.25f;
+};
+FreeCamState g_free_cam{};
+
+static float cam_rf(uint32_t addr) {
+    const uint32_t u = ee_r32(addr);
+    float v;
+    std::memcpy(&v, &u, sizeof(v));
+    return v;
+}
+static void cam_wf(uint32_t addr, float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, sizeof(u));
+    ee_w32(addr, u);
+}
+
+static void apply_free_cam_override() {
+    if (!battle_driver_is_free_cam()) {
+        g_free_cam.active = false;
+        return;
+    }
+    constexpr uint32_t kCameraRotation = 0x3E57A8;
+    constexpr uint32_t kCameraPosition = 0x3E57CC;
+    const uint64_t vb = kernel_vblank_count();
+    if (!g_free_cam.active) {
+        g_free_cam.active = true;
+        g_free_cam.last_vblank = vb;
+        g_free_cam.pos[0] = cam_rf(kCameraPosition + 0);
+        g_free_cam.pos[1] = cam_rf(kCameraPosition + 4);
+        g_free_cam.pos[2] = cam_rf(kCameraPosition + 8);
+        const float fx = cam_rf(kCameraRotation + 24);
+        const float fy = cam_rf(kCameraRotation + 28);
+        const float fz = cam_rf(kCameraRotation + 32);
+        if (std::isfinite(fx) && std::isfinite(fy) && std::isfinite(fz)) {
+            g_free_cam.yaw = std::atan2(fx, fz);
+            g_free_cam.pitch = std::clamp(std::asin(std::clamp(fy, -0.99f, 0.99f)), -1.45f, 1.45f);
+        }
+    }
+    if (vb != g_free_cam.last_vblank) {
+        const float dt = std::clamp(static_cast<float>(vb - g_free_cam.last_vblank) * (1.0f / 60.0f), 0.0f, 0.1f);
+        g_free_cam.last_vblank = vb;
+        HostPadState pad{};
+        platform_get_pad(0, &pad);
+        auto axis = [](uint8_t v) -> float {
+            const float f = (static_cast<float>(v) - 128.0f) / 127.0f;
+            return std::fabs(f) < 0.15f ? 0.0f : f;
+        };
+        float move_f = -axis(pad.ly);
+        float move_r = axis(pad.lx);
+        if (pad.buttons & PAD_UP) move_f += 1.0f;
+        if (pad.buttons & PAD_DOWN) move_f -= 1.0f;
+        if (pad.buttons & PAD_RIGHT) move_r += 1.0f;
+        if (pad.buttons & PAD_LEFT) move_r -= 1.0f;
+        float move_u = 0.0f;
+        if (pad.buttons & PAD_R1) move_u += 1.0f;
+        if (pad.buttons & PAD_L1) move_u -= 1.0f;
+
+        float look_x = axis(pad.rx);
+        float look_y = -axis(pad.ry);
+        if (pad.buttons & PAD_CIRCLE) look_x += 0.8f;
+        if (pad.buttons & PAD_SQUARE) look_x -= 0.8f;
+        if (pad.buttons & PAD_TRIANGLE) look_y += 0.8f;
+        if (pad.buttons & PAD_CROSS) look_y -= 0.8f;
+
+        g_free_cam.yaw += look_x * 2.1f * dt;
+        g_free_cam.pitch = std::clamp(g_free_cam.pitch + look_y * 1.6f * dt, -1.45f, 1.45f);
+
+        const float cy = std::cos(g_free_cam.yaw), sy = std::sin(g_free_cam.yaw);
+        const float cp = std::cos(g_free_cam.pitch), sp = std::sin(g_free_cam.pitch);
+        const float fwd[3] = {sy * cp, sp, cy * cp};
+        const float right[3] = {cy, 0.0f, -sy};
+        const float speed = (pad.buttons & PAD_R2) ? 90.0f : ((pad.buttons & PAD_L2) ? 12.0f : 35.0f);
+        for (int i = 0; i < 3; ++i) {
+            g_free_cam.pos[i] += (fwd[i] * move_f + right[i] * move_r) * speed * dt;
+        }
+        g_free_cam.pos[1] += move_u * speed * dt;
+    }
+
+    const float cy = std::cos(g_free_cam.yaw), sy = std::sin(g_free_cam.yaw);
+    const float cp = std::cos(g_free_cam.pitch), sp = std::sin(g_free_cam.pitch);
+    const float fx = sy * cp, fy = sp, fz = cy * cp;
+    const float rx = cy, ry = 0.0f, rz = -sy;
+    const float ux = -sy * sp, uy = cp, uz = -cy * sp;
+    // Rows of camera rotation matrix R at 0x3E57A8 (right, up, forward) and position at 0x3E57CC
+    cam_wf(kCameraRotation + 0, rx);  cam_wf(kCameraRotation + 4, ry);  cam_wf(kCameraRotation + 8, rz);
+    cam_wf(kCameraRotation + 12, ux); cam_wf(kCameraRotation + 16, uy); cam_wf(kCameraRotation + 20, uz);
+    cam_wf(kCameraRotation + 24, fx); cam_wf(kCameraRotation + 28, fy); cam_wf(kCameraRotation + 32, fz);
+    cam_wf(kCameraPosition + 0, g_free_cam.pos[0]);
+    cam_wf(kCameraPosition + 4, g_free_cam.pos[1]);
+    cam_wf(kCameraPosition + 8, g_free_cam.pos[2]);
+}
+} // namespace
+
 // Diagnostic only (EOD_CAMERA_TRACE): the native projection calculation is unchanged.
 extern "C" void f_0034E530() {
     static const bool trace=std::getenv("EOD_CAMERA_TRACE") != nullptr;
@@ -117,4 +220,5 @@ extern "C" void f_0034E530() {
             double(xscale),double(base),ee_r32(0x3dd660),ee_r32(0x3dd64c),ee_r32(0x3dd650));
     }
     f_0034E530_orig();
+    apply_free_cam_override();
 }

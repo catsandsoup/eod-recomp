@@ -199,10 +199,26 @@ extern "C" void f_00167C70(void) {
     f_00167C70_orig();
     if (!ram_object(master, battle_layout::kMasterSize) || ee_r32(master) != battle_layout::kMasterVtable ||
         !ram_object(out, 0x48)) return;
-    const uint32_t records = ee_r32(master + battle_layout::kRespawnCount);
-    if (!records || records > 16 || index < records || index >= battle_layout::kCapacity) return;
     auto f = [](uint32_t a) { const uint32_t u = ee_r32(a); float v; std::memcpy(&v, &u, 4); return v; };
     auto put = [](uint32_t a, float v) { uint32_t u; std::memcpy(&u, &v, 4); ee_w32(a, u); };
+    // Play-From-Camera / Placed Spawn Marker override for human player slot 0
+    if (index == 0) {
+        if (const char *sp = std::getenv("EOD_SPAWN_POS"); sp && *sp) {
+            float sx = 0.0f, sy = 0.0f, sz = 0.0f, heading_deg = 0.0f;
+            const int got = std::sscanf(sp, "%f,%f,%f,%f", &sx, &sy, &sz, &heading_deg);
+            if (got >= 3 && std::isfinite(sx) && std::isfinite(sy) && std::isfinite(sz)) {
+                const float rad = (got >= 4 && std::isfinite(heading_deg)) ? (heading_deg * 0.01745329252f) : 0.0f;
+                const float c = std::cos(rad), s = std::sin(rad);
+                put(out + 0x00, c);    put(out + 0x04, 0.0f); put(out + 0x08, -s);
+                put(out + 0x0C, 0.0f); put(out + 0x10, 1.0f); put(out + 0x14, 0.0f);
+                put(out + 0x18, s);    put(out + 0x1C, 0.0f); put(out + 0x20, c);
+                put(out + 0x24, sx);   put(out + 0x28, sy);   put(out + 0x2C, sz);
+                return;
+            }
+        }
+    }
+    const uint32_t records = ee_r32(master + battle_layout::kRespawnCount);
+    if (!records || records > 16 || index < records || index >= battle_layout::kCapacity) return;
     const uint32_t lap = index / records; // 1, 2, ...
     const float side = (lap & 1 ? 1.0f : -1.0f) * static_cast<float>((lap + 1) / 2) * 6.0f;
     const float rx = f(out), rz = f(out + 8), fx = f(out + 0x18), fz = f(out + 0x20);
