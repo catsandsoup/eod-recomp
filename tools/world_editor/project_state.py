@@ -523,6 +523,7 @@ class TransformMarkerCommand(QUndoCommand):
         self.marker = marker
         self.old_pos = tuple(old_pos)
         self.old_hdg = float(old_hdg)
+        self.old_source = marker.source
         self.new_pos = tuple(new_pos)
         self.new_hdg = float(new_hdg)
         self.on_change = on_change
@@ -530,11 +531,13 @@ class TransformMarkerCommand(QUndoCommand):
     def redo(self) -> None:
         self.marker.position = self.new_pos
         self.marker.heading_deg = self.new_hdg
+        self.marker.source = "Placed by the editor"
         self.on_change()
 
     def undo(self) -> None:
         self.marker.position = self.old_pos
         self.marker.heading_deg = self.old_hdg
+        self.marker.source = self.old_source
         self.on_change()
 
 
@@ -2199,6 +2202,118 @@ def _bake_modl_scale_bytes(mod_bytes: bytes, scale: tuple[float, float, float]) 
     return bytes(buf)
 
 
+def _build_standalone_modl_from_graf(
+    graf_bytes: bytes,
+    mod_off: int,
+    is_dyno: bool,
+    scale: tuple[float, float, float],
+) -> tuple[bytes | None, list[str]]:
+    """Extract an embedded `track.grf` `mrModel` at `mod_off` into a standalone `MODL v9` binary.
+
+    Converts the embedded `part_tbl = 0x50` header to standalone `MODL v9` (`part_tbl = 0x58`),
+    clears the low 5 bits of each `4SPS` part's `group` field so `RenderQueueFlushLayers0to8`
+    draws it in layer 0, recenters world-space VIF vertices around `mhdr["centre"]` (for non-dyno
+    models), bakes `scale`, and recomputes the local bounding sphere and AABB.
+    """
+    try:
+        mhdr = wg.parse_model(graf_bytes, mod_off)
+    except Exception:
+        return None, []
+    parts = mhdr.get("parts") or []
+    if not parts:
+        return None, []
+
+    n_parts = len(parts)
+    n_slots = max(4, ((n_parts + 3) // 4) * 4)
+    part_tbl = 0x58
+    inst_tbl = part_tbl + 4 * n_slots
+    inst_key_off = inst_tbl + 0x10
+    inst_block_size = max(0x80, 0x10 + ((n_parts * 4 + 15) & ~15))
+    first_part_off = inst_tbl + inst_block_size
+
+    buf = bytearray(first_part_off)
+    # 0x00..0x18: sub_ver=n_parts, hdr_size=0x58, unk1=0, tjrm_slot_ptr=inst_tbl, n_inst=1, inst_tbl
+    struct.pack_into("<6I", buf, 0x00, n_parts, part_tbl, 0, inst_tbl, 1, inst_tbl)
+    # 0x44..0x58: 0xE3 padding
+    buf[0x44:0x58] = b"\xe3" * (0x58 - 0x44)
+    # 0x58..inst_tbl: part offset slots (default 0xE3E3E3E3)
+    for slot in range(n_slots):
+        struct.pack_into("<I", buf, part_tbl + 4 * slot, 0xE3E3E3E3)
+    # inst_tbl: 1 runtime instance pointer -> inst_key_off, followed by zeroed runtime key table
+    struct.pack_into("<IIII", buf, inst_tbl, inst_key_off, 0xE3E3E3E3, 0xE3E3E3E3, 0xE3E3E3E3)
+
+    tex_names: list[str] = []
+    for idx, p in enumerate(parts):
+        poff_src = int(p["offset"])
+        psize = int(p["size"])
+        if poff_src < 0 or psize < 0x38 or poff_src + psize > len(graf_bytes):
+            return None, []
+        rem = len(buf) % 16
+        if rem:
+            buf.extend(b"\xe3" * (16 - rem))
+        dst_off = len(buf)
+        struct.pack_into("<I", buf, part_tbl + 4 * idx, dst_off)
+        part_chunk = bytearray(graf_bytes[poff_src : poff_src + psize])
+        # Clear low 5 bits of `group` at +0x18 so RenderQueueFlushLayers0to8 (layer 0) always draws it
+        orig_grp = struct.unpack_from("<I", part_chunk, 0x18)[0]
+        struct.pack_into("<I", part_chunk, 0x18, orig_grp & ~0x1F)
+        buf.extend(part_chunk)
+        tname = (p.get("texture") or "").strip()
+        if tname and tname.lower() not in ("-", ".tex") and tname not in tex_names:
+            tex_names.append(tname)
+
+    rem_end = len(buf) % 8
+    if rem_end:
+        buf.extend(b"\xe3" * (8 - rem_end))
+    struct.pack_into("<I", buf, 0x40, len(buf))
+
+    sx, sy, sz = (float(scale[0]), float(scale[1]), float(scale[2]))
+    cx0, cy0, cz0 = (float(v) for v in mhdr["centre"])
+    if is_dyno:
+        xf_fn = lambda pt: (pt[0] * sx, pt[1] * sy, pt[2] * sz)
+    else:
+        xf_fn = lambda pt: ((pt[0] - cx0) * sx, (pt[1] - cy0) * sy, (pt[2] - cz0) * sz)
+
+    orig_mod = bytes(buf)
+    mod_parsed = wg.parse_model(orig_mod, 0)
+    all_pts, _cnt = _encode_vif_parts_vertices(
+        buf,
+        orig_mod,
+        [(part, xf_fn) for part in mod_parsed["parts"]],
+    )
+
+    if all_pts:
+        xs = [pt[0] for pt in all_pts]
+        ys = [pt[1] for pt in all_pts]
+        zs = [pt[2] for pt in all_pts]
+        minx, maxx = float(min(xs)), float(max(xs))
+        miny, maxy = float(min(ys)), float(max(ys))
+        minz, maxz = float(min(zs)), float(max(zs))
+        ncx = 0.5 * (minx + maxx)
+        ncy = 0.5 * (miny + maxy)
+        ncz = 0.5 * (minz + maxz)
+        rad = max(math.dist(pt, (ncx, ncy, ncz)) for pt in all_pts) + 0.05
+    else:
+        bmin = mhdr["bbox"]["min"]
+        bmax = mhdr["bbox"]["max"]
+        ox, oy, oz = (0.0, 0.0, 0.0) if is_dyno else (cx0, cy0, cz0)
+        x0, x1 = (float(bmin[0]) - ox) * sx, (float(bmax[0]) - ox) * sx
+        y0, y1 = (float(bmin[1]) - oy) * sy, (float(bmax[1]) - oy) * sy
+        z0, z1 = (float(bmin[2]) - oz) * sz, (float(bmax[2]) - oz) * sz
+        minx, maxx = min(x0, x1), max(x0, x1)
+        miny, maxy = min(y0, y1), max(y0, y1)
+        minz, maxz = min(z0, z1), max(z0, z1)
+        ncx = 0.5 * (minx + maxx)
+        ncy = 0.5 * (miny + maxy)
+        ncz = 0.5 * (minz + maxz)
+        rad = max(0.5, 0.5 * math.sqrt((maxx - minx) ** 2 + (maxy - miny) ** 2 + (maxz - minz) ** 2))
+
+    struct.pack_into("<f", buf, 0x18, float(rad))
+    struct.pack_into("<3f", buf, 0x1C, float(ncx), float(ncy), float(ncz))
+    struct.pack_into("<6f", buf, 0x28, minx, maxx, miny, maxy, minz, maxz)
+    return bytes(buf), tex_names
+
+
 def _plane_from_tri(
     v0: np.ndarray, v1: np.ndarray, v2: np.ndarray
 ) -> tuple[float, float, float, float] | None:
@@ -2320,16 +2435,32 @@ def _append_sobl_boxes(sol_bytes: bytes, new_boxes: list[dict[str, Any]]) -> byt
     tmpl_bytes = sol_bytes[tmpl_off : tmpl_off + wc.SOBL_RECORD]
 
     # Build new 0x108-byte BOX records
+    _surf_name_to_id = {
+        "asphalt": 100,
+        "concrete": 101,
+        "dirt": 102,
+        "grass": 103,
+        "metal": 105,
+        "wood": 108,
+        "water": 109,
+        "wall": 110,
+    }
     appended_recs = bytearray()
     new_box_meta: list[tuple[int, float, float, float, float]] = []  # (rec_idx, x0, x1, z0, z1)
     for bi, spec in enumerate(new_boxes):
         rec_idx = orig_count + bi
         rbuf = bytearray(tmpl_bytes)
-        rows = spec.get("rows") or [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        rows = spec.get("rows") or spec.get("axes") or [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         cx, cy, cz = (float(v) for v in spec["centre"])
-        rx, ry, rz = (max(0.1, float(v)) for v in spec["half_extents"])
+        ext_src = spec.get("half_extents") or spec.get("radii") or (0.5, 0.5, 0.5)
+        rx, ry, rz = (max(0.1, float(v)) for v in ext_src)
         sr = math.sqrt(rx * rx + ry * ry + rz * rz) + wc.SPHERE_PAD
-        surf = int(spec.get("surface_type", 110))
+        raw_surf = spec.get("surface_type", spec.get("surface", 110))
+        if isinstance(raw_surf, str):
+            s_clean = raw_surf.strip().lower()
+            surf = _surf_name_to_id.get(s_clean, int(s_clean) if s_clean.isdigit() else 110)
+        else:
+            surf = int(raw_surf)
         struct.pack_into(
             "<9f", rbuf, 0x00,
             float(rows[0][0]), float(rows[0][1]), float(rows[0][2]),
@@ -2920,6 +3051,7 @@ def _resolve_custom_mod_and_textures(
 
     mod_bytes: bytes | None = None
     extra_tex: dict[str, bytes] = {}
+    scale_already_baked = False
 
     if model_key.startswith("car:"):
         car_filename = model_key.split(":", 1)[1]
@@ -2978,11 +3110,53 @@ def _resolve_custom_mod_and_textures(
                                 tdata, _ = mb.payload(ap, te["name"], aents, verify_crc=False)
                                 extra_tex[tname.lower()] = (te["name"], tdata)
                     break
+    elif "@0x" in model_key:
+        member_name, off_hex = model_key.split("@0x", 1)
+        try:
+            mod_off = int(off_hex, 16)
+        except ValueError:
+            mod_off = -1
+        if mod_off >= 0:
+            graf_bytes: bytes | None = None
+            if member_name.lower() == "track.grf":
+                try:
+                    graf_bytes = _get_retail_patch_index(world).get("clean_graf")
+                except Exception:
+                    graf_bytes = None
+            if not graf_bytes:
+                try:
+                    hit_g = next((e for e in world.entries if e["name"].lower() == member_name.lower()), None)
+                    if hit_g is not None:
+                        graf_bytes, _ = mb.payload(world.trk_path, hit_g["name"], world.entries, verify_crc=False)
+                except Exception:
+                    graf_bytes = None
+            if graf_bytes:
+                is_dyno = (wm.category == "dyno")
+                mod_bytes, ref_tex_names = _build_standalone_modl_from_graf(
+                    graf_bytes, mod_off, is_dyno=is_dyno, scale=scale
+                )
+                scale_already_baked = True
+                trk_tex_low = {e["name"].lower() for e in world.entries if e.get("type") == "TEX"}
+                for tname in ref_tex_names:
+                    tlow = tname.lower()
+                    if tlow in trk_tex_low or tlow in extra_tex:
+                        continue
+                    for arc_rel in ("DATA/RES/RACE.RES", "DATA/RES/COMMON.RES"):
+                        ap = world.game_dir / arc_rel
+                        if not ap.is_file():
+                            continue
+                        aents = mb.directory(ap)
+                        te = next((e for e in aents if e["name"].lower() == tlow and e["type"] == "TEX"), None)
+                        if te is not None:
+                            tdata, _ = mb.payload(ap, te["name"], aents, verify_crc=False)
+                            extra_tex[tlow] = (te["name"], tdata)
+                            break
 
     if mod_bytes is None:
         return None, {}, (2.0, 1.5, 4.0)
 
-    mod_bytes = _bake_modl_scale_bytes(mod_bytes, scale)
+    if not scale_already_baked:
+        mod_bytes = _bake_modl_scale_bytes(mod_bytes, scale)
     dims = (
         max(0.4, float(wm.bbox_max[0] - wm.bbox_min[0]) * abs(float(scale[0]))),
         max(0.4, float(wm.bbox_max[1] - wm.bbox_min[1]) * abs(float(scale[1]))),
@@ -3147,10 +3321,13 @@ def _compile_custom_objects_into_trk(
     all_walls_noclip: bool = False,
 ) -> int:
     """Inject editor-placed, replaced & scaled cars/props (plus synthesized SOBL boxes,
-    rebuilt `.ild` road lines, and optional `all_walls_noclip` obstacle.val wall flatten)
-    into the modded 0TSR v6 `.TRK` archive cleanly.
+    rebuilt `.ild` road lines, placed spawn markers, and optional `all_walls_noclip`
+    obstacle.val wall flatten) into the modded 0TSR v6 `.TRK` archive cleanly.
     """
-    if not custom_objs and not extra_sobl_boxes and not extra_members and not all_walls_noclip:
+    custom_spawns = [
+        m for m in world.markers if m.kind in ("Spawn", "Start Grid", "Car") and m.source != "Retail"
+    ]
+    if not custom_objs and not extra_sobl_boxes and not extra_members and not all_walls_noclip and not custom_spawns:
         return 0
 
     with tempfile.TemporaryDirectory(prefix="eod_trk_repack_") as tmp_dir:
@@ -3162,16 +3339,7 @@ def _compile_custom_objects_into_trk(
         entries_meta: list[dict[str, Any]] = manifest["entries"]
         existing_lower = {e["name"].lower() for e in entries_meta}
 
-        sobl_appended = False
-        if extra_sobl_boxes:
-            sol_meta = next((e for e in entries_meta if e["name"].lower() == "track.sol"), None)
-            if sol_meta is not None:
-                sol_path = tmp_p / sol_meta["name"]
-                orig_sol = sol_path.read_bytes()
-                new_sol = _append_sobl_boxes(orig_sol, extra_sobl_boxes)
-                if new_sol != orig_sol:
-                    sol_path.write_bytes(new_sol)
-                    sobl_appended = True
+        combined_sobl_boxes: list[dict[str, Any]] = list(extra_sobl_boxes or [])
 
         members_replaced = False
         if extra_members:
@@ -3207,10 +3375,17 @@ def _compile_custom_objects_into_trk(
                                     new_pairs.append((k, v))
                             sec["pairs"] = new_pairs
                     if changed_nc:
+                        om_nc["root_count"] = sum(
+                            1 for s in om_nc.get("sections", []) if not s.get("name", "").startswith("$")
+                        )
                         obst_p_nc.write_bytes(valt.compile_binary_valt(om_nc))
                         noclip_patched = True
                 except Exception as exc:
                     warnings.append(f"All Walls Noclip obstacle.val patch warning: {exc}")
+
+        all_va0_names = [
+            e["name"] for e in entries_meta if e["fourcc"].strip() == "VALT" and e["name"].lower().startswith("c_")
+        ]
 
         placed_records: list[tuple[str, WorldObject]] = []
         if custom_objs:
@@ -3231,9 +3406,6 @@ def _compile_custom_objects_into_trk(
                 existing_lower.add("obstacle.val")
 
             # Determine which c_*.va0 tables receive placed objects
-            all_va0_names = [
-                e["name"] for e in entries_meta if e["fourcc"].strip() == "VALT" and e["name"].lower().startswith("c_")
-            ]
             va0_by_l = {n.lower(): n for n in all_va0_names}
             base_target_va0s = list(all_va0_names)
             if not world.sync_all_events:
@@ -3248,6 +3420,11 @@ def _compile_custom_objects_into_trk(
             for obj in custom_objs:
                 q_scale = (round(obj.scale[0], 3), round(obj.scale[1], 3), round(obj.scale[2], 3))
                 ckey = (obj.model_key, q_scale)
+                nl = obj.name.lower()
+                is_non_solid_decal = (
+                    obj.category == "billboard"
+                    or any(tok in nl for tok in ("shadow", "-sh_", "_sh_", "bush", "rdwr", "foliage", "sween", "water"))
+                )
                 if ckey not in dyno_cache:
                     mod_bytes, tex_map, (dx, dy, dz) = _resolve_custom_mod_and_textures(world, obj.model_key, q_scale)
                     if mod_bytes is None:
@@ -3287,37 +3464,54 @@ def _compile_custom_objects_into_trk(
 
                     if obj.model_key.startswith("car:"):
                         surf_type = "metal"
-                    elif obj.category == "event-prop" or "wall" in obj.name.lower() or "obsw" in obj.model_key.lower():
+                    elif obj.category == "event-prop" or "wall" in nl or "obsw" in obj.model_key.lower():
                         surf_type = "wall"
                     else:
                         surf_type = "wood"
 
-                    # Append [dyno] wall definition to obstacle.val so SolBuilder creates solid collision
-                    obst_model["sections"].append(
-                        {
-                            "name": "dyno",
-                            "parent": "",
-                            "pairs": [
-                                ("name", dyno_name),
-                                ("type", "wall"),
-                                ("model", mod_member_name),
-                                ("dx", f"{dx:.3f}"),
-                                ("dy", f"{dy:.3f}"),
-                                ("dz", f"{dz:.3f}"),
-                                ("drop_height", "0"),
-                                ("mass", "30000"),
-                                ("surf_type", surf_type),
-                            ],
-                            "sec_vtable": 0x40C0D8,
-                            "tool_ptr": 0,
-                        }
+                    eff_dx = 0.010 if is_non_solid_decal else dx
+                    eff_dy = 0.010 if is_non_solid_decal else dy
+                    eff_dz = 0.010 if is_non_solid_decal else dz
+
+                    new_dyno_sec = {
+                        "name": "dyno",
+                        "parent": "",
+                        "pairs": [
+                            ("name", dyno_name),
+                            ("type", "wall"),
+                            ("model", mod_member_name),
+                            ("dx", f"{eff_dx:.3f}"),
+                            ("dy", f"{eff_dy:.3f}"),
+                            ("dz", f"{eff_dz:.3f}"),
+                            ("drop_height", "0"),
+                            ("mass", "30000"),
+                            ("surf_type", surf_type),
+                        ],
+                        "sec_vtable": 0x40C0D8,
+                        "tool_ptr": 0,
+                    }
+                    # Insert top-level [dyno] section before any `$NNNN$` sub-sections
+                    sub_idx = next(
+                        (i for i, s in enumerate(obst_model["sections"]) if s.get("name", "").startswith("$")),
+                        len(obst_model["sections"]),
                     )
+                    obst_model["sections"].insert(sub_idx, new_dyno_sec)
                     dyno_cache[ckey] = dyno_name
+
+                # For solid @0x static props (buildings, walls, ramps), also synthesize static SOBL collision in track.sol
+                if "@0x" in obj.model_key and not is_non_solid_decal and not world.all_walls_noclip:
+                    try:
+                        combined_sobl_boxes.extend(_synthesize_static_sobl_boxes(world, obj))
+                    except Exception:
+                        pass
 
                 placed_records.append((dyno_cache[ckey], obj))
 
             if placed_records:
                 # Compile updated obstacle.val
+                obst_model["root_count"] = sum(
+                    1 for s in obst_model["sections"] if not s.get("name", "").startswith("$")
+                )
                 obst_file = next(e["name"] for e in entries_meta if e["name"].lower() == "obstacle.val")
                 (tmp_p / obst_file).write_bytes(valt.compile_binary_valt(obst_model))
 
@@ -3347,6 +3541,23 @@ def _compile_custom_objects_into_trk(
                             if m
                         ]
                         next_num = (max(existing_nums) + 1) if existing_nums else 1
+                        obj_root_sec = next(
+                            (s for s in vmodel["sections"] if s.get("name", "").lower() == "objects"),
+                            None,
+                        )
+                        if obj_root_sec is None:
+                            obj_root_sec = {
+                                "name": "objects",
+                                "parent": "",
+                                "pairs": [],
+                                "sec_vtable": 0x40C0D8,
+                                "tool_ptr": 0,
+                            }
+                            sub_i = next(
+                                (i for i, s in enumerate(vmodel["sections"]) if s.get("name", "").startswith("$")),
+                                len(vmodel["sections"]),
+                            )
+                            vmodel["sections"].insert(sub_i, obj_root_sec)
                         for dyno_name, obj in recs_for_va0:
                             # Pure rigid rotation + translation matrix (scale is already baked into .mod!)
                             m4 = compose_transform(obj.position, obj.rotation_hpr, (1.0, 1.0, 1.0))
@@ -3354,6 +3565,7 @@ def _compile_custom_objects_into_trk(
                             frame64 = we.encode_frame64(rows)
                             sec_name = f"${next_num:04d}$object"
                             next_num += 1
+                            obj_root_sec.setdefault("pairs", []).append(("@object", sec_name))
                             vmodel["sections"].append(
                                 {
                                     "name": sec_name,
@@ -3366,11 +3578,91 @@ def _compile_custom_objects_into_trk(
                                     "tool_ptr": 0,
                                 }
                             )
+                        vmodel["root_count"] = sum(
+                            1 for s in vmodel["sections"] if not s.get("name", "").startswith("$")
+                        )
                         va0_path.write_bytes(valt.compile_binary_valt(vmodel))
                     except Exception as exc:
                         warnings.append(f"Inject custom objects into {va0_name} warning: {exc}")
 
-        if not placed_records and not sobl_appended and not members_replaced and not noclip_patched:
+        respawn_patched = False
+        if custom_spawns:
+            ordered_spawns = custom_spawns + [
+                m for m in world.markers if m.kind in ("Spawn", "Start Grid", "Car") and m.source == "Retail"
+            ]
+            for va0_name in all_va0_names:
+                va0_path = tmp_p / va0_name
+                if not va0_path.is_file():
+                    continue
+                try:
+                    vmodel = valt.parse_binary_valt(va0_path.read_bytes())
+                    resp_sec = next(
+                        (s for s in vmodel.get("sections", []) if s.get("name", "").lower() == "respawn"),
+                        None,
+                    )
+                    if resp_sec is None:
+                        continue
+                    sec_by_name = {s.get("name", ""): s for s in vmodel.get("sections", [])}
+                    changed_r = False
+                    for idx_r, (_skey, target_sec_name) in enumerate(resp_sec.get("pairs", [])):
+                        tsec = sec_by_name.get(str(target_sec_name))
+                        if tsec is None:
+                            continue
+                        mk = ordered_spawns[idx_r % len(ordered_spawns)]
+                        hdg_rad = math.radians(float(mk.heading_deg))
+                        dx_r = math.sin(hdg_rad)
+                        dz_r = math.cos(hdg_rad)
+                        px_r, _py_r, pz_r = (float(v) for v in mk.position)
+                        m4_r = compose_transform(mk.position, (float(mk.heading_deg), 0.0, 0.0), (1.0, 1.0, 1.0))
+                        frame64_r = we.encode_frame64(
+                            we.matrix_to_native_rows([float(v) for v in m4_r.reshape(-1)])
+                        )
+                        new_pairs_r: list[tuple[str, str]] = []
+                        has_dir = False
+                        has_pt = False
+                        has_f64 = False
+                        for k_r, v_r in tsec.get("pairs", []):
+                            kl_r = str(k_r).lower()
+                            if kl_r == "dir":
+                                new_pairs_r.append((k_r, f"{dx_r:.2f}, {dz_r:.2f}"))
+                                has_dir = True
+                            elif kl_r == "pt":
+                                new_pairs_r.append((k_r, f"{px_r:.2f}, {pz_r:.2f}"))
+                                has_pt = True
+                            elif kl_r == "unfloat_frame64":
+                                new_pairs_r.append((k_r, frame64_r))
+                                has_f64 = True
+                            else:
+                                new_pairs_r.append((k_r, v_r))
+                        if not has_dir:
+                            new_pairs_r.append(("dir", f"{dx_r:.2f}, {dz_r:.2f}"))
+                        if not has_pt:
+                            new_pairs_r.append(("pt", f"{px_r:.2f}, {pz_r:.2f}"))
+                        if not has_f64:
+                            new_pairs_r.append(("unfloat_frame64", frame64_r))
+                        tsec["pairs"] = new_pairs_r
+                        changed_r = True
+                    if changed_r:
+                        vmodel["root_count"] = sum(
+                            1 for s in vmodel["sections"] if not s.get("name", "").startswith("$")
+                        )
+                        va0_path.write_bytes(valt.compile_binary_valt(vmodel))
+                        respawn_patched = True
+                except Exception as exc:
+                    warnings.append(f"Respawn patch in {va0_name} warning: {exc}")
+
+        sobl_appended = False
+        if combined_sobl_boxes:
+            sol_meta = next((e for e in entries_meta if e["name"].lower() == "track.sol"), None)
+            if sol_meta is not None:
+                sol_path = tmp_p / sol_meta["name"]
+                orig_sol = sol_path.read_bytes()
+                new_sol = _append_sobl_boxes(orig_sol, combined_sobl_boxes)
+                if new_sol != orig_sol:
+                    sol_path.write_bytes(new_sol)
+                    sobl_appended = True
+
+        if not placed_records and not sobl_appended and not members_replaced and not noclip_patched and not respawn_patched:
             return 0
 
         manifest_p.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -4083,6 +4375,9 @@ def export_mod_layer(
             if known_solid_ids is not None:
                 known_solid_ids.add(o.obj_id)
 
+    has_custom_spawns = any(
+        m.kind in ("Spawn", "Start Grid", "Car") and m.source != "Retail" for m in world.markers
+    )
     can_delta = (
         allow_delta
         and prev_state is not None
@@ -4093,6 +4388,7 @@ def export_mod_layer(
         and not custom_inject_objs
         and custom_boxes_count == 0
         and not world.all_walls_noclip
+        and not has_custom_spawns
         and not has_structural_ilin
         and not prev_state["has_custom_members"]
         and not vif_bake_objs
@@ -4407,8 +4703,11 @@ def export_mod_layer(
         auto_sobl_boxes.append(
             {
                 "centre": (cx, cy, cz),
+                "half_extents": (rx, ry, rz),
                 "radii": (rx, ry, rz),
+                "rows": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
                 "axes": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                "surface_type": str(cbox.get("surface", "wall")),
                 "surface": str(cbox.get("surface", "wall")),
             }
         )
@@ -4418,9 +4717,9 @@ def export_mod_layer(
     if any(bake_stats.values()) or world.sync_all_events or sobl_patched_count or ilin_patched_lines:
         mod_trk_path.write_bytes(bytes(trk_bytes))
 
-    # Inject editor-placed, replaced & scaled Cars/Wrecks/Props + auto/custom SOBL boxes + resized ILIN + walls noclip
+    # Inject editor-placed, replaced & scaled Cars/Wrecks/Props + auto/custom SOBL boxes + resized ILIN + walls noclip + custom spawns
     custom_objects_compiled = 0
-    if custom_inject_objs or auto_sobl_boxes or rebuilt_ild_members or world.all_walls_noclip:
+    if custom_inject_objs or auto_sobl_boxes or rebuilt_ild_members or world.all_walls_noclip or has_custom_spawns:
         if progress:
             progress(74, f"Compiling {len(custom_inject_objs)} custom props & {len(auto_sobl_boxes)} solid boxes into .TRK...")
         try:
@@ -4493,6 +4792,7 @@ def export_mod_layer(
         and not auto_sobl_boxes
         and not rebuilt_ild_members
         and not world.all_walls_noclip
+        and not has_custom_spawns
         and not vif_bake_objs
         and bake_stats["sobl_scaled_barriers"] == 0
         and not any(o.category == "optional-terrain" for o in all_edited_terrain_objs)
