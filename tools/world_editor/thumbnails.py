@@ -86,13 +86,15 @@ def render_model_thumbnail_qimage(
 
     center = (model.bbox_min + model.bbox_max) * 0.5
     ext = model.bbox_max - model.bbox_min
+    horiz_span = max(float(ext[0]), float(ext[2]), 1e-4)
+    is_flat = float(ext[1]) < horiz_span * 0.22
     radius = float(np.linalg.norm(ext)) * 0.5
     if radius < 1e-4:
         radius = 1.0
 
-    # Camera rotation: yaw 38 deg, pitch 24 deg
+    # Auto-pitch: steeper 52 deg top-3/4 view for flat road/dirt/shadow strips so they don't collapse to a line!
     yaw = math.radians(38.0)
-    pitch = math.radians(24.0)
+    pitch = math.radians(52.0 if is_flat else 24.0)
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
 
@@ -102,11 +104,13 @@ def render_model_thumbnail_qimage(
 
     # Collect triangles across parts (subsampled if huge)
     step = max(1, model.tri_count // MAX_THUMB_TRIS)
-    tri_records: list[tuple[float, tuple[float, float], tuple[float, float], tuple[float, float], tuple[int, int, int]]] = []
+    dist = radius * 2.65
+    cx_img, cy_img = sw * 0.5, sh * 0.50
 
-    dist = radius * 2.55
-    focal = min(sw, sh) * 1.12
-    cx_img, cy_img = sw * 0.5, sh * 0.52
+    # Pre-project all parts to compute tight 2D screen bounds so elongated/flat meshes fill the card!
+    part_proj: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int]]] = []
+    ux_min, ux_max = 1e9, -1e9
+    uy_min, uy_max = 1e9, -1e9
 
     for part in model.parts:
         tex_asset = textures.get(part.texture)
@@ -117,13 +121,19 @@ def render_model_thumbnail_qimage(
             base_rgb = (100 + (h & 0x5F), 110 + ((h >> 6) & 0x5F), 120 + ((h >> 12) & 0x5F))
         else:
             base_rgb = (165, 172, 184)
+        # Brighten very dark / shadow meshes so they never blend invisibly into the dark studio card
+        if max(base_rgb) < 62:
+            base_rgb = (
+                max(base_rgb[0] + 68, 92),
+                max(base_rgb[1] + 72, 100),
+                max(base_rgb[2] + 80, 114),
+            )
 
         verts = part.vertices[:, 0:3] - center
         tris = part.indices.reshape(-1, 3)[::step]
         if len(tris) == 0:
             continue
 
-        # Transform vertices to camera space
         x = verts[:, 0]
         y = verts[:, 1]
         z = verts[:, 2]
@@ -131,22 +141,37 @@ def render_model_thumbnail_qimage(
         z1 = sy * x + cy * z
         y2 = cp * y - sp * z1
         z2 = sp * y + cp * z1
-        zc = dist - z2
-        zc = np.maximum(zc, 0.05)
+        zc = np.maximum(dist - z2, 0.05)
 
-        sx_arr = cx_img + focal * (x1 / zc)
-        sy_arr = cy_img - focal * (y2 / zc)
+        ux = x1 / zc
+        uy = y2 / zc
+        ux_min = min(ux_min, float(ux.min()))
+        ux_max = max(ux_max, float(ux.max()))
+        uy_min = min(uy_min, float(uy.min()))
+        uy_max = max(uy_max, float(uy.max()))
+        part_proj.append((verts, tris, ux, uy, zc, base_rgb))
 
-        # Triangle normals & depth
+    if not part_proj:
+        return _pil_to_qimage(img.resize((width, height), Image.Resampling.LANCZOS))
+
+    span_x = max(ux_max - ux_min, 1e-4)
+    span_y = max(uy_max - uy_min, 1e-4)
+    mid_ux = 0.5 * (ux_min + ux_max)
+    mid_uy = 0.5 * (uy_min + uy_max)
+    fit_scale = min((sw * 0.84) / span_x, (sh * 0.80) / span_y)
+
+    tri_records: list[tuple[float, tuple[float, float], tuple[float, float], tuple[float, float], tuple[int, int, int]]] = []
+    for verts, tris, ux, uy, zc, base_rgb in part_proj:
+        sx_arr = cx_img + (ux - mid_ux) * fit_scale
+        sy_arr = cy_img - (uy - mid_uy) * fit_scale
+
         v0 = verts[tris[:, 0]]
         v1 = verts[tris[:, 1]]
         v2 = verts[tris[:, 2]]
         fn = np.cross(v1 - v0, v2 - v0)
-        fn_len = np.linalg.norm(fn, axis=1)
-        fn_len = np.maximum(fn_len, 1e-6)
+        fn_len = np.maximum(np.linalg.norm(fn, axis=1), 1e-6)
         ndotl = np.abs((fn @ ldir) / fn_len)
-        shades = 0.34 + 0.66 * ndotl
-
+        shades = 0.42 + 0.58 * ndotl
         depths = (zc[tris[:, 0]] + zc[tris[:, 1]] + zc[tris[:, 2]]) * (1.0 / 3.0)
 
         r0, g0, b0 = base_rgb

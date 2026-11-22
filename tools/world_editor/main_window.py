@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QFontDatabase, QKeySequence, QUndoStack
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontDatabase, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -42,7 +42,13 @@ from home_hub import (
     thumbnail_path_for_project,
 )
 from perf_profiler import get_profiler
-from pie_host import PieHostWidget, build_pie_launch_spec
+from pie_host import (
+    GAME_EXE_LABEL,
+    PieHostWidget,
+    build_pie_launch_spec,
+    pie_staging_root,
+    tdeod_support_dir,
+)
 from vehicle_overlay import RegisteredVehicle, build_vehicle_pie_layer
 from project_state import (
     AddMarkerCommand,
@@ -128,6 +134,11 @@ class EodWorldEditorWindow(QMainWindow):
         self.game_dir = Path(game_dir) if game_dir else default_game_dir()
         self.project_name = "Untitled World"
         self.project_path: Path | None = None
+        self._mod_output_dir: Path | None = None
+        self._saved_undo_index: int = 0
+        self._pie_render_scale: int = 2
+        self._pending_pie_spawn_pos: tuple[float, float, float, float] | None = None
+        self._custom_car_archives: list[Path] = []
         self.world: TrackWorld | None = None
         self.undo_stack = QUndoStack(self)
         self._placed_counter = 1
@@ -264,7 +275,42 @@ class EodWorldEditorWindow(QMainWindow):
         super().showEvent(event)
         enable_windows_dark_titlebar(self)
 
+    def _is_dirty(self) -> bool:
+        return bool(self.world is not None and (self.undo_stack.index() != self._saved_undo_index or self._autosave_dirty))
+
+    def _mark_saved(self) -> None:
+        self._saved_undo_index = self.undo_stack.index()
+        self._autosave_dirty = False
+        if hasattr(self.properties, "set_project_dirty"):
+            self.properties.set_project_dirty(False)
+        self._update_window_chrome()
+
+    def _confirm_discard_changes(self, action_label: str = "continue") -> bool:
+        """Guard destructive actions against silent data loss (Save / Discard / Cancel)."""
+        if not self._is_dirty():
+            return True
+        if os.environ.get("EOD_EDITOR_NO_PROMPTS") == "1" or not self.isVisible():
+            return True
+        resp = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            f"Project '{self.project_name}' has unsaved changes.\nSave before you {action_label}?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if resp == QMessageBox.StandardButton.Cancel:
+            return False
+        if resp == QMessageBox.StandardButton.Save:
+            self.save_project()
+            return not self._is_dirty()
+        return True
+
     def closeEvent(self, event) -> None:
+        if not self._confirm_discard_changes("close the editor"):
+            event.ignore()
+            return
         if hasattr(self, "_autosave_timer"):
             self._autosave_timer.stop()
         if self._autosave_token is not None:
@@ -282,10 +328,13 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     def _update_window_chrome(self) -> None:
         trk = self.world.track_name if self.world else "NO TRACK"
+        dirty_mark = " *" if self._is_dirty() else ""
         self._sync_walls_noclip_action()
         self.act_package_mod.setEnabled(self.world is not None)
-        self.setWindowTitle(f"EOD World Editor \u2013 Test Drive: Eve of Destruction \u2013 {trk} [{self.project_name}]")
-        self.world_badge.setText(f"World: {self.project_name}")
+        self.setWindowTitle(
+            f"EOD World Editor \u2013 Test Drive: Eve of Destruction \u2013 {trk} [{self.project_name}{dirty_mark}]"
+        )
+        self.world_badge.setText(f"World: {self.project_name}{dirty_mark}")
         if self.world:
             self.lbl_zone.setText(f"Track: {self.world.display_name} ({self.world.track_name})")
 
@@ -309,8 +358,9 @@ class EodWorldEditorWindow(QMainWindow):
         m_file.addAction("Save Project As...", self.save_project_as)
         m_file.addSeparator()
         self.act_export_mod = m_file.addAction(
-            svg_icon("save", "#2ecc71"), "Write to Mod Layer (eod.exe)...", self.write_mod_layer_dialog, QKeySequence("Ctrl+Shift+S")
+            svg_icon("save", "#2ecc71"), "Export Mod Layer...", self.write_mod_layer_dialog, QKeySequence("Ctrl+Shift+S")
         )
+        m_file.addAction("Export Mod Layer As...", lambda: self.write_mod_layer_dialog(prompt_dir=True))
         self.act_package_mod = m_file.addAction(
             "Package Mod as .eodmod...", self.package_mod_dialog, QKeySequence("Ctrl+Shift+E")
         )
@@ -318,24 +368,42 @@ class EodWorldEditorWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction("Set Game Data Directory...", self.choose_game_dir)
         m_file.addSeparator()
-        m_file.addAction("Exit", self.close, QKeySequence("Alt+F4"))
+        m_file.addAction("Quit" if sys.platform == "darwin" else "Exit", self.close, QKeySequence.StandardKey.Quit)
 
-        # 2. World
-        m_world = mb.addMenu("&World")
+        # 2. Edit (industry-standard Undo / Redo / Duplicate / Delete with macOS Backspace support)
+        m_edit = mb.addMenu("&Edit")
         act_undo = self.undo_stack.createUndoAction(self, "Undo")
         act_undo.setShortcut(QKeySequence.StandardKey.Undo)
         act_undo.setIcon(svg_icon("undo"))
         act_redo = self.undo_stack.createRedoAction(self, "Redo")
         act_redo.setShortcut(QKeySequence.StandardKey.Redo)
         act_redo.setIcon(svg_icon("redo"))
-        m_world.addAction(act_undo)
-        m_world.addAction(act_redo)
-        m_world.addSeparator()
+        m_edit.addAction(act_undo)
+        m_edit.addAction(act_redo)
+        m_edit.addSeparator()
+        m_edit.addAction("Duplicate Selected", self.duplicate_selected_object, QKeySequence("Ctrl+D"))
+        self.act_delete_selected = m_edit.addAction(
+            svg_icon("trash", "#ff99a2"), "Delete Selected", self.delete_selected_item
+        )
+        self.act_delete_selected.setShortcuts(
+            [QKeySequence.StandardKey.Delete, QKeySequence(Qt.Key.Key_Backspace)]
+        )
+        m_edit.addSeparator()
+        m_edit.addAction("Select All Similar", self.select_similar_objects)
+
+        # 3. World
+        m_world = mb.addMenu("&World")
         m_world.addAction(svg_icon("sky", "#fbbf24"), "Environment / Skybox...", self.open_environment_panel)
         m_world.addAction("Reload Track from Retail Disc", self.reload_current_track)
         m_world.addAction("Open DATA/TRACKS Folder", self.open_tracks_folder)
         m_world.addSeparator()
         m_world.addAction(svg_icon("launch", "#2ecc71"), "Play Free Roam (PIE)", lambda: self.start_pie("free_roam"), QKeySequence("F5"))
+        m_world.addAction(
+            svg_icon("launch", "#38bdf8"),
+            "Play From Camera (PIE)",
+            self.play_from_camera,
+            QKeySequence("Ctrl+Shift+F5"),
+        )
         m_world.addAction(svg_icon("race", "#60a5fa"), "Play Event / Race (PIE)", lambda: self.start_pie("event"), QKeySequence("Shift+F5"))
         m_world.addAction(svg_icon("stop", "#ff99a2"), "Stop PIE", self.stop_pie)
 
@@ -377,20 +445,21 @@ class EodWorldEditorWindow(QMainWindow):
         # 5. Objects
         m_obj = mb.addMenu("&Objects")
         m_obj.addAction(svg_icon("move"), "Move Tool", lambda: self.select_tool("move"), QKeySequence("G"))
-        m_obj.addAction(svg_icon("rotate"), "Rotate Tool", lambda: self.select_tool("rotate"), QKeySequence("R"))
-        m_obj.addAction(svg_icon("scale"), "Scale Tool", lambda: self.select_tool("scale"))
-        m_obj.addAction(svg_icon("place"), "Place Mode (Ghost Preview)", lambda: self.select_tool("place"), QKeySequence("P"))
+        m_obj.addAction(svg_icon("rotate"), "Rotate Tool (or Rotate Ghost)", self._shortcut_rotate_or_ghost, QKeySequence("R"))
+        m_obj.addAction(svg_icon("scale"), "Scale Tool", lambda: self.select_tool("scale"), QKeySequence("T"))
+        m_obj.addAction("Cycle Move / Rotate / Scale (Tab)", self.viewport.cycle_transform_tool)
+        m_obj.addAction(svg_icon("place"), "Place Mode (Cursor Preview)", lambda: self.select_tool("place"), QKeySequence("P"))
         m_obj.addAction(svg_icon("scatter"), "Scatter / Paint Brush", lambda: self.select_tool("scatter"), QKeySequence("B"))
         m_obj.addSeparator()
         m_obj.addAction(svg_icon("replace", "#93c5fd"), "Replace Selection With...", self.replace_selected_with_dialog)
         m_obj.addAction("Select All Similar", self.select_similar_objects)
         m_obj.addAction(svg_icon("trash", "#ff99a2"), "Delete All Similar", self.delete_similar_objects)
         m_obj.addAction(svg_icon("ground"), "Snap Selected to Ground", self.snap_selected_to_ground, QKeySequence("Ctrl+G"))
-        m_obj.addAction("Duplicate Selected", self.duplicate_selected_object, QKeySequence("Ctrl+D"))
-        m_obj.addAction(svg_icon("blender"), "Edit Selected in Blender (OBJ)...", self.edit_selected_in_blender, QKeySequence("F2"))
+        m_obj.addAction("Duplicate Selected", self.duplicate_selected_object)
+        m_obj.addAction(svg_icon("blender"), "Export Selected to Blender (OBJ)...", self.edit_selected_in_blender, QKeySequence("F2"))
         m_obj.addAction(svg_icon("shield"), "Make Collision for Selected", self.make_collision_for_selected)
         m_obj.addSeparator()
-        m_obj.addAction(svg_icon("trash", "#ff99a2"), "Delete Selected", self.delete_selected_item, QKeySequence("Del"))
+        m_obj.addAction(self.act_delete_selected)
 
         # 6. Markers
         m_mk = mb.addMenu("&Markers")
@@ -404,7 +473,7 @@ class EodWorldEditorWindow(QMainWindow):
         # 7. Cars
         m_cars = mb.addMenu("Ca&rs")
         m_cars.addAction(svg_icon("car", "#ff8a8a"), "Browse Cars && Wrecks Library (DATA/CAR)", lambda: self._filter_explorer_category("car-wreck"))
-        m_cars.addAction(svg_icon("car", "#fbbf24"), "Vehicle / NASCAR Tuner (Live PIE)...", self.open_vehicle_tuner_dialog)
+        m_cars.addAction(svg_icon("car", "#fbbf24"), "Car Studio && NASCAR Importer...", self.open_vehicle_tuner_dialog)
         m_cars.addSeparator()
         m_cars.addAction(svg_icon("car"), "Place Car Spawn at View Target", lambda: self.add_marker_at_camera("Car"))
         m_cars.addAction("Place AI Opponent Car Slot", lambda: self.add_marker_at_camera("Car", prefix="AI_Car"))
@@ -533,6 +602,11 @@ class EodWorldEditorWindow(QMainWindow):
         self.act_pie_roam = tb.addAction(svg_icon("launch", "#2ecc71"), "Free Roam", lambda: self.start_pie("free_roam"))
         self.act_pie_roam.setToolTip("Compile mod layer and launch Open-Track Free Roam (Battle, Solo/AI) directly inside the viewport (F5)")
 
+        self.act_pie_from_cam = tb.addAction(svg_icon("launch", "#38bdf8"), "Play Here", self.play_from_camera)
+        self.act_pie_from_cam.setToolTip(
+            "Play From Camera: spawn directly at your current 3D editor camera position (Ctrl/Cmd+Shift+F5)"
+        )
+
         self.act_pie_event = tb.addAction(svg_icon("race", "#60a5fa"), "Play Event", lambda: self.start_pie("event"))
         self.act_pie_event.setToolTip("Compile mod layer and launch the selected Event / Race & Car directly inside the viewport (Shift+F5)")
 
@@ -593,6 +667,21 @@ class EodWorldEditorWindow(QMainWindow):
         settings.addSeparator()
         settings.addWidget(QLabel("Renderer"))
         settings.addWidget(self.cmb_renderer_mode)
+
+        self.cmb_pie_scale = QComboBox()
+        self.cmb_pie_scale.addItem("1x (PS2)", 1)
+        self.cmb_pie_scale.addItem("2x (HD)", 2)
+        self.cmb_pie_scale.addItem("3x (1440p)", 3)
+        self.cmb_pie_scale.addItem("4x (4K)", 4)
+        self.cmb_pie_scale.setCurrentIndex(1)  # Default 2x HD instead of inheriting RenderScale=6 (>4K)!
+        self.cmb_pie_scale.setToolTip(
+            "Isolated PIE internal resolution scale (never reads or overwrites your global eod.ini)"
+        )
+        self.cmb_pie_scale.currentIndexChanged.connect(
+            lambda _i: setattr(self, "_pie_render_scale", int(self.cmb_pie_scale.currentData() or 2))
+        )
+        settings.addWidget(QLabel("PIE Scale"))
+        settings.addWidget(self.cmb_pie_scale)
         tb.addSeparator()
 
         # Transform & Lumion/Twinmotion Placement Tools
@@ -612,7 +701,7 @@ class EodWorldEditorWindow(QMainWindow):
 
         self.act_tool_scale = QAction(svg_icon("scale"), "Scale", self)
         self.act_tool_scale.setCheckable(True)
-        self.act_tool_scale.setToolTip("Scale tool")
+        self.act_tool_scale.setToolTip("Scale tool (T, or Tab to cycle Move/Rotate/Scale)")
         self.act_tool_scale.triggered.connect(lambda: self.select_tool("scale"))
 
         self.act_tool_place = QAction(svg_icon("place", "#67e8f9"), "Place", self)
@@ -643,13 +732,13 @@ class EodWorldEditorWindow(QMainWindow):
 
         # Grid & Angle Snap toggles + Environment / Skybox
         settings.addSeparator()
-        self.act_grid_snap = QAction(svg_icon("snap_grid"), "Grid", self)
+        self.act_grid_snap = QAction(svg_icon("snap_grid"), "Snap 1m", self)
         self.act_grid_snap.setCheckable(True)
         self.act_grid_snap.setToolTip("Toggle 1.0 m Grid Snap for Move & Ghost Placement")
         self.act_grid_snap.toggled.connect(self._toggle_grid_snap)
         settings.addAction(self.act_grid_snap)
 
-        self.act_angle_snap = QAction(svg_icon("snap_angle"), "15°", self)
+        self.act_angle_snap = QAction(svg_icon("snap_angle"), "Snap 15°", self)
         self.act_angle_snap.setCheckable(True)
         self.act_angle_snap.setToolTip("Toggle 15° Angle Snap for Rotate & Ghost Placement")
         self.act_angle_snap.toggled.connect(self._toggle_angle_snap)
@@ -819,7 +908,7 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     def _connect_signals(self) -> None:
         # Explorer -> MainWindow
-        self.explorer.trackSelected.connect(lambda p: self.load_track_async(Path(p)))
+        self.explorer.trackSelected.connect(self._on_explorer_track_selected)
         self.explorer.objectPicked.connect(self._select_object_by_id)
         self.explorer.markerPicked.connect(self._select_marker_by_id)
         self.explorer.roadLineSelected.connect(self._switch_road_line)
@@ -829,6 +918,7 @@ class EodWorldEditorWindow(QMainWindow):
         self.explorer.scatterModeRequested.connect(self._activate_scatter_for)
         self.explorer.replaceSelectedRequested.connect(self._replace_selected_with_key)
         self.explorer.layerToggled.connect(self._on_layer_toggled)
+        self.explorer.carsRequested.connect(self._start_background_car_scan)
 
         # Viewport -> MainWindow & Properties
         self.viewport.objectSelected.connect(self._on_viewport_obj_selected)
@@ -838,6 +928,8 @@ class EodWorldEditorWindow(QMainWindow):
         self.viewport.barrierSelected.connect(self._on_viewport_barrier_selected)
         self.viewport.objectTransformed.connect(self._on_viewport_obj_transformed)
         self.viewport.multiObjectTransformed.connect(self._on_viewport_multi_obj_transformed)
+        self.viewport.altDuplicateCompleted.connect(self._on_alt_duplicate_completed)
+        self.viewport.toolCycled.connect(self.select_tool)
         self.viewport.markerTransformed.connect(self._on_viewport_marker_transformed)
         self.viewport.roadNodeMoved.connect(self._on_viewport_road_moved)
         self.viewport.roadActionRequested.connect(self._on_road_action)
@@ -1034,15 +1126,29 @@ class EodWorldEditorWindow(QMainWindow):
         self.explorer._rebuild_model_grid()
         self.set_action_status(f"Loaded {self.world.car_count} retail Cars & Wrecks from DATA/CAR/")
 
+    def _on_explorer_track_selected(self, path_str: str) -> None:
+        target = Path(path_str)
+        if self.world is not None and self.world.trk_path.resolve() == target.resolve():
+            return
+        if not self._confirm_discard_changes(f"switch track to {target.stem.upper()}"):
+            if self.world is not None:
+                self.explorer.set_available_tracks(self.available_tracks, self.world.trk_path)
+            return
+        self.load_track_async(target)
+
     def reload_current_track(self) -> None:
         if self.world is not None:
+            if not self._confirm_discard_changes("reload the retail track"):
+                return
             self.load_track_async(self.world.trk_path)
 
     # -----------------------------------------------------------------------
     # Adobe / Lumion-Style Home Hub, Viewport Thumbnails & Crash-Safe Autosave
     # -----------------------------------------------------------------------
     def open_home_hub(self) -> None:
-        """Open the dark Windows-11 Home Hub dialog for New Project / Recent Projects / Quick Launch."""
+        """Open the dark Home Hub dialog for New Project / Recent Projects / Quick Launch."""
+        if not self._confirm_discard_changes("open the Home Hub"):
+            return
         hub = HomeHubDialog(self.game_dir, parent=self)
         if hub.exec() == HomeHubDialog.DialogCode.Accepted:
             self.apply_home_hub_result(hub)
@@ -1103,7 +1209,10 @@ class EodWorldEditorWindow(QMainWindow):
 
     def _on_undo_index_changed(self, _idx: int) -> None:
         if self.world is not None:
-            self._autosave_dirty = True
+            self._autosave_dirty = self.undo_stack.index() != self._saved_undo_index
+            if hasattr(self.properties, "set_project_dirty"):
+                self.properties.set_project_dirty(self._is_dirty())
+            self._update_window_chrome()
 
     def trigger_background_autosave(self, *, force: bool = False, synchronous: bool = False) -> Path | None:
         """Silently write atomic crash-safe autosave (`<project>.autosave.tmp` -> `os.replace`) off the UI thread."""
@@ -1194,11 +1303,19 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     # Project & Non-Destructive Mod Layer Management
     # -----------------------------------------------------------------------
+    def _project_slug(self) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", self.project_name).strip("_") or "world_mod"
+
     def _default_mod_dir(self) -> Path:
-        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.project_name).strip("_") or "world_mod"
-        return self.game_dir / "mods" / slug
+        """Return isolated PIE staging folder (outside retail disc/ to preserve read-only disc invariant)."""
+        return pie_staging_root() / self._project_slug()
+
+    def _default_project_dir(self) -> Path:
+        return Path.home() / "Documents" / "EOD Projects" / self._project_slug()
 
     def new_project(self) -> None:
+        if not self._confirm_discard_changes("start a new project"):
+            return
         name, ok = QInputDialog.getText(
             self, "New World Project", "Project name:", text=f"{self.world.display_name if self.world else 'EOD'} Mod"
         )
@@ -1206,6 +1323,9 @@ class EodWorldEditorWindow(QMainWindow):
             return
         self.project_name = name.strip()
         self.project_path = None
+        self._mod_output_dir = None
+        self._saved_undo_index = 0
+        self._autosave_dirty = False
         if self.world is not None:
             self.load_track_async(self.world.trk_path)
         self._update_window_chrome()
@@ -1213,8 +1333,13 @@ class EodWorldEditorWindow(QMainWindow):
         self.set_action_status(f"Started new world project '{self.project_name}'")
 
     def open_project_dialog(self) -> None:
+        if not self._confirm_discard_changes("open another project"):
+            return
+        start_dir = self._default_project_dir().parent
+        if not start_dir.is_dir():
+            start_dir = Path.home() / "Documents"
         fn, _ = QFileDialog.getOpenFileName(
-            self, "Open World Project", str(self.game_dir), "EOD World Project (*.eodworld.json);;JSON (*.json)"
+            self, "Open World Project", str(start_dir), "EOD World Project (*.eodworld.json);;JSON (*.json)"
         )
         if fn:
             self.open_project_file(Path(fn))
@@ -1242,9 +1367,8 @@ class EodWorldEditorWindow(QMainWindow):
             self.viewport.mark_collision_dirty()
             self.viewport.mark_scene_dirty()
             self.explorer.refresh_counts()
-            self._update_window_chrome()
+            self._mark_saved()
             self._sync_pie_pickers_from_world()
-            self._autosave_dirty = False
             record_recent_project(
                 path,
                 self.project_name,
@@ -1260,6 +1384,8 @@ class EodWorldEditorWindow(QMainWindow):
     def save_project(self) -> None:
         if self.world is None:
             return
+        if hasattr(self.properties, "flush_pending_edits"):
+            self.properties.flush_pending_edits()
         if self.project_path is None:
             self.save_project_as()
             return
@@ -1275,21 +1401,32 @@ class EodWorldEditorWindow(QMainWindow):
             thumbnail_path=thumb,
         )
         clear_autosave(saved, self.world.track_name, self.project_name)
-        self._autosave_dirty = False
+        self._mark_saved()
         self.autosave_banner.hide()
         self.set_action_status(f"Saved project overlay -> {saved.name}")
 
     def save_project_as(self) -> None:
         if self.world is None:
             return
-        default_dir = self._default_mod_dir()
-        default_file = default_dir / f"{default_dir.name}.eodworld.json"
+        if hasattr(self.properties, "flush_pending_edits"):
+            self.properties.flush_pending_edits()
+        default_dir = self.project_path.parent if self.project_path else self._default_project_dir()
+        default_dir.mkdir(parents=True, exist_ok=True)
+        default_file = default_dir / f"{self._project_slug()}.eodworld.json"
         fn, _ = QFileDialog.getSaveFileName(
             self, "Save World Project Overlay", str(default_file), "EOD World Project (*.eodworld.json)"
         )
         if not fn:
             return
-        saved = save_project_overlay(Path(fn), self.project_name, self.world, self.viewport.camera_state())
+        target = Path(fn)
+        stem = target.name
+        if stem.lower().endswith(".eodworld.json"):
+            stem = stem[: -len(".eodworld.json")]
+        elif stem.lower().endswith(".json"):
+            stem = stem[: -len(".json")]
+        if stem.strip():
+            self.project_name = stem.strip()
+        saved = save_project_overlay(target, self.project_name, self.world, self.viewport.camera_state())
         self.project_path = saved
         thumb = self.capture_project_thumbnail(saved)
         record_recent_project(
@@ -1301,34 +1438,54 @@ class EodWorldEditorWindow(QMainWindow):
             thumbnail_path=thumb,
         )
         clear_autosave(saved, self.world.track_name, self.project_name)
-        self._autosave_dirty = False
+        self._mark_saved()
         self.autosave_banner.hide()
         self.set_action_status(f"Saved project overlay -> {saved.name}")
 
-    def write_mod_layer_dialog(self) -> None:
+    def write_mod_layer_dialog(self, *, prompt_dir: bool = False) -> None:
         if self.world is None:
             return
-        default_out = self._default_mod_dir()
-        default_out.parent.mkdir(parents=True, exist_ok=True)
-        dest = QFileDialog.getExistingDirectory(self, "Select Output Directory for Mod Layer", str(default_out.parent))
-        if not dest:
-            return
-        slug = default_out.name
-        out_dir = Path(dest) / slug if Path(dest).name != slug else Path(dest)
+        if hasattr(self.properties, "flush_pending_edits"):
+            self.properties.flush_pending_edits()
+        slug = self._project_slug()
+        if self._mod_output_dir is not None and not prompt_dir:
+            out_dir = self._mod_output_dir
+        else:
+            default_root = tdeod_support_dir() / "mods"
+            default_root.mkdir(parents=True, exist_ok=True)
+            dest = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for Mod Layer", str(self._mod_output_dir.parent if self._mod_output_dir else default_root)
+            )
+            if not dest:
+                return
+            out_dir = Path(dest) / slug if Path(dest).name != slug else Path(dest)
+            self._mod_output_dir = out_dir
         try:
             report = export_mod_layer(self.world, self.project_name, out_dir)
+            self._sync_custom_cars_into_mod_dir(out_dir)
             cms = float(report.get("compile_ms", 0.0))
             bmode = str(report.get("bake_mode", "full")).upper()
+            placed_total = int(report.get("editor_placed_objects", 0))
+            compiled_total = int(report.get("custom_objects_compiled", 0))
+            warnings_list = list(report.get("warnings") or [])
             self.profiler.record_phase("mod_compile", cms, detail=bmode)
             self._refresh_after_edit()
             self.append_log(
-                f"[Mod Baker] {bmode} compile finished in {cms:.2f} ms -> {out_dir}",
+                f"[Mod Baker] {bmode} compile finished in {cms:.2f} ms -> {out_dir} "
+                f"(placed compiled: {compiled_total}/{placed_total})",
             )
-            self.set_action_status(f"Wrote mod layer ({bmode} {cms:.2f} ms) -> {out_dir}")
-            QMessageBox.information(
-                self,
-                "Mod Layer Written",
-                f"Non-destructive mod layer exported successfully ({bmode} bake in {cms:.2f} ms)!\n\n"
+            for w_msg in warnings_list:
+                self.append_log(f"[Mod Baker][WARN] {w_msg}", force_open=True)
+            self.set_action_status(
+                f"Exported mod layer ({bmode} {cms:.2f} ms, compiled {compiled_total}/{placed_total}) -> {out_dir}"
+            )
+            warn_block = ""
+            if warnings_list:
+                shown = "\n".join(f"  • {w}" for w in warnings_list[:6])
+                more = f"\n  … and {len(warnings_list) - 6} more (see Output Log)" if len(warnings_list) > 6 else ""
+                warn_block = f"\n\nWarnings ({len(warnings_list)}):\n{shown}{more}"
+            summary = (
+                f"Non-destructive mod layer exported ({bmode} bake in {cms:.2f} ms)!\n\n"
                 f"Output folder: {out_dir}\n"
                 f"Mod TRK copy: {report['mod_trk']}\n"
                 f"Retail placement edits: {report['retail_placement_edits']} "
@@ -1336,15 +1493,21 @@ class EodWorldEditorWindow(QMainWindow):
                 f"SOBL barriers patched: {report['sobl_barriers_patched']}\n"
                 f"ILIN lines patched: {len(report['ilin_patched_lines'])}\n"
                 f"HOSTTEX textures exported: {report['host_textures_exported']}\n"
-                f"Editor-placed objects: {report['editor_placed_objects']}\n\n"
-                f"Retail .TRK SHA-256 verified UNTOUCHED.",
+                f"Placed objects compiled: {compiled_total} / {placed_total}\n\n"
+                f"Retail .TRK SHA-256 verified UNTOUCHED.{warn_block}"
             )
+            if placed_total > 0 and compiled_total < placed_total:
+                QMessageBox.warning(self, "Mod Layer Written With Warnings", summary)
+            else:
+                QMessageBox.information(self, "Mod Layer Written", summary)
         except Exception as exc:
             QMessageBox.critical(self, "Export Mod Layer Failed", str(exc))
 
     def package_mod_dialog(self) -> None:
         if self.world is None:
             return
+        if hasattr(self.properties, "flush_pending_edits"):
+            self.properties.flush_pending_edits()
         if self._active_token is not None:
             self.set_action_status("A background job is running. Package the mod when it finishes.")
             return
@@ -1413,14 +1576,39 @@ class EodWorldEditorWindow(QMainWindow):
 
     def open_tracks_folder(self) -> None:
         tracks_dir = self.game_dir / "DATA" / "TRACKS"
-        if tracks_dir.is_dir() and sys.platform == "win32":
-            os.startfile(str(tracks_dir))
+        if not tracks_dir.is_dir():
+            tracks_dir = self.game_dir
+        if tracks_dir.is_dir():
+            if sys.platform == "win32":
+                os.startfile(str(tracks_dir))
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(tracks_dir)))
+
+    def _sync_custom_cars_into_mod_dir(self, mod_dir: Path) -> None:
+        """Copy any car archives saved in Car Studio into the active PIE/exported mod layer."""
+        if not self._custom_car_archives:
+            return
+        import shutil
+
+        dst_car_dir = mod_dir / "DATA" / "CAR"
+        dst_car_dir.mkdir(parents=True, exist_ok=True)
+        for src in list(self._custom_car_archives):
+            if src.is_file():
+                try:
+                    shutil.copy2(src, dst_car_dir / src.name)
+                except OSError:
+                    pass
 
     # -----------------------------------------------------------------------
     # Unreal Engine 4/5 Play-In-Editor (PIE) Embedded Viewport
     # -----------------------------------------------------------------------
-    def build_current_pie_spec(self, mod_dir: Path, mode: str,
-                               vehicle: RegisteredVehicle | None = None) -> dict[str, Any]:
+    def build_current_pie_spec(
+        self,
+        mod_dir: Path,
+        mode: str,
+        vehicle: RegisteredVehicle | None = None,
+        spawn_pos: tuple[float, float, float, float] | None = None,
+    ) -> dict[str, Any]:
         """Build a live PIE launch spec directly from the toolbar pickers, Sync All Events, and Arcade Mode."""
         assert self.world is not None
         cfg = self.world.custom_race
@@ -1436,6 +1624,7 @@ class EodWorldEditorWindow(QMainWindow):
         cfg.ai_count = ai
         rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
         arcade_mode = str(cfg.arcade_mode or "free_roam")
+        pie_scale = int(self.cmb_pie_scale.currentData() or self._pie_render_scale) if hasattr(self, "cmb_pie_scale") else self._pie_render_scale
         spec = build_pie_launch_spec(
             self.game_dir,
             mod_dir,
@@ -1451,16 +1640,38 @@ class EodWorldEditorWindow(QMainWindow):
             arcade_mode=arcade_mode,
             ai_autodrive=self.pie_host.btn_ai_drive.isChecked(),
             free_cam=self.pie_host.btn_free_cam.isChecked(),
+            pie_render_scale=pie_scale,
+            spawn_pos=spawn_pos,
         )
         if vehicle is not None:
             spec["label"] += f" · {vehicle.chassis} #{vehicle.number}"
+        if spawn_pos is not None:
+            spec["label"] += " · Camera Spawn"
         return spec
 
-    def start_pie(self, mode: str = "free_roam", *, profile: tuple[str, Path] | None = None,
-                  vehicle: RegisteredVehicle | None = None) -> None:
-        """Compile mod layer on QThreadPool worker, then embed live `eod.exe` inside central viewport."""
+    def play_from_camera(self) -> None:
+        """Launch PIE Free Roam spawning directly at the current 3D editor camera position."""
         if self.world is None:
             return
+        cx, cy, cz = (float(self.viewport.cam_pos[0]), float(self.viewport.cam_pos[1]), float(self.viewport.cam_pos[2]))
+        gy = self.world.collision.ground_height(cx, cz)
+        spawn_y = max(gy + 1.2, min(cy, gy + 12.0))
+        yaw = float(self.viewport.cam_yaw)
+        self.start_pie("free_roam", spawn_pos=(cx, spawn_y, cz, yaw))
+
+    def start_pie(
+        self,
+        mode: str = "free_roam",
+        *,
+        profile: tuple[str, Path] | None = None,
+        vehicle: RegisteredVehicle | None = None,
+        spawn_pos: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        """Compile mod layer on QThreadPool worker, then launch live PIE."""
+        if self.world is None:
+            return
+        if hasattr(self.properties, "flush_pending_edits"):
+            self.properties.flush_pending_edits()
         mod_dir = self._default_mod_dir()
 
         # Sync live toolbar pickers + Sync All Events into TrackWorld before compiling mod layer
@@ -1468,7 +1679,7 @@ class EodWorldEditorWindow(QMainWindow):
         self.world.sync_all_events = bool(self.act_sync_events.isChecked())
         self.world.custom_race.sync_all_events = self.world.sync_all_events
 
-        # Pause background thumbnail & car-scan workers so PIE compile & eod.exe get full CPU/GPU
+        # Pause background thumbnail & car-scan workers so PIE compile & game get full CPU/GPU
         if getattr(self.explorer, "_thumb_token", None) is not None:
             self.explorer._thumb_token.cancel()
         if self._car_token is not None:
@@ -1482,6 +1693,7 @@ class EodWorldEditorWindow(QMainWindow):
         self._pending_pie_mod_dir = mod_dir
         self._pending_pie_mode = mode
         self._pending_pie_profile = profile
+        self._pending_pie_spawn_pos = spawn_pos
         self._show_progress(10, f"Compiling mod layer for PIE ({mode})...")
 
         if vehicle is not None:
@@ -1516,19 +1728,35 @@ class EodWorldEditorWindow(QMainWindow):
         self._active_token = None
         self._hide_progress()
 
+        self._sync_custom_cars_into_mod_dir(Path(mod_dir))
+
         cms = float(report.get("compile_ms", 0.0)) if isinstance(report, dict) else 0.0
         bmode = str(report.get("bake_mode", "full")).upper() if isinstance(report, dict) else "FULL"
+        placed_total = int(report.get("editor_placed_objects", 0)) if isinstance(report, dict) else 0
+        compiled_total = int(report.get("custom_objects_compiled", 0)) if isinstance(report, dict) else 0
+        warnings_list = list(report.get("warnings") or []) if isinstance(report, dict) else []
+        for w_msg in warnings_list:
+            self.append_log(f"[PIE][WARN] {w_msg}", force_open=True)
         self.profiler.record_phase("mod_compile", cms, detail=bmode)
-        self.set_action_status(f"Mod compiled ({bmode} {cms:.2f} ms) — launching PIE...")
+        self.set_action_status(
+            f"Mod compiled ({bmode} {cms:.2f} ms, placed {compiled_total}/{placed_total}) — launching PIE..."
+        )
 
         vehicle = report.get("pie_vehicle")
-        spec = self.build_current_pie_spec(mod_dir, mode, vehicle=vehicle)
+        spawn_pos = self._pending_pie_spawn_pos
+        if spawn_pos is None and self.world.markers:
+            sp_mk = next((m for m in self.world.markers if m.kind in ("Spawn", "Start Grid")), None)
+            if sp_mk is not None:
+                spawn_pos = (float(sp_mk.position[0]), float(sp_mk.position[1]) + 1.0, float(sp_mk.position[2]), float(sp_mk.heading_deg))
+        spec = self.build_current_pie_spec(mod_dir, mode, vehicle=vehicle, spawn_pos=spawn_pos)
         if report.get("pie_profile"):
             spec["label"] += f" · Profile {report['pie_profile']}"
         self.append_log(
-            f"[PIE] {bmode} compile finished in {cms:.2f} ms. Launching {spec['exe']} | {spec['direct_start']} "
+            f"[PIE] {bmode} compile finished in {cms:.2f} ms (placed {compiled_total}/{placed_total}). "
+            f"Launching {spec['exe']} | {spec['direct_start']} "
             f"| sync_all={self.world.sync_all_events} arcade={spec.get('arcade_mode')} "
-            f"| EOD_NATIVE={spec['env'].get('EOD_NATIVE')} EOD_LOOK={spec['env'].get('EOD_LOOK', 'original')}",
+            f"| scale={spec.get('pie_render_scale')}x | EOD_NATIVE={spec['env'].get('EOD_NATIVE')} "
+            f"EOD_LOOK={spec['env'].get('EOD_LOOK', 'original')}",
             verbose=True,
         )
         self.center_stack.setCurrentWidget(self.pie_host)
@@ -1546,10 +1774,21 @@ class EodWorldEditorWindow(QMainWindow):
         pie_ms = self.profiler.end_phase("pie_launch", detail=mode)
         self.append_log(f"[PIE] Process spawn handed off in {pie_ms:.1f} ms", verbose=True)
         if not ok:
+            exe_label = str(spec.get("exe_label") or GAME_EXE_LABEL)
             self.act_pie_stop.setEnabled(False)
             self.center_stack.setCurrentWidget(self.viewport)
-            self.append_log(f"[PIE][ERROR] Could not launch eod.exe at: {spec['exe']}", force_open=True)
-            QMessageBox.warning(self, "Play In Editor (PIE)", f"Could not launch eod.exe at:\n{spec['exe']}")
+            self.explorer.resume_thumbnails()
+            hint = (
+                "Build build-mac-plume/eod, install Eve of Destruction.app, or set EOD_PIE_EXE."
+                if sys.platform == "darwin"
+                else "Place eod.exe beside the editor, in build/eod.exe, or set EOD_PIE_EXE."
+            )
+            self.append_log(f"[PIE][ERROR] Could not launch {exe_label} at: {spec['exe']}", force_open=True)
+            QMessageBox.warning(
+                self,
+                "Play In Editor (PIE)",
+                f"Could not launch {exe_label} at:\n{spec['exe']}\n\n{hint}",
+            )
 
     def stop_pie(self) -> None:
         self.pie_host.stop_pie(emit_signal=True)
@@ -1565,6 +1804,10 @@ class EodWorldEditorWindow(QMainWindow):
         self.center_stack.setCurrentWidget(self.viewport)
         self.viewport.setFocus()
         self.viewport.update()
+        # Resume any paused background thumbnail & car-library scans so Explorer never stays blank!
+        self.explorer.resume_thumbnails()
+        if self.world is not None and self.world.car_count == 0 and self._car_token is None:
+            self._start_background_car_scan()
 
     def launch_game(self) -> None:
         """Alias for backward compatibility: runs PIE Free Roam."""
@@ -1573,6 +1816,15 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     # Tools, Snapping & View Toggles
     # -----------------------------------------------------------------------
+    def _shortcut_rotate_or_ghost(self) -> None:
+        """Route `R` to rotate Ghost Preview when in Place Mode, otherwise switch to Rotate Tool."""
+        if self.viewport.active_tool == "place":
+            self.viewport.ghost_yaw = (self.viewport.ghost_yaw + self.viewport.angle_snap_step) % 360.0
+            self.set_action_status(f"Ghost rotation: {self.viewport.ghost_yaw:.0f}°")
+            self.viewport.update()
+            return
+        self.select_tool("rotate")
+
     def select_tool(self, tool: str) -> None:
         if tool in ("place", "scatter") and not self.viewport.ghost_model_key:
             cur = self.explorer.current_model_key()
@@ -1908,8 +2160,45 @@ class EodWorldEditorWindow(QMainWindow):
         self.undo_stack.push(MultiTransformObjectsCommand(entries, self._refresh_after_edit, label))
         self.set_action_status(f"{label}")
 
+    def _on_alt_duplicate_completed(self, clones: list[WorldObject], label: str) -> None:
+        """Persist Alt+Drag clones into TrackWorld via QUndoStack so they never vanish on deselect."""
+        if self.world is None or not clones:
+            return
+        self.viewport.ensure_gl_textures()
+        self.undo_stack.push(ScatterPlaceCommand(self.world, clones, self._refresh_after_edit, label=label))
+        self.viewport.select_objects(clones)
+        self.set_action_status(f"{label} ({clones[-1].name})")
+
     def _on_prop_obj_transform(self, obj: WorldObject, new_p, new_r, new_s) -> None:
         if obj.position == new_p and obj.rotation_hpr == new_r and obj.scale == new_s:
+            return
+        selected = [o for o in self.viewport.selected_objects if not o.deleted]
+        if len(selected) > 1 and obj in selected:
+            # Apply delta/ratio across entire selected compound assembly (e.g. ramp + top wear strip)
+            dp = (new_p[0] - obj.position[0], new_p[1] - obj.position[1], new_p[2] - obj.position[2])
+            dr = (new_r[0] - obj.rotation_hpr[0], new_r[1] - obj.rotation_hpr[1], new_r[2] - obj.rotation_hpr[2])
+            sr = (
+                (new_s[0] / obj.scale[0]) if abs(obj.scale[0]) > 1e-6 else 1.0,
+                (new_s[1] / obj.scale[1]) if abs(obj.scale[1]) > 1e-6 else 1.0,
+                (new_s[2] / obj.scale[2]) if abs(obj.scale[2]) > 1e-6 else 1.0,
+            )
+            pivot = np.array(obj.position, dtype=np.float32)
+            entries = []
+            for so in selected:
+                op, orot, oscl = so.position, so.rotation_hpr, so.scale
+                if so is obj:
+                    entries.append((so, op, orot, oscl, new_p, new_r, new_s))
+                else:
+                    rel = np.array(op, dtype=np.float32) - pivot
+                    scaled_p = pivot + rel * np.array(sr, dtype=np.float32) + np.array(dp, dtype=np.float32)
+                    np_ = (float(scaled_p[0]), float(scaled_p[1]), float(scaled_p[2]))
+                    nrot = ((orot[0] + dr[0]) % 360.0, (orot[1] + dr[1]) % 360.0, (orot[2] + dr[2]) % 360.0)
+                    nscl = (oscl[0] * sr[0], oscl[1] * sr[1], oscl[2] * sr[2])
+                    entries.append((so, op, orot, oscl, np_, nrot, nscl))
+            self.undo_stack.push(
+                MultiTransformObjectsCommand(entries, self._refresh_after_edit, f"Edit transform ({len(entries)} parts)")
+            )
+            self.set_action_status(f"Updated transform for {len(entries)} grouped parts ({obj.name})")
             return
         self.undo_stack.push(
             TransformObjectCommand(
@@ -2156,7 +2445,7 @@ class EodWorldEditorWindow(QMainWindow):
     def edit_object_in_blender(self, obj: WorldObject) -> None:
         if self.world is None:
             return
-        export_dir = self.game_dir / "mods" / "blender_exports" / self.world.track_name.lower()
+        export_dir = tdeod_support_dir() / "editor" / "blender_exports" / self.world.track_name.lower()
         try:
             obj_path = export_object_obj(self.world, obj, export_dir)
             self.set_action_status(f"Exported Blender OBJ -> {obj_path}")
@@ -2404,11 +2693,21 @@ class EodWorldEditorWindow(QMainWindow):
 
         dlg = VehicleTunerDialog(self.game_dir, on_live_boost_changed=_on_boost, parent=self)
         dlg.nascar.testDriveRequested.connect(self._test_drive_registered_vehicle)
+        if hasattr(dlg, "handling") and hasattr(dlg.handling, "archiveSaved"):
+            dlg.handling.archiveSaved.connect(self._on_car_handling_saved)
         self._vehicle_tuner_dlg = dlg
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
         return dlg
+
+    def _on_car_handling_saved(self, archive_path: str) -> None:
+        p = Path(archive_path)
+        if p.is_file():
+            self._custom_car_archives = [x for x in self._custom_car_archives if x.name.lower() != p.name.lower()]
+            self._custom_car_archives.append(p)
+            self.append_log(f"[CarStudio] Registered tuned car archive for PIE/Export: {p.name}")
+            self.set_action_status(f"Tuned car ready for PIE & Export: {p.name}")
 
     def _test_drive_registered_vehicle(self, vehicle: RegisteredVehicle) -> None:
         if self.world is not None:
@@ -2692,34 +2991,37 @@ class EodWorldEditorWindow(QMainWindow):
         )
 
     def _show_controls_dialog(self) -> None:
-        zoom_modifier = "Command" if sys.platform == "darwin" else "Ctrl"
+        mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
+        del_key = "Delete / Backspace" if sys.platform == "darwin" else "Del"
         QMessageBox.information(
             self,
             "Controls & Keybindings",
             "Camera Navigation:\n"
             "  • Two-finger scroll or middle-mouse drag: Pan\n"
             "  • Shift + two-finger scroll or Alt + right-mouse drag: Orbit around the pointer\n"
-            f"  • Pinch or {zoom_modifier} + scroll: Zoom around the pointer\n"
+            f"  • Pinch or {mod} + scroll: Zoom around the pointer\n"
             "  • Right-mouse drag: Look around. Hold right mouse and scroll to change fly speed.\n"
             "  • Right-Click Selected Object: Quick Context Menu (Replace With, Ground, Delete)\n"
             "  • W / A / S / D: Fly horizontally  |  Q / E: Down / Up\n"
             "  • Shift: 2.8x fly boost  |  F: Frame selection\n\n"
-            "Lumion / Twinmotion / Unreal Editing:\n"
-            "  • G: Move  |  R: Rotate (or +15° in Place Mode)  |  P: Ghost Place  |  B: Scatter Brush\n"
-            "  • End / Ctrl+G: Drop selected object or marker to SCOL ground\n"
-            "  • Ctrl+D: Duplicate  |  F2: Export to Blender OBJ  |  Del: Delete\n"
-            "  • Ctrl+Z / Ctrl+Y: Undo / Redo\n"
-            "  • Ctrl+S: Save project overlay  |  Ctrl+Shift+S: Write real Mod Layer\n"
-            "  • F5: Play Free Roam (PIE)  |  Shift+F5: Play Event (PIE)  |  Esc: Stop PIE / Exit tool",
+            "Editing & Play-In-Editor:\n"
+            "  • Tab: Cycle Move / Rotate / Scale  |  G: Move  |  R: Rotate (or +15° in Place Mode)  |  T: Scale\n"
+            "  • P: Place Cursor Mode  |  B: Scatter Brush  |  Alt+Drag: Duplicate & Drag\n"
+            f"  • End / {mod}+G: Drop selected object or marker to terrain\n"
+            f"  • {mod}+D: Duplicate  |  F2: Export to Blender OBJ  |  {del_key}: Delete\n"
+            f"  • {mod}+Z / {mod}+Shift+Z: Undo / Redo\n"
+            f"  • {mod}+S: Save project  |  {mod}+Shift+S: Export Mod Layer\n"
+            f"  • F5: Free Roam (PIE)  |  {mod}+Shift+F5: Play From Camera  |  Shift+F5: Play Event  |  F4 (in-game): 6-DOF Free Cam",
         )
 
     def _show_about_dialog(self) -> None:
         from PySide6 import __version__ as pyside_ver
+        plat = {"darwin": "macOS", "win32": "Windows"}.get(sys.platform, sys.platform)
         QMessageBox.about(
             self,
             "About EOD World Editor",
             f"<h3>EOD World Editor</h3>"
-            f"<p>Native Windows 11 Qt 6 (PySide6 {pyside_ver}) + OpenGL 3.3 Core "
+            f"<p>Native {plat} Qt 6 (PySide6 {pyside_ver}) + OpenGL 3.3 Core / Plume Vulkan "
             f"world editor with Unreal-style Play-In-Editor (PIE) for <b>Test Drive: Eve of Destruction</b>.</p>"
             f"<p>Non-destructively edits retail 0TSR .TRK / .CAR archives (GRAF v18, 4SPS VIF meshes, "
             f"37 retail Cars &amp; Wrecks, Vulkan HOSTTEX PNG swaps, SCOL/SOBL barriers, and ILIN racing lines).</p>",

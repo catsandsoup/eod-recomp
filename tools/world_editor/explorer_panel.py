@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QDrag, QIcon, QPixmap
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -113,6 +113,7 @@ class ExplorerPanel(QWidget):
     scatterModeRequested = Signal(str)   # model_key -> activate Scatter Brush Mode
     replaceSelectedRequested = Signal(str)  # model_key -> Replace Selection With this model
     layerToggled = Signal(str, bool)     # layer_key, visible
+    carsRequested = Signal()             # user clicked Cars filter before car library loaded
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -164,7 +165,24 @@ class ExplorerPanel(QWidget):
     @staticmethod
     def _make_placeholder_pixmap() -> QPixmap:
         pm = QPixmap(THUMB_W, THUMB_H)
-        pm.fill(Qt.GlobalColor.transparent)
+        pm.fill(QColor(28, 31, 41))
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor(52, 59, 76), 1))
+        painter.drawRect(1, 1, THUMB_W - 2, THUMB_H - 2)
+        # Subtle isometric cube placeholder mark so unloaded cards never look blank/broken
+        cx, cy = THUMB_W // 2, THUMB_H // 2
+        painter.setPen(QPen(QColor(82, 94, 118), 1.4))
+        painter.drawLine(cx, cy - 12, cx + 13, cy - 5)
+        painter.drawLine(cx, cy - 12, cx - 13, cy - 5)
+        painter.drawLine(cx - 13, cy - 5, cx, cy + 2)
+        painter.drawLine(cx + 13, cy - 5, cx, cy + 2)
+        painter.drawLine(cx - 13, cy - 5, cx - 13, cy + 9)
+        painter.drawLine(cx + 13, cy - 5, cx + 13, cy + 9)
+        painter.drawLine(cx, cy + 2, cx, cy + 16)
+        painter.drawLine(cx - 13, cy + 9, cx, cy + 16)
+        painter.drawLine(cx + 13, cy + 9, cx, cy + 16)
+        painter.end()
         return pm
 
     # -----------------------------------------------------------------------
@@ -229,9 +247,9 @@ class ExplorerPanel(QWidget):
 
         act_row = QGridLayout()
         act_row.setSpacing(4)
-        btn_ghost = QPushButton("Ghost")
+        btn_ghost = QPushButton("Place Cursor")
         btn_ghost.setIcon(svg_icon("place"))
-        btn_ghost.setToolTip("Enter Ghost Placement Mode with selected model/car")
+        btn_ghost.setToolTip("Click on terrain to place copies of the selected model (R rotates preview)")
         btn_ghost.clicked.connect(self._ghost_place_selected_model)
 
         btn_scat = QPushButton("Scatter")
@@ -239,12 +257,13 @@ class ExplorerPanel(QWidget):
         btn_scat.setToolTip("Paint / Scatter selected model or wrecked car across terrain")
         btn_scat.clicked.connect(self._scatter_selected_model)
 
-        btn_rep = QPushButton("Swap")
+        btn_rep = QPushButton("Replace")
         btn_rep.setIcon(svg_icon("replace"))
         btn_rep.setToolTip("Replace currently selected scene object with this model/car")
         btn_rep.clicked.connect(self._replace_with_selected_model)
 
-        btn_place = QPushButton("Place")
+        btn_place = QPushButton("Spawn Here")
+        btn_place.setToolTip("Instantly spawn one copy in front of the camera")
         btn_place.clicked.connect(self._place_selected_model)
 
         act_row.addWidget(btn_ghost, 0, 0)
@@ -261,7 +280,7 @@ class ExplorerPanel(QWidget):
         lay.setContentsMargins(4, 6, 4, 4)
         lay.setSpacing(6)
 
-        lbl_road = QLabel("ACTIVE ILIN RACING LINE")
+        lbl_road = QLabel("ACTIVE RACING LINE (ILIN)")
         lbl_road.setProperty("sectionTitle", True)
         lay.addWidget(lbl_road)
 
@@ -269,16 +288,16 @@ class ExplorerPanel(QWidget):
         self.road_line_combo.currentIndexChanged.connect(self._on_road_line_changed)
         lay.addWidget(self.road_line_combo)
 
-        lbl_sec = QLabel("GRAF DISPLAY LIST & MLISTS")
+        lbl_sec = QLabel("TRACK SECTIONS & COLLISION")
         lbl_sec.setProperty("sectionTitle", True)
         lay.addWidget(lbl_sec)
 
         self.sections_tree = QTreeWidget()
-        self.sections_tree.setHeaderLabels(["Section / Mlist", "Count"])
+        self.sections_tree.setHeaderLabels(["Section", "Count"])
         self.sections_tree.setColumnWidth(0, 185)
         lay.addWidget(self.sections_tree, 1)
 
-        self.tabs.addTab(w, "Mlists")
+        self.tabs.addTab(w, "Track")
 
     def _build_layers_tab(self) -> None:
         w = QWidget()
@@ -358,12 +377,14 @@ class ExplorerPanel(QWidget):
         cat_counts: dict[str, int] = {}
         for m in self.world.models.values():
             cat_counts[m.category] = cat_counts.get(m.category, 0) + 1
+        car_cnt = cat_counts.get("car-wreck", 0)
         self.model_filter.addItem(f"All models ({len(self.world.models)})", "all")
-        if "car-wreck" in cat_counts:
-            self.model_filter.addItem(f"Cars & Wrecks ({cat_counts['car-wreck']})", "car-wreck")
-            self.btn_cars_quick.setText(f" Cars ({cat_counts['car-wreck']})")
+        if car_cnt > 0:
+            self.model_filter.addItem(f"Cars & Wrecks ({car_cnt})", "car-wreck")
+            self.btn_cars_quick.setText(f" Cars ({car_cnt})")
         else:
-            self.btn_cars_quick.setText(" Cars (0)")
+            self.model_filter.addItem("Cars & Wrecks (loading...)", "car-wreck")
+            self.btn_cars_quick.setText(" Cars (...)")
         for cat, cnt in sorted(cat_counts.items()):
             if cat == "car-wreck":
                 continue
@@ -381,8 +402,8 @@ class ExplorerPanel(QWidget):
         self.tabs.setTabToolTip(0, f"Scene Tree ({len(active_objs)} instances)")
         self.tabs.setTabText(1, "Models")
         self.tabs.setTabToolTip(1, f"Models ({len(self.world.models)})")
-        self.tabs.setTabText(2, "Mlists")
-        self.tabs.setTabToolTip(2, f"Sections / Mlists ({mlist_cnt})")
+        self.tabs.setTabText(2, "Track")
+        self.tabs.setTabToolTip(2, f"Racing Lines & Track Sections ({mlist_cnt})")
         self.tabs.setTabText(3, "Layers")
         self.tabs.setTabToolTip(3, "Visibility Layers (9)")
 
@@ -502,18 +523,55 @@ class ExplorerPanel(QWidget):
                 to_render.append((m.key, m))
             self.model_grid.addItem(item)
 
-        # Render thumbnails off the UI thread on QThreadPool (zero UI stutter!)
+        # Render thumbnails off the UI thread on QThreadPool (prioritize visible viewport items first!)
         if to_render:
-            token = CancelToken(self._thumb_gen)
-            self._thumb_token = token
-            worker = ThumbnailBatchWorker(
-                to_render,
-                dict(self.world.textures),
-                render_model_thumbnail_qimage,
-                token,
-            )
-            worker.signals.thumbnailReady.connect(self._on_worker_thumb_ready)
-            start_worker(worker, priority=-5)
+            self._start_thumb_worker(to_render)
+
+    def _start_thumb_worker(self, to_render: list[tuple[str, WorldModel]]) -> None:
+        if self.world is None or not to_render:
+            return
+        # Prioritize currently visible grid rows so the user never stares at blank placeholders
+        vp_rect = self.model_grid.viewport().rect()
+        visible_first: list[tuple[str, WorldModel]] = []
+        deferred: list[tuple[str, WorldModel]] = []
+        for mkey, m in to_render:
+            item = self._thumb_item_map.get(mkey)
+            if item is not None and vp_rect.intersects(self.model_grid.visualItemRect(item)):
+                visible_first.append((mkey, m))
+            else:
+                deferred.append((mkey, m))
+        ordered = visible_first + deferred
+        token = CancelToken(self._thumb_gen)
+        self._thumb_token = token
+        worker = ThumbnailBatchWorker(
+            ordered,
+            dict(self.world.textures),
+            render_model_thumbnail_qimage,
+            token,
+        )
+        worker.signals.thumbnailReady.connect(self._on_worker_thumb_ready)
+        start_worker(worker, priority=-5)
+
+    def resume_thumbnails(self) -> None:
+        """Restart thumbnail rendering for any remaining unrendered cards (e.g. after PIE stops)."""
+        if self.world is None or not self._thumb_item_map:
+            return
+        remaining: list[tuple[str, WorldModel]] = []
+        for mkey in list(self._thumb_item_map.keys()):
+            if mkey in self.thumb_cache._cache:
+                item = self._thumb_item_map.pop(mkey, None)
+                if item is not None:
+                    try:
+                        item.setIcon(QIcon(self.thumb_cache._cache[mkey]))
+                    except RuntimeError:
+                        pass
+                continue
+            m = self.world.models.get(mkey)
+            if m is not None:
+                remaining.append((mkey, m))
+        if remaining:
+            self._thumb_gen += 1
+            self._start_thumb_worker(remaining)
 
     def _on_worker_thumb_ready(self, gen: int, mkey: str, qimg: Any) -> None:
         if gen != self._thumb_gen:
@@ -582,6 +640,10 @@ class ExplorerPanel(QWidget):
 
     def _on_cars_quick_toggled(self, checked: bool) -> None:
         want = "car-wreck" if checked else "all"
+        if checked and self.world is not None:
+            has_cars = any(m.category == "car-wreck" for m in self.world.models.values())
+            if not has_cars:
+                self.carsRequested.emit()
         idx = self.model_filter.findData(want)
         if idx >= 0:
             self.model_filter.setCurrentIndex(idx)

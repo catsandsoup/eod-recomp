@@ -312,7 +312,7 @@ class TestEodWorldEditor(unittest.TestCase):
         # Verify all 14 top-level menus intact
         menu_titles = [a.text().replace("&", "") for a in win.menuBar().actions()]
         expected_menus = [
-            "File", "World", "View", "Camera", "Objects", "Markers", "Cars",
+            "File", "Edit", "World", "View", "Camera", "Objects", "Markers", "Cars",
             "Breakers", "Roads", "Terrain", "Mesh", "Races", "Collision", "Help",
         ]
         self.assertEqual(menu_titles, expected_menus)
