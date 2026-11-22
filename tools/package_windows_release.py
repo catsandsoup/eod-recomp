@@ -77,17 +77,22 @@ REQUIRED_WORLD_EDITOR_FILES: tuple[str, ...] = (
     "car_studio_handling.py",
     "dialogs.py",
     "explorer_panel.py",
+    "home_hub.py",
     "launch_editor.bat",
     "launch_editor_console.bat",
     "main_window.py",
+    "mod_manager.py",
     "nascar_import_panel.py",
+    "perf_profiler.py",
     "pie_host.py",
+    "plume_viewport.py",
+    "profile_pie.py",
     "project_state.py",
     "properties_panel.py",
     "test_editor.py",
     "theme.py",
-    "vehicle_overlay.py",
     "thumbnails.py",
+    "vehicle_overlay.py",
     "viewport_gl.py",
     "workers.py",
     "world_loader.py",
@@ -219,11 +224,13 @@ def sha256_file(path: Path) -> str:
 
 
 def verify_ast_import_closure(root: Path) -> list[str]:
-    """Verify that every local `tools/` import used by `tools/world_editor/` is listed in REQUIRED_TOOL_FILES."""
+    """Verify that every local `tools/` and `tools/world_editor/` import is listed in REQUIRED_*_FILES."""
     tools_dir = root / "tools"
     we_dir = tools_dir / "world_editor"
     all_tool_py = {p.stem: p.name for p in tools_dir.glob("*.py")}
-    bundled_set = set(REQUIRED_TOOL_FILES)
+    all_we_py = {p.stem: p.name for p in we_dir.glob("*.py")}
+    bundled_tool_set = set(REQUIRED_TOOL_FILES)
+    bundled_we_set = set(REQUIRED_WORLD_EDITOR_FILES)
     missing: list[str] = []
 
     queue = list(we_dir.glob("*.py"))
@@ -238,12 +245,23 @@ def verify_ast_import_closure(root: Path) -> list[str]:
             mod_names: list[str] = []
             if isinstance(node, ast.Import):
                 mod_names.extend(n.name.split(".")[0] for n in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                mod_names.append(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.level > 0 and node.module:
+                    mod_names.append(node.module.split(".")[0])
+                elif node.module:
+                    parts = node.module.split(".")
+                    mod_names.append(parts[0])
+                    if parts[0] == "world_editor" and len(parts) > 1:
+                        mod_names.append(parts[1])
             for m in mod_names:
-                if m in all_tool_py:
+                if p.parent == we_dir and m in all_we_py:
+                    fname = all_we_py[m]
+                    if fname not in bundled_we_set and f"world_editor/{fname}" not in missing:
+                        missing.append(f"world_editor/{fname}")
+                    queue.append(we_dir / fname)
+                elif m in all_tool_py:
                     fname = all_tool_py[m]
-                    if fname not in bundled_set and fname not in missing:
+                    if fname not in bundled_tool_set and fname not in missing:
                         missing.append(fname)
                     queue.append(tools_dir / fname)
     return missing

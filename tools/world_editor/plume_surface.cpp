@@ -4,6 +4,7 @@
 #include "plume_vulkan.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,7 @@ using namespace native::scene;
 constexpr RenderFormat scene_format = RenderFormat::B8G8R8A8_UNORM;
 constexpr uint32_t opaque_depth = (0xFu << 8) | (1u << 7) | (1u << 6) | (1u << 4);
 constexpr uint32_t blend_depth = (opaque_depth & ~(1u << 6)) | K_STRAIGHT_ALPHA;
+constexpr uint32_t overlay_top_depth = blend_depth & ~(3u << 4); // depth=1 (D32 match), zwrite=0, zfunc=ALWAYS
 constexpr uint32_t tex_decal = 1u | 1u << 2; // TME, TFX=decal
 constexpr uint32_t tex_alpha = 1u << 1; // TCC
 constexpr uint32_t alpha_cutout = 1u << 4 | 5u << 5 | 1u << 8; // ATE, GEQUAL, discard
@@ -78,14 +80,16 @@ struct Surface {
     std::unique_ptr<RenderTexture> depth;
     std::unique_ptr<RenderSampler> sampler;
     std::unique_ptr<RenderDescriptorSet> environment_set;
-    std::unique_ptr<RenderBuffer> mesh, environment;
+    std::unique_ptr<RenderBuffer> mesh, environment, overlay_buf;
     Texture white;
     std::unordered_map<uint32_t, Texture> textures;
     std::vector<Batch> batches;
     std::vector<std::unique_ptr<RenderFramebuffer>> targets;
     std::vector<std::unique_ptr<RenderCommandSemaphore>> ready;
-    RenderPipeline *opaque_pipeline = nullptr, *blend_pipeline = nullptr;
+    RenderPipeline *opaque_pipeline = nullptr, *blend_pipeline = nullptr, *overlay_top_pipeline = nullptr;
     uint32_t vertex_bytes = 0, index_bytes = 0;
+    uint32_t overlay_vbytes = 0, overlay_ibytes = 0;
+    uint32_t overlay_depth_count = 0, overlay_top_count = 0;
     bool needs_resize = true, submitted = false;
 
     void finish_frame() {
@@ -125,6 +129,7 @@ struct Surface {
         window = attach_surface(view);
         if (!window.view) return false;
 #else
+        if (volkInitialize() != VK_SUCCESS) return false;
         window = static_cast<HWND>(view);
 #endif
         api = CreateVulkanInterface();
@@ -133,8 +138,9 @@ struct Surface {
         if (!device || !scene.initialize(*device, scene_format)) return false;
         opaque_pipeline = scene.pipeline(opaque_depth | K_MODERN);
         blend_pipeline = scene.pipeline(blend_depth | K_MODERN);
+        overlay_top_pipeline = scene.pipeline(overlay_top_depth | K_MODERN);
         queue = device->createCommandQueue(RenderCommandListType::DIRECT);
-        if (!queue || !opaque_pipeline || !blend_pipeline) return false;
+        if (!queue || !opaque_pipeline || !blend_pipeline || !overlay_top_pipeline) return false;
         list = queue->createCommandList();
         fence = device->createCommandFence();
         acquired = device->createCommandSemaphore();
@@ -239,7 +245,7 @@ struct Surface {
 #endif
         if (!swapchain->resize()) return false;
         const uint32_t w = swapchain->getWidth(), h = swapchain->getHeight();
-        if (w != width || h != height) {
+        if (std::abs(int(w) - int(width)) > 2 || std::abs(int(h) - int(height)) > 2) {
             std::fprintf(stderr, "[editor plume] viewport extent %ux%u differs from requested %ux%u\n", w, h, width, height);
             return false;
         }
@@ -290,6 +296,75 @@ struct Surface {
         vertex_bytes = vb;
         index_bytes = ib;
         return true;
+    }
+
+    bool replace_overlay(const float *top_verts, uint32_t top_count, const float *depth_verts, uint32_t depth_count) {
+        finish_frame();
+        const uint32_t dc = (depth_verts && depth_count >= 3) ? (depth_count - (depth_count % 3)) : 0;
+        const uint32_t tc = (top_verts && top_count >= 3) ? (top_count - (top_count % 3)) : 0;
+        const uint32_t total = dc + tc;
+        if (total == 0) {
+            overlay_buf.reset();
+            overlay_vbytes = overlay_ibytes = 0;
+            overlay_depth_count = overlay_top_count = 0;
+            return true;
+        }
+        std::vector<Vertex> verts(total);
+        std::vector<uint32_t> idxs(total);
+        auto fill = [&](uint32_t dst_off, const float *src, uint32_t count) {
+            for (uint32_t i = 0; i < count; ++i) {
+                const float *s = src + size_t(i) * 7;
+                Vertex &v = verts[dst_off + i];
+                v.p[0] = s[0]; v.p[1] = s[1]; v.p[2] = s[2];
+                v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+                v.n[0] = 0; v.n[1] = 127; v.n[2] = 0; v.n[3] = 0;
+                v.c[0] = uint8_t(std::clamp(s[3] * 128.0f, 0.0f, 255.0f));
+                v.c[1] = uint8_t(std::clamp(s[4] * 128.0f, 0.0f, 255.0f));
+                v.c[2] = uint8_t(std::clamp(s[5] * 128.0f, 0.0f, 255.0f));
+                v.c[3] = uint8_t(std::clamp(s[6] * 255.0f, 0.0f, 255.0f));
+                idxs[dst_off + i] = dst_off + i;
+            }
+        };
+        if (dc) fill(0, depth_verts, dc);
+        if (tc) fill(dc, top_verts, tc);
+        const uint32_t vb = total * sizeof(Vertex), ib = total * sizeof(uint32_t);
+        auto next = device->createBuffer(RenderBufferDesc::UploadBuffer(
+            uint64_t(vb) + ib, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX));
+        if (!next) return false;
+        auto *bytes = static_cast<uint8_t *>(next->map());
+        if (!bytes) return false;
+        std::memcpy(bytes, verts.data(), vb);
+        std::memcpy(bytes + vb, idxs.data(), ib);
+        next->unmap();
+        overlay_buf = std::move(next);
+        overlay_vbytes = vb;
+        overlay_ibytes = ib;
+        overlay_depth_count = dc;
+        overlay_top_count = tc;
+        return true;
+    }
+
+    void draw_overlay(const float *matrix) {
+        if (!overlay_buf || (!overlay_depth_count && !overlay_top_count)) return;
+        PushConstants push{};
+        std::memcpy(&push, matrix, 16 * sizeof(float));
+        push.ambient[3] = 255;
+        push.mode[0] = 0; // unlit vertex color, no texture
+        push.mode[1] = 0;
+        push.mode[2] = (1u << 27); // unlit asset colours, no fog on gizmos/overlays
+        list->setGraphicsPipelineLayout(scene.layout());
+        list->setGraphicsDescriptorSet(environment_set.get(), 1);
+        list->setGraphicsDescriptorSet(white.set.get(), 0);
+        bind_indexed_mesh(*list, *overlay_buf, overlay_vbytes, overlay_vbytes, overlay_ibytes);
+        list->setGraphicsPushConstants(0, &push, 0, sizeof push);
+        if (overlay_depth_count) {
+            list->setPipeline(blend_pipeline);
+            list->drawIndexedInstanced(overlay_depth_count, 1, 0, 0, 0);
+        }
+        if (overlay_top_count) {
+            list->setPipeline(overlay_top_pipeline);
+            list->drawIndexedInstanced(overlay_top_count, 1, overlay_depth_count, 0, 0);
+        }
     }
 
     void draw_batches(const float *matrix) {
@@ -357,6 +432,7 @@ struct Surface {
         list->clearColor(0, RenderColor(clear[0], clear[1], clear[2], 1));
         list->clearDepth(true, 0);
         if (mesh && !batches.empty()) draw_batches(mat);
+        if (overlay_buf) draw_overlay(mat);
         list->setFramebuffer(nullptr);
         list->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(color, RenderTextureLayout::PRESENT));
         list->end();
@@ -409,6 +485,15 @@ EOD_VIEWPORT_API bool eod_plume_view_texture(Surface *surface, uint32_t slot, ui
 
 EOD_VIEWPORT_API void eod_plume_view_clear_textures(Surface *surface) {
     if (surface) surface->clear_textures();
+}
+
+EOD_VIEWPORT_API bool eod_plume_view_overlay(Surface *surface, const float *top_verts, uint32_t top_vert_count,
+                                             const float *depth_verts, uint32_t depth_vert_count) {
+    try {
+        return surface && surface->replace_overlay(top_verts, top_vert_count, depth_verts, depth_vert_count);
+    } catch (...) {
+        return false;
+    }
 }
 
 EOD_VIEWPORT_API int eod_plume_view_draw(Surface *surface, uint32_t width, uint32_t height, const float *matrix,
