@@ -70,4 +70,77 @@ inline std::vector<Voice> mix(const Profile&p,float rpm,float throttle,float aud
     }
     return out;
 }
+
+// Isolated audio-only xorshift32 PRNG (never touches gameplay/race RNG streams).
+struct AudioRng {
+    uint32_t state = 0x6D2B79F5u;
+    AudioRng() = default;
+    explicit AudioRng(uint32_t seed) : state(seed ? seed : 0x6D2B79F5u) {}
+    uint32_t next_u32() {
+        uint32_t x = state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        state = x ? x : 0x6D2B79F5u;
+        return state;
+    }
+    float next_unit() {
+        return float(next_u32() & 0x00FFFFFFu) / float(0x01000000u);
+    }
+    // Returns D2D source audio_random in [0.1f, 0.6f].
+    float next_caller_random() {
+        return 0.1f + 0.5f * next_unit();
+    }
+};
+
+// Matches SLUS_204.41 external camera modes (0x1EF09C).
+inline bool is_external_camera_mode(uint32_t mode) {
+    switch (mode) {
+        case 9: case 14: case 15: case 17:
+        case 18: case 19: case 20: case 22:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Idle layer blend for nseng1i.sfx below 1,600 RPM (fades smoothly 1,000..1,600 RPM).
+inline Voice evaluate_idle(float rpm, float throttle, bool viewed, bool local_mix, bool silenced) {
+    if (silenced || !std::isfinite(rpm) || rpm < 50.f || rpm >= 1600.f) {
+        return {false, 0.f, 0.f};
+    }
+    const float fade = rpm <= 1000.f ? 1.f : (1600.f - rpm) / 600.f;
+    const float th = std::clamp(throttle, 0.f, 1.f);
+    const float throttle_atten = 1.f - 0.45f * th;
+    float gain = 0.24f * fade * throttle_atten;
+    if (viewed) gain *= local_mix ? 1.85f : 1.50f;
+    const float pitch = std::clamp(rpm / 900.f, 0.55f, 1.65f);
+    return gain > 0.001f ? Voice{true, pitch, gain} : Voice{false, 0.f, 0.f};
+}
+
+// Built-in fallback profiles matching verified SLUS_204.41 PART.RES/eng1e..eng4e.ens.
+inline Profile builtin_profile(int engine_index) {
+    auto make_rec = [](const char* sfx, float sr, float gl, float gh,
+                       float ol, float il, float ih, float oh) {
+        Record r{};
+        std::strncpy(r.sample.data(), sfx, r.sample.size() - 1);
+        r.sample_rpm = sr; r.gain_low = gl; r.gain_high = gh;
+        r.outer_low = ol; r.inner_low = il; r.inner_high = ih; r.outer_high = oh;
+        return r;
+    };
+    const char* primary = "nseng10.sfx";
+    float base_rpm = 7806.f;
+    switch (engine_index) {
+        case 2: primary = "nseng20.sfx"; base_rpm = 5940.f; break;
+        case 3: primary = "nseng30.sfx"; base_rpm = 3791.f; break;
+        case 4: primary = "nseng30.sfx"; base_rpm = 4043.f; break;
+        case 1:
+        default: primary = "nseng10.sfx"; base_rpm = 7806.f; break;
+    }
+    return Profile{
+        make_rec(primary,       base_rpm, 0.65f, 0.96f,  100.f, 3000.f, 8100.f, 80000.f),
+        make_rec(primary,       base_rpm, 0.65f, 0.96f,  100.f, 3000.f, 8100.f, 80000.f),
+        make_rec("nseng12.sfx", 7806.f,   0.07f, 0.50f, 6400.f, 6750.f, 8100.f, 80000.f),
+    };
+}
 } // namespace nascar_audio

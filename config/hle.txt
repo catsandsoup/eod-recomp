@@ -71,6 +71,9 @@
 
 0034CEF0 wrap     # optional Cup source fast wheel geometry; exact native fallback
 00220788 wrap     # bounded opt-in Cup actual slow/fast selection trace
+0023C400 wrap     # native NASCAR ESFX engine audio loader (src/hle_nascar_audio.cpp); retail *.val passthrough
+0023C8D0 wrap     # native NASCAR ESFX per-frame engine mixer (src/hle_nascar_audio.cpp); retail passthrough
+00186DC8 wrap     # dynamic NASCAR track-class .gar transmission & shift-table builder (src/hle_nascar_audio.cpp)
 
 # Direct session start (src/session_start.cpp, EOD_DIRECT_START): inert unless the variable is set
 002BEC08 wrap     # title screen: passed immediately when EOD_DIRECT_START is set

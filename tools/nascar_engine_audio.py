@@ -18,6 +18,10 @@ import struct
 
 FAMILY_PROFILES = {'stock':'eng1', 'truck':'eng1', 'modified':'eng4',
                    'hobby':'eng3', 'pacecar':'eng1'}
+ALL_PROFILES = ('eng1', 'eng2', 'eng3', 'eng4')
+IDLE_SAMPLE_NAME = 'eng1i.sfx'
+FAMILY_ESFX_TARGETS = {fam: f'ns{prof}.ens' for fam, prof in FAMILY_PROFILES.items()}
+FAMILY_ESFX_TARGETS['dirt'] = 'nseng2.ens'
 
 
 def _sample_name(name):
@@ -144,24 +148,28 @@ def _sha(blob):
     return hashlib.sha256(blob).hexdigest()
 
 
-def prepare_audio(profile_dir, sample_dir, native_res, out):
-    """Build native-preserving archives with new, currently inactive ESFX assets.
+def prepare_audio(profile_dir, sample_dir, native_res, out, *, runtime_enabled=False):
+    """Build native-preserving archives with ESFX assets.
 
-    Never changes an installed disc/profile or existing candidate. Native engine
-    presets remain referenced until the source-only runtime adapter is accepted.
+    When runtime_enabled=True, mounts all four profiles (nseng1.ens..nseng4.ens)
+    and all engine samples including idle (nseng1i.sfx, nseng10.sfx, nseng12.sfx,
+    nseng20.sfx, nseng30.sfx) for live playback via src/hle_nascar_audio.cpp.
     """
     from nascar_roster import Archive
     profile_dir,sample_dir,native_res,out=map(Path,(profile_dir,sample_dir,native_res,out))
     if out.exists() and any(out.iterdir()):
         raise ValueError('Audio preparation requires a new empty output directory')
+    profile_keys = ALL_PROFILES if runtime_enabled else sorted(set(FAMILY_PROFILES.values()))
     profiles={}
-    for profile in sorted(set(FAMILY_PROFILES.values())):
+    for profile in profile_keys:
         blob=(profile_dir/(profile+'e.ens')).read_bytes()
         records=parse_esfx(blob)
         if not records:
             raise ValueError('Required source engine profile is empty')
         profiles[profile]=(blob,records)
     names=sorted({r.sample for _,rs in profiles.values() for r in rs})
+    if runtime_enabled and (sample_dir/IDLE_SAMPLE_NAME).exists() and IDLE_SAMPLE_NAME not in names:
+        names=sorted([*names, IDLE_SAMPLE_NAME])
     samples={}
     for name in names:
         blob=(sample_dir/name).read_bytes()
@@ -174,7 +182,8 @@ def prepare_audio(profile_dir, sample_dir, native_res, out):
     # All source extents/parameters checked before creating candidate resources.
     race=Archive(native_res/'RACE.RES',out/'extracted/RACE')
     sound=Archive(native_res/'RACESND.RES',out/'extracted/RACESND')
-    report={'runtime_enabled':False,'family_profiles':FAMILY_PROFILES.copy(),
+    report={'runtime_enabled':bool(runtime_enabled),'family_profiles':FAMILY_PROFILES.copy(),
+            'family_esfx_targets':FAMILY_ESFX_TARGETS.copy(),
             'profiles':{},'samples':[],'native_preservation':{}}
     for profile,(blob,records) in profiles.items():
         target='ns'+profile+'.ens'
@@ -195,7 +204,7 @@ def prepare_audio(profile_dir, sample_dir, native_res, out):
         archive.assert_native_preserved()
         report['native_preservation'][name]=len(archive.original)
         archive.pack(out/'DATA/RES'/f'{name}.RES')
-    report['acceptance_remaining']=['source-only mixer hook','native control/view/split-screen mapping',
+    report['acceptance_remaining']=[] if runtime_enabled else ['source-only mixer hook','native control/view/split-screen mapping',
         'source audio random stream policy','live RPM/throttle/voice verification','listening/native regression']
     (out/'audio-provenance.json').write_text(json.dumps(report,indent=2)+'\n')
     return report
@@ -207,8 +216,12 @@ def main():
     parser.add_argument('--samples',type=Path,required=True)
     parser.add_argument('--native-res',type=Path,required=True)
     parser.add_argument('--out',type=Path,required=True)
+    parser.add_argument('--enable-runtime',action='store_true',
+                        help='Mount all 4 ESFX profiles + idle sample for live hle_nascar_audio playback')
     args=parser.parse_args()
-    report=prepare_audio(args.profiles,args.samples,args.native_res,args.out)
-    print(f'Prepared {len(report["profiles"])} profiles/{len(report["samples"])} original samples; playback not activated')
+    report=prepare_audio(args.profiles,args.samples,args.native_res,args.out,
+                         runtime_enabled=args.enable_runtime)
+    status='runtime playback active' if report['runtime_enabled'] else 'playback not activated'
+    print(f'Prepared {len(report["profiles"])} profiles/{len(report["samples"])} original samples; {status}')
 
 if __name__=='__main__':main()

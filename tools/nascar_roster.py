@@ -21,9 +21,108 @@ from import_nascar_cars import (find_entry, transcode_modl, convert_tex_v9_to_v1
     hood_helpers, add_helpers, set_entry, STOCK_INTERIOR_TEXTURES)
 from create_custom_car import car_archive_filename
 from modl import retexture_modl
+from nascar_engine_audio import FAMILY_ESFX_TARGETS
 from nascar_wheels import build_source_wheels
 from rst0 import unpack_archive, pack_archive
 from valt import parse_binary_valt, compile_binary_valt
+
+# Default short-oval .gar ratios (KENYON.TRK/arcade.gar final=5.43, short-dirt gears)
+# so NASCAR cars cycle crisply through 1->2->3->4 on EOD dirt ovals instead of
+# stalling in 1st gear with Daytona's 2.80 superspeedway final drive.
+SHORT_OVAL_BASELINE_GEARS = (3.50, 2.70, 1.90, 1.25)
+SHORT_OVAL_BASELINE_FINAL = 5.43
+
+
+def parse_source_valt(data: bytes) -> dict:
+    """Parse source D2D VALT v6/v11, handling DIRTCAR.CAR's early 0x4C-stride v6 layout."""
+    if len(data) >= 12 + 0x4C:
+        vt, sec_count, unk1 = struct.unpack_from('<III', data, 0)
+        svt0 = struct.unpack_from('<I', data, 12)[0]
+        is_stride_4c = (
+            svt0 == 0x0040A0E4
+            and sec_count >= 2
+            and len(data) >= 12 + sec_count * 0x4C
+            and struct.unpack_from('<I', data, 12 + 0x4C)[0] == 0x0040A0E4
+            and (len(data) < 12 + 0x50 + 4 or struct.unpack_from('<I', data, 12 + 0x50)[0] != 0x0040A0E4)
+        )
+        if is_stride_4c:
+            def decode_str(off):
+                if off == 0 or off >= len(data):
+                    return ''
+                end = data.find(b'\0', off)
+                if end == -1:
+                    end = len(data)
+                chunk = data[off:end]
+                if chunk and (chunk[0] & 0x80):
+                    return bytes(b ^ 0xA5 for b in chunk).decode('latin1', errors='replace')
+                return chunk.decode('latin1', errors='replace')
+
+            sections = []
+            for i in range(sec_count):
+                soff = 12 + i * 0x4C
+                svt = struct.unpack_from('<I', data, soff)[0]
+                sname = decode_str(soff + 4)
+                npairs, pairs_off = struct.unpack_from('<II', data, soff + 0x44)
+                pairs = []
+                for p in range(npairs):
+                    poff = pairs_off + p * 8
+                    if poff + 8 > len(data):
+                        raise ValueError('Truncated VALT v6 (0x4C) pair table')
+                    koff, voff = struct.unpack_from('<II', data, poff)
+                    pairs.append((decode_str(koff), decode_str(voff)))
+                sections.append({
+                    'name': sname,
+                    'parent': '',
+                    'pairs': pairs,
+                    'sec_vtable': svt,
+                    'tool_ptr': 0,
+                })
+            return {
+                'tool_vtable': vt,
+                'unk1': unk1,
+                'orig_sec_count': sec_count,
+                'sections': sections,
+                'is_v6': True,
+            }
+    return parse_binary_valt(data)
+
+
+def build_short_oval_setup(gears=SHORT_OVAL_BASELINE_GEARS, final_drive=SHORT_OVAL_BASELINE_FINAL) -> bytes:
+    """Build a valid 196-byte SETU v2 payload with short-oval ratios."""
+    blob = bytearray(196)
+    struct.pack_into('<4f', blob, 0x78, *gears)
+    struct.pack_into('<f', blob, 0x94, final_drive)
+    return bytes(blob)
+
+
+def select_eod_baseline_setup(nascar_data, sources):
+    """Prefer KENYON.TRK/arcade.gar (final=5.43) for EOD short-oval baseline gearing."""
+    if nascar_data is not None:
+        kenyon = Path(nascar_data) / 'TRACKS' / 'KENYON.TRK'
+        if kenyon.exists():
+            with tempfile.TemporaryDirectory(prefix='kenyon-gar-') as tmp:
+                unpack_archive(str(kenyon), tmp)
+                for candidate in ('arcade.gar', 'default.gar'):
+                    try:
+                        p = find_entry(Path(tmp), candidate)
+                        blob = p.read_bytes()
+                        if len(blob) == 196:
+                            return blob, f'TRACKS/KENYON.TRK/{p.name}'
+                    except FileNotFoundError:
+                        pass
+    return build_short_oval_setup(), 'short-oval-default (g=3.50/2.70/1.90/1.25, final=5.43)'
+
+
+def apply_family_engine_sound(physics: dict, family: str) -> dict:
+    """Bind native NASCAR ESFX profile (nseng1/nseng3/nseng4.ens) on [EngineNormal]."""
+    target = FAMILY_ESFX_TARGETS.get(family, 'nseng1.ens')
+    for section in physics['sections']:
+        if section['name'] == 'EngineNormal':
+            pairs = [(k, v) for k, v in section['pairs'] if k.lower() != 'engine_sound']
+            pairs.append(('engine_sound', target))
+            section['pairs'] = pairs
+            break
+    return physics
 
 FAMILIES={
     'stock':dict(archive='STOCK',body='Stock1.tex',paint='PAINT256',roster='cup.val',price=18000,stats=(10,8,6)),
@@ -218,7 +317,7 @@ def collect_roster(sources):
     return records
 
 
-def build_chassis(family,style,name,records,sources,native_car,destination):
+def build_chassis(family,style,name,records,sources,native_car,destination,*,baseline_setup=None,baseline_label=None):
     """Construct from source resources only, with explicit remaining native-format adapters."""
     cfg=FAMILIES[family];src=sources[cfg['archive']];car=destination;car.mkdir()
     entries=[];provenance={};adapters=[]
@@ -277,10 +376,13 @@ def build_chassis(family,style,name,records,sources,native_car,destination):
             ar=cfg['paint'] if cfg['paint'] in ('PAINT256','TRUCKSET') else 'PAINT256'
         else:path,ar=lookup_texture(tex)
         put(tex,convert_tex_v9_to_v10(path.read_bytes()),10,'TEX',f'{ar}/{path.name}','TEX v9→v10 header; exact source pixels')
-    phys_source=parse_binary_valt(find_entry(src,'physics.val').read_bytes())
+    phys_source=parse_source_valt(find_entry(src,'physics.val').read_bytes())
     physics=merge_physics(native_car.table('physics.val'),phys_source,wheel_class='npc' if family=='pacecar' else 'ncu')
-    physics=adapt_source_transmission(physics,find_entry(sources['RACE'],'default.gar').read_bytes())
-    put('physics.val',compile_binary_valt(physics),origin=f'{cfg["archive"]}.CAR/physics.val + native physics schema',method='Every source section/key; neutral grip/damage_scale; exact source axle dirt copies; source wheel class adapter; source-authored RACE/default.gar gear/final-drive baseline for native EOD tracks; unresolved spring/audio/gauge adapters')
+    setup_blob=baseline_setup if baseline_setup is not None else build_short_oval_setup()
+    setup_label=baseline_label or 'short-oval-default (final=5.43)'
+    physics=adapt_source_transmission(physics,setup_blob)
+    physics=apply_family_engine_sound(physics,family)
+    put('physics.val',compile_binary_valt(physics),origin=f'{cfg["archive"]}.CAR/physics.val + native physics schema',method=f'Every source section/key; neutral grip/damage_scale; exact source axle dirt copies; source wheel class adapter; {setup_label} short-oval baseline gearing + runtime dynamic .gar hook; native ESFX engine_sound={FAMILY_ESFX_TARGETS.get(family,"nseng1.ens")}')
     lod=native_car.table('lod.val')
     for s in lod['sections']:
         if s['name']=='low':s['pairs']=[(k,body.lower() if k=='base_tex' else v) for k,v in s['pairs']]
@@ -346,12 +448,13 @@ def build_batch(nascar_data,eod_data,output,*,work_dir,prototype_native_class=Fa
                   native_class_prototype='Midsize (1); no fifth-class arrays changed',families={},liveries=records,
                   prototype_selector={'exposed_driver_ids':sorted(exposed,key=int),'cap':'5 source drivers +5 distinct dealer numbers per chassis; full125 selection requires native UI storage extension'},
                   native_resources={},unresolved_behavior=['source audio conversion; native-track setup-selection policy','source damage threshold and runtime dent behavior','spring_factor and remaining native-only physics keys','source LOD distance mapping','effects and Pace light animation','per-driver team suit selection','Career unlocks and dirt tyre shop'])
+    baseline_setup,baseline_label=select_eod_baseline_setup(nascar_data,sources)
     for family,choices in CHASSIS.items():
         family_prov={}
         for style,chassis in choices.items():
             paints=[r for r in records if r['chassis']==chassis]
             car_dir=work_dir/f'car-{chassis}'
-            prov=build_chassis(family,style,chassis,paints,sources,base,car_dir)
+            prov=build_chassis(family,style,chassis,paints,sources,base,car_dir,baseline_setup=baseline_setup,baseline_label=baseline_label)
             pack_archive(str(car_dir),str(package/'DATA'/'CAR'/car_archive_filename(chassis)))
             family_prov[chassis]=prov
             # Only append to an existing safe native list. Never append class4.
@@ -409,7 +512,7 @@ def build_batch(nascar_data,eod_data,output,*,work_dir,prototype_native_class=Fa
         native['CT'].add('777.'+ext,native['CT'].read(legacy['id']+'.'+ext),10,'TEX',ext=='tm0')
     manifest['legacy_alias']={'id':'777','source_id':legacy['id'],'chassis':'Cupcar','source':'PAINT256.RES/Car24.tex','note':'Resource alias for prototype saves; no duplicate driver'}
     manifest['setups']=preserve_source_setups(nascar_data,sources,package)
-    manifest['setup_baseline']={'source':'RACE.RES/default.gar','policy':'Explicit source-authored global baseline on native EOD tracks; source live retail loader normally selects track/mode setups. Per-track mapping remains pending.','gear_offsets':'0x78+4*i','final_drive_offset':'0x94','target':'Transmission.g1..gN / rear_end_ratio, direct ratios; ratio_factor removed'}
+    manifest['setup_baseline']={'source':baseline_label,'policy':'Short-oval baseline (KENYON.TRK/arcade.gar final=5.43) for EOD dirt ovals, dynamically overridden per active circuit class by src/hle_nascar_audio.cpp (0x186DC8).','gear_offsets':'0x78+4*i','final_drive_offset':'0x94','target':'Transmission.g1..gN / rear_end_ratio, direct ratios; ratio_factor removed'}
     wheel_prov={}
     for family,prefix in [('stock','ncu'),('pacecar','npc')]:
         cfg=FAMILIES[family];physics=parse_binary_valt(find_entry(sources[cfg['archive']],'physics.val').read_bytes())
