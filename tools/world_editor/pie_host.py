@@ -422,7 +422,10 @@ def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = False) -> Path
             Path("/Applications") / bundle_executable,
         ]
     elif sys.platform == "win32":
+        exe_parent = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else bundle_root
         candidates = [
+            exe_parent / "eod.exe",
+            exe_parent.parent / "eod.exe",
             bundle_root / "eod.exe",
             gdir / "eod.exe",
             repository / "build" / "eod.exe",

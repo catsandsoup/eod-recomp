@@ -35,18 +35,10 @@ CORE_PHASES: tuple[str, ...] = ("app_startup", "track_load", "mod_compile", "pie
 
 
 def profiler_appdata_dir() -> Path:
-    """Return writable per-user editor directory (respects EOD_EDITOR_APPDATA override)."""
-    override = os.environ.get("EOD_EDITOR_APPDATA")
-    if override:
-        p = Path(override)
-    else:
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            p = Path(local) / "EODWorldEditor"
-        else:
-            p = Path.home() / ".eod_world_editor"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    """Return canonical writable per-user editor directory (respects EOD_EDITOR_APPDATA override)."""
+    from world_loader import editor_appdata_dir
+
+    return editor_appdata_dir()
 
 
 @dataclass

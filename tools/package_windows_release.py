@@ -380,11 +380,14 @@ def build_bundle(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Copy eod.exe (and eodsetup.exe if built)
+    # 1. Copy eod.exe (and eodsetup.exe / eod_editor_plume.dll if built)
     shutil.copy2(game_exe, output_dir / "eod.exe")
     setup_exe = game_exe.parent / "eodsetup.exe"
     if setup_exe.is_file():
         shutil.copy2(setup_exe, output_dir / "eodsetup.exe")
+    plume_dll = game_exe.parent / "eod_editor_plume.dll"
+    if plume_dll.is_file():
+        shutil.copy2(plume_dll, output_dir / "eod_editor_plume.dll")
 
     # 2. Write 1-click root World Editor launcher
     (output_dir / "Launch EOD World Editor.bat").write_text(
@@ -396,6 +399,8 @@ def build_bundle(
     dest_tools = output_dir / "tools"
     dest_we = dest_tools / "world_editor"
     dest_we.mkdir(parents=True, exist_ok=True)
+    if plume_dll.is_file():
+        shutil.copy2(plume_dll, dest_we / "eod_editor_plume.dll")
     for rel in REQUIRED_WORLD_EDITOR_FILES:
         shutil.copy2(root / "tools" / "world_editor" / rel, dest_we / rel)
 

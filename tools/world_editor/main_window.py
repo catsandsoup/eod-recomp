@@ -564,6 +564,17 @@ class EodWorldEditorWindow(QMainWindow):
             style = (Qt.ToolButtonStyle.ToolButtonIconOnly if self.width() < 1400
                      else Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             self.main_toolbar.setToolButtonStyle(style)
+        if hasattr(self, "_lbl_pie_event"):
+            compact_tb = self.width() < 1100
+            self._lbl_pie_event.setText("Ev" if compact_tb else "Event")
+            self._lbl_pie_car.setText("Car" if compact_tb else "Vehicle")
+            self._lbl_pie_renderer.setText("GPU" if compact_tb else "Renderer")
+            self._lbl_pie_scale.setText("Res" if compact_tb else "PIE Scale")
+            self.cmb_pie_event.setMaximumWidth(120 if compact_tb else 240)
+            self.cmb_pie_car.setMaximumWidth(86 if compact_tb else 160)
+            self.cmb_renderer_mode.setMaximumWidth(82 if compact_tb else 130)
+            self.cmb_pie_scale.setMaximumWidth(56 if compact_tb else 110)
+            self.spn_pie_ai.setMaximumWidth(58 if compact_tb else 80)
         for panel, widget, action in panels:
             widget.setVisible(visible[panel])
             blocked = action.blockSignals(True)
@@ -619,26 +630,32 @@ class EodWorldEditorWindow(QMainWindow):
         self.cmb_pie_event.setToolTip(
             "Event Template / Race Mode — live-filters viewport ramps & props, switches active ILIN line, and targets PIE"
         )
-        self.cmb_pie_event.setMinimumWidth(155)
+        self.cmb_pie_event.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_pie_event.setMinimumContentsLength(10)
+        self.cmb_pie_event.setMinimumWidth(110)
         self.cmb_pie_event.addItems(
             ["All Templates (Combined)", "Battle (Free Roam)", "No-Rules Race", "Demolition Derby", "Career Overworld (Free Roam)"]
         )
         self.cmb_pie_event.currentTextChanged.connect(self._on_pie_picker_changed)
-        settings.addWidget(QLabel("Event"))
+        self._lbl_pie_event = QLabel("Event")
+        settings.addWidget(self._lbl_pie_event)
         settings.addWidget(self.cmb_pie_event)
 
         self.cmb_pie_car = QComboBox()
         self.cmb_pie_car.setEditable(True)
         self.cmb_pie_car.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.cmb_pie_car.setToolTip("Choose any retail vehicle to spawn in (type to filter)")
-        self.cmb_pie_car.setMinimumWidth(110)
+        self.cmb_pie_car.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_pie_car.setMinimumContentsLength(7)
+        self.cmb_pie_car.setMinimumWidth(80)
         car_names = [p.stem.replace("_1", "").title() for p in discover_cars(self.game_dir)]
         self.cmb_pie_car.addItems(car_names or ["Algar", "Bus", "Copcar", "Taxi", "Detonator"])
         idx_algar = self.cmb_pie_car.findText("Algar", Qt.MatchFlag.MatchFixedString)
         if idx_algar >= 0:
             self.cmb_pie_car.setCurrentIndex(idx_algar)
         self.cmb_pie_car.currentTextChanged.connect(self._on_pie_picker_changed)
-        settings.addWidget(QLabel("Vehicle"))
+        self._lbl_pie_car = QLabel("Vehicle")
+        settings.addWidget(self._lbl_pie_car)
         settings.addWidget(self.cmb_pie_car)
 
         self.spn_pie_ai = QSpinBox()
@@ -656,6 +673,8 @@ class EodWorldEditorWindow(QMainWindow):
 
         # Renderer Quality Selector (PS2 Fast Performance vs Plume Vulkan High-Quality)
         self.cmb_renderer_mode = QComboBox()
+        self.cmb_renderer_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_renderer_mode.setMinimumContentsLength(8)
         self.cmb_renderer_mode.addItem("PS2 Fast", "ps2")
         self.cmb_renderer_mode.addItem("Plume HQ", "plume")
         self.cmb_renderer_mode.setToolTip(
@@ -665,22 +684,26 @@ class EodWorldEditorWindow(QMainWindow):
         )
         self.cmb_renderer_mode.currentIndexChanged.connect(self._on_renderer_mode_changed)
         settings.addSeparator()
-        settings.addWidget(QLabel("Renderer"))
+        self._lbl_pie_renderer = QLabel("Renderer")
+        settings.addWidget(self._lbl_pie_renderer)
         settings.addWidget(self.cmb_renderer_mode)
 
         self.cmb_pie_scale = QComboBox()
-        self.cmb_pie_scale.addItem("1x (PS2)", 1)
-        self.cmb_pie_scale.addItem("2x (HD)", 2)
-        self.cmb_pie_scale.addItem("3x (1440p)", 3)
-        self.cmb_pie_scale.addItem("4x (4K)", 4)
+        self.cmb_pie_scale.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_pie_scale.setMinimumContentsLength(3)
+        self.cmb_pie_scale.addItem("1x", 1)
+        self.cmb_pie_scale.addItem("2x", 2)
+        self.cmb_pie_scale.addItem("3x", 3)
+        self.cmb_pie_scale.addItem("4x", 4)
         self.cmb_pie_scale.setCurrentIndex(1)  # Default 2x HD instead of inheriting RenderScale=6 (>4K)!
         self.cmb_pie_scale.setToolTip(
-            "Isolated PIE internal resolution scale (never reads or overwrites your global eod.ini)"
+            "Isolated PIE internal resolution scale: 1x (PS2), 2x (HD), 3x (1440p), 4x (4K) — never overwrites your global eod.ini"
         )
         self.cmb_pie_scale.currentIndexChanged.connect(
             lambda _i: setattr(self, "_pie_render_scale", int(self.cmb_pie_scale.currentData() or 2))
         )
-        settings.addWidget(QLabel("PIE Scale"))
+        self._lbl_pie_scale = QLabel("PIE Scale")
+        settings.addWidget(self._lbl_pie_scale)
         settings.addWidget(self.cmb_pie_scale)
         tb.addSeparator()
 

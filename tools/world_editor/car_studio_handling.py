@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 import modding_backend as backend
 from workers import FunctionWorker, start_worker
-from world_loader import discover_cars
+from world_loader import discover_cars, editor_appdata_dir
 
 _NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _NUMERIC_VALUE = re.compile(rf"{_NUMBER}(?:(?:[ \t]*,[ \t]*|[ \t]+){_NUMBER})*")
@@ -138,9 +138,7 @@ class CarHandlingSheet(QWidget):
         super().__init__(parent)
         self.disc = game_dir.resolve()
         if project_root is None:
-            base = os.environ.get("EOD_EDITOR_APPDATA") or QStandardPaths.writableLocation(
-                QStandardPaths.StandardLocation.AppLocalDataLocation)
-            project_root = Path(base) / "car-studio"
+            project_root = editor_appdata_dir() / "car-studio"
         self._project_root = project_root.resolve()
         self._request: dict | None = None
         self.saved_archive: dict | None = None

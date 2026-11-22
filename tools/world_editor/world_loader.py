@@ -69,6 +69,25 @@ def default_game_dir() -> Path:
     return DEFAULT_GAME_DIR
 
 
+def editor_appdata_dir() -> Path:
+    """Return canonical per-user EOD World Editor data dir (respects EOD_EDITOR_APPDATA override)."""
+    override = os.environ.get("EOD_EDITOR_APPDATA")
+    if override:
+        p = Path(override)
+    elif sys.platform == "darwin":
+        p = Path.home() / "Library" / "Application Support" / "TDEODRecomp" / "editor"
+    else:
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            p = Path(local) / "EODWorldEditor"
+        else:
+            xdg = os.environ.get("XDG_DATA_HOME")
+            base = Path(xdg) if xdg else (Path.home() / ".local" / "share")
+            p = base / "TDEODRecomp" / "editor"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def discover_tracks(game_dir: Path | str) -> list[Path]:
     """Return sorted list of retail .TRK files under <game_dir>/DATA/TRACKS."""
     base = Path(game_dir)
@@ -2187,13 +2206,7 @@ _TRK_SHA_STAT_CACHE: dict[str, tuple[int, int, str]] = {}
 
 def track_cache_dir() -> Path:
     """Return local binary track cache directory (respects EOD_EDITOR_APPDATA override)."""
-    override = os.environ.get("EOD_EDITOR_APPDATA")
-    if override:
-        base = Path(override)
-    else:
-        local = os.environ.get("LOCALAPPDATA")
-        base = (Path(local) / "EODWorldEditor") if local else (Path.home() / ".eod_world_editor")
-    cdir = base / "cache"
+    cdir = editor_appdata_dir() / "cache"
     cdir.mkdir(parents=True, exist_ok=True)
     return cdir
 

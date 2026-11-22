@@ -223,6 +223,7 @@ class ExplorerPanel(QWidget):
         filter_row.setSpacing(4)
         self.model_filter = QComboBox()
         self.model_filter.addItem("All models (0)", "all")
+        self.model_filter.addItem("Cars & Wrecks (0)", "car-wreck")
         self.model_filter.currentIndexChanged.connect(self._rebuild_model_grid)
 
         self.btn_cars_quick = QPushButton(" Cars")

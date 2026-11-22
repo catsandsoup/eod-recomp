@@ -72,21 +72,13 @@ DEFAULT_EVENT_TEMPLATES: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Persistent AppData Store (%LOCALAPPDATA%\EODWorldEditor)
+# Persistent AppData Store (unified via world_loader.editor_appdata_dir)
 # ---------------------------------------------------------------------------
 def editor_appdata_dir() -> Path:
-    """Return per-user EODWorldEditor data dir (respects EOD_EDITOR_APPDATA override for tests)."""
-    override = os.environ.get("EOD_EDITOR_APPDATA")
-    if override:
-        p = Path(override)
-    else:
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            p = Path(local) / "EODWorldEditor"
-        else:
-            p = Path.home() / ".eod_world_editor"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    """Return canonical per-user EOD World Editor data dir (respects EOD_EDITOR_APPDATA override)."""
+    from world_loader import editor_appdata_dir as _canonical_editor_appdata_dir
+
+    return _canonical_editor_appdata_dir()
 
 
 def recents_path() -> Path:

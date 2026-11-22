@@ -364,3 +364,30 @@ Rather than boiling the ocean at once, here is the clean dependency order where 
 ### Phase 5 — Dedicated Open-World Multiplayer Server
 1. Fix existing netplay sync gaps first (`kDamage`, dents/panels/wheels, collision impulses, synced chickens/weapons).
 2. Build dedicated off-EE World Server with 2D AOI + client network thread + Two-Ring Hybrid Puppet Pool (12–15 solid EE puppets + 50–100+ native Plume distant cars + native Plume remote chassis rendering for mod-menu/Career car parity + instanced native races + per-asset mod manifests).
+
+---
+
+## 9. Milestone 1 Repair Verification Status (Signed Off — 22 Nov 2026)
+
+All 15 Executive Diagnosis defects and Section 1.1 path/packaging bugs have been implemented, built natively (`build-mac-plume/eod` & `build-mac-plume/eod_editor_plume.dylib`), and verified against automated regression tests (`tools/world_editor/test_milestone1_audit.py`, `tools/world_editor/test_editor.py`, `test_plume_viewport.py`, `test_mod_manager.py`, `test_car_studio_handling.py`, and core `ctest` targets).
+
+| # | Executive Diagnosis / Section 1.1 Item | Status | Implementing Commits | Verification Coverage |
+|---:|---|---|---|---|
+| 1 | Placed `track.grf@0x...` props compiled `0 / 14` & hidden warnings | **VERIFIED FIXED** | `6d3907a`, `0f9a4e3` | `_resolve_custom_mod_and_textures` `@0x` branch + honest `compiled/total` & warning display (`test_01`) |
+| 2 | Scaled ramp spinbox uncommitted on Mac toolbar click + `"Written: No"` jargon | **VERIFIED FIXED** | `2d1c8ba`, `0f9a4e3` | 4-decimal `Vec3Editor`, debounce + `flush_pending_edits()` before Save/Write/PIE, clean status badge (`test_02`) |
+| 3 | Ramp + `af_rdwr` detached (`None == None` 473-obj flood) & opaque wear strip | **VERIFIED FIXED** | `a26d107` | Fixed `auto_group_compounds()`, `af_rdwr.tex` blend classification, track cache v4 (`test_03`) |
+| 4 | `Trailer5` vehicle-only spawn fell back to stock car `#0` | **VERIFIED FIXED** | `1c227f6` | Synthetic driver slot in `src/session_start.cpp` + `session_start_parser` ctest (`test_04_05`) |
+| 5 | Black screen behind `Event 2 of 5` (held fader) | **VERIFIED FIXED** | `1c227f6` | Cleared held fader / clean offline PIE transition in `src/session_start.cpp` (`test_04_05`) |
+| 6 | 24–42 FPS PIE lag (`RenderScale=6` inheritance + `d11b36d` 43.7 KB `memcmp`) | **VERIFIED FIXED** | `59c2ada`, `3d6d60b` | Isolated `pie.ini` / `pie_memcard` / `EOD_RENDER_SCALE`, `native_feed.cpp` cache fix (`test_06`) |
+| 7 | Blank model thumbnails & cancelled post-PIE worker | **VERIFIED FIXED** | `0f9a4e3` | `ExplorerPanel.resume_thumbnails()` on PIE stop + 52° flat/shadow framing (`test_07`) |
+| 8 | `Plume HQ` hides gizmos/highlights/roads/markers/collision & breaks clicking | **VERIFIED FIXED** | `d0f45e5`, `d7ad915` | `eod_plume_view_overlay` C ABI in `plume_surface.cpp` & `eod_editor_plume.dylib`, live `upload_overlay` (`test_08`) |
+| 9 | Hard picking (`+ t * 0.025` far bias, solid blend pick, `ray_aabb_hit` inside AABB) | **VERIFIED FIXED** | `d7ad915` | Removed `+ t * 0.025`, depth-tested markers/nodes, alpha-discard pick, `ray_aabb_hit` returns `0.0` inside (`test_09`) |
+| 10 | Dragged-out objects disappear on deselect (`altDuplicateCompleted`, `display-object`) | **VERIFIED FIXED** | `d7ad915`, `0f9a4e3` | Wired `altDuplicateCompleted` -> `_on_alt_duplicate_completed` & unified `layer_visibility["display-object"] = True` (`test_10`) |
+| 11 | `Ctrl+Shift+S` zooms camera out on macOS | **VERIFIED FIXED** | `d7ad915` | Guarded `ViewportGL.keyPressEvent` against Ctrl/Meta/Alt modifiers (`test_11`) |
+| 12 | `Tab` dead code, missing Scale shortcut, Ghost `R` clash | **VERIFIED FIXED** | `d7ad915`, `0f9a4e3` | Wired `Tab` -> `cycle_transform_tool` -> `toolCycled`, added `T` Scale shortcut, Ghost `R` priority (`test_12`) |
+| 13 | Re-prompted Write Mod dir & silent data loss on track switch / close | **VERIFIED FIXED** | `0f9a4e3` | Remembered `_mod_output_dir`, `save_project_as` updates `project_name`, `_confirm_discard_changes` guards (`test_13_14`) |
+| 14 | `Cars (0)` click no-op & cancelled car catalog after PIE | **VERIFIED FIXED** | `0f9a4e3` + sign-off | Pinned `"car-wreck"` in `ExplorerPanel.model_filter` from init + post-PIE car reload (`test_13_14`) |
+| 15 | No Custom Spawn Point & No 6-DOF Free Cam (`pie_live_control.ini` mismatch) | **VERIFIED FIXED** | `2434de5`, `0f9a4e3` | `Play Here` (`EOD_SPAWN_POS` in `battle_bots.cpp`), 6-DOF `hle_camera.cpp` Free Cam, string `arcade_mode` (`test_15`) |
+| S1.1 | macOS `eod` binary/label, unified AppData, zero `disc/mods/`, `ActiveProfile`, Windows packager & `volk` | **VERIFIED FIXED** | `3d6d60b`, `d0f45e5` + sign-off | `resolve_eod_exe` + `GAME_EXE_LABEL`, canonical `world_loader.editor_appdata_dir()` (`~/Library/Application Support/TDEODRecomp/editor`), `pie_staging/`, standalone `ActiveProfile`, `package_windows_release.py` + `eod_editor_plume.dll` (`test_16`, compact toolbar layout verified) |
+
+> **Deferred to Phase 2+ (per Roadmap Section 8):** Full 14-menu consolidation, Car Studio 3D showroom / NASCAR Class `4`, Mega-Map chunk streamer, and Dedicated Multiplayer Server remain scoped to Milestones 2–5.

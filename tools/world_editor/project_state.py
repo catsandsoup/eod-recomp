@@ -1575,13 +1575,9 @@ def atomic_write_json(
 
 
 def _autosave_dir() -> Path:
-    override = os.environ.get("EOD_EDITOR_APPDATA")
-    if override:
-        base = Path(override)
-    else:
-        local = os.environ.get("LOCALAPPDATA")
-        base = (Path(local) / "EODWorldEditor") if local else (Path.home() / ".eod_world_editor")
-    d = base / "autosave"
+    from world_loader import editor_appdata_dir
+
+    d = editor_appdata_dir() / "autosave"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
