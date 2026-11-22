@@ -12,6 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from perf_profiler import get_profiler
+
 from PySide6.QtCore import QByteArray, QMimeData, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -477,56 +479,57 @@ class ExplorerPanel(QWidget):
         self._thumb_item_map.clear()
 
     def _rebuild_model_grid(self) -> None:
-        self._cancel_thumb_worker()
-        self.model_grid.clear()
-        if self.world is None:
-            return
+        with get_profiler().zone("explorer.rebuild_grid", "ui"):
+            self._cancel_thumb_worker()
+            self.model_grid.clear()
+            if self.world is None:
+                return
 
-        q = self.model_search.text().strip().lower()
-        cat = self.model_filter.currentData() or "all"
-        only_placed = self.chk_only_placed.isChecked()
+            q = self.model_search.text().strip().lower()
+            cat = self.model_filter.currentData() or "all"
+            only_placed = self.chk_only_placed.isChecked()
 
-        self.btn_cars_quick.blockSignals(True)
-        self.btn_cars_quick.setChecked(cat == "car-wreck")
-        self.btn_cars_quick.blockSignals(False)
+            self.btn_cars_quick.blockSignals(True)
+            self.btn_cars_quick.setChecked(cat == "car-wreck")
+            self.btn_cars_quick.blockSignals(False)
 
-        matched: list[WorldModel] = []
-        for m in self.world.models.values():
-            if only_placed and not m.placed_by_map:
-                continue
-            if cat != "all" and m.category != cat:
-                continue
-            if q:
-                hay = f"{m.name} {m.category} {m.subtype} {' '.join(m.textures)}".lower()
-                if q not in hay:
+            matched: list[WorldModel] = []
+            for m in self.world.models.values():
+                if only_placed and not m.placed_by_map:
                     continue
-            matched.append(m)
+                if cat != "all" and m.category != cat:
+                    continue
+                if q:
+                    hay = f"{m.name} {m.category} {m.subtype} {' '.join(m.textures)}".lower()
+                    if q not in hay:
+                        continue
+                matched.append(m)
 
-        # Put Cars & Wrecks first when viewing that category or searching
-        if cat == "car-wreck":
-            matched.sort(key=lambda m: m.name.lower())
+            # Put Cars & Wrecks first when viewing that category or searching
+            if cat == "car-wreck":
+                matched.sort(key=lambda m: m.name.lower())
 
-        to_render: list[tuple[str, WorldModel]] = []
-        for m in matched[:400]:
-            label = f"{m.name}\n{m.tri_count} tris"
-            item = QListWidgetItem(self._placeholder_icon, label)
-            item.setData(Qt.ItemDataRole.UserRole, m.key)
-            item.setToolTip(
-                f"{m.name}\nStore: {m.model_store}\nCategory: {m.category} ({m.subtype})\n"
-                f"Triangles: {m.tri_count} | Textures: {len(m.textures)}\n"
-                f"Hash: {m.hash_hex}"
-            )
-            cached = self.thumb_cache._cache.get(m.key)
-            if cached is not None:
-                item.setIcon(QIcon(cached))
-            else:
-                self._thumb_item_map[m.key] = item
-                to_render.append((m.key, m))
-            self.model_grid.addItem(item)
+            to_render: list[tuple[str, WorldModel]] = []
+            for m in matched[:400]:
+                label = f"{m.name}\n{m.tri_count} tris"
+                item = QListWidgetItem(self._placeholder_icon, label)
+                item.setData(Qt.ItemDataRole.UserRole, m.key)
+                item.setToolTip(
+                    f"{m.name}\nStore: {m.model_store}\nCategory: {m.category} ({m.subtype})\n"
+                    f"Triangles: {m.tri_count} | Textures: {len(m.textures)}\n"
+                    f"Hash: {m.hash_hex}"
+                )
+                cached = self.thumb_cache._cache.get(m.key)
+                if cached is not None:
+                    item.setIcon(QIcon(cached))
+                else:
+                    self._thumb_item_map[m.key] = item
+                    to_render.append((m.key, m))
+                self.model_grid.addItem(item)
 
-        # Render thumbnails off the UI thread on QThreadPool (prioritize visible viewport items first!)
-        if to_render:
-            self._start_thumb_worker(to_render)
+            # Render thumbnails off the UI thread on QThreadPool (prioritize visible viewport items first!)
+            if to_render:
+                self._start_thumb_worker(to_render)
 
     def _start_thumb_worker(self, to_render: list[tuple[str, WorldModel]]) -> None:
         if self.world is None or not to_render:
@@ -575,16 +578,17 @@ class ExplorerPanel(QWidget):
             self._start_thumb_worker(remaining)
 
     def _on_worker_thumb_ready(self, gen: int, mkey: str, qimg: Any) -> None:
-        if gen != self._thumb_gen:
-            return
-        pm = QPixmap.fromImage(qimg)
-        self.thumb_cache._cache[mkey] = pm
-        item = self._thumb_item_map.pop(mkey, None)
-        if item is not None:
-            try:
-                item.setIcon(QIcon(pm))
-            except RuntimeError:
-                pass
+        with get_profiler().zone("explorer.thumb_apply", "ui"):
+            if gen != self._thumb_gen:
+                return
+            pm = QPixmap.fromImage(qimg)
+            self.thumb_cache._cache[mkey] = pm
+            item = self._thumb_item_map.pop(mkey, None)
+            if item is not None:
+                try:
+                    item.setIcon(QIcon(pm))
+                except RuntimeError:
+                    pass
 
     def _refresh_sections_tree(self) -> None:
         self.sections_tree.clear()

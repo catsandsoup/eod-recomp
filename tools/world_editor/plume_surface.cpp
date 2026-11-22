@@ -2,6 +2,7 @@
 // invokes this ABI on the window thread. No frame data crosses back into Python.
 #include "plume_scene.h"
 #include "plume_vulkan.h"
+#include "../../runtime/core/eod_tracy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -223,6 +224,7 @@ struct Surface {
 
     void record_upload(Texture &texture) {
         if (!texture.pending) return;
+        EOD_ZONE_SCOPED_N("plume.upload");
         list->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture.image.get(), RenderTextureLayout::COPY_DEST));
         for (uint32_t level = 0; level < texture.mips.size(); ++level) {
             const auto &mip = texture.mips[level];
@@ -263,6 +265,7 @@ struct Surface {
 
     bool replace_mesh(const Vertex *vertices, uint32_t vertex_count, const uint32_t *indices, uint32_t count,
                       const Batch *incoming, uint32_t batch_count) {
+        EOD_ZONE_SCOPED_N("plume.upload");
         finish_frame();
         if (count == 0) {
             mesh.reset();
@@ -299,6 +302,7 @@ struct Surface {
     }
 
     bool replace_overlay(const float *top_verts, uint32_t top_count, const float *depth_verts, uint32_t depth_count) {
+        EOD_ZONE_SCOPED_N("plume.overlay");
         finish_frame();
         const uint32_t dc = (depth_verts && depth_count >= 3) ? (depth_count - (depth_count % 3)) : 0;
         const uint32_t tc = (top_verts && top_count >= 3) ? (top_count - (top_count % 3)) : 0;
@@ -346,6 +350,7 @@ struct Surface {
 
     void draw_overlay(const float *matrix) {
         if (!overlay_buf || (!overlay_depth_count && !overlay_top_count)) return;
+        EOD_ZONE_SCOPED_N("plume.overlay");
         PushConstants push{};
         std::memcpy(&push, matrix, 16 * sizeof(float));
         push.ambient[3] = 255;
@@ -407,6 +412,7 @@ struct Surface {
     }
 
     int draw(uint32_t width, uint32_t height, const float *mat, const float *fog, const float *clear) {
+        EOD_ZONE_SCOPED_N("plume.draw");
         if (!width || !height) return 0;
         finish_frame();
         if (!resize(width, height)) return -1;

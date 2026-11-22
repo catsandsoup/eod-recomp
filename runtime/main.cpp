@@ -171,6 +171,7 @@ static bool g_game_started = false;
         r7_audit::report();
     }
     eod_profile::report("exit");
+    eod_profile::flush_chrome_trace();
     fflush(nullptr);
     _exit(code);
 }

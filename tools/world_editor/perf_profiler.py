@@ -14,9 +14,12 @@ Provides:
 from __future__ import annotations
 
 import cProfile
+import ctypes
 import io
+import json
 import os
 import pstats
+import sys
 import threading
 import time
 from collections import deque
@@ -32,6 +35,127 @@ from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QVBoxLay
 
 PASS_NAMES: tuple[str, ...] = ("terrain", "props", "water", "overlays")
 CORE_PHASES: tuple[str, ...] = ("app_startup", "track_load", "mod_compile", "pie_launch")
+
+
+_DARWIN_LIBSYSTEM: Any = None
+_DARWIN_MACH_INIT: bool = False
+
+
+def get_process_rss_mb() -> float:
+    """Return current process resident set size (RSS / working set) in MiB without third-party packages."""
+    global _DARWIN_LIBSYSTEM, _DARWIN_MACH_INIT
+    if sys.platform == "darwin":
+        try:
+            if not _DARWIN_MACH_INIT:
+                _DARWIN_MACH_INIT = True
+                lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                lib.mach_task_self.restype = ctypes.c_uint32
+                lib.task_info.argtypes = [
+                    ctypes.c_uint32,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.task_info.restype = ctypes.c_int
+                _DARWIN_LIBSYSTEM = lib
+            if _DARWIN_LIBSYSTEM is not None:
+                class _TimeValue(ctypes.Structure):
+                    _fields_ = [("seconds", ctypes.c_int32), ("microseconds", ctypes.c_int32)]
+
+                class _MachTaskBasicInfo(ctypes.Structure):
+                    _fields_ = [
+                        ("virtual_size", ctypes.c_uint64),
+                        ("resident_size", ctypes.c_uint64),
+                        ("resident_size_max", ctypes.c_uint64),
+                        ("user_time", _TimeValue),
+                        ("system_time", _TimeValue),
+                        ("policy", ctypes.c_int32),
+                        ("suspend_count", ctypes.c_int32),
+                    ]
+
+                MACH_TASK_BASIC_INFO = 20
+                info = _MachTaskBasicInfo()
+                count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+                kr = _DARWIN_LIBSYSTEM.task_info(
+                    _DARWIN_LIBSYSTEM.mach_task_self(),
+                    MACH_TASK_BASIC_INFO,
+                    ctypes.byref(info),
+                    ctypes.byref(count),
+                )
+                if kr == 0 and info.resident_size > 0:
+                    return float(info.resident_size) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        try:
+            import resource
+
+            return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    if sys.platform == "win32":
+        try:
+            class _ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_uint32),
+                    ("PageFaultCount", ctypes.c_uint32),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            pmc = _ProcessMemoryCounters()
+            pmc.cb = ctypes.sizeof(pmc)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
+                return float(pmc.WorkingSetSize) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as f:
+            parts = f.read().split()
+        if len(parts) >= 2:
+            pages = int(parts[1])
+            page_sz = os.sysconf("SC_PAGE_SIZE")
+            return float(pages * page_sz) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    try:
+        import resource
+
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+    except Exception:
+        return 0.0
+
+
+@dataclass(slots=True)
+class ZoneEvent:
+    name: str
+    category: str
+    ts_us: float
+    dur_us: float
+    ms: float
+    rss_mb: float
+    rss_delta_kb: float
+    tid: int
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    idx = (len(sorted_vals) - 1) * (pct / 100.0)
+    lo = int(idx)
+    hi = min(len(sorted_vals) - 1, lo + 1)
+    frac = idx - lo
+    return float(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac)
 
 
 def profiler_appdata_dir() -> Path:
@@ -205,9 +329,9 @@ class GpuPassTimer:
 
 
 class PerfProfiler:
-    """Thread-safe high-resolution CPU + GPU profiler and cProfile trace manager."""
+    """Thread-safe high-resolution CPU + GPU profiler, zone telemetry, Chrome Trace exporter & cProfile manager."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_events: int = 20000) -> None:
         self._lock = threading.Lock()
         self._active_starts: dict[str, int] = {}
         self.phases: dict[str, PhaseRecord] = {k: PhaseRecord(name=k) for k in CORE_PHASES}
@@ -219,6 +343,11 @@ class PerfProfiler:
         self._frame_history: deque[float] = deque(maxlen=60)
         self._cprof: cProfile.Profile | None = None
         self._cprof_active: bool = False
+        self._trace_epoch_ns: int = time.perf_counter_ns()
+        self._max_events: int = max(1, int(max_events))
+        self._zone_events: deque[ZoneEvent] = deque(maxlen=self._max_events)
+        # (ts_us, cpu_ms, gpu_ms, rss_mb)
+        self._frame_counters: deque[tuple[float, float, float, float]] = deque(maxlen=self._max_events)
 
     def begin_phase(self, name: str) -> int:
         now = time.perf_counter_ns()
@@ -271,6 +400,8 @@ class PerfProfiler:
         draw_calls: int = 0,
         tris_drawn: int = 0,
     ) -> None:
+        ts_us = (time.perf_counter_ns() - self._trace_epoch_ns) / 1000.0
+        rss_mb = get_process_rss_mb()
         with self._lock:
             self.cpu_frame_ms = float(cpu_ms)
             self._frame_history.append(self.cpu_frame_ms)
@@ -280,6 +411,185 @@ class PerfProfiler:
             self.tris_drawn = int(tris_drawn)
             if gpu_timings is not None:
                 self.gpu = gpu_timings
+            self._frame_counters.append((ts_us, self.cpu_frame_ms, float(self.gpu.total_gpu_ms), rss_mb))
+
+    @contextmanager
+    def zone(self, name: str, category: str = "ui") -> Iterator[None]:
+        """Record a bounded duration + RSS telemetry span compatible with Perfetto / Chrome Trace / Tracy."""
+        t0 = time.perf_counter_ns()
+        rss0 = get_process_rss_mb()
+        try:
+            yield
+        finally:
+            t1 = time.perf_counter_ns()
+            rss1 = get_process_rss_mb()
+            ts_us = (t0 - self._trace_epoch_ns) / 1000.0
+            dur_us = max(0.0, (t1 - t0) / 1000.0)
+            ms = dur_us / 1000.0
+            rss_delta_kb = (rss1 - rss0) * 1024.0
+            tid = threading.get_ident() & 0x7FFFFFFF
+            ev = ZoneEvent(
+                name=name,
+                category=category,
+                ts_us=ts_us,
+                dur_us=dur_us,
+                ms=ms,
+                rss_mb=rss1,
+                rss_delta_kb=rss_delta_kb,
+                tid=tid,
+            )
+            with self._lock:
+                self._zone_events.append(ev)
+
+    def clear_zones(self) -> None:
+        """Clear recorded zone & frame counter ring buffers."""
+        with self._lock:
+            self._zone_events.clear()
+            self._frame_counters.clear()
+
+    def zone_stats(self) -> dict[str, dict[str, Any]]:
+        """Aggregate per-zone latency quantiles (mean/p50/p95/p99/max/total ms) and ending RSS."""
+        with self._lock:
+            events = list(self._zone_events)
+        grouped: dict[str, list[ZoneEvent]] = {}
+        for ev in events:
+            grouped.setdefault(ev.name, []).append(ev)
+        out: dict[str, dict[str, Any]] = {}
+        for name, evs in grouped.items():
+            vals = sorted(e.ms for e in evs)
+            total = sum(vals)
+            out[name] = {
+                "category": evs[-1].category,
+                "count": len(vals),
+                "mean_ms": total / len(vals),
+                "p50_ms": _percentile(vals, 50.0),
+                "p95_ms": _percentile(vals, 95.0),
+                "p99_ms": _percentile(vals, 99.0),
+                "max_ms": vals[-1],
+                "total_ms": total,
+                "rss_mb_end": evs[-1].rss_mb,
+                "rss_delta_kb_sum": sum(e.rss_delta_kb for e in evs),
+            }
+        return out
+
+    def dump_chrome_trace(self, path: Path) -> Path:
+        """Export standard Chrome Trace / Perfetto / Tracy JSON (duration 'X' spans + 'C' RSS & GPU counters)."""
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            events = list(self._zone_events)
+            frame_counters = list(self._frame_counters)
+            gpu_ms_now = float(self.gpu.total_gpu_ms)
+            cpu_ms_now = float(self.cpu_frame_ms)
+
+        pid = os.getpid()
+        trace_events: list[dict[str, Any]] = [
+            {
+                "name": "process_name",
+                "ph": "M",
+                "pid": pid,
+                "tid": 0,
+                "args": {"name": "EOD World Editor"},
+            }
+        ]
+
+        has_rss_counter = False
+        has_gpu_counter = False
+
+        for ev in events:
+            trace_events.append(
+                {
+                    "name": ev.name,
+                    "cat": ev.category,
+                    "ph": "X",
+                    "ts": round(ev.ts_us, 3),
+                    "dur": round(ev.dur_us, 3),
+                    "pid": pid,
+                    "tid": ev.tid,
+                    "args": {
+                        "ms": round(ev.ms, 4),
+                        "rss_mb": round(ev.rss_mb, 3),
+                        "rss_delta_kb": round(ev.rss_delta_kb, 2),
+                    },
+                }
+            )
+            trace_events.append(
+                {
+                    "name": "ProcessRSS_MB",
+                    "cat": "memory",
+                    "ph": "C",
+                    "ts": round(ev.ts_us + ev.dur_us, 3),
+                    "pid": pid,
+                    "tid": 0,
+                    "args": {"rss_mb": round(ev.rss_mb, 3)},
+                }
+            )
+            has_rss_counter = True
+
+        for ts_us, cpu_ms, gpu_ms, rss_mb in frame_counters:
+            trace_events.append(
+                {
+                    "name": "GpuFrame_ms",
+                    "cat": "gpu",
+                    "ph": "C",
+                    "ts": round(ts_us, 3),
+                    "pid": pid,
+                    "tid": 0,
+                    "args": {"gpu_ms": round(gpu_ms, 4), "cpu_ms": round(cpu_ms, 4)},
+                }
+            )
+            trace_events.append(
+                {
+                    "name": "ProcessRSS_MB",
+                    "cat": "memory",
+                    "ph": "C",
+                    "ts": round(ts_us, 3),
+                    "pid": pid,
+                    "tid": 0,
+                    "args": {"rss_mb": round(rss_mb, 3)},
+                }
+            )
+            has_rss_counter = True
+            has_gpu_counter = True
+
+        now_us = (time.perf_counter_ns() - self._trace_epoch_ns) / 1000.0
+        rss_now = get_process_rss_mb()
+        if not has_rss_counter:
+            trace_events.append(
+                {
+                    "name": "ProcessRSS_MB",
+                    "cat": "memory",
+                    "ph": "C",
+                    "ts": round(now_us, 3),
+                    "pid": pid,
+                    "tid": 0,
+                    "args": {"rss_mb": round(rss_now, 3)},
+                }
+            )
+        if not has_gpu_counter:
+            trace_events.append(
+                {
+                    "name": "GpuFrame_ms",
+                    "cat": "gpu",
+                    "ph": "C",
+                    "ts": round(now_us, 3),
+                    "pid": pid,
+                    "tid": 0,
+                    "args": {"gpu_ms": round(gpu_ms_now, 4), "cpu_ms": round(cpu_ms_now, 4)},
+                }
+            )
+
+        payload = {
+            "displayTimeUnit": "ms",
+            "traceEvents": trace_events,
+            "otherData": {
+                "app": "EOD World Editor",
+                "rss_mb": round(rss_now, 3),
+                "zoneStats": self.zone_stats(),
+            },
+        }
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out_path
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

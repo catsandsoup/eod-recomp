@@ -1850,6 +1850,10 @@ class ViewportGL(QOpenGLWidget):
 
     def _pick_object_gpu(self, sx: float, sy: float) -> WorldObject | None:
         """Pixel-exact GPU Object-ID FBO pick (1x1 / 3x3 readback under cursor in <0.8 ms)."""
+        with get_profiler().zone("viewport.pick_gpu", "pick"):
+            return self._pick_object_gpu_impl(sx, sy)
+
+    def _pick_object_gpu_impl(self, sx: float, sy: float) -> WorldObject | None:
         if self.world is None or not self._gl_ready or not self._prog_id:
             return None
         w = max(1, self.width())
@@ -2599,6 +2603,10 @@ class ViewportGL(QOpenGLWidget):
     def _paint_plume(self) -> bool:
         if self.render_mode != "plume" or self._plume_module is None or self.world is None or not self.isVisible():
             return False
+        with get_profiler().zone("viewport.plume_paint", "render"):
+            return self._paint_plume_impl()
+
+    def _paint_plume_impl(self) -> bool:
         try:
             if self._plume_viewport is None:
                 self._plume_viewport = PlumeViewport(self, self._plume_module)
@@ -3138,54 +3146,56 @@ class ViewportGL(QOpenGLWidget):
 
     def _pick_object_at_screen(self, sx: float, sy: float) -> WorldObject | None:
         """Primary pixel-exact picker: GPU Object-ID FBO (PS2 Fast) or exact CPU ray-triangle (Plume HQ / fallback)."""
-        if self.render_mode != "plume" and self._gl_ready and self._prog_id and not self._static_dirty:
-            gpu_hit = self._pick_object_gpu(sx, sy)
-            if gpu_hit is not None:
-                return gpu_hit
-        ray_o, ray_d = self.screen_ray(sx, sy)
-        return self._pick_object(ray_o, ray_d)
+        with get_profiler().zone("viewport.pick_screen", "pick"):
+            if self.render_mode != "plume" and self._gl_ready and self._prog_id and not self._static_dirty:
+                gpu_hit = self._pick_object_gpu(sx, sy)
+                if gpu_hit is not None:
+                    return gpu_hit
+            ray_o, ray_d = self.screen_ray(sx, sy)
+            return self._pick_object(ray_o, ray_d)
 
     def _pick_object_with_t(self, ray_o: np.ndarray, ray_d: np.ndarray) -> tuple[WorldObject | None, float]:
-        if self.world is None:
-            return None, 1e9
-        inv_d = np.where(np.abs(ray_d) > 1e-8, 1.0 / ray_d, 1e12).astype(np.float32)
-        candidates: list[tuple[float, WorldObject]] = []
-        for obj in self.world.objects:
-            if not self.world.object_visible_in_event_template(obj):
-                continue
-            if not self.layer_visibility.get(obj.category, True):
-                continue
-            model = self.world.models.get(obj.model_key)
-            if not model:
-                continue
-            lo, hi = obj.world_aabb(model)
-            hit_t = ray_aabb_hit(ray_o, inv_d, lo, hi)
-            if hit_t is not None:
-                candidates.append((hit_t, obj))
-        candidates.sort(key=lambda item: item[0])
+        with get_profiler().zone("viewport.pick_cpu", "pick"):
+            if self.world is None:
+                return None, 1e9
+            inv_d = np.where(np.abs(ray_d) > 1e-8, 1.0 / ray_d, 1e12).astype(np.float32)
+            candidates: list[tuple[float, WorldObject]] = []
+            for obj in self.world.objects:
+                if not self.world.object_visible_in_event_template(obj):
+                    continue
+                if not self.layer_visibility.get(obj.category, True):
+                    continue
+                model = self.world.models.get(obj.model_key)
+                if not model:
+                    continue
+                lo, hi = obj.world_aabb(model)
+                hit_t = ray_aabb_hit(ray_o, inv_d, lo, hi)
+                if hit_t is not None:
+                    candidates.append((hit_t, obj))
+            candidates.sort(key=lambda item: item[0])
 
-        best_obj: WorldObject | None = None
-        best_t = 1e9
-        for aabb_t, obj in candidates:
-            if aabb_t > best_t:
-                break
-            model = self.world.models[obj.model_key]
-            m4 = obj.world_matrix()
-            inv_m = np.linalg.inv(m4)
-            local_o = (inv_m @ np.array([*ray_o, 1.0], dtype=np.float32))[:3]
-            local_d = (inv_m[:3, :3] @ ray_d)
-            dlen = float(np.linalg.norm(local_d))
-            if dlen < 1e-6:
-                continue
-            local_d /= dlen
-            for part in model.parts:
-                t_local = ray_mesh_hit(local_o, local_d, part.vertices[:, 0:3], part.indices)
-                if t_local is not None:
-                    t_world = t_local / dlen
-                    if t_world < best_t:
-                        best_t = t_world
-                        best_obj = obj
-        return best_obj, best_t
+            best_obj: WorldObject | None = None
+            best_t = 1e9
+            for aabb_t, obj in candidates:
+                if aabb_t > best_t:
+                    break
+                model = self.world.models[obj.model_key]
+                m4 = obj.world_matrix()
+                inv_m = np.linalg.inv(m4)
+                local_o = (inv_m @ np.array([*ray_o, 1.0], dtype=np.float32))[:3]
+                local_d = (inv_m[:3, :3] @ ray_d)
+                dlen = float(np.linalg.norm(local_d))
+                if dlen < 1e-6:
+                    continue
+                local_d /= dlen
+                for part in model.parts:
+                    t_local = ray_mesh_hit(local_o, local_d, part.vertices[:, 0:3], part.indices)
+                    if t_local is not None:
+                        t_world = t_local / dlen
+                        if t_world < best_t:
+                            best_t = t_world
+                            best_obj = obj
+            return best_obj, best_t
 
     def _pick_object(self, ray_o: np.ndarray, ray_d: np.ndarray) -> WorldObject | None:
         obj, _t = self._pick_object_with_t(ray_o, ray_d)
@@ -3339,6 +3349,122 @@ class ViewportGL(QOpenGLWidget):
                     self._drag_road_orig_pos = (n.x, n.y, n.z)
                     return
 
+    def _handle_gizmo_drag_move(self, event: QMouseEvent, ray_o: np.ndarray, ray_d: np.ndarray) -> bool:
+        ax_idx = self._gizmo_drag_axis
+        ax = np.eye(3, dtype=np.float32)[ax_idx]
+        origin = np.array(self._gizmo_drag_orig_pos, dtype=np.float32)
+
+        if self._gizmo_drag_target == "obj" and self.selected_obj is not None:
+            drag_list = self._gizmo_drag_multi or [
+                (
+                    self.selected_obj,
+                    self._gizmo_drag_orig_pos,
+                    self._gizmo_drag_orig_rot,
+                    self._gizmo_drag_orig_scale,
+                    self._gizmo_drag_orig_pos[1],
+                )
+            ]
+            if self.active_tool in ("move", "select"):
+                t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
+                delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
+                for so, sop, _sor, _sos, _bmy in drag_list:
+                    new_p = list(sop)
+                    new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
+                    so.position = (new_p[0], new_p[1], new_p[2])
+            elif self.active_tool == "rotate":
+                hit = ray_plane_intersect(ray_o, ray_d, origin, ax)
+                if hit is not None:
+                    u = _normalize(np.cross(ax, np.array([0, 1, 0], dtype=np.float32) if ax_idx != 1 else np.array([1, 0, 0], dtype=np.float32)))
+                    v = _normalize(np.cross(ax, u))
+                    rel = hit - origin
+                    ang = math.atan2(float(np.dot(rel, v)), float(np.dot(rel, u)))
+                    da_deg = self._snap_val(math.degrees(ang - self._gizmo_drag_start_angle), self.angle_snap_step, self.angle_snap_enabled)
+                    hpr_idx = {1: 0, 0: 1, 2: 2}[ax_idx]
+                    for so, _sop, sor, _sos, _bmy in drag_list:
+                        new_r = list(sor)
+                        new_r[hpr_idx] = (new_r[hpr_idx] + da_deg) % 360.0
+                        so.rotation_hpr = (new_r[0], new_r[1], new_r[2])
+            elif self.active_tool == "scale":
+                t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
+                s_ref = max(1.0, self._gizmo_scale(origin))
+                factor = max(0.05, 1.0 + (t_now - self._gizmo_drag_start_t) / s_ref)
+                uniform = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                if len(drag_list) > 1:
+                    pivot = np.array(self._gizmo_drag_orig_pos, dtype=np.float32)
+                    group_base_min_y = min(bmy for _so, _sop, _sor, _sos, bmy in drag_list)
+                    sf = np.array([factor, factor, factor], dtype=np.float32) if uniform else np.array([1.0, 1.0, 1.0], dtype=np.float32)
+                    if not uniform:
+                        sf[ax_idx] = factor
+                    new_group_min_y = 1e9
+                    for so, sop, _sor, sos, _bmy in drag_list:
+                        new_s = (sos[0] * float(sf[0]), sos[1] * float(sf[1]), sos[2] * float(sf[2]))
+                        so.scale = new_s
+                        rel = np.array(sop, dtype=np.float32) - pivot
+                        sp = pivot + rel * sf
+                        so.position = (float(sp[0]), float(sp[1]), float(sp[2]))
+                        if self.world is not None and so.model_key in self.world.models:
+                            lo, _hi = so.world_aabb(self.world.models[so.model_key])
+                            new_group_min_y = min(new_group_min_y, float(lo[1]))
+                    if (uniform or ax_idx == 1) and new_group_min_y < 1e8:
+                        dy_anchor = group_base_min_y - new_group_min_y
+                        for so, _sop, _sor, _sos, _bmy in drag_list:
+                            px_, py_, pz_ = so.position
+                            so.position = (px_, py_ + dy_anchor, pz_)
+                else:
+                    for so, sop, _sor, sos, base_min_y in drag_list:
+                        new_s = [v * factor for v in sos] if uniform else list(sos)
+                        if not uniform:
+                            new_s[ax_idx] = sos[ax_idx] * factor
+                        so.scale = (new_s[0], new_s[1], new_s[2])
+                        if (uniform or ax_idx == 1) and self.world is not None and so.model_key in self.world.models:
+                            so.position = sop
+                            lo, _hi = so.world_aabb(self.world.models[so.model_key])
+                            dy_anchor = base_min_y - float(lo[1])
+                            so.position = (sop[0], sop[1] + dy_anchor, sop[2])
+            if len(drag_list) > 1:
+                self._sel_dirty = True
+            if self.render_mode == "plume":
+                self._plume_dirty = True
+            if self.show_collision:
+                self._col_dirty = True
+            self.objectSelected.emit(self.selected_obj)
+            self.update()
+            return True
+
+        if self._gizmo_drag_target == "marker" and self.selected_marker is not None:
+            if self.active_tool == "rotate":
+                hit = ray_plane_intersect(ray_o, ray_d, origin, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+                if hit is not None:
+                    rel = hit - origin
+                    hdg = math.degrees(math.atan2(float(rel[0]), float(rel[2]))) % 360.0
+                    hdg = self._snap_val(hdg, self.angle_snap_step, self.angle_snap_enabled)
+                    self.selected_marker.heading_deg = hdg
+            else:
+                t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
+                delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
+                new_p = list(self._gizmo_drag_orig_pos)
+                new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
+                self.selected_marker.position = (new_p[0], new_p[1], new_p[2])
+            self.markerSelected.emit(self.selected_marker)
+            self._markers_dirty = True
+            self.update()
+            return True
+
+        if self._gizmo_drag_target == "road_node" and self.selected_road_node_id is not None and self.world is not None:
+            rn = self.world.road_graph.nodes.get(self.selected_road_node_id)
+            if rn is not None:
+                t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
+                delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
+                new_p = list(self._gizmo_drag_orig_pos)
+                new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
+                rn.x, rn.y, rn.z = float(new_p[0]), float(new_p[1]), float(new_p[2])
+                self._roads_dirty = True
+                self.roadNodeSelected.emit(rn)
+                self.update()
+            return True
+
+        return False
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position().toPoint()
         dx = pos.x() - self._last_mouse.x()
@@ -3374,121 +3500,9 @@ class ViewportGL(QOpenGLWidget):
 
         # Active gizmo dragging (Object OR Marker, with Grid & Angle Snap!)
         if self._gizmo_drag_axis >= 0:
-            ax_idx = self._gizmo_drag_axis
-            ax = np.eye(3, dtype=np.float32)[ax_idx]
-            origin = np.array(self._gizmo_drag_orig_pos, dtype=np.float32)
-
-            if self._gizmo_drag_target == "obj" and self.selected_obj is not None:
-                drag_list = self._gizmo_drag_multi or [
-                    (
-                        self.selected_obj,
-                        self._gizmo_drag_orig_pos,
-                        self._gizmo_drag_orig_rot,
-                        self._gizmo_drag_orig_scale,
-                        self._gizmo_drag_orig_pos[1],
-                    )
-                ]
-                if self.active_tool in ("move", "select"):
-                    t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
-                    delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
-                    for so, sop, _sor, _sos, _bmy in drag_list:
-                        new_p = list(sop)
-                        new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
-                        so.position = (new_p[0], new_p[1], new_p[2])
-                elif self.active_tool == "rotate":
-                    hit = ray_plane_intersect(ray_o, ray_d, origin, ax)
-                    if hit is not None:
-                        u = _normalize(np.cross(ax, np.array([0, 1, 0], dtype=np.float32) if ax_idx != 1 else np.array([1, 0, 0], dtype=np.float32)))
-                        v = _normalize(np.cross(ax, u))
-                        rel = hit - origin
-                        ang = math.atan2(float(np.dot(rel, v)), float(np.dot(rel, u)))
-                        da_deg = self._snap_val(math.degrees(ang - self._gizmo_drag_start_angle), self.angle_snap_step, self.angle_snap_enabled)
-                        hpr_idx = {1: 0, 0: 1, 2: 2}[ax_idx]
-                        for so, _sop, sor, _sos, _bmy in drag_list:
-                            new_r = list(sor)
-                            new_r[hpr_idx] = (new_r[hpr_idx] + da_deg) % 360.0
-                            so.rotation_hpr = (new_r[0], new_r[1], new_r[2])
-                elif self.active_tool == "scale":
-                    t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
-                    s_ref = max(1.0, self._gizmo_scale(origin))
-                    factor = max(0.05, 1.0 + (t_now - self._gizmo_drag_start_t) / s_ref)
-                    uniform = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-                    if len(drag_list) > 1:
-                        # Scale compound assemblies (e.g. ramp + top wear decal) around shared group pivot
-                        # so sub-parts remain locked together with zero detachment!
-                        pivot = np.array(self._gizmo_drag_orig_pos, dtype=np.float32)
-                        group_base_min_y = min(bmy for _so, _sop, _sor, _sos, bmy in drag_list)
-                        sf = np.array([factor, factor, factor], dtype=np.float32) if uniform else np.array([1.0, 1.0, 1.0], dtype=np.float32)
-                        if not uniform:
-                            sf[ax_idx] = factor
-                        new_group_min_y = 1e9
-                        for so, sop, _sor, sos, _bmy in drag_list:
-                            new_s = (sos[0] * float(sf[0]), sos[1] * float(sf[1]), sos[2] * float(sf[2]))
-                            so.scale = new_s
-                            rel = np.array(sop, dtype=np.float32) - pivot
-                            sp = pivot + rel * sf
-                            so.position = (float(sp[0]), float(sp[1]), float(sp[2]))
-                            if self.world is not None and so.model_key in self.world.models:
-                                lo, _hi = so.world_aabb(self.world.models[so.model_key])
-                                new_group_min_y = min(new_group_min_y, float(lo[1]))
-                        if (uniform or ax_idx == 1) and new_group_min_y < 1e8:
-                            dy_anchor = group_base_min_y - new_group_min_y
-                            for so, _sop, _sor, _sos, _bmy in drag_list:
-                                px_, py_, pz_ = so.position
-                                so.position = (px_, py_ + dy_anchor, pz_)
-                    else:
-                        for so, sop, _sor, sos, base_min_y in drag_list:
-                            new_s = [v * factor for v in sos] if uniform else list(sos)
-                            if not uniform:
-                                new_s[ax_idx] = sos[ax_idx] * factor
-                            so.scale = (new_s[0], new_s[1], new_s[2])
-                            # Anchor bottom base on ground during Y-scale so ramps grow UP instead of sinking!
-                            if (uniform or ax_idx == 1) and self.world is not None and so.model_key in self.world.models:
-                                so.position = sop
-                                lo, _hi = so.world_aabb(self.world.models[so.model_key])
-                                dy_anchor = base_min_y - float(lo[1])
-                                so.position = (sop[0], sop[1] + dy_anchor, sop[2])
-                if len(drag_list) > 1:
-                    self._sel_dirty = True
-                if self.render_mode == "plume":
-                    self._plume_dirty = True
-                if self.show_collision:
-                    self._col_dirty = True
-                self.objectSelected.emit(self.selected_obj)
-                self.update()
-                return
-
-            if self._gizmo_drag_target == "marker" and self.selected_marker is not None:
-                if self.active_tool == "rotate":
-                    hit = ray_plane_intersect(ray_o, ray_d, origin, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-                    if hit is not None:
-                        rel = hit - origin
-                        hdg = math.degrees(math.atan2(float(rel[0]), float(rel[2]))) % 360.0
-                        hdg = self._snap_val(hdg, self.angle_snap_step, self.angle_snap_enabled)
-                        self.selected_marker.heading_deg = hdg
-                else:
-                    t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
-                    delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
-                    new_p = list(self._gizmo_drag_orig_pos)
-                    new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
-                    self.selected_marker.position = (new_p[0], new_p[1], new_p[2])
-                self.markerSelected.emit(self.selected_marker)
-                self._markers_dirty = True
-                self.update()
-                return
-
-            if self._gizmo_drag_target == "road_node" and self.selected_road_node_id is not None and self.world is not None:
-                rn = self.world.road_graph.nodes.get(self.selected_road_node_id)
-                if rn is not None:
-                    t_now, _ = closest_point_ray_to_line(ray_o, ray_d, origin, ax)
-                    delta = self._snap_val(float(t_now - self._gizmo_drag_start_t), self.grid_snap_step, self.grid_snap_enabled)
-                    new_p = list(self._gizmo_drag_orig_pos)
-                    new_p[ax_idx] = self._snap_val(new_p[ax_idx] + delta, self.grid_snap_step, self.grid_snap_enabled)
-                    rn.x, rn.y, rn.z = float(new_p[0]), float(new_p[1]), float(new_p[2])
-                    self._roads_dirty = True
-                    self.roadNodeSelected.emit(rn)
-                    self.update()
-                return
+            with get_profiler().zone("viewport.gizmo_drag", "gizmo"):
+                if self._handle_gizmo_drag_move(event, ray_o, ray_d):
+                    return
 
         # Dragging a selected road node (Shift+Drag = pure 3D vertical Y elevation drag; else preserves custom height offset!)
         if self._dragging_road_node and self.selected_road_node_id is not None and self.world is not None:

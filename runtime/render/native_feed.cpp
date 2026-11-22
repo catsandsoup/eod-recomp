@@ -20,6 +20,7 @@
 
 #include "../core/config.h"
 #include "../core/diff_harness.h"
+#include "../core/eod_tracy.h"
 #include "../core/host_file.h"
 #include "../core/limit_tracker.h"
 #include "../core/log.h"
@@ -1294,6 +1295,7 @@ uint32_t queue_triangles(const vifmesh::DentChunk &chunk) {
 }
 
 std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &chunks) {
+    EOD_TRACE_ZONE("native_feed.queue_material");
 #ifndef EOD_PLUME
     (void)p;
     (void)chunks;

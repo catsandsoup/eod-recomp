@@ -2,6 +2,7 @@
 // belong to native objects, the objects' GS state, and the plume renderer that draws them.
 #include "../core/r7_audit.h"
 #include "core/diff_harness.h"
+#include "core/eod_tracy.h"
 #include "core/log.h"
 #include "core/trace.h"
 #include "native_renderer.h"
@@ -3931,6 +3932,7 @@ bool gs_shadow_boundary(ShadowPass pass) {
 }
 
 bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
+    EOD_TRACE_ZONE("native_renderer.clear_scene");
 #ifdef EOD_PLUME
     if (gs::g_skip_frame || !prepare() || (modern::g_on && modern::live())) return false;
     if (g_active) finalize();
@@ -4610,6 +4612,7 @@ bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm) {
 }
 
 void gs_vblank(uint64_t frame) {
+    EOD_TRACE_ZONE("native_renderer.frame");
     if (g_active) finalize();
     g_active = false;
     flush();
