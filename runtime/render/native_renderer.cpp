@@ -39,6 +39,7 @@
 #include "../gs/texture_replacements.h"
 
 #ifdef EOD_PLUME
+#include "plume_budget.h"
 #include "plume_device.h"
 #include "plume_scene.h"
 #include "plume_vulkan.h"
@@ -323,6 +324,7 @@ struct SunMaps {
     std::unique_ptr<plume::RenderFramebuffer> scene_framebuffer;
     uint64_t color_image = 0, depth_image = 0;
     uint32_t size[2] = {};
+    uint32_t resolution = sun_cascades::kResolution;
     uint64_t scene_binds = 0, composites = 0, armed = 0, resolved = 0;
 };
 
@@ -342,8 +344,9 @@ struct Renderer {
     std::unordered_map<uint64_t, std::shared_ptr<Texture>> textures;  // by content
     std::unordered_map<uint64_t, Texture *> replacements;  // by package entry, material and alpha domain
     std::unordered_map<uint64_t, AddrEntry> by_addr;
+    VramTexMemoCache vram_memo;
     XXH3_state_t *hash_state = XXH3_createState();
-    uint64_t texture_bytes = 0, decoded = 0;
+    uint64_t texture_bytes = 0, decoded = 0, tex_evictions = 0;
     // this vblank's surface wrappers and framebuffers (the backend may recycle its images later)
     std::unordered_map<uint64_t, std::unique_ptr<plume::RenderTexture>> wrappers;
     std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
@@ -871,7 +874,9 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         return gs::tex_fetch(e, int(u), int(v), int(level));
     };
     AddrEntry *address = nullptr;
-    uint64_t key;
+    VramTexMemoKey memo_key{};
+    bool have_memo_key = false;
+    uint64_t key = 0;
     if (queue) {
         const uint64_t identity[] = {queue->content_hash, palette_hash, levels};
         key = XXH3_64bits_withSeed(identity, sizeof identity, 0x50534D5438ull);
@@ -882,70 +887,105 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         const uint64_t identity[] = {indices->mip_hashes[levels], palette_hash, levels};
         key = XXH3_64bits_withSeed(identity, sizeof identity, 0x50534D5434ull);
     } else {
-        uint64_t k[5] = {(base(0) & 31) | (uint64_t)pitch(0) << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
-                         indexed ? palette_hash : 0,
-                         e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
-        k[4] = base(0);
-        k[1] |= (uint64_t)levels << 48;
-        uint64_t mk[6] = {};
-        for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = base(l) | (uint64_t)pitch(l) << 32;
-        const uint64_t addr_key = XXH3_64bits(k, sizeof k) ^ (levels ? XXH3_64bits(mk, sizeof mk) : 0);
-        address = &g_r.by_addr[addr_key];
-        if (address->tex) {
-            bool ok = true;
-            for (uint32_t i = 0; i < count && ok; i++)
-                if (gs::g_page_gen[(first + i) % gs::kPages] > address->stamp) ok = false;
-            for (uint32_t l = 1; l <= levels && ok; l++) {
-                uint32_t f2, c2;
-                gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
-                for (uint32_t i = 0; i < c2 && ok; i++)
-                    if (gs::g_page_gen[(f2 + i) % gs::kPages] > address->stamp) ok = false;
-            }
-            if (ok) {
-                address->tex->last_use = g_r.vb;
-                return address->tex;
+        uint64_t mip_hash = 0;
+        if (levels) {
+            for (uint32_t l = 1; l <= levels; l++) {
+                const uint64_t mv = base(l) | (uint64_t(pitch(l)) << 32);
+                mip_hash ^= mv + 0x9E3779B97F4A7C15ull + (mip_hash << 6) + (mip_hash >> 2);
             }
         }
-        // content key
-        XXH3_state_t *st = g_r.hash_state;
-        XXH3_64bits_reset(st);
-        XXH3_64bits_update(st, k, sizeof k - sizeof k[4]);
-        // the 256-byte GS memory blocks the texture covers (pages also hold other textures and CLUTs)
-        {
-            int bw = 8, bh = 8;
-            switch (e.tpsm) {
-            case gs::PSMCT16: case gs::PSMCT16S: bw = 16, bh = 8; break;
-            case gs::PSMT8: bw = 16, bh = 16; break;
-            case gs::PSMT4: bw = 32, bh = 16; break;
-            default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
+        const uint32_t texa_bits = e.tpsm == gs::PSMCT32 ? 0u : (e.ta0 | (e.ta1 << 8) | (uint32_t(e.aem) << 16));
+        memo_key = VramTexMemoKey{
+            base(0),
+            pitch(0),
+            e.tpsm,
+            e.tw,
+            e.th,
+            indexed ? palette_hash : 0ull,
+            texa_bits | (levels << 17) | ((e.cpsm & 0x3Fu) << 20),
+            gs::g_vram_clock,
+            mip_hash
+        };
+        have_memo_key = true;
+        // O(1) VRAM-write-generation memoization: skips page walk + 256-byte XXH3 hash (~5 ns).
+        if (const auto *hit = g_r.vram_memo.find(memo_key)) {
+            if (auto *cached_tex = static_cast<Texture *>(hit->user_ptr)) {
+                cached_tex->last_use = g_r.vb;
+                return cached_tex;
             }
-            for (uint32_t l = 0; l <= levels; l++) {
-                const uint32_t bp = base(l), bwid = pitch(l);
-                const int lw = std::max(1, (int)e.tw >> l), lh = std::max(1, (int)e.th >> l);
-                for (int y = 0; y < lh; y += bh)
-                    for (int x = 0; x < lw; x += bw) {
-                        uint32_t byte;
-                        switch (e.tpsm) {
-                        case gs::PSMCT16: byte = gs::addr16(x, y, bp, bwid) * 2; break;
-                        case gs::PSMCT16S: byte = gs::addr16s(x, y, bp, bwid) * 2; break;
-                        case gs::PSMT8: byte = gs::addr8(x, y, bp, bwid); break;
-                        case gs::PSMT4: byte = gs::addr4(x, y, bp, bwid) / 2; break;
-                        default: byte = gs::addr32(x, y, bp, bwid) * 4; break;
+            key = hit->texture_key;
+        } else {
+            uint64_t k[5] = {(base(0) & 31) | (uint64_t)pitch(0) << 32, e.tpsm | (uint64_t)e.tw << 16 | (uint64_t)e.th << 32,
+                             indexed ? palette_hash : 0,
+                             e.tpsm == gs::PSMCT32 ? 0 : (e.ta0 | e.ta1 << 8 | (uint64_t)e.aem << 16), 0};
+            k[4] = base(0);
+            k[1] |= (uint64_t)levels << 48;
+            uint64_t mk[6] = {};
+            for (uint32_t l = 1; l <= levels; l++) mk[l - 1] = base(l) | (uint64_t)pitch(l) << 32;
+            const uint64_t addr_key = XXH3_64bits(k, sizeof k) ^ (levels ? XXH3_64bits(mk, sizeof mk) : 0);
+            address = &g_r.by_addr[addr_key];
+            if (address->tex) {
+                bool ok = true;
+                for (uint32_t i = 0; i < count && ok; i++)
+                    if (gs::g_page_gen[(first + i) % gs::kPages] > address->stamp) ok = false;
+                for (uint32_t l = 1; l <= levels && ok; l++) {
+                    uint32_t f2, c2;
+                    gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+                    for (uint32_t i = 0; i < c2 && ok; i++)
+                        if (gs::g_page_gen[(f2 + i) % gs::kPages] > address->stamp) ok = false;
+                }
+                if (ok) {
+                    address->stamp = gs::g_vram_clock;
+                    g_r.vram_memo.insert(memo_key, address->tex->key, address->tex);
+                    address->tex->last_use = g_r.vb;
+                    return address->tex;
+                }
+            }
+            // content key
+            XXH3_state_t *st = g_r.hash_state;
+            XXH3_64bits_reset(st);
+            XXH3_64bits_update(st, k, sizeof k - sizeof k[4]);
+            // the 256-byte GS memory blocks the texture covers (pages also hold other textures and CLUTs)
+            {
+                int bw = 8, bh = 8;
+                switch (e.tpsm) {
+                case gs::PSMCT16: case gs::PSMCT16S: bw = 16, bh = 8; break;
+                case gs::PSMT8: bw = 16, bh = 16; break;
+                case gs::PSMT4: bw = 32, bh = 16; break;
+                default: break;  // 32-bit layouts (CT32, CT24, T8H, T4HL, T4HH)
+                }
+                for (uint32_t l = 0; l <= levels; l++) {
+                    const uint32_t bp = base(l), bwid = pitch(l);
+                    const int lw = std::max(1, (int)e.tw >> l), lh = std::max(1, (int)e.th >> l);
+                    for (int y = 0; y < lh; y += bh)
+                        for (int x = 0; x < lw; x += bw) {
+                            uint32_t byte;
+                            switch (e.tpsm) {
+                            case gs::PSMCT16: byte = gs::addr16(x, y, bp, bwid) * 2; break;
+                            case gs::PSMCT16S: byte = gs::addr16s(x, y, bp, bwid) * 2; break;
+                            case gs::PSMT8: byte = gs::addr8(x, y, bp, bwid); break;
+                            case gs::PSMT4: byte = gs::addr4(x, y, bp, bwid) / 2; break;
+                            default: byte = gs::addr32(x, y, bp, bwid) * 4; break;
+                            }
+                            XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
                         }
-                        XXH3_64bits_update(st, gs::vram + ((byte & ~255u) & (gs::kVramSize - 1)), 256);
-                    }
+                }
             }
+            key = XXH3_64bits_digest(st);
+            address->stamp = gs::g_vram_clock;
         }
-        key = XXH3_64bits_digest(st);
-        address->stamp = gs::g_vram_clock;
     }
     if (const auto it = g_r.textures.find(key); it != g_r.textures.end()) {
         Texture *cached = it->second.get();
         if (address) address->tex = cached;
+        if (have_memo_key) g_r.vram_memo.insert(memo_key, key, cached);
         cached->last_use = g_r.vb;
         return cached;
     }
-    if (cached_only) return nullptr;
+    if (cached_only) {
+        if (have_memo_key) g_r.vram_memo.insert(memo_key, key, nullptr);
+        return nullptr;
+    }
     auto next = std::make_shared<Texture>();
     Texture &t = *next;
     t.key = key;
@@ -977,6 +1017,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         replacement_id = 1 + ((uint64_t)found << 33 | (uint64_t)(t.mat + 1) << 1 | (uint64_t)gs_alpha);
         if (const auto it = g_r.replacements.find(replacement_id); it != g_r.replacements.end()) {
             if (address) address->tex = it->second;
+            if (have_memo_key) g_r.vram_memo.insert(memo_key, key, it->second);
             it->second->last_use = g_r.vb;
             return it->second;
         }
@@ -1060,30 +1101,60 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     }
     g_r.textures.emplace(key, std::move(next));
     if (address) address->tex = &t;
+    if (have_memo_key) g_r.vram_memo.insert(memo_key, key, &t);
     if (levels) g_mip_textures.fetch_add(1);
     g_r.decoded++;
     return &t;
 }
 
-// Textures unused for a while go once the cache is large (adaptive: it grows with what the
-// loaded tracks and cars use, and releases what they stopped using).
+// Adaptive LRU texture eviction: default 1,024 MB budget (configurable via EOD_TEX_CACHE_MB),
+// trimming only cold textures (> 120 vblanks stale) in bounded incremental batches (<= 16/frame)
+// so cache maintenance never introduces a frame hitch.
 void evict_textures() {
-    if (g_r.texture_bytes < (256ull << 20)) return;
-    for (auto it = g_r.textures.begin(); it != g_r.textures.end();) {
-        Texture *t = it->second.get();
-        if (t->last_use + 120 < g_r.vb && !t->pending_upload && it->second.use_count() == 1) {
-            if (t->replacement_id) g_r.replacements.erase(t->replacement_id);
-            for (auto a = g_r.by_addr.begin(); a != g_r.by_addr.end();)
-                a = a->second.tex == t ? g_r.by_addr.erase(a) : std::next(a);
-            Trash tr{g_r.vb};
-            tr.tex = std::move(t->tex);
-            for (int i = 0; i < 16; i++) tr.sets[i] = std::move(t->sets[i]);
-            g_r.trash.push_back(std::move(tr));
-            g_r.texture_bytes -= t->bytes;
-            it = g_r.textures.erase(it);
-        } else {
-            ++it;
+    static const uint64_t budget_bytes = compute_adaptive_tex_budget_bytes(std::getenv("EOD_TEX_CACHE_MB"));
+    if (g_r.texture_bytes < budget_bytes) return;
+    struct Candidate {
+        uint64_t last_use = ~0ull;
+        uint64_t key = 0;
+    };
+    std::array<Candidate, kMaxTexEvictionsPerFrame> coldest{};
+    uint32_t count = 0;
+    for (const auto &kv : g_r.textures) {
+        Texture *t = kv.second.get();
+        if (t->last_use + kTexEvictStaleVblanks < g_r.vb && !t->pending_upload && kv.second.use_count() == 1) {
+            if (count < kMaxTexEvictionsPerFrame) {
+                coldest[count++] = Candidate{t->last_use, kv.first};
+            } else {
+                uint32_t newest = 0;
+                for (uint32_t i = 1; i < kMaxTexEvictionsPerFrame; ++i)
+                    if (coldest[i].last_use > coldest[newest].last_use) newest = i;
+                if (t->last_use < coldest[newest].last_use)
+                    coldest[newest] = Candidate{t->last_use, kv.first};
+            }
         }
+    }
+    if (count == 0) return;
+    std::sort(coldest.begin(), coldest.begin() + count,
+              [](const Candidate &a, const Candidate &b) { return a.last_use < b.last_use; });
+    uint32_t evicted = 0;
+    for (uint32_t i = 0; i < count && g_r.texture_bytes >= budget_bytes; ++i) {
+        auto it = g_r.textures.find(coldest[i].key);
+        if (it == g_r.textures.end()) continue;
+        Texture *t = it->second.get();
+        if (t->replacement_id) g_r.replacements.erase(t->replacement_id);
+        for (auto a = g_r.by_addr.begin(); a != g_r.by_addr.end();)
+            a = a->second.tex == t ? g_r.by_addr.erase(a) : std::next(a);
+        Trash tr{g_r.vb};
+        tr.tex = std::move(t->tex);
+        for (int s = 0; s < 16; s++) tr.sets[s] = std::move(t->sets[s]);
+        g_r.trash.push_back(std::move(tr));
+        g_r.texture_bytes -= t->bytes;
+        g_r.textures.erase(it);
+        ++evicted;
+    }
+    if (evicted > 0) {
+        g_r.tex_evictions += evicted;
+        g_r.vram_memo.clear();
     }
 }
 
@@ -1335,7 +1406,9 @@ bool ensure_sun_maps() {
     if ((formats.optimalTilingFeatures & flags) != flags) return false;
     using namespace plume;
     namespace Stage = RenderShaderStageFlag;
-    const uint32_t res = sun_cascades::kResolution;
+    const uint32_t max_dim = g_r.dev->physicalDeviceProperties.limits.maxImageDimension2D;
+    const uint32_t res = compute_sun_cascade_resolution(std::getenv("EOD_SUN_CASCADE_RES"), max_dim);
+    maps.resolution = res;
     const RenderPushConstantRange caster_pc(0, 0, 0, sizeof(SunConstants), Stage::VERTEX);
     const RenderPushConstantRange receiver_pc(0, 0, 0, sizeof(SunConstants), Stage::PIXEL);
     const RenderDescriptorSetDesc desc = sun_receiver_desc();
@@ -1453,10 +1526,12 @@ uint32_t draw_sun_cascades(plume::RenderCommandList &list, const gs::hw::NativeS
                            const SunView &input, plume::RenderTexture *color, uint32_t boundary) {
     using namespace sun_cascades;
     using namespace plume;
+    if (!ensure_sun_maps() || !bind_sun_target(surface)) return 0;
+    const uint32_t res = g_r.sun_maps.resolution;
     const Packet &camera = input.camera;
     const Vec3 origin{camera.position[0], camera.position[1], camera.position[2]};
     const Vec3 forward{camera.rotation[6], camera.rotation[7], camera.rotation[8]};
-    const View view = make_view(origin, forward, input.sun);
+    const View view = make_view(origin, forward, input.sun, res);
     Packet world = camera;
     std::fill_n(world.model, 12, 0.0f);
     world.model[0] = world.model[5] = world.model[10] = 1;
@@ -1474,7 +1549,7 @@ uint32_t draw_sun_cascades(plume::RenderCommandList &list, const gs::hw::NativeS
         clip[3][i] = screen[3][i];
     }
     const Reprojection ray = make_reprojection(clip, view.axis);
-    if (!ray.valid || !ensure_sun_maps() || !bind_sun_target(surface)) return 0;
+    if (!ray.valid) return 0;
 
     enum class Casters { All, World, Queue, None };
     static const Casters caster_filter = [] {
@@ -1495,7 +1570,6 @@ uint32_t draw_sun_cascades(plume::RenderCommandList &list, const gs::hw::NativeS
     uint32_t counts[2][2]{};
     constexpr auto graphics = RenderBarrierStage::GRAPHICS;
     constexpr auto sampled = RenderTextureLayout::SHADER_READ;
-    constexpr uint32_t res = kResolution;
     for (size_t i = 0; i < 2; ++i) {
         const RenderTextureBarrier write(maps.depth[i].get(), RenderTextureLayout::DEPTH_WRITE);
         list.barriers(graphics, &write, 1);
@@ -1584,10 +1658,11 @@ void flush_shadows(bool ordered_composite = false) {
         g_r.shadow_pending.clear();
         return;
     }
-    // Stage R5 A3: the GS's own shadow target, w x h = min(view w, 320) x min(view h, 512) (0x35DA30,
-    // 0x363218) times RenderScale. At 1x it is the PS2 target pixel for pixel; higher scales give the
-    // adaptive finer target with the same mapping.
+    // Stage R5 A3 / S5: decoupled shadow accumulation target. Keeps 100% pixel-identical behavior
+    // at RenderScale 1..3 (Classic/P6 parity) while capping 4K/6x/8x shadow accumulation fill-rate
+    // cleanly via compute_shadow_target_extent (override via EOD_SHADOW_SCALE).
     const int sc = s.scale;
+    static const uint32_t max_shadow_scale = resolve_max_shadow_scale(std::getenv("EOD_SHADOW_SCALE"));
     const Packet &p0 = g_r.shadow_pending.front().p;
     int32_t rt_w = p0.shadow_rt[0], rt_h = p0.shadow_rt[1];
     int32_t vx = p0.shadow_rt[2], vy = p0.shadow_rt[3], vw = p0.shadow_rt[4], vh = p0.shadow_rt[5];
@@ -1595,14 +1670,17 @@ void flush_shadows(bool ordered_composite = false) {
         rt_w = (int32_t)std::min<uint32_t>(s.gs_width, 320u), rt_h = (int32_t)std::min<uint32_t>(s.gs_height, 512u);
         vx = 0, vy = 0, vw = (int32_t)s.gs_width, vh = (int32_t)s.gs_height;
     }
+    const ShadowTargetExtent sh_ext =
+        compute_shadow_target_extent((uint32_t)rt_w, (uint32_t)rt_h, (uint32_t)std::max(1, sc), max_shadow_scale);
     {
         static unsigned logged;
         if (logged++ < 8)
-            std::fprintf(stderr, "[native] shadow target %dx%d view %d,%d %dx%d scale %d gs %ux%u items %zu frame %llu sc %d,%d-%d,%d\n", rt_w, rt_h,
+            std::fprintf(stderr, "[native] shadow target %dx%d -> %ux%u (eff %ux%u, sh_scale %u) view %d,%d %dx%d scale %d gs %ux%u items %zu frame %llu sc %d,%d-%d,%d\n",
+                         rt_w, rt_h, sh_ext.tex_w, sh_ext.tex_h, sh_ext.eff_rt_w, sh_ext.eff_rt_h, sh_ext.shadow_scale,
                          vx, vy, vw, vh, sc, s.gs_width, s.gs_height, g_r.shadow_pending.size(),
                          (unsigned long long)p0.frame, g_r.main_sc[0], g_r.main_sc[1], g_r.main_sc[2], g_r.main_sc[3]);
     }
-    ensure_shadow_resources((uint32_t)(rt_w * sc), (uint32_t)(rt_h * sc));
+    ensure_shadow_resources(sh_ext.tex_w, sh_ext.tex_h);
     if (!g_r.shadow_mask.tex || !g_r.quad_buf) {
         gs::hw::native_end();
         for (const Item &it : g_r.shadow_pending) {
@@ -1626,7 +1704,7 @@ void flush_shadows(bool ordered_composite = false) {
     std::unique_ptr<plume::RenderDescriptorSet> zset = g_r.dev->createDescriptorSet(texture_desc());
     zset->setTexture(0, depth, plume::RenderTextureLayout::SHADER_READ);
     zset->setSampler(1, g_r.samplers[2 | 4].get());
-    const uint32_t geo = S_ON | (uint32_t)(sc & 63) << 24 | (uint32_t)(rt_h & 0xFFF) << 12 | (uint32_t)(rt_w & 0xFFF);
+    const uint32_t geo = S_ON | (uint32_t)(sc & 63) << 24 | (sh_ext.eff_rt_h & 0xFFF) << 12 | (sh_ext.eff_rt_w & 0xFFF);
     const uint32_t view_xy = (uint32_t)(vx & 0xFFFF) | (uint32_t)(vy & 0xFFFF) << 16;
     const uint32_t view_wh = (uint32_t)(vw & 0xFFFF) | (uint32_t)(vh & 0xFFFF) << 16;
 
@@ -1642,12 +1720,12 @@ void flush_shadows(bool ordered_composite = false) {
         g_r.shadow_fb_depth = 0;
     }
     cl->setFramebuffer(g_r.shadow_fb.get());
-    // main GS pixel x -> target pixel (x - vx) w / vw (0x363218 aspect and 0x35E200 viewport)
-    const double kx = (double)rt_w / vw, ky = (double)rt_h / vh;
+    // main GS pixel x -> target pixel (x - vx) eff_rt_w / vw (exact mapping at scale sc)
+    const double kx = (double)sh_ext.eff_rt_w / vw, ky = (double)sh_ext.eff_rt_h / vh;
     const double gw = s.gs_width, gh = s.gs_height;
     cl->setViewports(plume::RenderViewport((float)(-vx * kx * sc), (float)(-vy * ky * sc), (float)(gw * kx * sc),
                                            (float)(gh * ky * sc)));
-    cl->setScissors(plume::RenderRect(0, 0, rt_w * sc, rt_h * sc));
+    cl->setScissors(plume::RenderRect(0, 0, (int32_t)sh_ext.tex_w, (int32_t)sh_ext.tex_h));
     cl->clearColor(0, plume::RenderColor(0, 0, 0, 0));  // 0x362968's Z write clears the target to 0
     cl->setGraphicsPipelineLayout(g_r.scene.layout());
     cl->setGraphicsDescriptorSet(zset.get(), 0);
@@ -2142,9 +2220,11 @@ plume::RenderDescriptorSet *capture_scene_input(plume::VulkanCommandList &cl, pl
         // snapshot. Decline the effect until the next frame instead of recopying.
         return slot->color_source == s.color && slot->depth_source == s.depth ? slot->set.get() : nullptr;
     }
-    const uint32_t divisor = g_r.scene_blit ? std::max(1, (s.scale + 1) / 2) : 1;
-    const uint32_t w = (view.rect[2] - view.rect[0] + divisor - 1) / divisor;
-    const uint32_t h = (view.rect[3] - view.rect[1] + divisor - 1) / divisor;
+    const SceneCaptureExtent cap_ext = compute_scene_capture_extent(
+        (uint32_t)(view.rect[2] - view.rect[0]), (uint32_t)(view.rect[3] - view.rect[1]),
+        (uint32_t)std::max(1, s.scale), g_r.scene_blit);
+    const uint32_t w = cap_ext.width;
+    const uint32_t h = cap_ext.height;
     if (!slot || slot->rect != view.rect || slot->width != w || slot->height != h ||
         slot->surface_width != s.width || slot->surface_height != s.height) {
         auto next = std::make_unique<SceneSnapshot>();
@@ -4537,6 +4617,15 @@ void r6_report() {
                  g_draws_textured ? 100.0 * g_draws_material / g_draws_textured : 0.0, (unsigned long long)g_pk_fallback,
                  g_low_seen.size(), (unsigned long long)g_draws_vfx[0], (unsigned long long)g_draws_vfx[1],
                  (unsigned long long)g_draws_vfx[2]);
+    if (g_r.vram_memo.hits() || g_r.vram_memo.misses() || g_r.tex_evictions) {
+        const uint64_t total_memo = g_r.vram_memo.hits() + g_r.vram_memo.misses();
+        std::fprintf(stderr,
+                     "[plume-s5] vram_memo hits=%llu misses=%llu (%.1f%% hit), tex_cache=%llu MB (%zu entries, evictions=%llu)\n",
+                     (unsigned long long)g_r.vram_memo.hits(), (unsigned long long)g_r.vram_memo.misses(),
+                     total_memo ? 100.0 * g_r.vram_memo.hits() / total_memo : 0.0,
+                     (unsigned long long)(g_r.texture_bytes >> 20), g_r.textures.size(),
+                     (unsigned long long)g_r.tex_evictions);
+    }
     if (g_vfx_billboards || g_vfx_volume_draws[VFX_FIRE] || g_vfx_volume_draws[VFX_EXHAUST] || g_vfx_volume_draws[VFX_EMBER])
         std::fprintf(stderr, "[r6] volume VFX fire %llu smoke %llu exhaust %llu ember %llu, "
                      "GPU billboard projections %llu, peak/vblank %u, budget fallbacks %llu\n",

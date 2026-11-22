@@ -39,7 +39,7 @@ struct View {
     std::array<Box, 2> box;
 };
 
-inline View make_view(Vec3 camera, Vec3 forward, Vec3 toward_sun) {
+inline View make_view(Vec3 camera, Vec3 forward, Vec3 toward_sun, uint32_t resolution = kResolution) {
     View view{};
     const Vec3 z = scale(unit(toward_sun), -1.0);
     const Vec3 up = std::abs(z[1]) < 0.96 ? Vec3{0, 1, 0} : Vec3{0, 0, 1};
@@ -47,10 +47,11 @@ inline View make_view(Vec3 camera, Vec3 forward, Vec3 toward_sun) {
     view.axis = {x, cross(z, x), z};
     // Near overlap for car bodies and the road, far reach for track buildings and banks.
     view.box = {Box{{}, 24.0, 72.0}, Box{{}, 120.0, 168.0}};
+    const double res = static_cast<double>(std::max(1u, resolution));
     for (size_t i = 0; i < view.box.size(); ++i) {
         Box &box = view.box[i];
         const Vec3 focus = add(camera, scale(unit(forward), i == 0 ? 12.0 : 52.0));
-        const double steps[] = {2.0 * box.radius / kResolution, 2.0 * box.radius / kResolution, 1.0};
+        const double steps[] = {2.0 * box.radius / res, 2.0 * box.radius / res, 1.0};
         for (size_t k = 0; k < 3; ++k)
             box.center[k] = std::round(dot(view.axis[k], focus) / steps[k]) * steps[k];
     }

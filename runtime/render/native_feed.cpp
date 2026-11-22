@@ -1210,10 +1210,22 @@ static std::shared_ptr<const WorldTextureIndices> snapshot_world_indices(uint32_
         source[level] = ee_r32(texture + 0x24 + 4 * level);
         if (!source[level] || (source[level] & 15) || source[level] > EE_RAM_SIZE - bytes) return {};
     }
-    static std::unordered_map<uint32_t, std::shared_ptr<const WorldTextureIndices>> snapshots;
-    if (snapshots.size() >= 512 && !snapshots.count(texture))
-        snapshots.clear();
-    auto &cached = snapshots[texture];
+    struct WorldSnapshotEntry {
+        uint64_t last_use = 0;
+        std::shared_ptr<const WorldTextureIndices> indices;
+    };
+    static uint64_t use_seq = 0;
+    static std::unordered_map<uint32_t, WorldSnapshotEntry> snapshots;
+    if (snapshots.size() >= 4096 && !snapshots.count(texture)) {
+        auto oldest = snapshots.begin();
+        for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        }
+        snapshots.erase(oldest);
+    }
+    auto &slot = snapshots[texture];
+    slot.last_use = ++use_seq;
+    auto &cached = slot.indices;
     if (cached && cached->levels == levels) {
         bool equal = true;
         for (uint32_t level = 0; level < levels && equal; ++level) {
@@ -1344,7 +1356,7 @@ std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &c
         base += (bytes + 255) / 256;
     }
     const uint8_t function = ee_r32(texture + 8) ? 3 : 0;
-    if (snapshots.size() >= 2048 && !snapshots.count(texture)) {
+    if (snapshots.size() >= 4096 && !snapshots.count(texture)) {
         auto oldest = snapshots.begin();
         for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
             if (it->second.last_frame < oldest->second.last_frame) oldest = it;
@@ -1438,12 +1450,23 @@ std::unique_ptr<QueueMaterial> queue_material(const Packet &p, const DentPart &c
         uint32_t(d.scissor[2]), uint32_t(d.scissor[3]), d.origin_x, d.origin_y};
     const uint64_t key[] = {p.mesh, snapshot.decoded->content_hash, snapshot.decoded->palette_hash,
         uint32_t(material->bias), XXH3_64bits(surface, sizeof surface), function};
-    static std::unordered_map<uint64_t, std::shared_ptr<QueueReady>> ready;
+    struct ReadyEntry {
+        uint64_t last_frame = 0;
+        std::shared_ptr<QueueReady> token;
+    };
+    static std::unordered_map<uint64_t, ReadyEntry> ready;
     const uint64_t id = XXH3_64bits(key, sizeof key);
-    if (ready.size() >= 4096 && !ready.count(id)) ready.clear();
-    auto &token = ready[id];
-    if (!token) token = std::make_shared<QueueReady>();
-    material->readiness = token;
+    if (ready.size() >= 16384 && !ready.count(id)) {
+        auto oldest = ready.begin();
+        for (auto it = ready.begin(); it != ready.end(); ++it) {
+            if (it->second.last_frame < oldest->second.last_frame) oldest = it;
+        }
+        ready.erase(oldest);
+    }
+    auto &entry_ready = ready[id];
+    entry_ready.last_frame = p.frame;
+    if (!entry_ready.token) entry_ready.token = std::make_shared<QueueReady>();
+    material->readiness = entry_ready.token;
     return material;
 #endif
 }
