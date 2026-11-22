@@ -117,6 +117,7 @@ from workers import CancelToken, FunctionWorker, start_worker
 from world_loader import (
     EnvironmentState,
     RoadNode,
+    TextureAsset,
     TrackWorld,
     WorldMarker,
     WorldObject,
@@ -469,6 +470,7 @@ class EodWorldEditorWindow(QMainWindow):
         m_obj.addAction(svg_icon("ground"), "Snap Selected to Ground", self.snap_selected_to_ground, QKeySequence("Ctrl+G"))
         m_obj.addAction("Duplicate Selected", self.duplicate_selected_object)
         m_obj.addAction(svg_icon("blender"), "Export Selected to Blender (OBJ)...", self.edit_selected_in_blender, QKeySequence("F2"))
+        m_obj.addAction(svg_icon("blender"), "Import / Sync Mesh From Blender (OBJ)...", self.import_mesh_from_blender_dialog)
         m_obj.addAction(svg_icon("shield"), "Make Collision for Selected", self.make_collision_for_selected)
         m_obj.addSeparator()
         m_obj.addAction(self.act_delete_selected)
@@ -518,6 +520,7 @@ class EodWorldEditorWindow(QMainWindow):
         m_mesh = mb.addMenu("&Mesh")
         m_mesh.addAction("Toggle Wireframe Overlay", lambda: self.act_v_wire.trigger())
         m_mesh.addAction("Export Selected Object to OBJ...", self.edit_selected_in_blender)
+        m_mesh.addAction("Import / Sync Mesh From Blender (OBJ)...", self.import_mesh_from_blender_dialog)
         m_mesh.addAction("Export All Track Textures to Folder...", self.export_texture_folder_dialog)
         m_mesh.addAction("Import Texture Folder (HOSTTEX)...", self.import_texture_folder_dialog)
         m_mesh.addAction("Show Track Mesh Statistics...", self._show_mesh_stats)
@@ -2739,6 +2742,121 @@ class EodWorldEditorWindow(QMainWindow):
     def edit_selected_in_blender(self) -> None:
         if self.viewport.selected_obj is not None:
             self.edit_object_in_blender(self.viewport.selected_obj)
+
+    def import_mesh_from_blender_dialog(self) -> WorldObject | None:
+        if self.world is None:
+            return None
+        export_dir = tdeod_support_dir() / "editor" / "blender_exports" / self.world.track_name.lower()
+        start_dir = str(export_dir if export_dir.is_dir() else Path.home())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import / Sync Mesh From Blender (OBJ)",
+            start_dir,
+            "Wavefront OBJ (*.obj)",
+        )
+        if not file_path:
+            return None
+        try:
+            return self.import_obj_from_blender(Path(file_path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Blender Import Failed", str(exc))
+            return None
+
+    def import_obj_from_blender(
+        self,
+        obj_path: Path | str,
+        *,
+        replace_selected: bool | None = None,
+    ) -> WorldObject | None:
+        """Import a Blender RH Z-up OBJ into World Studio (replace selected or place new, undoable)."""
+        if self.world is None:
+            return None
+        from eod_blender_addon.eod_bridge import build_world_model_from_obj
+
+        sel = self.viewport.selected_obj
+        default_tex = sel.textures[0] if (sel is not None and sel.textures) else "rd-1.tex"
+        wm, pivot, tex_png_map = build_world_model_from_obj(Path(obj_path), default_tex=default_tex)
+
+        # Ingest any sidecar PNG textures referenced by the MTL so viewport & HOSTTEX show them live
+        for tex_name, png_path in tex_png_map.items():
+            if tex_name not in self.world.textures and png_path.is_file():
+                try:
+                    w, h, rgba = load_png_rgba(png_path)
+                    self.world.textures[tex_name] = TextureAsset(
+                        name=tex_name,
+                        width=w,
+                        height=h,
+                        rgba=rgba,
+                        alpha_kind="opaque",
+                        average_rgb=(160, 160, 160),
+                        asset_id=f"blender:{png_path.name}",
+                        is_replaced=True,
+                        replaced_png_path=str(png_path),
+                    )
+                except Exception:
+                    pass
+
+        self.world.models[wm.key] = wm
+        self.viewport.ensure_gl_textures()
+
+        do_replace = False
+        if sel is not None:
+            if replace_selected is not None:
+                do_replace = bool(replace_selected)
+            else:
+                box = QMessageBox(self)
+                box.setWindowTitle("Sync From Blender (OBJ)")
+                box.setText(
+                    f"Imported '{wm.name}' ({wm.tri_count} tris, {len(wm.parts)} material parts).\n\n"
+                    f"Replace selected object '{sel.name}' or place as a new object?"
+                )
+                btn_replace = box.addButton("Replace Selected", QMessageBox.ButtonRole.AcceptRole)
+                btn_place = box.addButton("Place as New Object", QMessageBox.ButtonRole.ActionRole)
+                box.addButton(QMessageBox.StandardButton.Cancel)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked == btn_replace:
+                    do_replace = True
+                elif clicked == btn_place:
+                    do_replace = False
+                else:
+                    return None
+
+        if do_replace and sel is not None:
+            self.undo_stack.push(ReplaceObjectModelCommand(self.world, sel, wm.key, self._refresh_after_edit))
+            self.viewport.select_object(sel)
+            self.set_action_status(f"Synced Blender OBJ -> replaced '{sel.name}' ({wm.tri_count} tris)")
+            return sel
+
+        # Place at OBJ world pivot (or camera ground target if OBJ was authored around world origin)
+        if abs(pivot[0]) < 1e-3 and abs(pivot[1]) < 1e-3 and abs(pivot[2]) < 1e-3:
+            place_pos = self._camera_ground_target(25.0)
+        else:
+            place_pos = pivot
+
+        obj_id = f"ed_{self._placed_counter:04d}"
+        self._placed_counter += 1
+        obj = WorldObject(
+            obj_id=obj_id,
+            name=wm.name,
+            model_key=wm.key,
+            source="Placed by the editor",
+            category=wm.category,
+            subtype=wm.subtype,
+            section_mlist="editor_layer",
+            model_store=wm.model_store,
+            hash_hex=wm.hash_hex,
+            tri_count=wm.tri_count,
+            textures=list(wm.textures),
+            position=place_pos,
+            rotation_hpr=(0.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
+            written=False,
+        )
+        self.undo_stack.push(PlaceObjectCommand(self.world, obj, self._refresh_after_edit))
+        self.viewport.select_object(obj)
+        self.set_action_status(f"Imported Blender OBJ '{wm.name}' ({wm.tri_count} tris)")
+        return obj
 
     # -----------------------------------------------------------------------
     # Live Texture Replacement (OpenGL 3.3 + Vulkan HOSTTEX Export)

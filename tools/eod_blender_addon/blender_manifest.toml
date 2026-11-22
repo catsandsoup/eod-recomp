@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "eod_world_studio"
+version = "1.0.0"
+name = "EOD World Studio Bridge"
+tagline = "Two-way Eve of Destruction (.TRK / .eodworld / .CAR) bridge for Blender 4.2+"
+maintainer = "EOD Recomp Project"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = ["Import-Export", "Game Engine", "Mesh"]
+
+[permissions]
+files = "Import and export EOD tracks, vehicles, textures, and World Studio OBJ bridges"
