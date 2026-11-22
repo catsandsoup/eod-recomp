@@ -81,10 +81,46 @@ def _to_float(val: Any, default: float) -> float:
         return default
 
 
+_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "idle_rpm": ("idle_rpm", "idle_speed", "idle"),
+    "redline": ("redline", "rpm_limit", "max_rpm", "redline_rpm"),
+    "torque_max": ("torque_max", "max_torque", "peak_torque"),
+    "torque_rpm": ("torque_rpm", "max_torque_rpm", "peak_torque_rpm"),
+    "power_max": ("power_max", "max_power", "horsepower", "peak_hp", "hp_max"),
+    "power_rpm": ("power_rpm", "max_power_rpm", "peak_hp_rpm"),
+    "rear_end_ratio": ("rear_end_ratio", "final_drive", "ratio"),
+    "damage_tweak": ("damage_tweak", "damage_scale"),
+}
+
+_KEY_SECTION_PRIORITY: dict[str, tuple[str, ...]] = {
+    "idle_rpm": ("engine", "enginenormal", "enginepro", "enginearcade"),
+    "redline": ("engine", "enginenormal", "enginepro", "enginearcade"),
+    "torque_max": ("engine", "enginenormal", "enginepro", "enginearcade"),
+    "torque_rpm": ("engine", "enginenormal", "enginepro", "enginearcade"),
+    "power_max": ("engine", "enginenormal", "enginepro", "enginearcade"),
+    "power_rpm": ("engine", "enginenormal", "enginepro", "enginearcade"),
+    "rear_end_ratio": ("transmission", "gearbox", "drivetrain"),
+    "g1": ("transmission", "gearbox", "drivetrain"),
+    "g2": ("transmission", "gearbox", "drivetrain"),
+    "g3": ("transmission", "gearbox", "drivetrain"),
+    "g4": ("transmission", "gearbox", "drivetrain"),
+    "g5": ("transmission", "gearbox", "drivetrain"),
+    "g6": ("transmission", "gearbox", "drivetrain"),
+    "mass": ("chassis", "body", "car"),
+    "cm_height": ("chassis", "body", "car"),
+    "wheelbase": ("chassis", "body", "car"),
+    "brake_factor": ("chassis", "brakes", "front", "rear"),
+    "spring_factor": ("chassis", "suspension", "front", "rear"),
+    "damage_tweak": ("chassis", "damage", "body"),
+    "tire_diameter": ("front", "rear", "tires", "wheels", "chassis"),
+}
+
+
 def parse_physics_dict(raw_fields: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize flat, dotted (`Section.key`), or nested `physics.val` dicts."""
     raw = raw_fields or {}
-    flat: dict[str, Any] = {}
+    top_flat: dict[str, Any] = {}
+    any_flat: dict[str, Any] = {}
     section_maps: dict[str, dict[str, Any]] = {}
 
     for k, v in raw.items():
@@ -94,20 +130,60 @@ def parse_physics_dict(raw_fields: dict[str, Any] | None) -> dict[str, Any]:
             for sk, sv in v.items():
                 sk_low = str(sk).strip().lower()
                 sec_dict[sk_low] = sv
-                flat.setdefault(sk_low, sv)
+                any_flat.setdefault(sk_low, sv)
         else:
             k_str = str(k).strip()
             k_low = k_str.lower()
-            flat[k_low] = v
+            matched_sep = False
             for sep in (".", "/"):
                 if sep in k_low:
                     sec, sub = k_low.split(sep, 1)
                     section_maps.setdefault(sec, {})[sub] = v
-                    flat.setdefault(sub, v)
+                    any_flat[sub] = v
+                    matched_sep = True
+                    break
+            if not matched_sep:
+                top_flat[k_low] = v
+            any_flat[k_low] = v
+
+    def _lookup_scalar(key: str, default: float) -> float:
+        aliases = _KEY_ALIASES.get(key, (key,))
+        # 1. Explicit flat top-level overrides win first
+        for alias in aliases:
+            if alias in top_flat:
+                return _to_float(top_flat[alias], default)
+        # 2. Section-priority lookup (e.g. Engine override > EngineNormal; Chassis.mass > EngineNormal.mass)
+        for sec in _KEY_SECTION_PRIORITY.get(key, ()):
+            sec_dict = section_maps.get(sec)
+            if not sec_dict:
+                continue
+            for alias in aliases:
+                if alias in sec_dict:
+                    return _to_float(sec_dict[alias], default)
+        # 3. Fallback to any section or dotted key
+        for alias in aliases:
+            if alias in any_flat:
+                return _to_float(any_flat[alias], default)
+        return default
 
     parsed: dict[str, Any] = {}
     for key, default in _SCALAR_DEFAULTS.items():
-        parsed[key] = _to_float(flat.get(key, default), default)
+        parsed[key] = _lookup_scalar(key, default)
+
+    # Optional multiplicative torque_scale support when present on Engine/EngineNormal
+    tq_scale = _to_float(
+        top_flat.get(
+            "torque_scale",
+            section_maps.get("engine", {}).get(
+                "torque_scale",
+                section_maps.get("enginenormal", {}).get("torque_scale", 1.0),
+            ),
+        ),
+        1.0,
+    )
+    if tq_scale > 0.0 and abs(tq_scale - 1.0) > 1e-6:
+        parsed["torque_max"] *= tq_scale
+        parsed["power_max"] *= tq_scale
 
     # Sanity clamps on core physical bounds
     parsed["idle_rpm"] = max(300.0, parsed["idle_rpm"])
@@ -130,7 +206,7 @@ def parse_physics_dict(raw_fields: dict[str, Any] | None) -> dict[str, Any]:
         for pkey, pdef in defaults.items():
             val = sec_src.get(pkey)
             if val is None:
-                val = flat.get(f"{sec_low}_{pkey}", flat.get(f"{sec_low}.{pkey}", pdef))
+                val = any_flat.get(f"{sec_low}_{pkey}", any_flat.get(f"{sec_low}.{pkey}", pdef))
             tyre[pkey] = _to_float(val, pdef)
         tyre["grip"] = max(0.05, tyre["grip"])
         parsed[sec_name] = tyre

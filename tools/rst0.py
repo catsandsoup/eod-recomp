@@ -283,6 +283,7 @@ def pack_archive(in_dir: str, out_archive_path: str):
     first_data_offset = (dir_offset + dir_size + 0x7F) & ~0x7F
 
     resident_entries = []
+    resident_sfx_entries = []
     extractable_entries = []
     for em in entries_meta:
         name = em["name"]
@@ -302,10 +303,16 @@ def pack_archive(in_dir: str, out_archive_path: str):
         }
         if entry_record["is_extractable"]:
             extractable_entries.append(entry_record)
+        elif str(entry_record["fourcc"]).strip().upper() == "SFX0":
+            # Retail 0TSR v6 archives place resident SFX0 (.sf_) banks at the very tail of the
+            # resident block right before extract_block. The PS2/recomp SPU uploader truncates
+            # resident storage starting at the SFX0 tail, clearing the 0x8 resident flag on any
+            # entry placed after SFX0 (causing f_00130AD0 -> NULL / "Couldn't load ModelInfo").
+            resident_sfx_entries.append(entry_record)
         else:
             resident_entries.append(entry_record)
 
-    all_entries = resident_entries + extractable_entries
+    all_entries = resident_entries + resident_sfx_entries + extractable_entries
 
     cur_file_offset = first_data_offset
     first_extractable_rel_offset = None

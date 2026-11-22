@@ -610,10 +610,16 @@ class ReplaceObjectModelCommand(QUndoCommand):
 
 
 class ScatterPlaceCommand(QUndoCommand):
-    """Single undoable command for a Scatter / Paint Brush stroke placing N objects."""
+    """Single undoable command for a Scatter / Paint Brush stroke or Alt+Drag duplicate placing N objects."""
 
-    def __init__(self, world: TrackWorld, objs: list[WorldObject], on_change: Callable[[], None]):
-        super().__init__(f"Scatter {len(objs)} objects")
+    def __init__(
+        self,
+        world: TrackWorld,
+        objs: list[WorldObject],
+        on_change: Callable[[], None],
+        label: str | None = None,
+    ):
+        super().__init__(label or f"Scatter {len(objs)} objects")
         self.world = world
         self.objs = list(objs)
         self.on_change = on_change
@@ -3704,6 +3710,18 @@ def _compile_custom_objects_into_trk(
             e["name"] for e in entries_meta if e["fourcc"].strip() == "VALT" and e["name"].lower().startswith("c_")
         ]
 
+        def _insert_resident_meta(entry: dict[str, Any]) -> None:
+            """Insert a new resident 0TSR entry before the SFX0 tail & extractable block."""
+            idx = next(
+                (
+                    i
+                    for i, e in enumerate(entries_meta)
+                    if e.get("is_extractable") or str(e.get("fourcc", "")).strip().upper() == "SFX0"
+                ),
+                len(entries_meta),
+            )
+            entries_meta.insert(idx, entry)
+
         placed_records: list[tuple[str, WorldObject]] = []
         if custom_objs:
             # Load or initialize track obstacle.val
@@ -3712,7 +3730,7 @@ def _compile_custom_objects_into_trk(
                 obst_model = valt.parse_binary_valt((tmp_p / obst_meta["name"]).read_bytes())
             else:
                 obst_model = {"tool_vtable": 0x40C218, "unk1": 0, "orig_sec_count": 0, "sections": [], "is_v6": False}
-                entries_meta.append(
+                _insert_resident_meta(
                     {
                         "name": "obstacle.val",
                         "fourcc": "VALT",
@@ -3752,10 +3770,10 @@ def _compile_custom_objects_into_trk(
                     mod_member_name = f"{dyno_name}.mod"
                     dyno_counter += 1
 
-                    # Write resident .mod member
+                    # Write resident .mod member (placed BEFORE SFX0 tail so SPU shrink keeps it resident!)
                     (tmp_p / mod_member_name).write_bytes(mod_bytes)
                     if mod_member_name.lower() not in existing_lower:
-                        entries_meta.append(
+                        _insert_resident_meta(
                             {
                                 "name": mod_member_name,
                                 "fourcc": "MODL",
@@ -3770,7 +3788,7 @@ def _compile_custom_objects_into_trk(
                         if tname.lower() in existing_lower or len(tname.encode("latin1")) > 31:
                             continue
                         (tmp_p / tname).write_bytes(tbytes)
-                        entries_meta.append(
+                        _insert_resident_meta(
                             {
                                 "name": tname,
                                 "fourcc": "TEX",

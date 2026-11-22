@@ -835,7 +835,14 @@ class ViewportGL(QOpenGLWidget):
         self._last_baked_obj_state: dict[str, tuple[Any, ...]] = {}
         self._static_filter_sig: Any = None
         self._force_full_static_rebuild: bool = True
-        self._dynamic_dirty: bool = False
+        self._pick_aabb_lo: np.ndarray | None = None
+        self._pick_aabb_hi: np.ndarray | None = None
+        self._pick_aabb_objs: list[WorldObject] = []
+        self._pick_aabb_sig: Any = None
+        self._pick_aabb_dirty: bool = True
+        self.__static_dirty: bool = False
+        self.__dynamic_dirty: bool = False
+        self._dynamic_dirty = False
         self._last_batch_rebuild_ms: float = 0.0
         self._active_obj_count: int = 0
         self._sel_batches: list[dict[str, Any]] = []
@@ -890,6 +897,33 @@ class ViewportGL(QOpenGLWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._on_tick)
+
+    @property
+    def _static_dirty(self) -> bool:
+        return self.__static_dirty
+
+    @_static_dirty.setter
+    def _static_dirty(self, value: bool) -> None:
+        self.__static_dirty = bool(value)
+        if self.__static_dirty:
+            self._invalidate_pick_aabb_cache()
+
+    @property
+    def _dynamic_dirty(self) -> bool:
+        return self.__dynamic_dirty
+
+    @_dynamic_dirty.setter
+    def _dynamic_dirty(self, value: bool) -> None:
+        self.__dynamic_dirty = bool(value)
+        if self.__dynamic_dirty:
+            self._invalidate_pick_aabb_cache()
+
+    def _invalidate_pick_aabb_cache(self) -> None:
+        self._pick_aabb_dirty = True
+        self._pick_aabb_lo = None
+        self._pick_aabb_hi = None
+        self._pick_aabb_objs = []
+        self._pick_aabb_sig = None
 
     def set_render_mode(self, mode: str) -> None:
         """Switch viewport shading mode: 'ps2' (fast power-sipping) or 'plume' (high quality)."""
@@ -3154,36 +3188,137 @@ class ViewportGL(QOpenGLWidget):
             ray_o, ray_d = self.screen_ray(sx, sy)
             return self._pick_object(ray_o, ray_d)
 
+    def _ensure_pick_aabb_cache(self) -> None:
+        """Build or refresh vectorized (N, 3) world AABB arrays for O(1)-NumPy broadphase picking."""
+        world = self.world
+        if world is None:
+            self._invalidate_pick_aabb_cache()
+            return
+        sig = (
+            id(world),
+            world.active_event_template,
+            tuple(sorted(self.layer_visibility.items())),
+            len(world.objects),
+        )
+        if not self._pick_aabb_dirty and self._pick_aabb_sig == sig and self._pick_aabb_lo is not None:
+            return
+
+        models = world.models
+        layer_vis = self.layer_visibility
+        vis_fn = world.object_visible_in_event_template
+        objs: list[WorldObject] = []
+        local_lo_list: list[np.ndarray] = []
+        local_hi_list: list[np.ndarray] = []
+        pos_list: list[tuple[float, float, float]] = []
+        rot_list: list[tuple[float, float, float]] = []
+        scl_list: list[tuple[float, float, float]] = []
+
+        for obj in world.objects:
+            if not vis_fn(obj):
+                continue
+            if not layer_vis.get(obj.category, True):
+                continue
+            model = models.get(obj.model_key)
+            if model is None:
+                continue
+            objs.append(obj)
+            local_lo_list.append(model.bbox_min)
+            local_hi_list.append(model.bbox_max)
+            pos_list.append(obj.position)
+            rot_list.append(obj.rotation_hpr)
+            scl_list.append(obj.scale)
+
+        if not objs:
+            self._pick_aabb_lo = np.empty((0, 3), dtype=np.float32)
+            self._pick_aabb_hi = np.empty((0, 3), dtype=np.float32)
+            self._pick_aabb_objs = []
+            self._pick_aabb_sig = sig
+            self._pick_aabb_dirty = False
+            return
+
+        local_lo = np.asarray(local_lo_list, dtype=np.float32)
+        local_hi = np.asarray(local_hi_list, dtype=np.float32)
+        pos = np.asarray(pos_list, dtype=np.float32)
+        rot_rad = np.deg2rad(np.asarray(rot_list, dtype=np.float32))
+        scl = np.asarray(scl_list, dtype=np.float32)
+
+        ch = np.cos(rot_rad[:, 0])
+        sh = np.sin(rot_rad[:, 0])
+        cp = np.cos(rot_rad[:, 1])
+        sp = np.sin(rot_rad[:, 1])
+        cr = np.cos(rot_rad[:, 2])
+        sr = np.sin(rot_rad[:, 2])
+
+        # Exact Ry(h) @ Rx(p) @ Rz(r) @ diag(sx, sy, sz) matching world_loader.compose_transform
+        sx, sy, sz = scl[:, 0], scl[:, 1], scl[:, 2]
+        m = np.empty((len(objs), 3, 3), dtype=np.float32)
+        m[:, 0, 0] = (ch * cr + sh * sp * sr) * sx
+        m[:, 0, 1] = (-ch * sr + sh * sp * cr) * sy
+        m[:, 0, 2] = (sh * cp) * sz
+        m[:, 1, 0] = (cp * sr) * sx
+        m[:, 1, 1] = (cp * cr) * sy
+        m[:, 1, 2] = (-sp) * sz
+        m[:, 2, 0] = (-sh * cr + ch * sp * sr) * sx
+        m[:, 2, 1] = (sh * sr + ch * sp * cr) * sy
+        m[:, 2, 2] = (ch * cp) * sz
+
+        # Arvo's exact world AABB of oriented box: center = M @ c + pos, extent = |M| @ e
+        local_c = 0.5 * (local_lo + local_hi)
+        local_e = 0.5 * (local_hi - local_lo)
+        world_c = np.einsum("nij,nj->ni", m, local_c) + pos
+        world_e = np.einsum("nij,nj->ni", np.abs(m), local_e)
+
+        self._pick_aabb_lo = (world_c - world_e).astype(np.float32, copy=False)
+        self._pick_aabb_hi = (world_c + world_e).astype(np.float32, copy=False)
+        self._pick_aabb_objs = objs
+        self._pick_aabb_sig = sig
+        self._pick_aabb_dirty = False
+
     def _pick_object_with_t(self, ray_o: np.ndarray, ray_d: np.ndarray) -> tuple[WorldObject | None, float]:
         with get_profiler().zone("viewport.pick_cpu", "pick"):
             if self.world is None:
                 return None, 1e9
-            inv_d = np.where(np.abs(ray_d) > 1e-8, 1.0 / ray_d, 1e12).astype(np.float32)
-            candidates: list[tuple[float, WorldObject]] = []
-            for obj in self.world.objects:
-                if not self.world.object_visible_in_event_template(obj):
-                    continue
-                if not self.layer_visibility.get(obj.category, True):
-                    continue
-                model = self.world.models.get(obj.model_key)
-                if not model:
-                    continue
-                lo, hi = obj.world_aabb(model)
-                hit_t = ray_aabb_hit(ray_o, inv_d, lo, hi)
-                if hit_t is not None:
-                    candidates.append((hit_t, obj))
-            candidates.sort(key=lambda item: item[0])
+            self._ensure_pick_aabb_cache()
+            lo = self._pick_aabb_lo
+            hi = self._pick_aabb_hi
+            objs = self._pick_aabb_objs
+            if lo is None or hi is None or not objs:
+                return None, 1e9
+
+            ray_o32 = np.asarray(ray_o, dtype=np.float32)
+            ray_d32 = np.asarray(ray_d, dtype=np.float32)
+            safe_d = np.where(np.abs(ray_d32) > 1e-8, ray_d32, 1.0)
+            inv_d = np.where(np.abs(ray_d32) > 1e-8, 1.0 / safe_d, 1e12).astype(np.float32)
+
+            # Single vectorized slab intersection across all visible world objects
+            t1 = (lo - ray_o32) * inv_d
+            t2 = (hi - ray_o32) * inv_d
+            tmin = np.max(np.minimum(t1, t2), axis=1)
+            tmax = np.min(np.maximum(t1, t2), axis=1)
+            hit_mask = tmax >= np.maximum(0.0, tmin)
+            hit_indices = np.flatnonzero(hit_mask)
+            if hit_indices.size == 0:
+                return None, 1e9
+
+            hit_t_vals = np.maximum(0.0, tmin[hit_indices])
+            order = np.argsort(hit_t_vals, kind="mergesort")
 
             best_obj: WorldObject | None = None
             best_t = 1e9
-            for aabb_t, obj in candidates:
+            models = self.world.models
+            ray_o_h = np.array([ray_o32[0], ray_o32[1], ray_o32[2], 1.0], dtype=np.float32)
+            for idx_pos in order:
+                aabb_t = float(hit_t_vals[idx_pos])
                 if aabb_t > best_t:
                     break
-                model = self.world.models[obj.model_key]
+                obj = objs[int(hit_indices[idx_pos])]
+                model = models.get(obj.model_key)
+                if model is None:
+                    continue
                 m4 = obj.world_matrix()
                 inv_m = np.linalg.inv(m4)
-                local_o = (inv_m @ np.array([*ray_o, 1.0], dtype=np.float32))[:3]
-                local_d = (inv_m[:3, :3] @ ray_d)
+                local_o = (inv_m @ ray_o_h)[:3]
+                local_d = inv_m[:3, :3] @ ray_d32
                 dlen = float(np.linalg.norm(local_d))
                 if dlen < 1e-6:
                     continue
