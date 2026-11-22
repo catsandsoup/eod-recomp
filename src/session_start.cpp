@@ -591,8 +591,8 @@ bool session_parse(const char *text, SessionRequest &out, std::string &err) {
     if (r.humans > 1 && r.ai >= 0) { err = "humans > 1 takes no ai= (head-to-head races have no AI roster choice)"; return false; }
     if (r.laps >= 0 && (r.humans > 1 || r.mode != "action")) { err = "laps= requires single-player Action"; return false; }
     if (r.mode == "career") {
-        if (!r.track.empty() || !r.event.empty() || !r.car.empty() || r.ai >= 0)
-            { err = "career takes place= and eve=, not track/event/car/ai"; return false; }
+        if (!r.track.empty() || !r.event.empty() || r.ai >= 0)
+            { err = "career takes place= and eve= (and optional car=), not track/event/ai"; return false; }
         if (r.place.empty()) r.place = "home";
         if (lower(r.place) != "here" && career_place_index(r.place) < 0) {
             err = "unknown place '" + r.place + "' (here, home, malt, next_eve, dealer, paintshop, gate1, gate2, petes)";
@@ -699,8 +699,53 @@ extern "C" void f_002A1298(void) {
 // the Arcade menu for the main menu, where the lobby reopens.
 bool head_to_head_menu();  // below: answers the head-to-head join screen
 
+namespace {
+uint32_t find_vehicle_record(uint32_t veh_number, uint32_t *out_table_idx = nullptr) {
+    const uint32_t table = ee_r32(kVehicleTable), count = ee_r32(kVehicleCount);
+    if (!table || !count || count > 4096) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t v = table + i * kVehicleStride;
+        if (ee_r32(v + 4) == veh_number) {
+            if (out_table_idx) *out_table_idx = ee_r32(v);
+            return v;
+        }
+    }
+    return 0;
+}
+
+// 0x0012A0B8 searches kDriverTable (0x003CBEE0) to set human_slot[0].vehicle_index (0x00439708+0x4C).
+// Vehicles without a kDriverTable entry (Trailer..Trailer5, BuyCar*, custom cars) miss 0x0012A0B8 and
+// fall back to index 0. Explicitly bind human_slot[0].vehicle_index from kVehicleTable.
+uint32_t apply_human_vehicle_override(uint32_t veh_number) {
+    uint32_t table_idx = 0;
+    const uint32_t v = find_vehicle_record(veh_number, &table_idx);
+    if (v) {
+        ee_w32(0x00439708 + 0x4C, table_idx);
+    }
+    return v;
+}
+
+// Exiting Event 1 in a multi-event Eve leaves the global fader (0x003CDAA8) in state 3 (HELD BLACK).
+// Entering RaceDayDo (0x0011F640) in Action mode calls RaceModeSwitch(0x1200, 0) (0x00175648), where
+// bit 0x1000 skips f_00176630 fade-in, causing 0x0036E568 to draw a solid black quad over the 3D
+// track behind Event 2 of 5 (tuevent_mp.lyt). Clear the held black fader on inter-event menus.
+void clear_held_black_fader_for_menu() {
+    if (ee_r32(0x003CDAB4) >= 2) {
+        ee_w32(0x003CDAB4, 0);
+        ee_w8(0x003CDABC, 0xFF);
+        const uint32_t world = ee_r32(0x00495C48);
+        if (world && !(world & 3) && world <= EE_RAM_SIZE - 0x1968) {
+            ee_w32(world + 0x1964, 0);
+        }
+    }
+}
+}  // namespace
+
 extern "C" void f_00270C10(void) {
     const uint32_t caller = g_ee.r[31].uw[0];
+    if (ee_r32(0x004A1AD8) == 0x0036E568 || (caller >= 0x00376000 && caller < 0x0037B000)) {
+        clear_held_black_fader_for_menu();
+    }
     // FastBoot (default ON): bypass artificial 1-second pre-load transition cards
     // (f_002C18B8 / 0x2C1A0C, 0x2C2018, f_002C2058 / 0x2C2178, f_002C2420 / 0x2C26F4)
     // and the 4-second boot memory card notice (f_002C6068 / 0x2C6118).
@@ -778,6 +823,7 @@ extern "C" void f_002A75E0(void) {
     if (P.armed && !P.car_done) {
         P.car_done = true;
         ee_w32(arg_u32(0), P.car);
+        apply_human_vehicle_override(P.car);
         log("car select answered: vehicle %u", P.car);
         ret_s32(1);
         return;
@@ -908,6 +954,18 @@ extern "C" void f_00120650(void) {
     const uint32_t session = g_ee.r[4].uw[0];
     int laps = -1;
     uint32_t selected_contest = 0;
+    if (P.event_done) {
+        clear_held_black_fader_for_menu();
+    }
+    long override_car = -1;
+    if (P.armed && P.req.humans <= 1) {
+        override_car = (long)P.car;
+    } else if (P.career && !P.req.car.empty()) {
+        override_car = find_car(P.req.car, P.req.paint);
+    }
+    if (override_car >= 0) {
+        apply_human_vehicle_override((uint32_t)override_car);
+    }
     if (P.armed && !P.event_done && P.players_done) {
         P.event_done = true;
         const uint32_t tracker = ee_r32(kTrackerPtr);
@@ -981,6 +1039,25 @@ extern "C" void f_00120650(void) {
         }
     }
     f_00120650_orig();
+    if (override_car >= 0) {
+        const uint32_t v = apply_human_vehicle_override((uint32_t)override_car);
+        if (v && session && !(session & 3) && session <= EE_RAM_SIZE - 0x9A8) {
+            const uint32_t pcount = ee_r32(session + 0x98C);
+            for (uint32_t i = 0; i < pcount && i < battle_layout::kCapacity; ++i) {
+                const uint32_t rec = session + 0x2C + i * 0x78;
+                if (ee_r32(rec) == 0x50 && (ee_r8(rec + 0x70) & 3) == 0) {
+                    if (ee_r32(rec + 0x6C) != (uint32_t)override_car) {
+                        ee_w32(rec + 0x6C, (uint32_t)override_car);
+                        ee_w32(rec + 0x74, ee_r32(v + 0x48));
+                        for (uint32_t k = 0; k < 32; ++k) ee_w8(rec + 0x44 + k, ee_r8(v + 8 + k));
+                        if (P.career) ee_w8(rec + 0x70, ee_r8(rec + 0x70) & ~4u);
+                        log("human slot 0 vehicle record bound to %u", (uint32_t)override_car);
+                    }
+                    break;
+                }
+            }
+        }
+    }
     if (laps < 0 || ee_r32(session + kSessionContest) != selected_contest) return;
     if (!(ee_r32(session + kSessionEventType) & kLapRaceFlag)) {
         log("laps= ignored for contest %u (no lap race)", selected_contest);
