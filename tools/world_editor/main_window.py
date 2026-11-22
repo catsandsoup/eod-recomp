@@ -85,12 +85,24 @@ from project_state import (
     load_png_rgba,
     package_world_mod,
     plan_clamp_sky_walls_to_assets,
+    rebuild_procedural_entry,
     save_autosave_snapshot,
     save_project_overlay,
     scan_import_texture_folder,
     snapshot_world_for_bake,
 )
 from properties_panel import PropertiesPanel
+from road_builder import (
+    BuiltRoad,
+    RoadControlPoint,
+    RoadPlan,
+    build_road_mesh,
+    make_banked_oval_plan,
+    make_bridge_plan,
+    make_figure8_plan,
+    make_jump_ramp_plan,
+)
+from road_collision import open_eod_junction
 from theme import (
     BORDER,
     ElidedLabel,
@@ -488,6 +500,13 @@ class EodWorldEditorWindow(QMainWindow):
         m_roads.addAction(svg_icon("road"), "Toggle Road Tool (ILIN)", lambda: self.select_tool("road"))
         m_roads.addAction("End Current Road Chain", self.viewport.end_current_road_chain)
         m_roads.addAction("Show / Hide Racing Lines (ILIN)", lambda: self.act_v_roads.trigger())
+        m_roads.addSeparator()
+        m_roads.addAction(svg_icon("road", "#4ade80"), "Build 3D Banked Oval Here", lambda: self.build_procedural_road_preset("oval"))
+        m_roads.addAction(svg_icon("road", "#60a5fa"), "Build 3D Figure-8 Track Here", lambda: self.build_procedural_road_preset("figure8"))
+        m_roads.addAction(svg_icon("road", "#fbbf24"), "Build 3D Jump Ramp Here", lambda: self.build_procedural_road_preset("ramp"))
+        m_roads.addAction(svg_icon("road", "#a78bfa"), "Build 3D Highway Bridge Here", lambda: self.build_procedural_road_preset("bridge"))
+        m_roads.addAction(svg_icon("road", "#38bdf8"), "Extrude 3D Road from Active ILIN Spline", self.extrude_road_from_active_ilin)
+        m_roads.addAction(svg_icon("road", "#34d399"), "Build Organic Terrain Island Here", self.build_procedural_island)
 
         # 10. Terrain
         m_terr = mb.addMenu("&Terrain")
@@ -2464,6 +2483,242 @@ class EodWorldEditorWindow(QMainWindow):
     def make_collision_for_selected(self) -> None:
         if self.viewport.selected_obj is not None:
             self.make_collision_for_object(self.viewport.selected_obj)
+
+    def _camera_ground_target(self, dist: float = 30.0) -> tuple[float, float, float]:
+        assert self.world is not None
+        fwd, _, _ = self.viewport.camera_vectors()
+        p = self.viewport.cam_pos + fwd * float(dist)
+        tx, tz = float(p[0]), float(p[2])
+        ty = float(self.world.collision.ground_height(tx, tz))
+        return (tx, ty, tz)
+
+    def _pick_procedural_textures(self) -> tuple[str, str, str, str, str]:
+        """Resolve authentic track textures for procedural roads/islands with safe retail defaults."""
+        defaults = ("rd-1.tex", "af_rdwr.tex", "wall01.tex", "conc01.tex", "W_dirt.tex")
+        if self.world is None or not self.world.textures:
+            return defaults
+        by_low = {name.lower(): name for name in self.world.textures}
+
+        def _pick(preferred: str, tokens: tuple[str, ...]) -> str:
+            if preferred.lower() in by_low:
+                return by_low[preferred.lower()]
+            for tok in tokens:
+                for low, orig in by_low.items():
+                    if tok in low:
+                        return orig
+            return preferred
+
+        return (
+            _pick("rd-1.tex", ("rd-", "road", "asph", "tar", "pave")),
+            _pick("af_rdwr.tex", ("rdwr", "wear", "skid", "track")),
+            _pick("wall01.tex", ("wall", "barr", "guard", "conc")),
+            _pick("conc01.tex", ("conc", "brdg", "bridge", "wall")),
+            _pick("W_dirt.tex", ("dirt", "grass", "terr", "mud", "ground")),
+        )
+
+    @staticmethod
+    def _wall_box_to_custom_box(box: dict[str, Any]) -> dict[str, Any]:
+        """Attach world AABB (min/max) to an OBB wall box so viewport wireframe and SOBL baker both consume it."""
+        c = np.asarray(box["centre"], dtype=np.float64)
+        r = np.asarray(box["radii"], dtype=np.float64)
+        ax = np.asarray(box["axes"], dtype=np.float64)
+        half_ext = np.abs(ax[0]) * r[0] + np.abs(ax[1]) * r[1] + np.abs(ax[2]) * r[2]
+        out = dict(box)
+        out["min"] = [float(v) for v in (c - half_ext)]
+        out["max"] = [float(v) for v in (c + half_ext)]
+        return out
+
+    def _commit_built_road(self, built: BuiltRoad) -> WorldObject | None:
+        if self.world is None:
+            return None
+        wm = built.model
+        self.world.models[wm.key] = wm
+        self.world.procedural_roads.append(built.plan.to_dict())
+
+        opened = open_eod_junction(
+            self.world.collision.sobl_records,
+            self.world.collision.sobl_edits,
+            built.junction_mouths,
+        )
+        if opened:
+            self.world.collision.rebuild_sobl_lines()
+
+        for box in built.wall_boxes:
+            self.world.collision.custom_boxes.append(self._wall_box_to_custom_box(box))
+
+        obj_id = f"ed_{self._placed_counter:04d}"
+        self._placed_counter += 1
+        pivot = tuple(float(v) for v in wm.pivot)
+        obj = WorldObject(
+            obj_id=obj_id,
+            name=wm.name,
+            model_key=wm.key,
+            source="Placed by the editor",
+            category=wm.category,
+            subtype=wm.subtype,
+            section_mlist="editor_layer",
+            model_store=wm.model_store,
+            hash_hex=wm.hash_hex,
+            tri_count=wm.tri_count,
+            textures=list(wm.textures),
+            position=pivot,
+            rotation_hpr=(0.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
+            written=False,
+        )
+        self.viewport.ensure_gl_textures()
+        self.undo_stack.push(PlaceObjectCommand(self.world, obj, self._refresh_after_edit))
+        self.viewport.select_object(obj)
+        self.set_action_status(
+            f"Built 3D road '{wm.name}' ({wm.tri_count} tris, {len(built.wall_boxes)} barrier boxes, {len(opened)} junctions opened)"
+        )
+        return obj
+
+    def build_procedural_road_preset(self, kind: str) -> WorldObject | None:
+        """Build a procedural 3D road preset (oval, figure8, ramp, bridge) grounded at the camera target."""
+        if self.world is None:
+            return None
+        tx, ty, tz = self._camera_ground_target(30.0)
+        seq = len(self.world.procedural_roads) + 1
+        k = kind.lower().strip()
+        if k == "oval":
+            plan = make_banked_oval_plan(center=(tx, ty, tz))
+            plan.name = f"banked_oval_{seq:02d}"
+        elif k == "figure8":
+            plan = make_figure8_plan(center=(tx, ty, tz))
+            plan.name = f"figure8_{seq:02d}"
+        elif k == "ramp":
+            plan = make_jump_ramp_plan(start=(tx, ty, tz))
+            plan.name = f"jump_ramp_{seq:02d}"
+        elif k == "bridge":
+            end_x, end_z = tx, tz + 160.0
+            end_y = float(self.world.collision.ground_height(end_x, end_z))
+            plan = make_bridge_plan(start=(tx, ty, tz), end=(end_x, end_y, end_z))
+            plan.name = f"highway_bridge_{seq:02d}"
+        else:
+            raise ValueError(f"Unknown procedural road preset: {kind!r}")
+
+        surf_t, wear_t, barr_t, deck_t, _dirt_t = self._pick_procedural_textures()
+        plan.surface_tex = surf_t
+        plan.wear_tex = wear_t
+        plan.barrier_tex = barr_t
+        plan.deck_tex = deck_t
+        built = build_road_mesh(plan, ground_fn=self.world.collision.ground_height)
+        return self._commit_built_road(built)
+
+    def extrude_road_from_active_ilin(self) -> WorldObject | None:
+        """Extrude a full 3D road mesh from the active ILIN racing-line spline."""
+        if self.world is None or not self.world.road_graph.nodes:
+            return None
+        g = self.world.road_graph
+        out_adj: dict[int, list[int]] = {}
+        for e in g.edges:
+            if e.a in g.nodes and e.b in g.nodes and e.a != e.b:
+                out_adj.setdefault(e.a, []).append(e.b)
+
+        start_id = min(g.nodes.keys())
+        order: list[int] = []
+        visited: set[int] = set()
+        cur: int | None = start_id
+        closed = False
+        while cur is not None and cur not in visited:
+            order.append(cur)
+            visited.add(cur)
+            nxts = out_adj.get(cur, [])
+            nxt = next((nid for nid in nxts if nid not in visited), None)
+            if nxt is None and len(order) >= 3 and start_id in nxts:
+                closed = True
+            cur = nxt
+
+        if len(order) < 2:
+            order = sorted(g.nodes.keys())
+            closed = False
+
+        pts: list[RoadControlPoint] = []
+        for nid in order:
+            nd = g.nodes[nid]
+            y = float(nd.y)
+            if abs(y) < 1e-4:
+                y = float(self.world.collision.ground_height(float(nd.x), float(nd.z)))
+            pts.append(
+                RoadControlPoint(
+                    x=float(nd.x),
+                    y=y,
+                    z=float(nd.z),
+                    width=max(8.0, float(nd.width or 14.0)),
+                )
+            )
+        if len(pts) < 2:
+            return None
+
+        seq = len(self.world.procedural_roads) + 1
+        surf_t, wear_t, barr_t, deck_t, _dirt_t = self._pick_procedural_textures()
+        line_slug = re.sub(r"[^A-Za-z0-9_]+", "_", Path(g.line_name).stem).strip("_") or "ilin"
+        plan = RoadPlan(
+            name=f"{line_slug}_road_{seq:02d}",
+            points=pts,
+            closed=closed,
+            surface_tex=surf_t,
+            wear_tex=wear_t,
+            barrier_tex=barr_t,
+            deck_tex=deck_t,
+            style="ilin_extrude",
+        )
+        built = build_road_mesh(plan, ground_fn=self.world.collision.ground_height)
+        return self._commit_built_road(built)
+
+    def build_procedural_island(self) -> WorldObject | None:
+        """Build an organic 3D terrain dome island grounded at the camera target."""
+        if self.world is None:
+            return None
+        tx, ty, tz = self._camera_ground_target(40.0)
+        seq = len(self.world.procedural_roads) + 1
+        name = f"terrain_island_{seq:02d}"
+        _surf_t, _wear_t, _barr_t, _deck_t, dirt_t = self._pick_procedural_textures()
+        entry = {
+            "kind": "island",
+            "name": name,
+            "model_key": f"island:{name}",
+            "center_xz": [tx, tz],
+            "ground_y": ty,
+            "radius_x": 36.0,
+            "radius_z": 28.0,
+            "height": 6.0,
+            "rings": 8,
+            "sectors": 24,
+            "seed": seq,
+            "tex": dirt_t,
+        }
+        wm, _ = rebuild_procedural_entry(self.world, entry)
+        if wm is None:
+            return None
+        self.world.procedural_roads.append(entry)
+
+        obj_id = f"ed_{self._placed_counter:04d}"
+        self._placed_counter += 1
+        pivot = tuple(float(v) for v in wm.pivot)
+        obj = WorldObject(
+            obj_id=obj_id,
+            name=wm.name,
+            model_key=wm.key,
+            source="Placed by the editor",
+            category=wm.category,
+            subtype=wm.subtype,
+            section_mlist="editor_layer",
+            model_store=wm.model_store,
+            hash_hex=wm.hash_hex,
+            tri_count=wm.tri_count,
+            textures=list(wm.textures),
+            position=pivot,
+            rotation_hpr=(0.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
+            written=False,
+        )
+        self.viewport.ensure_gl_textures()
+        self.undo_stack.push(PlaceObjectCommand(self.world, obj, self._refresh_after_edit))
+        self.viewport.select_object(obj)
+        self.set_action_status(f"Built organic terrain island '{wm.name}' ({wm.tri_count} tris)")
+        return obj
 
     def edit_object_in_blender(self, obj: WorldObject) -> None:
         if self.world is None:

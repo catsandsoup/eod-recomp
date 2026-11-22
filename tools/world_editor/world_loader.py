@@ -1212,6 +1212,7 @@ class TrackWorld:
     all_walls_noclip: bool = False
     compound_groups: dict[str, list[str]] = field(default_factory=dict)
     user_groups: dict[str, list[str]] = field(default_factory=dict)
+    procedural_roads: list[dict[str, Any]] = field(default_factory=list)
     _next_user_group_seq: int = 1
     car_catalog_loaded: bool = False
     car_count: int = 0

@@ -26,17 +26,22 @@ from PySide6.QtGui import QUndoCommand, QUndoStack
 from world_loader import (
     CustomRaceConfig,
     EnvironmentState,
+    MeshPart,
     RoadEdge,
     RoadGraph,
     RoadNode,
     TrackWorld,
     WorldMarker,
+    WorldModel,
     WorldObject,
     compose_transform,
     load_track_world,
     parse_bppt,
     query_bppt_plane,
 )
+import road_builder
+import road_collision
+import road_spline
 import modding_backend as mb
 import mod_package
 import rst0
@@ -1550,6 +1555,7 @@ def build_project_overlay_dict(
         "added_objects": added_objects,
         "deleted_object_ids": deleted_ids,
         "custom_collision_boxes": list(world.collision.custom_boxes),
+        "procedural_roads": list(world.procedural_roads),
         "roads": roads_doc,
         "markers": markers_doc,
     }
@@ -1661,10 +1667,80 @@ def save_project_overlay(
     return atomic_write_json(out_path, doc, tmp_suffix=".tmp", compact=False)
 
 
+def rebuild_procedural_entry(
+    world: TrackWorld,
+    entry: dict[str, Any],
+) -> tuple[WorldModel | None, road_builder.BuiltRoad | None]:
+    """Rebuild a procedural road or organic island WorldModel from its serialized dict."""
+    if not isinstance(entry, dict):
+        return None, None
+    ground_fn = world.collision.ground_height if world.collision is not None else None
+    if entry.get("kind") == "island":
+        name = str(entry.get("name", "island"))
+        center_xz = entry.get("center_xz", [0.0, 0.0])
+        ground_y = float(entry.get("ground_y", 0.0))
+        part = road_builder.build_organic_island(
+            center_xz=(float(center_xz[0]), float(center_xz[1])),
+            radius_x=float(entry.get("radius_x", 36.0)),
+            radius_z=float(entry.get("radius_z", 28.0)),
+            height=float(entry.get("height", 6.0)),
+            rings=int(entry.get("rings", 8)),
+            sectors=int(entry.get("sectors", 24)),
+            seed=int(entry.get("seed", 1)),
+            tex=str(entry.get("tex", "W_dirt.tex")),
+        )
+        verts = part.vertices.copy()
+        verts[:, 1] += np.float32(ground_y)
+        pivot = verts[:, 0:3].mean(axis=0).astype(np.float32)
+        verts[:, 0:3] -= pivot
+        local_part = MeshPart(texture=part.texture, vertices=verts, indices=part.indices, tri_count=part.tri_count)
+        bbox_min = verts[:, 0:3].min(axis=0).astype(np.float32)
+        bbox_max = verts[:, 0:3].max(axis=0).astype(np.float32)
+        hash_hex = hashlib.sha256(json.dumps(entry, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        mkey = str(entry.get("model_key") or f"island:{name}")
+        wm = WorldModel(
+            key=mkey,
+            name=name,
+            category="Terrain",
+            model_store="procedural:island",
+            hash_hex=hash_hex,
+            parts=[local_part],
+            tri_count=local_part.tri_count,
+            textures=[local_part.texture],
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            pivot=pivot,
+            placed_by_map=True,
+            model_offset=None,
+            subtype="Procedural Island",
+        )
+        world.models[wm.key] = wm
+        return wm, None
+    if "points" in entry:
+        plan = road_spline.RoadPlan.from_dict(entry)
+        built = road_builder.build_road_mesh(plan, ground_fn=ground_fn)
+        world.models[built.model.key] = built.model
+        return built.model, built
+    return None, None
+
+
 def apply_project_overlay(world: TrackWorld, path: Path | str) -> dict[str, Any]:
     """Load and apply an .eodworld.json overlay onto an already loaded TrackWorld."""
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
     by_id = {o.obj_id: o for o in world.objects}
+
+    # Rebuild procedural road/island models BEFORE added_objects so model_key lookup succeeds!
+    proc_roads_doc = doc.get("procedural_roads", [])
+    world.procedural_roads = []
+    if isinstance(proc_roads_doc, list):
+        for entry in proc_roads_doc:
+            if not isinstance(entry, dict):
+                continue
+            world.procedural_roads.append(dict(entry))
+            try:
+                rebuild_procedural_entry(world, entry)
+            except Exception:
+                pass
 
     for del_id in doc.get("deleted_object_ids", []):
         if del_id in by_id:
@@ -2303,6 +2379,230 @@ def _build_standalone_modl_from_graf(
         ncy = 0.5 * (miny + maxy)
         ncz = 0.5 * (minz + maxz)
         rad = max(0.5, 0.5 * math.sqrt((maxx - minx) ** 2 + (maxy - miny) ** 2 + (maxz - minz) ** 2))
+
+    struct.pack_into("<f", buf, 0x18, float(rad))
+    struct.pack_into("<3f", buf, 0x1C, float(ncx), float(ncy), float(ncz))
+    struct.pack_into("<6f", buf, 0x28, minx, maxx, miny, maxy, minz, maxz)
+    return bytes(buf), tex_names
+
+
+def _qbase_u16(lo: float, hi: float) -> tuple[float, float, float]:
+    """Pick exact power-of-2 float row base, ulp, and offset so [lo, hi] maps onto [0..65534]."""
+    span = max(float(hi) - float(lo), 1e-4)
+    k = max(-20, int(math.ceil(math.log2(span / 65534.0))) + 23)
+    base = float(2.0 ** k)
+    ulp = float(2.0 ** (k - 23))
+    off = struct.unpack("<f", struct.pack("<f", float(lo) - base))[0]
+    return base, ulp, off
+
+
+def _fbits(val: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", float(val)))[0]
+
+
+def _encode_4sps_part_from_mesh(
+    part: MeshPart,
+    scale: tuple[float, float, float],
+    offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> tuple[bytes | None, list[tuple[float, float, float]]]:
+    """Encode a MeshPart ([px,py,pz,nx,ny,nz,u,v] + uint32 indices) into a native EOD 4SPS VIF part."""
+    if part.vertices.size == 0 or part.indices.size < 3:
+        return None, []
+    idx = np.asarray(part.indices, dtype=np.uint32).reshape(-1, 3)
+    if len(idx) == 0:
+        return None, []
+    sx, sy, sz = (float(scale[0]), float(scale[1]), float(scale[2]))
+    ox, oy, oz = (float(offset_xyz[0]), float(offset_xyz[1]), float(offset_xyz[2]))
+
+    verts_arr = np.asarray(part.vertices, dtype=np.float32)
+    pos_scaled = np.empty((len(verts_arr), 3), dtype=np.float64)
+    pos_scaled[:, 0] = (verts_arr[:, 0] - ox) * sx
+    pos_scaled[:, 1] = (verts_arr[:, 1] - oy) * sy
+    pos_scaled[:, 2] = (verts_arr[:, 2] - oz) * sz
+
+    nrm_arr = verts_arr[:, 3:6].astype(np.float64)
+    uv_arr = verts_arr[:, 6:8].astype(np.float64)
+
+    # Expand indexed triangles into 3-vertex ADC strips (2 ADC opens + 1 kick per triangle)
+    flat_idx = idx.reshape(-1)
+    tri_count = len(idx)
+    all_pts: list[tuple[float, float, float]] = [
+        (float(pos_scaled[vi, 0]), float(pos_scaled[vi, 1]), float(pos_scaled[vi, 2]))
+        for vi in np.unique(flat_idx)
+    ]
+
+    stream = bytearray()
+    batch_tris = 16  # 48 verts/batch -> VU1 addr 3 + 3*47 = 144 < 150 (skin base)
+    for b_idx, start_t in enumerate(range(0, tri_count, batch_tris)):
+        sub_idx = idx[start_t : start_t + batch_tris].reshape(-1)
+        n = len(sub_idx)  # multiple of 3, <= 48
+        bp = pos_scaled[sub_idx]
+        bn = nrm_arr[sub_idx]
+        buv = uv_arr[sub_idx]
+
+        p_bases = [_qbase_u16(float(bp[:, c].min()), float(bp[:, c].max())) for c in range(3)]
+        uv_bases = [_qbase_u16(float(buv[:, c].min()), float(buv[:, c].max())) for c in range(2)]
+
+        # 1. Batch vertex count @0
+        stream += struct.pack("<II", 0x6001C000, 0x8000 | n)
+        # 2. Positions @2 (V3-16 masked, stride 3)
+        stream += struct.pack("<I", 0x01000103)  # STCYCL cl=3 wl=1
+        stream += struct.pack("<I", 0x05000001)  # STMOD offset
+        stream += struct.pack("<II", 0x20000000, 0x40404040)  # STMASK w=row
+        stream += struct.pack(
+            "<I4I",
+            0x30000000,
+            _fbits(p_bases[0][0]),
+            _fbits(p_bases[1][0]),
+            _fbits(p_bases[2][0]),
+            _fbits(1.0),
+        )
+        pos_q = bytearray()
+        for k in range(n):
+            ux = max(0, min(0xFFFF, int(round((bp[k, 0] - p_bases[0][2] - p_bases[0][0]) / p_bases[0][1]))))
+            uy = max(0, min(0xFFFF, int(round((bp[k, 1] - p_bases[1][2] - p_bases[1][0]) / p_bases[1][1]))))
+            uz = max(0, min(0xFFFF, int(round((bp[k, 2] - p_bases[2][2] - p_bases[2][0]) / p_bases[2][1]))))
+            pos_q += struct.pack("<3H", ux, uy, uz)
+        while len(pos_q) % 4:
+            pos_q += b"\x00"
+        stream += struct.pack("<I", 0x79000000 | (n << 16) | 0xC002) + pos_q
+
+        # 3. Normals + ADC @1 (V4-8 unmasked)
+        stream += struct.pack("<I4I", 0x30000000, 0x47800000, 0x47800000, 0x47800000, 0x7F80)
+        nrm_b = bytearray()
+        for k in range(n):
+            adc_b = 0x80 if (k % 3) < 2 else 0x00
+            nx = max(0, min(255, int(round(bn[k, 0] * 127.0)) + 128))
+            ny = max(0, min(255, int(round(bn[k, 1] * 127.0)) + 128))
+            nz = max(0, min(255, int(round(bn[k, 2] * 127.0)) + 128))
+            nrm_b += bytes((nx, ny, nz, adc_b))
+        stream += struct.pack("<I", 0x6E000000 | (n << 16) | 0xC001) + nrm_b
+
+        # 4. Texcoords @3 (V2-16 masked)
+        stream += struct.pack("<II", 0x20000000, 0x50505050)  # STMASK z,w=row
+        stream += struct.pack(
+            "<I4I",
+            0x30000000,
+            _fbits(uv_bases[0][0]),
+            _fbits(uv_bases[1][0]),
+            _fbits(1.0),
+            0x8000,
+        )
+        uv_q = bytearray()
+        for k in range(n):
+            uu = max(0, min(0xFFFF, int(round((buv[k, 0] - uv_bases[0][2] - uv_bases[0][0]) / uv_bases[0][1]))))
+            uv = max(0, min(0xFFFF, int(round((buv[k, 1] - uv_bases[1][2] - uv_bases[1][0]) / uv_bases[1][1]))))
+            uv_q += struct.pack("<2H", uu, uv)
+        stream += struct.pack("<I", 0x75000000 | (n << 16) | 0xC003) + uv_q
+
+        # 5. Rigid bone weights @150 (V4-8 unmasked, STCYCL 1/1)
+        stream += struct.pack("<I4I", 0x30000000, 0, 0, 0x47000000, 0x47000000)
+        stream += struct.pack("<I", 0x01000101)  # STCYCL cl=1 wl=1
+        stream += struct.pack("<I", 0x6E000000 | (n << 16) | 0xC000 | 150) + (b"\x00\x00\xfe\x00" * n)
+
+        # 6. Per-batch UV + position offsets @198..199 & EOD VU1 MSCAL 0x5C / MSCNT
+        stream += struct.pack("<I", 0x05000000)  # STMOD normal
+        stream += struct.pack(
+            "<I4I4I",
+            0x6C020000 | 0xC000 | 198,
+            _fbits(uv_bases[0][2]),
+            _fbits(uv_bases[1][2]),
+            0,
+            _fbits(1.0),
+            _fbits(p_bases[0][2]),
+            _fbits(p_bases[1][2]),
+            _fbits(p_bases[2][2]),
+            0,
+        )
+        stream += struct.pack("<I", 0x1400005C if b_idx == 0 else 0x17000000)
+
+    while len(stream) % 16:
+        stream += b"\x00\x00\x00\x00"
+
+    qwc = len(stream) // 16
+    part_size = 0x38 + len(stream)
+    tex_bytes = (part.texture or "rd-1.tex").strip().encode("latin1", errors="ignore")[:15]
+    hdr = bytearray(0x38)
+    hdr[0:4] = b"4SPS"
+    struct.pack_into("<I", hdr, 0x04, part_size)
+    hdr[0x08 : 0x08 + len(tex_bytes)] = tex_bytes
+    struct.pack_into("<I", hdr, 0x18, 0)  # group=0 (layer 0 -> RenderQueueFlushLayers0to8)
+    struct.pack_into("<7I", hdr, 0x1C, 0, 0, 0, 0, 0, tri_count, qwc)
+    return bytes(hdr) + bytes(stream), all_pts
+
+
+def _build_modl_v9_from_mesh_parts(
+    parts: list[MeshPart],
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    recenter: bool = False,
+) -> tuple[bytes | None, list[str]]:
+    """Build a standalone `MODL v9` binary from `MeshPart` geometry with native EOD 4SPS VIF parts."""
+    valid_parts = [p for p in parts if p.vertices.size > 0 and p.indices.size >= 3]
+    if not valid_parts:
+        return None, []
+
+    if recenter:
+        all_raw = np.vstack([p.vertices[:, 0:3] for p in valid_parts])
+        c0 = all_raw.mean(axis=0)
+        offset_xyz = (float(c0[0]), float(c0[1]), float(c0[2]))
+    else:
+        offset_xyz = (0.0, 0.0, 0.0)
+
+    encoded_chunks: list[tuple[bytes, str]] = []
+    all_pts: list[tuple[float, float, float]] = []
+    for p in valid_parts:
+        chunk, pts = _encode_4sps_part_from_mesh(p, scale=scale, offset_xyz=offset_xyz)
+        if chunk is not None:
+            encoded_chunks.append((chunk, (p.texture or "").strip()))
+            all_pts.extend(pts)
+    if not encoded_chunks:
+        return None, []
+
+    n_parts = len(encoded_chunks)
+    n_slots = max(4, ((n_parts + 3) // 4) * 4)
+    part_tbl = 0x58
+    inst_tbl = part_tbl + 4 * n_slots
+    inst_key_off = inst_tbl + 0x10
+    inst_block_size = max(0x80, 0x10 + ((n_parts * 4 + 15) & ~15))
+    first_part_off = inst_tbl + inst_block_size
+
+    buf = bytearray(first_part_off)
+    struct.pack_into("<6I", buf, 0x00, n_parts, part_tbl, 0, inst_tbl, 1, inst_tbl)
+    buf[0x44:0x58] = b"\xe3" * (0x58 - 0x44)
+    for slot in range(n_slots):
+        struct.pack_into("<I", buf, part_tbl + 4 * slot, 0xE3E3E3E3)
+    struct.pack_into("<IIII", buf, inst_tbl, inst_key_off, 0xE3E3E3E3, 0xE3E3E3E3, 0xE3E3E3E3)
+
+    tex_names: list[str] = []
+    for idx, (part_chunk, tname) in enumerate(encoded_chunks):
+        rem = len(buf) % 16
+        if rem:
+            buf.extend(b"\xe3" * (16 - rem))
+        dst_off = len(buf)
+        struct.pack_into("<I", buf, part_tbl + 4 * idx, dst_off)
+        buf.extend(part_chunk)
+        if tname and tname.lower() not in ("-", ".tex") and tname not in tex_names:
+            tex_names.append(tname)
+
+    rem_end = len(buf) % 8
+    if rem_end:
+        buf.extend(b"\xe3" * (8 - rem_end))
+    struct.pack_into("<I", buf, 0x40, len(buf))
+
+    if all_pts:
+        xs = [pt[0] for pt in all_pts]
+        ys = [pt[1] for pt in all_pts]
+        zs = [pt[2] for pt in all_pts]
+        minx, maxx = float(min(xs)), float(max(xs))
+        miny, maxy = float(min(ys)), float(max(ys))
+        minz, maxz = float(min(zs)), float(max(zs))
+        ncx = 0.5 * (minx + maxx)
+        ncy = 0.5 * (miny + maxy)
+        ncz = 0.5 * (minz + maxz)
+        rad = max(math.dist(pt, (ncx, ncy, ncz)) for pt in all_pts) + 0.05
+    else:
+        minx = maxx = miny = maxy = minz = maxz = ncx = ncy = ncz = 0.0
+        rad = 1.0
 
     struct.pack_into("<f", buf, 0x18, float(rad))
     struct.pack_into("<3f", buf, 0x1C, float(ncx), float(ncy), float(ncz))
@@ -3147,6 +3447,27 @@ def _resolve_custom_mod_and_textures(
                             tdata, _ = mb.payload(ap, te["name"], aents, verify_crc=False)
                             extra_tex[tlow] = (te["name"], tdata)
                             break
+    elif wm.model_store.startswith("procedural:") or (
+        wm.parts and model_key.startswith(("road:", "island:", "procedural:"))
+    ):
+        mod_bytes, ref_tex_names = _build_modl_v9_from_mesh_parts(wm.parts, scale=scale)
+        scale_already_baked = True
+        if mod_bytes is not None:
+            trk_tex_low = {e["name"].lower() for e in world.entries if e.get("type") == "TEX"}
+            for tname in ref_tex_names:
+                tlow = tname.lower()
+                if tlow in trk_tex_low or tlow in extra_tex:
+                    continue
+                for arc_rel in ("DATA/RES/RACE.RES", "DATA/RES/COMMON.RES", "DATA/TRACKS/HOMEBASE.TRK"):
+                    ap = world.game_dir / arc_rel
+                    if not ap.is_file():
+                        continue
+                    aents = mb.directory(ap)
+                    te = next((e for e in aents if e["name"].lower() == tlow and e["type"] == "TEX"), None)
+                    if te is not None:
+                        tdata, _ = mb.payload(ap, te["name"], aents, verify_crc=False)
+                        extra_tex[tlow] = (te["name"], tdata)
+                        break
 
     if mod_bytes is None:
         return None, {}, (2.0, 1.5, 4.0)
@@ -3419,6 +3740,7 @@ def _compile_custom_objects_into_trk(
                 nl = obj.name.lower()
                 is_non_solid_decal = (
                     obj.category == "billboard"
+                    or obj.model_store.startswith("procedural:")
                     or any(tok in nl for tok in ("shadow", "-sh_", "_sh_", "bush", "rdwr", "foliage", "sween", "water"))
                 )
                 if ckey not in dyno_cache:
@@ -4383,6 +4705,7 @@ def export_mod_layer(
         and prev_state["retail_sha256"] == retail_sha_before
         and not custom_inject_objs
         and custom_boxes_count == 0
+        and not world.procedural_roads
         and not world.all_walls_noclip
         and not has_custom_spawns
         and not has_structural_ilin
@@ -4578,6 +4901,9 @@ def export_mod_layer(
             "host_textures": host_exported,
             "editor_placed_objects": 0,
             "custom_collision_boxes": len(world.collision.custom_boxes),
+            "eodcol_path": None,
+            "eodcol_tris": 0,
+            "minimap_preview": None,
             "warnings": place_warnings,
             "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -4686,6 +5012,24 @@ def export_mod_layer(
     # Convert Make Collision (`world.collision.custom_boxes`) into SOBL boxes so they actually bake into track.sol!
     custom_sobl_baked = 0
     for cbox in world.collision.custom_boxes:
+        if "centre" in cbox and "radii" in cbox and "axes" in cbox:
+            cx, cy, cz = (float(v) for v in cbox["centre"][:3])
+            rx, ry, rz = (max(0.1, abs(float(v))) for v in cbox["radii"][:3])
+            ax = tuple(tuple(float(v) for v in row[:3]) for row in cbox["axes"][:3])
+            surf = str(cbox.get("surface", "wall"))
+            auto_sobl_boxes.append(
+                {
+                    "centre": (cx, cy, cz),
+                    "half_extents": (rx, ry, rz),
+                    "radii": (rx, ry, rz),
+                    "rows": ax,
+                    "axes": ax,
+                    "surface_type": surf,
+                    "surface": surf,
+                }
+            )
+            custom_sobl_baked += 1
+            continue
         cmin = cbox.get("min")
         cmax = cbox.get("max")
         if not cmin or not cmax or len(cmin) < 3 or len(cmax) < 3:
@@ -4730,6 +5074,50 @@ def export_mod_layer(
             )
         except Exception as exc:
             place_warnings.append(f"Custom object .TRK compile warning: {exc}")
+
+    # Build 32-bit unified .eodcol collision mesh + top-down minimap preview whenever procedural roads or edited objects exist
+    eodcol_path: Path | None = None
+    eodcol_tris = 0
+    minimap_path: Path | None = None
+    if world.procedural_roads or retail_edits or all_edited_terrain_objs or custom_inject_objs:
+        try:
+            built_roads: list[road_builder.BuiltRoad] = []
+            road_model_keys: set[str] = set()
+            for entry in world.procedural_roads:
+                if isinstance(entry, dict) and "points" in entry:
+                    _wm, built = rebuild_procedural_entry(world, entry)
+                    if built is not None:
+                        built_roads.append(built)
+                        road_model_keys.add(built.model.key)
+            base_scol_tris = None
+            if world.collision.terrain is not None and getattr(world.collision.terrain, "tris", None):
+                base_scol_tris = np.array([t["verts"] for t in world.collision.terrain.tris], dtype=np.float32)
+            col_edited_objs: list[WorldObject] = list(all_edited_terrain_objs)
+            seen_col_ids = {o.obj_id for o in col_edited_objs}
+            for o in custom_inject_objs:
+                if o.obj_id not in seen_col_ids and o.model_key not in road_model_keys:
+                    col_edited_objs.append(o)
+                    seen_col_ids.add(o.obj_id)
+            col_mesh = road_collision.build_unified_collision_32bit(
+                built_roads,
+                col_edited_objs,
+                world.models,
+                base_scol_tris=base_scol_tris,
+            )
+            eodcol_path = out / "DATA" / "TRACKS" / f"{world.track_name.upper()}.eodcol"
+            eodcol_path.parent.mkdir(parents=True, exist_ok=True)
+            eodcol_path.write_bytes(road_collision.pack_eodcol(col_mesh))
+            eodcol_tris = int(len(col_mesh.triangles))
+
+            mm_rgba, _mm_bounds = road_collision.rasterize_minimap_rgba(
+                built_roads,
+                road_graphs=list(world.all_road_graphs.values()),
+                size=256,
+            )
+            minimap_path = out / "minimap_preview.png"
+            Image.frombytes("RGBA", (256, 256), mm_rgba).save(minimap_path)
+        except Exception as exc:
+            place_warnings.append(f"Unified .eodcol/minimap compile warning: {exc}")
 
     # Write env_override.ini (read by eod.exe modern renderer) + Vulkan HOSTTEX replacements
     env_ini_path = write_env_override_ini(world, out)
@@ -4891,6 +5279,9 @@ def export_mod_layer(
         ),
         "custom_collision_boxes": len(world.collision.custom_boxes),
         "custom_sobl_baked": custom_sobl_baked,
+        "eodcol_path": str(eodcol_path) if eodcol_path is not None else None,
+        "eodcol_tris": eodcol_tris,
+        "minimap_preview": str(minimap_path) if minimap_path is not None else None,
         "all_walls_noclip": bool(world.all_walls_noclip),
         "env_override_ini": str(env_ini_path),
         "warnings": place_warnings,
