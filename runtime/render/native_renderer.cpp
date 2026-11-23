@@ -1,6 +1,7 @@
 // native_renderer.cpp - GS-thread side of the native renderer (native_renderer.h): which GS draws
 // belong to native objects, the objects' GS state, and the plume renderer that draws them.
 #include "../core/r7_audit.h"
+#include "../core/frame_pacing.h"
 #include "core/diff_harness.h"
 #include "core/eod_tracy.h"
 #include "core/log.h"
@@ -45,6 +46,7 @@
 #include "plume_vulkan.h"
 #include "sun_cascades.h"
 #endif
+#include "world_visibility.h"
 
 namespace gs {
 extern bool g_skip_frame;  // gs_draw.cpp
@@ -52,6 +54,7 @@ extern uint32_t g_env_serial;
 }
 
 namespace native {
+extern std::atomic<uint64_t> g_track_gen;  // native_feed.cpp: increments on track.grf reload
 namespace {
 std::atomic<uint64_t> g_fge_draws{0};
 std::atomic<uint64_t> g_mip_clamped{0};   // EE TEX1.MXL above the levels the GS state decodes
@@ -185,6 +188,11 @@ struct GpuMesh {
     uint64_t index_offset = 0;
     uint64_t billboard_offset = 0;
     sun_cascades::Bounds sun_bounds;
+    float bmin[3] = {0.0f, 0.0f, 0.0f};
+    float bmax[3] = {0.0f, 0.0f, 0.0f};
+    bool has_bounds = false;
+    uint64_t world_track_gen = 0;
+    uint64_t world_chunk_key = 0;
 };
 
 struct Texture {
@@ -341,6 +349,29 @@ struct Renderer {
     std::unique_ptr<plume::RenderSampler> samplers[16];
     Texture white;
     std::unordered_map<uint32_t, std::shared_ptr<GpuMesh>> meshes;
+    struct WorldChunkVboKey {
+        uint64_t track_gen = 0;
+        uint64_t chunk_key = 0;
+        bool operator==(const WorldChunkVboKey &o) const {
+            return track_gen == o.track_gen && chunk_key == o.chunk_key;
+        }
+    };
+    struct WorldChunkVboKeyHash {
+        size_t operator()(const WorldChunkVboKey &k) const noexcept {
+            uint64_t h = (k.track_gen * 0x9E3779B97F4A7C15ull) ^ k.chunk_key;
+            h ^= h >> 30;
+            h *= 0xBF58476D1CE4E5B9ull;
+            return static_cast<size_t>(h ^ (h >> 27));
+        }
+    };
+    std::unordered_map<WorldChunkVboKey, std::shared_ptr<GpuMesh>, WorldChunkVboKeyHash> world_chunk_vbos;
+    uint64_t active_world_track_gen = 0;
+    uint64_t frustum_tested_total = 0, frustum_culled_total = 0;
+    uint64_t chunk_vbo_hits_total = 0, chunk_vbo_misses_total = 0;
+    frame_pacing::PoseInterpolator pose_interp;
+    std::unordered_map<uint64_t, uint32_t> entity_occ;
+    uint64_t entity_occ_frame = ~0ull;
+    std::chrono::steady_clock::time_point last_present_tp{};
     std::unordered_map<uint64_t, std::shared_ptr<Texture>> textures;  // by content
     std::unordered_map<uint64_t, Texture *> replacements;  // by package entry, material and alpha domain
     std::unordered_map<uint64_t, AddrEntry> by_addr;
@@ -1212,19 +1243,61 @@ GpuMesh *gpu_mesh(uint32_t id) {
         if (m.billboard_offset)
             std::memcpy(p + m.billboard_offset, billboards.data(), billboards.size() * sizeof(EffectBillboard));
         m.buf->unmap();
-        if (sun_cascades_enabled()) {
-            sun_cascades::Vec3 lo, hi;
-            for (size_t k = 0; k < 3; ++k) lo[k] = hi[k] = m.cpu->vertices.front().p[k];
-            for (const Vertex &v : m.cpu->vertices)
+        if (!m.cpu->vertices.empty()) {
+            for (size_t k = 0; k < 3; ++k) m.bmin[k] = m.bmax[k] = m.cpu->vertices.front().p[k];
+            for (const Vertex &v : m.cpu->vertices) {
                 for (size_t k = 0; k < 3; ++k) {
-                    lo[k] = std::min(lo[k], static_cast<double>(v.p[k]));
-                    hi[k] = std::max(hi[k], static_cast<double>(v.p[k]));
+                    if (v.p[k] < m.bmin[k]) m.bmin[k] = v.p[k];
+                    if (v.p[k] > m.bmax[k]) m.bmax[k] = v.p[k];
                 }
-            m.sun_bounds = {sun_cascades::scale(sun_cascades::add(lo, hi), 0.5),
-                            sun_cascades::scale(sun_cascades::sub(hi, lo), 0.5)};
+            }
+            m.has_bounds = true;
+            if (sun_cascades_enabled()) {
+                const sun_cascades::Vec3 lo{m.bmin[0], m.bmin[1], m.bmin[2]};
+                const sun_cascades::Vec3 hi{m.bmax[0], m.bmax[1], m.bmax[2]};
+                m.sun_bounds = {sun_cascades::scale(sun_cascades::add(lo, hi), 0.5),
+                                sun_cascades::scale(sun_cascades::sub(hi, lo), 0.5)};
+            }
         }
     }
     return &m;
+}
+
+void sync_world_chunk_vbo(uint32_t mesh_id, GpuMesh *mesh) {
+    if (!mesh || !mesh->buf || !mesh->cpu || mesh->cpu->transient) return;
+    const uint64_t tgen = std::max<uint64_t>(1ull, g_track_gen.load(std::memory_order_acquire));
+    if (g_r.active_world_track_gen != 0 && g_r.active_world_track_gen != tgen) {
+        for (auto &kv : g_r.world_chunk_vbos) {
+            if (kv.second) g_r.retired_meshes.emplace_back(g_r.vb, std::move(kv.second));
+        }
+        g_r.world_chunk_vbos.clear();
+        g_r.active_world_track_gen = tgen;
+    } else if (g_r.active_world_track_gen == 0) {
+        g_r.active_world_track_gen = tgen;
+    }
+    if (mesh->world_track_gen == tgen && mesh->world_chunk_key != 0) {
+        ++g_r.chunk_vbo_hits_total;
+        r7_audit::add(r7_audit::Counter::ChunkVboHits);
+        return;
+    }
+    const uint64_t chunk_key = (uint64_t(mesh->cpu->batch) << 32) ^
+                               (uint64_t(mesh->cpu->vertices.size()) << 16) ^
+                               uint64_t(mesh->cpu->indices.size());
+    const Renderer::WorldChunkVboKey key{tgen, chunk_key};
+    if (g_r.world_chunk_vbos.find(key) != g_r.world_chunk_vbos.end()) {
+        mesh->world_track_gen = tgen;
+        mesh->world_chunk_key = chunk_key;
+        ++g_r.chunk_vbo_hits_total;
+        r7_audit::add(r7_audit::Counter::ChunkVboHits);
+        return;
+    }
+    if (auto mit = g_r.meshes.find(mesh_id); mit != g_r.meshes.end()) {
+        mesh->world_track_gen = tgen;
+        mesh->world_chunk_key = chunk_key;
+        g_r.world_chunk_vbos.emplace(key, mit->second);
+        ++g_r.chunk_vbo_misses_total;
+        r7_audit::add(r7_audit::Counter::ChunkVboMisses);
+    }
 }
 
 std::unique_ptr<plume::VulkanTexture> make_wrapper(uint64_t image, uint32_t w, uint32_t h, bool depth) {
@@ -2419,8 +2492,68 @@ void flush() {
     PushConstants mpc;
     plume::RenderDescriptorSet *bound_scene_input = nullptr;
     const Item *last_scene_world = nullptr;
-    for (Item &it : g_r.pending) {
+    static const bool frustum_cull_on = [] {
+        const char *v = std::getenv("EOD_FRUSTUM_CULL");
+        return !v || v[0] != '0';
+    }();
+    std::vector<uint8_t> culled_flags;
+    if (frustum_cull_on && !g_r.pending.empty()) {
+        bool any_world = false;
+        for (const Item &cand : g_r.pending) {
+            if (cand.p.kind == KIND_WORLD && cand.mesh && cand.mesh->buf &&
+                cand.mesh->has_bounds && !cand.mesh->cpu->transient) {
+                any_world = true;
+                break;
+            }
+        }
+        if (any_world) {
+            EOD_TRACE_ZONE("plume_frustum_cull");
+            culled_flags.assign(g_r.pending.size(), 0u);
+            uint64_t tested = 0, culled = 0;
+            for (size_t idx = 0; idx < g_r.pending.size(); ++idx) {
+                const Item &cand = g_r.pending[idx];
+                if (cand.p.kind != KIND_WORLD || !cand.mesh || !cand.mesh->buf ||
+                    !cand.mesh->has_bounds || cand.mesh->cpu->transient)
+                    continue;
+                const double kx = (0.5 - cand.ox) * 2.0 / gw - 1.0;
+                const double ky = (0.5 - cand.oy) * 2.0 / gh - 1.0;
+                const double ws = cand.p.w_scale > 0 ? (double)cand.p.w_scale : 1.0;
+                float cx[4], cy[4], cz[4], cw[4];
+                for (int c = 0; c < 4; ++c) {
+                    cx[c] = (float)((cand.a[0][c] * 2.0 / gw + cand.a[3][c] * kx) * ws);
+                    cy[c] = (float)((cand.a[1][c] * 2.0 / gh + cand.a[3][c] * ky) * ws);
+                    cz[c] = (float)(cand.a[2][c] * cand.zscale * ws);
+                    cw[c] = (float)(cand.a[3][c] * ws);
+                }
+                const world_visibility::Frustum6 f =
+                    world_visibility::frustum6_from_clip_rows(cx, cy, cz, cw);
+                if (!f.valid) continue;
+                ++tested;
+                if (world_visibility::aabb_outside_frustum_simd(f, cand.mesh->bmin, cand.mesh->bmax)) {
+                    culled_flags[idx] = 1u;
+                    ++culled;
+                }
+            }
+            if (tested) {
+                g_r.frustum_tested_total += tested;
+                g_r.frustum_culled_total += culled;
+                r7_audit::add(r7_audit::Counter::FrustumTested, tested);
+                if (culled) r7_audit::add(r7_audit::Counter::FrustumCulled, culled);
+            }
+        }
+    }
+    for (size_t item_idx = 0; item_idx < g_r.pending.size(); ++item_idx) {
+        Item &it = g_r.pending[item_idx];
         FrameStats &fs = g_frames[it.p.frame];
+        if (!culled_flags.empty() && culled_flags[item_idx]) {
+            if (it.world_strip.texture) ++g_world_strip_recorded_by_view[it.sc[1]];
+            if (capture_sun) observe_sun_caster(it, tg, s);
+            if (!it.second) {
+                fs.drawn++;
+                fs.k_drawn[it.p.kind % KIND_COUNT]++;
+            }
+            continue;
+        }
         if (!it.mesh || !it.mesh->buf) {
             if (it.world_strip.texture) fatal("prepared world strip mesh changed before recording");
             if (it.second) continue;
@@ -3147,6 +3280,7 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
         fs.k_lost[kind]++;
         return;
     }
+    if (kind == KIND_WORLD && mesh && mesh->buf) sync_world_chunk_vbo(g_cur.mesh, mesh);
     if (kind == KIND_SHADOW) {
         // Flush any pending opaque world/queue draws so s.depth is populated before shadow volumes
         if (!g_r.pending.empty()) flush();
@@ -3210,7 +3344,29 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     it.p = g_cur;
     it.mesh = mesh;
     if (strip) it.world_strip = *strip;
-    screen_matrix(g_cur, it.a, kind == KIND_QUEUE && mesh && mesh->cpu->skinned);
+    const Packet *proj_pkt = &g_cur;
+    Packet interp_pkt;
+    if (frame_pacing::global_pacer().interpolation_enabled() &&
+        (kind == KIND_QUEUE || kind == KIND_WORLD || kind == KIND_WATER ||
+         kind == KIND_PARTICLE || kind == KIND_SPRITE)) {
+        interp_pkt = g_cur;
+        if (g_r.entity_occ_frame != g_cur.frame) {
+            g_r.entity_occ.clear();
+            g_r.entity_occ_frame = g_cur.frame;
+        }
+        g_r.pose_interp.submit_camera(g_cur.rotation, g_cur.position, g_cur.frame);
+        const float alpha = static_cast<float>(frame_pacing::global_pacer().alpha());
+        g_r.pose_interp.evaluate_camera(alpha, interp_pkt.rotation, interp_pkt.position);
+        if (kind == KIND_QUEUE && (!mesh || !mesh->cpu->skinned)) {
+            const uint64_t base_key = (uint64_t(g_cur.batch) << 32) | uint32_t(g_cur.texture_key);
+            const uint32_t occ = g_r.entity_occ[base_key]++;
+            const uint64_t entity_id = base_key ^ (uint64_t(occ) * 0x9E3779B97F4A7C15ull);
+            g_r.pose_interp.submit_entity_matrix3x4(entity_id, g_cur.model, g_cur.frame);
+            g_r.pose_interp.evaluate_entity_matrix3x4(entity_id, alpha, interp_pkt.model);
+        }
+        proj_pkt = &interp_pkt;
+    }
+    screen_matrix(*proj_pkt, it.a, kind == KIND_QUEUE && mesh && mesh->cpu->skinned);
     it.ox = float(surface.origin_x) / 16.0f;
     it.oy = float(surface.origin_y) / 16.0f;
     it.zscale = (float)(1.0 / depth_range(surface.depth_format));
@@ -4205,6 +4361,12 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
                         flush_shadows();
                         break;
                     }
+                if (it->second->world_track_gen && it->second->world_chunk_key) {
+                    const Renderer::WorldChunkVboKey wkey{it->second->world_track_gen, it->second->world_chunk_key};
+                    auto wit = g_r.world_chunk_vbos.find(wkey);
+                    if (wit != g_r.world_chunk_vbos.end() && wit->second.get() == it->second.get())
+                        g_r.world_chunk_vbos.erase(wit);
+                }
                 g_r.retired_meshes.emplace_back(g_r.vb, it->second);
                 g_r.meshes.erase(it);
             }
@@ -4626,6 +4788,18 @@ void r6_report() {
                      (unsigned long long)(g_r.texture_bytes >> 20), g_r.textures.size(),
                      (unsigned long long)g_r.tex_evictions);
     }
+    if (g_r.frustum_tested_total || g_r.chunk_vbo_hits_total || g_r.chunk_vbo_misses_total) {
+        std::fprintf(stderr,
+                     "[plume-4p2] frustum(%s) culled=%llu/%llu (%.1f%%), chunk_vbo hits=%llu misses=%llu (persistent=%zu, track_gen=%llu)\n",
+                     world_visibility::simd_backend_name(),
+                     (unsigned long long)g_r.frustum_culled_total,
+                     (unsigned long long)g_r.frustum_tested_total,
+                     g_r.frustum_tested_total ? 100.0 * g_r.frustum_culled_total / g_r.frustum_tested_total : 0.0,
+                     (unsigned long long)g_r.chunk_vbo_hits_total,
+                     (unsigned long long)g_r.chunk_vbo_misses_total,
+                     g_r.world_chunk_vbos.size(),
+                     (unsigned long long)g_r.active_world_track_gen);
+    }
     if (g_vfx_billboards || g_vfx_volume_draws[VFX_FIRE] || g_vfx_volume_draws[VFX_EXHAUST] || g_vfx_volume_draws[VFX_EMBER])
         std::fprintf(stderr, "[r6] volume VFX fire %llu smoke %llu exhaust %llu ember %llu, "
                      "GPU billboard projections %llu, peak/vblank %u, budget fallbacks %llu\n",
@@ -4705,6 +4879,23 @@ void gs_vblank(uint64_t frame) {
     if (g_active) finalize();
     g_active = false;
     flush();
+#ifdef EOD_PLUME
+    if (frame_pacing::global_pacer().interpolation_enabled()) {
+        EOD_TRACE_ZONE("plume_present_interpolated");
+        auto &pacer = frame_pacing::global_pacer();
+        const auto now = std::chrono::steady_clock::now();
+        double dt = pacer.present_dt() > 0.0 ? pacer.present_dt() : frame_pacing::FramePacer::kSimDt;
+        if (g_r.last_present_tp.time_since_epoch().count()) {
+            dt = std::chrono::duration<double>(now - g_r.last_present_tp).count();
+        }
+        g_r.last_present_tp = now;
+        pacer.advance(dt);
+        while (pacer.consume_sim_step()) {}
+        pacer.note_present();
+        g_r.pose_interp.begin_sim_tick(frame);
+        r7_audit::add(r7_audit::Counter::InterpPresents);
+    }
+#endif
     end_vblank(frame);
     report(frame);
 #ifdef EOD_PLUME

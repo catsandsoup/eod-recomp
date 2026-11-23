@@ -7,6 +7,7 @@
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
 #include "core/r7_audit.h"
+#include "core/frame_pacing.h"
 #include "core/eod_tracy.h"
 #include "core/diff_harness.h"
 #include "core/host_file.h"
@@ -457,6 +458,14 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[native] Plume is required but was not compiled into this build\n");
         return 2;
 #endif
+    }
+    frame_pacing::global_pacer().configure_from_env();
+    if (frame_pacing::global_pacer().interpolation_enabled()) {
+        const double hz = frame_pacing::global_pacer().target_fps();
+        if (hz > 0.0)
+            std::fprintf(stderr, "[pacing] decoupled presentation active: sim=60Hz target=%.0fHz\n", hz);
+        else
+            std::fprintf(stderr, "[pacing] decoupled presentation active: sim=60Hz target=uncapped\n");
     }
     log_init(log_spec);
 #ifndef _WIN32

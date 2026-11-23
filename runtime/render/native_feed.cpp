@@ -25,17 +25,21 @@
 #include "../core/limit_tracker.h"
 #include "../core/log.h"
 #include "../core/memory.h"
+#include "../core/r7_audit.h"
 #include "../hw/offload.h"
 #include "../gs/gs_mem.h"
 #include "scene_tap.h"
 #include "sun_cascades.h"
 #include "vif_mesh.h"
+#include "world_visibility.h"
 #include "vu.h"
 
 extern uint64_t kernel_vblank_count();
 extern uint32_t g_vif1_dma_tag;  // runtime/hw/hw.cpp: DMA tag VIF1 is reading
 
 namespace native {
+
+std::atomic<uint64_t> g_track_gen{0};
 
 bool enabled() {
     static const bool on = [] {
@@ -280,6 +284,11 @@ struct CacheEntry {
     uint64_t hash = 0;
     uint64_t checked = ~0ull;  // vblank the hash was last compared
     uint32_t id = 0;
+    uint64_t world_track_gen = 0;
+    uint32_t world_qwc = 0;
+    float bmin[3] = {0.0f, 0.0f, 0.0f};
+    float bmax[3] = {0.0f, 0.0f, 0.0f};
+    bool has_bounds = false;
     // camera-facing parts and skinned batches keep their decoded geometry on the EE side and get a
     // transient mesh per draw
     std::vector<Vertex> base;
@@ -292,6 +301,27 @@ struct CacheEntry {
     std::vector<Mesh::KRun> k_runs;
 };
 std::unordered_map<uint32_t, CacheEntry> g_cache;
+
+uint64_t update_track_gen() {
+    const uint32_t graf = ee_r32(0x003D1C18);  // 0x214678: loaded track.grf data
+    const uint32_t mlist = MEM_LW(0x4D6F10);   // kMlist
+    uint64_t sig = (uint64_t(graf) << 32) ^ uint64_t(mlist);
+    if (graf >= 8 && graf <= EE_RAM_SIZE - 16 && !(graf & 3)) {
+        sig ^= (uint64_t(ee_r32(graf - 8)) << 17) ^ uint64_t(ee_r32(graf)) ^
+               (uint64_t(ee_r32(graf + 4)) << 29);
+    }
+    static uint64_t last_sig = 0;
+    if (sig && sig != last_sig) {
+        last_sig = sig;
+        const uint64_t next = g_track_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+        for (auto it = g_cache.begin(); it != g_cache.end();) {
+            it = (it->second.world_track_gen != 0 && it->second.world_track_gen != next)
+                     ? g_cache.erase(it)
+                     : std::next(it);
+        }
+    }
+    return g_track_gen.load(std::memory_order_acquire);
+}
 
 void copy_k(Mesh *m, const CacheEntry &c) {
     m->k_delta = c.k_delta;
@@ -426,8 +456,14 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     CacheEntry &c = g_cache[batch];
     if (entry) *entry = &c;
     if (c.checked == vb && c.id) return c.id;
+    const uint64_t tgen = world ? g_track_gen.load(std::memory_order_acquire) : 0;
     const uint32_t qwc = MEM_LW(batch + 0x34);
     if (qwc == 0 || qwc > 0x10000) return 0;
+    if (world && tgen != 0 && c.world_track_gen == tgen && c.id && c.world_qwc == qwc &&
+        c.facing.empty() && c.skin.empty()) {
+        c.checked = vb;
+        return c.id;
+    }
     const uint32_t bytes = 0x38 + qwc * 16;
     g_bytes.resize(bytes);
     ee_read_block(batch, g_bytes.data(), bytes);
@@ -528,6 +564,25 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     c.k_delta = m->k_delta;
     c.k_kick = m->k_kick;
     c.k_mixed = m->k_mixed;
+    if (!m->vertices.empty()) {
+        for (int k = 0; k < 3; ++k) c.bmin[k] = c.bmax[k] = m->vertices.front().p[k];
+        for (const Vertex &v : m->vertices) {
+            for (int k = 0; k < 3; ++k) {
+                if (v.p[k] < c.bmin[k]) c.bmin[k] = v.p[k];
+                if (v.p[k] > c.bmax[k]) c.bmax[k] = v.p[k];
+            }
+        }
+        c.has_bounds = true;
+    } else {
+        c.has_bounds = false;
+    }
+    if (world && tgen != 0 && c.facing.empty() && c.skin.empty()) {
+        c.world_track_gen = tgen;
+        c.world_qwc = qwc;
+    } else {
+        c.world_track_gen = 0;
+        c.world_qwc = 0;
+    }
     {
         // the runs must tile the index list (one part, batches in order)
         uint32_t next = 0;
@@ -949,6 +1004,7 @@ ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc) {
 void ee_world_pass(int32_t pass, uint32_t) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
+    update_track_gen();
     g_world_pass = pass;
     g_leaves.clear();
     g_wc.passes++;
