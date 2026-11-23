@@ -3248,6 +3248,25 @@ void q_check(const gs::Env &e, const gs::Vertex &v) {
     }
 }
 
+// Synthesize the GS draw environment directly from live VIF1 DIRECT GS registers + EE-captured
+// PRIM/TEX1 state when VU1 execution is bypassed for a Plume-owned object.
+const gs::Env &synthesize_direct_env(const Packet &p, const EeState &rs, uint64_t &xy_out) {
+    // 0x3620A8 (RenderStateCommit): PRIM = (flags & 0x100 ? 2 : 4) | 0x18 (IIP|TME) | FGE | ABE.
+    const uint32_t attr = ((p.flags & 0x100u) ? 2u : 4u) | 0x18u |
+                          ((p.flags & 0x8u) << 2) | ((p.flags & 0x1u) << 6);
+    if (rs.k_known) {
+        const uint64_t tex1 = 0x120ull | (uint64_t(rs.mxl & 7u) << 2) |
+                              (uint64_t(rs.k & 0xFFFu) << 32);
+        if (gs::st.ctx[0].tex1 != tex1) {
+            gs::st.ctx[0].tex1 = tex1;
+            gs::g_reg_gen++;
+        }
+    }
+    gs::st.prim = attr;
+    xy_out = gs::st.ctx[0].xyoffset;
+    return gs::world_strip_env(attr);
+}
+
 // The current object is complete: queue it with the GS state it had.
 void finalize(const PreparedWorldStrip *strip = nullptr) {
     if (!g_active || g_finalized) return;
@@ -3269,8 +3288,6 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
         fs.k_lost[kind]++;
         return;
     }
-    const gs::Env &e = g_have_env ? g_env : gs::current_env();
-    const uint64_t xy = g_have_env ? g_xyoffset : context_xyoffset();
     const auto ready = g_queue_material ? g_queue_material->readiness : nullptr;
     const auto pinned = ready ? g_queue_resources.find(ready) : g_queue_resources.end();
     GpuMesh *mesh = strip ? strip->mesh : pinned != g_queue_resources.end() ? pinned->second.mesh.get() :
@@ -3314,6 +3331,12 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     static const bool state_hooked = (diff_add_exit_report(state_report), true);
     (void)state_hooked;
     const EeState rs = ee_state(g_cur, mesh ? mesh->cpu.get() : nullptr);
+    if (!g_have_env) {
+        g_env = synthesize_direct_env(g_cur, rs, g_xyoffset);
+        g_have_env = true;
+    }
+    const gs::Env &e = g_env;
+    const uint64_t xy = g_xyoffset;
     if (mesh && mesh->cpu->k_mixed && !mesh->cpu->k_runs.empty() && !g_gs_k.empty()) {
         std::vector<int32_t> rk;
         int32_t k = rs.k;
@@ -4107,6 +4130,14 @@ bool prepare() {
 #endif
 }
 
+bool plume_ready() {
+#ifdef EOD_PLUME
+    return g_r.ok.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
 bool gs_shadow_boundary(ShadowPass pass) {
 #ifdef EOD_PLUME
     if (!prepare() || (modern::g_on && modern::live())) return false;
@@ -4316,6 +4347,7 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
         break;
     }
     case CMD_OFF:
+    case CMD_DIRECT_FINALIZE:
         finalize();
         g_active = false;
         break;

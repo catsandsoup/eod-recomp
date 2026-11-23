@@ -28,6 +28,9 @@
 #include "../core/r7_audit.h"
 #include "../hw/offload.h"
 #include "../gs/gs_mem.h"
+#include "../gs/modern_scene.h"
+#include "../vu/scene_capture.h"
+#include "../vu/scene_emit.h"
 #include "scene_tap.h"
 #include "sun_cascades.h"
 #include "vif_mesh.h"
@@ -2528,9 +2531,42 @@ void check_queue_dent_input(uint32_t top, size_t launch_word, bool continuation)
     g_dent_checks.nonpositive_k += int16_t(k) <= 0;
 }
 
+bool vu1_bypass_enabled() {
+#ifdef EOD_PLUME
+    static const bool env_on = [] {
+        const char *v = std::getenv("EOD_R7_VU1_BYPASS");
+        return !v || !*v || v[0] != '0' || v[1] != '\0';
+    }();
+    static const bool diag_off = [] {
+        const char *const vars[] = {
+            "EOD_VU_INTERP", "EOD_VU_CHECK", "EOD_VU_REC", "EOD_VU_DUMP", "EOD_VU_STATS",
+            "EOD_GS_DUMP", "EOD_GS_DUMP_COLD_START", "EOD_GS_CENSUS", "EOD_GS_TRACE",
+            "EOD_NATIVE_CHECK", "EOD_VERTEX_CHECK", "EOD_NATIVE_SKIN_CHECK",
+            "EOD_NATIVE_QCHECK", "EOD_NATIVE_PASSES", "EOD_VIF_CHECK",
+            "EOD_NATIVE_WORLD_RETIRE_CHECK", "EOD_NATIVE_WORLD_CLIPPED_CHECK",
+            "EOD_NATIVE_QUEUE_DENT_CHECK", "EOD_NATIVE_WORLD_TEXTURE_CHECK",
+            "EOD_NATIVE_WORLD_INDICES_CHECK", "EOD_NATIVE_WORLD_SURFACE_CHECK",
+            "EOD_R5A2_OFF", "EOD_GS_SKIPALL", "EOD_MODERN",
+        };
+        for (const char *name : vars) {
+            const char *v = std::getenv(name);
+            if (v && *v && (v[0] != '0' || v[1] != '\0')) return true;
+        }
+        return false;
+    }();
+    return env_on && !diag_off && enabled() && plume_ready() && !diff_in_original_side() &&
+           !scene_capture::g_on && !scene_emit::capture_requested() && !scene_emit::observing_vu() &&
+           !(modern::g_on && modern::live()) && !g_log_enabled[LOG_VU];
+#else
+    return false;
+#endif
+}
+
 bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
-               bool &clipped_world_continuation) {
+               bool &clipped_world_continuation, bool *bypass_vu1) {
+    if (bypass_vu1) *bypass_vu1 = false;
     if (!enabled()) return false;
+    static bool g_obj_bypassed = false;
     if (program != 0x0D48) g_queue_candidate = {};
     const uint32_t tag = g_vif1_dma_tag;
     std::vector<Mesh *> meshes;
@@ -2579,15 +2615,19 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
     }
     if (!found) {
         if (g_obj_active) {
-            post(CMD_OFF, nullptr, 0);
+            if (!g_obj_bypassed) post(CMD_OFF, nullptr, 0);
             g_obj_active = false;
+            g_obj_bypassed = false;
             g_sent_key = ~0ull;
         }
         return false;
     }
     for (Mesh *m : meshes) post(CMD_MESH, &m, sizeof m);
     const uint64_t key = p.frame << 32 | p.serial;
-    if (g_obj_active && key == g_sent_key) return false;  // another program of the same record
+    if (g_obj_active && key == g_sent_key) {
+        if (g_obj_bypassed && bypass_vu1) *bypass_vu1 = true;
+        return false;  // another program/continuation of the same record
+    }
     if (skin_check() && p.kind == KIND_QUEUE) vu_check(key, program);
     if (p.kind == KIND_QUEUE) p.itop = itop;  // world, water, shadow, flare carry the ITOP their EE packet sets
     p.program = program;
@@ -2598,12 +2638,24 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
              offsetof(WorldTextureIndices, data) + world_texture_index_bytes(world_indices->levels));
         sent_index_version = world_indices->version;
     }
+    const bool do_bypass = bypass_vu1 != nullptr && vu1_bypass_enabled() &&
+                           p.mesh != 0 && p.kind < KIND_COUNT;
     post(CMD_OBJ, &p, sizeof p);
     if (indexed_queue) {
         auto *owned = indexed_queue.release();
         post(CMD_QUEUE_MATERIAL, &owned, sizeof owned);
     }
+    if (do_bypass) {
+        post(CMD_DIRECT_FINALIZE, nullptr, 0);
+        g_obj_active = true;
+        g_obj_bypassed = true;
+        g_sent_key = key;
+        clipped_world_continuation = false;
+        *bypass_vu1 = true;
+        return false;
+    }
     g_obj_active = true;
+    g_obj_bypassed = false;
     g_sent_key = key;
     if (retire_world_leaf) world_lod = p.world_lod;
     return retire_world_leaf;

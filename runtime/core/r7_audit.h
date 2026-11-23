@@ -11,7 +11,8 @@ namespace r7_audit {
 enum class Counter {
     Vu1, GifQwords, GsRaster, GsSuppressed, SyncVram, DeferredWait, ClutWait,
     Vu0Mlist, Vu0Micro, Vu0Macro, Vu0Control,
-    FrustumTested, FrustumCulled, ChunkVboHits, ChunkVboMisses, InterpPresents, Count
+    FrustumTested, FrustumCulled, ChunkVboHits, ChunkVboMisses, InterpPresents,
+    Vu1Bypassed, Count
 };
 
 inline std::atomic<uint64_t> counts[static_cast<unsigned>(Counter::Count)]{};
@@ -44,8 +45,8 @@ inline void report() {
                  get(Counter::ClutWait), get(Counter::Vu0Mlist), get(Counter::Vu0Micro),
                  get(Counter::Vu0Macro), get(Counter::Vu0Control));
     std::fprintf(stderr,
-                 "[r7_audit] vu1_exec=%llu gs_rast=%llu frustum_culled=%llu/%llu chunk_vbo_hits=%llu\n",
-                 get(Counter::Vu1), get(Counter::GsRaster),
+                 "[r7_audit] vu1_exec=%llu vu1_bypassed=%llu gs_rast=%llu frustum_culled=%llu/%llu chunk_vbo_hits=%llu\n",
+                 get(Counter::Vu1), get(Counter::Vu1Bypassed), get(Counter::GsRaster),
                  get(Counter::FrustumCulled), get(Counter::FrustumTested),
                  get(Counter::ChunkVboHits));
 }

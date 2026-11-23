@@ -13,6 +13,7 @@
 
 #include "../core/log.h"
 #include "../core/diff_harness.h"
+#include "../core/r7_audit.h"
 #include "ee.h"
 #include "../gs/gs.h"
 #include "../kernel/kernel.h"
@@ -105,7 +106,14 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
         g_vif1_itop = v.itop;
         native::WorldTextureLod world_lod{};
         bool clipped_world_continuation = false;
-        const bool retire_world_leaf = native::vu1_start(addr, v.itop, world_lod, clipped_world_continuation);
+        bool bypass_vu1 = false;
+        const bool retire_world_leaf = native::vu1_start(
+            addr, v.itop, world_lod, clipped_world_continuation,
+            g_vu1_start_hook ? nullptr : &bypass_vu1);
+        if (bypass_vu1) {
+            r7_audit::add(r7_audit::Counter::Vu1Bypassed);
+            return;
+        }
 #ifdef EOD_PLUME
         // The verified E-bit NOP pair is shared by ordinary MSCAL producers.
         static const char *nop_setting = std::getenv("EOD_NATIVE_CAMERA_NOP");

@@ -46,6 +46,8 @@ bool look_modern();
 bool sun_cascades_enabled();  // opt-in for the validated ordered scene path
 // Prepare native pipelines after GS device creation and before the guest starts.
 bool prepare();
+bool plume_ready();
+bool vu1_bypass_enabled();
 const editor_environment::Override *environment_override();
 void ee_environment_world(bool drawing);
 
@@ -222,7 +224,7 @@ bool queue_dent_check_enabled();
 void check_queue_dent_input(uint32_t top, size_t launch_word, bool continuation);
 
 bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
-               bool &clipped_world_continuation);
+               bool &clipped_world_continuation, bool *bypass_vu1 = nullptr);
 
 // ---- GS command stream ----------------------------------------------------------------------
 // One queue record as the GS receives it.
@@ -365,7 +367,8 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
 
 enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4,
                   CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7,
-                  CMD_WORLD_STRIP_CHECK = 8, CMD_QUEUE_MATERIAL = 9, CMD_QUEUE_STRIP = 10 };
+                  CMD_WORLD_STRIP_CHECK = 8, CMD_QUEUE_MATERIAL = 9, CMD_QUEUE_STRIP = 10,
+                  CMD_DIRECT_FINALIZE = 11 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),
