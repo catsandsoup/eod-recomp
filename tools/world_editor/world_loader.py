@@ -1025,6 +1025,8 @@ class CollisionData:
     bppt_slots: dict[int, dict[str, Any]] = field(default_factory=dict)
     bppt_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
     scol_base_line_verts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+    eodcol_mesh: Any = None
+    eodcol_path: Path | None = None
     _scol_raw: bytes | None = field(default=None, repr=False)
     _terrain: wc.Terrain | None = field(default=None, init=False, repr=False)
 
@@ -2682,6 +2684,88 @@ def _load_track_cache(
         return None
 
 
+def _load_track_dict(trk_p: Path, gdir: Path, trk_rel: str) -> dict[str, Any]:
+    """Load a retail disc-relative or external imported 0TSR v6 .TRK into world_export's track_dict contract."""
+    try:
+        rel_check = trk_p.relative_to(gdir)
+        if str(trk_p).startswith(str(gdir / "DATA")) and ".." not in rel_check.parts:
+            return we.load_track(gdir, trk_rel)
+    except ValueError:
+        pass
+    raw = trk_p.read_bytes()
+    entries = mb.directory(trk_p)
+    graf = [e for e in entries if e["type"] == "GRAF"]
+    if len(graf) != 1:
+        raise ValueError(f"Expected exactly one GRAF member in {trk_p.name}")
+    gentry = graf[0]
+    dir_off = struct.unpack_from("<I", raw, 20)[0]
+    index = entries.index(gentry)
+    version = struct.unpack_from("<I", raw, dir_off + index * 68 + 36)[0]
+    if version != wg.GRAF_VERSION:
+        raise ValueError(f"bad graf version {version} (native loader requires {wg.GRAF_VERSION})")
+    data, _ = payload(trk_p, gentry["name"], entries, verify_crc=False)
+    return dict(
+        disc=gdir,
+        rel=trk_rel,
+        path=trk_p,
+        raw=raw,
+        entries=entries,
+        graf_entry=gentry,
+        graf_index=index,
+        graf=data,
+        dir_offset=dir_off,
+    )
+
+
+def _load_battle_respawn_markers(
+    trk_p: Path,
+    entries: list[dict[str, Any]],
+    collision: CollisionData,
+) -> list[WorldMarker]:
+    """Extract [respawn] spawn grid markers from c_battle.va0 if present."""
+    hit = next((e for e in entries if e["name"].lower() == "c_battle.va0" and e["type"] == "VALT"), None)
+    if hit is None:
+        return []
+    out: list[WorldMarker] = []
+    try:
+        raw, _ = payload(trk_p, hit["name"], entries, verify_crc=False)
+        tv = parse_binary_valt(raw)
+        secs = {s["name"].lower(): dict(s.get("pairs", [])) for s in tv.get("sections", [])}
+        resp = secs.get("respawn")
+        if not resp:
+            return []
+        for idx, (k, ref_sec) in enumerate(resp.items()):
+            if not k.startswith("@"):
+                continue
+            target = secs.get(str(ref_sec).lower())
+            if not target or "pt" not in target:
+                continue
+            pt_parts = [float(v.strip()) for v in str(target["pt"]).split(",")[:2]]
+            if len(pt_parts) < 2:
+                continue
+            rx, rz = pt_parts[0], pt_parts[1]
+            hdg = 0.0
+            if "dir" in target:
+                dp = [float(v.strip()) for v in str(target["dir"]).split(",")[:2]]
+                if len(dp) >= 2:
+                    hdg = math.degrees(math.atan2(dp[0], dp[1]))
+            ry = collision.ground_height(rx, rz) + 0.25
+            out.append(
+                WorldMarker(
+                    marker_id=f"m_battle_respawn_{idx}",
+                    name=f"Battle Spawn {k[1:].upper()}",
+                    kind="Spawn",
+                    position=(rx, ry, rz),
+                    heading_deg=hdg,
+                    source="Retail",
+                    note="c_battle.va0",
+                )
+            )
+    except Exception:
+        return []
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main Track World Loader
 # ---------------------------------------------------------------------------
@@ -2695,10 +2779,10 @@ def load_track_world(
     progress: Any = None,
     use_cache: bool = True,
 ) -> TrackWorld:
-    """Load an EOD retail .TRK archive into an interactive TrackWorld (with Turbo Binary Cache)."""
+    """Load an EOD retail or imported .TRK archive into an interactive TrackWorld (with Turbo Binary Cache)."""
     t_start_ns = time.perf_counter_ns()
     trk_p = Path(trk_path).resolve()
-    gdir = Path(game_dir).resolve() if game_dir else trk_p.parents[2]
+    gdir = Path(game_dir).resolve() if game_dir else default_game_dir()
     try:
         trk_rel = trk_p.relative_to(gdir).as_posix()
     except ValueError:
@@ -2722,15 +2806,24 @@ def load_track_world(
         except Exception:
             pass
 
-    track_dict = we.load_track(gdir, trk_rel)
+    track_dict = _load_track_dict(trk_p, gdir, trk_rel)
     graf_data = track_dict["graf"]
     graf = wg.parse_graf(graf_data)
     graf_summary = wg.summarize(graf)
     graf_member = track_dict["graf_entry"]["name"]
     entries = track_dict["entries"]
 
-    # 1. Load collision (SCOL + SOBL)
+    # 1. Load collision (SCOL + SOBL + optional sibling 32-bit .eodcol)
     collision = _load_collision(track_dict["raw"], entries)
+    eodcol_cand = trk_p.with_suffix(".eodcol")
+    if eodcol_cand.is_file():
+        try:
+            import road_collision as rc_mod
+
+            collision.eodcol_mesh = rc_mod.unpack_eodcol(eodcol_cand.read_bytes())
+            collision.eodcol_path = eodcol_cand
+        except Exception:
+            pass
 
     # 2. Decode GRAF leaves into deduplicated WorldModels + placed WorldObjects
     models: dict[str, WorldModel] = {}
@@ -2984,8 +3077,9 @@ def load_track_world(
     # 5. Decode textures
     textures = _load_textures(track_dict, all_tex_names)
 
-    # 6. Load ILIN racing lines
+    # 6. Load ILIN racing lines + c_battle.va0 [respawn] spawn markers
     road_graph, all_road_graphs = _load_road_graphs(trk_p, entries, collision)
+    markers.extend(_load_battle_respawn_markers(trk_p, entries, collision))
 
     # Add Start / Finish Grid slots along ILIN centerline (4 staggered grid markers)
     if road_graph.nodes:
@@ -3085,3 +3179,7 @@ def load_track_world(
     if progress is not None:
         progress(100, f"Loaded {world.display_name} ({world.load_ms:.1f} ms)")
     return world
+
+
+load_world = load_track_world
+

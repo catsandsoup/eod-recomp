@@ -367,6 +367,11 @@ class EodWorldEditorWindow(QMainWindow):
         m_file.addSeparator()
         self.act_new = m_file.addAction(svg_icon("new_world"), "New World Project...", self.new_project, QKeySequence.StandardKey.New)
         self.act_open = m_file.addAction(svg_icon("open_world"), "Open Project...", self.open_project_dialog, QKeySequence.StandardKey.Open)
+        self.act_import_nascar_track = m_file.addAction(
+            svg_icon("open_world", "#f59e0b"),
+            "Import NASCAR Track from ISO...",
+            self.open_import_nascar_track_dialog,
+        )
         self.act_save = m_file.addAction(svg_icon("save"), "Save Project", self.save_project, QKeySequence.StandardKey.Save)
         m_file.addAction("Save Project As...", self.save_project_as)
         m_file.addSeparator()
@@ -3422,3 +3427,149 @@ class EodWorldEditorWindow(QMainWindow):
             f"<p>Non-destructively edits retail 0TSR .TRK / .CAR archives (GRAF v18, 4SPS VIF meshes, "
             f"37 retail Cars &amp; Wrecks, Vulkan HOSTTEX PNG swaps, SCOL/SOBL barriers, and ILIN racing lines).</p>",
         )
+
+    def open_import_nascar_track_dialog(self, default_iso: Path | str | None = None) -> None:
+        """Open the NASCAR: Dirt to Daytona Track Importer dialog and load the imported track."""
+        from PySide6.QtWidgets import (
+            QCheckBox,
+            QComboBox,
+            QDialog,
+            QHBoxLayout,
+            QHeaderView,
+            QLineEdit,
+            QPushButton,
+            QTableWidget,
+            QTableWidgetItem,
+            QVBoxLayout,
+        )
+        import nascar_track_importer as nti
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import NASCAR Track from ISO")
+        dlg.resize(760, 520)
+        lay = QVBoxLayout(dlg)
+
+        iso_row = QHBoxLayout()
+        iso_edit = QLineEdit()
+        cand_iso = Path(default_iso) if default_iso else (Path.home() / "Downloads" / "NASCAR - Dirt to Daytona (USA).iso")
+        if cand_iso.exists():
+            iso_edit.setText(str(cand_iso))
+        iso_edit.setPlaceholderText("Select NASCAR: Dirt to Daytona .iso or extracted disc folder...")
+        btn_browse = QPushButton("Browse ISO...")
+        btn_scan = QPushButton("Scan 32 Tracks")
+        iso_row.addWidget(QLabel("D2D ISO:"))
+        iso_row.addWidget(iso_edit, 1)
+        iso_row.addWidget(btn_browse)
+        iso_row.addWidget(btn_scan)
+        lay.addLayout(iso_row)
+
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["Track", "Key", "Class", "Size", "Night Sky"])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(table, 1)
+
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("Lighting:"))
+        cmb_light = QComboBox()
+        cmb_light.addItems(["Day", "Night"])
+        chk_mod = QCheckBox("Export .eodmod v2 package")
+        chk_mod.setChecked(True)
+        lbl_tracy = QLabel("Tracy: ready")
+        lbl_tracy.setStyleSheet("color: #94a3b8;")
+        opt_row.addWidget(cmb_light)
+        opt_row.addWidget(chk_mod)
+        opt_row.addStretch(1)
+        opt_row.addWidget(lbl_tracy)
+        lay.addLayout(opt_row)
+
+        btn_row = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        btn_import = QPushButton("Import && Open in World Studio")
+        btn_import.setEnabled(False)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_import)
+        lay.addLayout(btn_row)
+
+        tracks_state: list[nti.NascarTrackInfo] = []
+
+        def _populate() -> None:
+            iso_p = Path(iso_edit.text().strip())
+            if not iso_p.exists():
+                return
+            timings: dict[str, float] = {}
+            try:
+                tracks_state[:] = nti.scan_nascar_tracks(iso_p, timings=timings)
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Scan Failed", str(exc))
+                return
+            table.setRowCount(len(tracks_state))
+            for r, info in enumerate(tracks_state):
+                full_name = f"{info.display_name} {info.longname}".strip()
+                table.setItem(r, 0, QTableWidgetItem(full_name))
+                table.setItem(r, 1, QTableWidgetItem(info.track_key))
+                table.setItem(r, 2, QTableWidgetItem(info.surface_class))
+                table.setItem(r, 3, QTableWidgetItem(f"{info.archive_size / (1024 * 1024):.2f} MB"))
+                table.setItem(r, 4, QTableWidgetItem("Yes (Night)" if info.has_night_sky else "Day only"))
+            if tracks_state:
+                table.selectRow(0)
+                btn_import.setEnabled(True)
+            lbl_tracy.setText(f"Tracy scan_iso: {timings.get('scan_iso', 0.0):.1f} ms ({len(tracks_state)} tracks)")
+
+        def _on_sel() -> None:
+            row = table.currentRow()
+            if 0 <= row < len(tracks_state):
+                info = tracks_state[row]
+                cmb_light.setEnabled(info.has_night_sky)
+                if not info.has_night_sky:
+                    cmb_light.setCurrentText("Day")
+
+        def _browse() -> None:
+            p, _ = QFileDialog.getOpenFileName(dlg, "Select NASCAR: Dirt to Daytona ISO", str(Path.home() / "Downloads"), "ISO Images (*.iso);;All Files (*)")
+            if p:
+                iso_edit.setText(p)
+                _populate()
+
+        imported_res: list[nti.ImportTrackResult] = []
+
+        def _do_import() -> None:
+            row = table.currentRow()
+            if not (0 <= row < len(tracks_state)):
+                return
+            info = tracks_state[row]
+            mode = "night" if (info.has_night_sky and cmb_light.currentText().lower() == "night") else "day"
+            out_dir = editor_appdata_dir() / "imported_tracks" / f"{info.track_key}_{mode}"
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                res = nti.import_nascar_track(
+                    Path(iso_edit.text().strip()),
+                    self.game_dir / "DATA",
+                    info.track_key,
+                    out_dir,
+                    lighting_mode=mode,
+                    export_eodmod=chk_mod.isChecked(),
+                )
+                imported_res.append(res)
+                t_sum = ", ".join(f"{k}={v:.0f}ms" for k, v in res.timings_ms.items())
+                lbl_tracy.setText(f"Tracy total: {res.total_ms:.1f} ms ({t_sum})")
+                self.append_log(f"[NASCAR Track Import] {res.display_name} ({mode}) -> {res.trk_path} in {res.total_ms:.1f} ms ({t_sum})")
+                dlg.accept()
+            except Exception as exc:
+                QMessageBox.critical(dlg, "Import Failed", str(exc))
+            finally:
+                QApplication.restoreOverrideCursor()
+
+        btn_browse.clicked.connect(_browse)
+        btn_scan.clicked.connect(_populate)
+        table.itemSelectionChanged.connect(_on_sel)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_import.clicked.connect(_do_import)
+
+        if iso_edit.text().strip():
+            _populate()
+        if dlg.exec() == QDialog.DialogCode.Accepted and imported_res:
+            self.load_track(imported_res[0].trk_path, include_cars=False)
+
