@@ -58,13 +58,17 @@ void ee_object(uint32_t batch);       // after scene_tap::object, before EmitBat
 void ee_object_end();                 // after EmitBatch
 // packet manager reserve (src/render_trace.cpp wrappers): addr, qwc, return address
 // 0x361098's aligned clear inputs, in the EE's whole-pixel XY coordinates.
-enum class SceneClearTarget : uint32_t { ColorAndDepth, Depth, Bootstrap };
+enum class SceneClearTarget : uint32_t { ColorAndDepth, Depth, Bootstrap, RectColorDepth, RectDepth };
 struct SceneClear {
     int32_t left, top, right, bottom;
     uint32_t rgba, zbuf;
     SceneClearTarget target;
 };
 constexpr uint32_t kSceneClearDirectQwc = 45;
+inline bool is_rect_clear(SceneClearTarget target) {
+    return target == SceneClearTarget::RectColorDepth || target == SceneClearTarget::RectDepth;
+}
+inline uint32_t scene_clear_qwc(SceneClearTarget target) { return is_rect_clear(target) ? 6u : kSceneClearDirectQwc; }
 bool scene_clear_enabled();
 void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneClear *clear = nullptr);
 bool take_scene_clear(uint32_t dma_tag, uint32_t qwc, SceneClear &clear);
@@ -85,18 +89,23 @@ bool bootstrap_raster_enabled();
 void ee_tag_display_copy(uint32_t addr, const DisplayCopy &copy);
 bool take_display_copy(uint32_t dma_tag, uint32_t qwc, DisplayCopy &copy);
 enum class ShadowPass : uint32_t {
-    None, Prepare, Composite, PrepareUpper, CompositeUpper, PrepareLower, CompositeLower
+    None, Prepare, Composite, PrepareUpper, CompositeUpper, PrepareLower, CompositeLower,
+    PrepareTopLeft, CompositeTopLeft, PrepareTopRight, CompositeTopRight,
+    PrepareBottomLeft, CompositeBottomLeft, PrepareBottomRight, CompositeBottomRight
 };
-constexpr bool shadow_prepares(ShadowPass pass) {
-    return pass == ShadowPass::Prepare || pass == ShadowPass::PrepareUpper || pass == ShadowPass::PrepareLower;
-}
-constexpr int shadow_split_y(ShadowPass pass) {
-    if (pass == ShadowPass::PrepareUpper || pass == ShadowPass::CompositeUpper) return 0;
-    if (pass == ShadowPass::PrepareLower || pass == ShadowPass::CompositeLower) return 224;
-    return -1;
-}
+struct ShadowViewport { int x, y, width, height; };
+inline constexpr ShadowViewport kShadowViewports[] = {
+    {0, 0, 640, 448}, {0, 0, 640, 224}, {0, 224, 640, 224},
+    {0, 0, 320, 224}, {320, 0, 320, 224}, {0, 224, 320, 224}, {320, 224, 320, 224}
+};
+constexpr unsigned shadow_view_index(ShadowPass pass) { return (unsigned(pass) - 1) / 2; }
+constexpr bool shadow_prepares(ShadowPass pass) { return (unsigned(pass) & 1) != 0; }
 constexpr uint32_t kShadowPrepareDirectQwc = 77;
-constexpr uint32_t kShadowCompositeDirectQwc = 89;
+constexpr uint32_t shadow_composite_qwc(unsigned width) { return 9 + 4 * (width / 32); }
+constexpr uint32_t shadow_direct_qwc(ShadowPass pass) {
+    return shadow_prepares(pass) ? kShadowPrepareDirectQwc :
+        shadow_composite_qwc(kShadowViewports[shadow_view_index(pass)].width);
+}
 ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc);
 
 // ---- EE thread, track world (src/native_world.cpp, stage R2) --------------------------------
@@ -134,7 +143,7 @@ uint64_t fog_fge_draws();             // native draws that had FGE set (retail: 
 // 0x365308 (*0x4D8BB8: the particle/sprite K delta, both halves), BlendSelect 0x3654E0 (*0x4D8B78).
 void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k);
 void ee_blend_select(uint32_t sel);
-void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y);
+void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y, bool retail_quad_view);
 void ee_shadow_opened(bool opened);
 void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t mat_pkt, uint32_t ref_qword);
 void ee_shadow_end();
@@ -175,6 +184,8 @@ struct Expected {
     uint32_t particle = 0, sprite = 0, immediate = 0, cockpit = 0;  // R4 Phase A2 P1 counters
     uint32_t hud = 0;                                                // R7 A1b P1 counter
 };
+void ee_finish_submissions();
+Expected ee_pending_at_shutdown(uint64_t frame, const std::vector<bool> &received);
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out);
 // EOD_NATIVE_ONLY=1: the GS emulator draws nothing (missing native paths show as missing geometry)
 bool native_only();
@@ -224,7 +235,7 @@ bool gs_queue_dent_accepted(const QueueStripOmission &omission, const gs::Env &e
 bool queue_dent_check_enabled();
 void check_queue_dent_input(uint32_t top, size_t launch_word, bool continuation);
 
-bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
+bool vu1_start(uint32_t program, uint32_t itop, bool continuation, WorldTextureLod &world_lod,
                bool &clipped_world_continuation, bool *bypass_vu1 = nullptr);
 
 // ---- GS command stream ----------------------------------------------------------------------
@@ -369,7 +380,8 @@ struct Mesh {                  // a decoded batch (EE -> GS; the GS owns it)
 enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, CMD_DISPLAY_COPY = 4,
                   CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7,
                   CMD_WORLD_STRIP_CHECK = 8, CMD_QUEUE_MATERIAL = 9, CMD_QUEUE_STRIP = 10,
-                  CMD_DIRECT_FINALIZE = 11 };
+                  CMD_DIRECT_FINALIZE = 11, CMD_TEXTURE_UPLOAD = 12, CMD_MATERIAL_STATE = 13, CMD_SHADOW_BLEND = 14, CMD_TEXTURE_FENCE = 15,
+                  CMD_TRANSIENT_MESH = 16 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),
@@ -382,7 +394,7 @@ void post(uint32_t kind, const void *data, uint32_t size);
 
 // GS thread
 void gs_command(uint32_t kind, const void *data, uint32_t size);
-bool gs_clear_scene(const gs::Env &env, const SceneClear &clear);
+bool gs_clear_scene(const gs::Env &env, const SceneClear &clear, const int *rect = nullptr);
 bool gs_draw_bootstrap_quad(const gs::Env &env, const Vertex (&vertices)[4]);
 bool gs_shadow_boundary(ShadowPass pass);
 // GS worker: conditionally accepts the verified strip as one native world object.
@@ -400,5 +412,6 @@ void gs_barrier();
 // The GS FIFO may overwrite movie pages when no earlier native work is queued.
 bool gs_movie_clear_ready();
 void gs_vblank(uint64_t frame);
+void gs_finish_submissions(uint64_t frame);
 
 }  // namespace native

@@ -85,9 +85,12 @@ if 'libvulkan' in run('otool','-L',str(exe)).lower():
 while pending:
     src,dst=pending.pop()
     paths=rpaths(src)+rpaths(exe)
+    # otool -L includes a dylib's own ID, which still names the original
+    # installation when a release dependency was copied into a staging kit.
+    self_id = run('otool','-D',str(src)).splitlines()[1:] if src != exe else []
     for line in run('otool','-L',str(src)).splitlines()[1:]:
         dep=line.strip().split(' (compatibility')[0]
-        if dep.startswith(('/System/','/usr/lib/')): continue
+        if dep in self_id or dep.startswith(('/System/','/usr/lib/')): continue
         if dep.startswith('@rpath/'):
             suffix=dep[len('@rpath/'):]
             candidates=[pathlib.Path(p.replace('@loader_path',str(src.parent)).replace('@executable_path',str(exe.parent)))/suffix for p in paths]
@@ -130,8 +133,12 @@ for name,license_path in [('SDL3',str(sdl_license)),('libusb','/opt/homebrew/opt
     source=pathlib.Path(license_path)
     if source.exists(): shutil.copyfile(source,licenses/(name+'.txt'))
 if release_deps:
-    for name in ('libusb', 'MoltenVK', 'Opus'):
-        shutil.copyfile(pathlib.Path(release_deps) / 'licenses' / (name + '.txt'), licenses / (name + '.txt'))
+    release_notices = pathlib.Path(release_deps) / 'licenses'
+    for name in ('libusb.txt', 'MoltenVK.txt', 'Opus.txt'):
+        if not (release_notices / name).is_file():
+            raise RuntimeError(f'Missing release dependency notice: {name}')
+    for notice in sorted(release_notices.glob('*.txt')):
+        shutil.copyfile(notice, licenses / notice.name)
 if len(sys.argv)>2:
     xxhash_license=pathlib.Path(sys.argv[2]).resolve().parent/'_deps/eod_xxhash-src/LICENSE'
     if xxhash_license.is_file(): shutil.copyfile(xxhash_license,licenses/'xxHash.txt')
@@ -144,6 +151,7 @@ plist_path=app/'Contents/Info.plist'
 with plist_path.open('rb') as f: info=plistlib.load(f)
 info['CFBundleShortVersionString'] = info['CFBundleVersion'] = (pathlib.Path(__file__).resolve().parents[2]/'VERSION').read_text().strip()
 info['LSMinimumSystemVersion']='.'.join(map(str,minimum))
+info['EODIntegratedContentOptional'] = not bool(mod_source)
 with plist_path.open('wb') as f: plistlib.dump(info,f)
 # macOS may propagate Finder metadata from Documents into linker outputs.
 subprocess.run(['xattr','-cr',str(app)],check=True)

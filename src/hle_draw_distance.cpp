@@ -20,6 +20,7 @@
 #include "core/cpu.h"
 #include "core/memory.h"
 #include "draw_distance.h"
+#include "netplay_names.h"
 #include "ee.h"
 
 extern "C" void f_00214678_orig();
@@ -174,6 +175,7 @@ uint64_t now_us() { return uint64_t(std::chrono::duration_cast<std::chrono::micr
 }  // namespace
 
 extern "C" void f_003582B8() {
+    if (netplay::names::on_world_view) netplay::names::on_world_view();
     const uint32_t m0 = g_ee.r[4].uw[0];
     FILE *csv = frame_log();
     const bool sampled_trace = trace();

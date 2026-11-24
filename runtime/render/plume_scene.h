@@ -49,9 +49,10 @@ private:
     std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> pipelines_;
 };
 
-// The buffer holds one contiguous vertex stream at byte zero and u32 indices
+// The buffer holds one contiguous vertex stream at vertex_offset and u32 indices
 // at index_offset. The caller chooses the index range and instance count.
 void bind_indexed_mesh(plume::RenderCommandList &list, const plume::RenderBuffer &buffer,
-                       uint32_t vertex_bytes, uint64_t index_offset, uint32_t index_bytes);
+                       uint32_t vertex_bytes, uint64_t index_offset, uint32_t index_bytes,
+                       uint64_t vertex_offset = 0);
 
 } // namespace native::scene

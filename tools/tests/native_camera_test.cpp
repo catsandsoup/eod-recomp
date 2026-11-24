@@ -5,6 +5,7 @@
 #include "core/config.h"
 #include "core/cpu.h"
 #include "platform/presentation.h"
+#include "platform/platform.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,8 @@ uint8_t *g_ram;
 
 // The projection fixture has no running kernel, game key queue, or LOD feed.
 uint64_t kernel_vblank_count() { return 0; }
+bool battle_driver_is_free_cam() { return false; }
+void platform_get_pad(int, HostPadState *) { std::abort(); }
 extern "C" void f_0033C168() {}
 struct LodViewCounts { unsigned long long frames, cars, low0, records; };
 LodViewCounts g_lod_view{};
@@ -40,7 +43,7 @@ int main(int argc, char **argv) {
         check(std::memcmp(&expected, &g_ee, sizeof g_ee) == 0, "projection trace leaves native EE state untouched");
     }
     check(eod_presentation_aspect() == launch, "launch aspect before the game sets a display mode");
-    for (int want : {0, 1, 2}) {
+    for (int want : {0, 1, 2, 3, drawable_aspect(3024, 1964)}) {
         presentation::requested.store(want);
         check(eod_presentation_aspect() == want, "the game's requested display aspect");
     }

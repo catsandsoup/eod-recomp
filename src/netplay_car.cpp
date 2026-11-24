@@ -2,6 +2,7 @@
 #include "../runtime/core/memory.h"
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,22 @@ uint32_t car_of_slot(uint32_t slot) {
     return valid(c, 0x1C34) ? c : 0;
 }
 bool is_human(uint32_t car) { return valid(car, 0x1C34) && ee_r32(car + kType) == 0x50; }
+
+uint32_t attached_trailer(uint32_t tow_car) {
+    const uint32_t entities = ee_r32(0x3CE548);
+    if (!valid(tow_car, 0x1C34) || entities > 20) return 0;
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < entities; ++i) {
+        const uint32_t entity = ee_r32(0x3CE4F8 + 4 * i);
+        // The native TRLR entity stores its tow-car pointer at +0x1C18.
+        if (valid(entity, 0x1C34) && ee_r32(entity + kType) == 0x56 &&
+            ee_r32(entity + 0x1C18) == tow_car) {
+            if (found) return 0;
+            found = entity;
+        }
+    }
+    return found;
+}
 
 uint32_t body_of(uint32_t car) {
     if (!valid(car, 0x1C34)) return 0;
@@ -56,6 +73,7 @@ bool read(uint32_t car, State &s) {
     for (int i = 0; i < 3; ++i) { s.vel[i] = rf(car + kVel + 4 * i); s.ang[i] = rf(car + kAngVel + 4 * i); }
     s.steer = rf(car + kSteer); s.gas = rf(car + kGas); s.brake = rf(car + kBrake); s.handbrake = rf(car + kHandbrake);
     s.gear = (int32_t)ee_r32(car + kGear); s.damage = rf(car + kDamage);
+    s.damage_stage = ee_r32(car + 0x1BE8);
     return valid_state(s);
 }
 void matrix_to_quat(const float m[9], float q[4]) {
@@ -81,6 +99,25 @@ static void write_body(uint32_t B, const State &s) {
     for (int i = 0; i < 4; ++i) wf(B + 0x40 + 4 * i, q[i]);
     for (int i = 0; i < 3; ++i) { wf(B + 0x50 + 4 * i, s.vel[i]); wf(B + 0x60 + 4 * i, s.ang[i]); }
 }
+void write_controls(uint32_t car, const State &s) {
+    if (!valid(car, 0x1C34)) return;
+    wf(car + kSteer, s.steer); wf(car + kGas, s.gas); wf(car + kBrake, s.brake); wf(car + kHandbrake, s.handbrake);
+    ee_w32(car + kGear, (uint32_t)s.gear);
+}
+
+void release_controls(uint32_t car) {
+    if (!valid(car, 0x1C34)) return;
+    State neutral;
+    neutral.gear = static_cast<int32_t>(ee_r32(car + kGear));
+    write_controls(car, neutral);
+}
+
+void write_condition(uint32_t car, const State &s) {
+    if (!valid(car, 0x1C34) || !std::isfinite(s.damage) || s.damage < 0 || s.damage > 4 || s.damage_stage > 12) return;
+    wf(car + kDamage, s.damage);
+    ee_w32(car + 0x1BE8, s.damage_stage);
+}
+
 void write(uint32_t car, const State &s) {
     if (!valid(car, 0x1C34) || !valid_state(s)) return;
     // Resolve against the current world on every write. Native car addresses are
@@ -90,8 +127,7 @@ void write(uint32_t car, const State &s) {
     if (B) write_body(B, s);
     for (int i = 0; i < 12; ++i) wf(car + kPose + 4 * i, s.pose[i]);
     for (int i = 0; i < 3; ++i) { wf(car + kVel + 4 * i, s.vel[i]); wf(car + kAngVel + 4 * i, s.ang[i]); }
-    wf(car + kSteer, s.steer); wf(car + kGas, s.gas); wf(car + kBrake, s.brake); wf(car + kHandbrake, s.handbrake);
-    ee_w32(car + kGear, (uint32_t)s.gear);
+    write_controls(car, s);
 }
 
 State lerp(const State &a, const State &b, float t) {
@@ -126,6 +162,13 @@ void Remote::push(uint32_t tick, const State &s) {
     // Event changes reset this timeline explicitly. A very late UDP packet in
     // the same event must never masquerade as a restarted sender clock.
     if (!ring_.empty() && tick <= ring_.back().tick) return;
+    if (stalled()) {
+        // The native body has moved during the gap. Resume from that body
+        // without interpolating through poses from before the outage.
+        ring_.clear();
+        head_init_ = false;
+    }
+    steps_since_sample_ = 0;
     ring_.push_back({tick, s});
     if (ring_.size() > 90) ring_.erase(ring_.begin(), ring_.begin() + 30);
 }
@@ -143,14 +186,34 @@ State Remote::sample(float tick) const {
     float ahead = std::min(tick - (float)last.tick, kExtrapolateMax);
     return extrapolate(last.s, ahead / 60.f);
 }
-State Remote::advance() {
+float Remote::proximity_to(const State &car) const {
+    const auto &other = ring_.back().s;
+    const float dx = other.pose[9] - car.pose[9], dy = other.pose[10] - car.pose[10];
+    const float dz = other.pose[11] - car.pose[11];
+    const float squared = dx * dx + dy * dy + dz * dz;
+    if (squared >= 50.f * 50.f) return 0.f;
+    if (squared <= 15.f * 15.f) return 1.f;
+    return (50.f - std::sqrt(squared)) / 35.f;
+}
+State Remote::advance(int buffer_ms, float proximity, unsigned rtt_ms) {
+    if (!stalled()) ++steps_since_sample_;
     const float newest = (float)ring_.back().tick;
-    if (!head_init_) { head_ = newest - kDelay; head_init_ = true; }
+    // A delayed bumper acts like an obstacle behind its owner's car.
+    // Bring nearby cars toward their current positions for contact;
+    // distant cars keep the configured jitter buffer.
+    const float one_way_ms = .5f * std::min(rtt_ms, 500u);
+    const float offset_ms = -buffer_ms + proximity * (one_way_ms + buffer_ms);
+    const float target_tick = newest + offset_ms * (60.f / 1000.f);
+    if (!head_init_) { head_ = target_tick; head_init_ = true; }
     head_ += 1.f;
     // keep the play-head near newest - delay: speed up / slow down gently, jump only after a long gap
-    const float err = (newest - kDelay) - head_;
-    if (std::fabs(err) > 40.f) head_ = newest - kDelay; else head_ += err * 0.03f;
+    const float err = target_tick - head_;
+    if (std::fabs(err) > 40.f) head_ = target_tick; else head_ += err * 0.03f;
     State target = sample(head_);
+    // Damage and native impairment state belong to the latest accepted simulation
+    // result. Interpolation is for the rendered trajectory only.
+    target.damage = ring_.back().s.damage;
+    target.damage_stage = ring_.back().s.damage_stage;
     if (!shown_init_) { shown_ = target; shown_init_ = true; return shown_; }
     // follow the target: ride the car's own velocity, then close the position error over a few
     // steps (large corrections are blended, never teleported, and the car stays solid throughout)
@@ -161,6 +224,8 @@ State Remote::advance() {
     State out = lerp(moved, target, k);
     out.vel[0] = target.vel[0]; out.vel[1] = target.vel[1]; out.vel[2] = target.vel[2];
     out.ang[0] = target.ang[0]; out.ang[1] = target.ang[1]; out.ang[2] = target.ang[2];
+    out.damage = target.damage;
+    out.damage_stage = target.damage_stage;
     shown_ = out;
     return shown_;
 }
@@ -168,6 +233,9 @@ State Remote::advance() {
 // Developer proof harness (N1): EOD_NETPLAY_REC=<file> records the human car each race
 // tick; EOD_NETPLAY_PLAY=<file> replays it onto the first AI car as a puppet.
 namespace {
+// Raw developer recordings predate damage-stage replication. Preserve the
+// original record width so existing playback files keep their frame boundaries.
+constexpr size_t kRecordingBytes = offsetof(State, damage_stage);
 std::vector<State> g_rec;
 bool g_init = false;
 FILE *g_rec_file = nullptr;
@@ -183,14 +251,14 @@ void init_harness() {
     g_init = true;
     if (const char *p = std::getenv("EOD_NETPLAY_REC")) g_rec_file = std::fopen(p, "wb");
     if (const char *p = std::getenv("EOD_NETPLAY_PLAY"))
-        if (FILE *f = std::fopen(p, "rb")) { State s; while (std::fread(&s, sizeof s, 1, f) == 1) g_rec.push_back(s); std::fclose(f); }
+        if (FILE *f = std::fopen(p, "rb")) { State s; while (std::fread(&s, kRecordingBytes, 1, f) == 1) g_rec.push_back(s); std::fclose(f); }
 }
 }  // namespace
 void before_step() {
     init_harness();
     if (!g_rec_file && g_rec.empty()) return;
     uint32_t t = race_tick();
-    if (g_rec_file) { State s; if (uint32_t c = first_car(true)) if (read(c, s)) { std::fwrite(&s, sizeof s, 1, g_rec_file); if ((t & 255) == 0) std::fflush(g_rec_file); } }
+    if (g_rec_file) { State s; if (uint32_t c = first_car(true)) if (read(c, s)) { std::fwrite(&s, kRecordingBytes, 1, g_rec_file); if ((t & 255) == 0) std::fflush(g_rec_file); } }
     if (!g_rec.empty()) {
         if (!g_puppet) { g_puppet = first_car(false); if (g_puppet) set_puppet(g_puppet, true); }
         if (g_puppet && t < g_rec.size()) write(g_puppet, g_rec[t]);

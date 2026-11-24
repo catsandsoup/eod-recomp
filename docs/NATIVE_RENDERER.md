@@ -400,6 +400,8 @@ SLUS_209.10, the VU1 image `config/vu/vu1_fd0ce30ab0ec263c.bin` (`tools/vudis.py
 culling (the VU1 programs have no backface test). Textures, blend, alpha test and depth state
 come from the GS state the texture manager (`0x34F8D0`) sets for the leaf, as in R1.
 
+The native decoder retains strip triangles for MSCAL `0x6A` even when two uploaded positions coincide. Their corner indices and weights separate them during camera-facing expansion. For the 41 `ma-tree1.tex` through `ma-tree4.tex` cards in Dundas this yields 82 nonzero-area posed triangles. Rejecting duplicate positions before expansion eliminated 79 of them.
+
 ### Split screen (P8)
 
 PS2 and Xbox both skip passes 1, 2 and 4 (and their water display objects, effects and
@@ -2093,3 +2095,45 @@ ordered GS terminal attributes are compatibility state. The native
 queue draw remains a single item in the same target batch. Readiness
 may be published after a prior successful draw of the same immutable
 mesh/material/state. Unready resources retain the original MSCNT.
+
+### Native matrix and rigid-body producers
+
+The EE helper at `0x38AE78` writes the four identity columns. The helper at
+`0x38A5D0` multiplies two column-major matrices, rounding each product
+before the addition. The generated EE loop retains its ordered input/output
+accesses, which matters when the destination aliases an input. Its native
+column operation leaves the partial Z sum in ACC, the completed column in
+VF9, and the original MAC and sticky status. Camera initialization at
+`0x3590A0` seeds VF1 from VF0. VIF initialization at `0x388930` applies
+the write-only reset strobe, and the synchronization loop at `0x3892CC`
+polls the actual offload worker, including when the worker is enabled.
+
+The vehicle producer `0x1DE7B0` stages 11 body, 31 wheel and 24 tuning
+qwords. Its launch at `0x1DEA4C` requires VI1/VI2/VI3 = 0/11/42 and the
+retail 4 KiB image fingerprint `dc7d103a5a6e1a99`. The host solver in
+`src/vehicle_dynamics.cpp` applies eight substeps of 0.0166/8 seconds.
+
+| Retail byte PCs | Native calculation |
+| --- | --- |
+| `0x000..0x048` | Scale the initial force and torque by eight. |
+| `0x050..0x308` | Transform torque into body coordinates, apply inverse inertia, then update angular and linear velocity, position, quaternion and basis. |
+| `0x310..0x660` | Derive drag, drivetrain feedback, braking, spring/damper loads and axle anti-roll forces. |
+| `0x668..0xBF8` | For each wheel, project the hub onto the sampled ground plane, compute contact velocity and tire slip, then accumulate suspension force, friction, wheel torque and body moment. |
+| `0xC00..0xCB0` | Update suspension travel, wheel angle, and their rates. Store the force and torque for the next substep. |
+| `0xCB8..0xCF8` | Rescale force and torque by 1/8 and return to the EE producer. |
+
+The EE can observe partial vector lanes, the divider, ACC, VI4..VI11, flags
+and the 12,011-cycle return schedule. The solver preserves them alongside
+the 42 writable qwords. The 24 tuning qwords and the rest of the 4 KiB
+local store retain their input data. `EOD_VEHICLE_PHYSICS_CHECK=1` in a
+reference-capable build runs the host solver on a copy, executes the retail
+program on the live state, and compares the full VU state, data memory and
+scoreboard for every launch. `EOD_VEHICLE_PHYSICS=0` selects the original
+producer in that build.
+
+The strict R7 target excludes the general macro, control and microprogram
+backends. The generated EE retains named fault entries for uncovered
+instructions. A fault reports its operation and EE return address. A
+separate development build provides the interpreter and `--vu-bench`.
+The release gate checks the CMake target source list and definitions for
+both EE and runtime, the executable's defined symbols and its link map.

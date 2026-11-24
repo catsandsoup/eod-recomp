@@ -23,6 +23,7 @@ namespace modern {
 
 // available with a hardware backend that draws it (Direct3D 11 or Vulkan) unless EOD_MODERN=0; EOD_MODERN=1 also
 // switches it on at start. Whether it draws is the config's ModernRenderer (Graphics panel).
+#ifndef EOD_R7_RELEASE
 bool g_on = [] {
 #if defined(_WIN32) || defined(EOD_VULKAN)
     const char *v = getenv("EOD_MODERN");
@@ -57,31 +58,41 @@ bool live() {
     env_start();
     return g_config.modern_renderer;
 }
+#endif
 bool look_switch_available() { return native::look_available() || available(); }
+#ifndef EOD_R7_RELEASE
 void disable() {
     if (!g_failed.exchange(true)) fprintf(stderr, "[modern] renderer unavailable: original\n");
 }
+
+#endif
 namespace {
 std::optional<RendererLook> toggle_look() {
     if (native::look_available())
         return native::toggle_look() ? RendererLook::Modern : RendererLook::Classic;
+#ifdef EOD_R7_RELEASE
+    return std::nullopt;
+#else
     if (!available()) return std::nullopt;
     env_start();
     const bool enabled = g_config.modern_renderer.toggle();
     fprintf(stderr, "[modern] renderer: %s\n", enabled ? "modern" : "original");
     return enabled ? RendererLook::Modern : RendererLook::Original;
+#endif
 }
 }  // namespace
 
 void toggle() { (void)toggle_look(); }
 
-void toggle_from_input() {
+void toggle_from_input(const char *source) {
     if (const auto look = toggle_look()) {
+        std::fprintf(stderr, "[look] %s selected %s\n", source, overlay_renderer_look_label(*look));
         platform_show_hud_banner(overlay_renderer_look_label(*look));
         overlay_show_renderer_look(*look);
     }
 }
 
+#ifndef EOD_R7_RELEASE
 namespace {
 int g_path;
 int32_t g_batch = -1;   // the replaced batch whose kicks are being processed
@@ -140,5 +151,7 @@ void gs_draw(Frame *f) {
         delete f;
     g_target.valid = false;
 }
+
+#endif
 
 }  // namespace modern

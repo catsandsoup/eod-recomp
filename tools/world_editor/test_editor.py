@@ -143,6 +143,12 @@ class TestPieLaunchSpec(unittest.TestCase):
                 self.assertTrue(window.cmb_pie_event.isVisible())
                 self.assertTrue(window.cmb_pie_car.isVisible())
                 self.assertTrue(window.cmb_renderer_mode.isVisible())
+                native_available = bool(window.viewport._discover_plume_library())
+                self.assertEqual(window.cmb_pie_scale.currentData(), 6 if native_available else 2)
+                self.assertEqual(window.cmb_renderer_mode.currentData(), "plume" if native_available else "ps2")
+                self.assertEqual(window.cmb_renderer_mode.currentData(), window.viewport.render_mode)
+                window.cmb_pie_scale.setCurrentIndex(window.cmb_pie_scale.findData(8))
+                self.assertEqual(window._pie_render_scale, 8)
                 for toolbar in (window.main_toolbar, window.settings_toolbar):
                     for action in toolbar.actions():
                         if not action.isSeparator():
@@ -188,21 +194,45 @@ class TestPieLaunchSpec(unittest.TestCase):
             self.assertEqual(spec["exe"], str(binary))
             self.assertEqual(spec["args"][1:4], ["--windowed", "--data", str(disc)])
 
+    def test_macos_discovers_r7_before_development_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            editor = repo / "tools" / "world_editor" / "pie_host.py"
+            development = repo / "build-mac-plume" / "eod"
+            release = repo / "build-mac-r7-release" / "eod"
+            for binary in (development, release):
+                binary.parent.mkdir()
+                binary.touch()
+            with patch.dict("os.environ", {}, clear=True), patch.object(pie_host.sys, "platform", "darwin"), \
+                    patch.object(pie_host, "__file__", str(editor)):
+                for mode in ("ps2", "plume"):
+                    spec = pie_host.build_pie_launch_spec(repo / "disc", repo / "mod", "Afton", renderer_mode=mode)
+                    self.assertEqual(spec["exe"], str(release))
+                release.unlink()
+                self.assertEqual(pie_host.resolve_eod_exe(repo / "disc"), development)
+
+    def test_pie_keeps_runtime_card_override_in_staging(self) -> None:
+        with patch.dict("os.environ", {"EOD_MEMCARD": "/other/card"}, clear=True):
+            spec = pie_host.build_pie_launch_spec(".", "test", "Afton")
+        self.assertEqual(spec["env"]["EOD_MEMCARD"], spec["pie_memcard"])
+        self.assertEqual(spec["env"]["EOD_MEMCARD_DIR"], spec["pie_memcard"])
+
     def test_explicit_pie_executable_overrides_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "my-eod"
             with patch.dict("os.environ", {"EOD_PIE_EXE": str(binary)}, clear=True):
                 self.assertEqual(pie_host.resolve_eod_exe("."), binary.resolve())
 
-    def test_renderer_options_select_distinct_backends(self) -> None:
-        with patch.dict("os.environ", {"EOD_NATIVE_ONLY": "1", "EOD_PLUME": "0", "EOD_LOOK": "modern"}, clear=True):
+    def test_renderer_options_select_native_looks(self) -> None:
+        with patch.dict("os.environ", {"EOD_NATIVE_ONLY": "1", "EOD_NATIVE": "0", "EOD_PLUME": "0", "EOD_LOOK": "modern"}, clear=True):
             classic = pie_host.build_pie_launch_spec(".", "test", "Afton", renderer_mode="ps2")
             plume = pie_host.build_pie_launch_spec(".", "test", "Afton", renderer_mode="plume")
 
-        self.assertEqual(classic["env"]["EOD_NATIVE"], "0")
+        self.assertNotIn("EOD_NATIVE", classic["env"])
+        self.assertEqual(classic["env"]["EOD_PLUME"], "1")
         self.assertEqual(classic["env"]["EOD_MODERN"], "0")
         self.assertNotIn("EOD_NATIVE_ONLY", classic["env"])
-        self.assertNotIn("EOD_LOOK", classic["env"])
+        self.assertEqual(classic["env"]["EOD_LOOK"], "classic")
         self.assertNotIn("--require-plume", classic["args"])
         self.assertEqual(plume["env"]["EOD_NATIVE"], "1")
         self.assertEqual(plume["env"]["EOD_LOOK"], "modern")
@@ -210,6 +240,26 @@ class TestPieLaunchSpec(unittest.TestCase):
         self.assertEqual(plume["env"]["EOD_PLUME"], "1")
         self.assertNotIn("EOD_NATIVE_ONLY", plume["env"])
         self.assertEqual(plume["args"][-3:], ["--renderer", "vulkan", "--require-plume"])
+
+    def test_pie_scale_matches_ini_and_process_environment(self) -> None:
+        for requested, effective in [(0, 1), (2, 2), (6, 6), (7, 7), (8, 8), (20, 8)]:
+            with self.subTest(requested=requested):
+                spec = pie_host.build_pie_launch_spec(".", "test", "Afton", pie_render_scale=requested)
+                self.assertEqual(spec["pie_render_scale"], effective)
+                self.assertEqual(spec["env"]["EOD_RENDER_SCALE"], str(effective))
+                self.assertIn(f"RenderScale={effective}", spec["pie_ini_text"].splitlines())
+
+    def test_career_playtest_forwards_selected_car(self) -> None:
+        for mode, track, event in [
+            ("career_roam", "Afton", "Battle"),
+            ("free_roam", "HomeBase", "Battle"),
+            ("event", "HomeBase", "Career Overworld (Free Roam)"),
+        ]:
+            with self.subTest(mode=mode):
+                spec = pie_host.build_pie_launch_spec(
+                    ".", "test", track, mode=mode, event_name=event, car_name="Trailer5.CAR"
+                )
+                self.assertEqual(spec["env"]["EOD_DIRECT_START"], "mode=career;place=home;car=Trailer5")
 
     def test_laps_are_forwarded_only_to_action_events(self) -> None:
         for mode, track, event, expected in (
@@ -598,10 +648,10 @@ class TestEodWorldEditor(unittest.TestCase):
         import numpy as np
         from pie_host import build_pie_launch_spec
 
-        # 1. Verify mutually exclusive PS2 Fast vs Plume HQ PIE env vars + Free Roam uses Battle (NOT #0 Jump Race!)
+        # 1. Verify Classic and Plume HQ PIE looks + Free Roam uses Battle (NOT #0 Jump Race!)
         spec_ps2 = build_pie_launch_spec(self.game_dir, self.game_dir / "mods" / "Test", "Afton", mode="free_roam", ai_count=0, renderer_mode="ps2")
         spec_plume = build_pie_launch_spec(self.game_dir, self.game_dir / "mods" / "Test", "Afton", mode="event", event_name="No-Rules Race", car_name="Bus", renderer_mode="plume")
-        self.assertEqual(spec_ps2["env"]["EOD_NATIVE"], "0")
+        self.assertNotIn("EOD_NATIVE", spec_ps2["env"])
         self.assertEqual(spec_ps2["env"]["EOD_MODERN"], "0")
         self.assertIn("event=Battle", spec_ps2["direct_start"])
         self.assertIn("ai=0", spec_ps2["direct_start"])
@@ -627,7 +677,12 @@ class TestEodWorldEditor(unittest.TestCase):
             vp.show_lighting = True
             vp.repaint()
             self.app.processEvents()
-            if mode == "plume" and vp._plume_viewport is not None and vp._plume_viewport.presented > 0:
+            if mode == "plume":
+                if not vp._discover_plume_library():
+                    self.assertTrue(vp._plume_error.isVisible())
+                    continue
+                self.assertIsNotNone(vp._plume_viewport)
+                self.assertGreater(vp._plume_viewport.presented, 0)
                 # Native Vulkan/Metal Plume child surface presents directly to its own swapchain (not QOpenGLWidget FBO)
                 self.assertGreater(vp._plume_viewport.triangles, 1000, "Native Plume viewport rendered too few triangles")
             else:

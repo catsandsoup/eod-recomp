@@ -16,6 +16,7 @@
 #include "../core/r7_audit.h"
 #include "ee.h"
 #include "../gs/gs.h"
+#include "../gs/material_state.h"
 #include "../kernel/kernel.h"
 #include "vu.h"
 #include "../core/prof.h"
@@ -107,18 +108,21 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
         native::WorldTextureLod world_lod{};
         bool clipped_world_continuation = false;
         bool bypass_vu1 = false;
-        const bool retire_world_leaf = native::vu1_start(
-            addr, v.itop, world_lod, clipped_world_continuation,
-            g_vu1_start_hook ? nullptr : &bypass_vu1);
-        if (bypass_vu1) {
-            r7_audit::add(r7_audit::Counter::Vu1Bypassed);
-            return;
-        }
 #ifdef EOD_PLUME
-        if (launch == VuLaunch::Mscal && !g_vu1_start_hook && native::vu1_bypass_enabled()) {
-            if (addr == 0x2538 && vu_retire_xgkick_top(v.vu, addr, v.top)) {
-                r7_audit::add(r7_audit::Counter::Vu1Bypassed);
-                return;
+        // Explicit state dispatches still own their GIF/register side effects
+        // when the same DMA range also supplies a native draw.
+        const bool state_launch = launch != VuLaunch::Mscnt && !g_vu1_start_hook && native::vu1_bypass_enabled() &&
+            (addr == 0x2538 || addr == 0x25F0 || addr == 0x0000 || addr == 0x24D8);
+        if (state_launch && launch == VuLaunch::Mscal) {
+            if (addr == 0x2538) {
+                gs::MaterialState material;
+                const bool known = gs::material_state_enabled() && v.top <= 1024 - 16 &&
+                    gs::match_material_state(g_vif1_dma_tag, ref_payload, ref_words, offset,
+                                             v.vu->mem + 16 * v.top, material);
+                if (vu_retire_xgkick_top(v.vu, addr, v.top, known ? &material : nullptr)) {
+                    r7_audit::add(r7_audit::Counter::Vu1Bypassed);
+                    return;
+                }
             }
             if (addr == 0x25F0 && vu_retire_giftag_setup(v.vu, addr, v.top)) {
                 r7_audit::add(r7_audit::Counter::Vu1Bypassed);
@@ -136,7 +140,17 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
             ++g_vu1_nops_retired;
             return;
         }
+#else
+        constexpr bool state_launch = false;
 #endif
+        const bool retire_world_leaf = !state_launch && native::vu1_start(
+            addr, v.itop, launch == VuLaunch::Mscnt, world_lod, clipped_world_continuation,
+            g_vu1_start_hook ? nullptr : &bypass_vu1);
+        if (bypass_vu1) {
+            r7_audit::add(r7_audit::Counter::Vu1Bypassed);
+            return;
+        }
+#ifndef EOD_R7_RELEASE
         if (retire_world_leaf && matches_draw_ref(v, ref_payload, ref_words, 0x80) &&
             vu_retire_world_leaf(v.vu, addr, v.top, world_lod)) {
             ++g_vu1_world_leaf_retires;
@@ -161,12 +175,22 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
                 if (!candidate.omission.reference) return;
             }
         }
+#else
+        (void)retire_world_leaf;
+        (void)ref_payload;
+        (void)ref_words;
+        (void)offset;
+#endif
         g_vu1_program_starts[(addr >> 3) & 0x7FF]++;
         if (g_vu1_start_hook) g_vu1_start_hook(addr);
     } else {
         v.itop = v.itops;
     }
+#ifdef EOD_R7_RELEASE
+    vu_reject_launch(*v.vu, addr, launch);
+#else
     vu_execute(v.vu, addr, launch);
+#endif
 }
 
 // Number of data words an UNPACK consumes.
@@ -464,9 +488,10 @@ void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
 // number of words consumed.
 size_t run(Vif &v, const uint32_t *w, size_t n) {
 #ifdef EOD_PLUME
-    const bool skip_dead_unpack =
-        v.n == 1 && !g_vu1_start_hook && native::vu1_bypass_dma_tag(g_vif1_dma_tag);
+    const bool vu1_bypass = v.n == 1 && !g_vu1_start_hook && native::vu1_bypass_enabled();
+    const bool skip_dead_unpack = vu1_bypass && native::vu1_bypass_dma_tag(g_vif1_dma_tag);
 #else
+    const bool vu1_bypass = false;
     const bool skip_dead_unpack = false;
 #endif
     size_t pos = 0;
@@ -541,6 +566,12 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         case 0x50:
         case 0x51: {  // DIRECT / DIRECTHL
             const uint32_t qwc = imm ? imm : 65536;
+            bool additive;
+            if (v.n == 1 && qwc == 3 && gs::material_state_enabled() &&
+                gs::match_shadow_blend(g_vif1_dma_tag, d, additive)) {
+                gs::submit_shadow_blend(additive);
+                break;
+            }
             native::SceneClear clear;
             native::DisplayCopy copy;
             const bool has_clear = v.n == 1 && native::take_scene_clear(g_vif1_dma_tag, qwc, clear);
@@ -556,7 +587,32 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         }
         default:
             if ((cmd & 0x60) == 0x60) {
-                if (skip_dead_unpack && v.mode != 2) v.num = 0;
+                bool skip = false;
+                if (v.mode != 2) {
+                    if (skip_dead_unpack) {
+                        skip = true;
+                    } else if (vu1_bypass) {
+                        const bool flg = (c >> 15) & 1;
+                        if (!flg && v.base == 0xE0 && v.cycle == 0x0101) {
+                            // Static VU1 data RAM below TOP (camera/bones/dents/sun-quad) is unread when bypassed;
+                            // 0x2538 A+D state packets always unpack via FLG=1 to TOP (0xE0 or 0x270).
+                            const uint32_t dst_qw = c & 0x3FF;
+                            const uint32_t cnt = numf ? numf : 256;
+                            if (dst_qw + cnt <= 0xE0) skip = true;
+                        } else if (flg && pos + need < n) {
+                            // Skip FLG=1 UNPACKs feeding retired setup 0x0000 (0x35CD28 matrix/lighting) or
+                            // retired NOP 0x24D8; NEVER skip 0x2538 (MSCAL 0x4A7) A+D state packets.
+                            for (size_t look = pos + need; look < n && look < pos + need + 4; ++look) {
+                                const uint32_t nw = w[look];
+                                const uint32_t ncmd = (nw >> 24) & 0x7F;
+                                if (ncmd == 0x00 || ncmd == 0x01 || ncmd == 0x04 || ncmd == 0x05) continue;
+                                if (nw == 0x14000000u || nw == 0x1400049Bu) skip = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (skip) v.num = 0;
                 else do_unpack(v, c, d);
             } else {
                 WARN("VIF%d: unknown command %08x", v.n, c);

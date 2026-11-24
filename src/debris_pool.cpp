@@ -164,6 +164,12 @@ uint32_t create_phob(Pool &p, bool wheel, uint32_t ra) {
         call_at(lwu(lwu(phob + 0x98) + 8), ra);  // 0x1B2868 (0x3FCE50) / 0x1E28B8 (0x400EE8)
         set(4, (int32_t)phob);
         call(f_00178378, ra);
+        // Race startup resets every registered phob at 0x1770DC. New panels
+        // need that reset to initialize the ground normal used on their first tick.
+        set(4, (int32_t)phob);
+        const uint32_t vtable = lwu(phob + 0x98);
+        set(5, (int32_t)vtable);
+        call_at(lwu(vtable + 0x10), 0x1770E4);
     }
     sw(p.array, slot0), sw(p.count, count), sw(kHeapPermit, permit);
     g_ee = saved;

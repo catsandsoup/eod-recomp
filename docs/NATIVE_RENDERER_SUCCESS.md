@@ -1312,3 +1312,76 @@ and 37.5 with retirement enabled. Guest vblanks/s ranged from 53.2 to
 60.0, and the GS GPU timestamps were 6.46–7.95 ms per present across
 those windows. That result applies to its original-detail fixture.
 Neither sample isolates the cause of the maximum-detail slowdown.
+
+## Native VU0 car physics record transfers (2026-11-24)
+
+The EE producer at `0x001DE7B0`, called from `0x00187E08`, now stages and
+collects ordinary car records with contiguous native copies. It reads the car
+count at `0x00494D28` and the body, wheel/contact and parameter array pointers
+at `0x00494D30`, `0x00494D34` and `0x00494D38`. Each car stages 11, 31 and
+24 qwords into VU0 data qwords 0–65. A zero entry in the array addressed
+by `0x00494D3C` enables copy-back of the first 42 qwords. The generated EE
+code keeps the loop counters, branch delay slots and interrupt checks.
+Each block materializes the original terminal VF1, VF2 and VI1 values.
+Mapped or wrapping ranges use the original ordered transfers, and a pending
+P/Q result still takes the original interlock.
+
+The DMA0 chain at `0x003BC590` uploads 256 pairs to PC 0 and 160 pairs to
+byte PC `0x800`. With the zero-filled tail the 4 KiB image hashes to
+`dc7d103a5a6e1a99`. VCALLMS still executes the 416-pair program, which
+takes eight integration steps with four wheel iterations per step and ends
+at byte PC `0xCF8`. The DMA upload and this micro solver remain in use.
+
+The portable `PhysicsRecordTransfers` CTest compares 480 transfer cases,
+including unaligned EE addresses, VU data wrap, scratchpad and busy P/Q.
+A separate macOS fixture ran the original and updated EE producer in
+independently initialized runtime processes with the retail DMA upload and
+micro solver. All 32 seeded states matched across 128 MiB of EE RAM, EE
+registers, both VUs' registers, flags, pipeline state, data and micro memories.
+The fixture varied the car count from zero through four and the copy-back
+mask. Its contact query returned scripted hits and misses. A second pass
+matched all 892 instrumented EE loop back edges, including injected pending
+Q results. In the identical four-car fixture, VU0 macro calls went from
+432 to zero, COP2 control calls from 28 to zero, and both sides ran the
+solver four times.
+
+Both 240-vblank Modern 2P Dennison release runs joined the same two pads
+and cars. An executable relinked with the original EE producer recorded
+25,650 macros and 1,520 control calls at its two return contexts across
+190 solver calls. The updated producer recorded zero macros and control calls
+at those contexts across 110 solver calls. The differing simulation progress
+limits whole-run comparisons. The updated run still recorded 6,481 macros
+and 18 control calls elsewhere. Updated 3P and 4P Dundas runs also recorded
+zero producer macro/control calls, with 260 and 80 solver calls respectively.
+
+## Native VU0 matrix and vehicle solver completion (2026-11-24)
+
+The later release replaces the matrix operations and the 416-pair vehicle
+program described above with native calculations. The vehicle call at
+`0x1DEA4C` verifies its inputs and the fingerprint of the uploaded program.
+The strict target physically excludes generic VU0/VU1 execution and COP2 control
+handlers. An uncovered instruction reports its opcode or VU program address
+and terminates. The development target keeps the original execution paths.
+
+The matrix differential matched the entire VU state for 60,000 calls. The
+vehicle differential matched 20,000 complete solves, including raw float
+bit patterns, signed zero, infinities, NaNs and pending flags. The compared
+outputs included all 4 KiB of local memory, the architectural state and the
+private register scoreboard. Live original/native comparisons matched 8,289
+car updates across Anoka, Dundas and Hampton. A newly linked development
+binary matched a further 3,472 updates in Anoka. The release passed both
+`PhysicsRecordTransfers` and `VehicleDynamicsKernel`. The asset-free
+solver goldens also passed on x86-64 under Rosetta.
+
+In a four-scene strict macOS release run, the menu, Anoka race, Dundas Bus
+battle and Hampton Postal battle each reached 300 frames. All eleven
+lifecycle counters were zero, with the VU census reconciled in all four
+scenes. Each frame-240 capture contained a nonblank playfield. The same
+binary, linker map and CMake source manifest passed the 36-symbol exclusion
+check. Selecting the original solver in the strict build triggered the
+unretired VU0 instruction guard. The reference-only benchmark option exited
+with status 2.
+
+This particular strict run reported end-of-run submission differences for
+the menu, Anoka and Dundas after the frame limit. Its aggregate submission
+parity gate failed. The separate VU and physics results above passed.

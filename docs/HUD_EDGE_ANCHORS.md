@@ -1,5 +1,13 @@
 # Native race HUD edge anchors
 
+## Current renderer
+
+The host reads each viewport's saved overscan from the 20-byte records at `003C42C0` when drawing its two HUD queues. The retail wide insets (-58 left and -53 right) have already extended the bounds by 106 and 101 units respectively. The host subtracts that existing extension from `320 × (outputAspect / (4/3) − 1)`. This preserves row sizes and prevents applying the wide inset twice. The same calculation handles fixed widescreen and the actual drawable ratio. The separate skull and its count in `00128090` read the right endpoint at `001281B8`. The endpoint wrapper applies the same shift for this call so the icon and text keep their spacing beside the speed rows.
+
+Frame 180 of the Dundas No-Rules Race at 6× on a 3024×1964 Mac display confirmed the skull/count remained to the left of the speed rows, with the left and right panels aligned to their viewport edges. The CPU contract also checks the separate skull read and per-viewport row shifts.
+
+## October 2026 checkpoint
+
 Source and CPU-contract verification checkpoint, 2026-10-16. Rendered acceptance remains
 pending. The existing matched 4:3/16:10 image shows real additional scenery but
 also shows left position/lap/damage rows and right speed rows inset into the

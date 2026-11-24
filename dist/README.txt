@@ -1,11 +1,13 @@
-Eve of Destruction Remaster 1.0
+Eve of Destruction Remaster
 Windows x64
 https://github.com/catsandsoup/eod-recomp
 
 GET STARTED
 Unzip the download and open eod.exe. Choose your North American PS2 game
-ISO when asked. The app installs the game files and remembers them.
-No disc extraction or command line is required.
+ISO when asked. If you already extracted your disc, choose SLUS_209.10
+inside that folder. The game remembers the library for future releases.
+You can unzip the next release into a different folder and open eod.exe.
+To change the saved location, open eodsetup.exe and choose Game data.
 
 CONTROLS
 Xbox and PlayStation controllers are supported. Start + Select opens the

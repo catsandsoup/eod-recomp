@@ -44,6 +44,7 @@ from home_hub import (
 from perf_profiler import get_profiler
 from pie_host import (
     GAME_EXE_LABEL,
+    MAX_PIE_RENDER_SCALE,
     PieHostWidget,
     build_pie_launch_spec,
     pie_staging_root,
@@ -149,7 +150,6 @@ class EodWorldEditorWindow(QMainWindow):
         self.project_path: Path | None = None
         self._mod_output_dir: Path | None = None
         self._saved_undo_index: int = 0
-        self._pie_render_scale: int = 2
         self._pending_pie_spawn_pos: tuple[float, float, float, float] | None = None
         self._custom_car_archives: list[Path] = []
         self.world: TrackWorld | None = None
@@ -183,6 +183,7 @@ class EodWorldEditorWindow(QMainWindow):
         # Core panels: Left Explorer | Center (Autosave Banner + OpenGL Viewport / Embedded PIE) | Right Properties
         self.explorer = ExplorerPanel()
         self.viewport = ViewportGL()
+        self._pie_render_scale = 6 if self.viewport.render_mode == "plume" else 2
         self.pie_host = PieHostWidget()
         self.center_stack = QStackedWidget()
         self.center_stack.addWidget(self.viewport)  # Page 0: OpenGL 3.3 Core Editor
@@ -698,17 +699,17 @@ class EodWorldEditorWindow(QMainWindow):
         self.act_vehicle_tuner = tb.addAction(svg_icon("car", "#fbbf24"), "Car Tuner", self.open_vehicle_tuner_dialog)
         self.act_vehicle_tuner.setToolTip("Open Live PIE Vehicle Boost / Handling Tuner & NASCAR / Custom Car Tools")
 
-        # Renderer Quality Selector (PS2 Fast Performance vs Plume Vulkan High-Quality)
         self.cmb_renderer_mode = QComboBox()
         self.cmb_renderer_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.cmb_renderer_mode.setMinimumContentsLength(8)
-        self.cmb_renderer_mode.addItem("PS2 Fast", "ps2")
+        self.cmb_renderer_mode.addItem("Classic", "ps2")
         self.cmb_renderer_mode.addItem("Plume HQ", "plume")
         self.cmb_renderer_mode.setToolTip(
             "Renderer Quality for Viewport & Play-In-Editor (PIE):\n"
-            "• PS2 Fast: Low-power PS2-style preview + EOD_NATIVE=0, EOD_MODERN=0\n"
+            "• Classic uses the lightweight editor preview and original shading in PIE.\n"
             "• Plume HQ: Enhanced shading preview and native Plume Modern in PIE (Vulkan required)"
         )
+        self.cmb_renderer_mode.setCurrentIndex(self.cmb_renderer_mode.findData(self.viewport.render_mode))
         self.cmb_renderer_mode.currentIndexChanged.connect(self._on_renderer_mode_changed)
         settings.addSeparator()
         self._lbl_pie_renderer = QLabel("Renderer")
@@ -718,13 +719,11 @@ class EodWorldEditorWindow(QMainWindow):
         self.cmb_pie_scale = QComboBox()
         self.cmb_pie_scale.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.cmb_pie_scale.setMinimumContentsLength(3)
-        self.cmb_pie_scale.addItem("1x", 1)
-        self.cmb_pie_scale.addItem("2x", 2)
-        self.cmb_pie_scale.addItem("3x", 3)
-        self.cmb_pie_scale.addItem("4x", 4)
-        self.cmb_pie_scale.setCurrentIndex(1)  # Default 2x HD instead of inheriting RenderScale=6 (>4K)!
+        for scale in range(1, MAX_PIE_RENDER_SCALE + 1):
+            self.cmb_pie_scale.addItem(f"{scale}x", scale)
+        self.cmb_pie_scale.setCurrentIndex(self.cmb_pie_scale.findData(self._pie_render_scale))
         self.cmb_pie_scale.setToolTip(
-            "Isolated PIE internal resolution scale: 1x (PS2), 2x (HD), 3x (1440p), 4x (4K) — never overwrites your global eod.ini"
+            "Internal resolution multiplier for this playtest. Higher scales require more GPU memory."
         )
         self.cmb_pie_scale.currentIndexChanged.connect(
             lambda _i: setattr(self, "_pie_render_scale", int(self.cmb_pie_scale.currentData() or 2))
@@ -1969,7 +1968,7 @@ class EodWorldEditorWindow(QMainWindow):
     def _on_renderer_mode_changed(self, _index: int) -> None:
         rmode = str(self.cmb_renderer_mode.currentData() or "ps2")
         self.viewport.set_render_mode(rmode)
-        label = "Plume HQ (native Vulkan)" if rmode == "plume" else "PS2 Fast (Original)"
+        label = "Plume HQ (native Vulkan)" if rmode == "plume" else "Classic (Original)"
         self.append_log(f"[Renderer] Switched to {label}", verbose=True)
         self.set_action_status(f"Renderer mode: {label}")
 

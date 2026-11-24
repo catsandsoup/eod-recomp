@@ -164,7 +164,8 @@ void shadow_begin() {
         const bool retail_view = saved_ra == 0x30A59C && lwu(kPhyscamView) <= 18;
         const bool single_view = retail_view && view_count == 1 && view_index == 0;
         const int split_y = retail_view && view_count == 2 && view_index < 2 ? int(view_index) * 224 : -1;
-        native::ee_shadow_begin(alpha, single_view, split_y);
+        const bool quad_view = retail_view && view_count >= 3 && view_count <= 4 && view_index < view_count;
+        native::ee_shadow_begin(alpha, single_view, split_y, quad_view);
     }
 
     set(4, alpha);

@@ -2,7 +2,7 @@
 // projection trace.
 //
 // Widescreen follows upstream 1.0 (src/game_patches.cpp): the game's own
-// display mode, forced by AspectRatio=16:9 / 4:3 or left to the game (auto);
+// display mode, projected at the drawable or selected fixed ratio (auto follows the game);
 // movies stay 4:3. This fork's earlier race-only wide camera
 // (docs/NATIVE_CAMERA_ASPECT.md) is retired. The aspect the GS command stream
 // carries per frame is the one game_patches_vblank reports through
@@ -29,7 +29,7 @@ extern LodViewCounts g_lod_view;  // src/hle_lod.cpp
 
 int eod_presentation_aspect() {
     const int requested = presentation::requested.load(std::memory_order_relaxed);
-    return requested >= 0 ? requested : display_aspect(g_config.aspect);
+    return requested >= 0 ? requested : display_aspect(g_config.aspect, presentation::active_drawable());
 }
 
 // Camera view of player 0 (EOD_CAMERA_TRACE, diagnostic). The physcam record of player p is

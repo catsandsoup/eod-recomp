@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+bool session_test_native_lap(); // Headless native-driver integration fixture.
+
 struct SessionRequest {
     std::string mode = "action";   // "action" or "career"
     std::string track;             // Eve track: internal id ("Anoka") or display name
@@ -56,14 +58,26 @@ int session_ai_override();
 // records 0x3CBEE4). refresh() calls guest code, so it must run in guest context (the pad-read hook
 // while the main menu is up). Used by the online lobby's TRACK / MODE / CAR / PAINT rows.
 namespace session_catalog {
-struct Track { int eve = 0; std::string name; std::vector<std::string> events; };
-struct Vehicle { uint32_t number = 0; std::string name; uint32_t record = 0; };
+struct Track {
+    int eve = 0;
+    std::string name;
+    std::vector<std::string> events;
+    std::vector<uint32_t> event_types;
+};
+struct Vehicle {
+    uint32_t number = 0;
+    std::string name;
+    uint32_t record = 0;
+    bool is_trailer = false;
+};
 bool refresh();                                   // false while the tables are not loaded yet
 bool ready();
 const std::vector<Track> &tracks();
 const std::vector<Vehicle> &vehicles();
 std::vector<std::string> models();                // distinct vehicle names in table order
 std::vector<uint32_t> paints(const std::string &model);   // vehicle numbers of a model
+bool is_online_driver_choice(const Vehicle &vehicle);
+bool online_vehicle_is_drivable(uint32_t number);
 void dump();                                      // developer: EOD_CATALOG_DUMP=1
 }
 

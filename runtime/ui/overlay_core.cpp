@@ -19,6 +19,7 @@
 #include "../core/config.h"
 #include "../gs/modern_scene.h"
 #include "../platform/platform.h"
+#include "../platform/presentation.h"
 #include "../render/native_renderer.h"
 #include "frontend.h"
 #include "frontend_draw.h"
@@ -50,6 +51,7 @@ std::atomic<uint64_t> g_renderer_notice{0};
 constexpr unsigned kRendererLookBits = 2;
 constexpr uint64_t kRendererLookMask = (1u << kRendererLookBits) - 1;
 std::unique_ptr<frontend::Menu> g_menu;
+std::unique_ptr<game_frontend::Command> g_resumed_invite;
 std::shared_ptr<game_frontend::Network> g_net;
 ImFont *g_font_main;
 menu_input::PadEdges g_pads[2];
@@ -362,7 +364,7 @@ frontend::Input gather_input(bool &toggled) {
 void apply(const frontend::Effects &fx) {
     play(fx.sound);
     if (fx.toggle_plume_look && native::look_available()) {
-        modern::toggle_from_input();
+        modern::toggle_from_input("settings menu");
         refresh_host();
     }
     if (fx.fullscreen) platform_set_fullscreen(g_config.fullscreen);
@@ -502,7 +504,7 @@ bool overlay_key(int vk, bool down) {
     }
     if (down && vk == 0x70) {
         if (!g_context) ensure_context();
-        if (g_menu && g_menu->error_active()) return true;
+        if (g_menu && (g_menu->error_active() || g_menu->online_modal_title())) return true;
         if (vk == 0x70 && g_open && g_menu && g_menu->rebinding() < 0) { open_menu(false); play(frontend::Sound::Back); return true; }
         if (!g_open) { open_menu(true); play(frontend::Sound::Select); return true; }
     }
@@ -566,6 +568,11 @@ void overlay_show_online() {
     if (!g_open) { open_menu(true); play(frontend::Sound::Select); }
 }
 
+void overlay_resume_join(const game_frontend::Command &command) {
+    g_resumed_invite = std::make_unique<game_frontend::Command>(command);
+    netplay::session().submit(command);
+}
+
 // Developer test hook: EOD_MENU_SCRIPT="FRAME:ROW[:left|right],..." presses a menu row by its id at a presented
 // frame (game vblanks plus frames drawn while the menu holds the game), through the menu's own input path.
 static void menu_script(frontend::Input &in) {
@@ -625,6 +632,14 @@ void overlay_frame() {
     netplay::session().poll();   // network pump: every vblank, also with the menu closed or headless
     if (menu_trace && platform_time_us() - poll_t0 > 50000)
         fprintf(stderr, "[menu] STALL: network pump held the game thread %llu ms\n", (unsigned long long)((platform_time_us() - poll_t0) / 1000));
+    static const bool trace_names = std::getenv("EOD_NETPLAY_TEST_NAMES") != nullptr;
+    if (!g_available && !trace_names) return;
+    if (g_available && g_resumed_invite) {
+        overlay_show_online();
+        g_menu->remember_join(*g_resumed_invite);
+        g_resumed_invite.reset();
+    }
+    const auto tags = (!g_open || trace_names) ? netplay::session().driver_tags() : std::vector<netplay::names::Tag>{};
     if (!g_available) return;
     const uint64_t renderer_notice = g_renderer_notice.load(std::memory_order_relaxed);
     const bool show_renderer_look = renderer_notice && (renderer_notice >> kRendererLookBits) > platform_time_us();
@@ -637,7 +652,7 @@ void overlay_frame() {
             if (g_pads[p].update(s).toggle) toggled = true;
         }
         if (toggled || g_open) { ensure_context(); g_open = false; open_menu(true); play(frontend::Sound::Select); }
-        if (!g_open && !g_config.show_fps && !show_renderer_look && netplay::session().strip().empty()) return;
+        if (!g_open && !g_config.show_fps && !show_renderer_look && netplay::session().strip().empty() && tags.empty()) return;
     }
     ensure_context();
     refresh_host();
@@ -651,7 +666,7 @@ void overlay_frame() {
     bool toggled = false;
     frontend::Input in = gather_input(toggled);
     menu_script(in);
-    if (toggled && !g_menu->error_active()) {
+    if (toggled && !g_menu->error_active() && !g_menu->online_modal_title()) {
         open_menu(!g_open);
         play(g_open ? frontend::Sound::Select : frontend::Sound::Back);
     } else if (g_open && g_import_state != 1) {
@@ -677,8 +692,9 @@ void overlay_frame() {
         if (!any) g_release_wait = false;
     }
     const std::string strip = netplay::session().strip();
+    const auto *event_results = netplay::session().event_results();
     const std::vector<std::string> speakers = netplay::session().speakers();
-    if (!g_open && !g_config.show_fps && !show_renderer_look && strip.empty() && speakers.empty()) {
+    if (!g_open && !g_config.show_fps && !show_renderer_look && strip.empty() && speakers.empty() && !event_results && tags.empty()) {
         if (g_published_any) {
             g_published_any = false;
             std::lock_guard<std::mutex> lk(g_pub_mtx);
@@ -706,6 +722,22 @@ void overlay_frame() {
     c.version = EOD_RECOMP_VERSION;
     if (g_import_state == 1) c.busy = "INSTALLING YOUR DISC...";
     ImDrawList *dl = ImGui::GetForegroundDrawList();
+    if (!g_open && !tags.empty()) {
+        const int requested = presentation::requested.load(std::memory_order_relaxed);
+        const auto rect = display_rect(requested >= 0 ? requested : display_aspect(g_config.aspect, presentation::active_drawable()), w, h);
+        const float scale = rect.height / 720.f;
+        for (const auto &tag : tags) {
+            const float size = scale * (15.f + 12.f / (1.f + tag.distance / 18.f));
+            const ImVec2 text = g_font_main->CalcTextSizeA(size, FLT_MAX, 0.f, tag.name.c_str());
+            const float x = rect.x + tag.x * rect.width - text.x * 0.5f;
+            const float y = rect.y + tag.y * rect.height - text.y - 3.f * scale;
+            dl->PushClipRect(ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.width, rect.y + rect.height), true);
+            dl->AddRectFilled(ImVec2(x - 4.f * scale, y - scale), ImVec2(x + text.x + 4.f * scale, y + text.y + scale),
+                              IM_COL32(14, 12, 10, 180), 3.f * scale);
+            dl->AddText(g_font_main, size, ImVec2(x, y), IM_COL32(255, 250, 238, 255), tag.name.c_str());
+            dl->PopClipRect();
+        }
+    }
     if (g_open) frontend_draw::draw_menu(dl, *g_menu, c, g_hits);
     else g_hits.clear();
     if (show_renderer_look && (!g_open || g_menu->tab() != frontend::Tab::Graphics)) {
@@ -723,6 +755,39 @@ void overlay_frame() {
         dl->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, 38), IM_COL32(24, 14, 8, 215));
         dl->AddRectFilled(ImVec2(0, 36), ImVec2((float)w, 38), IM_COL32(230, 120, 30, 255));
         dl->AddText(g_font_main, 22.f, ImVec2(18, 7), IM_COL32(255, 160, 50, 255), strip.c_str());
+    }
+    if (event_results) {
+        using netplay::EventFinishState;
+        const float scale = std::min(w / 720.f, h / 640.f);
+        const float width = 490.f * scale;
+        const float height = (93.f + 27.f * event_results->size()) * scale;
+        const float x = (w - width) * 0.5f, y = (h - height) * 0.5f;
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height), IM_COL32(24, 14, 8, 245), 8.f * scale);
+        dl->AddText(g_font_main, 31.f * scale, ImVec2(x + 24.f * scale, y + 14.f * scale),
+                    IM_COL32(255, 180, 80, 255), "Event results");
+        float row_y = y + 59.f * scale;
+        for (const auto &row : *event_results) {
+            std::string status;
+            switch (row.state) {
+            case EventFinishState::Finished: status = "Finished"; break;
+            case EventFinishState::Totalled: status = "Totalled"; break;
+            case EventFinishState::Completed: status = "Event complete"; break;
+            case EventFinishState::BattleScore: status = std::to_string(row.score) + (row.score == 1 ? " point" : " points"); break;
+            case EventFinishState::Withdrawn: status = "Withdrew"; break;
+            case EventFinishState::Disconnected: status = "Disconnected"; break;
+            case EventFinishState::TimedOut: status = "Time expired"; break;
+            case EventFinishState::Survivor: status = "Winner"; break;
+            case EventFinishState::Active: break;
+            }
+            const std::string rank = row.rank ? std::to_string(row.rank) : "-";
+            const auto color = IM_COL32(250, 240, 225, 255);
+            dl->AddText(g_font_main, 22.f * scale, ImVec2(x + 24.f * scale, row_y), color, rank.c_str());
+            dl->AddText(g_font_main, 22.f * scale, ImVec2(x + 70.f * scale, row_y), color, row.name.c_str());
+            dl->AddText(g_font_main, 22.f * scale, ImVec2(x + 325.f * scale, row_y), color, status.c_str());
+            row_y += 27.f * scale;
+        }
+        dl->AddText(g_font_main, 20.f * scale, ImVec2(x + 24.f * scale, row_y + 3.f * scale),
+                    IM_COL32(255, 180, 80, 255), "Returning to the lobby...");
     }
     if (!speakers.empty()) {
         float y = strip.empty() ? 18.f : 48.f;

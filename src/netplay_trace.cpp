@@ -2,6 +2,7 @@
 // modify native inputs only when requested. Normal offline behavior is retained.
 #include "netplay_trace.h"
 #include "netplay_car.h"
+#include "netplay_impact_fixture.h"
 #include "netplay_session.h"
 #include "../runtime/core/memory.h"
 #include "../runtime/kernel/kernel.h"
@@ -78,6 +79,37 @@ void netplay_trace_pad(int port,int slot,uint32_t length,const uint8_t *data) {
  for(int i=0;i<20;++i)std::fprintf(f,"%02x",data[i]);
  std::fputs("\"}\n",f);
 }
+// SLUS_209.10's incident dispatcher (2577F0) starts this orbit for a qualifying
+// crash. The native single-viewport check passes on every online machine. The
+// orbit requests a physics pause at 1D4020 and resumes after 3s at 1C6AF0.
+extern "C" void f_001D3FB8_orig(void);
+extern "C" void f_001D3FB8(void) {
+    if (netplay::session().event_active()) {
+        if (std::getenv("EOD_NETPLAY_LIFECYCLE"))
+            std::fprintf(stderr, "[netplay] crash camera skipped at native tick %u\n", ee_r32(0x003CDA8C));
+        return;
+    }
+    f_001D3FB8_orig();
+}
+
+extern "C" void f_00189648_orig(void);
+extern "C" void f_00189648(void) {
+    // This native callback receives the solved impulse for each body. It
+    // calls the damage routine only above a second, higher threshold.
+    // A light push still needs the same ownership handoff as a hard hit.
+    const uint32_t victim = R[4].uw[0], impulse = R[5].uw[0], other = R[8].uw[0];
+    if (netplay::session().event_active() && R[7].uw[0] == 0x6D &&
+        other && !(other & 3) && other <= EE_RAM_SIZE - 0x1E0 &&
+        impulse && !(impulse & 3) && impulse <= EE_RAM_SIZE - 12) {
+        float v[3];
+        ee_read_block(impulse, v, sizeof(v));
+        const float strength2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        if (strength2 > .01f)
+            netplay::session().car_contact(victim, static_cast<int32_t>(ee_r32(other + 0x1DC)), other);
+    }
+    f_00189648_orig();
+}
+
 extern "C" void f_00177718_orig(void);
 extern "C" void f_00177718(void) {
  netplay::session().step_begin();
@@ -95,7 +127,17 @@ extern "C" void f_0038FF40(void) {
  f_0038FF40_orig();
  if(port==0 && dst<EE_RAM_SIZE-32 && R[2].uw[0]>=4) {
   // online lobby START while the native main menu waits: press ACTION for the player
-  const uint16_t press=netplay::session().menu_buttons();
+  uint16_t press=netplay::session().menu_buttons();
+  const auto &fixture = netplay_impact_fixture::observation;
+  static const bool recovery_drive = netplay_impact_fixture::enabled() && std::getenv("EOD_NETPLAY_TEST_BATTLE_RESPAWN");
+  const bool driver = (fixture.observer && fixture.local_slot == 2) ||
+                      (recovery_drive && fixture.local_slot == 0 && fixture.tick >= 135);
+  if (slot == 0 && driver && netplay::session().event_active() && netplay::session().step_allowed()) {
+   // Hold the fixture driver's real native accelerator after the starting grid is
+   // bound. An absolute vblank script could select a menu on slower hosts.
+   press |= 0x4000;
+   if (R[2].uw[0] > 14) ee_w8(dst + 14, 220);
+  }
   if(press){uint16_t keys=uint16_t(~(ee_r8(dst+2)|(ee_r8(dst+3)<<8)));keys|=press;ee_w8(dst+2,uint8_t(~keys));ee_w8(dst+3,uint8_t(~keys>>8));}
  }
  if(trace() && R[2].uw[0] && dst<EE_RAM_SIZE-32) {

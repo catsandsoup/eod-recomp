@@ -294,3 +294,74 @@ track world renderer (`0x358BD0`), shadows (`0x35D298`), the immediate geometry 
 (`0x363DE8`/`0x363F48`), plus the camera, matrix, material and texture state they consume. HUD,
 menus and fonts do not start VU1 programs; they are PATH2/PATH3 GS work and need their own count
 (milestone M6).
+
+### PATH3 palette and mip transfers
+
+The two calls from `0x35EEA8` to `0x35FC40` return to `0x35EF54`
+(palette) and `0x35F184` (mip). Both supply the EE source pointer,
+destination block, transfer dimensions, pitch, Y offset and game pixel
+type. The typed producer in `src/native_texture_upload.cpp` records these
+values when it builds the byte-identical guest chain. A texture can reuse
+either bank's cached chain long after creation.
+
+On channel 2, an unmodified nine-qword prefix at a registered address
+submits that transfer directly. It reads the source at DMA execution,
+preserves its bytes through deferred PATH3 unmasking, then uses the GS
+transfer writer with the same four ordered register writes. The following
+EOP and CALL/RET tags still govern release and channel completion. The
+producer records each empty fence separately. The GS worker consumes it
+at its original masked-release position, including packet completion on EOP. A
+mutated prefix, evicted recipe, partial preceding GIF tag or portable
+capture takes the ordinary path. `EOD_NATIVE_TEXTURE_UPLOAD=0` selects
+the reference path in R7. Other builds opt in with `=1`. Under
+`EOD_R7_AUDIT=1` the separate `[r7-texture]` line counts transfers and
+IMAGE qwords delivered by the typed producer.
+
+`NativeTextureUploadProducer` compares the returned size and guest bytes
+against the generated retail function for 60 format, size and fence
+combinations. It changes each byte of the cached prefix in turn to check
+stale-recipe rejection. A separate CPU differential used the production
+DMA and GS code with the GS thread on and off. Nine snapshots covered
+all 4 MiB of VRAM, page generations, transfer and path state, and DMA
+channel state. All four streams matched. The fixture admitted 13 uploads
+(1,268 IMAGE qwords). Parsed PATH3 fell from 1,857 to 511 qwords,
+including 230 IMAGE qwords retained by the deliberately altered-chain
+and partial-tag cases. These counts describe the initial upload fixture.
+
+### R7 ordered material state and boot transfers
+
+`0x35F9A0` supplies the mip addresses, dimensions and pixel formats for
+the texture bind. `0x3620A8` calls `0x361F80` at return address
+`0x362588` to construct the dirty render-state packet. Both still build
+the retail EE buffer. VIF admits the corresponding typed GS state only
+after checking the DMA tag, the complete VIF buffer, its copy at VU TOP
+and the installed 0x2538 microprogram. The GS worker applies the fields
+in producer order. Render flags bit zero selects the alpha test and can
+request both a PRIM setup and a TEST write in the same commit.
+`EOD_NATIVE_MATERIAL_STATE=0` selects the original PATH1 transport.
+
+`0x363708` reserves four qwords at `0x363720` to select a shadow blend
+and vertex color. VIF checks the reserved address and both the original
+and queued bytes before issuing the typed PATH2 command. The startup
+clear, clipped display history and rotating quad preserve their final
+vertex FIFO, attributes and EOP state directly after native submission.
+
+On PATH3, SDK submitter `0x3896E8` transfers sixteen 256 KiB pages on
+boot. The native path verifies the producer, SDK header and idle channel
+and reads the EE staging bytes for every page. The second bank finalizer
+`0x365878` appends its EOP before the list terminator. A partial preceding
+tag takes the compatibility path. The real DMA list controls CALL/RET,
+termination and channel completion.
+
+On macOS the four default 300-frame release cases (menu, Anoka race,
+Dundas battle and Hampton battle) each recorded zero parsed qwords on
+PATH1, PATH2 and PATH3. A reference comparison checked 35 ordered CPU
+snapshots, including all four MiB of VRAM, page generations, GS and path
+registers, pending transfers and DMA state, with single-threaded and
+threaded GS. It covered all sixteen boot pages, masked one-packet releases,
+a mutated upload, a partial tag, both shadow-blend states and material
+state. All four 146,943,160-byte streams matched. A separate live Anoka
+instrumentation run replayed each accepted bootstrap packet with draws
+disabled and compared every GS state field, path state, attribute tracking
+and register generation. All three history copies, the startup clear and
+fifteen rotating quads matched (519 reference qwords).

@@ -38,6 +38,17 @@ void arcade_mod_badges_run_menu(uint32_t, void (*run_menu)()) { run_menu(); }
 extern "C" {
 }
 int main() {
+    using session_catalog::is_online_driver_choice;
+    CHECK(is_online_driver_choice({14, "Moth", 0}));
+    CHECK(is_online_driver_choice({505, "Bus", 0}));
+    CHECK(is_online_driver_choice({600, "Custom Hatchback", 0}));
+    CHECK(!is_online_driver_choice({0, "", 0}));
+    for (uint32_t id = 400; id <= 413; ++id)
+        CHECK(!is_online_driver_choice({id, "Renamed attachment", 0}));
+    CHECK(!is_online_driver_choice({701, "Trailer", 0}));
+    CHECK(!is_online_driver_choice({701, "trailer6", 0}));
+    CHECK(is_online_driver_choice({702, "Trailer Rally", 0}));
+    CHECK(!is_online_driver_choice({702, "Towable Camper", 0, true}));
     SessionRequest r; std::string e;
     CHECK(session_parse("mode=action;track=Anoka;event=Battle (8 AI);car=Phantom;paint=0;humans=1", r, e));
     CHECK(r.track == "Anoka" && r.event == "Battle (8 AI)" && r.car == "Phantom" && r.paint == 0 && r.laps == -1);

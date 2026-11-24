@@ -53,7 +53,7 @@ struct Config {
     bool fullscreen = false;         // borderless window covering the monitor
     int width = 1280, height = 960;  // window client size (windowed mode; SDL logical points on macOS)
     bool vsync = true;
-    std::string aspect = "auto";     // auto (the game's own 4:3 / 16:9 option) | 4:3 | 16:9 | stretch
+    std::string aspect = "display";  // match the drawable | auto (game option) | 4:3 | 16:9 | 16:10 | stretch
 #ifdef __APPLE__
     int render_scale = 0;  // 0 = auto (Vulkan: the scale nearest the window pixel height)
 #else
@@ -65,6 +65,7 @@ struct Config {
     // the modern renderer (Windows, d3d11): switched live in the Graphics panel, F9 or L1+R1+R3;
     // its effects in percent of the default look (docs/SCENE_CAPTURE.md "Modern renderer")
     ModernRendererPreference modern_renderer;
+    ModernRendererPreference plume_modern; // native Plume look, independent of the legacy GS preference
     // the native renderer (docs/NATIVE_RENDERER.md, R1): queued 3D objects drawn by plume
     bool native_renderer = false;
     // split-screen views run the single-view track passes, mlist and water (P8; docs/NATIVE_RENDERER.md R2)
@@ -112,8 +113,10 @@ struct Config {
     // detached wheel/panel debris pools grow past the scene's PS2 phob count (offline only;
     // online events keep the PS2 pools so every peer simulates the same; src/debris_pool.cpp)
     bool expand_debris = true;
-    // [Cheats & Gameplay Mods]
+    // [Online]
     std::string nickname; // empty chooses a new callsign for each online session
+    int snapshot_buffer_ms = 100;
+    // [Cheats & Gameplay Mods]
     bool unlock_all = true;            // unlock all cars, tracks, dares, and feats out of the box
     bool career_cheats = true;         // allow cheats in career mode (master cheat flag)
     bool cheat_turbo = false;          // turbo boost active on L2

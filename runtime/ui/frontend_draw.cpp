@@ -228,6 +228,8 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
     // dim the game
     dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, 150));
     const bool err = m.error_active();
+    const auto &rows = m.rows();
+    const char *online_modal = m.online_modal_title();
 
     // panels' geometry
     const float top = 150 * s, bottom = H - 96 * s;
@@ -269,10 +271,10 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
         const ImVec2 a(bx + 250 * k, 84 * s), b(bx + 1030 * k, 128 * s);
         dl->AddRectFilled(a, b, IM_COL32(14, 12, 11, 235), 6 * s);
         dl->AddRect(a, b, IM_COL32(110, 98, 86, 255), 6 * s, 0, 2 * s);
-        if (err) {
-            const std::string t = upper(m.error_title());
+        if (err || online_modal) {
+            const std::string t = err ? upper(m.error_title()) : online_modal;
             float px = fit(d, 30 * s, b.x - a.x - 30 * s, t.c_str());
-            text(d, px, (a.x + b.x - text_size(d, px, t.c_str()).x) * 0.5f, a.y + 7 * s, kRed, t.c_str());
+            text(d, px, (a.x + b.x - text_size(d, px, t.c_str()).x) * 0.5f, a.y + 7 * s, err ? kRed : kOrange, t.c_str());
         } else {
             const int n = (int)frontend::Tab::Count;
             const float tw = (b.x - a.x) / n;
@@ -295,7 +297,6 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
     panel(d, ra, rb);
 
     // left: rows
-    const auto &rows = m.rows();
     const float pad = 22 * s, rh = 46 * s;
     const float lx0 = la.x + pad, lx1 = lb.x - pad, ly0 = la.y + pad, ly1 = lb.y - pad;
     const int visible = std::max(1, (int)((ly1 - ly0) / rh));
@@ -486,10 +487,10 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
         dl->AddRect(a, b, IM_COL32(110, 98, 86, 255), 10 * s, 0, 2.5f * s);
         dl->AddRect(ImVec2(a.x + 4 * s, a.y + 4 * s), ImVec2(b.x - 4 * s, b.y - 4 * s), IM_COL32(60, 52, 44, 255), 8 * s, 0, 1.5f * s);
         struct P { G g; const char *label; };
-        std::vector<P> ps = {{G::Navigate, "NAVIGATE"}, {G::Accept, "SELECT / TOGGLE"}, {G::Back, err ? "BACK" : "BACK / CLOSE"}};
+        std::vector<P> ps = {{G::Navigate, "NAVIGATE"}, {G::Accept, "SELECT / TOGGLE"}, {G::Back, err || online_modal ? "BACK" : "BACK / CLOSE"}};
         if (m.rebinding() >= 0) ps = {{G::Back, "CANCEL (ESC)"}};
         else if (m.editing_text()) ps = {{G::Accept, "CONFIRM"}, {G::Back, "CANCEL"}};
-        else if (!err) {
+        else if (!err && !online_modal) {
             if (m.tab() == frontend::Tab::Mods) {
                 ps.push_back({G::Details, "MOD DETAILS"});
                 ps.push_back({G::Move, "LOAD ORDER"});

@@ -37,13 +37,15 @@ namespace d3d11 {
 EOD_HW_DECLARE
 }
 namespace vulkan {
+void stop_pipeline_worker();
 EOD_HW_DECLARE
 struct ClutSnapshot;
 void vram_write_complete();
 #ifdef EOD_PLUME
-bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback);
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback, const int *bounds);
 bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth, bool check_ownership);
-bool native_begin_depth_clear(const Env &e, NativeSurfaces &out);
+bool native_begin_depth_clear(const Env &e, NativeSurfaces &out, const int *bounds);
+NativeSubmission native_submission();
 void native_mark_bootstrap_depth_clear(const Env &e);
 void native_end();
 bool native_display_copy(const Env &e);
@@ -105,6 +107,7 @@ void bind_thread() { EOD_HW_FORWARD(bind_thread()); }
 void vblank() { EOD_HW_FORWARD(vblank()); }
 void reset() { EOD_HW_FORWARD(reset()); }
 void finish() { EOD_HW_FORWARD(finish()); }
+void stop_pipeline_worker() { vulkan::stop_pipeline_worker(); }
 void stats_line(char *buf, size_t size) { EOD_HW_FORWARD(stats_line(buf, size)); }
 void modern_texture(int32_t batch, const Env &e) { EOD_HW_FORWARD(modern_texture(batch, e)); }
 void modern_draw(modern::Frame *f) { EOD_HW_FORWARD(modern_draw(f)); }
@@ -112,13 +115,16 @@ void modern_alpha(int32_t batch, uint32_t alpha) { EOD_HW_FORWARD(modern_alpha(b
 
 bool vulkan_active() { return g_on && g_vk; }
 #ifdef EOD_PLUME
-bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback) {
-    return g_vk && vulkan::native_begin(e, depth, out, require_no_readback);
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback, const int *bounds) {
+    return g_vk && vulkan::native_begin(e, depth, out, require_no_readback, bounds);
 }
 bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth, bool check_ownership) {
     return g_vk && vulkan::native_cached_targets(e, color, depth, check_ownership);
 }
-bool native_begin_depth_clear(const Env &e, NativeSurfaces &out) { return g_vk && vulkan::native_begin_depth_clear(e, out); }
+NativeSubmission native_submission() { return g_vk ? vulkan::native_submission() : NativeSubmission{}; }
+bool native_begin_depth_clear(const Env &e, NativeSurfaces &out, const int *bounds) {
+    return g_vk && vulkan::native_begin_depth_clear(e, out, bounds);
+}
 void native_mark_bootstrap_depth_clear(const Env &e) {
     if (g_vk) vulkan::native_mark_bootstrap_depth_clear(e);
 }

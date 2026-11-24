@@ -7,7 +7,7 @@
 //   'BATC' u32 pc, itop, kick0, kicks; u64 geom; f32 model[12] (rows of the 3x4 world
 //          matrix); f32 light[4] (q17 rotated to world, normalised; .w = q17.w);
 //          f32 dir2[4] (vf12 rotated to world); f32 mvp[16] (the batch's model->GS
-//          screen matrix, columns vf4..vf7)
+//          screen matrix, columns vf4..vf7); u32 sky_dome (classifier result; absent in older captures)
 //   'CAMR' u64 frame, f32 cam[16] (columns vf4..vf7 of a world batch: world -> GS screen)
 //   'KICK' u32 run, u32 qwc, packet (EOD_SCENE_EMIT_VERIFY frame only; PATH1)
 //   'VBLK' u64 frame; u32 batches, geoms; u64 producer ns this frame
@@ -100,6 +100,7 @@ bool geometry_program(uint32_t pc) {
 }
 
 struct Batch {
+    uint32_t sky_dome;
     uint32_t pc, itop, kick0, kicks;
     uint64_t geom;
     float mvp[16];  // column-major: column c = vf[4 + c]
@@ -801,7 +802,7 @@ void flush_frame() {
             for (int c = 0; c < 4; c++) model[r * 4 + c] = (float)M[r][c];
         world_dir(M, b.q17, light);
         world_dir(M, b.vf12, dir2);
-        rec(fourcc("BATC"), 16 + 8 + 48 + 16 + 16 + 64);
+        rec(fourcc("BATC"), 16 + 8 + 48 + 16 + 16 + 64 + 4);
         uint32_t h[4] = {b.pc, b.itop, b.kick0, b.kicks};
         put(h, 16);
         put(&b.geom, 8);
@@ -809,6 +810,7 @@ void flush_frame() {
         put(light, 16);
         put(dir2, 16);
         put(b.mvp, 64);
+        put(&b.sky_dome, sizeof b.sky_dome);
     }
     uint32_t counts[2] = {(uint32_t)g_batches.size(), g_new_geoms};
     rec(fourcc("VBLK"), 8 + 8 + 8);
@@ -914,6 +916,7 @@ bool vu1_start(const VUState *vu, uint32_t pc) {
             if (ok) {
                 Batch b;
                 b.pc = pc;
+                b.sky_dome = sky_dome;
                 b.itop = g_vif1_itop;
                 b.kick0 = g_kicks;
                 b.kicks = 0;

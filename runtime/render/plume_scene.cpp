@@ -192,8 +192,8 @@ plume::RenderPipeline *PipelineCache::make_pipeline(uint32_t key) {
 }
 
 void bind_indexed_mesh(plume::RenderCommandList &list, const plume::RenderBuffer &buffer,
-                       uint32_t vertex_bytes, uint64_t index_offset, uint32_t index_bytes) {
-    const plume::RenderVertexBufferView vertices(buffer.at(0), vertex_bytes);
+                       uint32_t vertex_bytes, uint64_t index_offset, uint32_t index_bytes, uint64_t vertex_offset) {
+    const plume::RenderVertexBufferView vertices(buffer.at(vertex_offset), vertex_bytes);
     const plume::RenderInputSlot slot(0, sizeof(Vertex));
     list.setVertexBuffers(0, &vertices, 1, &slot);
     const plume::RenderIndexBufferView indices(buffer.at(index_offset), index_bytes, plume::RenderFormat::R32_UINT);

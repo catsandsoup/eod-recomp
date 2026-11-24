@@ -58,6 +58,13 @@ int main(int argc,char**argv){
     unsetenv("EOD_MOD_DIR");g_config.unlock_all=false;setenv("EOD_UNLOCK_ALL","0",1); // explicit override wins
     require(mac_app_select_mods(false)&&!g_config.unlock_all,14);
     unsetenv("EOD_UNLOCK_ALL");unsetenv("EOD_MOD_DIR");
+    // A standalone checkout can share the installed app's staged bundle assets.
+    const fs::path staged = root / "bundle-mods" / "integrated";
+    fs::create_directories(staged.parent_path());
+    fs::rename(content, staged);
+    require(mac_app_activate_integrated(&why) && fs::path(getenv("EOD_MOD_DIR")) == staged, 15);
+    unsetenv("EOD_MOD_DIR");
+    fs::rename(staged, content);
     // Explicit developer override is left exactly alone, even with broken built-in content.
     setenv("EOD_MOD_DIR","sentinel",1);
     fs::remove(content/"INTEGRATED.MANIFEST");

@@ -56,7 +56,8 @@ def load(path):
         elif t == T['BATC']:
             pc, itop, k0, kn, gid = struct.unpack_from('<IIIIQ', p, 0)
             f = struct.unpack_from('<12f4f4f16f', p, 24)
-            cur.append(('b', dict(pc=pc, itop=itop, kick0=k0, kicks=kn, geom=gid,
+            sky_dome = bool(struct.unpack_from('<I', p, 168)[0]) if len(p) >= 172 else None
+            cur.append(('b', dict(pc=pc, itop=itop, kick0=k0, kicks=kn, geom=gid, sky_dome=sky_dome,
                                   model=np.vstack([np.array(f[:12]).reshape(3, 4), [0, 0, 0, 1]]),
                                   light=np.array(f[12:16]), dir2=np.array(f[16:20]),
                                   mvp=np.array(f[20:36]).reshape(4, 4).T)))

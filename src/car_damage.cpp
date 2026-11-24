@@ -36,7 +36,11 @@
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/limit_tracker.h"
+#include "core/trace.h"
 #include "core/memory.h"
+#include "netplay_impact_fixture.h"
+#include "netplay_damage_detail.h"
+#include "netplay_hooks.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -60,6 +64,8 @@ void f_001E0DC8(void);  // DetachedPanelPoolInit / spawn (car, bit, centre, min,
 void f_001741C0(void);  // CareerIsFreeRoamActive
 void f_001E06A8(void);  // CarSuspension(car index, out)
 void f_0017D770(void);  // CarPointVelocity(car, out, point)
+void f_001B2DD8(void);  // reset one detached wheel to its unused pool state
+void f_001E2738(void);  // reset one detached panel to its unused pool state
 void f_001B3068(void);  // DetachedWheelSpawn(car index, wheel, matrix, velocity, position)
 void f_00331E48(void);  // DebugPrintf
 void f_001DA468(void);  // CarImpaired(car index, other)
@@ -151,6 +157,7 @@ constexpr uint32_t kContactSlots = 16;           // obj+0x190 .. obj+0x1CC (coun
 uint32_t g_contacts_peak = 0;
 
 void contact_record() {
+    EOD_ZONE("physics.contact_record");
     const uint32_t obj = reg(4), id = reg(5), impulse = reg(6), point = reg(7);
     const uint32_t t0 = reg(8), alt = reg(9), t2 = reg(10);
     const float scale = g_ee.fpr[12].f;
@@ -320,6 +327,24 @@ uint32_t dent_bones(uint32_t car, uint32_t sp) {
     return nearest;
 }
 
+void spawn_panel(uint32_t car, uint32_t sp, uint32_t panel) {
+    // off: a detached panel phob from the panel's box (0x1E0DC8)
+    const uint32_t bit = lwu(panel + 8);
+    const uint32_t box = lwu(car + 0x25C) + bit * 0x18 + 0x2150;
+    const float h = bf(kHalfNeg);
+    const float bx = fadd_ps2(lf(box), lf(box + 0xC));
+    sf(sp + kBone, bx);
+    const float by = fadd_ps2(lf(box + 4), lf(box + 0x10));
+    sf(sp + kBone + 4, by);
+    const float bz = fadd_ps2(lf(box + 8), lf(box + 0x14));
+    sf(sp + kBone, fmul_ps2(bx, h));
+    sf(sp + kBone + 4, fmul_ps2(by, h));
+    sf(sp + kBone + 8, fmul_ps2(bz, h));
+    set(4, (int32_t)car), set(5, (int32_t)(1u << (bit & 31))), set(6, (int32_t)(sp + kBone));
+    set(7, (int32_t)box), set(8, (int32_t)(box + 0xC)), set(9, lw(panel + 0x34)), set(10, (int32_t)(panel + 0x38));
+    call(f_001E0DC8, 0x18D1D0);
+}
+
 // Panels: a panel whose bone moved further than its distance comes loose (state 2) or off (3).
 void update_panels(uint32_t car, uint32_t sp) {
     for (uint32_t i = 0; i < 8; i++) {
@@ -353,21 +378,7 @@ void update_panels(uint32_t car, uint32_t sp) {
             }
         }
         if (state != 3) continue;
-        // off: a detached panel phob from the panel's box (0x1E0DC8)
-        const uint32_t bit = lwu(panel + 8);
-        const uint32_t box = lwu(car + 0x25C) + bit * 0x18 + 0x2150;
-        const float h = bf(kHalfNeg);
-        const float bx = fadd_ps2(lf(box), lf(box + 0xC));
-        sf(sp + kBone, bx);
-        const float by = fadd_ps2(lf(box + 4), lf(box + 0x10));
-        sf(sp + kBone + 4, by);
-        const float bz = fadd_ps2(lf(box + 8), lf(box + 0x14));
-        sf(sp + kBone, fmul_ps2(bx, h));
-        sf(sp + kBone + 4, fmul_ps2(by, h));
-        sf(sp + kBone + 8, fmul_ps2(bz, h));
-        set(4, (int32_t)car), set(5, (int32_t)(1u << (bit & 31))), set(6, (int32_t)(sp + kBone));
-        set(7, (int32_t)box), set(8, (int32_t)(box + 0xC)), set(9, lw(panel + 0x34)), set(10, (int32_t)(panel + 0x38));
-        call(f_001E0DC8, 0x18D1D0);
+        spawn_panel(car, sp, panel);
     }
 }
 
@@ -426,11 +437,24 @@ inline uint32_t hit_side(uint32_t sp) {
 }
 
 void apply_collision_damage() {
+    EOD_ZONE("physics.collision_damage");
     Frame fr;
     const uint32_t sp = fr.sp();
     const uint32_t car = reg(4), impulse = reg(5), point = reg(6), negate = reg(7);
     const int32_t other = (int32_t)reg(8);
     const uint32_t surface = reg(9);
+
+#ifdef EOD_TRACY
+    if (lwu(car + 0x1E0) == 0x50) {
+        EOD_PLOT("Player contact surface", surface);
+        EOD_PLOT("Player contact other", other);
+        const float vx = lf(impulse), vy = lf(impulse + 4), vz = lf(impulse + 8);
+        TracyPlot("Player contact impulse squared", double(vx) * vx + double(vy) * vy + double(vz) * vz);
+        static const bool contact_log = std::getenv("EOD_RACE_STRESS_TRACE") != nullptr;
+        if (contact_log) std::fprintf(stderr, "[race-contact] vb=%u surface=%u other=%d impulse2=%.3f\n",
+            ee_r32(0x003E579C), surface, other, double(vx) * vx + double(vy) * vy + double(vz) * vz);
+    }
+#endif
 
     const bool report = (++g_dent.calls & (g_dent.calls - 1)) == 0 || g_dent.calls % 1024 == 0;
     struct Report {
@@ -438,7 +462,9 @@ void apply_collision_damage() {
         ~Report() { if (on) dent_report(); }
     } at_end{report};
     call(f_0018AAD0, 0x18CAF0);
-    if (g_ee.r[2].ud[0] == 0) return;
+    const bool can_damage = g_ee.r[2].ud[0] != 0;
+    if (netplay_impact_fixture::enabled()) netplay_impact_fixture::inspect_guard(car, other, surface, can_damage);
+    if (!can_damage) return;
     g_dent.can_damage++;
 
     copy3(sp + kImpulse, impulse);
@@ -450,12 +476,24 @@ void apply_collision_damage() {
     copy3(sp + kPoint, point);
     const float ix = lf(sp + kImpulse), iy = lf(sp + kImpulse + 4), iz = lf(sp + kImpulse + 8);
     const float strength = fsqrt_ps2(madd3(ix, ix, iy, iy, iz, iz));
+    const bool predicted_contact = other >= 0 && fcmp_lt(bf(kHardHit), strength) &&
+        netplay_hooks::car_contact && netplay_hooks::car_contact(car, other);
     sw(sp + kNearest, 0), sw(sp + kNearest + 4, 0), sw(sp + kNearest + 8, 0);
 
     if (dent_bones(car, sp)) update_panels(car, sp);
 
     // damage and wreck state; $v0 as the original leaves it on each path
     const float before = lf(car + 0x1BEC);
+    if (predicted_contact) {
+        // The host's native callback resolves competitive damage once for the
+        // pair. Keep this machine's physical response and cosmetic dents, then
+        // take the absolute health and impairment from the host checkpoint.
+        if (netplay_impact_fixture::enabled())
+            netplay_impact_fixture::contact(car, other, strength, before, before, lwu(car + 0x1BE8));
+        sw(car + 0x1BF8, 0);
+        g_ee.r[2].sd[0] = 0;
+        return;
+    }
     float now = before;
     bool impaired = false;
     int64_t v0 = 0;
@@ -539,6 +577,8 @@ void apply_collision_damage() {
         now = lf(car + 0x1BEC);
     }
 
+    if (netplay_impact_fixture::enabled())
+        netplay_impact_fixture::contact(car, other, strength, before, lf(car + 0x1BEC), lwu(car + 0x1BE8));
     const float delta = fsub_ps2(now, before);
     if (fcmp_lt(bf(kMinDelta), delta)) {
         sf(car + 0x1BF4, fmin_ps2(fadd_ps2(lf(car + 0x1BF4), fmul_ps2(delta, bf(kFlash))), bf(kHalf)));
@@ -547,11 +587,15 @@ void apply_collision_damage() {
             g_ee.fpr[12].f = delta;
             call(f_00202DA8, 0x18D778);
         }
+        float shake = 0.f;
         if (fcmp_le(bf(kShakeFrom), delta)) {
+            shake = fmin_ps2(fmul_ps2(fsub_ps2(delta, bf(kShakeFrom)), bf(kShakeGain)), bf(kShakeMax));
             set(4, (int32_t)car);
-            g_ee.fpr[12].f = fmin_ps2(fmul_ps2(fsub_ps2(delta, bf(kShakeFrom)), bf(kShakeGain)), bf(kShakeMax));
+            g_ee.fpr[12].f = shake;
             call(f_001D4B28, 0x18D7C0);
         }
+        if (other >= 0 && other != lw(car + 0x1DC) && netplay_hooks::damage_feedback)
+            netplay_hooks::damage_feedback(car, lf(car + 0x1BF4), shake);
         // cheat 0x101 (one-hit wrecks) outside free roam
         const uint32_t cheats = lwu(kCheatMask);
         v0 = 0;
@@ -664,14 +708,18 @@ void setup_damage_and_panels() {
 
     int32_t who = lw(car + 0x1E0);
     bool rule = false;
-    if (who == kHuman) {
+    const bool network_player = netplay_hooks::remote_driver_car && netplay_hooks::remote_driver_car(car);
+    const int bus = netplay_hooks::detention_bus_slot;
+    const bool detention = bus >= 0 && netplay_hooks::event_active && netplay_hooks::event_active();
+    const bool player_rules = detention ? ee_r8(car + 0x252) == bus : who == kHuman || network_player;
+    if (player_rules) {
         call(f_00176768, 0x18B574);
         set(4, lw(reg(2) + 0x40));
         call(f_00125388, 0x18B57C);
         const float player = vcall_tweak(lwu(reg(2) + 0x20), kPlayerTweak, 0x18B59C);
         sf(car + 0x4B0, fmul_ps2(lf(car + 0x4B0), player));
         who = lw(car + 0x1E0);
-        rule = who == kHuman;
+        rule = detention || who == kHuman || network_player;
     }
     if (!rule && who == kRemote) {
         set(4, lw(car + 0x1DC));
@@ -698,9 +746,84 @@ void setup_damage_and_panels() {
     g_ee.r[2].ud[0] = (uint64_t)lwu(car + 0x1738) | (uint64_t)lwu(car + 0x173C) << 32;  // last ld of the copy
 }
 
+// The online debris pools use the retail 16-entry windows. A speculative
+// detachment can leave a loose part in the world after its car is repaired.
+void retire_detached_part(uint32_t car, unsigned part, bool wheel) {
+    const uint32_t pool = wheel ? 0x484E68 : 0x494D60;
+    const uint32_t count = lwu(pool + 0x40);
+    if (count > 16) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t phob = lwu(pool + 4*i);
+        if (!phob || (phob & 3) || phob > EE_RAM_SIZE - 0x264 || !lwu(phob + 0x1DC)) continue;
+        const bool same_car = wheel ? lwu(phob + 0x1E0) == lwu(car + 0x1DC) : lwu(phob + 0x1DC) == car;
+        if (same_car && lwu(phob + 0x1E4) == part) {
+            set(4, static_cast<int32_t>(phob));
+            if (wheel) call(f_001B2DD8, 0x18D6A8);
+            else call(f_001E2738, 0x18D1D0);
+        }
+    }
+}
+
 }  // namespace
 
+
+void netplay_damage::apply_parts(uint32_t car, uint16_t panels, uint8_t wheels, int side) {
+    const EEState saved = g_ee;
+    {
+        Frame frame;
+        for (unsigned i = 0; i < 8; ++i) {
+            const uint32_t st = car + 0x13E8 + 0x18*i;
+            const unsigned stage = (panels >> (2*i)) & 3u;
+            const uint32_t previous = lwu(st + 0x14);
+            if (!lwu(st) || lw(st + 4) <= 0 || previous == stage) continue;
+            if (previous == 3) {
+                const unsigned bit = lwu(kPanelTable + 0x40*i + 8) & 31;
+                retire_detached_part(car, 1u << bit, false);
+            }
+            sw(st + 0x14, stage);
+            if (stage == 3) spawn_panel(car, frame.sp(), kPanelTable + 0x40*i);
+            if (stage == 2) {
+                sf(st+0xC, fmax_ps2(bf(kLooseMin3), lf(st+0xC)));
+                sf(st+0x10, fmax_ps2(bf(kLooseMin4), lf(st+0x10)));
+            }
+        }
+        sw(car + 0x1C04, static_cast<uint32_t>(side));
+        for (unsigned i = 0; i < 4; ++i) {
+            const uint32_t flags = car + 0x1A00 + 0x54*i + 0x50;
+            // The retail toss also halves suspension stiffness and creates the loose wheel.
+            const bool missing = (wheels & (1u << i)) != 0;
+            if (missing == ((lwu(flags) & 0x80) != 0)) continue;
+            if (missing) {
+                toss_wheel(car, frame.sp(), i);
+            } else {
+                set(4, lw(car + 0x1DC)); set(5, static_cast<int32_t>(frame.sp() + kSuspension));
+                call(f_001E06A8, 0x18D4F0);
+                const uint32_t susp = lwu(frame.sp() + kSuspension);
+                if (!susp || (susp & 3) || susp > EE_RAM_SIZE - 0x80) continue;
+                const uint32_t stiffness = susp + 0x70 + 4*i;
+                sf(stiffness, fmul_ps2(lf(stiffness), 2.0f));
+                sw(flags, lwu(flags) & ~0x80u);
+                retire_detached_part(car, i, true);
+            }
+        }
+    }
+    g_ee = saved;
+}
+
 extern "C" void f_0017B918(void) { diff_run(0x0017B918, contact_record, f_0017B918_orig); }
+// Impact checkpoints run between native physics steps. The host already handled
+// damage, scoring and debris. Apply just the native visual response for this owner.
+void netplay_hooks::apply_damage_feedback(uint32_t car, float flash, float shake) {
+    sf(car + 0x1BF4, fmax_ps2(lf(car + 0x1BF4), flash));
+    if (shake > 0.f) {
+        const EEState saved = g_ee;
+        set(4, (int32_t)car);
+        g_ee.fpr[12].f = shake;
+        call(f_001D4B28, 0x18D7C0);
+        g_ee = saved;
+    }
+}
+
 // called by f_0018CA98 (src/game_patches.cpp) when the invincibility cheat lets the damage through
 extern "C" void car_apply_collision_damage(void) { diff_run(0x0018CA98, apply_collision_damage, f_0018CA98_orig); }
 // called by f_0018AFE0 (src/game_patches.cpp), which applies the CarDurability scale after it

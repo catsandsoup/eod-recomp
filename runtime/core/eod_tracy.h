@@ -30,8 +30,13 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+// The Win64 unwind metadata names a bitfield R. Some EE translation units
+// have already defined R as the emulated register bank.
+#pragma push_macro("R")
+#undef R
 #include <windows.h>
 #include <psapi.h>
+#pragma pop_macro("R")
 #elif defined(__linux__)
 #include <unistd.h>
 #endif

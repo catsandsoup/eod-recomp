@@ -19,7 +19,7 @@
 
 #include "../core/config.h"
 
-namespace game_frontend { class Network; struct Snapshot; }
+namespace game_frontend { class Network; struct Command; struct Snapshot; }
 
 namespace frontend {
 
@@ -138,6 +138,7 @@ public:
     void set_host(const HostInfo &h) { host_ = h; }
     const HostInfo &host() const { return host_; }
     void set_network(std::shared_ptr<game_frontend::Network> n);
+    void remember_join(const game_frontend::Command &command);
     void set_music(std::shared_ptr<MusicSource> m) { music_ = std::move(m); }
     bool music_open() const { return music_open_; }
     game_frontend::Network *network() { return net_.get(); }
@@ -158,6 +159,7 @@ public:
     const std::string &text_value() const { return text_; }
     const std::string &pic_track() const { return pic_track_; }
     uint32_t pic_car() const { return pic_car_; }
+    const char *online_modal_title() const;
     std::string copy_text();       // what Cmd+C copies on this screen (the hosted Garage Code), "" if nothing
     bool dirty() const { return dirty_; }
     void clear_dirty() { dirty_ = false; }
@@ -195,6 +197,8 @@ private:
     void rows_inputs(std::vector<Row> &r);
     void rows_online(std::vector<Row> &r);
     void rows_error(std::vector<Row> &r);
+    void submit_join(game_frontend::Command command);
+    void cancel_join();
     void change(const Row &row, int dir, Effects &fx);
     void activate(const Row &row, Effects &fx);
     void move_selection(int dy);
@@ -203,6 +207,10 @@ private:
     Config &cfg_;
     HostInfo host_;
     std::shared_ptr<game_frontend::Network> net_;
+    std::unique_ptr<game_frontend::Command> join_attempt_;
+    enum class OnlineDialog { None, Connecting, Failure } online_dialog_ = OnlineDialog::None;
+    bool online_advanced_ = false;
+    bool joined_lobby_ = false;
     Tab tab_ = Tab::Graphics;
     int sel_[(int)Tab::Count + 1] = {};
     int scroll_[(int)Tab::Count + 1] = {};

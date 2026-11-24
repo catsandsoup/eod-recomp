@@ -18,6 +18,8 @@ CENSUS_ROW = re.compile(
 )
 CENSUS_END = re.compile(r"\[r7-vu\] vu=([01]) rows=([0-9]+) dropped=([0-9]+)")
 MICRO_SOURCES = {"direct", "mscal", "mscalf", "mscnt", "vcallms", "vcallmsr", "cmsar1"}
+FIXED_RETIREMENTS = {"retired_0000": 0, "retired_2538": 0x2538, "retired_25f0": 0x25F0,
+                     "retired_queue_dent": 0x0D48}
 CENSUS_FIELDS = ("vu1", "vu0_micro", "vu0_macro", "vu0_control")
 
 
@@ -52,6 +54,10 @@ def check_vu_census(lines, audit):
         elif unit == "0" and kind in {"macro", "cfc2", "ctc2"}:
             field = "vu0_macro" if kind == "macro" else "vu0_control"
         elif unit == "1" and kind in {"retired_nop", "retired_world", "retired_world_clipped"}:
+            continue
+        elif unit == "1" and kind in FIXED_RETIREMENTS:
+            if int(address, 16) != FIXED_RETIREMENTS[kind]:
+                raise ValueError(f"invalid address {address} for {kind}")
             continue
         else:
             raise ValueError(f"unknown VU census kind {kind} for VU{unit}")

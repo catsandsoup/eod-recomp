@@ -109,7 +109,7 @@ struct SceneCaptureExtent {
     uint32_t divisor = 1;
 };
 
-inline constexpr uint32_t kDefaultMaxSceneCaptureDim = 1920u;
+inline constexpr uint32_t kDefaultMaxSceneCaptureDim = 1024u;
 
 inline SceneCaptureExtent compute_scene_capture_extent(
     uint32_t view_w, uint32_t view_h, uint32_t render_scale, bool can_blit,

@@ -8,7 +8,7 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
 // As above, but with problem set no Cocoa dialog opens: the reason is returned for the in-game
 // error screen (and its controller disc chooser).
 bool mac_app_prepare(std::string &data, const std::string &config, bool headless, const DiscId &id, std::string *problem);
-// Installs the disc image/folder chosen in-game into Application Support/disc; "" or a message.
+// Remembers a verified disc folder in place or installs an image into Application Support/disc.
 std::string mac_app_install_disc(const std::string &source, const std::string &config, const DiscId &id);
 bool mac_app_settings();
 // Integrated content (Phantom, Battle, NASCAR Cup + native) is activated automatically before

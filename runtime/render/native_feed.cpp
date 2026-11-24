@@ -1,4 +1,5 @@
 // native_feed.cpp - EE and VIF1 side of the native renderer (native_renderer.h).
+#include "core/trace.h"
 #include "native_renderer.h"
 #include "editor_environment.h"
 
@@ -33,12 +34,14 @@
 #include "../vu/scene_emit.h"
 #include "scene_tap.h"
 #include "sun_cascades.h"
+#include "static_immediate.h"
 #include "vif_mesh.h"
 #include "world_visibility.h"
 #include "vu.h"
 
 extern uint64_t kernel_vblank_count();
 extern uint32_t g_vif1_dma_tag;  // runtime/hw/hw.cpp: DMA tag VIF1 is reading
+namespace gs { extern bool g_replaying; }
 
 namespace native {
 
@@ -46,6 +49,11 @@ std::atomic<uint64_t> g_track_gen{0};
 
 bool enabled() {
     static const bool on = [] {
+#ifdef EOD_R7_RELEASE
+        scene_tap::set_enabled(true);
+        std::fprintf(stderr, "[native] renderer on (EOD_R7_RELEASE): Plume native-only\n");
+        return true;
+#else
         const char *e = std::getenv("EOD_NATIVE");
         const char *only = std::getenv("EOD_NATIVE_ONLY");
         const bool v = (e && *e ? *e != '0' : g_config.native_renderer) || (only && *only && *only != '0');
@@ -54,6 +62,7 @@ bool enabled() {
             std::fprintf(stderr, "[native] renderer on: queued 3D objects, track world, water, shadows and flares drawn by plume\n");
         }
         return v;
+#endif
     }();
     return on;
 }
@@ -130,7 +139,7 @@ bool bootstrap_raster_enabled() {
 #ifdef EOD_PLUME
     static const bool enabled = [] {
         const char *value = std::getenv("EOD_NATIVE_BOOTSTRAP_RASTER");
-        return value && value[0] == '1';
+        return !value || value[0] != '0';
     }();
     return enabled && native_only();
 #else
@@ -177,7 +186,9 @@ bool full_shadow_pass_enabled() {
 }
 
 bool split_shadow_pass_enabled() {
-#ifdef EOD_PLUME
+#ifdef EOD_R7_RELEASE
+    return true;
+#elif defined(EOD_PLUME)
     static const bool on = [] {
         const char *value = std::getenv("EOD_NATIVE_SPLIT_SHADOW_PASS");
         return value && value[0] == '1';
@@ -193,30 +204,32 @@ bool shadow_pass_enabled() { return full_shadow_pass_enabled() || split_shadow_p
 // EE-thread selection, latched before ShadowTargetOpen for both ordered DIRECT packets.
 bool g_hybrid_shadow_cascades = false;
 int g_retail_split_y = -1;
-
-uint32_t shadow_direct_qwc(ShadowPass pass) {
-    return shadow_prepares(pass) ? kShadowPrepareDirectQwc : kShadowCompositeDirectQwc;
-}
+bool g_retail_quad_view = false;
 
 ShadowPass shadow_reservation(uint32_t ra, uint32_t qwc) {
-    const ShadowPass pass = ra == 0x362a34 ? ShadowPass::Prepare
-                          : ra == 0x362f34 ? ShadowPass::Composite : ShadowPass::None;
-    if (pass == ShadowPass::None || qwc != shadow_direct_qwc(pass) + 1) return ShadowPass::None;
-    // 0x363218 saves the main viewport and the temporary target's format.
+    if (ra != 0x362a34 && ra != 0x362f34) return ShadowPass::None;
+    const bool prepare = ra == 0x362a34;
+    // 0x363218 saves the actual main viewport before using the temporary 320px target.
     constexpr uint32_t rt = 0x4d8bd8;
     if (MEM_LW(rt) != 320 || MEM_LW(rt + 0x10) != 0x19f || MEM_LW(rt + 0x14) != 2 ||
-        MEM_LW(rt + 0x18) != 0x15f || MEM_LW(rt + 0x1c) != 0x32 ||
-        MEM_LW(rt + 0x28) || MEM_LW(rt + 0x30) != 640)
-        return ShadowPass::None;
-
-    const uint32_t top = MEM_LW(rt + 0x2c);
-    const uint32_t height = MEM_LW(rt + 0x34);
-    if (MEM_LW(rt + 4) != height) return ShadowPass::None;
-    if (!top && height == 448 && full_shadow_pass_enabled() && (native_only() || g_hybrid_shadow_cascades))
-        return pass;
-    if (!split_shadow_pass_enabled() || height != 224 || int(top) != g_retail_split_y) return ShadowPass::None;
-    if (!top) return shadow_prepares(pass) ? ShadowPass::PrepareUpper : ShadowPass::CompositeUpper;
-    if (top == 224) return shadow_prepares(pass) ? ShadowPass::PrepareLower : ShadowPass::CompositeLower;
+        MEM_LW(rt + 0x18) != 0x15f || MEM_LW(rt + 0x1c) != 0x32) return ShadowPass::None;
+    const auto x = MEM_LW(rt + 0x28), y = MEM_LW(rt + 0x2c);
+    const auto w = MEM_LW(rt + 0x30), h = MEM_LW(rt + 0x34);
+    if (MEM_LW(rt + 4) != h) return ShadowPass::None;
+    for (unsigned v = 0; v < std::size(kShadowViewports); ++v) {
+        const auto &viewport = kShadowViewports[v];
+        if (x != unsigned(viewport.x) || y != unsigned(viewport.y) ||
+            w != unsigned(viewport.width) || h != unsigned(viewport.height)) continue;
+        if (v == 0) {
+            if (!full_shadow_pass_enabled() || (!native_only() && !g_hybrid_shadow_cascades))
+                return ShadowPass::None;
+        } else {
+            const bool active_view = w == 320 ? g_retail_quad_view : int(y) == g_retail_split_y;
+            if (!split_shadow_pass_enabled() || !active_view) return ShadowPass::None;
+        }
+        const auto pass = ShadowPass(2 * v + (prepare ? 1 : 2));
+        return qwc == shadow_direct_qwc(pass) + 1 ? pass : ShadowPass::None;
+    }
     return ShadowPass::None;
 }
 
@@ -350,13 +363,42 @@ struct Tagged {
     std::shared_ptr<const WorldTextureIndices> world_indices{};
     std::shared_ptr<const DentPart> dent{};
     std::unique_ptr<QueueMaterial> queue_material{};
+    std::shared_ptr<Mesh> geometry{};  // immutable transient geometry owned by this DMA range
+    bool empty_bypass = false;  // committed DMA packet with 0 drawable triangles (e.g. empty ImmediateBegin/End)
 };
 std::map<uint32_t, Tagged> g_tags;     // batch packet start -> record; latest writer wins
 std::vector<Mesh *> g_new_meshes;      // decoded, not yet in the GS stream
 
+// An immediate draw can reserve several DMA ranges. Keep their keys until
+// End so closing one HUD/effect draw never walks every resident world tag.
+// A subsequent reservation can overwrite an address before End, so validate
+// the current mesh identity under g_mutex on every lookup.
+struct TransientTags {
+    std::vector<uint32_t> starts;
+
+    void finish(const Packet &packet, bool committed, const std::shared_ptr<Mesh> &geometry) {
+        for (uint32_t address : starts) {
+            auto it = g_tags.find(address);
+            if (it == g_tags.end() || !it->second.range || it->second.packet.mesh != packet.mesh) continue;
+            if (!committed) {
+                g_tags.erase(it);
+            } else if (!geometry || geometry->indices.empty()) {
+                it->second.empty_bypass = true;
+                it->second.packet.mesh = 0;
+            } else {
+                it->second.packet.itop = packet.itop;
+                it->second.geometry = geometry;
+            }
+        }
+        starts.clear();
+    }
+};
+TransientTags g_water_tags, g_flare_tags, g_imm_tags, g_particle_tags, g_sprite_tags;
+
 // ---- EE state ----
 bool g_in_object = false;
 Packet g_current;
+std::shared_ptr<Mesh> g_current_geometry;
 std::shared_ptr<const DentPart> g_current_dent;
 uint64_t g_frame_vb = ~0ull;
 uint32_t g_serial = 0;
@@ -383,22 +425,27 @@ bool g_imm_hud = false;
 int32_t g_shadow_intensity = 0;
 Packet g_shadow_cam;
 int32_t g_world_pass = 0;
-std::vector<std::pair<uint32_t, Packet>> g_leaves;  // this texture record's REFs, until its commit
+struct WorldLeaf {
+    uint32_t address;
+    Packet packet;
+    std::shared_ptr<Mesh> geometry;
+};
+std::vector<WorldLeaf> g_leaves;  // this texture record's REFs, until its commit
 Packet g_water;
-Mesh *g_water_mesh = nullptr;
+std::shared_ptr<Mesh> g_water_mesh;
 Packet g_flare;
-Mesh *g_flare_mesh = nullptr;
+std::shared_ptr<Mesh> g_flare_mesh;
 Packet g_particle;
-Mesh *g_particle_mesh = nullptr;
+std::shared_ptr<Mesh> g_particle_mesh;
 float g_particle_scale = 0.0f;
 uint32_t g_particle_count = 0;
 bool g_particle_alpha_set = false;
 Packet g_sprite;
-Mesh *g_sprite_mesh = nullptr;
+std::shared_ptr<Mesh> g_sprite_mesh;
 uint32_t g_sprite_count = 0;
 bool g_sprite_alpha_set = false;
 Packet g_imm;
-Mesh *g_imm_mesh = nullptr;
+std::shared_ptr<Mesh> g_imm_mesh;
 bool g_imm_alpha_set = false;
 // counters (EE frame)
 struct WorldCounts {
@@ -432,8 +479,8 @@ struct SkinTotals {
 };
 SkinTotals g_st;
 void apply_material();
-uint32_t posed_mesh(const CacheEntry &c, const Packet &p);
-uint32_t facing_queue_mesh(const CacheEntry &c, uint32_t batch);
+std::shared_ptr<Mesh> posed_mesh(const CacheEntry &c, const Packet &p);
+std::shared_ptr<Mesh> facing_queue_mesh(const CacheEntry &c, uint32_t batch);
 
 // ---- VIF1 state ----
 uint64_t g_sent_key = ~0ull;  // (frame << 32 | serial) of the record whose kicks are being sent
@@ -487,6 +534,7 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     opt.keep_dent_chunks = !world && queue_dent_check_enabled();
 #endif
     opt.keep_shadow_extrusion_faces = true;
+    opt.keep_camera_facing_faces = true;
     const vifmesh::Status st = g_decoder->decode_vif(g_bytes.data() + 0x38, qwc * 16, g_scratch, opt);
     c.dent.reset();
     if (!g_scratch.dent_chunks.empty())
@@ -615,22 +663,25 @@ using Expect = Expected;
 std::mutex g_expect_mutex;
 std::map<uint64_t, Expect> g_expect;
 
+void publish_expected() {
+    if (g_frame_vb == ~0ull) return;
+    std::lock_guard<std::mutex> lk(g_expect_mutex);
+    Expect &e = g_expect[g_frame_vb];
+    e.world += g_wc.leaves;
+    e.water += g_wc.water_draws;
+    e.queue += g_records;
+    e.shadow += g_wc.shadow_batches;
+    e.flare += g_wc.flare_draws;
+    e.particle += g_wc.particle_draws;
+    e.sprite += g_wc.sprite_draws;
+    e.immediate += g_wc.imm_draws + g_wc.sphere_imm_draws;
+    e.cockpit += g_wc.cockpit_draws;
+    e.hud += g_wc.hud_draws;
+}
+
 void roll(uint64_t vb) {
     if (vb == g_frame_vb) return;
-    if (g_frame_vb != ~0ull) {
-        std::lock_guard<std::mutex> lk(g_expect_mutex);
-        Expect &e = g_expect[g_frame_vb];
-        e.world += g_wc.leaves;
-        e.water += g_wc.water_draws;
-        e.queue += g_records;
-        e.shadow += g_wc.shadow_batches;
-        e.flare += g_wc.flare_draws;
-        e.particle += g_wc.particle_draws;
-        e.sprite += g_wc.sprite_draws;
-        e.immediate += g_wc.imm_draws + g_wc.sphere_imm_draws;
-        e.cockpit += g_wc.cockpit_draws;
-        e.hud += g_wc.hud_draws;
-    }
+    publish_expected();
     if (g_frame_vb != ~0ull && log_every() && (log_every() == 1 || g_frame_vb / log_every() != vb / log_every())) {
         std::fprintf(stderr, "[native] ee vb %llu records %u tagged %u meshes decoded %u (failed %u) cached %zu\n",
                      (unsigned long long)g_frame_vb, g_records, g_tagged, g_meshes_decoded, g_mesh_fail, g_cache.size());
@@ -871,8 +922,10 @@ void ee_object(uint32_t batch) {
     CacheEntry *c = nullptr;
     p.mesh = mesh_for(p.batch, vb, false, &c);
     g_current_dent = c && p.mesh ? c->dent : nullptr;
-    if (c && p.mesh && !c->skin.empty()) p.mesh = posed_mesh(*c, p);
-    else if (c && p.mesh && !c->facing.empty()) p.mesh = facing_queue_mesh(*c, p.batch);
+    g_current_geometry.reset();
+    if (c && p.mesh && !c->skin.empty()) g_current_geometry = posed_mesh(*c, p);
+    else if (c && p.mesh && !c->facing.empty()) g_current_geometry = facing_queue_mesh(*c, p.batch);
+    if (g_current_geometry) p.mesh = g_current_geometry->id;
     g_records++;
     g_in_object = true;
 }
@@ -880,6 +933,7 @@ void ee_object(uint32_t batch) {
 void ee_object_end() {
     g_in_object = false;
     g_current_dent.reset();
+    g_current_geometry.reset();
 }
 
 namespace {
@@ -900,7 +954,7 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneCle
     auto clear_it = g_scene_clear_packets.lower_bound(addr);
     if (clear_it != g_scene_clear_packets.begin()) {
         auto prev = std::prev(clear_it);
-        if (prev->first + (kSceneClearDirectQwc + 1) * 16 > addr)
+        if (prev->first + (scene_clear_qwc(prev->second.target) + 1) * 16 > addr)
             g_scene_clear_packets.erase(prev);
     }
     while (clear_it != g_scene_clear_packets.end() && clear_it->first < end)
@@ -941,36 +995,42 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneCle
     while (it != g_tags.end() && it->first < end) it = g_tags.erase(it);
     if (water) {  // every VU1 start under this packet's DMA tags draws the water surface
         g_tags[addr] = Tagged{end, g_water, true};
+        g_water_tags.starts.push_back(addr);
         return;
     }
     if (flare) {  // every VU1 start under this packet's DMA tags draws the flare bucket
         g_tags[addr] = Tagged{end, g_flare, true};
+        g_flare_tags.starts.push_back(addr);
         return;
     }
     if (imm) {  // general immediate geometry or cockpit quad
         g_tags[addr] = Tagged{end, g_imm, true};
+        g_imm_tags.starts.push_back(addr);
         return;
     }
     if (part) {  // particle stream
         g_tags[addr] = Tagged{end, g_particle, true};
+        g_particle_tags.starts.push_back(addr);
         return;
     }
     if (spr) {  // simple or atlas effect sprite stream
         g_tags[addr] = Tagged{end, g_sprite, true};
+        g_sprite_tags.starts.push_back(addr);
         return;
     }
     if (!batch) return;  // any other packet there replaces a record's tag
     auto &tag = g_tags[addr] = Tagged{end, g_current, false, false, {}, g_current_dent};
+    tag.geometry = g_current_geometry;
     if (tag.dent && tag.dent->size() >= 4)
         tag.queue_material = queue_material(tag.packet, *tag.dent);
     g_tagged++;
 }
 
 bool take_scene_clear(uint32_t dma_tag, uint32_t qwc, SceneClear &clear) {
-    if (qwc != kSceneClearDirectQwc || !scene_clear_enabled()) return false;
+    if ((qwc != kSceneClearDirectQwc && qwc != 6) || !scene_clear_enabled()) return false;
     std::lock_guard<std::mutex> lk(g_mutex);
     const auto found = g_scene_clear_packets.find(dma_tag);
-    if (found == g_scene_clear_packets.end()) return false;
+    if (found == g_scene_clear_packets.end() || qwc != scene_clear_qwc(found->second.target)) return false;
     clear = found->second;
     g_scene_clear_packets.erase(found);
     return true;
@@ -992,7 +1052,8 @@ bool take_display_copy(uint32_t dma_tag, uint32_t qwc, DisplayCopy &copy) {
 }
 
 ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc) {
-    if ((qwc != kShadowPrepareDirectQwc && qwc != kShadowCompositeDirectQwc) || !shadow_pass_enabled())
+    if ((qwc != kShadowPrepareDirectQwc && qwc != shadow_composite_qwc(640) &&
+         qwc != shadow_composite_qwc(320)) || !shadow_pass_enabled())
         return ShadowPass::None;
     std::lock_guard<std::mutex> lk(g_mutex);
     const auto found = g_shadow_pass_packets.find(dma_tag);
@@ -1007,6 +1068,29 @@ ShadowPass take_shadow_pass(uint32_t dma_tag, uint32_t qwc) {
 void ee_world_pass(int32_t pass, uint32_t) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
+#ifdef EOD_TRACY
+    // Trace the first world view in a frame, before secondary cameras can replace it.
+    static uint64_t last_camera_frame = ~0ull;
+    if (last_camera_frame != g_frame_vb) {
+        last_camera_frame = g_frame_vb;
+        const uint32_t participants = ee_r32(0x48522C);
+        for (uint32_t slot = 0; participants <= 20 && slot < participants; ++slot) {
+            const uint32_t car = ee_r32(0x447458 + slot * 4);
+            if (!car || (car & 3) || car > EE_RAM_SIZE - 0x1C34 || ee_r32(car + 0x1E0) != 0x50) continue;
+            const float camera_y = rf(kCameraPosition + 4);
+            const float car_y = rf(car + 0x8C);
+            TracyPlot("Player car height", double(car_y));
+            TracyPlot("World camera height", double(camera_y));
+            TracyPlot("Camera above player", double(camera_y - car_y));
+            EOD_PLOT("Player camera view", ee_r32(0x48CB8C));
+            static const bool log = std::getenv("EOD_CAMERA_MOTION_LOG") != nullptr;
+            if (log) std::fprintf(stderr, "[camera-motion] vb=%llu car=%.4f,%.4f,%.4f camera=%.4f,%.4f,%.4f view=%u\n",
+                                  (unsigned long long)g_frame_vb, rf(car + 0x88), car_y, rf(car + 0x90),
+                                  rf(kCameraPosition), camera_y, rf(kCameraPosition + 8), ee_r32(0x48CB8C));
+            break;
+        }
+    }
+#endif
     update_track_gen();
     g_world_pass = pass;
     g_leaves.clear();
@@ -1035,20 +1119,20 @@ bool sun_quad(float c[4][3], uint32_t &alpha) {
 }
 
 // A camera-facing part as this view sees it: a transient mesh (released by the GS after use).
-uint32_t facing_mesh(const CacheEntry &c, uint32_t part, uint32_t &alpha) {
+std::shared_ptr<Mesh> facing_mesh(const CacheEntry &c, uint32_t part, uint32_t &alpha) {
     float q[4][3];
     if (!sun_quad(q, alpha)) {
         g_wc.no_quad++;
-        return c.id;
+        return {};
     }
-    auto *m = new Mesh();
+    auto m = std::make_shared<Mesh>();
     m->id = g_next_mesh++;
     m->replaces = 0;
     m->batch = part;
     m->skinned = false;
     m->transient = true;
     m->vertices = c.base;
-    copy_k(m, c);
+    copy_k(m.get(), c);
     m->indices = c.indices;
     for (const FacingVertex &f : c.facing) {
         Vertex &v = m->vertices[f.vertex];
@@ -1056,9 +1140,7 @@ uint32_t facing_mesh(const CacheEntry &c, uint32_t part, uint32_t &alpha) {
             if (f.corner[k] < 4)
                 for (int i = 0; i < 3; i++) v.p[i] += f.weight[k] * q[f.corner[k]][i];
     }
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_new_meshes.push_back(m);
-    return m->id;
+    return m;
 }
 }  // namespace
 
@@ -1104,7 +1186,7 @@ std::map<uint64_t, UsedQwords> g_used;  // (frame << 32 | serial) -> qwords
 
 // A skinned batch as this record poses it: a transient mesh, or the bind-pose mesh when every dent
 // it reads is zero (p + 0 = p).
-uint32_t posed_mesh(const CacheEntry &c, const Packet &p) {
+std::shared_ptr<Mesh> posed_mesh(const CacheEntry &c, const Packet &p) {
     apply_material();
     g_sc.records++;
     if (!g_uploads.count(g_applied)) g_sc.no_upload++;
@@ -1122,9 +1204,9 @@ uint32_t posed_mesh(const CacheEntry &c, const Packet &p) {
     }
     if (!any) {
         g_sc.undented++;
-        return c.id;
+        return {};
     }
-    auto *m = new Mesh();
+    auto m = std::make_shared<Mesh>();
     m->id = g_next_mesh++;
     m->replaces = 0;
     m->batch = p.batch;
@@ -1133,7 +1215,7 @@ uint32_t posed_mesh(const CacheEntry &c, const Packet &p) {
     m->posed = true;
     m->bind = c.id;
     m->vertices = c.base;
-    copy_k(m, c);
+    copy_k(m.get(), c);
     m->indices = c.indices;
     UsedQwords used;
     auto note = [&](uint32_t q) {
@@ -1188,22 +1270,20 @@ uint32_t posed_mesh(const CacheEntry &c, const Packet &p) {
         g_used[p.frame << 32 | p.serial] = std::move(used);
         while (g_used.size() > 65536) g_used.erase(g_used.begin());
     }
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_new_meshes.push_back(m);
-    return m->id;
+    return m;
 }
 
 // A camera-facing batch (VU1 0x350) drawn through the queue: corners from the bone qwords in effect.
-uint32_t facing_queue_mesh(const CacheEntry &c, uint32_t batch) {
+std::shared_ptr<Mesh> facing_queue_mesh(const CacheEntry &c, uint32_t batch) {
     apply_material();
-    auto *m = new Mesh();
+    auto m = std::make_shared<Mesh>();
     m->id = g_next_mesh++;
     m->replaces = 0;
     m->batch = batch;
     m->skinned = false;
     m->transient = true;
     m->vertices = c.base;
-    copy_k(m, c);
+    copy_k(m.get(), c);
     m->indices = c.indices;
     for (const FacingVertex &f : c.facing) {
         Vertex &v = m->vertices[f.vertex];
@@ -1212,9 +1292,7 @@ uint32_t facing_queue_mesh(const CacheEntry &c, uint32_t batch) {
                 for (int i = 0; i < 3; i++) v.p[i] += f.weight[k] * vf(0xACu + f.corner[k], i);
     }
     g_sc.facing++;
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_new_meshes.push_back(m);
-    return m->id;
+    return m;
 }
 }  // namespace
 
@@ -1611,13 +1689,15 @@ void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, ui
     if (p.mesh && c && c->k_kick && !c->k_mixed)
         p.world_lod = {uint16_t(p.tex_k + c->k_delta), uint8_t(p.tex_mxl & 7), true};
     if (!p.mesh) g_wc.nomesh++;
+    std::shared_ptr<Mesh> geometry;
     if (c && !c->facing.empty() && p.mesh) {
         uint32_t alpha = 0x80;
-        p.mesh = facing_mesh(*c, part, alpha);
+        geometry = facing_mesh(*c, part, alpha);
+        if (geometry) p.mesh = geometry->id;
         p.itop = (itop & ~0xFFu) | alpha;
         g_wc.facing++;
     }
-    g_leaves.emplace_back(ref_qword, p);
+    g_leaves.push_back({ref_qword, p, std::move(geometry)});
 }
 
 // The texture record's packet commit: its REFs are what VIF1 will read; tag each with its leaf.
@@ -1633,7 +1713,7 @@ void ee_world_record(bool committed) {
     const bool retire_enabled = (!retire || retire[0] != '0') && !diff_in_original_side();
     std::lock_guard<std::mutex> lk(g_mutex);
     for (auto &l : g_leaves) {
-        const uint32_t a = l.first;
+        const uint32_t a = l.address;
         auto it = g_tags.lower_bound(a);
         if (it != g_tags.begin()) {
             auto prev = std::prev(it);
@@ -1641,10 +1721,11 @@ void ee_world_record(bool committed) {
         }
         it = g_tags.lower_bound(a);
         while (it != g_tags.end() && it->first < a + 16) it = g_tags.erase(it);
-        const Packet &leaf = l.second;
+        const Packet &leaf = l.packet;
         const bool eligible = retire_enabled && leaf.itop == 0x80 && leaf.mesh != 0;
         g_tags[a] = Tagged{a + 16, leaf, false, eligible,
                            leaf.world_texture.index_version ? g_world_indices : nullptr};
+        g_tags[a].geometry = std::move(l.geometry);
         g_wc.leaves++;
     }
     g_leaves.clear();
@@ -1667,14 +1748,14 @@ void ee_water_begin(uint32_t surface) {
     p.texture_key = (int32_t)MEM_LW(surface + 0x3C);
     p.layer = -1;
     fill_camera(p);
-    delete g_water_mesh;
-    g_water_mesh = new Mesh();
+    g_water_mesh = std::make_shared<Mesh>();
     g_water_mesh->id = g_next_mesh++;
     g_water_mesh->replaces = 0;
     g_water_mesh->batch = surface;
     g_water_mesh->skinned = false;
     g_water_mesh->transient = true;
     p.mesh = g_water_mesh->id;
+    g_water_tags.starts.clear();
     g_in_water = true;
 }
 
@@ -1711,20 +1792,16 @@ void ee_water_end(bool drawn) {
     g_in_water = false;
     std::lock_guard<std::mutex> lk(g_mutex);
     // the tags this draw's packets got stay (they only match VU1 starts inside those packets)
-    if (!drawn) {
-        for (auto it = g_tags.begin(); it != g_tags.end();)
-            it = it->second.range && it->second.packet.mesh == g_water.mesh ? g_tags.erase(it) : std::next(it);
-        delete g_water_mesh;
-        g_water_mesh = nullptr;
-        return;
-    }
+    auto geometry = std::move(g_water_mesh);
+    g_water_tags.finish(g_water, drawn, geometry);
+    if (!drawn || !geometry || geometry->indices.empty()) return;
     g_wc.water_draws++;
     {  // per viewport (split screen: one per view)
         static std::map<uint32_t, std::array<uint64_t, 3>> views;
         auto &n = views[g_water.pass];
         n[0]++;
-        n[1] += g_water_mesh->vertices.size();
-        n[2] += g_water_mesh->indices.size() / 3;
+        n[1] += geometry->vertices.size();
+        n[2] += geometry->indices.size() / 3;
         if ((n[0] & 127) == 0)
             for (auto &v : views)
                 std::fprintf(stderr, "[native] water submitted, view %u of the frame: draws %llu vertices %llu triangles %llu\n",
@@ -1732,9 +1809,7 @@ void ee_water_end(bool drawn) {
                              (unsigned long long)v.second[2]);
     }
     // the guest asks ImmediateBegin for 0x3000 vertices; the native mesh grows with the surface
-    limit_note("water surface vertices (0x35DF10 request 0x3000)", g_water_mesh->vertices.size(), 0, 0x3000);
-    g_new_meshes.push_back(g_water_mesh);
-    g_water_mesh = nullptr;
+    limit_note("water surface vertices (0x35DF10 request 0x3000)", geometry->vertices.size(), 0, 0x3000);
 }
 
 // ---- projected shadows (0x34C7D0 / 0x35D170 / 0x34C798, src/native_shadows_flares.cpp) ---------
@@ -1755,13 +1830,14 @@ void ee_tex_lod(int32_t k_template, uint32_t mxl, uint32_t bias_k) {
 }
 void ee_blend_select(uint32_t sel) { g_tex.blend_sel = sel; }
 
-void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y) {
+void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y, bool retail_quad_view) {
     if (!enabled()) return;
     roll(kernel_vblank_count());
     std::memset(&g_shadow_cam, 0, sizeof g_shadow_cam);
     fill_camera(g_shadow_cam);
     g_shadow_cam.retail_shadow_view = retail_single_view;
     g_retail_split_y = retail_split_y;
+    g_retail_quad_view = retail_quad_view;
     g_hybrid_shadow_cascades = sun_cascades_enabled() && look_modern() && retail_single_view &&
                               !g_shadow_cam.editor_environment && !g_shadow_cam.fge &&
                               sun_cascades::daylight(g_shadow_cam.fogcol);
@@ -1782,8 +1858,8 @@ void ee_shadow_opened(bool opened) {
 }
 
 namespace {
-uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
-    if (c.base.empty() || c.indices.empty()) return 0;
+std::shared_ptr<Mesh> shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
+    if (c.base.empty() || c.indices.empty()) return {};
     // VU1 0x3BE4C0 0x16f8..0x17b8: vf1 = -M^T * (light.xyz * light.w)
     double vf1[3];
     for (int col = 0; col < 3; col++) {
@@ -1792,14 +1868,14 @@ uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
         vf1[col] = -s * (double)p.light[3];
     }
     const double extrude = (double)p.colour_b[3];  // 0x35CD28 q[5].w = *(float*)0x4D7D18
-    auto *m = new Mesh();
+    auto m = std::make_shared<Mesh>();
     m->id = g_next_mesh++;
     m->replaces = 0;
     m->batch = p.batch;
     m->skinned = false;
     m->transient = true;
     m->vertices = c.base;
-    copy_k(m, c);
+    copy_k(m.get(), c);
     for (Vertex &v : m->vertices) {
         // VU1 0x3BE4C0 0x0130..0x0170: d = dot(n, vf1), e = min(max(0, d) * 65535, extrude)
         const double d = (double)v.n[0] * vf1[0] + (double)v.n[1] * vf1[1] + (double)v.n[2] * vf1[2];
@@ -1813,9 +1889,7 @@ uint32_t shadow_extruded_mesh(const CacheEntry &c, const Packet &p) {
         v.c[0] = v.c[1] = v.c[2] = v.c[3] = 15;  // 0x363708 RGB 15 (the shader writes one 5-bit step)
     }
     m->indices = c.indices;
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_new_meshes.push_back(m);
-    return m->id;
+    return m;
 }
 }  // namespace
 
@@ -1839,7 +1913,8 @@ void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t
     p.layer = -1;
     CacheEntry *c = nullptr;
     const uint32_t base_id = mesh_for(batch, g_frame_vb, false, &c);
-    p.mesh = (c && base_id) ? shadow_extruded_mesh(*c, p) : 0;
+    auto geometry = c && base_id ? shadow_extruded_mesh(*c, p) : nullptr;
+    p.mesh = geometry ? geometry->id : 0;
     std::lock_guard<std::mutex> lk(g_mutex);
     auto it = g_tags.lower_bound(ref_qword);
     if (it != g_tags.begin()) {
@@ -1849,6 +1924,7 @@ void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t
     it = g_tags.lower_bound(ref_qword);
     while (it != g_tags.end() && it->first < ref_qword + 16) it = g_tags.erase(it);
     g_tags[ref_qword] = Tagged{ref_qword + 16, p, false};
+    g_tags[ref_qword].geometry = std::move(geometry);
     g_wc.shadow_batches++;
 }
 
@@ -1868,18 +1944,18 @@ void ee_flare_begin(uint32_t tex_slot) {
     p.serial = g_serial++;
     p.batch = tex_slot;
     p.pass = g_wc.flare_draws;
-    p.itop = 0x280;  // 0x361468 clip flag 0x200 + va=0x80 (1.0); per-flare alpha folded into additive RGB
+    p.itop = 0x200;  // ImmediateBegin writes ITOP 0x200.
     p.texture_key = (int32_t)tex_slot;
     p.layer = -1;
     fill_camera(p);  // 0x34D9A8 already installed the 2D screen camera
-    delete g_flare_mesh;
-    g_flare_mesh = new Mesh();
+    g_flare_mesh = std::make_shared<Mesh>();
     g_flare_mesh->id = g_next_mesh++;
     g_flare_mesh->replaces = 0;
     g_flare_mesh->batch = tex_slot;
     g_flare_mesh->skinned = false;
     g_flare_mesh->transient = true;
     p.mesh = g_flare_mesh->id;
+    g_flare_tags.starts.clear();
     g_in_flare = true;
 }
 
@@ -1893,11 +1969,10 @@ void ee_flare_vertex(const float xyz[3], const float st[2], uint32_t colour, uin
     for (int i = 0; i < 3; i++) v.p[i] = xyz[i];
     v.uv[0] = st[0];
     v.uv[1] = st[1];
-    const uint32_t a = (c >> 24) & 0xFFu;
-    v.c[0] = (uint8_t)std::min(128u, (((c >> 16) & 0xFFu) * a + 64u) >> 7);
-    v.c[1] = (uint8_t)std::min(128u, (((c >> 8) & 0xFFu) * a + 64u) >> 7);
-    v.c[2] = (uint8_t)std::min(128u, ((c & 0xFFu) * a + 64u) >> 7);
-    v.c[3] = (uint8_t)a;
+    v.c[0] = (uint8_t)(c >> 16);
+    v.c[1] = (uint8_t)(c >> 8);
+    v.c[2] = (uint8_t)c;
+    v.c[3] = (uint8_t)(c >> 24);
     Mesh &m = *g_flare_mesh;
     const uint32_t i = (uint32_t)m.vertices.size();
     m.vertices.push_back(v);
@@ -1914,16 +1989,10 @@ void ee_flare_end(bool drawn) {
     if (!g_in_flare) return;
     g_in_flare = false;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!drawn) {
-        for (auto it = g_tags.begin(); it != g_tags.end();)
-            it = it->second.range && it->second.packet.mesh == g_flare.mesh ? g_tags.erase(it) : std::next(it);
-        delete g_flare_mesh;
-        g_flare_mesh = nullptr;
-        return;
-    }
+    auto geometry = std::move(g_flare_mesh);
+    g_flare_tags.finish(g_flare, drawn, geometry);
+    if (!drawn || !geometry || geometry->indices.empty()) return;
     g_wc.flare_draws++;
-    g_new_meshes.push_back(g_flare_mesh);
-    g_flare_mesh = nullptr;
 }
 
 // ---- particles (0x363B98 / 0x3639D0 / 0x363B68, VU1 0x08E0, src/native_effects_imm.cpp) --------
@@ -1940,8 +2009,7 @@ void ee_particle_begin(float scale) {
     p.texture_key = -1;
     p.layer = -1;
     fill_camera(p);
-    delete g_particle_mesh;
-    g_particle_mesh = new Mesh();
+    g_particle_mesh = std::make_shared<Mesh>();
     g_particle_mesh->id = g_next_mesh++;
     g_particle_mesh->replaces = 0;
     g_particle_mesh->skinned = false;
@@ -1950,6 +2018,7 @@ void ee_particle_begin(float scale) {
     g_particle_scale = scale;
     g_particle_count = 0;
     g_particle_alpha_set = false;
+    g_particle_tags.starts.clear();
     g_in_particle = true;
 }
 
@@ -2014,20 +2083,11 @@ void ee_particle_end(bool drawn) {
     if (!g_in_particle) return;
     g_in_particle = false;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!drawn || !g_particle_mesh || g_particle_mesh->indices.empty()) {
-        for (auto it = g_tags.begin(); it != g_tags.end();)
-            it = it->second.range && it->second.packet.mesh == g_particle.mesh ? g_tags.erase(it) : std::next(it);
-        delete g_particle_mesh;
-        g_particle_mesh = nullptr;
-        return;
-    }
-    for (auto &kv : g_tags)
-        if (kv.second.range && kv.second.packet.mesh == g_particle.mesh)
-            kv.second.packet.itop = g_particle.itop;
+    auto geometry = std::move(g_particle_mesh);
+    g_particle_tags.finish(g_particle, drawn, geometry);
+    if (!drawn || !geometry || geometry->indices.empty()) return;
     limit_note("particle stream count (0x363FF8 16/pkt cap)", g_particle_count, 0, 16);
     g_wc.particle_draws++;
-    g_new_meshes.push_back(g_particle_mesh);
-    g_particle_mesh = nullptr;
 }
 
 // ---- effect sprites (0x363F48/0x363DE8 VU1 0x01B8 & 0x363D78/0x363C18 VU1 0x05E0) --------------
@@ -2045,8 +2105,7 @@ void ee_sprite_begin(int32_t grid_size) {
     p.texture_key = -1;
     p.layer = -1;
     fill_camera(p);
-    delete g_sprite_mesh;
-    g_sprite_mesh = new Mesh();
+    g_sprite_mesh = std::make_shared<Mesh>();
     g_sprite_mesh->id = g_next_mesh++;
     g_sprite_mesh->replaces = 0;
     g_sprite_mesh->skinned = false;
@@ -2054,6 +2113,7 @@ void ee_sprite_begin(int32_t grid_size) {
     p.mesh = g_sprite_mesh->id;
     g_sprite_count = 0;
     g_sprite_alpha_set = false;
+    g_sprite_tags.starts.clear();
     g_in_sprite = true;
 }
 
@@ -2127,20 +2187,11 @@ void ee_sprite_end(bool drawn) {
     if (!g_in_sprite) return;
     g_in_sprite = false;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!drawn || !g_sprite_mesh || g_sprite_mesh->indices.empty()) {
-        for (auto it = g_tags.begin(); it != g_tags.end();)
-            it = it->second.range && it->second.packet.mesh == g_sprite.mesh ? g_tags.erase(it) : std::next(it);
-        delete g_sprite_mesh;
-        g_sprite_mesh = nullptr;
-        return;
-    }
-    for (auto &kv : g_tags)
-        if (kv.second.range && kv.second.packet.mesh == g_sprite.mesh)
-            kv.second.packet.itop = g_sprite.itop;
+    auto geometry = std::move(g_sprite_mesh);
+    g_sprite_tags.finish(g_sprite, drawn, geometry);
+    if (!drawn || !geometry || geometry->indices.empty()) return;
     limit_note("sprite stream count (0x364548/0x3642B8 33/pkt cap)", g_sprite_count, 0, 33);
     g_wc.sprite_draws++;
-    g_new_meshes.push_back(g_sprite_mesh);
-    g_sprite_mesh = nullptr;
 }
 
 // ---- general immediate geometry & cockpit quad (0x35DF10 / 0x361708 / 0x361BC8 / 0x35CAA0) -----
@@ -2157,8 +2208,7 @@ void ee_imm_begin(bool cockpit, bool hud) {
     p.texture_key = -1;
     p.layer = -1;
     fill_camera(p);
-    delete g_imm_mesh;
-    g_imm_mesh = new Mesh();
+    g_imm_mesh = std::make_shared<Mesh>();
     g_imm_mesh->id = g_next_mesh++;
     g_imm_mesh->replaces = 0;
     g_imm_mesh->skinned = false;
@@ -2167,6 +2217,7 @@ void ee_imm_begin(bool cockpit, bool hud) {
     g_imm_cockpit = cockpit;
     g_imm_hud = hud && !cockpit;
     g_imm_alpha_set = false;
+    g_imm_tags.starts.clear();
     g_in_imm = true;
 }
 
@@ -2210,22 +2261,13 @@ void ee_imm_end(bool drawn) {
     if (!g_in_imm) return;
     g_in_imm = false;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!drawn || !g_imm_mesh || g_imm_mesh->indices.empty()) {
-        for (auto it = g_tags.begin(); it != g_tags.end();)
-            it = it->second.range && it->second.packet.mesh == g_imm.mesh ? g_tags.erase(it) : std::next(it);
-        delete g_imm_mesh;
-        g_imm_mesh = nullptr;
-        return;
-    }
-    for (auto &kv : g_tags)
-        if (kv.second.range && kv.second.packet.mesh == g_imm.mesh)
-            kv.second.packet.itop = g_imm.itop;
-    limit_note("immediate geometry vertices (0x361468 60/chunk cap)", g_imm_mesh->vertices.size(), 0, 60);
+    auto geometry = std::move(g_imm_mesh);
+    g_imm_tags.finish(g_imm, drawn, geometry);
+    if (!drawn || !geometry || geometry->indices.empty()) return;
+    limit_note("immediate geometry vertices (0x361468 60/chunk cap)", geometry->vertices.size(), 0, 60);
     if (g_imm_cockpit) g_wc.cockpit_draws++;
     else if (g_imm_hud) g_wc.hud_draws++;
     else g_wc.imm_draws++;
-    g_new_meshes.push_back(g_imm_mesh);
-    g_imm_mesh = nullptr;
 }
 
 // ---- sphere-tested pre-built immediate geometry (0x361C30 <- 0x361ED8 <- 0x34EE70/0x34EEB8) ----
@@ -2234,9 +2276,10 @@ void ee_sphere_imm(uint32_t buf_obj, uint32_t ref_qword) {
     roll(kernel_vblank_count());
     const uint32_t buf = MEM_LW(buf_obj);
     const int32_t qwc = (int16_t)MEM_LH(buf_obj + 16);
-    if (!buf || qwc <= 0) return;
-    const uint32_t end_addr = buf + (uint32_t)qwc * 16u;
-    auto *m = new Mesh();
+    if (!buf || (buf & 15) || qwc <= 0 || buf >= EE_RAM_SIZE || uint32_t(qwc) > (EE_RAM_SIZE - buf) / 16)
+        return;
+    const uint32_t end_addr = buf + uint32_t(qwc) * 16;
+    auto m = std::make_unique<Mesh>();
     m->id = g_next_mesh++;
     m->replaces = 0;
     m->batch = buf;
@@ -2244,19 +2287,19 @@ void ee_sphere_imm(uint32_t buf_obj, uint32_t ref_qword) {
     m->transient = true;
     uint8_t first_alpha = 0x80;
     bool have_alpha = false;
-    // Decode 0x361C98 VIF chunks (VU1 0x0270 format)
-    uint32_t p = buf;
-    while (p + 32u <= end_addr) {
-        // Expect 0x01000202, 0x05000000, 0x6102C0C6, tex, 0x6001C000, nverts|0x8000, 0x01000103, UNPACK V4-8
-        if (MEM_LW(p + 16) != 0x6001C000u) { p += 4; continue; }
-        const uint32_t nverts = MEM_LW(p + 20) & 0x7FFFu;
-        const uint32_t col_base = p + 32u;
-        uint32_t cur = col_base + nverts * 4u;
-        if (cur + 12u > end_addr) break;
-        if (MEM_LW(cur) == 0x20000000u) cur += 28u;  // optional STMASK + STROW (7 words)
-        if (cur + 12u > end_addr) break;
-        const uint32_t vert_base = cur + 12u;
-        if (vert_base + nverts * 24u > end_addr) break;
+    for (uint32_t p = buf; p < end_addr;) {
+        StaticImmediateChunk chunk{};
+        if (!decode_static_immediate_chunk(g_ram + p, end_addr - p, chunk)) {
+#ifdef EOD_R7_RELEASE
+            fatal("unsupported ImmStatic VIF packet at %08x (REF %08x, offset %u of %u bytes)",
+                  buf, ref_qword, p - buf, end_addr - buf);
+#else
+            return;
+#endif
+        }
+        const uint32_t nverts = chunk.emitted;
+        const uint32_t col_base = p + uint32_t(chunk.colors);
+        const uint32_t vert_base = p + uint32_t(chunk.vertices);
         const uint32_t base_v = (uint32_t)m->vertices.size();
         for (uint32_t i = 0; i < nverts; i++) {
             const uint32_t cw = MEM_LW(col_base + i * 4u);
@@ -2281,11 +2324,21 @@ void ee_sphere_imm(uint32_t buf_obj, uint32_t ref_qword) {
                 m->indices.push_back(base_v + i);
             }
         }
-        p = vert_base + nverts * 24u + 4u;  // past MSCAL 0x4E
-        p = (p + 15u) & ~15u;               // 16-byte chunk alignment
+        p += uint32_t(chunk.bytes);
     }
     if (m->indices.empty()) {
-        delete m;
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_tags.lower_bound(ref_qword);
+        if (it != g_tags.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second.end > ref_qword) g_tags.erase(prev);
+        }
+        it = g_tags.lower_bound(ref_qword);
+        while (it != g_tags.end() && it->first < ref_qword + 16) it = g_tags.erase(it);
+        Tagged empty_tag{ref_qword + 16, Packet{}, true};
+        empty_tag.packet.kind = KIND_IMMEDIATE;
+        empty_tag.empty_bypass = true;
+        g_tags[ref_qword] = std::move(empty_tag);
         return;
     }
     Packet pkt{};
@@ -2308,8 +2361,40 @@ void ee_sphere_imm(uint32_t buf_obj, uint32_t ref_qword) {
     it = g_tags.lower_bound(ref_qword);
     while (it != g_tags.end() && it->first < ref_qword + 16) it = g_tags.erase(it);
     g_tags[ref_qword] = Tagged{ref_qword + 16, pkt, true};
-    g_new_meshes.push_back(m);
+    g_tags[ref_qword].geometry = std::move(m);
     g_wc.sphere_imm_draws++;
+}
+
+void ee_finish_submissions() {
+    publish_expected();
+}
+
+// At a process cutoff the EE may have authored the next chain without launching it.
+// Count only distinct records still held by live DMA tags and never received by the GS.
+Expected ee_pending_at_shutdown(uint64_t frame, const std::vector<bool> &received) {
+    Expected pending;
+    std::vector<bool> counted = received;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (const auto &[address, tag] : g_tags) {
+        const Packet &p = tag.packet;
+        if (tag.empty_bypass || p.frame != frame) continue;
+        if (p.serial >= counted.size()) counted.resize(size_t(p.serial) + 1);
+        if (counted[p.serial]) continue;
+        counted[p.serial] = true;
+        switch (p.kind) {
+        case KIND_QUEUE: ++pending.queue; break;
+        case KIND_WORLD: ++pending.world; break;
+        case KIND_WATER: ++pending.water; break;
+        case KIND_SHADOW: ++pending.shadow; break;
+        case KIND_FLARE: ++pending.flare; break;
+        case KIND_PARTICLE: ++pending.particle; break;
+        case KIND_SPRITE: ++pending.sprite; break;
+        case KIND_IMMEDIATE: ++pending.immediate; break;
+        case KIND_COCKPIT: ++pending.cockpit; break;
+        case KIND_HUD: ++pending.hud; break;
+        }
+    }
+    return pending;
 }
 
 void take_expected(uint64_t before, std::map<uint64_t, Expected> &out) {
@@ -2321,21 +2406,52 @@ void take_expected(uint64_t before, std::map<uint64_t, Expected> &out) {
 }
 
 int native_only_level() {
+#ifdef EOD_R7_RELEASE
+    return 1;
+#else
+    if (gs::g_replaying) return 0;
     static const int level = [] {
         const char *e = std::getenv("EOD_NATIVE_ONLY");
-        return e && *e && *e != '0' ? std::atoi(e) : 0;
+        if (e && *e) return *e != '0' ? std::atoi(e) : 0;
+#ifdef EOD_PLUME
+        auto env_set = [](const char *name) {
+            const char *v = std::getenv(name);
+            return v && *v && std::strcmp(v, "0") != 0;
+        };
+        const char *plume = std::getenv("EOD_PLUME");
+        if (plume && plume[0] == '0') return 0;
+        const char *nat = std::getenv("EOD_NATIVE");
+        if (nat && nat[0] == '0') return 0;
+        if (!g_config.native_renderer) return 0;
+        if (env_set("EOD_MODERN") || env_set("EOD_GS_CENSUS") || env_set("EOD_GS_TRACE") ||
+            env_set("EOD_GS_DUMP") || env_set("EOD_SCENE_CAPTURE") || env_set("EOD_SCENE_EMIT") ||
+            env_set("EOD_NATIVE_CHECK") || env_set("EOD_NATIVE_SKIN_CHECK") ||
+            env_set("EOD_NATIVE_WORLD_INDICES_CHECK") || env_set("EOD_NATIVE_VTX_CHECK") ||
+            env_set("EOD_NATIVE_WORLD_STRIPS") || env_set("EOD_GS_REPLAY_FORCE") || env_set("EOD_DIFF"))
+            return 0;
+        return 1;
+#else
+        return 0;
+#endif
     }();
     return level;
+#endif
 }
 
 bool native_only() {
-    static const bool on = [] {
-        const char *e = std::getenv("EOD_NATIVE_ONLY");
-        const bool v = e && *e && *e != '0';
-        if (v) std::fprintf(stderr, "[native] EOD_NATIVE_ONLY: the GS emulator draws nothing\n");
-        return v;
-    }();
-    return on;
+    const bool v = native_only_level() != 0;
+    if (v) {
+        static const bool logged = [] {
+#ifdef EOD_R7_RELEASE
+            std::fprintf(stderr, "[native] EOD_R7_RELEASE: Plume native-only active (legacy GS rasterizer excluded)\n");
+#else
+            std::fprintf(stderr, "[native] EOD_NATIVE_ONLY: the GS emulator draws nothing\n");
+#endif
+            return true;
+        }();
+        (void)logged;
+    }
+    return v;
 }
 
 // EOD_NATIVE_CHECK=1: the derived model -> screen matrix against the one VU1 uses for the record
@@ -2532,7 +2648,9 @@ void check_queue_dent_input(uint32_t top, size_t launch_word, bool continuation)
 }
 
 bool vu1_bypass_enabled() {
-#ifdef EOD_PLUME
+#ifdef EOD_R7_RELEASE
+    return plume_ready();
+#elif defined(EOD_PLUME)
     static const bool env_on = [] {
         const char *v = std::getenv("EOD_R7_VU1_BYPASS");
         return !v || !*v || v[0] != '0' || v[1] != '\0';
@@ -2568,14 +2686,31 @@ bool vu1_bypass_dma_tag(uint32_t tag) {
     auto it = g_tags.upper_bound(tag);
     if (it == g_tags.begin()) return false;
     --it;
-    // Only skip UNPACKs on non-range mesh REF tags (cars, props, world, shadows).
-    // Range tags (imm/hud/water/particles) can carry inline state/0x2538 A+D packets.
-    if (it->second.range || tag >= it->second.end) return false;
+    if (tag >= it->second.end) return false;
+    if (it->second.range) {
+        // Range tags (imm/hud/water/flare/particle/sprite/sphere_imm) only contain draw UNPACKs
+        // for VU1 0x0270/0x08E0/0x01B8/0x05E0, never 0x2538 A+D state packets.
+        return it->second.empty_bypass ||
+               (it->second.packet.mesh != 0 && it->second.packet.kind < KIND_COUNT);
+    }
     if ((MEM_LW(tag + 4) & 0x7FFFFFFFu) != it->second.packet.batch + 0x38) return false;
     return it->second.packet.mesh != 0 && it->second.packet.kind < KIND_COUNT;
 }
 
-bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
+// A reservation is spatial provenance, not permission to skip another VU
+// program that happens to lie within it. Each immediate sender emits these
+// draw entries (0x361468, 0x364068, 0x3645B8 and 0x364328).
+bool range_draw_program(uint32_t kind, uint32_t program) {
+    switch (kind) {
+    case KIND_PARTICLE: return program == 0x08e0;
+    case KIND_SPRITE: return program == 0x01b8 || program == 0x05e0;
+    case KIND_WATER: case KIND_FLARE: case KIND_IMMEDIATE: case KIND_COCKPIT: case KIND_HUD:
+        return program == 0x0270;
+    default: return false;
+    }
+}
+
+bool vu1_start(uint32_t program, uint32_t itop, bool continuation, WorldTextureLod &world_lod,
                bool &clipped_world_continuation, bool *bypass_vu1) {
     if (bypass_vu1) *bypass_vu1 = false;
     if (!enabled()) return false;
@@ -2587,7 +2722,9 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
     std::shared_ptr<const WorldTextureIndices> world_indices;
     std::unique_ptr<QueueMaterial> indexed_queue;
     bool found = false;
+    bool empty_bypass = false;
     bool retire_world_leaf = false;
+    std::shared_ptr<Mesh> geometry;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         auto it = g_tags.upper_bound(tag);
@@ -2595,36 +2732,55 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
             --it;
             // the tag VIF1 reads must still be the record's DMA REF to its batch data
             if (tag < it->second.end &&
-                (it->second.range || (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38)) {
-                p = it->second.packet;
-                if (program == 0x0618 && itop == 0x280 && p.itop == itop &&
-                    p.kind == KIND_WORLD && tag == it->first && !it->second.range &&
-                    !diff_in_original_side())
-                    clipped_world_continuation = true;
-                if (p.kind == KIND_QUEUE && program == 0x02E0 && itop == 0x80 && tag == it->first) {
-                    indexed_queue = std::move(it->second.queue_material);
-                    if (indexed_queue && indexed_queue->readiness && !diff_in_original_side()) {
-                        static const bool hooked = (diff_add_exit_report(queue_candidate_report), true);
-                        (void)hooked;
-                        g_queue_candidate = {it->second.dent, indexed_queue->readiness, p.frame, p.serial, tag};
-                        ++g_queue_candidates;
-                        g_queue_ready += indexed_queue->readiness->ready.load(std::memory_order_acquire);
+                (it->second.range ? continuation || range_draw_program(it->second.packet.kind, program)
+                                  : (MEM_LW(tag + 4) & 0x7FFFFFFF) == it->second.packet.batch + 0x38)) {
+                if (it->second.empty_bypass) {
+                    empty_bypass = true;
+                } else {
+                    p = it->second.packet;
+                    geometry = it->second.geometry;
+                    if (program == 0x0618 && itop == 0x280 && p.itop == itop &&
+                        p.kind == KIND_WORLD && tag == it->first && !it->second.range &&
+                        !diff_in_original_side())
+                        clipped_world_continuation = true;
+                    if (p.kind == KIND_QUEUE && program == 0x02E0 && itop == 0x80 && tag == it->first) {
+                        indexed_queue = std::move(it->second.queue_material);
+                        if (indexed_queue && indexed_queue->readiness && !diff_in_original_side()) {
+                            static const bool hooked = (diff_add_exit_report(queue_candidate_report), true);
+                            (void)hooked;
+                            g_queue_candidate = {it->second.dent, indexed_queue->readiness, p.frame, p.serial, tag};
+                            ++g_queue_candidates;
+                            g_queue_ready += indexed_queue->readiness->ready.load(std::memory_order_acquire);
+                        }
                     }
+                    if (program == 0x0270 && itop == 0x80) {
+                        world_indices = std::move(it->second.world_indices);
+                        if (!world_indices) p.world_texture.index_version = 0;
+                    }
+                    if (tag == it->first && it->second.retire_world_leaf) {
+                        // Consume the commit at its first MSCAL. A continuation or stale
+                        // reference may still use the marker but cannot retire another leaf.
+                        it->second.retire_world_leaf = false;
+                        retire_world_leaf = program == 0x0270 && itop == 0x80;
+                    }
+                    found = true;
                 }
-                if (program == 0x0270 && itop == 0x80) {
-                    world_indices = std::move(it->second.world_indices);
-                    if (!world_indices) p.world_texture.index_version = 0;
-                }
-                if (tag == it->first && it->second.retire_world_leaf) {
-                    // Consume the commit at its first MSCAL. A continuation or stale
-                    // reference may still use the marker but cannot retire another leaf.
-                    it->second.retire_world_leaf = false;
-                    retire_world_leaf = program == 0x0270 && itop == 0x80;
-                }
-                found = true;
             }
         }
         if (found && !g_new_meshes.empty()) meshes.swap(g_new_meshes);
+    }
+    if (empty_bypass) {
+        if (g_obj_active) {
+            if (!g_obj_bypassed) post(CMD_OFF, nullptr, 0);
+            g_obj_active = false;
+            g_obj_bypassed = false;
+            g_sent_key = ~0ull;
+        }
+        if (bypass_vu1 && vu1_bypass_enabled() &&
+            program != 0x2538 && program != 0x25F0 && program != 0x0000 && program != 0x24D8) {
+            *bypass_vu1 = true;
+        }
+        return false;
     }
     if (!found) {
         if (g_obj_active) {
@@ -2653,6 +2809,10 @@ bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
     }
     const bool do_bypass = bypass_vu1 != nullptr && vu1_bypass_enabled() &&
                            p.mesh != 0 && p.kind < KIND_COUNT;
+    if (geometry) {
+        auto *source = new std::shared_ptr<Mesh>(std::move(geometry));
+        post(CMD_TRANSIENT_MESH, &source, sizeof source);
+    }
     post(CMD_OBJ, &p, sizeof p);
     if (indexed_queue) {
         auto *owned = indexed_queue.release();

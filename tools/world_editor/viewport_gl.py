@@ -756,9 +756,14 @@ class ViewportGL(QOpenGLWidget):
         self._last_scatter_pt: np.ndarray | None = None
 
         # View toggles & renderer mode ("ps2" = fast power-sipping PS2 mode, "plume" = high-quality mode)
-        self.render_mode = "ps2"
         self._plume_viewport: PlumeViewport | None = None
         self._plume_module = self._discover_plume_library()
+        self.render_mode = "plume" if self._plume_module else "ps2"
+        self._plume_error = QLabel(self)
+        self._plume_error.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._plume_error.setWordWrap(True)
+        self._plume_error.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._plume_error.hide()
         self._plume_dirty = True
         self._plume_retry = False
         self.show_wireframe = False
@@ -928,6 +933,9 @@ class ViewportGL(QOpenGLWidget):
     def set_render_mode(self, mode: str) -> None:
         """Switch viewport shading mode: 'ps2' (fast power-sipping) or 'plume' (high quality)."""
         self.render_mode = "plume" if mode == "plume" else "ps2"
+        self._plume_error.hide()
+        if self.render_mode == "plume" and self._plume_module is None:
+            self._plume_module = self._discover_plume_library()
         if self.render_mode == "ps2" and self._plume_viewport:
             self._plume_viewport.close_surface()
             self._plume_dirty = True
@@ -1397,6 +1405,7 @@ class ViewportGL(QOpenGLWidget):
         self._position_overlays()
 
     def _position_overlays(self) -> None:
+        self._plume_error.setGeometry(self.rect())
         self.mode_pill.adjustSize()
         self.mode_pill.move(12, 12)
         min_x = self.mode_pill.x() + self.mode_pill.width() + 12
@@ -2474,7 +2483,7 @@ class ViewportGL(QOpenGLWidget):
         for c in candidates:
             if c.is_file():
                 return str(c)
-        return override
+        return None
 
     @staticmethod
     def _append_ribbon_seg(
@@ -2635,8 +2644,12 @@ class ViewportGL(QOpenGLWidget):
     # Paint Frame
     # -----------------------------------------------------------------------
     def _paint_plume(self) -> bool:
-        if self.render_mode != "plume" or self._plume_module is None or self.world is None or not self.isVisible():
+        if self.render_mode != "plume" or self.world is None or not self.isVisible():
             return False
+        if self._plume_module is None:
+            if not self._plume_error.isVisible():
+                self._show_plume_error("Native Plume viewport library unavailable")
+            return True
         with get_profiler().zone("viewport.plume_paint", "render"):
             return self._paint_plume_impl()
 
@@ -2672,8 +2685,19 @@ class ViewportGL(QOpenGLWidget):
             if self._plume_viewport:
                 self._plume_viewport.close_surface()
             self._plume_module = None
-            self.statusMessage.emit(f"Native Plume viewport unavailable ({error}). OpenGL preview active.")
-            return False
+            if self._plume_viewport:
+                self._plume_viewport.deleteLater()
+            self._plume_viewport = None
+            self._show_plume_error(f"Native Plume viewport unavailable ({error})")
+            return True
+
+    def _show_plume_error(self, reason: str) -> None:
+        self._plume_error.setText(f"{reason}. Select Classic for the OpenGL preview.")
+        self._plume_error.setGeometry(self.rect())
+        self._plume_error.setStyleSheet("background: #1c2129; color: #ddd; padding: 24px")
+        self._plume_error.show()
+        self._plume_error.raise_()
+        self.statusMessage.emit(reason)
 
     def paintGL(self) -> None:
         if self._paint_plume():

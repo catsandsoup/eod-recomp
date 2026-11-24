@@ -16,7 +16,13 @@ using namespace frontend;
 struct FakeNet : game_frontend::Network {
     game_frontend::Snapshot snap;
     std::vector<game_frontend::Command> got;
-    game_frontend::Snapshot snapshot() const override { return snap; }
+    mutable int ready_reads_left = -1;
+    game_frontend::Snapshot snapshot() const override {
+        auto s = snap;
+        if (ready_reads_left == 0) s.can_start = false;
+        if (ready_reads_left > 0) --ready_reads_left;
+        return s;
+    }
     void submit(game_frontend::Command c) override { got.push_back(c); }
 };
 
@@ -261,6 +267,7 @@ int main() {
     CHECK(find(m, "kick:1:42") < 0);
     CHECK(find(m, "ready") >= 0);
     net->snap.phase = game_frontend::Snapshot::Phase::Connecting;
+    net->snap.can_cancel = true;
     CHECK(find(m, "ready") < 0 && find(m, "addr") < 0 && find(m, "leave") >= 0);
     // host racing: BACK TO LOBBY (EndEvent) keeps the overlay open through cleanup
     net->snap.phase = game_frontend::Snapshot::Phase::Racing;
@@ -276,7 +283,11 @@ int main() {
     CHECK(find(m, "leave") > find(m, "mic"));
     // guest racing: LEAVE MATCH is shown, and gameplay-diverging cheats in SETTINGS are locked to host rules
     net->snap.is_host = false;
-    CHECK(find(m, "end_event") < 0 && m.rows()[find(m, "leave")].label == "LEAVE MATCH");
+    CHECK(find(m, "end_event") < 0 && m.rows()[find(m, "leave")].label == "LEAVE PARTY");
+    net->snap.can_rejoin_lobby = true;
+    m.select(find(m, "withdraw"));
+    m.update(in);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::RejoinLobby);
     m.set_tab(Tab::Settings);
     CHECK(!m.rows()[find(m, "turbo")].enabled && !m.rows()[find(m, "chickens")].enabled && !m.rows()[find(m, "invincible")].enabled);
     m.set_tab(Tab::Online);
@@ -300,17 +311,134 @@ int main() {
     for (char c : std::string("DEMO2")) { Input key = none(); key.ch = c; couch.update(key); }
     couch.update(accept);
     CHECK(net->got.back().kind == game_frontend::Command::Kind::JoinCode && net->got.back().text == "DEMO2");
+    CHECK(find(couch, "addr") < 0);
+    int advanced = find(couch, "advanced");
+    CHECK(advanced >= 0);
+    if (advanced >= 0) {
+        couch.select(advanced);
+        couch.update(accept);
+        CHECK(find(couch, "addr") >= 0);
+    }
+    net->snap.phase = game_frontend::Snapshot::Phase::CheckingCompatibility;
+    net->snap.status = "Checking your game files";
+    net->snap.can_cancel = true;
+    net->snap.players.push_back({0, "Stale host"});
+    net->snap.options.push_back({"car", "YOUR CAR", "Stale car", true, ""});
+    net->snap.track_pic = "Stale track";
+    net->snap.car_pic = 37;
+    CHECK(find(couch, "player") < 0 && find(couch, "opt:car") < 0);
+    CHECK(couch.pic_track().empty() && !couch.pic_car());
+    CHECK(find(couch, "ready") < 0 && find(couch, "leave") >= 0);
+    couch.update(shoulder);
+    CHECK(couch.tab() == Tab::Online);
+    couch.set_tab(Tab::Graphics);
+    CHECK(couch.tab() == Tab::Online);
+    net->snap.phase = game_frontend::Snapshot::Phase::Error;
+    net->snap.error = "The lobby did not respond.";
+    CHECK(find(couch, "profile_match") < 0);
+    net->snap.checking_installed_content = true;
+    CHECK(find(couch, "profile_search") >= 0 && find(couch, "profile_match") < 0);
+    net->snap.checking_installed_content = false;
+    net->snap.can_match_content = true;
+    const int match = find(couch, "profile_match");
+    CHECK(match >= 0);
+    if (match >= 0) {
+        couch.select(match);
+        couch.update(accept);
+        CHECK(net->got.back().kind == game_frontend::Command::Kind::MatchContent);
+    }
+    net->snap.can_match_content = false;
+    int retry = find(couch, "join_retry");
+    CHECK(retry >= 0 && find(couch, "join_back") >= 0 && find(couch, "code") < 0);
+    if (retry >= 0) {
+        const size_t before_retry = net->got.size();
+        couch.select(retry);
+        couch.update(accept);
+        CHECK(net->got.size() == before_retry + 1);
+        CHECK(net->got.back().kind == game_frontend::Command::Kind::JoinCode && net->got.back().text == "DEMO2");
+    }
+    net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
+    net->snap.error.clear();
+    CHECK(find(couch, "ready") >= 0);
+    net->snap.phase = game_frontend::Snapshot::Phase::Error;
+    net->snap.error = "Lost connection to the host.";
+    net->snap.retryable_error = true;
+    retry = find(couch, "join_retry");
+    CHECK(retry >= 0 && couch.rows()[retry].label == "REJOIN");
+    net->snap.retryable_error = false;
+    CHECK(find(couch, "join_retry") < 0);
+    net->snap.retryable_error = true;
+    couch.select(find(couch, "join_retry"));
+    couch.update(accept);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::JoinCode && net->got.back().text == "DEMO2");
+    net->snap.phase = game_frontend::Snapshot::Phase::Connecting;
+    Input back = none(); back.back = true;
+    CHECK(!couch.update(back).close && net->got.back().kind == game_frontend::Command::Kind::Cancel);
+    net->snap = {};
+    CHECK(find(couch, "host") >= 0 && find(couch, "join_back") < 0);
+
     net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
     couch.update(none());
     CHECK(couch.rows()[couch.selected()].id == "ready");
+    const size_t before_ready = net->got.size();
+    CHECK(!couch.rows()[couch.selected()].enabled);
+    couch.update(accept);
+    CHECK(net->got.size() == before_ready);
+    net->snap.car_pic = 37;
     couch.update(accept);
     CHECK(net->got.back().kind == game_frontend::Command::Kind::Ready && net->got.back().enabled);
+    net->snap.is_host = true;
+    net->snap.can_start = true;
+    CHECK(couch.rows()[find(couch, "start")].label == "START EVENT ALONE");
+    net->snap.players = {{0, "Host"}, {1, "Guest"}};
+    CHECK(couch.rows()[find(couch, "start")].label == "START EVENT");
+    couch.select(find(couch, "start"));
+    net->ready_reads_left = 2; // readiness changes after the rows are built
+    const size_t before_start = net->got.size();
+    CHECK(!couch.update(accept).close && net->got.size() == before_start);
+    net->ready_reads_left = -1;
     net->snap.phase = game_frontend::Snapshot::Phase::Racing;
     net->snap.is_host = true;
     couch.update(none());
     CHECK(couch.rows()[couch.selected()].id == "end_event");
     CHECK(!couch.update(accept).close && net->got.back().kind == game_frontend::Command::Kind::EndEvent);
     net->snap = {};
+
+    // Turbo explains the local driving input even when a guest cannot edit the room rule.
+    {
+        Config input_cfg;
+        input_cfg.keys[KEY_L2] = "A, J, Space";
+        Menu turbo_menu(input_cfg);
+        turbo_menu.set_network(net);
+        HostInfo input_host;
+        input_host.device[0] = "Keyboard";
+        turbo_menu.set_host(input_host);
+        turbo_menu.set_tab(Tab::Settings);
+#ifdef _WIN32
+        const std::string keyboard_label = "TURBO BOOST [J / Q / F]";
+#else
+        const std::string keyboard_label = "TURBO BOOST [J]";
+#endif
+        CHECK(turbo_menu.rows()[find(turbo_menu, "turbo")].label == keyboard_label);
+        turbo_menu.set_tab(Tab::Online);
+        net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
+        net->snap.is_host = true;
+        net->snap.options = {{"rule_turbo", "TURBO BOOST", "ON", true, "Applies to all players."}};
+        auto turbo = turbo_menu.rows()[find(turbo_menu, "opt:rule_turbo")];
+        CHECK(turbo.label == keyboard_label && turbo.kind == RowKind::Choice);
+        net->snap.is_host = false;
+        net->snap.options[0].editable = false;
+        input_host.device[0] = "Gamepad";
+        turbo_menu.set_host(input_host);
+        turbo = turbo_menu.rows()[find(turbo_menu, "opt:rule_turbo")];
+        CHECK(turbo.label.find("RIGHT STICK CLICK") != std::string::npos && turbo.kind == RowKind::Info);
+#ifndef _WIN32
+        input_cfg.controller_layout = "original";
+        turbo = turbo_menu.rows()[find(turbo_menu, "opt:rule_turbo")];
+        CHECK(turbo.label == "TURBO BOOST [LEFT TRIGGER]");
+#endif
+        net->snap = {};
+    }
 
     // error screen replaces the tabs; Back never closes it
     m.show_error("NO DISC", "x", true);

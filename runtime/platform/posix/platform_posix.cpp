@@ -32,10 +32,10 @@
 // to a WAV file, input comes only from the pad scripts.
 static PlatformConfig g_cfg;
 
-void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; }
+void platform_configure_display(const PlatformConfig &cfg) { g_cfg=cfg; presentation::set_drawable_size(cfg.width, cfg.height); }
 
 bool platform_init(const PlatformConfig &cfg) {
-    g_cfg = cfg;
+    platform_configure_display(cfg);
     return true;
 }
 

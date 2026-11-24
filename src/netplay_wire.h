@@ -7,8 +7,9 @@
 #include <string>
 #include <vector>
 #include "netplay_car.h"
+#include "netplay_event_completion.h"
 namespace netplay {
-constexpr uint16_t kMagic = 0x7D3E, kProtocol = 6;
+constexpr uint16_t kMagic = 0x7D3E, kProtocol = 11;
 constexpr int kMaxPlayers = 16;
 enum Kind : uint8_t {
     K_JOIN = 1, K_WELCOME, K_REFUSE, K_HEARTBEAT, K_LOBBY, K_START, K_TRACK, K_ROSTER, K_GO, K_END, K_LEAVE,
@@ -20,6 +21,12 @@ enum Kind : uint8_t {
 // GRID uses the same bounded car records as SNAP, including the local human.
 // GRID_ACK contains the event ID only.
 constexpr uint8_t K_GRID = K_VOICE + 1, K_GRID_ACK = K_GRID + 1;
+constexpr uint8_t K_FINISH_STATE = K_GRID_ACK + 1, K_FINISH_COUNTDOWN = K_FINISH_STATE + 1,
+                  K_EVENT_RESULTS = K_FINISH_COUNTDOWN + 1, K_RESULT_CLOCK = K_EVENT_RESULTS + 1;
+// Event ID, absolute post-contact body state, and the native damage feedback for its owner.
+constexpr uint8_t K_IMPACT_STATE = K_EVENT_RESULTS + 2;
+constexpr uint8_t K_BATTLE_STATE = K_IMPACT_STATE + 1, K_BATTLE_RESPAWN = K_BATTLE_STATE + 1;
+constexpr uint8_t K_DAMAGE_DETAIL = K_BATTLE_RESPAWN + 1, K_DAMAGE_DETAIL_ACK = K_DAMAGE_DETAIL + 1;
 // guest phase, reported in heartbeats
 enum Phase : uint8_t { P_LOBBY = 0, P_STARTED, P_CAR_DONE, P_LOADED, P_RACING, P_DONE };
 
@@ -40,8 +47,42 @@ struct Reader {
     uint32_t u32() { uint32_t a = u16(); return (a << 16) | u16(); }
     float f32() { uint32_t u = u32(); float f; std::memcpy(&f, &u, 4); return f; }
     float i16(float scale) { return (float)(int16_t)u16() / scale; }
-    std::string str() { size_t n = u8(); if (p + n > e) { ok = false; return {}; } std::string s((const char *)p, n); p += n; return s; }
+    std::string str() { size_t n = u8(); if (size_t(e - p) < n) { ok = false; return {}; } std::string s((const char *)p, n); p += n; return s; }
 };
+inline void put_event_results(Writer &w, const std::vector<EventResultRow> &rows) {
+    w.u8(rows.size());
+    for (const auto &row : rows) {
+        w.u8(row.slot);
+        w.u8(static_cast<uint8_t>(row.state));
+        w.u8(row.rank);
+        w.str(row.name, 16);
+        if (row.state == EventFinishState::BattleScore) w.u32(static_cast<uint32_t>(row.score));
+    }
+}
+inline bool get_event_results(Reader &r, std::vector<EventResultRow> &rows) {
+    const uint32_t count = r.u8();
+    if (!count || count > kMaxPlayers) return false;
+    uint16_t slots = 0, ranks = 0;
+    std::vector<EventResultRow> decoded;
+    for (uint32_t i = 0; i < count && r.ok; ++i) {
+        const auto slot = static_cast<uint8_t>(r.u8());
+        const auto state = static_cast<EventFinishState>(r.u8());
+        const auto rank = static_cast<uint8_t>(r.u8());
+        auto name = r.str();
+        const auto score = state == EventFinishState::BattleScore ? static_cast<int32_t>(r.u32()) : 0;
+        const bool placed = state == EventFinishState::Finished || state == EventFinishState::Survivor ||
+                            state == EventFinishState::BattleScore;
+        if (slot >= kMaxPlayers || (slots & (1u << slot)) || state <= EventFinishState::Active ||
+            state > EventFinishState::BattleScore || rank > count || placed != (rank != 0) ||
+            (rank && (ranks & (1u << (rank - 1)))) || name.empty() || name.size() > 16) return false;
+        slots |= static_cast<uint16_t>(1u << slot);
+        if (rank) ranks |= static_cast<uint16_t>(1u << (rank - 1));
+        decoded.push_back({slot, state, rank, std::move(name), score});
+    }
+    if (!r.ok || r.p != r.e) return false;
+    rows = std::move(decoded);
+    return true;
+}
 inline void put_car(Writer &w, uint8_t slot, uint32_t tick, const netplay_car::State &s) {
     w.u8(slot); w.u32(tick);
     for (int i = 9; i < 12; ++i) w.f32(s.pose[i]);
@@ -51,7 +92,7 @@ inline void put_car(Writer &w, uint8_t slot, uint32_t tick, const netplay_car::S
     if (q[3] < 0) for (float &v : q) v = -v;
     for (float v : q) w.i16(v, 32000.f);
     w.i16(s.steer, 30000.f); w.i16(s.gas, 30000.f); w.i16(s.brake, 30000.f); w.u8(s.handbrake > .5f); w.u8((uint8_t)(int8_t)s.gear);
-    w.i16(s.damage, 8000.f);
+    w.f32(s.damage); w.u8(s.damage_stage);
 }
 inline bool get_car(Reader &r, uint8_t &slot, uint32_t &tick, netplay_car::State &s) {
     slot = (uint8_t)r.u8(); tick = r.u32();
@@ -61,7 +102,7 @@ inline bool get_car(Reader &r, uint8_t &slot, uint32_t &tick, netplay_car::State
     float q[4]; for (float &v : q) v = r.i16(32000.f);
     netplay_car::quat_to_matrix(q, s.pose);
     s.steer = r.i16(30000.f); s.gas = r.i16(30000.f); s.brake = r.i16(30000.f); s.handbrake = r.u8() ? 1.f : 0.f; s.gear = (int8_t)r.u8();
-    s.damage = r.i16(8000.f);
-    return r.ok && netplay_car::valid_state(s);
+    s.damage = r.f32(); s.damage_stage = r.u8();
+    return r.ok && s.damage >= 0 && s.damage <= 4 && s.damage_stage <= 12 && netplay_car::valid_state(s);
 }
 }  // namespace netplay

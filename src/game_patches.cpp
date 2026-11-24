@@ -5,8 +5,8 @@
 // widescreen the 3D view widens and the HUD and menus are laid out for a
 // picture stretched to 16:9. The applied mode is at 0x3DD660 (the Options
 // screen's own selection, 0x4A807C, only takes effect through that function).
-// AspectRatio=16:9 / 4:3 in eod.ini keeps the mode at widescreen / normal;
-// with "auto" the display follows the game's mode. Movies are 4:3 either way.
+// AspectRatio=display uses the drawable for projection. Fixed ratios select
+// the matching mode, auto follows the retail option, and movies stay 4:3.
 //
 // EOD_POKE=addr=value,... (hex, 32-bit words) writes arbitrary words every
 // vblank (testing patches).
@@ -34,6 +34,7 @@
 #include "hle_career.h"
 #include "iop/iop.h"
 #include "platform/platform.h"
+#include "platform/presentation.h"
 #include "gs/modern_scene.h"
 
 // The Career unlocks (hle_career.cpp); standalone unit tests that do not link it get this no-op.
@@ -75,10 +76,11 @@ const uint32_t kAspectScale = 0x3DD658;   // 1.0, or 0.75 in widescreen and lett
 const uint32_t kWideFlag = 0x3DD64C;      // 1 in widescreen
 const uint32_t kLetterboxFlag = 0x3DD650; // 1 in letterbox
 
-// The mode the settings force (-1: the game's own).
-int forced_mode() {
-    const std::string &a = g_config.aspect;
-    return a == "16:9" ? 1 : a == "4:3" ? 0 : -1;
+// A negative value leaves the retail display option in charge. Match Display
+// uses the pixel dimensions published by the window thread, including Retina.
+int forced_aspect() {
+    if (g_config.aspect == "auto" || g_config.aspect == "stretch") return -1;
+    return display_aspect(g_config.aspect, presentation::active_drawable());
 }
 
 uint32_t fbits(float f) {
@@ -89,12 +91,13 @@ uint32_t fbits(float f) {
 
 // What f_0034D328 does with the game's state (without its settings-table
 // record and debug message), for switching while the game runs.
-void set_mode(int mode) {
-    ee_w32(kDisplayMode, (uint32_t)mode);
-    ee_w32(kViewScaleY, fbits(mode == 2 ? 0.75f : 1.0f));
-    ee_w32(kAspectScale, fbits(mode != 0 ? 0.75f : 1.0f));
-    ee_w32(kWideFlag, mode == 1 ? 1 : 0);
-    ee_w32(kLetterboxFlag, mode == 2 ? 1 : 0);
+void set_mode(int aspect) {
+    const bool wide = aspect != 0;
+    ee_w32(kDisplayMode, wide);
+    ee_w32(kViewScaleY, fbits(1.0f));
+    ee_w32(kAspectScale, fbits(projection_x_scale(aspect)));
+    ee_w32(kWideFlag, wide);
+    ee_w32(kLetterboxFlag, 0);
 }
 
 struct Poke {
@@ -173,9 +176,12 @@ void apply_car_looks() {
 // The game applies its display mode (at start from its settings, and from the
 // Options screen): the forced mode replaces the one asked for.
 extern "C" void f_0034D328(void) {
-    int want = forced_mode();
-    if (want >= 0) g_ee.r[4].sd[0] = want;
+    const int aspect = forced_aspect();
+    if (aspect >= 0) g_ee.r[4].sd[0] = aspect != 0;
     f_0034D328_orig();
+    // The retail setter hardcodes 0.75 for all wide modes. Its vertical
+    // scale stays 1.0: only retail letterbox mode reduces both axes.
+    if (aspect > 0) ee_w32(kAspectScale, fbits(projection_x_scale(aspect)));
 }
 
 
@@ -249,6 +255,15 @@ static float car_damage_scale(const std::string &model) {
     return v;
 }
 
+extern "C" void f_00165E10_orig(void);
+extern "C" void f_00165E10(void) {
+    // 165D20 finds the local Human and stores its slot here just before
+    // calling 165E10. All peers must protect and score the same bus.
+    if (netplay_hooks::detention_bus_slot >= 0 && netplay_hooks::event_active && netplay_hooks::event_active())
+        ee_w32(0x003CD8F4, static_cast<uint32_t>(netplay_hooks::detention_bus_slot));
+    f_00165E10_orig();
+}
+
 // Car setup (car in a0, its chassis parameters in a1: the mass at +8, the
 // model name at +0xAC). It sets the car's damage multiplier (+0x4B0):
 // event tweak * 4000 lb / mass * the upgrades' factor (+0x2EC); the
@@ -274,7 +289,8 @@ extern "C" void f_0018AFE0(void) {
 // Existing damage and already detached panels are not repaired.
 static bool invincible_human(uint32_t car) {
     return netplay_hooks::rule(netplay_hooks::Invincible, g_config.cheat_invincible) && car && !(car & 3) &&
-        car <= EE_RAM_SIZE - 0x1E4 && ee_r32(car + 0x1E0) == 0x50;
+        car <= EE_RAM_SIZE - 0x1E4 && (ee_r32(car + 0x1E0) == 0x50 ||
+        (netplay_hooks::remote_driver_car && netplay_hooks::remote_driver_car(car)));
 }
 extern "C" void f_0018AD20_orig(void);
 extern "C" void f_0018CA98_orig(void);
@@ -283,7 +299,20 @@ extern "C" void f_0018AD20(void) {
 }
 extern "C" void car_apply_collision_damage(void);  // 0x18CA98 as readable C++ (src/car_damage.cpp)
 extern "C" void f_0018CA98(void) {
-    if (!invincible_human(g_ee.r[4].uw[0])) car_apply_collision_damage();
+    const uint32_t car = g_ee.r[4].uw[0];
+    if (!invincible_human(car)) {
+        car_apply_collision_damage();
+        return;
+    }
+    // Invincibility skips the native damage callback. Its rigid body still
+    // participates in the collision and needs the same host recoil handoff.
+    const uint32_t impulse = g_ee.r[5].uw[0];
+    const int32_t other = g_ee.r[8].sw[0];
+    if (netplay_hooks::car_contact && other >= 0 && impulse && !(impulse & 3) && impulse <= EE_RAM_SIZE - 12) {
+        const float x = ee_rf(impulse), y = ee_rf(impulse + 4), z = ee_rf(impulse + 8);
+        if (x * x + y * y + z * z > 300.f * 300.f)
+            netplay_hooks::car_contact(car, other);
+    }
 }
 
 // The native world update has one inline damage write for the timed-damage
@@ -500,10 +529,16 @@ uint16_t game_patches_suppressed_buttons() {
 void game_patches_vblank() {
     // a forced mode the game hasn't applied (the setting changed while running):
     // set it (not during a movie, which restores the view it saved when it ends)
-    int want = forced_mode();
-    if (want >= 0 && !g_movie_playing && ee_r32(kDisplayMode) != (uint32_t)want) {
-        LOG(LOG_CORE, "display mode %s", want ? "widescreen" : "normal");
-        set_mode(want);
+    const int want = forced_aspect();
+    static int previous = -1;
+    if (!g_movie_playing) {
+        if (want >= 0 && (want != previous || ee_r32(kDisplayMode) != uint32_t(want != 0)))
+            set_mode(want);
+        previous = want;
+    } else {
+        // The movie restores a saved retail mode. Reapply the selected
+        // projection on the first game vblank after its final 4:3 frame.
+        previous = -1;
     }
     apply_car_looks();
     trace_battle();
@@ -633,7 +668,7 @@ void game_patches_vblank() {
         }
         if ((b & PAD_R3) && modern::look_switch_available()) {
             s_suppressed_pad0_buttons |= PAD_R3;
-            if (pressed & PAD_R3) modern::toggle_from_input();
+            if (pressed & PAD_R3) modern::toggle_from_input("controller shortcut");
         }
         if (pressed & PAD_SQUARE) {
             g_config.cheat_invincible = !g_config.cheat_invincible;
@@ -685,10 +720,16 @@ void game_patches_vblank() {
     else if (g_movie_playing)
         aspect = 0;
     else
-        aspect = ee_r32(kDisplayMode) == 1 ? 1 : 0;  // (letterbox is drawn inside a 4:3 picture)
+        aspect = ee_r32(kDisplayMode) == 1 ? (want > 0 ? want : 1) : 0;  // (letterbox is drawn inside a 4:3 picture)
     static int last = -1;
     if (aspect != last) {
-        LOG(LOG_CORE, "display aspect %s", aspect == 2 ? "stretched" : aspect == 1 ? "16:9" : "4:3");
+        if (aspect == 2) {
+            LOG(LOG_CORE, "display aspect stretched");
+        } else {
+            const auto ratio = aspect_ratio(aspect);
+            LOG(LOG_CORE, "display aspect %d:%d, projection x scale %.7f", ratio.width, ratio.height,
+                projection_x_scale(aspect));
+        }
         last = aspect;
         platform_set_aspect(aspect);
     }

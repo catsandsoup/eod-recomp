@@ -25,6 +25,7 @@
 #include "../../core/memory.h"
 #include "../../ui/overlay.h"
 #include "../platform.h"
+#include "../presentation.h"
 #include "../keyboard_input.h"
 #include "../pad_script.h"
 #include "../../gs/modern_scene.h"
@@ -34,7 +35,6 @@ void build_key_map();
 namespace {
 
 PlatformConfig g_cfg;
-std::atomic<int> g_aspect{0};  // display aspect (platform_set_aspect)
 HWND g_hwnd;
 bool g_quit;
 bool g_fullscreen;
@@ -143,6 +143,9 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(h, &ps);
         return 0;
     }
+    case WM_SIZE:
+        presentation::set_drawable_size(LOWORD(lp), HIWORD(lp));
+        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_SYSKEYDOWN:
@@ -158,7 +161,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_F11) toggle_fullscreen();
-        if (wp == VK_F9 && !(lp & (1 << 30)) && GetFocus() == h) modern::toggle_from_input();
+        if (wp == VK_F9 && !(lp & (1 << 30)) && GetFocus() == h) modern::toggle_from_input("keyboard F9");
         g_keys[wp & 255] = true;
         return 0;
     case WM_KEYUP:
@@ -223,7 +226,7 @@ bool platform_init(const PlatformConfig &cfg) {
     WSADATA winsock{};
     g_winsock_ready = WSAStartup(MAKEWORD(2, 2), &winsock) == 0;
     g_cfg = cfg;
-    g_aspect = cfg.aspect;
+    presentation::set_drawable_size(cfg.width, cfg.height);
     QueryPerformanceFrequency(&g_qpf);
     timeBeginPeriod(1);
     load_xinput();
@@ -525,22 +528,12 @@ void platform_get_controller(int port, HostPadState *out) {
     }
 }
 
-void platform_set_aspect(int aspect) { g_aspect = aspect; }
+void platform_set_aspect(int aspect) { presentation::requested.store(aspect, std::memory_order_relaxed); }
 
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h) {
-    int vw = cw, vh = ch, aspect = g_aspect;
-    if (aspect != 2) {  // 4:3 or 16:9, letterboxed
-        int an = aspect == 1 ? 16 : 4, ad = aspect == 1 ? 9 : 3;
-        vh = cw * ad / an;
-        if (vh > ch) {
-            vh = ch;
-            vw = ch * an / ad;
-        }
-    }
-    *x = (cw - vw) / 2;
-    *y = (ch - vh) / 2;
-    *w = vw;
-    *h = vh;
+    const int requested = presentation::requested.load(std::memory_order_relaxed);
+    const auto rect = display_rect(presentation::current(requested < 0 ? g_cfg.aspect : requested), cw, ch);
+    *x=rect.x; *y=rect.y; *w=rect.width; *h=rect.height;
 }
 
 void *platform_native_window() { return g_hwnd; }

@@ -396,6 +396,34 @@ bool shadow_extrusion_faces() {
     return decode(options) && mesh.indices == std::vector<uint32_t>{0, 1, 2};
 }
 
+bool camera_facing_faces() {
+    uint32_t stream[] = {
+        0x6001c000, 0x8004,                // four vertices at the same uploaded position
+        0x01000103,                        // STCYCL 1:3, normal/position/UV
+        0x6804c002, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x6e04c001, 0x80808080, 0x80808080, 0x00808080, 0x00808080,
+        0x01000101,
+        0x6e04c096, 0x00800020, 0x0080001f, 0x0080001e, 0x0080001d, // reversed V4-8 corners
+        0x1400006a,
+    };
+    Decoder decoder;
+    Mesh mesh;
+    Options options;
+    auto decode = [&] {
+        mesh.clear();
+        return decoder.decode_vif(reinterpret_cast<const uint8_t *>(stream), sizeof stream,
+                                  mesh, options) == Status::Ok && mesh.vertices.size() == 4;
+    };
+    if (!decode() || !mesh.indices.empty()) return false;
+    options.keep_camera_facing_faces = true;
+    if (!decode() || mesh.indices != std::vector<uint32_t>{0, 1, 2, 2, 1, 3}) return false;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!(mesh.vertices[i].flags & kHasAux) || mesh.vertices[i].aux[0] != 29 + i) return false;
+    }
+    stream[sizeof stream / sizeof *stream - 1] = 0x1400004e;
+    return decode() && mesh.indices.empty();  // static geometry still filters equal positions
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -403,7 +431,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "shadow side face was lost or retained in the wrong mode\n");
         return 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "--shadow-extrusion")) return 0;
+    if (!camera_facing_faces()) {
+        fprintf(stderr, "camera-facing quad indices do not survive corner expansion\n");
+        return 1;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--shadow-extrusion") || !strcmp(argv[1], "--camera-facing"))) return 0;
     if (argc < 3) {
         fprintf(stderr, "usage: %s <DISC/DATA> <ref.bin> [--verbose] | --shadow-extrusion\n", argv[0]);
         return 2;

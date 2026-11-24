@@ -62,6 +62,12 @@ class AuditParserTest(unittest.TestCase):
             ([launch, launch, launch_end, empty_vu1, launch_audit], 1, "duplicate"),
             ([empty_vu0, empty_vu1.replace("dropped=0", "dropped=1"), self.ZERO], 1, "truncated"),
         ]
+        for kind, address in (("retired_0000", "00000000"), ("retired_2538", "00002538"),
+                              ("retired_25f0", "000025f0"), ("retired_queue_dent", "00000d48")):
+            row = retirement.replace("retired_world", kind).replace("00000270", address)
+            cases.append(([empty_vu0, row, vu1_end, self.ZERO], 0, "reconciles"))
+            cases.append(([empty_vu0, row.replace("address=" + address, "address=00000008"),
+                           vu1_end, self.ZERO], 1, "invalid address"))
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "run.log"
             for lines, status, message in cases:

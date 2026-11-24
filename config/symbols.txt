@@ -9,6 +9,7 @@
 00119428 HudGetParticipantDisplayName [V]  # Returns participant display name for HUD/kill messages -> docs/BATTLE_RECOVERY.md
 00119888 HudDrawLeftRaceRows [V]  # Draws left-anchored position/lap/damage HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
 00119F40 HudDrawRightSpeedRows [V]  # Draws right-anchored speedometer/tachometer HUD rows in race viewports -> docs/HUD_EDGE_ANCHORS.md
+0011DC30 HudGetRightEdge [V]  # Returns the right HUD endpoint used by the speed and skull/count rows -> docs/HUD_EDGE_ANCHORS.md
 00120650 EventSetupSelectInitial [V]  # Per-event setup screen initial contest selection; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 00120FB8 EveHasMoreEvents [V]  # Returns whether the current Eve has remaining contests; wrapped to unwind after an online event -> docs/INDEX.md
 001244A8 EveLoadContests [V]  # Loads Eve contest descriptors into g_EveContestTable; wrapped to inject solo/AI Battle events -> docs/BATTLE_RECOVERY.md
@@ -30,8 +31,10 @@
 00134A70 TrackRelocateSectionTable [I]  # Relocates loaded track section pointers in place -> docs/BATTLE_RECOVERY.md
 00138288 DriverFactoryCreate [V]  # Creates human/AI/null driver controller for a participant slot -> docs/GAMEPLAY_MODS_RE.md
 001515B8 TrackLookupBattleSection [V]  # Looks up c_battle section for a track; wrapped to supply Welch Battle table -> docs/BATTLE_RECOVERY.md
+00165E10 DetentionSetupParticipants [I]  # Initial participant setup for Detention, including the bus role -> docs/NETPLAY_STATE_SYNC.md
 00166B50 BattleDrawKillMessages [V]  # Draws HUD kill attribution banner during Battle matches -> docs/BATTLE_RECOVERY.md
 00166C38 BattleCreate [V]  # Allocates and initializes BattleMaster match controller -> docs/BATTLE_RECOVERY.md
+001671E8 BattleCheckSelectRespawn [I]  # Battle SELECT respawn request validates delay and chooses spawn -> docs/BATTLE_RECOVERY.md
 00167340 BattleInitParticipants [V]  # Initializes per-car BattleMaster participant records and spawns -> docs/BATTLE_RECOVERY.md
 001675C0 BattleRespawnCar [V]  # Resets damage, detaches/reattaches parts, and teleports wrecked car to spawn point -> docs/BATTLE_RECOVERY.md
 00167C70 BattlePlaceInitialCars [V]  # Places Battle participants on initial spawn transforms; wrapped for >4 cars -> docs/BATTLE_RECOVERY.md
@@ -59,7 +62,9 @@
 0017E5C8 ChickenWeaponUpdate [V]  # Advances projectile flight, reload state machine, and collision checks -> docs/BATTLE_RECOVERY.md
 0017E718 ChickenWeaponDetonate [V]  # Triggers explosion SFX, particle burst, and radial shockwave at impact point -> docs/BATTLE_RECOVERY.md
 0017EA10 ChickenWeaponInit [V]  # Initializes projectile scene nodes, SFX handles, and weapon registry entry -> docs/BATTLE_RECOVERY.md
+00186DC8 BuildTransmissionShiftTable [I]  # Builds shift data before the NASCAR transmission override -> docs/NASCAR_HOLISTIC_LIFECYCLE_AUDIT.md
 00188F20 CarResetForRespawn [V]  # Clears velocity, repairs damage/wheels/panels, and resets deform bones -> docs/BATTLE_RECOVERY.md
+00189648 CarApplySolvedContact [V]  # Receives the solved impulse for a contact body -> src/netplay_trace.cpp
 0018AA68 CarSetBrake [V]  # Stores footbrake into car + 0x1B74; wrapped by KillableChallengers (wrecked challenger brakes) -> docs/CAREER_UNLOCKS.md
 0018AA70 CarSetThrottle [V]  # Stores throttle into car + 0x1B70; wrapped by KillableChallengers (wrecked challenger stops) -> docs/CAREER_UNLOCKS.md
 0018AA80 CarSetSteering [V]  # Writes normalized steering angle [-1, 1] to car+0x1B6C -> docs/BATTLE_RECOVERY.md
@@ -83,6 +88,7 @@
 001B8370 CarRecoveryCountdownUpdate [V]  # Updates rollover/wrong-way reset timer and SELECT manual recovery -> docs/MANUAL_RECOVERY.md
 001C31A0 CameraDirectorUpdate [V]  # CameraDirectorUpdate: injects 360 orbit & turntable in showroom/garage -> docs/CAREER_UNLOCKS.md
 001D2DC8 CameraDirectorPlayTrack [V]  # CameraDirectorPlayTrack: tracks active clip track -> docs/CAREER_UNLOCKS.md
+001D3FB8 StartCrashOrbitPause [I]  # Requests the single-view crash orbit pause -> docs/NETPLAY_STATE_SYNC.md
 001D8F58 TerrainSnapTransformToGround [V]  # Raycasts terrain and aligns 4x3 transform to ground height/normal -> docs/BATTLE_RECOVERY.md
 001DF9A0 DeformResetMeshVertices [I]  # Resets deformed car mesh vertices and bone offsets to rest state -> docs/NASCAR_A2_RECOVERY.md
 001E0DC8 DetachedPanelPoolInit [V]  # Initializes detached body panel phob pool at 0x00494D60 -> docs/INDEX.md
@@ -115,6 +121,8 @@
 00223800 SkyDestroy [I]  # SkyDestroy (vtable 0x408318 slot 2) -> docs/NATIVE_RENDERER.md
 00223858 SkyDraw [I]  # SkyDraw: dome parts through the draw queue -> docs/NATIVE_RENDERER.md
 00227EE8 ChickenWeaponCreateForCar [V]  # Constructs and registers a chicken launcher for car slot -> docs/BATTLE_RECOVERY.md
+0023C400 LoadEngineSound [I]  # Loads retail engine parameters or the NASCAR ESFX override -> docs/NASCAR_HOLISTIC_LIFECYCLE_AUDIT.md
+0023C8D0 MixEngineSound [I]  # Updates the running car engine mix -> docs/NASCAR_HOLISTIC_LIFECYCLE_AUDIT.md
 00270C10 MenuRun [I]  # Runs one menu screen to a result; wrapped to auto-answer the Arcade single/multi prompt for online events -> docs/NETPLAY_STATE_SYNC.md
 002A1298 MainMenuUpdate [V]  # Main menu state machine; wrapped by EOD_DIRECT_START -> docs/INDEX.md
 002A75E0 SinglePlayerCarSelectUpdate [V]  # Action/Single car selection screen; wrapped by EOD_DIRECT_START -> docs/INDEX.md
@@ -208,12 +216,15 @@
 0035DD28 DentOffsetWrite [I]  # DentOffsetWrite: car dent offsets to VU1 0x90 (src/bone_pose.cpp, readable C++; EOD_DIFF) -> docs/NATIVE_RENDERER.md
 0035DEE0 WorldPacketBegin [I]  # WorldPacketBegin(qwc) -> docs/NATIVE_RENDERER.md
 0035DF10 ImmediateBegin [I]  # ImmediateBegin(numVerts) (VU1 0x0270) -> docs/NATIVE_RENDERER.md
+0035F9A0 TextureBindBuild [I]  # Builds a VIF texture binding from the game texture and mip records -> docs/EE_RENDER_SUBMISSION.md
+0035FC40 TextureUploadBuild [I]  # palette or mip transfer from 0x35EEA8 (src/native_texture_upload.cpp) -> docs/EE_RENDER_SUBMISSION.md
 00360E18 GsStateInit [I]  # GS state init: publishes its fog constants to the native feed (src/native_fog.cpp) -> docs/NATIVE_RENDERER.md
 00361468 ImmediatePacketBegin [I]  # ImmediatePacketBegin(numVerts) -> docs/NATIVE_RENDERER.md
 00361708 ImmediateVertex [I]  # ImmediateVertex: readable C++ (src/native_effects_imm.cpp, R4 A2; water/flare/cockpit/immediate) -> docs/NATIVE_RENDERER.md
 00361BC8 ImmediateEnd [I]  # ImmediateEnd() -> docs/NATIVE_RENDERER.md
 00361C30 ImmStaticEmitRef [I]  # ImmStaticEmitRef(bufObj*) -> docs/NATIVE_RENDERER.md
 00361ED8 ImmStaticDraw [I]  # ImmStaticDraw(bufObj*) -> docs/NATIVE_RENDERER.md
+00361F80 RenderStateCommit [I]  # Builds the ordered material state packet, including 0x362588 -> docs/EE_RENDER_SUBMISSION.md
 003639D0 ParticleAdd [I]  # ParticleAdd(col_rgb, col_alpha, size, x, y, z, angle) -> docs/NATIVE_RENDERER.md
 00363B68 ParticleEnd [I]  # ParticleEnd() -> docs/NATIVE_RENDERER.md
 00363B98 ParticleBegin [I]  # ParticleBegin(count, scale) (VU1 0x08E0) -> docs/NATIVE_RENDERER.md
@@ -234,6 +245,7 @@
 003654E0 BlendSelect [I]  # BlendSelect: ALPHA_1 select 0x4D8B78 (src/native_texstate.cpp) -> docs/NATIVE_RENDERER.md
 00365540 RenderFlagsCommit [I]  # RenderFlagsCommit: 0x4D8BC8, bit 3 = GS PRIM.FGE (src/native_fog.cpp) -> docs/NATIVE_RENDERER.md
 00365578 GsStateReset [I]  # GS state reset: publishes the LOD/blend values it stored (src/native_texstate.cpp) -> docs/NATIVE_RENDERER.md
+00365878 DmaBankCompletionFence [V]  # Fence for the active DMA bank -> src/native_texture_upload.cpp
 00366C88 DmaPacketReserveTop [I]  # packet reserve (top): tagged for VU1 start attribution (render_trace) -> docs/NATIVE_RENDERER.md
 00366D30 DmaPacketReserve [I]  # packet reserve: tagged for VU1 start attribution -> docs/NATIVE_RENDERER.md
 00366D78 DmaSecondManagerPacketReserve [I]  # packet reserve, second manager: tagged for VU1 start attribution -> docs/NATIVE_RENDERER.md
@@ -280,6 +292,7 @@
 00383C40 sceSifCallRpc [V]  # SIF RPC synchronous/asynchronous call
 00383DF0 sceSifCheckStatRpc [V]  # SIF RPC completion check
 00386C90 CareerJumpTo [V]  # Pause menu Jump To (action 9): teleport list 0x386DE8, Eve list 0x387080 -> docs/CAREER_WARP.md
+003896E8 GsExecuteLoadImage [I]  # normal-DMA image submitter used by 0x35B060 -> docs/EE_RENDER_SUBMISSION.md
 0038F868 scePadInit [V]  # libpad init (SID 0x80000100) -> docs/INPUT_CONTINUATION.md
 0038FB40 scePadPortOpen [V]  # libpad open controller port/slot -> docs/INPUT_CONTINUATION.md
 0038FF40 scePadRead [V]  # libpad read 32-byte DualShock2 pad DMA buffer -> docs/INPUT_CONTINUATION.md

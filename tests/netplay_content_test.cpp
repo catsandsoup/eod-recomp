@@ -44,5 +44,18 @@ int main() {
     fs::create_directory_symlink(root/"b/data",root/"linked/DATA");
     check(!netplay::content_fingerprint((root/"linked").u8string(),"").error.empty(),"linked DATA root rejected");
 #endif
+    const std::string digest(64, 'a');
+    auto profile = root/"profile";
+    put(profile/"PROFILE.TXT", "profile private-folder-name\ngame " + digest + "\npackage track-kit 2.1.0 manifest " + digest + "\n");
+    const auto custom = netplay::describe_overlay(profile);
+    check(custom.source == netplay::ContentSource::Custom && custom.packages == std::vector<std::string>{"track-kit@2.1.0"}, "custom recovery shares only declared package IDs and versions");
+    put(profile/"PROFILE.TXT", "profile /Users/private\ngame " + digest + "\npackage /Users/private 2.1.0 manifest " + digest + "\n");
+    check(netplay::describe_overlay(profile).packages.empty(), "local path cannot become a network package label");
+    put(profile/"PROFILE.TXT", "profile name\ngame " + digest + "\npackage car 1.0.0 manifest " + digest + "\npackage car 2.0.0 manifest " + digest + "\n");
+    check(netplay::describe_overlay(profile).packages.empty(), "ambiguous package metadata falls back to custom");
+    fs::remove(profile/"PROFILE.TXT");
+    put(profile/"INTEGRATED.MANIFEST", "obsolete marker");
+    check(netplay::describe_overlay(profile).source == netplay::ContentSource::Custom, "a stale marker alone cannot identify integrated content");
+    check(a.profile.source == netplay::ContentSource::Disc, "stock disc requires no mod overlay");
     fs::remove_all(root); std::puts("netplay_content_test ok");
 }

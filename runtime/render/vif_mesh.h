@@ -138,6 +138,8 @@ struct Options {
     // The native draw queue retains the exact per-launch source geometry.
     // Offline visual export uses the flattened preview mesh.
     bool keep_dent_chunks = false;
+    // Camera-facing quads expand coincident bind positions using their per-vertex corner indices.
+    bool keep_camera_facing_faces = false;
 };
 
 // Guest-memory reader: copy n bytes at guest address addr to dst; return false on failure.

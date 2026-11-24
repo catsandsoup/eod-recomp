@@ -1,6 +1,15 @@
 # Online player journeys
 
-This is the player contract for the 1.0 release. “Implemented” describes code. “Exercised” means the stated scenario ran. “Proposed” identifies design work. A passing localhost test is evidence for its specific player count, event and exit path.
+## Current Plume checkout
+
+* A guest enters a Garage Code, waits for admission and a valid roster, chooses a car, and readies. A configured service checks the direct path and automatically relays unavailable connections. A guest who arrives during an event waits in the same party for the next grid. The release publisher supplies the public endpoint. [Garage Code setup and acceptance](GARAGE_RELAY.md)
+* Start freezes the entrants. A guest who withdraws to the lobby keeps their party membership. Their current result records the withdrawal. In a three-process test the late arrival and withdrawn driver both entered the next grid with the host. Closing that party during the rematch returned everyone to their native menus. [Party test](../tools/test_online_party.py)
+* In lap races a first human finish starts the shared 30-second countdown. When all remaining humans finish, or time expires, the host issues the standings to every connected entrant, including wrecked drivers. Two native one-lap races on Anoka produced matching ranks and a successful rematch. In demolition derby the last eligible human or AI vehicle wins. [Event completion rules](../src/netplay_event_completion.h) · [Completion and rematch tests](../tools/test_online_completion.py)
+* Physical crash tests exercised the host's authoritative native contact response, guest reconciliation and shared damage stages. A native impact totalled a pre-damaged car and both games agreed on the winner and returned. [Vehicle replication](NETPLAY_STATE_SYNC.md) · [Impact tests](../tools/test_online_impact.py)
+
+## Historical 1.0 release contract
+
+The tables and measurements below describe the 1.0 release. “Implemented” describes its code. “Exercised” means the stated scenario ran. “Proposed” identifies design work at that release.
 
 ## Seats, cars and voice
 

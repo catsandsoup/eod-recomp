@@ -63,19 +63,29 @@ extern VUState g_vu0;
 extern VUState g_vu1;
 
 /* Run a single macro-mode (COP2) instruction on VU0. */
+#ifdef EOD_R7_RELEASE
+void eod_unretired_vu0_macro(uint32_t instr);
+#define vu0_macro(word) eod_unretired_vu0_macro(word)
+#else
 void vu0_macro(uint32_t instr);
+#endif
 
 #ifdef __cplusplus
 }
 
 enum class VuLaunch { Direct, Mscal, Mscalf, Mscnt, Vcallms, Vcallmsr, Cmsar1 };
+#ifdef EOD_R7_RELEASE
+void vu_reject_launch(const VUState& vu, uint32_t address, VuLaunch launch);
+#else
 /* Execute a micro program starting at tpc until the E bit retires. */
 void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch = VuLaunch::Direct,
                 uint32_t ee_ra = 0);
+#endif
 /* Retire the verified VU1 MSCAL E-bit NOP and delay pair at 0x24D8. */
 bool vu_retire_mscal_nop(VUState *vu, uint32_t start_pc);
 /* Retire the verified VU1 A+D XGKICK-from-TOP program at 0x2538. */
-bool vu_retire_xgkick_top(VUState *vu, uint32_t start_pc, uint32_t top);
+namespace gs { struct MaterialState; }
+bool vu_retire_xgkick_top(VUState *vu, uint32_t start_pc, uint32_t top, const gs::MaterialState *material);
 /* Retire the verified VU1 GIFtag template setup program at 0x25F0. */
 bool vu_retire_giftag_setup(VUState *vu, uint32_t start_pc, uint32_t top);
 /* Retire the verified VU1 matrix/lighting setup program at 0x0000 (0 XGKICKs, bypass-only). */

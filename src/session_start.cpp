@@ -14,6 +14,7 @@
 #include "session_start.h"
 #include "battle_layout.h"
 #include "netplay_hooks.h"
+#include "netplay_impact_fixture.h"
 
 #include "core/config.h"
 #include "core/cpu.h"
@@ -71,6 +72,10 @@ constexpr uint32_t kActionMode = 0x12F;
 constexpr uint32_t kHeadToHeadMode = 0x131;
 constexpr uint32_t kSessionEventType = 0x9A4, kSessionLaps = 0x9B0, kSessionContest = 0x9D0;
 constexpr uint32_t kLapRaceFlag = 0x100;
+// World initialization copies session+0x990 to 0x495BE0. The retail AI
+// strength lookup at 0x15F4D8 reads offset 0x28 and accepts levels 0..4.
+constexpr uint32_t kSessionAIStrength = 0x990 + 0x28;
+constexpr uint32_t kHardAIStrength = 4;
 
 bool ieq(const std::string &a, const std::string &b) {
     if (a.size() != b.size()) return false;
@@ -439,27 +444,51 @@ bool refresh() {
             const uint32_t cp = battle_layout::kContestTable + c * battle_layout::kContestStride;
             if (ee_r32(cp + 4) != i) continue;
             const std::string name = guest_text(native(f_001252C0, {c}), 40);
-            if (!name.empty()) t.events.push_back(name);
+            if (!name.empty()) {
+                t.events.push_back(name);
+                t.event_types.push_back(ee_r32(cp + 8));
+            }
         }
         if (!t.events.empty()) g_tracks.push_back(t);
     }
     for (uint32_t i = 0; i < nv; ++i) {
         const uint32_t v = table + i * kVehicleStride;
         Vehicle e; e.number = ee_r32(v + 4); e.name = guest_text(v + 8, 32); e.record = v;
+        // 111C78 asks 12A2F0 for vehicles with bit 0 set when appending trailers.
+        e.is_trailer = (ee_r32(v + 0x44) & 1u) != 0;
         if (!e.name.empty()) g_vehicles.push_back(e);
     }
     g_ready = !g_tracks.empty() && !g_vehicles.empty();
     if (g_ready) std::fprintf(stderr, "[SESSION] catalog: %zu tracks, %zu vehicles\n", g_tracks.size(), g_vehicles.size());
     return g_ready;
 }
+bool is_online_driver_choice(const Vehicle &vehicle) {
+    if (!vehicle.number || vehicle.name.empty() || vehicle.is_trailer ||
+        (vehicle.number >= 400 && vehicle.number <= 413)) return false;
+    constexpr size_t prefix_length = 7;
+    const auto &name = vehicle.name;
+    return !ieq(name.substr(0, prefix_length), "trailer") ||
+           !std::all_of(name.begin() + prefix_length, name.end(),
+                        [](char c) { return c >= '0' && c <= '9'; });
+}
+
+bool online_vehicle_is_drivable(uint32_t number) {
+    const auto it = std::find_if(g_vehicles.begin(), g_vehicles.end(),
+                                 [number](const Vehicle &vehicle) { return vehicle.number == number; });
+    return it != g_vehicles.end() && is_online_driver_choice(*it);
+}
+
 std::vector<std::string> models() {
     std::vector<std::string> m;
-    for (auto &v : g_vehicles) if (std::find(m.begin(), m.end(), v.name) == m.end()) m.push_back(v.name);
+    for (const auto &v : g_vehicles)
+        if (is_online_driver_choice(v) && std::find(m.begin(), m.end(), v.name) == m.end())
+            m.push_back(v.name);
     return m;
 }
 std::vector<uint32_t> paints(const std::string &model) {
     std::vector<uint32_t> p;
-    for (auto &v : g_vehicles) if (v.name == model) p.push_back(v.number);
+    for (const auto &v : g_vehicles)
+        if (v.name == model && is_online_driver_choice(v)) p.push_back(v.number);
     return p;
 }
 void dump() {
@@ -545,6 +574,8 @@ void arm_net(const netplay_hooks::StartInfo &info) {
     P = Plan{};
     P.net = true;
     P.req.event = info.event;
+    if (netplay_impact_fixture::enabled()) P.req.ai = 0;
+    if (session_test_native_lap()) { P.req.laps = 1; P.req.ai = 0; }
     P.requested = true;
     P.armed = true;
     if (!info.track.empty()) {
@@ -636,6 +667,14 @@ int career_place_index(const std::string &name) {
 const char *career_place_name(int index) { return index >= 0 && index < kCareerPlaces ? kPlaces[index].plain : "?"; }
 
 const SessionRequest *career_warp_request() { return P.career ? &P.req : nullptr; }
+
+bool session_test_native_lap() {
+    static const bool enabled = [] {
+        const char *fixture = std::getenv("EOD_NETPLAY_TEST_NATIVE_LAP");
+        return netplay_impact_fixture::test_session() && fixture && !std::strcmp(fixture, "1");
+    }();
+    return enabled;
+}
 
 std::string session_event_name(const SessionRequest &r) {
     if (r.ai >= 0 && ieq(r.event, "battle")) return r.ai == 1 ? "Battle (1v1)" : "Battle (" + std::to_string(r.ai) + " AI)";
@@ -763,7 +802,9 @@ extern "C" void f_00270C10(void) {
         }
     }
     if (caller == 0x002A16D8) {
+        netplay_hooks::main_selection_active = true;
         f_00270C10_orig();
+        netplay_hooks::main_selection_active = false;
         // The main dispatcher maps result 16 to Arcade. Preserve MenuRun cleanup.
         if (P.armed && P.net) ret_s32(16);
         return;
@@ -1066,6 +1107,8 @@ extern "C" void f_00120650(void) {
     // Native setup scales the catalog lap count by the profile race length, then copies it here.
     // 0x114860 uses this session descriptor to initialize the race. Override the final count
     // for this race while keeping the catalog and profile available for later native events.
+    if (session_test_native_lap() && P.net)
+        ee_w32(session + kSessionAIStrength, kHardAIStrength);
     const uint32_t previous = ee_r32(session + kSessionLaps);
     ee_w32(session + kSessionLaps, (uint32_t)laps);
     log("race lap count set to %u (was %u, contest %u)", (uint32_t)laps, previous, selected_contest);

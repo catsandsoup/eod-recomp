@@ -13,6 +13,7 @@
 #include "gs/modern_scene.h"
 #include "netplay_hooks.h"
 #include "platform/platform.h"
+#include "platform/presentation.h"
 
 EEState g_ee{};
 uint8_t *g_ram = nullptr;
@@ -33,12 +34,13 @@ bool platform_find_file(const char *, const char *, char *, size_t) { return fal
 namespace modern {
 int input_toggles = 0;
 bool look_switch_available() { return true; }
-void toggle_from_input() { ++input_toggles; }
+void toggle_from_input(const char *) { ++input_toggles; }
 }
 
 // Mock native functions
 extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
+extern "C" void f_00165E10_orig() { std::abort(); }
 extern "C" void car_setup_damage_and_panels() { std::abort(); }
 extern "C" void f_0018AD20();
 extern "C" void f_0018CA98();
@@ -77,7 +79,15 @@ extern "C" void f_001A2D20_orig() {}
 extern "C" void f_001671E8() {}
 bool battle_bots_is_ai_slot(uint32_t) { return false; }
 extern "C" void f_0017DFA8() { g_ee.r[2].ud[0] = 0; }
-extern "C" void f_0034D328_orig() {}
+extern "C" void f_0034D328();
+extern "C" void f_0034D328_orig() {
+    const uint32_t mode = g_ee.r[4].uw[0];
+    MEM_SW(0x3dd660, mode);
+    MEM_SW(0x3dd658, mode ? 0x3f400000 : 0x3f800000);
+    MEM_SW(0x3dd65c, mode == 2 ? 0x3f400000 : 0x3f800000);
+    MEM_SW(0x3dd64c, mode == 1);
+    MEM_SW(0x3dd650, mode == 2);
+}
 extern "C" void f_00179A08() {}
 extern "C" void f_0018AA50() {}
 extern "C" void f_0018AA80() {}
@@ -104,7 +114,7 @@ static std::string s_last_hud_banner;
 void platform_show_hud_banner(const char *text, int) { s_last_hud_banner = text ? text : ""; }
 static bool s_mod_overlay_visible = false;
 void platform_set_mod_overlay(bool visible) { s_mod_overlay_visible = visible; }
-void platform_set_aspect(int) {}
+void platform_set_aspect(int aspect) { presentation::requested.store(aspect); }
 
 static void check(bool cond, const char *msg) {
     if (!cond) {
@@ -117,6 +127,46 @@ int main() {
     std::vector<uint8_t> ram(EE_RAM_SIZE, 0);
     g_ram = ram.data();
 
+    {
+        const auto xscale = [] {
+            uint32_t bits = MEM_LW(0x3dd658); float x;
+            std::memcpy(&x, &bits, sizeof x);
+            return x;
+        };
+        for (const char *setting : {"display", "16:10", "16:9", "4:3"}) {
+            g_config.aspect = setting;
+            presentation::set_drawable_size(3024,1964);
+            const int aspect = display_aspect(setting, drawable_aspect(3024,1964));
+            g_ee.r[4].ud[0] = 2;
+            f_0034D328();
+            check(MEM_LW(0x3dd660) == uint32_t(aspect != 0) && MEM_LW(0x3dd650) == 0 &&
+                  xscale() == projection_x_scale(aspect) && MEM_LW(0x3dd65c) == 0x3f800000,
+                  "native setter uses the requested camera geometry");
+            game_patches_vblank();
+            check(presentation::requested.load() == aspect, "vblank composes the same geometry as the camera");
+            MEM_SW(0x3dd658, 0x3f000000);
+            game_patches_vblank();
+            check(xscale() == 0.5f, "steady vblank preserves temporary offscreen projection");
+            g_movie_playing = true;
+            game_patches_vblank();
+            check(presentation::requested.load() == 0, "movie retains original 4:3 composition");
+            g_movie_playing = false;
+            game_patches_vblank();
+            check(xscale() == projection_x_scale(aspect), "movie exit restores the host ratio");
+        }
+        g_config.aspect = "display";
+        presentation::set_drawable_size(3840,1600);
+        game_patches_vblank();
+        check(xscale() == projection_x_scale(drawable_aspect(3840,1600)), "new drawable updates the native projection");
+        presentation::set_drawable_size(0,0);
+        game_patches_vblank();
+        check(presentation::requested.load() == drawable_aspect(3840,1600), "minimizing keeps the last valid ratio");
+        g_config.aspect = "auto";
+        g_ee.r[4].ud[0] = 2;
+        f_0034D328();
+        game_patches_vblank();
+        check(MEM_LW(0x3dd660) == 2 && presentation::requested.load() == 0, "retail letterbox remains available");
+    }
     // Disabling via environment must never enable the cheat merely because
     // the variable exists. Config parsing is the sole launch-option authority.
     setenv("EOD_INVINCIBLE", "0", 1);

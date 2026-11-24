@@ -11,6 +11,7 @@
 #include "../core/log.h"
 #include "../core/memory.h"
 #include "../gs/gs.h"
+#include "../gs/texture_upload.h"
 #include "../iop/sif.h"
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
@@ -209,6 +210,27 @@ void dma_run_chain(int ch) {
         } else if (tte && ch == DMA_GIF) {
             // GIF ignores TTE (would send the whole tag); real hw behaviour is undefined
         }
+        if (ch == DMA_GIF && id == 1 && qwc == 5 && gs::native_texture_uploads_enabled()) {
+            gs::TextureUpload upload;
+            if (gs::find_texture_upload(c.tadr, tp, upload)) {
+                // The proven prefix consists of CNT setup, CNT image header and REF.
+                // The trailing fences and all CALL/RET flow still use the ordinary DMAC.
+                gs::enqueue_texture_upload(upload, dma_ptr(upload.source));
+                c.chcr = (c.chcr & 0xffff) | (upload.source << 16);
+                c.madr = upload.source + upload.qwc * 16;
+                c.tadr += gs::kUploadPrefixQwords * 16;
+                c.qwc = 0;
+                continue;
+            }
+        }
+        const auto inline_data = [&] {
+            bool eop;
+            if (ch == DMA_GIF && qwc == 1 && gs::native_texture_uploads_enabled() &&
+                gs::find_texture_fence(c.tadr, tp, eop))
+                gs::enqueue_texture_fence(eop);
+            else
+                dma_sink(ch, dma_ptr(c.tadr + 16), qwc);
+        };
         bool end = false;
         uint32_t next = c.tadr + 16;
         switch (id) {
@@ -218,7 +240,7 @@ void dma_run_chain(int ch) {
             end = true;
             break;
         case 1:  // cnt
-            dma_sink(ch, dma_ptr(c.tadr + 16), qwc);
+            inline_data();
             c.madr = c.tadr + 16 + qwc * 16;
             next = c.madr;
             break;
@@ -258,7 +280,7 @@ void dma_run_chain(int ch) {
             break;
         }
         case 7:  // end
-            dma_sink(ch, dma_ptr(c.tadr + 16), qwc);
+            inline_data();
             c.madr = c.tadr + 16 + qwc * 16;
             end = true;
             break;
@@ -380,6 +402,23 @@ uint32_t g_sio_line_len;
 char g_sio_line[512];
 
 }  // namespace
+
+bool gs::try_boot_texture_upload(const TextureUpload &u, uint32_t packet) {
+    // With an idle synchronous channel the SDK's poll between its two normal
+    // DMAs returns immediately. A mask, pending packet or VIF worker retains
+    // the SDK's original wait and timeout behavior.
+    auto &ch = g_dma[DMA_GIF];
+    if (offloaded(DMA_GIF) || (ch.chcr & 0x100) || !immediate_texture_upload_ready()) return false;
+    ch.chcr = 0x101;
+    ch.madr = packet + 6 * 16;
+    ch.qwc = 0;
+    dmac_channel_done(DMA_GIF);
+    enqueue_texture_upload(u, dma_ptr(u.source));
+    ch.chcr = 0x101;
+    ch.madr = u.source + u.qwc * 16;
+    dmac_channel_done(DMA_GIF);
+    return true;
+}
 
 void dmac_channel_done(int ch) {
     g_dma[ch].chcr &= ~0x100u;

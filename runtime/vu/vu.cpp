@@ -8,6 +8,9 @@
 #include "../render/native_renderer.h"
 #include "../render/world_visibility.h"
 #include "vu.h"
+#include "matrix_producer.h"
+#include "vehicle_dynamics.h"
+#include "../gs/material_state.h"
 #include "core/trace.h"
 #include "../core/prof.h"
 
@@ -49,6 +52,7 @@ static uint8_t g_vu1_mem[0x4000 + 64], g_vu1_micro[0x4000 + 64];
 
 // VIF1 TOP/ITOP for XTOP/XITOP (set by vif.cpp)
 uint32_t g_vif1_top, g_vif1_itop;
+extern uint32_t g_vu_micro_gen[2];
 
 void vu_init() {
     memset(&g_vu0, 0, sizeof g_vu0);
@@ -68,13 +72,11 @@ void vu_init() {
         v->q = v->p = 1.0f;
         v->r = 0x3F800000;
     }
+    g_vu_micro_gen[0]++;
+    g_vu_micro_gen[1]++;
 }
 
 namespace {
-
-// control register indices in vi[]
-enum { REG_STATUS = 16, REG_MAC = 17, REG_CLIP = 18, REG_R = 20, REG_I = 21, REG_Q = 22, REG_P = 23,
-       REG_TPC = 26, REG_CMSAR0 = 27, REG_FBRST = 28, REG_VPU_STAT = 29, REG_CMSAR1 = 31 };
 
 inline float vu_clamp(float f) {
     uint32_t u;
@@ -92,6 +94,7 @@ inline uint32_t f2u(float f) {
     return u;
 }
 
+#ifndef EOD_R7_RELEASE
 struct Ctx {
     VUState *vu;
     // pending upper result
@@ -116,6 +119,8 @@ inline int FT(uint32_t i) { return (i >> 16) & 31; }
 inline int FS(uint32_t i) { return (i >> 11) & 31; }
 inline int FD(uint32_t i) { return (i >> 6) & 31; }
 inline int BC(uint32_t i) { return i & 3; }
+
+#endif
 
 // MAC flag update for the written components of result r.
 inline uint32_t mac_for(const VUReg &r, int dest) {
@@ -186,6 +191,7 @@ __attribute__((always_inline)) inline void vu_flag_push(VUState *vu, uint32_t ki
     vu->fq_n++;
 }
 
+#ifndef EOD_R7_RELEASE
 // --------------------------------------------------------------- upper
 void upper_result(Ctx &c, int reg, const VUReg &v, int dest, bool acc) {
     c.up_write = true;
@@ -208,6 +214,8 @@ __attribute__((always_inline)) inline void commit_upper(Ctx &c) {
     c.up_write = false;
     c.mac_set = false;
 }
+
+#endif
 
 enum ArOp { OP_ADD, OP_SUB, OP_MUL, OP_MADD, OP_MSUB, OP_MAX, OP_MIN };
 
@@ -240,6 +248,7 @@ inline float apply(ArOp op, float acc, float a, float b) {
     }
 }
 
+#ifndef EOD_R7_RELEASE
 // Generic FMAC: src2 is either a vector (bc<0), a broadcast component, or a scalar
 void fmac(Ctx &c, uint32_t ins, ArOp op, int bc, const float *scalar, bool to_acc) {
     VUState *vu = c.vu;
@@ -267,6 +276,8 @@ void fmac(Ctx &c, uint32_t ins, ArOp op, int bc, const float *scalar, bool to_ac
 // (S_VEC), a broadcast component (S_BC), Q (S_Q) or I (S_I).
 enum Src { S_VEC, S_BC, S_Q, S_I };
 
+#endif
+
 template <ArOp OP>
 inline float apply_t(float acc, float a, float b) {
     float r = 0.0f;
@@ -283,6 +294,7 @@ inline float apply_t(float acc, float a, float b) {
     return r;
 }
 
+#ifndef EOD_R7_RELEASE
 template <ArOp OP, int SRC, bool ACC, bool FLAGS = true>
 __attribute__((always_inline)) inline void up_fmac(Ctx &c, uint32_t ins) {
     VUState *vu = c.vu;
@@ -536,6 +548,8 @@ inline void set_vi(VUState *vu, int r, uint32_t v) {
 
 inline int16_t vis(VUState *vu, int r) { return (int16_t)vu->vi[r]; }
 
+#endif
+
 __attribute__((always_inline)) inline void sync_pipes(VUState *vu) {
     if (vu->q_busy && vu->cycle >= vu->q_ready) {
         vu->q = vu->q_pending;
@@ -547,6 +561,7 @@ __attribute__((always_inline)) inline void sync_pipes(VUState *vu) {
     }
 }
 
+#ifndef EOD_R7_RELEASE
 void q_pipeline_set(VUState *vu, float v, int latency) {
     if (vu->q_busy) {  // divider busy: stall until the previous result is out
         if (vu->cycle < vu->q_ready) vu->cycle = vu->q_ready;
@@ -567,6 +582,8 @@ void p_pipeline_set(VUState *vu, float v, int latency) {
     vu->p_busy = 1;
 }
 
+#endif
+
 void flush_q(VUState *vu) {
     if (vu->q_busy) {
         if (vu->cycle < vu->q_ready) vu->cycle = vu->q_ready;
@@ -583,6 +600,7 @@ void flush_p(VUState *vu) {
     }
 }
 
+#ifndef EOD_R7_RELEASE
 // DIV / SQRT / RSQRT on the selected fields' values
 void lower_div_f(VUState *vu, int kind, float fs, float ft) {
     fs = vu_clamp(fs);
@@ -620,6 +638,8 @@ void lower_div(VUState *vu, uint32_t ins, int kind) {
     int fsf = (ins >> 21) & 3, ftf = (ins >> 23) & 3;
     lower_div_f(vu, kind, vu->vf[FS(ins)].f[fsf], vu->vf[FT(ins)].f[ftf]);
 }
+
+#endif
 
 bool g_vu_mute_kick;  // differential checks execute the reference without sending it to GS
 
@@ -677,6 +697,7 @@ void xgkick(VUState *vu, uint32_t addr_qw) {
     gif_transfer(GIF_PATH1, buf, n);
 }
 
+#ifndef EOD_R7_RELEASE
 uint32_t rand_next(uint32_t r) {
     // VU random: 23-bit LFSR (taps per PCSX2)
     int x = (r >> 4) & 1;
@@ -784,6 +805,7 @@ void lower_ext(Ctx &c, uint32_t ins, uint32_t ext) {
             for (int k = 0; k < 4; k++)
                 if (has(dest, k)) vu->vf[ft].f[k] = vu->p;
         return;
+#ifndef EOD_R7_RELEASE
     case 0x68:  // XTOP
         set_vi(vu, ft, g_vif1_top);
         return;
@@ -793,6 +815,7 @@ void lower_ext(Ctx &c, uint32_t ins, uint32_t ext) {
     case 0x6C:  // XGKICK is
         xgkick(vu, vu->vi[fs]);
         return;
+#endif
     case 0x7B:  // WAITP
         flush_p(vu);
         return;
@@ -1072,6 +1095,8 @@ void decode_pair(DecPair &d, uint32_t lo, uint32_t hi) {
     reg_bits(d.lw.reg, d.lw.mask, d.lw_lo, d.lw_hi);
 }
 
+#endif
+
 }  // namespace
 
 // Bumped when micro memory is loaded (VIF MPG), for EOD_VU_DUMP.
@@ -1146,6 +1171,7 @@ void census_retire(const VUState &vu, uint32_t pc, const char *kind) {
         census_add(vu.index, {kind, pc, micro_image_id(vu), g_vif1_itop});
 }
 
+#ifndef EOD_R7_RELEASE
 // EOD_VU_DUMP=dir: writes each distinct VU micro memory image that runs
 // (dir/vu<n>_<hash>.bin) and lists the entry points (dir/vu_entries.txt):
 // the input of tools/vurecomp.py.
@@ -1177,6 +1203,8 @@ void vu_dump(VUState *vu, uint32_t pc) {
         }
     }
 }
+#endif
+
 }  // namespace
 
 void vu_report_census() {
@@ -1192,97 +1220,8 @@ void vu_report_census() {
     }
 }
 
-// --------------------------------------------------------------- micro mode
-// Interprets from `pc` until the program ends.
-static void vu_interp(VUState *vu, uint32_t pc) {
-    uint32_t start_pc = pc;
-    Ctx c;
-    c.vu = vu;
-    bool in_delay = false;
-    uint32_t delay_target = 0;
-    int end_countdown = -1;
-    uint64_t guard = 0;
-    vu->running = 1;
-    vu->flag_pipe = 1;
-    LOG(LOG_VU, "VU%d start at %04x", vu->index, pc);
-    for (;;) {
-        if (++guard > 50000000) {
-            WARN("VU%d: program at %04x does not terminate", vu->index, start_pc);
-            break;
-        }
-        uint32_t lo, hi;
-        memcpy(&lo, vu->micro + pc, 4);
-        memcpy(&hi, vu->micro + pc + 4, 4);
-        DecPair &d = g_dec[vu->index][pc >> 3];
-        if (!d.valid || d.lo != lo || d.hi != hi) decode_pair(d, lo, hi);
-        // stall until every register this pair reads has been written
-        Scoreboard &sb = g_score[vu->index];
-        if (d.use_lo | d.use_hi) {
-            for (uint64_t dd = 1; dd <= 3; dd++) {
-                uint64_t ic = vu->cycle - dd;
-                int sl = (int)(ic & 3);
-                if (sb.stamp[sl] == ic && ((sb.lo[sl] & d.use_lo) | (sb.hi[sl] & d.use_hi))) {
-                    vu->cycle = ic + 4;
-                    break;
-                }
-            }
-        }
-        if (d.waitq) flush_q(vu);
-        sync_pipes(vu);
-        vu_flag_sync(vu);
-        const uint64_t lw_lo = d.lw_lo, lw_hi = d.lw_hi;
-        // upper first (computed against old state), committed after lower
-        c.up_write = false;
-        c.mac_set = false;
-        c.branch = false;
-        d.up(c, hi);
-        bool up_vf = c.up_write && !c.up_acc;
-        int up_reg = c.up_reg, up_dest = c.up_dest;
-        if (hi & 0x80000000u) {
-            // I bit: lower word is a float immediate for the I register
-            commit_upper(c);
-            memcpy(&vu->i, &lo, 4);
-        } else {
-            lower(c, lo, pc);
-            commit_upper(c);
-        }
-        {
-            uint64_t wlo = lw_lo, whi = lw_hi;
-            if (up_vf) reg_bits(up_reg, up_dest, wlo, whi);
-            if (wlo | whi) {
-                int sl = (int)(vu->cycle & 3);
-                if (sb.stamp[sl] != vu->cycle) {
-                    sb.stamp[sl] = vu->cycle;
-                    sb.lo[sl] = sb.hi[sl] = 0;
-                }
-                sb.lo[sl] |= wlo;
-                sb.hi[sl] |= whi;
-            }
-        }
-        vu->cycle++;
-        if (hi & 0x40000000u) end_countdown = 1;  // E bit: one more pair
-        if (hi & 0x08000000u) { /* T bit: debug */ }
-        if (hi & 0x10000000u) { /* D bit: debug */ }
-        uint32_t next = (pc + 8) & vu->micro_mask;
-        if (in_delay) {
-            next = delay_target & vu->micro_mask;
-            in_delay = false;
-        }
-        if (c.branch) {
-            in_delay = true;
-            delay_target = c.branch_target;
-        }
-        if (end_countdown == 0) break;
-        if (end_countdown > 0) end_countdown--;
-        pc = next;
-    }
-    flush_q(vu);
-    flush_p(vu);
-    vu_flag_flush(vu);
-    vu->flag_pipe = 0;
-    vu->tpc = pc;
-    vu->running = 0;
-}
+#ifndef EOD_R7_RELEASE
+#include "reference_interpreter.inc"
 
 // Micro programs compiled ahead of time by tools/vurecomp.py (gen/vu_rec.inc):
 // used when the code in micro memory matches what was compiled.
@@ -1350,8 +1289,8 @@ struct VuProg {
         sb.hi[sl] |= (whi);                        \
     } while (0)
 
-// The public interpreter build excludes the captured reference tables.
-#ifndef EOD_PUBLIC_VU_INTERPRETER
+// Captured tables may contain compiled VU1 programs even when gameplay uses only VU0.
+#if !defined(EOD_PUBLIC_VU_INTERPRETER) && !defined(EOD_R7_RELEASE)
 #if __has_include("vu_rec.inc")
 #define VU_REC 1
 #endif
@@ -1615,7 +1554,7 @@ const VuProg *vu_rec_find(VUState *vu, uint32_t pc) {
 }  // namespace
 #endif
 
-#if defined(EOD_VULKAN) || defined(VU_REC)
+#if (defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)) || defined(VU_REC)
 // Scoreboards that will stall later code the same way: the writes stamped
 // in the three cycles before `cycle` (older slots are never looked at).
 static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
@@ -1665,6 +1604,8 @@ void vu_rec_hook(VUState *vu, uint32_t pc) {
 }
 }  // namespace
 
+#endif
+
 namespace {
 bool vu_dispatch_observed() {
     static const bool trace = getenv("EOD_VU_REC") || getenv("EOD_VU_DUMP") ||
@@ -1675,19 +1616,26 @@ bool vu_dispatch_observed() {
 
 bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
     constexpr uint32_t pairs[] = {0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu};
-    if (vu_dispatch_observed() ||
-        vu->index != 1 || pc != 0x24D8 || std::memcmp(vu->micro + pc, pairs, sizeof(pairs)) != 0)
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x24D8)
         return false;
+    static thread_local uint32_t cached_gen = ~0u;
+    static thread_local bool cached_match = false;
+    if (cached_gen != g_vu_micro_gen[1]) {
+        cached_gen = g_vu_micro_gen[1];
+        cached_match = std::memcmp(vu->micro + pc, pairs, sizeof(pairs)) == 0;
+    }
+    if (!cached_match) return false;
 
     // Both paths recognize the live instruction pairs. Only reference builds
     // can dispatch a compiled version of those pairs.
 #ifdef VU_REC
     const VuProg *compiled = vu_rec_find(vu, pc);
+    const bool compiled_timing = compiled != nullptr;
 #else
-    const VuProg *compiled = nullptr;
+    constexpr bool compiled_timing = false;
 #endif
-    const auto retire = [compiled, pc](VUState *state) {
-        if (compiled) {
+    const auto retire = [=](VUState *state) {
+        if (compiled_timing) {
             // The generated NOP pairs advance cycles without per-pair pipe synchronization.
             state->cycle += 2;
         } else {
@@ -1705,6 +1653,7 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
         state->running = 0;
     };
 
+#ifndef EOD_R7_RELEASE
     static const bool check = getenv("EOD_NATIVE_CAMERA_NOP_CHECK") != nullptr;
     if (check) {
         VUState expected;
@@ -1713,21 +1662,27 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
         uint8_t memory[0x4000];
         std::memcpy(memory, vu->mem, sizeof(memory));
         retire(&expected);
+#ifdef VU_REC
         if (compiled) compiled->fn(vu, pc);
-        else vu_interp(vu, pc);
+        else
+#endif
+            vu_interp(vu, pc);
         if (std::memcmp(vu, &expected, sizeof(expected)) ||
             std::memcmp(&g_score[vu->index], &scoreboard, sizeof(scoreboard)) ||
             std::memcmp(vu->mem, memory, sizeof(memory)))
             fatal("MSCAL no-op retirement differs from VU1 execution at vblank %llu (%s)",
-                  (unsigned long long)kernel_vblank_count(), compiled ? "compiled" : "interpreted");
+                  (unsigned long long)kernel_vblank_count(), compiled_timing ? "compiled" : "interpreted");
     } else {
         retire(vu);
     }
+#else
+    retire(vu);
+#endif
     census_retire(*vu, pc, "retired_nop");
     return true;
 }
 
-bool vu_retire_xgkick_top(VUState *vu, uint32_t pc, uint32_t top) {
+bool vu_retire_xgkick_top(VUState *vu, uint32_t pc, uint32_t top, const gs::MaterialState *material) {
     // Verified 23-instruction A+D state-packet kicker at 0x2538: copies TOP..TOP+nloop to TOP+0xC8 and XGKICKs.
     static constexpr uint32_t kProg2538[] = {
         0x800106BCu, 0x000002FFu, 0x01ED0800u, 0x000002FFu, 0x8000033Cu, 0x000002FFu,
@@ -1739,10 +1694,17 @@ bool vu_retire_xgkick_top(VUState *vu, uint32_t pc, uint32_t top) {
         0x800106BCu, 0x000002FFu, 0x100108C8u, 0x000002FFu, 0x80000EFCu, 0x000002FFu,
         0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu,
     };
-    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x2538 ||
-        std::memcmp(vu->micro + pc, kProg2538, sizeof(kProg2538)) != 0)
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x2538)
         return false;
-    xgkick(vu, top);
+    static thread_local uint32_t cached_gen = ~0u;
+    static thread_local bool cached_match = false;
+    if (cached_gen != g_vu_micro_gen[1]) {
+        cached_gen = g_vu_micro_gen[1];
+        cached_match = std::memcmp(vu->micro + pc, kProg2538, sizeof(kProg2538)) == 0;
+    }
+    if (!cached_match) return false;
+    if (material && !g_vu_mute_kick) gs::submit_material_state(*material);
+    else xgkick(vu, top);
     vu->tpc = pc + 0xB0u;
     vu->running = 0;
     census_retire(*vu, pc, "retired_2538");
@@ -1755,9 +1717,15 @@ bool vu_retire_giftag_setup(VUState *vu, uint32_t pc, uint32_t top) {
         0x800106BCu, 0x000002FFu, 0x01EE0800u, 0x000002FFu, 0x01ED0801u, 0x000002FFu,
         0x03E07013u, 0x000002FFu, 0x03E06812u, 0x400002FFu, 0x8000033Cu, 0x000002FFu,
     };
-    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x25F0 ||
-        std::memcmp(vu->micro + pc, kProg25F0, sizeof(kProg25F0)) != 0)
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x25F0)
         return false;
+    static thread_local uint32_t cached_gen = ~0u;
+    static thread_local bool cached_match = false;
+    if (cached_gen != g_vu_micro_gen[1]) {
+        cached_gen = g_vu_micro_gen[1];
+        cached_match = std::memcmp(vu->micro + pc, kProg25F0, sizeof(kProg25F0)) == 0;
+    }
+    if (!cached_match) return false;
     const uint32_t qmask = (vu->mem_mask + 1) / 16 - 1;
     std::memcpy(vu->mem + (19u & qmask) * 16, vu->mem + (top & qmask) * 16, 16);
     std::memcpy(vu->mem + (18u & qmask) * 16, vu->mem + ((top + 1u) & qmask) * 16, 16);
@@ -1767,26 +1735,42 @@ bool vu_retire_giftag_setup(VUState *vu, uint32_t pc, uint32_t top) {
     return true;
 }
 
+static uint64_t vu_fnv1a(const uint8_t *data, size_t len) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; ++i) h = (h ^ data[i]) * 1099511628211ull;
+    return h;
+}
+
 bool vu_retire_setup_0000(VUState *vu, uint32_t pc) {
-    // Verified 78-instruction matrix/lighting setup at 0x0000 (0 XGKICKs, E-bit at +0x260).
-    // Safe to skip when Plume VU1 bypass is active so no bypassed draw reads VU1 matrix registers.
-    static constexpr uint32_t kHead0000[] = {
-        0x800106BCu, 0x000002FFu, 0x01E5000Du, 0x000002FFu,
-        0x01E8000Eu, 0x000002FFu, 0x01E40010u, 0x000002FFu,
-    };
-    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x0000 ||
-        std::memcmp(vu->micro, kHead0000, sizeof(kHead0000)) != 0)
+    // Verified 0-XGKICK matrix/lighting/camera setup entrypoints at 0x0000 across all 4 retail VU1 images:
+    //  1. fd0ce30ab0ec263c & c08fde1e49632824 (main/world/skin): straight-line 0x0000..0x0268 (E-bit @ 0x0260)
+    //  2. 029b295eacf3f666 (particles/sprites, 0x3BD670): straight-line 0x0000..0x01b0 (E-bit @ 0x01a8, 0 stores)
+    //  3. eb9855205ae4523b (shadow extrusion, 0x3BE4C0): B 0x1568 -> straight-line 0x1568..0x17b8 -> B 0x10 (E-bit @ 0x0010, 0 stores)
+    // Safe to retire when Plume VU1 bypass is active so no bypassed draw reads VU1 matrix registers.
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x0000 || vu->micro_mask < 0x17BF)
         return false;
-    uint32_t e_hi = 0;
-    std::memcpy(&e_hi, vu->micro + 0x260 + 4, 4);
-    if ((e_hi & 0x40000000u) == 0) return false;
-    vu->tpc = 0x268u;
+    static thread_local uint32_t cached_gen = ~0u;
+    static thread_local uint32_t cached_tpc = 0;
+    if (cached_gen != g_vu_micro_gen[1]) {
+        cached_gen = g_vu_micro_gen[1];
+        cached_tpc = 0;
+        if (vu_fnv1a(vu->micro, 0x0270) == 0x75089a5a27b467d6ull) {
+            cached_tpc = 0x268u;
+        } else if (vu_fnv1a(vu->micro, 0x01B8) == 0x0937b6d2d4a13031ull) {
+            cached_tpc = 0x1B0u;
+        } else if (vu_fnv1a(vu->micro, 0x0020) == 0xbb56f8c081b5a738ull &&
+                   vu_fnv1a(vu->micro + 0x1568, 0x17C0 - 0x1568) == 0x6077876c66b9740eull) {
+            cached_tpc = 0x018u;
+        }
+    }
+    if (!cached_tpc) return false;
+    vu->tpc = cached_tpc;
     vu->running = 0;
     census_retire(*vu, pc, "retired_0000");
     return true;
 }
 
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
 namespace {
 constexpr uint32_t kWorldLeafPc = 0x270;
 constexpr uint32_t kWorldLeafTpc = 0x920;
@@ -2311,7 +2295,7 @@ void check_clipped_world_strip(const ClippedWorldStrip &strip, VUState &vu, unsi
 #endif
 
 void vu_report_world_strip_transport() {
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
     const auto &low = g_world_strip_direct[0];
     const auto &high = g_world_strip_direct[1];
     if (low.packets || high.packets)
@@ -2322,7 +2306,7 @@ void vu_report_world_strip_transport() {
 }
 
 bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::WorldTextureLod &lod) {
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
     // Portable capture and original-path diagnostics must see the original dispatch.
     static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
         getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
@@ -2348,7 +2332,7 @@ bool vu_retire_world_leaf(VUState *vu, uint32_t pc, uint32_t top, const native::
 }
 
 bool vu_retire_clipped_world_strip(VUState *vu, uint32_t top, unsigned vertices) {
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
     static const char *setting = getenv("EOD_NATIVE_WORLD_CLIPPED");
     static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") || getenv("EOD_NATIVE_CHECK") ||
         getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
@@ -2376,7 +2360,7 @@ bool vu_retire_clipped_world_strip(VUState *vu, uint32_t top, unsigned vertices)
 }
 
 bool vu_retire_queue_dent(VUState *vu, unsigned top, native::QueueDentChunk &candidate) {
-#ifdef EOD_PLUME
+#if defined(EOD_PLUME) && !defined(EOD_R7_RELEASE)
     static const bool diagnostic = getenv("EOD_VU_INTERP") || getenv("EOD_GS_DUMP") ||
         getenv("EOD_NATIVE_CHECK") || getenv("EOD_VERTEX_CHECK") || getenv("EOD_NATIVE_SKIN_CHECK") ||
         getenv("EOD_NATIVE_QCHECK") || getenv("EOD_VIF_CHECK") ||
@@ -2478,6 +2462,7 @@ bool vu_retire_queue_dent(VUState *vu, unsigned top, native::QueueDentChunk &can
 #endif
 }
 
+#ifndef EOD_R7_RELEASE
 static constexpr uint32_t kMlistVisibilityPc = 0x40;
 
 static bool is_mlist_visibility_image(const VUState &vu) {
@@ -2490,30 +2475,12 @@ static bool is_mlist_visibility_image(const VUState &vu) {
     return fingerprint == 0x2a3140a9ff711e39ull;
 }
 
-void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch, uint32_t ee_ra) {
-    EOD_ZONE("vu_execute");
-    ProfScope prof(P_EE_VU);
-    uint32_t pc = start_pc & vu->micro_mask & ~7u;
-    vu_rec_hook(vu, pc);
-    vu_dump(vu, pc);
-    if (scene_capture::g_on && vu->index == 1) scene_capture::vu1_start(vu, pc);
-    if (scene_emit::g_on && vu->index == 1 && scene_emit::vu1_start(vu, pc)) return;
-    r7_audit::add(vu->index == 1 ? r7_audit::Counter::Vu1 : r7_audit::Counter::Vu0Micro);
-    if (census_enabled()) census_micro(*vu, pc, launch, ee_ra);
-    if (vu->index == 0 && pc == kMlistVisibilityPc && r7_audit::enabled()) {
-        static uint32_t checked_generation = ~0u;
-        static bool is_mlist;
-        if (checked_generation != g_vu_micro_gen[0]) {
-            checked_generation = g_vu_micro_gen[0];
-            is_mlist = is_mlist_visibility_image(*vu);
-        }
-        if (is_mlist) r7_audit::add(r7_audit::Counter::Vu0Mlist);
-    }
+static void vu_dispatch_software(VUState *vu, uint32_t pc) {
 #ifdef VU_REC
     if (const VuProg *p = vu_rec_find(vu, pc)) {
         static bool check = getenv("EOD_VU_CHECK") != nullptr;
         static const bool stats = getenv("EOD_VU_STATS") != nullptr;
-        if (stats && !check) {  // EOD_VU_STATS=1: elapsed time per compiled VU1 entry
+        if (stats && !check) {  // EOD_VU_STATS=1: elapsed time per compiled VU entry
             using Clock = std::chrono::steady_clock;
             static uint64_t cnt[0x800], ns[0x800];
             static auto last = Clock::now();
@@ -2607,6 +2574,155 @@ void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch, uint32_t ee_ra)
     vu_interp(vu, pc);
 }
 
+#ifndef EOD_R7_RELEASE
+__attribute__((noinline)) void vu1_interp_execute(VUState *vu, uint32_t pc, VuLaunch launch, uint32_t ee_ra) {
+    if (scene_capture::g_on) scene_capture::vu1_start(vu, pc);
+    if (scene_emit::g_on && scene_emit::vu1_start(vu, pc)) return;
+    r7_audit::add(r7_audit::Counter::Vu1);
+    if (census_enabled()) census_micro(*vu, pc, launch, ee_ra);
+    vu_dispatch_software(vu, pc);
+}
+#endif
+
+void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch, uint32_t ee_ra) {
+    EOD_ZONE("vu_execute");
+    ProfScope prof(P_EE_VU);
+    uint32_t pc = start_pc & vu->micro_mask & ~7u;
+    if (vu->index == 1) {
+        vu_rec_hook(vu, pc);
+        vu_dump(vu, pc);
+        vu1_interp_execute(vu, pc, launch, ee_ra);
+        return;
+    }
+    vu_rec_hook(vu, pc);
+    vu_dump(vu, pc);
+    r7_audit::add(r7_audit::Counter::Vu0Micro);
+    if (census_enabled()) census_micro(*vu, pc, launch, ee_ra);
+    if (pc == kMlistVisibilityPc && r7_audit::enabled()) {
+        static uint32_t checked_generation = ~0u;
+        static bool is_mlist;
+        if (checked_generation != g_vu_micro_gen[0]) {
+            checked_generation = g_vu_micro_gen[0];
+            is_mlist = is_mlist_visibility_image(*vu);
+        }
+        if (is_mlist) r7_audit::add(r7_audit::Counter::Vu0Mlist);
+    }
+    vu_dispatch_software(vu, pc);
+}
+
+// Only the final four occupied scoreboard slots survive the fixed physics
+// schedule. All are at least six cycles old when the register file returns.
+static Scoreboard vehicle_return_score(uint64_t end) {
+    Scoreboard score{};
+    constexpr uint32_t ages[] = {7, 6, 25, 12};
+    constexpr uint64_t lanes[] = {0xe00, 0xe0, 0xf000f00000000000ull, 0xe0000};
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint64_t issue = end - ages[i];
+        const unsigned slot = issue & 3;
+        score.stamp[slot] = issue;
+        score.lo[slot] = lanes[i];
+    }
+    return score;
+}
+
+#endif
+
+extern "C" void eod_vehicle_physics_step(void) {
+    VUState& vu = g_vu0;
+#ifdef EOD_R7_RELEASE
+    static const bool reference_check = getenv("EOD_VEHICLE_PHYSICS_CHECK") != nullptr;
+    if (reference_check) fatal("EOD_VEHICLE_PHYSICS_CHECK requires a reference build");
+#endif
+    static const bool reference = [] {
+        const char* setting = getenv("EOD_VEHICLE_PHYSICS");
+        return setting && !strcmp(setting, "0");
+    }();
+    if (reference || vu_dispatch_observed() || vu.running || vu.flag_pipe || vu.fq_n ||
+        vu.vi[0] || vu.vi[1] || vu.vi[2] != 11 || vu.vi[3] != 42 ||
+        vu.vf[0].u[0] || vu.vf[0].u[1] || vu.vf[0].u[2] || vu.vf[0].u[3] != 0x3f800000 ||
+        vu.mem_mask != 0xfff || vu.micro_mask != 0xfff || micro_image_id(vu) != 0xdc7d103a5a6e1a99ull) {
+        vu0_macro(0x4A000038);
+        return;
+    }
+    flush_q(&vu);
+    flush_p(&vu);
+#ifndef EOD_R7_RELEASE
+    static const bool check = getenv("EOD_VEHICLE_PHYSICS_CHECK") != nullptr;
+    if (check) {
+        alignas(16) uint8_t memory[0x1000];
+        memcpy(memory, vu.mem, sizeof memory);
+        VUState expected = vu;
+        expected.mem = memory;
+        vehicle_dynamics_step(expected);
+        expected.mem = vu.mem;
+        const Scoreboard expected_score = vehicle_return_score(expected.cycle);
+        vu0_macro(0x4A000038);
+        const auto* before = reinterpret_cast<const uint8_t*>(&expected);
+        const auto* actual = reinterpret_cast<const uint8_t*>(&vu);
+        const auto* state_diff = std::mismatch(before, before + sizeof vu, actual).first;
+        const auto* mem_diff = std::mismatch(memory, memory + sizeof memory, vu.mem).first;
+        static size_t calls;
+        ++calls;
+        if (state_diff != before + sizeof vu || mem_diff != memory + sizeof memory ||
+            memcmp(&expected_score, &g_score[0], sizeof expected_score))
+            fatal("vehicle physics call %zu: state byte %zu, local memory byte %zu, status %x/%x",
+                  calls, size_t(state_diff - before), size_t(mem_diff - memory), expected.status, vu.status);
+        if (calls == 1 || calls % 1000 == 0)
+            fprintf(stderr, "[vehicle-physics] %zu original/native calls matched\n", calls);
+        return;
+    }
+#endif
+    vehicle_dynamics_step(vu);
+#ifndef EOD_R7_RELEASE
+    g_score[0] = vehicle_return_score(vu.cycle);
+#endif
+}
+
+// 0x38A5D0 multiplies two column-major matrices. Keep the partial sum after
+// column Z in ACC and publish MAC/sticky status for each rounded term.
+extern "C" void eod_matrix_product_column(void) {
+    VUState *vu = &g_vu0;
+    flush_q(vu);
+    flush_p(vu);
+    const VUReg &weights = vu->vf[8];
+    for (int column = 0; column < 4; ++column) {
+        VUReg sum;
+        for (int row = 0; row < 4; ++row) {
+            const float coefficient = vu->vf[4 + column].f[row];
+            sum.f[row] = column == 0 ? apply_t<OP_MUL>(0, coefficient, weights.f[0])
+                                     : apply_t<OP_MADD>(vu->acc.f[row], coefficient, weights.f[column]);
+        }
+        (column == 3 ? vu->vf[9] : vu->acc) = sum;
+        vu_flag_push(vu, 0, mac_for(sum, 15));
+    }
+}
+
+extern "C" void eod_matrix_identity_rows(void) {
+    VUState *vu = &g_vu0;
+    flush_q(vu);
+    flush_p(vu);
+    // VF0 = (0,0,0,1). The subtraction sets zero in all lanes, then
+    // adding VF0.w sets W and updates only the W MAC lane.
+    vu_flag_push(vu, 0, 0xF);
+    vu_flag_push(vu, 0, 0);
+    for (int axis = 3; axis >= 0; --axis) {
+        VUReg basis = {};
+        basis.f[axis] = 1.0f;
+        vu->vf[7 - axis] = basis;
+    }
+}
+
+extern "C" void eod_matrix_seed_camera_row(void) {
+    flush_q(&g_vu0);
+    flush_p(&g_vu0);
+    g_vu0.vf[1] = g_vu0.vf[0];
+}
+
+extern "C" uint32_t eod_vif1_worker_status(void) {
+    return offload_busy() ? 0x100u : 0u;
+}
+
+#ifndef EOD_R7_RELEASE
 // --------------------------------------------------------------- macro mode
 extern "C" void vu0_macro(uint32_t ins) {
     VUState *vu = &g_vu0;
@@ -2687,7 +2803,7 @@ int vu_bench(const char *path, int repeat) {
         for (size_t k = 0; k < n; k++) hash = (hash ^ b[k]) * 1099511628211ull;
     };
     std::vector<double> pass;  // VU1 time of each pass
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
     const bool world_check = getenv("EOD_NATIVE_WORLD_BENCH_CHECK") != nullptr;
     size_t world_matched = 0, world_mismatched = 0, world_unsupported = 0;
 #endif
@@ -2709,7 +2825,7 @@ int vu_bench(const char *path, int repeat) {
             g_score[r.h.index] = r.sb;
             g_vif1_top = r.h.top;
             g_vif1_itop = r.h.itop;
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
             if (world_check && rep == 0 && r.h.index == 1 && r.h.pc == kWorldLeafPc &&
                 r.h.itop == 0x80 && (r.h.top == 0xE0 || r.h.top == 0x270)) {
                 WorldLeafRetirement expected;
@@ -2769,7 +2885,7 @@ int vu_bench(const char *path, int repeat) {
     }
     bool checks_requested = mlist_check;
     bool checks_passed = true;
-#ifdef EOD_VULKAN
+#if defined(EOD_VULKAN) && !defined(EOD_R7_RELEASE)
     if (world_check) {
         fprintf(stderr, "world-bench: %zu matched, %zu mismatched, %zu unsupported\n",
                 world_matched, world_mismatched, world_unsupported);
@@ -2808,59 +2924,13 @@ int vu_bench(const char *path, int repeat) {
     return 0;
 }
 
+#endif
+
 extern "C" void vu0_sync(void) {}
 
-extern "C" uint32_t vu0_cfc2(int reg) {
+#ifndef EOD_R7_RELEASE
+void vu_reference_control_access(int reg, bool write) {
     r7_audit::add(r7_audit::Counter::Vu0Control);
-    if (census_enabled()) census_add(0, {"cfc2", static_cast<uint32_t>(reg), 0, g_ee.r[31].uw[0]});
-    VUState *vu = &g_vu0;
-    if (reg < 16) return vu->vi[reg] & 0xFFFF;
-    switch (reg) {
-    case REG_STATUS: return vu->status;
-    case REG_MAC: return vu->mac;
-    case REG_CLIP: return vu->clip;
-    case REG_R: return vu->r;
-    case REG_I: return f2u(vu->i);
-    case REG_Q: return f2u(vu->q);
-    case REG_P: return f2u(vu->p);
-    case REG_TPC: return vu->tpc / 8;
-    case REG_CMSAR0: return vu->cmsar;
-    case REG_VPU_STAT: return offload_busy() ? 0x100 : 0;  // VBS1: VU1 (on the worker) busy
-    case REG_CMSAR1: offload_sync(); return g_vu1.cmsar;
-    }
-    return 0;
+    if (census_enabled()) census_add(0, {write ? "ctc2" : "cfc2", static_cast<uint32_t>(reg), 0, g_ee.r[31].uw[0]});
 }
-
-extern "C" void vu0_ctc2(int reg, uint32_t v) {
-    r7_audit::add(r7_audit::Counter::Vu0Control);
-    if (census_enabled()) census_add(0, {"ctc2", static_cast<uint32_t>(reg), 0, g_ee.r[31].uw[0]});
-    VUState *vu = &g_vu0;
-    if (reg < 16) {
-        set_vi(vu, reg, v);
-        return;
-    }
-    switch (reg) {
-    case REG_STATUS: vu->status = (vu->status & 0x3F) | (v & 0xFC0); break;
-    case REG_MAC: break;
-    case REG_CLIP: vu->clip = v & 0xFFFFFF; break;
-    case REG_R: vu->r = 0x3F800000 | (v & 0x7FFFFF); break;
-    case REG_I: memcpy(&vu->i, &v, 4); break;
-    case REG_Q: memcpy(&vu->q, &v, 4); break;
-    case REG_P: memcpy(&vu->p, &v, 4); break;
-    case REG_CMSAR0: vu->cmsar = v & 0xFFFF; break;
-    case REG_FBRST:
-        if (v & 2) { /* reset VU0 */ }
-        if (v & 0x200) { /* reset VU1 */ }
-        break;
-    case REG_CMSAR1: {
-        const uint32_t ee_ra = g_ee.r[31].uw[0];
-        offload_run([v, ee_ra] {
-            g_vu1.cmsar = v & 0xFFFF;
-            vu_execute(&g_vu1, (v & 0xFFFF) * 8, VuLaunch::Cmsar1, ee_ra);
-        });
-        break;
-    }
-    default:
-        break;
-    }
-}
+#endif

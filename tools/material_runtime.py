@@ -207,12 +207,18 @@ def main():
 
     keys = defaultdict(set)
     bound_ik_wh = set()
+    weathered_hunter_keys = set()
     by_name = defaultdict(list)
     for m in texs:
         by_name[m["name"].lower().rsplit("/", 1)[-1]].append(m)
         info, px = info_of(m)
         if px is None:
             continue
+        # Retail Hunter dealer finishes 825..829 share the same weathered body artwork.
+        # Bind both resolutions by their full texture keys, as other archives reuse numbers.
+        if (os.path.basename(m["archive"]).upper() == "CT.RES" and
+                re.fullmatch(r"82[5-9]\.(tex|tm0)", m["name"], re.IGNORECASE)):
+            weathered_hunter_keys.add((info["indexKey"], info["paletteKey"], info["width"], info["height"]))
         sha = hashlib.sha1(px + bytes(str((info["width"], info["height"])), "ascii")).hexdigest()
         rid = by_sha.get(sha)
         if rid and "indexKey" in info:
@@ -287,6 +293,8 @@ def main():
         r = all_records[rid]
         if r.get("needs_human"):
             still_uncertain += 1
+        if weathered_hunter_keys.intersection(keys.get(rid, ())):
+            r = dict(r, surface="metal_painted", metalness=0.0, roughness=0.85)
         fields = [r["surface"], "%.2f" % r["metalness"], "%.2f" % r["roughness"], r.get("detail") or "none",
                   "1" if r.get("emissive") else "0", r.get("alpha") or "opaque", "%.2f" % r["confidence"],
                   "1" if r.get("needs_human") else "0"]

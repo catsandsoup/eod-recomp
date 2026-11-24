@@ -1,5 +1,5 @@
-// eodsetup.cpp - settings program for the PC port (writes eod.ini next to
-// eod.exe and can start the game).  Plain Win32 controls, no dependencies
+// eodsetup.cpp - settings program for the PC port (shares the game's
+// per-user eod.ini and can start the game).  Plain Win32 controls, no dependencies
 // beyond what Windows 7 ships.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +19,8 @@
 #include <vector>
 
 #include "../../runtime/core/config.h"
+#include "../../runtime/app/windows_disc.h"
+#include "../../runtime/app/windows_settings.h"
 #include "../../runtime/core/eodsave.h"
 #include "../../runtime/core/ps2mc.h"
 
@@ -27,7 +29,9 @@ namespace {
 HINSTANCE g_inst;
 HWND g_main;
 HFONT g_font, g_bold;
-std::string g_dir;  // folder of eodsetup.exe (and eod.exe / eod.ini)
+namespace fs = std::filesystem;
+std::string g_dir;  // folder containing eodsetup.exe and eod.exe
+std::string g_settings_path, g_saved_data;
 Config g_cfg;
 
 enum : int {
@@ -48,7 +52,11 @@ std::vector<Size> g_sizes;  // what the size combo lists
 
 HWND ctl(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, HWND parent, int id,
          DWORD ex = 0) {
-    HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent, (HMENU)(INT_PTR)id,
+    HWND c;
+    if (id == ID_DATA || id == ID_MEMCARD) {
+        c = CreateWindowExW(ex, L"EDIT", L"", WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+                            (HMENU)(INT_PTR)id, g_inst, nullptr);
+    } else c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent, (HMENU)(INT_PTR)id,
                              g_inst, nullptr);
     SendMessageA(c, WM_SETFONT, (WPARAM)g_font, TRUE);
     return c;
@@ -73,6 +81,12 @@ int cur(int id) { return (int)SendDlgItemMessageA(g_main, id, CB_GETCURSEL, 0, 0
 bool checked(int id) { return IsDlgButtonChecked(g_main, id) == BST_CHECKED; }
 void set_check(int id, bool v) { CheckDlgButton(g_main, id, v ? BST_CHECKED : BST_UNCHECKED); }
 std::string text_of(HWND parent, int id) {
+    if (id == ID_DATA || id == ID_MEMCARD) {
+        const HWND edit = GetDlgItem(parent, id);
+        std::wstring text(GetWindowTextLengthW(edit) + 1, L'\0');
+        text.resize(GetWindowTextW(edit, text.data(), static_cast<int>(text.size())));
+        return fs::path(text).u8string();
+    }
     char buf[1024] = {};
     GetDlgItemTextA(parent, id, buf, sizeof buf);
     return buf;
@@ -184,8 +198,21 @@ void list_adapters(HWND cb) {
     if (!any) add(cb, "Default adapter");
 }
 
+struct RendererChoice { const char *value; const char *label; };
+constexpr RendererChoice renderers[] = {
+    {"vulkan", "Vulkan (graphics card, recommended)"},
+#ifndef EOD_R7_RELEASE
+    {"software", "Software (CPU only, most compatible)"},
+    {"warp", "Direct3D 11 WARP (in software, for testing)"},
+    {"d3d11", "Direct3D 11 (graphics card)"},
+#endif
+};
+
 void load_into_ui() {
-    sel(GetDlgItem(g_main, ID_RENDERER), g_cfg.renderer == "software" ? 1 : g_cfg.renderer == "warp" ? 2 : g_cfg.renderer == "d3d11" ? 3 : 0);
+    int renderer = 0;
+    for (size_t i = 0; i < std::size(renderers); ++i)
+        if (g_cfg.renderer == renderers[i].value) renderer = (int)i;
+    sel(GetDlgItem(g_main, ID_RENDERER), renderer);
     HWND ad = GetDlgItem(g_main, ID_ADAPTER);
     int n = (int)SendMessageA(ad, CB_GETCOUNT, 0, 0);
     sel(ad, g_cfg.adapter < n ? g_cfg.adapter : 0);
@@ -206,7 +233,7 @@ void load_into_ui() {
         add(ws, b);
     }
     sel(ws, found);
-    sel(GetDlgItem(g_main, ID_ASPECT), g_cfg.aspect == "4:3" ? 1 : g_cfg.aspect == "16:9" ? 2 : g_cfg.aspect == "stretch" ? 3 : 0);
+    sel(GetDlgItem(g_main, ID_ASPECT), g_cfg.aspect == "4:3" ? 1 : g_cfg.aspect == "16:9" ? 2 : g_cfg.aspect == "stretch" ? 3 : g_cfg.aspect == "16:10" ? 4 : g_cfg.aspect == "display" ? 5 : 0);
     sel(GetDlgItem(g_main, ID_SCALE), g_cfg.render_scale - 1);
     set_check(ID_VSYNC, g_cfg.vsync);
     set_check(ID_SMOOTH, g_cfg.smooth_display);
@@ -218,12 +245,13 @@ void load_into_ui() {
     SetDlgItemTextA(g_main, ID_VOLUME_LABEL, v);
     set_check(ID_VIBRATION, g_cfg.vibration);
     set_check(ID_DURABILITY, g_cfg.car_durability);
-    SetDlgItemTextA(g_main, ID_MEMCARD, g_cfg.memcard_dir.c_str());
-    SetDlgItemTextA(g_main, ID_DATA, g_cfg.data_dir.c_str());
+    SetDlgItemTextW(g_main, ID_MEMCARD, fs::u8path(g_cfg.memcard_dir).c_str());
+    SetDlgItemTextW(g_main, ID_DATA, fs::u8path(g_cfg.data_dir).c_str());
 }
 
 void read_from_ui() {
-    g_cfg.renderer = cur(ID_RENDERER) == 1 ? "software" : cur(ID_RENDERER) == 2 ? "warp" : cur(ID_RENDERER) == 3 ? "d3d11" : "vulkan";
+    const int renderer = cur(ID_RENDERER);
+    g_cfg.renderer = renderers[renderer >= 0 && (size_t)renderer < std::size(renderers) ? renderer : 0].value;
     g_cfg.adapter = cur(ID_ADAPTER) < 0 ? 0 : cur(ID_ADAPTER);
     g_cfg.fullscreen = checked(ID_FULLSCREEN);
     int s = cur(ID_WINSIZE);
@@ -231,8 +259,8 @@ void read_from_ui() {
         g_cfg.width = g_sizes[(size_t)s].w;
         g_cfg.height = g_sizes[(size_t)s].h;
     }
-    static const char *const aspects[] = {"auto", "4:3", "16:9", "stretch"};
-    g_cfg.aspect = aspects[std::max(0, std::min(3, (int)cur(ID_ASPECT)))];
+    static const char *const aspects[] = {"auto", "4:3", "16:9", "stretch", "16:10", "display"};
+    g_cfg.aspect = aspects[std::max(0, std::min(5, (int)cur(ID_ASPECT)))];
     g_cfg.render_scale = cur(ID_SCALE) + 1;
     g_cfg.vsync = checked(ID_VSYNC);
     g_cfg.smooth_display = checked(ID_SMOOTH);
@@ -257,23 +285,27 @@ void update_enabled() {
 
 bool save() {
     read_from_ui();
-    std::string path = g_dir + "\\eod.ini";
-    if (!config_save(path, g_cfg)) {
-        MessageBoxA(g_main, ("Could not write " + path).c_str(), "Eve of Destruction setup", MB_OK | MB_ICONERROR);
+    if (g_cfg.data_dir != g_saved_data && !g_cfg.data_dir.empty()) {
+        if (!windows_prepare_disc(g_cfg.data_dir, g_dir, false, {EOD_DISC_SIZE, EOD_DISC_CRC32})) return false;
+        SetDlgItemTextW(g_main, ID_DATA, fs::u8path(g_cfg.data_dir).c_str());
+    }
+    if (!config_save(g_settings_path, g_cfg)) {
+        MessageBoxW(g_main, (L"Could not write " + fs::u8path(g_settings_path).wstring()).c_str(), L"Eve of Destruction setup", MB_OK | MB_ICONERROR);
         return false;
     }
+    g_saved_data = g_cfg.data_dir;
     return true;
 }
 
-void browse(int edit_id, const char *title) {
-    BROWSEINFOA bi = {};
+void browse(int edit_id, const wchar_t *title) {
+    BROWSEINFOW bi = {};
     bi.hwndOwner = g_main;
     bi.lpszTitle = title;
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    LPITEMIDLIST l = SHBrowseForFolderA(&bi);
+    LPITEMIDLIST l = SHBrowseForFolderW(&bi);
     if (!l) return;
-    char path[MAX_PATH];
-    if (SHGetPathFromIDListA(l, path)) SetDlgItemTextA(g_main, edit_id, path);
+    wchar_t path[MAX_PATH];
+    if (SHGetPathFromIDListW(l, path)) SetDlgItemTextW(g_main, edit_id, path);
     CoTaskMemFree(l);
 }
 
@@ -451,8 +483,10 @@ LRESULT CALLBACK save_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::string looks_text = eodsave_format_looks(looks);
             if (looks_text != g_cfg.car_looks) {  // the cars shown as other vehicles (eod.ini)
                 g_cfg.car_looks = looks_text;
-                if (!config_save(g_dir + "\\eod.ini", g_cfg))
-                    MessageBoxA(h, ("Could not write " + g_dir + "\\eod.ini.").c_str(), title, MB_OK | MB_ICONERROR);
+                Config saved = g_cfg;
+                saved.data_dir = g_saved_data;
+                if (!config_save(g_settings_path, saved))
+                    MessageBoxW(h, (L"Could not write " + fs::u8path(g_settings_path).wstring()).c_str(), L"Save editor", MB_OK | MB_ICONERROR);
             }
             MessageBoxA(h, ("Saved. The previous save is kept as " + bak + ".").c_str(), title, MB_OK | MB_ICONINFORMATION);
             DestroyWindow(h);
@@ -608,14 +642,12 @@ void open_save_editor() {
 
 void play() {
     if (!save()) return;
-    std::string exe = g_dir + "\\eod.exe";
-    STARTUPINFOA si = {sizeof si};
+    const fs::path directory = fs::u8path(g_dir);
+    const fs::path exe = directory / L"eod.exe";
+    STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    std::string cmd = "\"" + exe + "\"";
-    std::vector<char> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    if (!CreateProcessA(exe.c_str(), buf.data(), nullptr, nullptr, FALSE, 0, nullptr, g_dir.c_str(), &si, &pi)) {
-        MessageBoxA(g_main, ("Could not start " + exe).c_str(), "Eve of Destruction setup", MB_OK | MB_ICONERROR);
+    if (!CreateProcessW(exe.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, directory.c_str(), &si, &pi)) {
+        MessageBoxW(g_main, (L"Could not start " + exe.wstring()).c_str(), L"Eve of Destruction setup", MB_OK | MB_ICONERROR);
         return;
     }
     CloseHandle(pi.hThread);
@@ -638,10 +670,7 @@ void build_ui(HWND w) {
     group("Graphics", 12, y, W - 24, 214, w);
     label("Renderer:", 28, y + 24, 120, w);
     HWND r = combo(160, y + 22, 330, w, ID_RENDERER);
-    add(r, "Vulkan (graphics card, recommended)");
-    add(r, "Software (CPU only, most compatible)");
-    add(r, "Direct3D 11 WARP (in software, for testing)");
-    add(r, "Direct3D 11 (graphics card)");
+    for (const auto &renderer : renderers) add(r, renderer.label);
     label("Graphics adapter:", 28, y + 54, 120, w);
     list_adapters(combo(160, y + 52, 330, w, ID_ADAPTER));
     check("Fullscreen", 28, y + 84, 120, w, ID_FULLSCREEN);
@@ -653,6 +682,8 @@ void build_ui(HWND w) {
     add(a, "4:3 (original)");
     add(a, "16:9 widescreen");
     add(a, "Stretch to window");
+    add(a, "16:10 widescreen");
+    add(a, "Match display");
     label("Resolution:", 312, y + 116, 70, w);
     HWND s = combo(385, y + 114, 105, w, ID_SCALE);
     add(s, "1x (640x448)");
@@ -712,12 +743,13 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             read_from_ui();
             open_controls();
             return 0;
-        case ID_MEMCARD_BROWSE: browse(ID_MEMCARD, "Folder for the memory card saves"); return 0;
-        case ID_DATA_BROWSE: browse(ID_DATA, "Folder with the game disc files (SLUS_209.10 and DATA)"); return 0;
+        case ID_MEMCARD_BROWSE: browse(ID_MEMCARD, L"Folder for the memory card saves"); return 0;
+        case ID_DATA_BROWSE: browse(ID_DATA, L"Folder with the game disc files (SLUS_209.10 and DATA)"); return 0;
         case ID_IMPORT_PCSX2: import_pcsx2(); return 0;
         case ID_EDIT_SAVE: open_save_editor(); return 0;
         case ID_DEFAULTS:
             g_cfg = Config();
+            g_cfg.data_dir = g_saved_data;
             load_into_ui();
             update_enabled();
             return 0;
@@ -756,11 +788,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     InitCommonControlsEx(&icc);
     CoInitialize(nullptr);
 
-    char path[MAX_PATH];
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    g_dir = path;
-    g_dir = g_dir.substr(0, g_dir.find_last_of("\\/"));
-    config_load(g_dir + "\\eod.ini", g_cfg);
+    wchar_t path[32768];
+    const DWORD length = GetModuleFileNameW(nullptr, path, 32768);
+    if (!length || length == 32768) return 1;
+    g_dir = fs::path(path).parent_path().u8string();
+    g_settings_path = windows_settings_path(g_dir);
+    config_load(g_settings_path, g_cfg);
+    g_saved_data = g_cfg.data_dir;
 
     NONCLIENTMETRICSA ncm = {};
     ncm.cbSize = sizeof ncm;

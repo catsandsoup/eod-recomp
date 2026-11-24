@@ -35,8 +35,9 @@ void at_exit() { summary("scene end"); }
 }  // namespace
 
 void limit_note(const char *name, uint64_t used, uint64_t capacity, uint64_t ps2_cap) {
-    if (!g_hooked) g_hooked = true, std::atexit(at_exit);
+    // Register the exit callback after constructing the map so it runs before the map destructor.
     Limit &l = limits()[name];
+    if (!g_hooked) g_hooked = true, std::atexit(at_exit);
     l.capacity = capacity;
     l.ps2_cap = ps2_cap;
     if (used > l.run_high) l.run_high = used;

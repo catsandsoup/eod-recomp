@@ -14,6 +14,7 @@
 #include "kernel/kernel.h"
 #include "funcs.h"
 #include "movie_bits.h"
+#include "netplay_session.h"
 #include "gs/gs.h"
 #include "platform/editor_test_startup.h"
 
@@ -122,6 +123,7 @@ void f_0033EC78(void) {
     const unsigned trace_call = trace && race_loop ? ++traced_calls : 0;
     if (trace_call && trace_call <= 160) editor_trace_native_publication(trace_call, "before");
     f_0033EC78_orig(); // includes 35C3F8: FrameWaitVblank/DrawDone and display publication
+    if (race_loop) netplay::session().race_frame();
     if (trace_call && trace_call <= 160) editor_trace_native_publication(trace_call, "after");
     if (editor_test_startup::state().enabled() && g_editor_native_frame.frame_published(race_loop)) {
         std::fputs("[editor-test] native gameplay frame publication completed: caller=0011412c\n", stderr);

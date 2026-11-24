@@ -333,8 +333,15 @@ extern "C" {
 #endif
 #define VU0 g_vu0
 void vu0_sync(void);
+#ifdef EOD_R7_RELEASE
+uint32_t eod_unretired_vu0_read(int reg);
+void eod_unretired_vu0_write(int reg, uint32_t v);
+#define vu0_cfc2(reg) eod_unretired_vu0_read(reg)
+#define vu0_ctc2(reg, value) eod_unretired_vu0_write(reg, value)
+#else
 uint32_t vu0_cfc2(int reg);
 void vu0_ctc2(int reg, uint32_t v);
+#endif
 
 /* ------------------------------------------------------------- MMI */
 #define MMI_DECL(n) void mmi_##n(int rd, int rs, int rt, int sa);

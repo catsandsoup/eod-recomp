@@ -66,6 +66,7 @@ static bool count_prim() {
 
 namespace {
 
+#ifndef EOD_R7_RELEASE
 // Statistics per rasterising thread (0 = GS thread, 1.. raster workers).
 constexpr int kMaxWorkers = 4;
 struct alignas(64) WStats {
@@ -100,6 +101,7 @@ void trace_prim(const char *kind, const Vertex *v, int n) {
                       v[i].v, v[i].s, v[i].t, v[i].q);
     log_write(LOG_GS, "%s", buf);
 }
+#endif
 
 
 // ----------------------------------------------------------------- setup
@@ -120,6 +122,7 @@ void mark_env_written(const Env &e) {
 
 inline void note_draw() { g_draw_dirty = true; }
 
+#ifndef EOD_R7_RELEASE
 struct TexKey {
     uint32_t tbp, tbw, psm, w, h, pal_hash, texa;
     bool operator==(const TexKey &o) const {
@@ -254,6 +257,9 @@ inline uint32_t texel(const Env &e, TexEntry &t, int x, int y) {
     if (!__atomic_load_n(&t.valid[(y >> 3) * t.tiles_w + (x >> 3)], __ATOMIC_ACQUIRE)) decode_tile(e, t, x >> 3, y >> 3);
     return t.data[(size_t)y * t.w + x];
 }
+#else
+uint32_t fetch(const Env &e, int u, int v, int lvl);
+#endif
 
 // EOD_SCENE_CAPTURE: the texture of this draw state with the host-texture
 // identity keys (texture_replacements.h), so a captured draw can be paired
@@ -273,6 +279,7 @@ void capture_texture(const Env &e, bool four, bool eight) {
     scene_capture::gs_texture(e.mip_tbp[0], e.mip_tbw[0], e.tpsm, e.tw, e.th, e.cpsm, e.csa, ik, pk);
 }
 
+#ifndef EOD_R7_RELEASE
 // EOD_SCENE_EMIT: one texture row per textured PATH1 draw state. The index key
 // (a decode of every texel) is cached by a hash of the raw VRAM pages the
 // texture occupies, so a texture seen before costs one linear hash.
@@ -306,6 +313,7 @@ void emit_texture(const Env &e, bool four, bool eight, uint32_t attr) {
     scene_emit::gs_cost_ns((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t0).count());
 }
+#endif
 
 void setup_env(uint32_t attr) {
     attr &= ~7u;  // the primitive type doesn't matter here
@@ -315,7 +323,9 @@ void setup_env(uint32_t attr) {
     g_env_serial++;
     stats.env_setups++;
     ProfScope prof(P_GS_STATE);
+#ifndef EOD_R7_RELEASE
     g_env_snap = nullptr;
+#endif
     Env &e = g_env;
     if (g_draw_dirty) {
         mark_env_written(e);
@@ -499,7 +509,13 @@ void setup_env(uint32_t attr) {
             }
         }
         if (scene_capture::g_on && scene_capture::gs_active()) capture_texture(e, four, eight);
+#ifndef EOD_R7_RELEASE
         if (scene_emit::g_on && scene_emit::gs_wants_texture()) emit_texture(e, four, eight, attr);
+#endif
+#ifdef EOD_R7_RELEASE
+        e.tcached = false;
+        return;
+#else
         if (hw::g_on) {  // the hardware renderer keeps its own textures
             e.tcached = false;
             return;
@@ -522,6 +538,7 @@ void setup_env(uint32_t attr) {
             e.tl[i] = tex_lookup(e, i);
             if (!e.tl[i]) e.tcached = false;
         }
+#endif
     } else {
         e.tcached = false;
     }
@@ -694,6 +711,7 @@ inline uint32_t fetch(const Env &e, int u, int v, int lvl) {
     return 0;
 }
 
+#ifndef EOD_R7_RELEASE
 inline int wrap(int c, int size, int mode, int mn, int mx) {
     switch (mode) {
     case 0:  // REPEAT
@@ -1574,6 +1592,7 @@ void submit(Job &j) {
     if (zt) g_pend_write.add(e.z_ps);
     push_job(j);
 }
+#endif  // !EOD_R7_RELEASE
 
 }  // namespace
 
@@ -1602,6 +1621,13 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
     Env &e = g_env;
     if (census::g_on)
         census::draw(e, "sprite", (uint64_t)std::abs((b.x - a.x) >> 4) * (uint64_t)std::abs((b.y - a.y) >> 4));
+#ifdef EOD_R7_RELEASE
+    if (!e.write_none && !g_skip_frame) {
+        if (native::enabled()) (void)native::gs_draw(e, a, &b);
+        note_draw();
+    }
+    return;
+#else
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
             if (!(modern::g_on && modern::gs_replaced(e, b.a)) && !(native::enabled() && native::gs_draw(e, a, &b))) hw::draw_sprite(e, a, b);
@@ -1674,6 +1700,7 @@ void draw_sprite(const Vertex &a, const Vertex &b) {
     job.w0 = w0;
     job.dw = dw;
     submit(job);
+#endif  // !EOD_R7_RELEASE
 }
 
 void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
@@ -1685,6 +1712,13 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
         int64_t ar = ((int64_t)(b0.x - a0.x) * (c0.y - a0.y) - (int64_t)(c0.x - a0.x) * (b0.y - a0.y)) / 512;
         census::draw(e, "tri", (uint64_t)(ar < 0 ? -ar : ar));
     }
+#ifdef EOD_R7_RELEASE
+    if (!e.write_none && !g_skip_frame) {
+        if (native::enabled()) (void)native::gs_draw(e, a0, &b0, &c0);
+        note_draw();
+    }
+    return;
+#else
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
             if (!(modern::g_on && modern::gs_replaced(e, (a0.a + b0.a + c0.a) / 3u)) && !(native::enabled() && native::gs_draw(e, a0, &b0, &c0))) hw::draw_triangle(e, a0, b0, c0);
@@ -1813,6 +1847,7 @@ void draw_triangle(const Vertex &a0, const Vertex &b0, const Vertex &c0) {
     job.variant = (e.iip ? 1 : 0) | (e.tme ? 2 : 0) | (e.tme && !e.fst ? 4 : 0) | (e.fge ? 8 : 0) | ((e.pix_kind >> 1) << 4);
     job.ts = ts;
     submit(job);
+#endif  // !EOD_R7_RELEASE
 }
 
 void draw_line(const Vertex &a, const Vertex &b) {
@@ -1821,6 +1856,13 @@ void draw_line(const Vertex &a, const Vertex &b) {
     setup_env(attr);
     Env &e = g_env;
     if (census::g_on) census::draw(e, "line", 1);
+#ifdef EOD_R7_RELEASE
+    if (!e.write_none && !g_skip_frame) {
+        if (native::enabled()) (void)native::gs_draw(e, a);
+        note_draw();
+    }
+    return;
+#else
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
             if (!(modern::g_on && modern::gs_replaced(e, b.a)) && !(native::enabled() && native::gs_draw(e, a))) hw::draw_line(e, a, b);
@@ -1859,6 +1901,7 @@ void draw_line(const Vertex &a, const Vertex &b) {
         }
         shade(e, x, y, f);
     }
+#endif  // !EOD_R7_RELEASE
 }
 
 void draw_point(const Vertex &a) {
@@ -1867,6 +1910,13 @@ void draw_point(const Vertex &a) {
     setup_env(attr);
     Env &e = g_env;
     if (census::g_on) census::draw(e, "point", 1);
+#ifdef EOD_R7_RELEASE
+    if (!e.write_none && !g_skip_frame) {
+        if (native::enabled()) (void)native::gs_draw(e, a);
+        note_draw();
+    }
+    return;
+#else
     if (hw::g_on) {
         if (!e.write_none && !g_skip_frame) {
             if (!(modern::g_on && modern::gs_replaced(e, a.a)) && !(native::enabled() && native::gs_draw(e, a))) hw::draw_point(e, a);
@@ -1895,6 +1945,7 @@ void draw_point(const Vertex &a) {
         }
     }
     shade(e, (a.x + 8) >> 4, (a.y + 8) >> 4, f);
+#endif  // !EOD_R7_RELEASE
 }
 
 // ------------------------------------------------------------------ CLUT
@@ -2010,6 +2061,7 @@ void clut_load(uint64_t tex0) {
     default: return;
     }
     uint32_t cpsm = bits(tex0, 51, 4), csm = bits(tex0, 55, 1), csa = bits(tex0, 56, 5);
+#ifndef EOD_R7_RELEASE
     if (g_nw) {
         uint32_t first, count;
         page_range(cbp, csm ? bits(st.texclut, 0, 6) : 1, cpsm, 0, csm ? (int)bits(st.texclut, 12, 10) : 0, 256, 16,
@@ -2022,6 +2074,7 @@ void clut_load(uint64_t tex0) {
             barrier();
         }
     }
+#endif
     if (g_trace)
         log_write(LOG_GS, "CLUT load cld=%u cbp=%x cpsm=%x csm=%u csa=%u psm=%x", cld, cbp, cpsm, csm, csa, psm);
     g_clut_gen++;
@@ -2064,6 +2117,9 @@ void clut_load(uint64_t tex0) {
 
 // ------------------------------------------------------------ worker control
 void raster_start(int n) {
+#ifdef EOD_R7_RELEASE
+    (void)n;
+#else
     if (n > kMaxWorkers) n = kMaxWorkers;
     if (n <= 0) return;
     if (g_nw) return;
@@ -2074,11 +2130,17 @@ void raster_start(int n) {
     g_nw = n;
     if (platform_core_count() < platform_cpu_count()) g_spin_us = 100;
     for (int i = 0; i < n; i++) g_raster_threads.emplace_back(raster_worker, i);
+#endif
 }
 
-void raster_sync() { barrier(); }
+void raster_sync() {
+#ifndef EOD_R7_RELEASE
+    barrier();
+#endif
+}
 
 void raster_shutdown() {
+#ifndef EOD_R7_RELEASE
     if (!g_nw) return;
     barrier(); // No producer remains; finish every job before stopping workers.
     {
@@ -2091,10 +2153,13 @@ void raster_shutdown() {
     g_nw = 0;
     delete[] g_ring;
     g_ring = nullptr;
+#endif
 }
 
 void raster_reset() {
+#ifndef EOD_R7_RELEASE
     barrier();
+#endif
     g_replaying = true;
     g_env_attr = ~0u;
     g_draw_dirty = false;
@@ -2111,6 +2176,9 @@ void raster_mark_pages() {
 }
 
 void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+#ifdef EOD_R7_RELEASE
+    (void)bp; (void)bw; (void)psm; (void)x; (void)y; (void)w; (void)h;
+#else
     if (!g_nw) return;
     uint32_t first, count;
     page_range(bp, bw, psm, x, y, w, h, first, count);
@@ -2121,9 +2189,13 @@ void raster_vram_write(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int
         g_barrier_cause = 6;
         barrier();
     }
+#endif
 }
 
 void raster_vram_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
+#ifdef EOD_R7_RELEASE
+    (void)bp; (void)bw; (void)psm; (void)x; (void)y; (void)w; (void)h;
+#else
     if (!g_nw) return;
     uint32_t first, count;
     page_range(bp, bw, psm, x, y, w, h, first, count);
@@ -2131,9 +2203,11 @@ void raster_vram_read(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int 
     ps.clear();
     ps.add(first, count);
     if (ps.any(g_pend_write)) barrier();
+#endif
 }
 
 void raster_collect_stats() {
+#ifndef EOD_R7_RELEASE
     LOG(LOG_GS, "  worker sleeps %u, notifies %u, GS thread sleeps %u, GS thread waited %.2f ms (per vblank)",
         g_dbg_sleeps.load() / 60, g_dbg_notifies.load() / 60, g_dbg_psleeps.load() / 60, g_dbg_wait_ns / 60 / 1e6);
     g_dbg_sleeps = g_dbg_notifies = g_dbg_psleeps = 0;
@@ -2146,6 +2220,7 @@ void raster_collect_stats() {
         for (int k = 0; k < 64; k++) stats.kind_px[k] += w.kind_px[k];
         w = WStats();
     }
+#endif
 }
 
 void census_xfer(int dir, uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t dbp, uint32_t dbw, uint32_t dpsm,

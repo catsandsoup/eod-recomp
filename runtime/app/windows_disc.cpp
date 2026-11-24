@@ -4,6 +4,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "windows_settings.h"
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -30,24 +31,22 @@ void windows_utf8_arguments(int &argc, char **&argv) {
 }
 
 bool windows_prepare_disc(std::string &root, const std::string &exe_dir, bool headless, const DiscId &id) {
-    const char *narrow_env = std::getenv("EOD_DATA");
-    if (root.empty() || (narrow_env && root == narrow_env)) {
-        if (const wchar_t *wide_env = _wgetenv(L"EOD_DATA"))
-            if (*wide_env) root = fs::path(wide_env).u8string();
-    }
-    wchar_t local[MAX_PATH];
-    if (SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local) != S_OK) return false;
-    const auto install = fs::path(local) / L"TDEODRecomp" / L"disc";
+    const auto support = windows_support_folder();
+    if (support.empty()) return false;
+    const auto install = support / L"disc";
     std::error_code ec;
     const auto recovery = disc_recover_install(install.u8string());
     if (!recovery.ok()) std::fprintf(stderr, "%s\n", recovery.message.c_str());
-    if (!root.empty() && disc_check_folder(root, id).ok()) return true;
+
     // Explicit sources (including a folder holding a single ISO) must be tried,
     // rather than silently ignored in favor of an older installed copy.
     const bool explicit_source = !root.empty();
     if (!explicit_source) {
-        for (const auto &dir : {root, install.u8string(), exe_dir, std::string(".")}) {
-            if (!dir.empty() && disc_check_folder(dir, id).ok()) { root = dir; return true; }
+        for (const auto &dir : {install.u8string(), exe_dir, std::string(".")}) {
+            if (disc_check_folder(dir, id).ok()) {
+                root = fs::absolute(fs::u8path(dir), ec).lexically_normal().u8string();
+                return !ec;
+            }
         }
     }
     std::string image = explicit_source ? root : "";
@@ -57,8 +56,8 @@ bool windows_prepare_disc(std::string &root, const std::string &exe_dir, bool he
             wchar_t path[32768] = {};
             OPENFILENAMEW chooser{};
             chooser.lStructSize = sizeof chooser;
-            chooser.lpstrTitle = L"Choose your Eve of Destruction disc image";
-            chooser.lpstrFilter = L"Game disc image (*.iso;*.cue;*.bin)\0*.iso;*.cue;*.bin\0All files\0*.*\0";
+            chooser.lpstrTitle = L"Choose your disc image, or SLUS_209.10 in your extracted game folder";
+            chooser.lpstrFilter = L"Disc image or extracted game (SLUS_209.10)\0*.iso;*.cue;*.bin;SLUS_209.10\0All files\0*.*\0";
             chooser.lpstrFile = path; chooser.nMaxFile = 32768;
             chooser.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
             if (!GetOpenFileNameW(&chooser)) {
@@ -67,6 +66,13 @@ bool windows_prepare_disc(std::string &root, const std::string &exe_dir, bool he
             }
             image = fs::path(path).u8string();
         }
+        auto source = fs::u8path(image);
+        if (_wcsicmp(source.filename().c_str(), L"SLUS_209.10") == 0 && fs::is_regular_file(source, ec))
+            source = source.parent_path();
+        if (disc_check_folder(source.u8string(), id).ok()) {
+            root = fs::absolute(source, ec).lexically_normal().u8string();
+            return !ec;
+        }
         HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         IProgressDialog *progress = nullptr;
         if (!headless && SUCCEEDED(CoCreateInstance(CLSID_ProgressDialog,nullptr,CLSCTX_INPROC_SERVER,IID_IProgressDialog, reinterpret_cast<void **>(&progress)))) {
@@ -74,7 +80,7 @@ bool windows_prepare_disc(std::string &root, const std::string &exe_dir, bool he
             progress->SetLine(1,L"Copying game files from your disc image…",FALSE,nullptr);
             progress->StartProgressDialog(nullptr,nullptr,PROGDLG_AUTOTIME,nullptr);
         }
-        const auto result = disc_import(image, install.u8string(), id, [&](uint64_t done,uint64_t total,const std::string &) {
+        const auto result = disc_import(source.u8string(), install.u8string(), id, [&](uint64_t done,uint64_t total,const std::string &) {
             if (!progress) return true;
             progress->SetProgress64(done,total);
             return !progress->HasUserCancelled();
@@ -84,7 +90,7 @@ bool windows_prepare_disc(std::string &root, const std::string &exe_dir, bool he
         if (result.ok()) { root = install.u8string(); return true; }
         std::fprintf(stderr,"Disc install: %s\n",result.message.c_str());
         if (headless || result.status == DiscStatus::Cancelled) return false;
-        auto msg = fs::u8path(result.message + "\n\nChoose another disc image?").wstring();
+        auto msg = fs::u8path(result.message + "\n\nChoose another disc image or extracted game?").wstring();
         if (MessageBoxW(nullptr,msg.c_str(),L"Eve of Destruction",MB_RETRYCANCEL|MB_ICONWARNING) != IDRETRY) return false;
         image.clear();
     }

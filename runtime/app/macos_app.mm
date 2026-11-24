@@ -103,6 +103,7 @@ static bool activate_integrated(std::string *why, bool allow_missing, bool *load
         candidates.push_back(fs::path(resources.UTF8String) / "Mods" / "integrated");
     candidates.push_back(fs::path(mac_app_support()) / "mods" / "integrated");
     fs::path root = candidates.back();
+    candidates.push_back(fs::path(mac_app_support()) / "bundle-mods" / "integrated");
     bool missing = true;
     for (const auto &candidate : candidates) {
         std::error_code ec;
@@ -136,7 +137,9 @@ bool mac_app_select_mods(bool headless, std::string *problem) {
         fprintf(stderr, "EOD_NATIVE_ONLY=1: launching the retail game without the integrated content\n");
         return true;
     }
-    const bool allow_missing = bundle_flag(@"EODIntegratedContentOptional");
+    // An unbundled game or an older public app may have no packaging metadata.
+    // Only a build explicitly packaged with personal content requires the profile.
+    const bool allow_missing = ![[[NSBundle mainBundle] infoDictionary][@"EODIntegratedContentOptional"] isEqual:@NO];
     std::string why;
     bool loaded = false;
     if (activate_integrated(&why, allow_missing, &loaded)) {
@@ -147,6 +150,7 @@ bool mac_app_select_mods(bool headless, std::string *problem) {
         return true;
     }
     fprintf(stderr, "Integrated content: %s\n", why.c_str());
+    if (allow_missing) return true;  // The verified retail library can launch on its own.
     if (problem) {  // shown in-game by the front end (runtime/ui) instead of a Cocoa alert
         *problem = why + "\n\nEve of Destruction will not start with only part of the game. Reinstall or restore the app, "
                          "or restore the previous copy from backup.";
@@ -163,15 +167,31 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
     return mac_app_prepare(data, config, headless, id, nullptr);
 }
 
-std::string mac_app_install_disc(const std::string &source, const std::string &config, const DiscId &id) {
-    const std::string data = mac_app_support() + "/disc";
-    DiscResult r = disc_import(source, data, id);
-    if (!r.ok()) return r.message;
-    g_config.data_dir = data;
+static DiscResult select_disc(const std::string &source, std::string &data, const std::string &config,
+                              const DiscId &id, const DiscProgress &progress = {}) {
     std::error_code ec;
+    std::string selected;
+    if (disc_check_folder(source, id).ok()) {
+        selected = fs::absolute(fs::u8path(source), ec).lexically_normal().u8string();
+        if (ec) return {DiscStatus::IoError, "Could not resolve the selected disc folder."};
+    } else {
+        selected = mac_app_support() + "/disc";
+        DiscResult result = disc_import(source, selected, id, progress);
+        if (!result.ok()) return result;
+    }
+    if (selected == g_config.data_dir) { data = selected; return {}; }
     fs::create_directories(fs::path(config).parent_path(), ec);
-    if (!config_save(config)) return "Your disc is installed, but settings could not be saved. Check the folder permissions.";
-    return "";
+    Config updated = g_config;
+    updated.data_dir = selected;
+    if (!config_save(config, updated))
+        return {DiscStatus::IoError, "Could not save your disc location. Check the settings folder permissions."};
+    g_config.data_dir = data = selected;
+    return {};
+}
+
+std::string mac_app_install_disc(const std::string &source, const std::string &config, const DiscId &id) {
+    std::string selected;
+    return select_disc(source, selected, config, id).message;
 }
 
 bool mac_app_prepare(std::string &data, const std::string &config, bool headless, const DiscId &id, std::string *problem) {
@@ -187,19 +207,8 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
     if (!data.empty()) {
         // Validate before main's fatal-error path: platform_init has not yet
         // established whether SDL dialogs are allowed for this launch.
-        DiscResult r = disc_check_folder(data, id);
+        DiscResult r = select_disc(data, data, config, id);
         if (r.ok()) return true;
-        // --data and EOD_DATA accept an ISO directly, just like the first-run picker.
-        if (fs::exists(fs::u8path(data), ec)) {
-            const std::string installed = support + "/disc";
-            r = disc_import(data, installed, id);
-            if (r.ok()) {
-                data = installed;
-                g_config.data_dir = data;
-                if (!config_save(config)) fprintf(stderr, "Disc installed; settings could not be saved.\n");
-                return true;
-            }
-        }
         if (problem && !headless) { *problem = r.message; return false; }
         if (headless) fprintf(stderr, "%s\n", r.message.c_str());
         else {
@@ -239,7 +248,7 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
         cancelButton.frame = NSMakeRect(350,20,100,30); cancelButton.keyEquivalent = @"\x1b";
         [panel.contentView addSubview:cancelButton];
         [panel center]; [panel makeKeyAndOrderFront:nil];
-        DiscResult r = disc_import(picker.URL.path.UTF8String, data, id, [&](uint64_t done, uint64_t total, const std::string &file) {
+        DiscResult r = select_disc(picker.URL.path.UTF8String, data, config, id, [&](uint64_t done, uint64_t total, const std::string &file) {
             bar.doubleValue = total ? 100.0 * done / total : 0;
             label.stringValue = ns("Copying " + file); [panel displayIfNeeded];
             NSEvent *event;
@@ -249,13 +258,9 @@ bool mac_app_prepare(std::string &data, const std::string &config, bool headless
         });
         [panel orderOut:nil];
         if (r.status == DiscStatus::Cancelled) return false;
-        if (r.ok()) break;
+        if (r.ok()) return true;
         error(r.message);
     }
-    g_config.data_dir = data;
-    fs::create_directories(fs::path(config).parent_path(), ec);
-    if (!config_save(config)) error("Your disc is installed, but settings could not be saved. Check the folder permissions.");
-    return true;
 }
 
 bool mac_app_settings() {
@@ -365,7 +370,7 @@ bool mac_app_settings() {
         *scales[i] = n;
     }
     for(int i=0;i<KEY_COUNT;i++) c.keys[i]=value(key_start+i);
-    if (c.aspect!="auto" && c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="stretch") { error("Aspect must be auto (the game's Widescreen option), 4:3, 16:9 or stretch."); return false; }
+    if (c.aspect!="display" && c.aspect!="16:10" && c.aspect!="auto" && c.aspect!="4:3" && c.aspect!="16:9" && c.aspect!="stretch") { error("Aspect must be display, auto (game option), 4:3, 16:9, 16:10 or stretch."); return false; }
     if (c.renderer!="software" && c.renderer!="vulkan") { error("Renderer must be software (or vulkan in a build with Vulkan support)."); return false; }
     if (!config_save(config_path,c)) { error("Could not save settings. Check the settings folder permissions."); return false; }
     g_config=c; return true;

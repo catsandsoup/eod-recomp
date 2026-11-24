@@ -90,16 +90,18 @@ bool initialize_loader(PFN_vkGetInstanceProcAddr getProc) {
 VkInstance instance() {
     if (!g_tried) {
         g_tried = true;
+#ifndef EOD_R7_RELEASE
         // EOD_PLUME=0: the GS creates its own instance and device (diagnostic A/B).
         if (const char *v = getenv("EOD_PLUME"); v && v[0] == '0') {
             fprintf(stderr, "[vulkan] EOD_PLUME=0: the GS creates its own instance and device\n");
             return VK_NULL_HANDLE;
         }
+#endif
         plume::vulkanCreateOptions.applicationName = "TDEODRecomp";
         plume::vulkanCreateOptions.apiVersion = VK_API_VERSION_1_3;
         g_interface = plume::CreateVulkanInterface();
         if (!g_interface)
-            fprintf(stderr, "[vulkan] plume could not create an instance: the GS creates its own\n");
+            fprintf(stderr, "[vulkan] plume could not create an instance\n");
     }
     return g_interface ? static_cast<plume::VulkanInterface *>(g_interface.get())->instance : VK_NULL_HANDLE;
 }
@@ -117,17 +119,17 @@ bool create_device(VkPhysicalDevice physical, uint32_t family, const std::vector
     plume::vulkanCreateOptions.deviceCreateHook = nullptr;
     plume::vulkanCreateOptions.userData = nullptr;
     if (!created) {
-        fprintf(stderr, "[vulkan] plume could not create a device: the GS creates its own\n");
+        fprintf(stderr, "[vulkan] plume could not create a device\n");
         return false;
     }
     auto *dev = static_cast<plume::VulkanDevice *>(created.get());
     if (dev->physicalDevice != physical) {
-        fprintf(stderr, "[vulkan] plume chose another GPU (%s): the GS creates its own device\n",
+        fprintf(stderr, "[vulkan] plume chose another GPU (%s)\n",
                 dev->description.name.c_str());
         return false;
     }
     if (family >= dev->queueFamilies.size() || dev->queueFamilies[family].queues.empty()) {
-        fprintf(stderr, "[vulkan] plume made no queue in family %u: the GS creates its own device\n", family);
+        fprintf(stderr, "[vulkan] plume made no queue in family %u\n", family);
         return false;
     }
     plume::VulkanQueue &q = dev->queueFamilies[family].queues[0];

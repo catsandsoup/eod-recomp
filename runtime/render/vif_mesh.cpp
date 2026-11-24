@@ -41,6 +41,7 @@ constexpr uint32_t kEmpty = 0xE3E3E3E3u;
 constexpr uint32_t kSkinBase = 150;  // per-vertex word block (UNPACK @150)
 constexpr uint32_t kProgCar = 0x5C;      // MSCAL 0x5C -> VU1 0x2e0 (dent offsets)
 constexpr uint32_t kProgDriver = 0x63;   // MSCAL 0x63 -> VU1 0x318 (bone matrices)
+constexpr uint32_t kProgFacing = 0x6A;   // MSCAL 0x6A -> VU1 0x350 (camera-facing corner offsets)
 constexpr uint32_t kProgShadow = 4;      // MSCAL 4 -> VU1 0x20 (shadow source, 2-qword stride)
 
 inline uint32_t rd32(const uint8_t *p) {
@@ -268,8 +269,10 @@ struct BatchEmitter {
         auto same = [&](uint32_t x, uint32_t y) {
             return P[3 * x] == P[3 * y] && P[3 * x + 1] == P[3 * y + 1] && P[3 * x + 2] == P[3 * y + 2];
         };
+        const bool keep_bind_duplicates = (shadow && opt.keep_shadow_extrusion_faces) ||
+                                          (program == kProgFacing && opt.keep_camera_facing_faces);
         auto push = [&](uint32_t a, uint32_t bb, uint32_t c) {
-            if (opt.drop_degenerate && !(shadow && opt.keep_shadow_extrusion_faces) &&
+            if (opt.drop_degenerate && !keep_bind_duplicates &&
                 (same(a, bb) || same(bb, c) || same(a, c))) return;
             out.indices.push_back(a + base);
             out.indices.push_back(bb + base);

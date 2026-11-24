@@ -23,7 +23,7 @@ bool matches(const uint8_t *pixel, int r, int g, int b) {
     return std::abs(pixel[0] - r) <= 1 && std::abs(pixel[1] - g) <= 1 && std::abs(pixel[2] - b) <= 1;
 }
 
-enum class Draw { Classic, ModernFog, ModernTexture };
+enum class Draw { Classic, ModernFog, ModernTexture, ModernZeroAlpha };
 
 bool render(RenderDevice &dev, PipelineCache &scene, Draw draw) {
     const bool modern = draw != Draw::Classic;
@@ -46,10 +46,15 @@ bool render(RenderDevice &dev, PipelineCache &scene, Draw draw) {
         {{  0.f,  .8f, .5f}, {.5f, 1}, {}, {180, 85, 45, 128}},
     };
     static const uint32_t indices[] = {0, 1, 2};
+    // Modern draws exercise a slice after an empty region of the upload page.
+    const uint64_t vertex_offset = modern ? 256 : 0;
+    const uint64_t index_offset = vertex_offset + sizeof vertices;
     auto mesh = dev.createBuffer(RenderBufferDesc::UploadBuffer(
-        sizeof vertices + sizeof indices, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX));
+        index_offset + sizeof indices, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX));
     auto environment = dev.createBuffer(RenderBufferDesc::UploadBuffer(8 * sizeof(float), RenderBufferFlag::CONSTANT));
-    auto *pipeline = scene.pipeline((0xFu << 8) | (modern ? K_MODERN : 0u));
+    uint32_t key = (0xFu << 8) | (modern ? K_MODERN : 0u);
+    if (draw == Draw::ModernZeroAlpha) key |= K_GENERIC | (2u << 16) | (3u << 18);
+    auto *pipeline = scene.pipeline(key);
     if (!list || !fence || !color || !texture || !sampler || !texture_set || !environment_set ||
         !staging || !readback || !mesh || !environment || !pipeline) return false;
     const RenderTexture *attachments[] = {color.get()};
@@ -58,8 +63,9 @@ bool render(RenderDevice &dev, PipelineCache &scene, Draw draw) {
 
     auto *mesh_bytes = static_cast<uint8_t *>(mesh->map());
     if (!mesh_bytes) return false;
-    std::memcpy(mesh_bytes, vertices, sizeof vertices);
-    std::memcpy(mesh_bytes + sizeof vertices, indices, sizeof indices);
+    std::memset(mesh_bytes, 0, vertex_offset);
+    std::memcpy(mesh_bytes + vertex_offset, vertices, sizeof vertices);
+    std::memcpy(mesh_bytes + index_offset, indices, sizeof indices);
     mesh->unmap();
     auto *pixels = static_cast<uint8_t *>(staging->map());
     if (!pixels) return false;
@@ -87,7 +93,7 @@ bool render(RenderDevice &dev, PipelineCache &scene, Draw draw) {
     list->setFramebuffer(framebuffer.get());
     list->setViewports(RenderViewport(0, 0, width, height));
     list->setScissors(RenderRect(0, 0, width, height));
-    list->clearColor(0, RenderColor(0, 0, 0, 1));
+    list->clearColor(0, RenderColor(0, 0, draw == Draw::ModernZeroAlpha ? 1 : 0, 1));
     list->setGraphicsPipelineLayout(scene.layout());
     list->setPipeline(pipeline);
     list->setGraphicsDescriptorSet(texture_set.get(), 0);
@@ -96,13 +102,17 @@ bool render(RenderDevice &dev, PipelineCache &scene, Draw draw) {
     push.cx[0] = push.cy[1] = push.cz[2] = push.cw[3] = 1;
     push.cw[2] = 1;  // model-space eye z = -1, fog saturates at a distance of 1
     push.ambient[3] = 128;
+    if (draw == Draw::ModernZeroAlpha) {
+        push.ambient[3] = 0;
+        push.mode[0] = 0x4000u;
+    }
     if (draw == Draw::ModernFog) push.mode[2] = 1u << 31;  // Modern authored fog
     if (draw == Draw::ModernTexture) {
         push.mode[0] = 1u | (1u << 2);  // texture decal
         push.mode[2] = 1u << 27;        // unlit
     }
     list->setGraphicsPushConstants(0, &push, 0, sizeof push);
-    bind_indexed_mesh(*list, *mesh, sizeof vertices, sizeof vertices, sizeof indices);
+    bind_indexed_mesh(*list, *mesh, sizeof vertices, index_offset, sizeof indices, vertex_offset);
     list->drawIndexedInstanced(3, 1, 0, 0, 0);
     list->setFramebuffer(nullptr);
     list->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(color.get(), RenderTextureLayout::COPY_SOURCE));
@@ -123,10 +133,12 @@ bool render(RenderDevice &dev, PipelineCache &scene, Draw draw) {
         drawn = matches(pixel(24, 24), 255, 0, 0) && matches(pixel(40, 24), 0, 255, 0) &&
                 matches(pixel(29, 38), 0, 0, 255) && matches(pixel(34, 38), 255, 255, 0);
         if (!drawn) std::fprintf(stderr, "Modern decal did not sample the four UV quadrants\n");
+    } else if (draw == Draw::ModernZeroAlpha) {
+        drawn = matches(middle, 0, 0, 255) && middle[3] == 0 && bytes[3] == 255;
     } else {
         drawn = modern ? matches(middle, 0, 255, 0) : matches(middle, 180, 85, 45);
     }
-    const bool valid = drawn && matches(bytes, 0, 0, 0);
+    const bool valid = drawn && matches(bytes, 0, 0, draw == Draw::ModernZeroAlpha ? 255 : 0);
     readback->unmap();
     return valid;
 }
@@ -150,7 +162,8 @@ int main() {
     }
     native::scene::PipelineCache scene;
     if (!scene.initialize(*dev) || !render(*dev, scene, Draw::Classic) ||
-        !render(*dev, scene, Draw::ModernFog) || !render(*dev, scene, Draw::ModernTexture)) {
+        !render(*dev, scene, Draw::ModernFog) || !render(*dev, scene, Draw::ModernTexture) ||
+        !render(*dev, scene, Draw::ModernZeroAlpha)) {
         std::fprintf(stderr, "Shared Plume scene draw failed\n");
         return 1;
     }

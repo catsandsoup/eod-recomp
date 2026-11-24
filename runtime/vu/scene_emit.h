@@ -19,11 +19,17 @@ struct VUState;
 
 namespace scene_emit {
 
+#ifdef EOD_R7_RELEASE
+inline constexpr bool g_on = false;
+inline constexpr bool capture_requested() { return false; }
+inline constexpr bool observing_vu() { return false; }
+#else
 extern bool g_on;
 bool capture_requested();
 
 // Producer side (the thread that runs VU1 and queues GS commands).
 bool observing_vu();
+#endif
 // true: the modern renderer redraws this run's batch from cached results, so the program is not
 // run and its GS packet not built (EOD_MODERN_SKIPVU=0 disables)
 bool vu1_start(const VUState *vu, uint32_t pc);

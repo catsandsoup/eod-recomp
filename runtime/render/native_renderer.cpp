@@ -3,6 +3,7 @@
 #include "../core/r7_audit.h"
 #include "../core/frame_pacing.h"
 #include "core/diff_harness.h"
+#include "core/config.h"
 #include "core/eod_tracy.h"
 #include "core/log.h"
 #include "core/trace.h"
@@ -69,13 +70,16 @@ std::atomic<uint64_t> g_blend_ad{0};      // ALPHA.C = Ad draws (DST_ALPHA facto
 // ---- per EE frame counters (the frame a record was queued in) ----
 struct FrameStats {
     uint32_t objects = 0;     // records the GS was told about (OBJ)
-    uint32_t drawn = 0;       // drawn by plume
-    uint32_t empty = 0;       // drawn, but the batch decoded to no triangles
+    uint32_t drawn = 0;       // accounted native records, including proven empty and frustum-rejected records
+    uint32_t empty = 0;       // empty geometry or an alpha test that rejects the entire batch
+    uint32_t culled = 0;      // records outside the current view
+    uint32_t recorded = 0;    // records for which Plume recorded geometry
     uint32_t skipped = 0;     // frame skipped by the GS (FrameSkip): nothing drawn, as the GS
     uint32_t lost = 0;        // not drawn: no mesh, no surface or no renderer
     uint32_t textured = 0, untextured_rt = 0, skinned = 0, posed = 0, flushes = 0, mipmapped = 0;
     uint64_t suppressed = 0;  // GS primitives not drawn because they were a native object's
     // by Packet::kind (queue, world, water, shadow, flare)
+    std::vector<bool> received;  // EE serials observed on the ordered stream, for shutdown reconciliation
     uint32_t k_objects[KIND_COUNT] = {}, k_drawn[KIND_COUNT] = {}, k_skipped[KIND_COUNT] = {}, k_lost[KIND_COUNT] = {};
 };
 std::map<uint64_t, FrameStats> g_frames;
@@ -109,6 +113,14 @@ struct DropStat {
 };
 std::map<DropKey, DropStat> g_drops;
 void note_drop(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const gs::Vertex *c) {
+#ifdef EOD_R7_RELEASE
+    fatal("R7 unowned draw near scene frame %llu: prim=%x fb=%x texture=%x scissor=%d,%d..%d,%d "
+          "vertices=%d,%d %d,%d %d,%d rgba=%u,%u,%u,%u ztest=%d zmask=%d fbmask=%08x",
+          (unsigned long long)g_newest_frame, (unsigned)(gs::st.prim & 7), e.fbp,
+          e.tme ? e.tbp : ~0u, e.scx0, e.scy0, e.scx1, e.scy1, v.x, v.y,
+          b ? b->x : 0, b ? b->y : 0, c ? c->x : 0, c ? c->y : 0,
+          v.r, v.g, v.b, v.a, e.ztst, e.zmsk, e.fbmsk);
+#else
     DropStat &d = g_drops[{(uint32_t)e.fbp, e.tme ? (uint32_t)e.tbp : 0xFFFFFFFFu, b ? (c ? 3u : 2u) : 1u}];
     d.prims++;
     for (const gs::Vertex *p : {&v, b, c}) {
@@ -117,6 +129,7 @@ void note_drop(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const
         d.box[0] = std::min(d.box[0], x), d.box[1] = std::min(d.box[1], y);
         d.box[2] = std::max(d.box[2], x), d.box[3] = std::max(d.box[3], y);
     }
+#endif
 }
 void report_drops(uint64_t frame) {
     for (auto &[k, d] : g_drops)
@@ -169,10 +182,11 @@ uint64_t context_xyoffset() {
 #include "material_table.inc"
 using namespace scene;
 #include "native_sun_cascades_spv.inc"
+#include "native_modern_spv.inc"
 
 constexpr uint32_t kAuthoredEnvironment = 1u << 31; // Modern mode.z, above the material class
 enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
-                  M_CFIX = 0x200, M_SPEC = 0x400, M_FGE = 0x800,
+                  M_CFIX = 0x200, M_SPEC = 0x400, M_FGE = 0x800, M_DISCARD_ZERO_A = 0x8000u, M_STORE_ZERO_A = 0x4000u,
                   // stage R5 A2: GS texture addressing (TEX0 size, TEX1, CLAMP) and the AFAIL second pass
                   M_TW_SHIFT = 12, M_TH_SHIFT = 16, M_MXL_SHIFT = 20, M_MMAG = 1u << 23, M_MMIN_SHIFT = 24,
                   M_WMS_SHIFT = 27, M_WMT_SHIFT = 29, M_FAILED = 1u << 31 };
@@ -183,8 +197,9 @@ enum : uint32_t { Z_K_SHIFT = 16, Z_L_SHIFT = 28, Z_LCM = 1u << 30 };
 enum : uint32_t { S_ON = 1u << 31, S_COMPOSITE = 1u << 30 };
 
 struct GpuMesh {
-    std::unique_ptr<Mesh> cpu;
-    std::unique_ptr<plume::RenderBuffer> buf;  // vertices, indices, optional billboard instances
+    std::shared_ptr<Mesh> cpu;
+    std::shared_ptr<plume::RenderBuffer> buf;  // vertices, indices, optional billboard instances
+    uint64_t vertex_offset = 0;
     uint64_t index_offset = 0;
     uint64_t billboard_offset = 0;
     sun_cascades::Bounds sun_bounds;
@@ -207,6 +222,7 @@ struct Texture {
     uint64_t replacement_id = 0;
     int32_t mat = -1;                 // material record (stage R6), -1: none
     uint32_t sky_top = 0, sky_hor = 0;  // a sky texture's mean upper / lower colour (RGBA8)
+    uint8_t alpha_min = 0, alpha_max = 255;  // exact decoded texel alpha bounds across all mips
 };
 struct PreparedWorldStrip {
     Texture *texture = nullptr;
@@ -288,7 +304,7 @@ struct SceneView {
     std::array<std::unique_ptr<SceneSnapshot>, size_t(SceneStage::Count)> inputs;
 };
 
-// Destroyed some vblanks later, when the GPU no longer reads them.
+// Retained until the submission using these objects has finished on the GPU.
 struct Trash {
     uint64_t vb;
     std::unique_ptr<plume::RenderBuffer> buf;
@@ -302,7 +318,7 @@ struct SunCaster {
     float model[12];
     sun_cascades::Bounds bounds;
     const plume::RenderBuffer *buffer;
-    uint64_t index_offset;
+    uint64_t vertex_offset, index_offset;
     uint32_t vertex_bytes, index_count, kind;
 };
 
@@ -336,6 +352,20 @@ struct SunMaps {
     uint64_t scene_binds = 0, composites = 0, armed = 0, resolved = 0;
 };
 
+struct ModernFastShaders {
+    std::unique_ptr<plume::RenderShader> vs_modern;
+    std::unique_ptr<plume::RenderShader> ps_opaque;
+    std::unique_ptr<plume::RenderShader> ps_scene_opaque;
+    std::unique_ptr<plume::RenderShader> ps_water_opaque;
+    std::unique_ptr<plume::RenderShader> ps_unlit_opaque;
+    std::unique_ptr<plume::RenderShader> ps_pbr_ate;
+    std::unique_ptr<plume::RenderShader> ps_scene_ate;
+    std::unique_ptr<plume::RenderShader> ps_unlit_ate;
+    std::unique_ptr<plume::RenderShader> ps_depth_only;
+    std::unordered_map<uint64_t, std::unique_ptr<plume::RenderPipeline>> pipelines;
+    bool ready = false;
+};
+
 struct Renderer {
     bool tried = false;
     std::atomic<bool> ok{false};
@@ -343,12 +373,16 @@ struct Renderer {
     std::unique_ptr<plume::RenderCommandQueue> queue;
     std::unique_ptr<plume::RenderCommandList> list;
     PipelineCache scene;
+    ModernFastShaders modern_fast;
     bool static_queue_projection = false;
     std::unique_ptr<plume::RenderBuffer> environment_buffer;
     std::unique_ptr<plume::RenderDescriptorSet> environment_set;
     std::unique_ptr<plume::RenderSampler> samplers[16];
     Texture white;
     std::unordered_map<uint32_t, std::shared_ptr<GpuMesh>> meshes;
+    std::shared_ptr<plume::RenderBuffer> transient_upload;
+    uint64_t transient_upload_used = 0;
+    uint64_t transient_upload_meshes = 0, transient_upload_pages = 0;
     struct WorldChunkVboKey {
         uint64_t track_gen = 0;
         uint64_t chunk_key = 0;
@@ -382,6 +416,8 @@ struct Renderer {
     std::unordered_map<uint64_t, std::unique_ptr<plume::RenderTexture>> wrappers;
     std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
     std::deque<Trash> trash;
+    std::deque<std::pair<uint64_t, uint64_t>> submission_vblanks; // last vblank recorded per submission
+    uint64_t first_uncompleted_vblank = 0;
     std::deque<std::pair<uint64_t, std::shared_ptr<GpuMesh>>> retired_meshes;
     uint64_t vb = 0;
     std::vector<Item> pending;
@@ -393,7 +429,7 @@ struct Renderer {
     SunView sun_view;
     SunMaps sun_maps;
     bool hybrid_shadow_prepared = false;
-    int split_shadow_prepared_y = -1;
+    int split_shadow_view = -1;
     Target main_target{};
     bool has_main_target = false;
     uint64_t main_xy = 0;
@@ -432,7 +468,6 @@ struct MatKey {
 std::vector<Material> g_mats;
 std::unordered_map<uint64_t, std::vector<std::pair<MatKey, int32_t>>> g_mat_by_ik;
 size_t g_mat_records = 0, g_mat_bound = 0;
-std::atomic<bool> g_modern{false};
 std::atomic<uint32_t> g_look_toggles{0};
 // statistics: draws drawn in each look, draws with a material, Modern draws whose texture has a
 // low-confidence record (the 318 needs_human records)
@@ -480,6 +515,11 @@ struct GpuTimer {
     // Per-look GPU timing accumulators (0 = Classic, 1 = Modern)
     double sum_ms[2] = {}, max_ms[2] = {}, shadow_ms[2] = {};
     uint64_t frames[2] = {}, draws[2] = {};
+    // Per-span breakdown (EOD_GPU_PROF=1)
+    double span_sum_ms[8] = {};
+    uint64_t span_cnt[8] = {};
+    uint64_t mf_draws[10] = {};
+    uint64_t afail_spec = 0, afail_mixed = 0, afail_other = 0;
 };
 GpuTimer g_gpu;
 
@@ -523,6 +563,10 @@ void gpu_timer_collect_slot(GpuTimer::Slot &s, bool wait) {
             const double dt = (double)(ts[q0 + 1] - ts[q0]) * g_gpu.ts_period;
             if (is_sh) sh_ns += dt;
             else main_ns += dt;
+            if (i < 8) {
+                g_gpu.span_sum_ms[i] += dt / 1e6;
+                g_gpu.span_cnt[i]++;
+            }
         }
     }
     const double total_ms = (main_ns + sh_ns) / 1e6;
@@ -667,18 +711,16 @@ void load_materials() {
     for (auto &kv : g_mat_by_ik)
         for (auto &q : kv.second) bound.insert(q.second);
     g_mat_bound = bound.size();
-    const char *look = std::getenv("EOD_LOOK");
-    if (look && (look[0] == 'm' || look[0] == 'M')) g_modern = true;
     std::fprintf(stderr, "[r6] material records loaded: %zu (%zu with a runtime texture key); look %s\n", g_mat_records,
-                 g_mat_bound, g_modern ? "Modern" : "Classic");
+                 g_mat_bound, g_config.plume_modern ? "Modern" : "Classic");
 }
 
 // Read the original identity once for both material tags and HOSTTEX lookup.
 template<class ReadIndex>
-MatKey indexed_texture_key(const gs::Env &e, const uint32_t *palette, ReadIndex read_index) {
+MatKey indexed_texture_key(const gs::Env &e, const uint32_t *palette, ReadIndex read_index,
+                           std::vector<uint8_t> &plane) {
     const bool eight = e.tpsm == gs::PSMT8 || e.tpsm == gs::PSMT8H;
     g_textures_indexed++;
-    static std::vector<uint8_t> plane;
     plane.resize((size_t)e.tw * e.th);
     for (uint32_t y = 0; y < e.th; y++)
         for (uint32_t x = 0; x < e.tw; x++)
@@ -698,6 +740,138 @@ int32_t material_of(const MatKey &key) {
     }
     if (any >= 0) g_pk_fallback++;
     return any;
+}
+
+bool ensure_sun_maps();
+
+enum ModernFastVariant : uint32_t {
+    MF_NONE = 0,
+    MF_OPAQUE = 1,
+    MF_SCENE_OPAQUE = 2,
+    MF_WATER_OPAQUE = 3,
+    MF_UNLIT_OPAQUE = 4,
+    MF_PBR_ATE = 5,
+    MF_SCENE_ATE = 6,
+    MF_UNLIT_ATE = 7,
+    MF_DEPTH_ONLY = 8,
+};
+
+// Specialize only textured, non-emissive PBR draws. The few class/height/metal
+// combinations are shared across all texture identities and roughness values.
+uint32_t lit_material_key(uint32_t variant, const PushConstants &pc) {
+    if (variant != MF_OPAQUE && variant != MF_PBR_ATE &&
+        variant != MF_SCENE_OPAQUE && variant != MF_SCENE_ATE)
+        return 0;
+    const uint32_t mz = pc.mode[2], cls = (mz >> 27) & 15u;
+    if (!(pc.mode[0] & M_TME) || (mz & (1u << 24)) || cls == C_UNLIT || cls >= C_VFX_FIRE)
+        return 0;
+    return 1 + (cls | ((mz >> 25) & 1u) << 4 | uint32_t(((mz >> 16) & 15u) != 0) << 5);
+}
+
+uint64_t modern_pipeline_id(uint32_t key, uint32_t variant, uint32_t material) {
+    return uint64_t(material) << 40 | uint64_t(variant) << 32 | key;
+}
+
+plume::RenderPipeline *modern_fast_pipeline(uint32_t key, uint32_t variant, uint32_t material) {
+    if (!g_r.modern_fast.ready || variant == MF_NONE) return nullptr;
+    const uint64_t map_key = modern_pipeline_id(key, variant, material);
+    auto &slot = g_r.modern_fast.pipelines[map_key];
+    if (slot) return slot.get();
+    plume::RenderShader *ps = nullptr;
+    switch (variant) {
+    case MF_OPAQUE: ps = g_r.modern_fast.ps_opaque.get(); break;
+    case MF_SCENE_OPAQUE: ps = g_r.modern_fast.ps_scene_opaque.get(); break;
+    case MF_WATER_OPAQUE: ps = g_r.modern_fast.ps_water_opaque.get(); break;
+    case MF_UNLIT_OPAQUE: ps = g_r.modern_fast.ps_unlit_opaque.get(); break;
+    case MF_PBR_ATE: ps = g_r.modern_fast.ps_pbr_ate.get(); break;
+    case MF_SCENE_ATE: ps = g_r.modern_fast.ps_scene_ate.get(); break;
+    case MF_UNLIT_ATE: ps = g_r.modern_fast.ps_unlit_ate.get(); break;
+    case MF_DEPTH_ONLY: ps = g_r.modern_fast.ps_depth_only.get(); break;
+    default: return nullptr;
+    }
+    const uint32_t blend = key & 15, zfunc = (key >> 4) & 3, mask = (key >> 8) & 15;
+    const uint32_t cull = (key >> 12) & 3;
+    const bool zwrite = (key >> 6) & 1, depth = (key >> 7) & 1, blend_alpha = (key >> 14) & 1;
+    const plume::RenderInputSlot in(0, sizeof(Vertex));
+    const plume::RenderInputElement el[] = {
+        plume::RenderInputElement("POSITION", 0, 0, plume::RenderFormat::R32G32B32_FLOAT, 0, 0),
+        plume::RenderInputElement("TEXCOORD", 0, 1, plume::RenderFormat::R32G32_FLOAT, 0, 12),
+        plume::RenderInputElement("NORMAL", 0, 2, plume::RenderFormat::R8G8B8A8_SINT, 0, 20),
+        plume::RenderInputElement("COLOR", 0, 3, plume::RenderFormat::R8G8B8A8_UNORM, 0, 24)};
+    plume::RenderGraphicsPipelineDesc d;
+    d.pipelineLayout = g_r.scene.layout();
+    d.vertexShader = g_r.modern_fast.vs_modern.get();
+    d.pixelShader = ps;
+    const plume::RenderSpecConstant material_constant(0, material - 1);
+    if (material) {
+        d.specConstants = &material_constant;
+        d.specConstantsCount = 1;
+    }
+    d.inputSlots = &in;
+    d.inputSlotsCount = 1;
+    d.inputElements = el;
+    d.inputElementsCount = 4;
+    d.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    d.cullMode = cull == 1 ? plume::RenderCullMode::BACK : cull == 2 ? plume::RenderCullMode::FRONT : plume::RenderCullMode::NONE;
+    d.depthClipEnabled = (key & K_NOCLIP) == 0;
+    d.renderTargetCount = 1;
+    d.renderTargetFormat[0] = plume::RenderFormat::R8G8B8A8_UNORM;
+    if (depth) {
+        d.depthTargetFormat = plume::RenderFormat::D32_FLOAT;
+        d.depthEnabled = true;
+        d.depthWriteEnabled = zwrite;
+        d.depthFunction = zfunc == 0   ? plume::RenderComparisonFunction::ALWAYS
+                          : zfunc == 1 ? plume::RenderComparisonFunction::GREATER_EQUAL
+                          : zfunc == 2 ? plume::RenderComparisonFunction::GREATER
+                                       : plume::RenderComparisonFunction::NEVER;
+    }
+    using B = plume::RenderBlend;
+    using O = plume::RenderBlendOperation;
+    plume::RenderBlendDesc &b = d.renderTargetBlend[0];
+    b.blendEnabled = blend != B_OPAQUE;
+    b.blendOp = (blend == B_REVSUB || blend == B_SHADOW) ? O::REV_SUBTRACT : O::ADD;
+    if (key & K_GENERIC) {
+        const bool cd = (key & K_CDST) != 0;
+        auto factor = [&](uint32_t f) {
+            switch (f & 3) {
+            case 0: return B::ZERO;
+            case 1: return B::ONE;
+            case 2: return cd ? B::DEST_ALPHA : B::SRC1_ALPHA;
+            default: return cd ? B::INV_DEST_ALPHA : B::INV_SRC1_ALPHA;
+            }
+        };
+        const uint32_t sf = (key >> 16) & 3, df = (key >> 18) & 3, op = (key >> 20) & 3;
+        b.blendEnabled = !(sf == 1 && df == 0 && op == 0);
+        b.srcBlend = factor(sf);
+        b.dstBlend = factor(df);
+        b.blendOp = op == 1 ? O::SUBTRACT : op == 2 ? O::REV_SUBTRACT : O::ADD;
+    } else {
+        switch (blend) {
+        case B_MIX: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::INV_SRC1_ALPHA; break;
+        case B_ADD: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
+        case B_REVSUB: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ONE; break;
+        case B_SCALE: b.srcBlend = B::SRC1_ALPHA, b.dstBlend = B::ZERO; break;
+        case B_DST_ADD: b.srcBlend = B::ONE, b.dstBlend = B::SRC1_ALPHA; break;
+        case B_INV_MIX: b.srcBlend = B::INV_SRC1_ALPHA, b.dstBlend = B::SRC1_ALPHA; break;
+        case B_KEEP: b.srcBlend = B::ZERO, b.dstBlend = B::ONE; break;
+        case B_SHADOW: b.srcBlend = B::ONE, b.dstBlend = B::INV_SRC1_ALPHA; break;
+        default: b.srcBlend = B::ONE, b.dstBlend = B::ZERO; break;
+        }
+    }
+    if (blend_alpha) {
+        b.srcBlendAlpha = B::ONE;
+        b.dstBlendAlpha = B::ONE;
+        b.blendOpAlpha = b.blendOp;
+    } else {
+        b.srcBlendAlpha = B::ONE;
+        b.dstBlendAlpha = B::ZERO;
+        b.blendOpAlpha = O::ADD;
+    }
+    if (key & K_STRAIGHT_ALPHA) b = plume::RenderBlendDesc::AlphaBlend();
+    b.renderTargetWriteMask = (uint8_t)mask;
+    slot = g_r.dev->createGraphicsPipeline(d);
+    if (slot && !static_cast<plume::VulkanGraphicsPipeline *>(slot.get())->vk) slot.reset();
+    return slot.get();
 }
 
 bool init() {
@@ -750,8 +924,12 @@ bool init() {
     std::memcpy(mapped, environment, sizeof environment);
     g_r.environment_buffer->unmap();
     g_r.environment_set->setBuffer(0, g_r.environment_buffer.get(), sizeof environment);
-    // the Modern look's samplers (8..15): trilinear, anisotropic, every level the texture holds;
-    // bit 1 / 2 the GS CLAMP.WMS / WMT (clamp, else repeat)
+    // the Modern look's samplers (8..15): trilinear, 16x anisotropic (clamped to device limit),
+    // every level the texture holds; bit 1 / 2 the GS CLAMP.WMS / WMT (clamp, else repeat)
+    const char *aniso_env = std::getenv("EOD_MODERN_ANISO");
+    const uint32_t want_aniso = (aniso_env && *aniso_env) ? std::clamp<uint32_t>((uint32_t)std::atoi(aniso_env), 1u, 16u) : 16u;
+    const uint32_t max_aniso = std::clamp<uint32_t>(
+        (uint32_t)std::floor(gpu_properties.properties.limits.maxSamplerAnisotropy), 1u, want_aniso);
     for (uint32_t i = 8; i < 16; i++) {
         plume::RenderSamplerDesc s;
         s.minFilter = s.magFilter = plume::RenderFilter::LINEAR;
@@ -759,11 +937,25 @@ bool init() {
         s.addressU = (i & 2) ? plume::RenderTextureAddressMode::CLAMP : plume::RenderTextureAddressMode::WRAP;
         s.addressV = (i & 4) ? plume::RenderTextureAddressMode::CLAMP : plume::RenderTextureAddressMode::WRAP;
         s.addressW = plume::RenderTextureAddressMode::CLAMP;
-        s.anisotropyEnabled = true;
-        s.maxAnisotropy = 8;
+        s.anisotropyEnabled = max_aniso > 1u;
+        s.maxAnisotropy = max_aniso;
         g_r.samplers[i] = dev->createSampler(s);
     }
     load_materials();
+    g_r.modern_fast.vs_modern = dev->createShader(k_native_vs_modern, sizeof k_native_vs_modern, "vs_modern", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_opaque = dev->createShader(k_native_ps_modern_opaque, sizeof k_native_ps_modern_opaque, "ps_modern_opaque", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_scene_opaque = dev->createShader(k_native_ps_modern_scene_opaque, sizeof k_native_ps_modern_scene_opaque, "ps_modern_scene_opaque", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_water_opaque = dev->createShader(k_native_ps_modern_water_opaque, sizeof k_native_ps_modern_water_opaque, "ps_modern_water_opaque", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_unlit_opaque = dev->createShader(k_native_ps_modern_unlit_opaque, sizeof k_native_ps_modern_unlit_opaque, "ps_modern_unlit_opaque", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_pbr_ate = dev->createShader(k_native_ps_modern_pbr_ate, sizeof k_native_ps_modern_pbr_ate, "ps_modern_pbr_ate", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_scene_ate = dev->createShader(k_native_ps_modern_scene_ate, sizeof k_native_ps_modern_scene_ate, "ps_modern_scene_ate", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_unlit_ate = dev->createShader(k_native_ps_modern_unlit_ate, sizeof k_native_ps_modern_unlit_ate, "ps_modern_unlit_ate", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ps_depth_only = dev->createShader(k_native_ps_modern_depth_only, sizeof k_native_ps_modern_depth_only, "ps_modern_depth_only", plume::RenderShaderFormat::SPIRV);
+    g_r.modern_fast.ready = g_r.modern_fast.vs_modern && g_r.modern_fast.ps_opaque &&
+                            g_r.modern_fast.ps_scene_opaque && g_r.modern_fast.ps_water_opaque &&
+                            g_r.modern_fast.ps_unlit_opaque && g_r.modern_fast.ps_pbr_ate &&
+                            g_r.modern_fast.ps_scene_ate && g_r.modern_fast.ps_unlit_ate &&
+                            g_r.modern_fast.ps_depth_only;
     for (uint32_t i = 0; i < 8; i++) {
         plume::RenderSamplerDesc s;
         s.minFilter = s.magFilter = (i & 1) ? plume::RenderFilter::LINEAR : plume::RenderFilter::NEAREST;
@@ -1032,8 +1224,12 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     const gs::hosttex::Entry *replacement = nullptr;
     const bool candidate = store && store->has_dims(e.tw, e.th);
     int found = -1;
-    if (indexed && (!g_mats.empty() || candidate)) {
-        const MatKey id = indexed_texture_key(e, palette, read_index);
+    // Texture creation is confined to the GS thread. Reuse the exact index
+    // plane hashed for material/host replacement lookup when expanding mip 0.
+    static std::vector<uint8_t> base_indices;
+    const bool have_indices = indexed && (!g_mats.empty() || candidate);
+    if (have_indices) {
+        const MatKey id = indexed_texture_key(e, palette, read_index, base_indices);
         t.mat = material_of(id);
         if (candidate) {
             std::string why;
@@ -1104,10 +1300,19 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         } else {
             for (uint32_t v = 0; v < lh; v++) {
                 auto *line = reinterpret_cast<uint32_t *>(level + (size_t)v * row);
-                for (uint32_t u = 0; u < lw; u++) line[u] = texel(u, v, l);
+                for (uint32_t u = 0; u < lw; u++) {
+                    const uint32_t c = (l == 0 && have_indices) ? palette[base_indices[size_t(v) * lw + u]]
+                                                                : texel(u, v, l);
+                    line[u] = c;
+                    const uint32_t a8 = c >> 24;
+                    if (a8 < alpha_lo) alpha_lo = a8;
+                    if (a8 > alpha_hi) alpha_hi = a8;
+                }
             }
         }
     }
+    t.alpha_min = (uint8_t)std::min(alpha_lo, 255u);
+    t.alpha_max = (uint8_t)std::min(alpha_hi, 255u);
     // stage R6: the material record, and a sky texture's upper / lower mean colour (the Modern IBL)
     if (t.mat >= 0) g_textures_material++;
     if (t.mat >= 0 && g_mats[(size_t)t.mat].surface == "sky") {
@@ -1216,6 +1421,42 @@ void record_uploads(plume::RenderCommandList *cl) {
     g_r.uploads.clear();
 }
 
+// Append-only pages keep one-draw meshes from creating one Vulkan/Metal buffer each.
+// Every mesh pins its own page until the existing GPU retirement queue releases it.
+std::shared_ptr<plume::RenderBuffer> new_mesh_buffer(uint64_t bytes) {
+    auto buffer = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+        bytes, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
+    if (!buffer || !static_cast<plume::VulkanBuffer *>(buffer.get())->vk) return {};
+    return buffer;
+}
+
+uint8_t *map_mesh_upload(GpuMesh &mesh, uint64_t bytes) {
+    constexpr uint64_t page_size = 1024 * 1024;
+    if (mesh.cpu->transient && bytes <= page_size) {
+        // Padding keeps writes and flushes in a different non-coherent atom from earlier draws.
+        const uint64_t alignment = std::max<uint64_t>(16, g_r.dev->physicalDeviceProperties.limits.nonCoherentAtomSize);
+        uint64_t offset = (g_r.transient_upload_used + alignment - 1) & ~(alignment - 1);
+        if (!g_r.transient_upload || offset + bytes > page_size) {
+            g_r.transient_upload = new_mesh_buffer(page_size);
+            g_r.transient_upload_used = offset = 0;
+            if (g_r.transient_upload) ++g_r.transient_upload_pages;
+        }
+        if (g_r.transient_upload) {
+            auto *mapped = static_cast<uint8_t *>(g_r.transient_upload->map());
+            if (mapped) {
+                mesh.buf = g_r.transient_upload;
+                mesh.vertex_offset = offset;
+                g_r.transient_upload_used = offset + bytes;
+                ++g_r.transient_upload_meshes;
+                return mapped + offset;
+            }
+        }
+    }
+    mesh.vertex_offset = 0;
+    mesh.buf = new_mesh_buffer(bytes);
+    return mesh.buf ? static_cast<uint8_t *>(mesh.buf->map()) : nullptr;
+}
+
 GpuMesh *gpu_mesh(uint32_t id) {
     auto it = g_r.meshes.find(id);
     if (it == g_r.meshes.end()) return nullptr;
@@ -1230,15 +1471,11 @@ GpuMesh *gpu_mesh(uint32_t id) {
             m.billboard_offset = (index_end + 15) & ~15ull;
             size = m.billboard_offset + billboards.size() * sizeof(EffectBillboard);
         }
-        const auto map_upload = [&](uint64_t bytes) -> uint8_t * {
-            m.buf = g_r.dev->createBuffer(plume::RenderBufferDesc::UploadBuffer(
-                bytes, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
-            return m.buf ? static_cast<uint8_t *>(m.buf->map()) : nullptr;
-        };
-        auto *p = map_upload(size);
+        auto *p = map_mesh_upload(m, size);
         if (!p && m.billboard_offset) {
             m.billboard_offset = 0;
-            p = map_upload(index_end);
+            size = index_end;
+            p = map_mesh_upload(m, size);
         }
         if (!p) {
             m.buf.reset();
@@ -1249,8 +1486,12 @@ GpuMesh *gpu_mesh(uint32_t id) {
         std::memcpy(p + m.index_offset, m.cpu->indices.data(), m.cpu->indices.size() * 4);
         if (m.billboard_offset)
             std::memcpy(p + m.billboard_offset, billboards.data(), billboards.size() * sizeof(EffectBillboard));
+        auto *buffer = static_cast<plume::VulkanBuffer *>(m.buf.get());
+        vmaFlushAllocation(g_r.dev->allocator, buffer->allocation, m.vertex_offset, size);
         m.buf->unmap();
-        if (!m.cpu->vertices.empty()) {
+        m.index_offset += m.vertex_offset;
+        if (m.billboard_offset) m.billboard_offset += m.vertex_offset;
+        if (!m.cpu->vertices.empty() && (!m.cpu->transient || sun_cascades_enabled())) {
             for (size_t k = 0; k < 3; ++k) m.bmin[k] = m.bmax[k] = m.cpu->vertices.front().p[k];
             for (const Vertex &v : m.cpu->vertices) {
                 for (size_t k = 0; k < 3; ++k) {
@@ -1453,6 +1694,7 @@ void observe_sun_caster(const Item &it, const Target &target, const gs::hw::Nati
     std::copy_n(p.model, 12, caster.model);
     caster.bounds = mesh.sun_bounds;
     caster.buffer = mesh.buf.get();
+    caster.vertex_offset = mesh.vertex_offset;
     caster.index_offset = mesh.index_offset;
     caster.vertex_bytes = static_cast<uint32_t>(mesh.cpu->vertices.size() * sizeof(Vertex));
     caster.index_count = static_cast<uint32_t>(mesh.cpu->indices.size());
@@ -1666,7 +1908,7 @@ uint32_t draw_sun_cascades(plume::RenderCommandList &list, const gs::hw::NativeS
             if (!caster_rows(view, view.box[i], caster.model, caster.bounds, pc.ray)) continue;
             list.setGraphicsPushConstants(0, &pc, 0, sizeof pc);
             bind_indexed_mesh(list, *caster.buffer, caster.vertex_bytes, caster.index_offset,
-                              caster.index_count * sizeof(uint32_t));
+                              caster.index_count * sizeof(uint32_t), caster.vertex_offset);
             list.drawIndexedInstanced(caster.index_count, 1, 0, 0, 0);
             ++counts[i][caster.kind == KIND_QUEUE];
         }
@@ -1789,7 +2031,7 @@ void flush_shadows(bool ordered_composite = false) {
     const uint32_t view_wh = (uint32_t)(vw & 0xFFFF) | (uint32_t)(vh & 0xFFFF) << 16;
 
     // Pass 1: shadow volumes into the target (0x363708 counts, z test against the main depth)
-    const uint32_t gpu_q = gpu_timer_begin((VkCommandBuffer)s.cmd, true, g_modern.load(std::memory_order_relaxed));
+    const uint32_t gpu_q = gpu_timer_begin((VkCommandBuffer)s.cmd, true, g_config.plume_modern);
     uint32_t sh_draws = 0;
     plume::RenderTextureBarrier in1[2] = {plume::RenderTextureBarrier(smask, plume::RenderTextureLayout::COLOR_WRITE),
                                           plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::SHADER_READ)};
@@ -1841,9 +2083,10 @@ void flush_shadows(bool ordered_composite = false) {
         cl->setGraphicsPushConstants(0, &pc, 0, sizeof pc);
         const GpuMesh &m = *it.mesh;
         bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
-                          (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)));
+                          (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)), m.vertex_offset);
         cl->drawIndexedInstanced((uint32_t)m.cpu->indices.size(), 1, 0, 0, 0);
         sh_draws++;
+        fs.recorded++;
         fs.drawn++;
         fs.k_drawn[KIND_SHADOW]++;
     }
@@ -1890,7 +2133,7 @@ void flush_shadows(bool ordered_composite = false) {
         sh_draws++;
         cl->setFramebuffer(nullptr);
     }
-    if (ordered_composite && sun_cascades_enabled() && g_modern.load(std::memory_order_relaxed))
+    if (ordered_composite && sun_cascades_enabled() && g_config.plume_modern)
         arm_sun_cascades(s, p0);
     gpu_timer_end((VkCommandBuffer)s.cmd, gpu_q, sh_draws);
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
@@ -1943,6 +2186,20 @@ uint32_t vfx_fade_mode(const Item &it, const PushConstants &pc) {
 // (blend, tests, alpha, fog, FIX) stays as the Classic item has it.
 void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
     out = pc;
+    // Modern uses hardware samplers. Classic packs log2(texture width) into bits 12..15.
+    // Remove its sampler fields before assigning any Modern-only shader flags.
+    out.mode[0] &= 0xFFFu | M_FAILED;
+    if ((it.pipeline & 0xF00u) == 0) {
+        // Depth-only pass (colour write mask 0): keep alpha test / M_SPEC alpha intact, skip PBR/sky work.
+        if (pc.mode[0] & M_SPEC) {
+            float hz;
+            std::memcpy(&hz, &pc.mode[3], 4);
+            const uint32_t pk = ((uint32_t)pc.ambient[3] & 0xFFu) | oct_encode(pc.light[3], pc.diffuse[3], hz) << 8;
+            std::memcpy(&out.ambient[3], &pk, 4);
+        }
+        out.mode[2] = (pc.mode[2] & 0xFFFFu) | (C_UNLIT << 27);
+        return;
+    }
     if (pc.mode[0] & M_SPEC) {
         // the Classic highlight alpha (VU1 0x948 with the game's q17 half vector, guardrail rows 4/5):
         // light.w / diffuse.w / mode.w are reused for the sky below, so the half vector goes into
@@ -2006,21 +2263,35 @@ void modern_patch(const Item &it, const PushConstants &pc, PushConstants &out) {
     // daylight (guardrail 4): the sky texture's mean is not the sky the game draws (night skies are
     // modulated down); the game's horizon is its FOGCOL. Sky light and the prelit sun are scaled by
     // FOGCOL / sky-horizon luminance (1 by day, where the fog matches the horizon).
-    auto lum8 = [](uint32_t c) { return 0.2126 * (c & 0xFF) + 0.7152 * (c >> 8 & 0xFF) + 0.0722 * (c >> 16 & 0xFF); };
     const uint32_t fog = it.p.fogcol & 0xFFFFFF;
-    uint32_t top = g_sky_top, hor = g_sky_hor;
-    double day = 1.0;
-    if (!g_sky_seen) {
-        top = hor = fog;
-    } else {
-        day = std::min(1.0, lum8(fog) / std::max(1.0, lum8(hor)));
-        auto scale = [day](uint32_t c) {
-            uint32_t r = 0;
-            for (int k = 0; k < 3; k++) r |= (uint32_t)((c >> (8 * k) & 0xFF) * day + 0.5) << (8 * k);
-            return r;
-        };
-        top = scale(top), hor = scale(hor);
+    static bool cached_sky_valid = false, cached_sky_seen = false;
+    static uint32_t cached_in_top = 0, cached_in_hor = 0, cached_in_fog = 0;
+    static uint32_t cached_top = 0, cached_hor = 0;
+    static double cached_day = 1.0;
+    if (!cached_sky_valid || cached_sky_seen != g_sky_seen || cached_in_top != g_sky_top ||
+        cached_in_hor != g_sky_hor || cached_in_fog != fog) {
+        cached_sky_valid = true;
+        cached_sky_seen = g_sky_seen;
+        cached_in_top = g_sky_top;
+        cached_in_hor = g_sky_hor;
+        cached_in_fog = fog;
+        if (!g_sky_seen) {
+            cached_top = cached_hor = fog;
+            cached_day = 1.0;
+        } else {
+            auto lum8 = [](uint32_t c) { return 0.2126 * (c & 0xFF) + 0.7152 * (c >> 8 & 0xFF) + 0.0722 * (c >> 16 & 0xFF); };
+            cached_day = std::min(1.0, lum8(fog) / std::max(1.0, lum8(g_sky_hor)));
+            auto scale = [](uint32_t c, double d) {
+                uint32_t r = 0;
+                for (int k = 0; k < 3; k++) r |= (uint32_t)((c >> (8 * k) & 0xFF) * d + 0.5) << (8 * k);
+                return r;
+            };
+            cached_top = scale(g_sky_top, cached_day);
+            cached_hor = scale(g_sky_hor, cached_day);
+        }
     }
+    const uint32_t top = cached_top, hor = cached_hor;
+    const double day = cached_day;
     const auto *authored = it.p.editor_environment && surface && cls != C_UNLIT && !em ? environment_override() : nullptr;
     if (authored) {
         out.mode[2] |= kAuthoredEnvironment;
@@ -2232,6 +2503,9 @@ SceneStage scene_surface_stage(const Item &it) {
         return SceneStage::Count;
     const auto &material = g_mats[size_t(it.tex->mat)];
     if (material.emissive) return SceneStage::Count;
+    // Pass 2 (alpha-fail fringe, a < 96) on C_PAINT car bodies only draws 1-px alpha cutouts;
+    // keep full SSR on Pass 1 C_PAINT, C_CHROME, C_GLASS, and C_WATER.
+    if (it.second && material.cls == C_PAINT) return SceneStage::Count;
     return material.cls == C_PAINT || material.cls == C_CHROME || material.cls == C_GLASS
         ? SceneStage::Reflection : SceneStage::Count;
 }
@@ -2291,8 +2565,9 @@ void copy_scene_input(plume::VulkanCommandList &cl, plume::RenderTexture &dst, p
 plume::RenderDescriptorSet *capture_scene_input(plume::VulkanCommandList &cl, plume::RenderFramebuffer &fb,
                                                  plume::RenderTexture &color, plume::RenderTexture &depth,
                                                  SceneView &view, SceneStage stage,
-                                                 const gs::hw::NativeSurfaces &s) {
+                                                 const gs::hw::NativeSurfaces &s, bool *broke_pass = nullptr) {
     using namespace plume;
+    if (broke_pass) *broke_pass = false;
     const bool need_color = stage != SceneStage::Particles;
     auto &slot = view.inputs[size_t(stage)];
     if (slot && slot->captured) {
@@ -2328,6 +2603,7 @@ plume::RenderDescriptorSet *capture_scene_input(plume::VulkanCommandList &cl, pl
         {&color, RenderTextureLayout::COLOR_WRITE}, {slot->color.get(), RenderTextureLayout::SHADER_READ}};
     static_cast<RenderCommandList &>(cl).barriers(RenderBarrierStage::GRAPHICS, after, need_color ? 4 : 2);
     cl.setFramebuffer(&fb);
+    if (broke_pass) *broke_pass = true;
     slot->captured = true;
     slot->color_source = s.color;
     slot->depth_source = s.depth;
@@ -2455,7 +2731,7 @@ void flush() {
     plume::RenderTextureBarrier in[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
     cl->barriers(plume::RenderBarrierStage::GRAPHICS, in, depth ? 2 : 1);
-    const bool modern = g_modern.load(std::memory_order_relaxed);  // stage R6: one look per flush
+    const bool modern = g_config.plume_modern;  // stage R6: one look per flush
     const bool capture_sun = modern && sun_cascades_enabled() && sun_scene_target(tg);
     if (g_vfx_budget_vb != g_r.vb) {
         g_vfx_budget_vb = g_r.vb;
@@ -2495,7 +2771,12 @@ void flush() {
                                   ? bind_static_queue_projections(*cl, gw, gh)
                                   : nullptr;
     uint32_t static_projection_index = 0;
-    uint32_t bound = ~0u;
+    uint64_t bound = ~0ull;
+    plume::RenderDescriptorSet *bound_tex_set = nullptr;
+    int32_t bound_sc[4] = {-1, -1, -1, -1};
+    const plume::RenderBuffer *bound_mesh_buf = nullptr;
+    uint64_t bound_mesh_idx_off = ~0ull;
+    bool bound_was_billboard = false;
     PushConstants mpc;
     plume::RenderDescriptorSet *bound_scene_input = nullptr;
     const Item *last_scene_world = nullptr;
@@ -2556,6 +2837,7 @@ void flush() {
             if (it.world_strip.texture) ++g_world_strip_recorded_by_view[it.sc[1]];
             if (capture_sun) observe_sun_caster(it, tg, s);
             if (!it.second) {
+                fs.culled++;
                 fs.drawn++;
                 fs.k_drawn[it.p.kind % KIND_COUNT]++;
             }
@@ -2625,9 +2907,24 @@ void flush() {
                 stage = SceneStage::Particles;
             if (stage != SceneStage::Count) {
                 if (SceneView *view = scene_view(it, tg, s, false)) {
-                    auto *variant = g_r.scene.pipeline(key | K_SCENE_INPUTS);
+                    const bool authored_draw = (mpc.mode[2] & kAuthoredEnvironment) != 0;
+                    const bool no_ate_draw = (mpc.mode[0] & M_ATE) == 0;
+                    plume::RenderPipeline *variant = nullptr;
+                    if (g_r.modern_fast.ready && !vfx_billboard && !authored_draw && stage != SceneStage::Particles) {
+                        const uint32_t sv = (stage == SceneStage::Water)
+                            ? (no_ate_draw ? MF_WATER_OPAQUE : MF_NONE)
+                            : (no_ate_draw ? MF_SCENE_OPAQUE : MF_SCENE_ATE);
+                        variant = sv != MF_NONE ? modern_fast_pipeline(key | K_SCENE_INPUTS, sv, lit_material_key(sv, mpc))
+                                                : g_r.scene.pipeline(key | K_SCENE_INPUTS);
+                    } else {
+                        variant = g_r.scene.pipeline(key | K_SCENE_INPUTS);
+                    }
                     if (variant && static_cast<plume::VulkanGraphicsPipeline *>(variant)->vk) {
-                        auto *input = capture_scene_input(*vl, *fb, *color, *depth, *view, stage, s);
+                        bool broke_pass = false;
+                        auto *input = capture_scene_input(*vl, *fb, *color, *depth, *view, stage, s, &broke_pass);
+                        if (broke_pass) {
+                            bound_sc[0] = -1;
+                        }
                         if (input) {
                             key |= K_SCENE_INPUTS;
                             if (stage == SceneStage::Water) {
@@ -2668,15 +2965,60 @@ void flush() {
         if (it.world_strip_reference &&
             (g_r.scene.pipeline(key) != strip.pipelines[modern] || texture_set(t, samp) != strip.sets[modern]))
             fatal("original world strip recording selected different resources");
-        if (key != bound) {
-            cl->setPipeline(strip.texture ? strip.pipelines[modern] : g_r.scene.pipeline(key));
-            bound = key;
+        uint32_t fast_variant = MF_NONE;
+        if (modern && g_r.modern_fast.ready && !vfx_billboard && !strip.texture && !it.world_strip_reference) {
+            const uint32_t write_mask = (key >> 8) & 15u;
+            const bool authored_draw = (mpc.mode[2] & kAuthoredEnvironment) != 0;
+            const uint32_t cls = (mpc.mode[2] >> 27) & 15u;
+            const bool is_vfx = cls >= C_VFX_FIRE && cls <= C_VFX_SPARK;
+            const bool unlit_draw = cls == C_UNLIT || ((mpc.mode[2] & (1u << 24)) != 0) || ((mpc.mode[0] & M_TME) == 0);
+            // Zero-alpha cutout discard on depth-read-only SRC1_ALPHA blended draws (e.g. M_FAILED pass 2):
+            // a == 0 contributes 0*Cs + Cd (invisible) and writes no depth, so discarding early skips PBR/SSR/ROP.
+            const bool zwrite_off = (key & 0x40u) == 0;
+            const uint32_t sf = (key >> 16) & 3u, df = (key >> 18) & 3u, op = (key >> 20) & 3u;
+            // Ordinary GS blending replaces destination alpha even when RGB is unchanged.
+            const bool preserves_alpha = !(write_mask & 8u) || (key & (1u << 14));
+            const bool zero_rgb_contribution = zwrite_off && (key & K_GENERIC) && !(key & K_CDST) &&
+                                     !(mpc.mode[0] & M_CFIX) && sf == 2u && (df == 1u || df == 3u) && op == 0u;
+            if (zero_rgb_contribution && ((mpc.mode[0] & M_ATE) || is_vfx)) {
+                mpc.mode[0] |= preserves_alpha ? M_DISCARD_ZERO_A : M_STORE_ZERO_A;
+            }
+            const bool no_ate = (mpc.mode[0] & (M_ATE | M_DISCARD_ZERO_A | M_STORE_ZERO_A)) == 0;
+            if (write_mask == 0) {
+                fast_variant = MF_DEPTH_ONLY;
+            } else if (!is_vfx && !authored_draw) {
+                if ((key & K_SCENE_INPUTS) != 0) {
+                    if (cls == C_WATER) fast_variant = no_ate ? MF_WATER_OPAQUE : MF_NONE;
+                    else fast_variant = no_ate ? MF_SCENE_OPAQUE : MF_SCENE_ATE;
+                } else if (no_ate) {
+                    fast_variant = unlit_draw ? MF_UNLIT_OPAQUE : MF_OPAQUE;
+                } else {
+                    fast_variant = unlit_draw ? MF_UNLIT_ATE : MF_PBR_ATE;
+                }
+            }
         }
-        cl->setGraphicsDescriptorSet(strip.texture ? strip.sets[modern] : texture_set(t, samp), 0);
+        const uint32_t material = fast_variant ? lit_material_key(fast_variant, mpc) : 0;
+        const uint64_t pipe_id = modern_pipeline_id(key, fast_variant, material);
+        if (modern && fast_variant < 10) g_gpu.mf_draws[fast_variant]++;
+        if (pipe_id != bound) {
+            plume::RenderPipeline *p = fast_variant ? modern_fast_pipeline(key, fast_variant, material) : nullptr;
+            if (!p) p = strip.texture ? strip.pipelines[modern] : g_r.scene.pipeline(key);
+            cl->setPipeline(p);
+            bound = pipe_id;
+        }
+        plume::RenderDescriptorSet *tex_set = strip.texture ? strip.sets[modern] : texture_set(t, samp);
+        if (tex_set != bound_tex_set) {
+            cl->setGraphicsDescriptorSet(tex_set, 0);
+            bound_tex_set = tex_set;
+        }
         cl->setGraphicsPushConstants(0, modern ? &mpc : &pc, 0, sizeof pc);
         const int32_t x0 = std::max(0, it.sc[0]) * sc, y0 = std::max(0, it.sc[1]) * sc;
-        const int32_t x1 = std::min((int32_t)gw, it.sc[2] + 1) * sc, y1 = std::min((int32_t)gh, it.sc[3] + 1) * sc;
-        cl->setScissors(plume::RenderRect(x0, y0, std::max(x0, x1), std::max(y0, y1)));
+        const int32_t x1 = std::max(x0, std::min((int32_t)gw, it.sc[2] + 1) * sc);
+        const int32_t y1 = std::max(y0, std::min((int32_t)gh, it.sc[3] + 1) * sc);
+        if (x0 != bound_sc[0] || y0 != bound_sc[1] || x1 != bound_sc[2] || y1 != bound_sc[3]) {
+            cl->setScissors(plume::RenderRect(x0, y0, x1, y1));
+            bound_sc[0] = x0; bound_sc[1] = y0; bound_sc[2] = x1; bound_sc[3] = y1;
+        }
         const GpuMesh &m = *it.mesh;
         if (vfx_billboard) {
             const auto count = (uint32_t)m.cpu->billboards.size();
@@ -2684,12 +3026,19 @@ void flush() {
             const plume::RenderInputSlot slot(0, sizeof(EffectBillboard),
                 plume::RenderInputSlotClassification::PER_INSTANCE_DATA);
             cl->setVertexBuffers(0, &view, 1, &slot);
+            bound_mesh_buf = nullptr;
+            bound_was_billboard = true;
             cl->drawInstanced(6, count, 0, 0);
             g_vfx_billboards += count;
             pass_draws++;
         } else {
-            bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
-                              (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)));
+            if (bound_was_billboard || bound_mesh_buf != m.buf.get() || bound_mesh_idx_off != m.index_offset) {
+                bind_indexed_mesh(*cl, *m.buf, (uint32_t)(m.cpu->vertices.size() * sizeof(Vertex)), m.index_offset,
+                                  (uint32_t)(m.cpu->indices.size() * sizeof(uint32_t)), m.vertex_offset);
+                bound_mesh_buf = m.buf.get();
+                bound_mesh_idx_off = m.index_offset;
+                bound_was_billboard = false;
+            }
             static const bool no_runs = std::getenv("EOD_R5A2_OFF") && (std::strtoul(std::getenv("EOD_R5A2_OFF"), nullptr, 0) & 8);
             if (!modern && !no_runs && !it.run_k.empty() && it.run_k.size() == m.cpu->k_runs.size()) {
                 // one draw per VU1 run: each has its own TEX1.K
@@ -2746,6 +3095,7 @@ void flush() {
         if (it.second) continue;
         const VfxProfile profile = modern ? vfx_payload_profile(mpc) : VFX_LEGACY;
         if (profile != VFX_LEGACY) g_vfx_volume_draws[profile]++;
+        fs.recorded++;
         fs.drawn++;
         fs.k_drawn[it.p.kind % KIND_COUNT]++;
         if (it.p.kind == KIND_WATER) water_view_drawn(m.cpu->indices.size() / 3, it.sc, it.ox, it.oy);
@@ -2775,7 +3125,7 @@ void finish_sun_cascades(uint64_t frame, uint32_t boundary) {
     SunView &input = g_r.sun_view;
     if (!input.armed) return;
     flush();
-    if (!input.armed || frame != input.camera.frame || !input.have_sun || !g_modern.load(std::memory_order_relaxed)) {
+    if (!input.armed || frame != input.camera.frame || !input.have_sun || !g_config.plume_modern) {
         static uint32_t guarded = 0;
         if (++guarded <= 8 || guarded % 120 == 0)
             std::fprintf(stderr, "[sun] foreground guard scene=%llu next=%llu kind=%u lit=%d armed=%d\n",
@@ -3299,7 +3649,7 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     const auto pinned = ready ? g_queue_resources.find(ready) : g_queue_resources.end();
     GpuMesh *mesh = strip ? strip->mesh : pinned != g_queue_resources.end() ? pinned->second.mesh.get() :
                     g_cur.mesh ? gpu_mesh(g_cur.mesh) : nullptr;
-    if (g_cur.mesh && !mesh) {
+    if ((g_cur.mesh && !mesh) || (mesh && !mesh->buf && !mesh->cpu->indices.empty())) {
         fs.lost++;
         fs.k_lost[kind]++;
         return;
@@ -3409,9 +3759,9 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     }
     std::memcpy(pc.diffuse, g_cur.colour_a, 16);
     std::memcpy(pc.ambient, g_cur.colour_b, 16);
-    // The water immediate packet's per-vertex STQ.z is added to ITOP by VU1 0x04C0.
-    // KIND_WATER uses ITOP 0x200, so its low-byte alpha is the decoded vertex alpha.
-    pc.ambient[3] = kind == KIND_WATER ? -1.0f : (float)(g_cur.itop & 0xFF);
+    // Water and flare immediate packets use ITOP 0x200. VU1 0x04C0 takes
+    // their alpha from each vertex's STQ.z, as emitted by 0x361708.
+    pc.ambient[3] = (kind == KIND_WATER || kind == KIND_FLARE) ? -1.0f : (float)(g_cur.itop & 0xFF);
     // q17 (setup 0x0000): h = -normalize(M^T (camera forward + light)), the car highlight's half vector
     {
         double h[3], len = 0;
@@ -3560,6 +3910,63 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
         g_r.pending.push_back(it);
         return;
     }
+    // Modern-only exact alpha-bounds culling (Classic stays byte-identical):
+    // when texel [alpha_min, alpha_max] + constant vertex alpha provably make 100% of fragments
+    // pass or fail the alpha test, omit the provably-empty pass and strip M_ATE so the surviving
+    // pass runs on the zero-discard Early-Z/HSR pipeline.
+    if (g_config.plume_modern && !(m & M_SPEC) && pc.ambient[3] >= 0.0f &&
+        kind != KIND_WATER && kind != KIND_PARTICLE && kind != KIND_SPRITE) {
+        const uint32_t va = std::min<uint32_t>((uint32_t)std::floor(pc.ambient[3]), 255u);
+        uint32_t a_lo = va, a_hi = va;
+        if (it.tex && (m & M_TCC)) {
+            const uint32_t tfx = (m >> M_TFX_SHIFT) & 3u;
+            const uint32_t t_lo = it.tex->alpha_min, t_hi = it.tex->alpha_max;
+            // Conservative 1-LSB margin when texture has varying alpha; exact when uniform.
+            const uint32_t c_lo = (t_lo == t_hi || t_lo == 0) ? t_lo : (t_lo - 1u);
+            const uint32_t c_hi = (t_lo == t_hi || t_hi == 255u) ? t_hi : (t_hi + 1u);
+            if (tfx == 0) {
+                a_lo = std::min<uint32_t>((c_lo * va) >> 7, 255u);
+                a_hi = std::min<uint32_t>((c_hi * va) >> 7, 255u);
+            } else if (tfx == 2) {
+                a_lo = std::min<uint32_t>(c_lo + va, 255u);
+                a_hi = std::min<uint32_t>(c_hi + va, 255u);
+            } else {
+                a_lo = c_lo;
+                a_hi = c_hi;
+            }
+        }
+        bool always_pass = false, always_fail = false;
+        switch (rs.atst & 7) {
+        case 0: always_fail = true; break;
+        case 1: always_pass = true; break;
+        case 2: always_pass = a_hi < rs.aref; always_fail = a_lo >= rs.aref; break;   // LESS
+        case 3: always_pass = a_hi <= rs.aref; always_fail = a_lo > rs.aref; break;   // LEQUAL
+        case 4: always_pass = (a_lo == rs.aref && a_hi == rs.aref); always_fail = (a_hi < rs.aref || a_lo > rs.aref); break;
+        case 5: always_pass = a_lo >= rs.aref; always_fail = a_hi < rs.aref; break;   // GEQUAL
+        case 6: always_pass = a_lo > rs.aref; always_fail = a_hi <= rs.aref; break;   // GREATER
+        default: always_pass = (a_hi < rs.aref || a_lo > rs.aref); always_fail = (a_lo == rs.aref && a_hi == rs.aref); break;
+        }
+        if (always_pass) {
+            it.pc.mode[0] &= ~(M_ATE | M_AFAIL_DISCARD);
+            g_r.pending.push_back(it);
+            return;
+        }
+        if (always_fail) {
+            if (fail_mask || fail_z) {
+                Item f = it;
+                f.second = false;  // sole emitted pass for this object (preserves P1 frame accounting)
+                f.pc.mode[0] &= ~(M_ATE | M_AFAIL_DISCARD | M_FAILED);
+                f.pipeline = (it.pipeline & ~(0x40u | 0xF00u)) | (fail_z ? 0x40u : 0u) | fail_mask << 8;
+                g_r.pending.push_back(f);
+            } else {
+                // Provably draws zero pixels (KEEP): count as drawn empty to preserve P1 parity.
+                fs.drawn++;
+                fs.k_drawn[kind]++;
+                fs.empty++;
+            }
+            return;
+        }
+    }
     if (rs.atst != 0) g_r.pending.push_back(it);  // NEVER: no pixel passes
     if (fail_mask || fail_z) {
         Item f = it;
@@ -3568,12 +3975,38 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
         f.pipeline = (it.pipeline & ~(0x40u | 0xF00u)) | (fail_z ? 0x40u : 0u) | fail_mask << 8;
         g_r.pending.push_back(f);
         g_afail_second.fetch_add(1);
+        if (m & M_SPEC) {
+            if (g_gpu.afail_spec++ < 8 && std::getenv("EOD_GPU_PROF"))
+                std::fprintf(stderr, "[afail-spec] kind=%u prog=%x tfx=%u tcc=%d atst=%d aref=%u afail=%d tex_a=%u..%u va=%.0f cls=%d\n",
+                             kind, g_cur.program, (m >> M_TFX_SHIFT) & 3u, (m & M_TCC) != 0, rs.atst, rs.aref, rs.afail,
+                             it.tex ? it.tex->alpha_min : 0, it.tex ? it.tex->alpha_max : 0, pc.ambient[3],
+                             (it.tex && it.tex->mat >= 0) ? (int)g_mats[it.tex->mat].cls : -1);
+        } else if (it.tex && it.tex->alpha_min < it.tex->alpha_max) {
+            if (g_gpu.afail_mixed++ < 8 && std::getenv("EOD_GPU_PROF"))
+                std::fprintf(stderr, "[afail-mix] kind=%u prog=%x tfx=%u tcc=%d atst=%d aref=%u afail=%d tex_a=%u..%u va=%.0f cls=%d\n",
+                             kind, g_cur.program, (m >> M_TFX_SHIFT) & 3u, (m & M_TCC) != 0, rs.atst, rs.aref, rs.afail,
+                             it.tex->alpha_min, it.tex->alpha_max, pc.ambient[3],
+                             (it.tex->mat >= 0) ? (int)g_mats[it.tex->mat].cls : -1);
+        } else g_gpu.afail_other++;
     }
 }
 
 void end_vblank(uint64_t vb) {
+    // Simulation vblanks can outrun render submissions during loading and
+    // fast-forward. Associate the work since the last vblank with its real
+    // Vulkan fence before freeing any images, framebuffers, or mesh buffers.
+    const auto submission = gs::hw::native_submission();
+    auto &fences = g_r.submission_vblanks;
+    if (!fences.empty() && fences.back().second == submission.recording)
+        fences.back().first = g_r.vb;
+    else
+        fences.emplace_back(g_r.vb, submission.recording);
+    while (!fences.empty() && fences.front().second <= submission.completed) {
+        g_r.first_uncompleted_vblank = fences.front().first + 1;
+        fences.pop_front();
+    }
     g_r.sun_view.reset();
-    g_r.split_shadow_prepared_y = -1;
+    g_r.split_shadow_view = -1;
     g_r.vb = vb;
     if (scene_capture_log()) {
         if (g_r.scene_draws[size_t(SceneStage::Reflection)]) {
@@ -3599,13 +4032,15 @@ void end_vblank(uint64_t vb) {
             ++it;
         }
     }
-    while (!g_r.retired_meshes.empty() && g_r.retired_meshes.front().first + 8 <= vb)
+    while (!g_r.retired_meshes.empty() && g_r.retired_meshes.front().first + 8 <= vb &&
+           g_r.retired_meshes.front().first < g_r.first_uncompleted_vblank)
         g_r.retired_meshes.pop_front();
     evict_textures();
     if (log_every() > 1 && vb % log_every() == 0 && g_r.ok)
-        std::fprintf(stderr, "[native] vb %llu textures decoded %llu (total), cached %zu (%llu MB), meshes %zu\n",
+        std::fprintf(stderr, "[native] vb %llu textures decoded %llu (total), cached %zu (%llu MB), meshes %zu, transient uploads %llu in %llu pages (total)\n",
                      (unsigned long long)vb, (unsigned long long)g_r.decoded, g_r.textures.size(),
-                     (unsigned long long)(g_r.texture_bytes >> 20), g_r.meshes.size());
+                     (unsigned long long)(g_r.texture_bytes >> 20), g_r.meshes.size(),
+                     (unsigned long long)g_r.transient_upload_meshes, (unsigned long long)g_r.transient_upload_pages);
     if (g_r.shadow_fb) {
         Trash t{vb};
         t.fb = std::move(g_r.shadow_fb);
@@ -3624,8 +4059,9 @@ void end_vblank(uint64_t vb) {
         g_r.trash.push_back(std::move(t));
     }
     g_r.wrappers.clear();
-    while (!g_r.trash.empty() && g_r.trash.front().vb + 8 <= vb) g_r.trash.pop_front();
-    // one-draw geometry (water, camera-facing parts) goes 8 vblanks after it arrived (drawn by then)
+    while (!g_r.trash.empty() && g_r.trash.front().vb + 8 <= vb &&
+           g_r.trash.front().vb < g_r.first_uncompleted_vblank) g_r.trash.pop_front();
+    // A later replay of the DMA tag supplies its own CPU source and can re-upload this mesh.
     while (!g_r.transient.empty() && g_r.transient.front().second + 8 <= vb) {
         auto it = g_r.meshes.find(g_r.transient.front().first);
         if (it != g_r.meshes.end()) {
@@ -3801,7 +4237,7 @@ void vertex_check(const gs::Vertex *const *vs, int n) {
         auto it = g_r.meshes.find(g_cur.mesh);
         if (it == g_r.meshes.end() || !it->second->cpu) return;
         const Mesh &m = *it->second->cpu;
-        const bool vu_rounding = m.skinned || (g_r.static_queue_projection && !g_modern.load(std::memory_order_relaxed) &&
+        const bool vu_rounding = m.skinned || (g_r.static_queue_projection && !g_config.plume_modern &&
                                               uses_static_queue_projection(g_cur, m));
         double a[4][4];
         screen_matrix(g_cur, a, vu_rounding);
@@ -3966,20 +4402,24 @@ void begin_object(const Packet &p) {
     g_queue_omitted = g_queue_reference = false;
     g_queue_first_suppressed = g_frames[p.frame].suppressed;
 #endif
-    g_frames[p.frame].objects++;
-    g_frames[p.frame].k_objects[p.kind % KIND_COUNT]++;
+    auto &stats = g_frames[p.frame];
+    stats.objects++;
+    stats.k_objects[p.kind % KIND_COUNT]++;
+    if (p.serial >= stats.received.size()) stats.received.resize(size_t(p.serial) + 1);
+    stats.received[p.serial] = true;
     g_newest_frame = std::max(g_newest_frame, p.frame);
 }
 
-void report(uint64_t vb) {
+void report(uint64_t vb, bool final = false) {
+    const uint64_t before = final ? UINT64_MAX : g_newest_frame;
     const uint64_t every = log_every();
     // EE frames older than the newest one the GS has seen are complete on both sides
     std::map<uint64_t, Expected> expected;
-    take_expected(g_newest_frame, expected);
+    take_expected(before, expected);
     std::vector<uint64_t> frames;
     for (auto &e : expected) frames.push_back(e.first);
     for (auto &f : g_frames)
-        if (f.first < g_newest_frame && !expected.count(f.first)) frames.push_back(f.first);
+        if (f.first < before && !expected.count(f.first)) frames.push_back(f.first);
     std::sort(frames.begin(), frames.end());
     const bool log_parity = std::getenv("EOD_NATIVE_PARITY_LOG") != nullptr;
     for (const uint64_t frame : frames) {
@@ -3987,6 +4427,32 @@ void report(uint64_t vb) {
         FrameStats none;
         const FrameStats &s = it != g_frames.end() ? it->second : none;
         auto e = expected.find(frame);
+        if (final && e != expected.end()) {
+            const Expected pending = ee_pending_at_shutdown(frame, s.received);
+            Expected &submitted = e->second;
+            if (pending.queue || pending.world || pending.water || pending.shadow || pending.flare ||
+                pending.particle || pending.sprite || pending.immediate || pending.cockpit || pending.hud) {
+                std::fprintf(stderr, "[native] cutoff frame %llu still in EE DMA tags: queue %u world %u water %u "
+                             "shadow %u flare %u particle %u sprite %u immediate %u cockpit %u hud %u\n",
+                             (unsigned long long)frame, pending.queue, pending.world, pending.water, pending.shadow,
+                             pending.flare, pending.particle, pending.sprite, pending.immediate, pending.cockpit, pending.hud);
+                // A deficit is explained only by that many individually identified, unissued tags.
+                // Any other count remains in P1 as a mismatch, including a missing or duplicate tag.
+                auto reconcile = [&](uint32_t &authored, uint32_t staged, uint32_t kind) {
+                    if (uint64_t(staged) + s.k_objects[kind] == authored) authored -= staged;
+                };
+                reconcile(submitted.queue, pending.queue, KIND_QUEUE);
+                reconcile(submitted.world, pending.world, KIND_WORLD);
+                reconcile(submitted.water, pending.water, KIND_WATER);
+                reconcile(submitted.shadow, pending.shadow, KIND_SHADOW);
+                reconcile(submitted.flare, pending.flare, KIND_FLARE);
+                reconcile(submitted.particle, pending.particle, KIND_PARTICLE);
+                reconcile(submitted.sprite, pending.sprite, KIND_SPRITE);
+                reconcile(submitted.immediate, pending.immediate, KIND_IMMEDIATE);
+                reconcile(submitted.cockpit, pending.cockpit, KIND_COCKPIT);
+                reconcile(submitted.hud, pending.hud, KIND_HUD);
+            }
+        }
         const uint32_t world = e != expected.end() ? e->second.world : 0, water = e != expected.end() ? e->second.water : 0;
         const uint32_t queue = e != expected.end() ? e->second.queue : 0;
         const uint32_t shadow = e != expected.end() ? e->second.shadow : 0, flare = e != expected.end() ? e->second.flare : 0;
@@ -4066,12 +4532,13 @@ void report(uint64_t vb) {
                              imm, s.k_objects[KIND_IMMEDIATE], s.k_drawn[KIND_IMMEDIATE],
                              cockpit, s.k_objects[KIND_COCKPIT], s.k_drawn[KIND_COCKPIT]);
         }
-        if (every && (every == 1 || frame % every < 2)) {
+        if ((every && (every == 1 || frame % every < 2)) ||
+            (final && frame == frames.back() && (every || log_parity))) {
             std::fprintf(stderr,
                          "[native] gs frame %llu objects %u drawn %u (empty %u, textured %u, skinned %u of them posed %u, "
-                         "render-target texture untextured %u) skipped %u lost %u suppressed GS prims %llu render passes %u (gs vb %llu)\n",
+                         "render-target texture untextured %u) skipped %u lost %u suppressed GS prims %llu render passes %u (gs vb %llu) GPU-recorded objects %u frustum-culled %u\n",
                          (unsigned long long)frame, s.objects, s.drawn, s.empty, s.textured, s.skinned, s.posed, s.untextured_rt,
-                         s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb);
+                         s.skipped, s.lost, (unsigned long long)s.suppressed, s.flushes, (unsigned long long)vb, s.recorded, s.culled);
             std::fprintf(stderr, "[native] gs frame %llu fog: FGE draws %llu\n", (unsigned long long)frame,
                          (unsigned long long)g_fge_draws.load());
             std::fprintf(stderr,
@@ -4150,27 +4617,28 @@ bool gs_shadow_boundary(ShadowPass pass) {
     if (!prepare() || (modern::g_on && modern::live())) return false;
     if (g_active) finalize();
     SunView &view = g_r.sun_view;
-    const int split_y = shadow_split_y(pass);
-    if (split_y >= 0) {
+    const int index = int(shadow_view_index(pass));
+    const auto &viewport = kShadowViewports[index];
+    if (index) {
         if (shadow_prepares(pass)) {
             // The preceding view's work must be complete before changing its target.
             flush();
-            g_r.split_shadow_prepared_y = -1;
+            g_r.split_shadow_view = -1;
             view.reset();
-            if (!g_r.has_main_target || g_r.main_sc[0] != 0 || g_r.main_sc[1] != split_y ||
-                g_r.main_sc[2] != 639 || g_r.main_sc[3] != split_y + 223)
+            if (!g_r.has_main_target || g_r.main_sc[0] != viewport.x || g_r.main_sc[1] != viewport.y ||
+                g_r.main_sc[2] != viewport.x + viewport.width - 1 || g_r.main_sc[3] != viewport.y + viewport.height - 1)
                 return false;
-            g_r.split_shadow_prepared_y = split_y;
+            g_r.split_shadow_view = index;
         } else {
-            const bool prepared = g_r.split_shadow_prepared_y == split_y;
-            g_r.split_shadow_prepared_y = -1;
+            const bool prepared = g_r.split_shadow_view == index;
+            g_r.split_shadow_view = -1;
             if (!prepared) return false;
             const bool same_view = std::all_of(g_r.shadow_pending.begin(), g_r.shadow_pending.end(),
-                                              [split_y](const Item &item) {
+                                              [&viewport](const Item &item) {
                                                   const auto &rt = item.p.shadow_rt;
                                                   return rt[0] == 320 && rt[1] == 224 &&
-                                                         rt[2] == 0 && rt[3] == split_y &&
-                                                         rt[4] == 640 && rt[5] == 224;
+                                                         rt[2] == viewport.x && rt[3] == viewport.y &&
+                                                         rt[4] == viewport.width && rt[5] == viewport.height;
                                               });
             if (!same_view) return false;
             flush_shadows();
@@ -4178,7 +4646,7 @@ bool gs_shadow_boundary(ShadowPass pass) {
         }
         return true;
     }
-    g_r.split_shadow_prepared_y = -1;
+    g_r.split_shadow_view = -1;
     if (pass == ShadowPass::Prepare) {
         flush();
         const bool ordered_scene = view.valid && view.target == g_r.main_target && view.xy == g_r.main_xy &&
@@ -4205,7 +4673,7 @@ bool gs_shadow_boundary(ShadowPass pass) {
 #endif
 }
 
-bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
+bool gs_clear_scene(const gs::Env &env, const SceneClear &clear, const int *bounds) {
     EOD_TRACE_ZONE("native_renderer.clear_scene");
 #ifdef EOD_PLUME
     if (gs::g_skip_frame || !prepare() || (modern::g_on && modern::live())) return false;
@@ -4214,13 +4682,14 @@ bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
     flush();
 
     gs::hw::NativeSurfaces surfaces{};
-    const bool depth_only = clear.target == SceneClearTarget::Depth;
+    const bool depth_only = clear.target == SceneClearTarget::Depth || clear.target == SceneClearTarget::RectDepth;
     const bool bootstrap = clear.target == SceneClearTarget::Bootstrap;
-    g_r.sun_view.reset();
-    const uint32_t rows = bootstrap ? env.scy1 + 1 : 448;
-    if (depth_only ? !gs::hw::native_begin_depth_clear(env, surfaces)
-                   : !gs::hw::native_begin(env, true, surfaces, bootstrap)) return false;
-    if (!surfaces.depth || surfaces.gs_width < 640 || surfaces.gs_height < rows) {
+    if (!bounds) g_r.sun_view.reset();
+    const uint32_t rows = bounds ? bounds[3] : (bootstrap ? env.scy1 + 1 : 448);
+    const uint32_t cols = bounds ? bounds[2] : 640;
+    if (depth_only ? !gs::hw::native_begin_depth_clear(env, surfaces, bounds)
+                   : !gs::hw::native_begin(env, true, surfaces, bootstrap || bounds, bounds)) return false;
+    if (!surfaces.depth || surfaces.gs_width < cols || surfaces.gs_height < rows) {
         gs::hw::native_end();
         return false;
     }
@@ -4241,7 +4710,8 @@ bool gs_clear_scene(const gs::Env &env, const SceneClear &clear) {
         framebuffer = g_r.dev->createFramebuffer(plume::RenderFramebufferDesc(attachments, depth_only ? 0 : 1, depth));
     }
     list->setFramebuffer(framebuffer.get());
-    const plume::RenderRect rect(0, 0, 640 * surfaces.scale, rows * surfaces.scale);
+    const plume::RenderRect rect(bounds ? bounds[0] * surfaces.scale : 0, bounds ? bounds[1] * surfaces.scale : 0,
+                                (bounds ? bounds[2] : 640) * surfaces.scale, rows * surfaces.scale);
     if (!depth_only) {
         const auto byte = [&clear](unsigned shift) { return ((clear.rgba >> shift) & 0xff) / 255.0f; };
         list->clearColor(0, plume::RenderColor(byte(0), byte(8), byte(16), byte(24)), &rect, 1);
@@ -4382,11 +4852,25 @@ void gs_command(uint32_t kind, const void *data, uint32_t size) {
 #endif
         break;
     }
+    case CMD_TRANSIENT_MESH: {
+        std::shared_ptr<Mesh> *source;
+        std::memcpy(&source, data, sizeof source);
+        std::unique_ptr<std::shared_ptr<Mesh>> owner(source);
+#ifdef EOD_PLUME
+        const uint32_t id = (*source)->id;
+        if (!g_r.meshes.count(id)) {
+            auto mesh = std::make_shared<GpuMesh>();
+            mesh->cpu = std::move(*source);
+            g_r.meshes.emplace(id, std::move(mesh));
+            g_r.transient.emplace_back(id, g_r.vb);
+        }
+#endif
+        break;
+    }
     case CMD_MESH: {
         Mesh *m;
         std::memcpy(&m, data, sizeof m);
 #ifdef EOD_PLUME
-        if (m->transient) g_r.transient.emplace_back(m->id, g_r.vb);
         if (m->replaces) {
             auto it = g_r.meshes.find(m->replaces);
             if (it != g_r.meshes.end()) {
@@ -4858,6 +5342,20 @@ void r6_report() {
                      cm, g_gpu.max_ms[0], cs, (unsigned long long)g_gpu.frames[0], cd,
                      mm, g_gpu.max_ms[1], ms, (unsigned long long)g_gpu.frames[1], md,
                      (g_gpu.frames[0] && g_gpu.frames[1]) ? (mm - cm) : 0.0);
+        if (std::getenv("EOD_GPU_PROF")) {
+            std::fprintf(stderr, "[r6-prof] spans:");
+            for (int i = 0; i < 8; i++)
+                if (g_gpu.span_cnt[i])
+                    std::fprintf(stderr, " s%d=%.3fms(%llu)", i, g_gpu.span_sum_ms[i] / g_gpu.span_cnt[i],
+                                 (unsigned long long)g_gpu.span_cnt[i]);
+            std::fprintf(stderr, "\n[r6-prof] mf_draws: uber=%llu opaque=%llu scene_op=%llu water_op=%llu unlit_op=%llu pbr_ate=%llu scene_ate=%llu unlit_ate=%llu depth=%llu | afail: spec=%llu mixed=%llu other=%llu\n",
+                         (unsigned long long)g_gpu.mf_draws[0], (unsigned long long)g_gpu.mf_draws[1],
+                         (unsigned long long)g_gpu.mf_draws[2], (unsigned long long)g_gpu.mf_draws[3],
+                         (unsigned long long)g_gpu.mf_draws[4], (unsigned long long)g_gpu.mf_draws[5],
+                         (unsigned long long)g_gpu.mf_draws[6], (unsigned long long)g_gpu.mf_draws[7],
+                         (unsigned long long)g_gpu.mf_draws[8], (unsigned long long)g_gpu.afail_spec,
+                         (unsigned long long)g_gpu.afail_mixed, (unsigned long long)g_gpu.afail_other);
+        }
     }
     for (int l = 0; l < 2; l++)
         if (g_lt.n[l])
@@ -4872,14 +5370,13 @@ void r6_report() {
 // any thread (F9 on the window thread): only flips the look; gs_vblank does the bookkeeping
 bool look_available() { return g_r.ok.load(std::memory_order_acquire); }
 bool toggle_look() {
-    bool modern = g_modern.load(std::memory_order_relaxed);
-    while (!g_modern.compare_exchange_weak(modern, !modern, std::memory_order_relaxed)) {}
+    const bool modern = g_config.plume_modern.toggle();
     ++g_look_toggles;
-    return !modern;
+    return modern;
 }
 namespace {
 void toggled(uint32_t n) {  // GS thread
-    const bool m = g_modern.load();
+    const bool m = g_config.plume_modern;
     g_lt.pending_toggle = 2;
     if (n == 1) {
         g_lt.pipes_at_first = g_r.scene.size();
@@ -4893,7 +5390,7 @@ void toggled(uint32_t n) {  // GS thread
                      g_lt.tex_bytes_first / 1048576.0);
 }
 }  // namespace
-bool look_modern() { return g_modern.load(); }
+bool look_modern() { return g_config.plume_modern; }
 #else
 bool look_available() { return false; }
 bool toggle_look() { return false; }
@@ -4913,12 +5410,31 @@ bool last_target(uint32_t &fbp, uint32_t &fbw, uint32_t &psm) {
 #endif
 }
 
+void gs_finish_submissions(uint64_t frame) {
+    finalize();
+    g_active = false;
+    flush();
+    report(frame, true);
+}
+
 void gs_vblank(uint64_t frame) {
     EOD_TRACE_ZONE("native_renderer.frame");
     if (g_active) finalize();
     g_active = false;
     flush();
 #ifdef EOD_PLUME
+#ifdef EOD_TRACY
+    static const bool stress_trace = std::getenv("EOD_RACE_STRESS_TRACE") != nullptr;
+    if (stress_trace) {
+        static uint64_t fire, smoke, exhaust, ember;
+        const auto df = g_vfx_volume_draws[VFX_FIRE] - fire, ds = g_vfx_volume_draws[VFX_SMOKE] - smoke;
+        const auto dx = g_vfx_volume_draws[VFX_EXHAUST] - exhaust, de = g_vfx_volume_draws[VFX_EMBER] - ember;
+        std::fprintf(stderr, "[race-vfx] vb=%llu fire=%llu smoke=%llu exhaust=%llu spark=%llu\n",
+            (unsigned long long)frame, (unsigned long long)df, (unsigned long long)ds,
+            (unsigned long long)dx, (unsigned long long)de);
+        fire += df; smoke += ds; exhaust += dx; ember += de;
+    }
+#endif
     if (frame_pacing::global_pacer().interpolation_enabled()) {
         EOD_TRACE_ZONE("plume_present_interpolated");
         auto &pacer = frame_pacing::global_pacer();
@@ -4945,7 +5461,7 @@ void gs_vblank(uint64_t frame) {
         const auto now = std::chrono::steady_clock::now();
         if (g_lt.last.time_since_epoch().count() && g_r.ok) {
             const double ms = std::chrono::duration<double, std::milli>(now - g_lt.last).count();
-            const int l = g_modern.load() ? 1 : 0;
+            const int l = g_config.plume_modern ? 1 : 0;
             g_lt.sum[l] += ms, g_lt.n[l]++, g_lt.max[l] = std::max(g_lt.max[l], ms);
             static const bool flog = std::getenv("EOD_LOOK_FRAME_LOG") != nullptr;
             if (flog) std::fprintf(stderr, "[lookf] vb %llu %s %.2f ms\n", (unsigned long long)frame, l ? "M" : "C", ms);

@@ -107,7 +107,28 @@ bool native_display_copy(const Env &e) {
 
 void native_display_copy_fallback() { g_native_display_history = false; }
 
-bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool require_no_readback) {
+// A full physical page has no surviving texels after a clear. Discard its
+// previous owner and any pending readback before recording the overwrite.
+void claim_full_clear_pages(Surface *surface, const PageCoverage &cov) {
+    bool claimed = false;
+    for (uint32_t i = 0; i < cov.count; ++i) {
+        const uint32_t page = cov.pages[i];
+        if (cov.complete[page] != 0xffffffffu) continue;
+        if (g_deferred[page]) {
+            deferred_free(page);
+            g_dstats.overwritten++;
+        }
+        if (g_owner[page] != surface) {
+            g_owner[page] = surface;
+            claimed = true;
+        }
+        g_vram_ok[page] = false;
+        g_cpu_valid_blocks[page] = 0;
+    }
+    if (claimed) surface->ownership = ++g_surface_ownership;
+}
+
+bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool require_no_readback, const int *bounds) {
     if (g_skip_frame) return false;
     const int rows = e.scy1 + 1;
     Surface *rt = get_surface(e.fbp, e.fbw, e.fpsm_mem, false, rows);
@@ -121,12 +142,15 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
     if (ds && (!ds->tex || ds->w != rt->w)) ds = nullptr;
     flush();
     const int cols = std::min((int)e.fbw * 64, rt->w);
+    const int x0 = bounds ? bounds[0] : 0, y0 = bounds ? bounds[1] : 0;
+    const int x1 = bounds ? bounds[2] : cols, y1 = bounds ? bounds[3] : rows;
+    if (bounds && (x1 > cols || y1 > rt->h || (ds && y1 > ds->h))) return false;
     if (require_no_readback) {
         if (want_depth && !ds) return false;
         std::vector<PageRect> pages;
         for (Surface *surface : {rt, ds}) {
             if (!surface) continue;
-            surface_pages_rect(surface, 0, 0, cols, rows, pages);
+            surface_pages_rect(surface, x0, y0, x1, y1, pages);
             for (const auto &page : pages) {
                 const Surface *owner = g_owner[page.page];
                 if (owner != surface && ((owner && !g_vram_ok[page.page]) || g_deferred[page.page]))
@@ -137,10 +161,17 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
     g_ctx->barrier(2);
     const uint64_t rt_own0 = rt->ownership;
     const uint64_t ds_own0 = ds ? ds->ownership : 0;
-    acquire(rt, 0, 0, cols, std::min(rows, rt->h));
+    if (g_native_scene_clear_active && !require_no_readback && cols >= 640 && rows >= 448) {
+        // gs_clear_scene overwrites every pixel in [0,640)x[0,448) of rt and ds via
+        // clearColor/clearDepth. Any physical page 100% covered by this clear does not
+        // need prior CPU bytes uploaded or deferred GPU readbacks resolved.
+        claim_full_clear_pages(rt, page_coverage(e.fbp, e.fbw, e.fpsm_mem, 0, 0, 640, 448));
+        if (ds) claim_full_clear_pages(ds, page_coverage(e.zbp, e.fbw, e.zpsm, 0, 0, 640, 448));
+    }
+    acquire(rt, x0, y0, x1, std::min(y1, rt->h));
     rt->version++;
     if (ds) {
-        acquire(ds, 0, 0, cols, std::min(rows, ds->h));
+        acquire(ds, x0, y0, x1, std::min(y1, ds->h));
         ds->version++;
     }
     if (rt->ownership != rt_own0 || (ds && ds->ownership != ds_own0))
@@ -168,7 +199,11 @@ bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth, bool 
         rt->h < allocation_rows || e.scx1 >= rt->w || e.scy1 >= rt->h)
         return false;
     if (check_ownership) {
+#ifndef EOD_R7_RELEASE
         if (!g_verts.empty() || !g_ctx->cmd) return false;
+#else
+        if (!g_ctx->cmd) return false;
+#endif
         std::vector<PageRect> pages;
         for (const Surface *target : {rt, ds}) {
             surface_pages_rect(target, 0, 0, std::min(int(e.fbw * 64), target->w), rows, pages);
@@ -181,22 +216,27 @@ bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth, bool 
     return color && depth;
 }
 
-bool native_begin_depth_clear(const Env &e, NativeSurfaces &out) {
-    constexpr int cols = 640, rows = 448;
-    if (g_skip_frame || (g_scale > 1 && e.scy1 != rows - 1)) return false;
-    Surface *ds = find_surface(e.zbp, e.fbw, e.zpsm, true);
-    if (!ds || !ds->dsv || ds->w != cols || ds->h < rows) return false;
+bool native_begin_depth_clear(const Env &e, NativeSurfaces &out, const int *bounds) {
+    const int x0 = bounds ? bounds[0] : 0, y0 = bounds ? bounds[1] : 0;
+    const int x1 = bounds ? bounds[2] : 640, y1 = bounds ? bounds[3] : 448;
+    if (g_skip_frame || (!bounds && g_scale > 1 && e.scy1 != 447)) return false;
+    Surface *ds = get_surface(e.zbp, e.fbw, e.zpsm, true, y1);
+    if (!ds || !ds->dsv || x1 > ds->w || y1 > ds->h) return false;
 
-    // The covered depth pages must already be resident in their exact owner.
-    // In particular, don't acquire or invalidate any scene color pages.
-    std::vector<PageRect> pages;
-    surface_pages_rect(ds, 0, 0, cols, rows, pages);
-    for (const auto &page : pages)
-        if (g_owner[page.page] != ds) return false;
-
+    // Discard an old owner only where this clear overwrites the entire physical page.
+    // For each boundary page, acquire its surviving texels from CPU or GPU residency.
+    const auto cov = page_coverage(e.zbp, e.fbw, e.zpsm, x0, y0, x1 - x0, y1 - y0);
+    for (uint32_t i = 0; i < cov.count; ++i) {
+        const auto page = cov.pages[i];
+        const auto *owner = g_owner[page];
+        if (cov.complete[page] == 0xffffffffu || owner == ds) continue;
+        if (!bounds || g_deferred[page] || (owner && !g_vram_ok[page] && !convertible(owner, ds)))
+            return false;
+    }
     flush();
     g_ctx->barrier(2);
-    acquire(ds, 0, 0, cols, rows);
+    claim_full_clear_pages(ds, cov);
+    acquire(ds, x0, y0, x1, y1);
     ++ds->version;
     ds->last_use = g_frame_no;
     out = {(void *)g_ctx->cmd, 0, (uint64_t)ds->tex->image, (uint32_t)(ds->w * g_scale), (uint32_t)(ds->h * g_scale),
@@ -205,16 +245,26 @@ bool native_begin_depth_clear(const Env &e, NativeSurfaces &out) {
 }
 
 void native_mark_bootstrap_depth_clear(const Env &e) {
-    // The first Z16S page lies wholly inside the completed zero clear.
-    // 0x35BE08 aliases it as CT32 before the icon upload partially updates
-    // it. Keep the known zero CPU bytes current for both operations.
-    const uint32_t page = e.zbp >> 5;
-    const Surface *owner = g_owner[page];
+    // Every full Z16S page inside the completed 640x418 zero clear is known
+    // zero on both GPU and CPU. Early boot uploads (e.g. 0x35BE08 icon and
+    // font/UI textures) alias these pages before any scene draw touches them;
+    // marking all fully cleared pages current avoids spurious deferred readbacks.
+    const uint32_t first_page = e.zbp >> 5;
+    const Surface *owner = g_owner[first_page];
     if (!owner || !owner->depth || owner->psm != PSMZ16S || owner->bp != e.zbp) return;
+    const PageCoverage cov = page_coverage(e.zbp, e.fbw, e.zpsm, 0, 0, 640, 418);
     constexpr uint32_t page_bytes = kVramSize / kPages;
-    memset(vram + page * page_bytes, 0, page_bytes);
-    g_vram_ok[page] = true;
-    g_cpu_valid_blocks[page] = ~0u;
+    for (uint32_t i = 0; i < cov.count; ++i) {
+        const uint32_t page = cov.pages[i];
+        if (cov.complete[page] != 0xffffffffu || g_owner[page] != owner) continue;
+        memset(vram + page * page_bytes, 0, page_bytes);
+        g_vram_ok[page] = true;
+        g_cpu_valid_blocks[page] = ~0u;
+    }
+}
+
+NativeSubmission native_submission() {
+    return g_ctx ? NativeSubmission{g_ctx->serial, g_ctx->completed} : NativeSubmission{};
 }
 
 void native_end() {

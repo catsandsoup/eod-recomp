@@ -341,6 +341,16 @@ void drive_player_along_ilin(uint32_t car) {
     const float brake = (speed > desired + 4.0f) ? 0.45f : 0.0f;
     const float handbrake = (front < 0.1f && speed > 10.0f) ? 0.35f : 0.0f;
     controls(car, steer, gas, brake, handbrake, -10);
+#ifdef EOD_TRACY
+    static const bool trace_input = std::getenv("EOD_RACE_STRESS_TRACE") != nullptr;
+    static uint32_t last_sample = 0;
+    const uint32_t vb = ee_r32(0x003E579C);
+    if (trace_input && vb - last_sample >= 30) {
+        last_sample = vb;
+        std::fprintf(stderr, "[race-ai] vb=%u line=%08x x=%.2f z=%.2f target=%.2f,%.2f speed=%.3f steer=%.3f gas=%.3f brake=%.3f\n",
+                     vb, resource, x, z, tx, tz, speed, steer, gas, brake);
+    }
+#endif
 }
 
 void apply_live_car_tuner_and_arcade(uint32_t player_car) {

@@ -1,5 +1,19 @@
 # Native camera aspect hook
 
+## Current renderer
+
+Match Display (`AspectRatio=display`) uses the drawable's aspect for the game's projection and HUD. SDL and Win32 publish window pixel sizes. Vulkan takes its final dimensions from the created swapchain. Headless runs use the configured window width and height. Drawables narrower than 4:3 retain the retail field of view. Fixed 16:9, 16:10 and 4:3, the retail game option (`auto`), and Stretch remain selectable.
+
+`src/game_patches.cpp` wraps the retail display setter at `0034D328`. In widescreen mode it supplies the horizontal scale `(4/3) / outputAspect` at `003DD658`. The retail wide mode sets `003DD65C` to 1. Only the retail letterbox mode also reduces the vertical scale. The game builds the projection and the Plume scene feed consumes those coefficients. Each queued frame carries its own display ratio. A movie switches composition to 4:3. The next game frame restores the selected ratio. An explicit Stretch selection retains its stretched movie presentation.
+
+`EOD_CAMERA_TRACE=1` records projection inputs and the Vulkan composition source extent, target extent and destination rectangle. RenderScale 6 gives a 3840×2688 scene crop from the 640×448 game viewport. A visible Vulkan screenshot defaults to the drawable dimensions. An explicit `EOD_SCREENSHOT_SCALE` selects a raw capture, and explicit `EOD_SCREENSHOT_WIDTH` and `EOD_SCREENSHOT_HEIGHT` select a composition canvas.
+
+A 6× fullscreen Dundas race on the 3024×1964 Mac display presented the 3840×2688 scene to rectangle (0, 0, 3024, 1964). Matched frame 180 and 360 captures with fixed 4:3 had 203-pixel side margins. Switching to Match Display exposed scenery on both sides and filled the panel. Background feature matches in those two pairs gave horizontal-to-vertical magnification ratios of 0.9993 and 1.0029 (207 and 338 inliers).
+
+## Historical race-loop hook (October 2026)
+
+The following describes the earlier race-only hook and its original measurements. The current implementation uses the display setter described above.
+
 The host display aspect and the game's camera must agree. The PS2 game already
 has native widescreen projection and associated display handling. `src/hle_camera.cpp`
 wraps its display-mode setup rather than transforming rendered GS coordinates.

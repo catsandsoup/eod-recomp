@@ -7,6 +7,7 @@
 //
 // Checks it reports: whether batch emission (0x35CB88) ever happens outside a flush (0x34AF98), whether
 // queued records equal flushed records, and which callers queue through 0x34BDA8 / 0x34BF90.
+#include "gs/material_state.h"
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
@@ -155,7 +156,9 @@ const bool g_init = [] {
     }
     if (const char *e = std::getenv("EOD_RENDER_TRACE_EVERY")) g_every = std::strtoull(e, nullptr, 10);
     g_on = !g_frames.empty() || g_every;
+#ifndef EOD_R7_RELEASE
     if (g_on) g_vu1_start_hook = on_vu1_start;
+#endif
     return true;
 }();
 
@@ -383,7 +386,18 @@ extern "C" void f_0034B140(void) {
     }
 }
 
-static bool scene_clear_inputs(uint32_t qwc, native::SceneClear &clear) {
+static bool scene_clear_inputs(uint32_t qwc, uint32_t caller, native::SceneClear &clear) {
+    // 0x360EF0 is the unaligned-width branch of the same rectangle producer.
+    // Capture its saved arguments before the seven-qword DMA reservation.
+    if (caller == 0x360F48 && qwc == 7 && native::scene_clear_enabled() && !diff_in_original_side()) {
+        const auto byte = [](int i) { return g_ee.r[i].uw[0] & 255; };
+        const uint32_t zbuf = (MEM_LW(0x4D8BD0) & 511) | ((MEM_LW(0x4D8BD4) & 15) << 24);
+        clear = {g_ee.r[16].sw[0], g_ee.r[17].sw[0], g_ee.r[19].sw[0], g_ee.r[30].sw[0],
+                 byte(18) | (byte(20) << 8) | (byte(21) << 16) | (byte(22) << 24), zbuf,
+                 g_ee.r[23].sw[0] ? native::SceneClearTarget::RectColorDepth : native::SceneClearTarget::RectDepth};
+        return true;
+    }
+    if (caller != 0x361154) return false;
     // The aligned branch in 0x361098 has spilled the original rectangle/color
     // into these registers before its sole reserve call at 0x361154.
     if (!native::scene_clear_enabled() || diff_in_original_side() || qwc != native::kSceneClearDirectQwc + 1 ||
@@ -391,11 +405,13 @@ static bool scene_clear_inputs(uint32_t qwc, native::SceneClear &clear) {
         return false;
     const bool depth_only = g_ee.r[21].ud[0] == 0;
     if (depth_only) {
+#ifndef EOD_R7_RELEASE
         static const bool frontend_depth_clear = [] {
             const char *v = std::getenv("EOD_NATIVE_FRONTEND_DEPTH_CLEAR");
             return v && v[0] == '1';
         }();
         if (!frontend_depth_clear || !native::native_only()) return false;
+#endif
         // 0x35BBAC -> 0x35B9F8 -> 0x365228. The helper at 0x361318
         // tail-calls the aligned clear, so check the saved callers.
         const uint32_t sp = g_ee.r[29].uw[0];
@@ -428,8 +444,10 @@ static bool scene_clear_inputs(uint32_t qwc, native::SceneClear &clear) {
         if (!g_on && !nat) return f_##addr##_orig();                              \
         const uint32_t qwc = arg(0), r = ra();                                    \
         native::SceneClear clear{};                                               \
-        const bool scene_clear = nat && r == 0x361154 && scene_clear_inputs(qwc, clear); \
+        const bool scene_clear = nat && scene_clear_inputs(qwc, r, clear); \
         f_##addr##_orig();                                                        \
+        if (nat && r == 0x363720 && qwc == 4 && gs::material_state_enabled() && !diff_in_original_side()) \
+            gs::record_shadow_blend(g_ee.r[2].uw[0], g_ee.r[16].ud[0] != 0);       \
         if (g_on && g_ee.r[2].uw[0]) tag_range(g_ee.r[2].uw[0], qwc * 16, r);     \
         if (nat) native::ee_packet_reserved(g_ee.r[2].uw[0], qwc, r,              \
                                             scene_clear ? &clear : nullptr);      \

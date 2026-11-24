@@ -16,6 +16,7 @@ struct State {
     float steer = 0, gas = 0, brake = 0, handbrake = 0;
     int32_t gear = 0;
     float damage = 0;
+    uint32_t damage_stage = 0;
 };
 constexpr uint32_t kPose = 0x64, kVel = 0x104, kAngVel = 0x110, kSteer = 0x1B6C, kGas = 0x1B70,
                    kBrake = 0x1B74, kHandbrake = 0x1B7C, kGear = 0x1B90, kDamage = 0x1BEC, kType = 0x1E0;
@@ -25,8 +26,12 @@ uint32_t car_of_slot(uint32_t slot);        // 0 when absent
 bool is_human(uint32_t car);                // type 0x50
 uint32_t human_controller_of(uint32_t car); // verifies native HumanDriver + pad zero input
 uint32_t body_of(uint32_t car);             // physics master record, 0 if not found
+uint32_t attached_trailer(uint32_t tow_car); // single native trailer hitched to this tow car
 bool valid_state(const State &s);           // finite pose/controls within native world limits
 bool read(uint32_t car, State &s);
+void write_controls(uint32_t car, const State &s);
+void release_controls(uint32_t car);
+void write_condition(uint32_t car, const State &s);
 void write(uint32_t car, const State &s);   // body record + car copies
 void before_step();                         // world-step wrapper hooks
 void after_step();
@@ -36,22 +41,25 @@ void quat_to_matrix(const float q[4], float rows[9]);
 State lerp(const State &a, const State &b, float t);   // pose slerp, linear elsewhere
 State extrapolate(const State &s, float seconds);       // dead reckoning
 
-// Remote car timeline: snapshots keyed by the sender's tick, a play-head that follows
-// the newest tick at a fixed delay, a short dead-reckoning window, and a blend that
-// turns big corrections into a few frames of movement. The car is never made intangible.
+// Remote car timeline. Nearby solid cars use bounded prediction for contact;
+// at distance the play-head buffers snapshots to smooth network jitter.
 class Remote {
 public:
-    static constexpr float kDelay = 6.f;          // ticks (1/60 s) behind the newest snapshot
     static constexpr float kExtrapolateMax = 15.f;
+    static constexpr unsigned kStallSteps = 30;   // half a second without a newer snapshot
     void push(uint32_t tick, const State &s);
     bool ready() const { return !ring_.empty(); }
-    State advance();                              // one local world step
-    void reset() { ring_.clear(); head_init_ = false; shown_init_ = false; }
+    float proximity_to(const State &car) const;
+    State advance(int buffer_ms = 100, float proximity = 0, unsigned rtt_ms = 0);
+    bool stalled() const { return steps_since_sample_ == kStallSteps; }
+    void follow_native(const State &s) { shown_ = s; }
+    void reset() { ring_.clear(); head_init_ = false; shown_init_ = false; steps_since_sample_ = 0; }
     float newest_tick() const { return ring_.empty() ? 0.f : (float)ring_.back().tick; }
 private:
     struct Entry { uint32_t tick; State s; };
     std::vector<Entry> ring_;
     float head_ = 0;
+    unsigned steps_since_sample_ = 0;
     bool head_init_ = false, shown_init_ = false;
     State shown_;
     State sample(float tick) const;

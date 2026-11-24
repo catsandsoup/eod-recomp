@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 Config g_config;
 
@@ -18,6 +20,14 @@ const char *const kPadKeyLabels[KEY_COUNT] = {"Up / steer", "Down", "Left / stee
 Config::Config() {
 #ifdef EOD_PLUME
     native_renderer = true;
+#endif
+#ifdef EOD_R7_RELEASE
+    plume_modern = true;
+    render_scale = 6;
+    frame_skip = false;
+    fullscreen = true;
+    detail = "maximum";
+    draw_distance = 8.0f;
 #endif
     static const char *const defaults[KEY_COUNT] = {"Up", "Down", "Left", "Right", "X,Space", "C", "Z", "V",
                                                     "Q", "E", "A,1", "D,3", "", "", "Enter", "Backspace"};
@@ -84,17 +94,13 @@ std::string g_config_path = "eod.ini";
 
 bool config_load(const std::string &path, Config &c) {
     if (&c == &g_config) g_config_path = path;
-    FILE *f = host_fopen(path.c_str(), "r");
-    const bool file_loaded = f != nullptr;
+    std::ifstream file(std::filesystem::u8path(path));
+    const bool file_loaded = file.is_open();
     int input_defaults = 0;  // [Input] InputDefaults: 2 = written after triggers became the default
-    char line[1024];
-    std::string section;
-    while (f && fgets(line, sizeof line, f)) {
-        std::string l = line;
-        size_t sc = l.find(';');
-        if (sc != std::string::npos) l = l.substr(0, sc);
+    std::string section, l;
+    while (std::getline(file, l)) {
         l = trim(l);
-        if (l.empty()) continue;
+        if (l.empty() || l[0] == ';') continue;
         if (l[0] == '[') {
             section = trim(l.substr(1, l.find(']') == std::string::npos ? std::string::npos : l.find(']') - 1));
             continue;
@@ -102,6 +108,10 @@ bool config_load(const std::string &path, Config &c) {
         size_t eq = l.find('=');
         if (eq == std::string::npos) continue;
         std::string k = trim(l.substr(0, eq)), v = trim(l.substr(eq + 1));
+        // The settings writer stores paths literally. A semicolon in a folder
+        // name is valid on both Windows and macOS.
+        if (!(ieq(section, "System") && (ieq(k, "DataPath") || ieq(k, "MemoryCard"))))
+            v = trim(v.substr(0, v.find(';')));
         auto num = [&](int lo, int hi) {
             int n = atoi(v.c_str());
             return n < lo ? lo : n > hi ? hi : n;
@@ -125,7 +135,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "Width")) c.width = num(320, 16384);
             else if (ieq(k, "Height")) c.height = num(240, 16384);
             else if (ieq(k, "VSync")) c.vsync = to_bool(v);
-            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "16:9") ? "16:9" : ieq(v, "16:10") ? "16:10" : ieq(v, "stretch") ? "stretch" : ieq(v, "4:3") ? "4:3" : "auto";
+            else if (ieq(k, "AspectRatio")) c.aspect = ieq(v, "display") ? "display" : ieq(v, "16:9") ? "16:9" : ieq(v, "16:10") ? "16:10" : ieq(v, "stretch") ? "stretch" : ieq(v, "4:3") ? "4:3" : "auto";
 #ifdef __APPLE__
             else if (ieq(k, "RenderScale")) c.render_scale = num(0, kMaxRenderScale);  // 0 = auto (Vulkan)
 #else
@@ -134,6 +144,7 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);
             else if (ieq(k, "ShowFps")) c.show_fps = to_bool(v);
+            else if (ieq(k, "Look") && (ieq(v, "Classic") || ieq(v, "Modern"))) c.plume_modern = ieq(v, "Modern");
             else if (ieq(k, "ModernRenderer")) c.modern_renderer = to_bool(v);
             else if (ieq(k, "NativeRenderer")) c.native_renderer = to_bool(v);
             else if (ieq(k, "SplitScreenParity")) c.split_screen_parity = to_bool(v);
@@ -206,6 +217,7 @@ bool config_load(const std::string &path, Config &c) {
             if (ieq(k, "CarLooks")) c.car_looks = v;
         } else if (ieq(section, "Online")) {
             if (ieq(k, "Nickname")) c.nickname = v;
+            else if (ieq(k, "SnapshotBufferMs")) c.snapshot_buffer_ms = num(60, 140);
         } else if (ieq(section, "System")) {
             if (ieq(k, "MemoryCard")) c.memcard_dir = v;
             else if (ieq(k, "DataPath")) c.data_dir = v;
@@ -215,7 +227,6 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "SkipMemcard")) c.skip_memcard = to_bool(v);
         }
     }
-    if (f) fclose(f);
 #ifndef _WIN32
     // Older files stored ControllerLayout=original only because it was the default then; analog
     // trigger gas/brake is the default now (an explicit choice is kept once the file is rewritten).
@@ -276,7 +287,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "Width=%d\n", c.width);
     fprintf(f, "Height=%d\n", c.height);
     fprintf(f, "VSync=%d\n", c.vsync ? 1 : 0);
-    fprintf(f, "AspectRatio=%s      ; auto (the game's Widescreen option), 4:3, 16:9 (sets the game's option) or stretch\n",
+    fprintf(f, "AspectRatio=%s      ; display (match drawable), auto (game option), 4:3, 16:9, 16:10 or stretch\n",
             c.aspect.c_str());
 #ifdef __APPLE__
     fprintf(f, "RenderScale=%d        ; internal resolution: 0 = auto, 1 = 640x448 (PS2), 2 = 1280x896, ...\n", c.render_scale);
@@ -286,6 +297,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "SmoothDisplay=%d\n", c.smooth_display ? 1 : 0);
     fprintf(f, "FrameSkip=%d\n", c.frame_skip ? 1 : 0);
     fprintf(f, "ShowFps=%d\n", c.show_fps ? 1 : 0);
+    fprintf(f, "Look=%s\n", c.plume_modern ? "Modern" : "Classic");
     fprintf(f, "ModernRenderer=%d     ; the modern renderer (F9 or L1+R1+R3 switch it live); effects in percent:\n",
             c.modern_renderer ? 1 : 0);
     fprintf(f, "NativeRenderer=%d     ; cars, props and characters drawn by the native renderer (preview)\n",
@@ -353,6 +365,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "\n[Career]\n; career cars shown as another car or paint job (career vehicle:vehicle, set by the save editor)\n");
     fprintf(f, "CarLooks=%s\n", c.car_looks.c_str());
     fprintf(f, "\n[Online]\nNickname=%s\n", c.nickname.c_str());
+    fprintf(f, "SnapshotBufferMs=%d\n", c.snapshot_buffer_ms);
     fprintf(f, "\n[System]\n");
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
     fprintf(f, "DataPath=%s\n", c.data_dir.c_str());
@@ -360,6 +373,6 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "FastBoot=%d           ; 1: skip intros, title screen, memcard & loading screen hold delays\n", c.fast_boot ? 1 : 0);
     fprintf(f, "SkipIntros=%d         ; 1: skip startup .PSS intro movies\n", c.skip_intros ? 1 : 0);
     fprintf(f, "SkipMemcard=%d        ; 1: skip PS2 memory card boot hold/prompt delays (save still loads)\n", c.skip_memcard ? 1 : 0);
-    fclose(f);
-    return true;
+    const bool wrote_settings = !ferror(f);
+    return fclose(f) == 0 && wrote_settings;
 }

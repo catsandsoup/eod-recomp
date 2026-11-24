@@ -55,6 +55,8 @@ bool overlay_paused();
 void overlay_toggle();
 // Opens the menu on the ONLINE tab (the lobby comes back after an online event).
 void overlay_show_online();
+namespace game_frontend { struct Command; }
+void overlay_resume_join(const game_frontend::Command &command);
 enum class RendererLook { Classic, Modern, Original };
 const char *overlay_renderer_look_label(RendererLook look);
 // Publishes the graphics look on the next overlay frame.

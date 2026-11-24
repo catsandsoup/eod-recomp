@@ -30,6 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  EOD_RELAY_ENDPOINT: ${{ vars.EOD_RELAY_ENDPOINT }}
   SLUS_SHA256: 4f60053dc141365f5ae50737622f8408be30ced513b4c109427c926461f2e2ae
 
 jobs:
@@ -102,7 +103,7 @@ jobs:
 
       - name: Configure
         run: |
-          args="-DCMAKE_BUILD_TYPE=Release"
+          args="-DCMAKE_BUILD_TYPE=Release -DEOD_BUNDLED_OPUS=ON"
           if [ -n "${{ matrix.toolchain }}" ]; then
             args="$args -DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }}"
           fi

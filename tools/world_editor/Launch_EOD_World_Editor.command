@@ -17,9 +17,6 @@ if [[ -d "$QT_PLUGINS" ]]; then
 fi
 
 # Wire native macOS Plume build & Homebrew MoltenVK/Vulkan loader when present
-if [[ -x "$REPO_ROOT/build-mac-plume/eod" ]]; then
-  export EOD_PIE_EXE="${EOD_PIE_EXE:-$REPO_ROOT/build-mac-plume/eod}"
-fi
 if [[ -f "$REPO_ROOT/build-mac-plume/eod_editor_plume.dylib" ]]; then
   export EOD_EDITOR_PLUME_LIBRARY="${EOD_EDITOR_PLUME_LIBRARY:-$REPO_ROOT/build-mac-plume/eod_editor_plume.dylib}"
 fi

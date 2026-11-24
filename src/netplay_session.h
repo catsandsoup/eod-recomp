@@ -5,6 +5,7 @@
 // Design and references: docs/NETPLAY_STATE_SYNC.md.
 #include "../runtime/app/game_frontend.h"
 #include "netplay_car.h"
+#include "netplay_names.h"
 #include "netplay_hooks.h"
 #include "netplay_wire.h"
 #include <functional>
@@ -52,13 +53,22 @@ public:
     void roster_post(uint32_t description);
     void step_begin();                            // world-step hooks
     void step_end();
+    bool remote_driver_car(uint32_t car) const;
+    uint16_t eligible_battle_slots() const;
+    bool battle_respawn(uint32_t master, uint32_t slot);
+    bool car_contact(uint32_t car, int32_t other_index, uint32_t other_car = 0);
+    void record_damage_feedback(uint32_t car, float flash, float shake);
     bool step_allowed() const;                    // false while online grid is blocked/aborting
+    void race_frame();                            // after native frame publication, before the exit gate
+    const std::vector<EventResultRow> *event_results() const;
     const std::string &last_error() const { return error_; }
     std::string strip() const;
+    std::vector<names::Tag> driver_tags();
     void mix_voice(int16_t *stereo, int frames);
     std::vector<std::string> speakers() const;
 
 private:
+    void battle_frame(uint64_t now);
     void auto_drive(uint64_t t);
     struct Impl;
     std::unique_ptr<Impl> d_;

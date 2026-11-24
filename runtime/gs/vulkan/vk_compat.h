@@ -2,6 +2,7 @@
 // from gs_d3d11.cpp. These are CPU state descriptions, not a Direct3D runtime:
 // all allocation, synchronization and drawing below use Vulkan exclusively.
 #pragma once
+#include "../../platform/presentation.h"
 #include "present_timing.h"
 #include "core/trace.h"
 #include "core/prof.h"
@@ -470,7 +471,7 @@ struct Context {
     std::vector<VkSemaphore> presentDone;
     bool wantVsync = true; // snapshotted once from the launch configuration
     VkBool32 anisotropy = VK_FALSE;
-    bool displayTiming = false;
+    bool displayTiming = false, schedulePresents = false, logPresents = false;
     PFN_vkGetRefreshCycleDurationGOOGLE refreshDuration{};
     PFN_vkGetPastPresentationTimingGOOGLE pastPresentation{};
     PresentCadence cadence;
@@ -499,12 +500,17 @@ struct Context {
     uint64_t presentation_deadline() {
         if (!displayTiming)
             return 0;
-        if (!refreshQueryCountdown) {
+#ifdef __APPLE__
+        if (schedulePresents)
+            cadence.refresh(presentation::refresh_period_ns.load(std::memory_order_relaxed));
+#else
+        if (schedulePresents && !refreshQueryCountdown) {
             VkRefreshCycleDurationGOOGLE duration{};
             cadence.refresh(refreshDuration(device, swap, &duration) == VK_SUCCESS ? duration.refreshDuration : 0);
             refreshQueryCountdown = 119;
-        } else
+        } else if (refreshQueryCountdown)
             --refreshQueryCountdown;
+#endif
         // Nonblocking feedback: the extension returns only completed presents.
         uint32_t count = 0;
         if (pastPresentation(device, swap, &count, nullptr) == VK_SUCCESS && count) {
@@ -512,10 +518,16 @@ struct Context {
             count = (uint32_t)times.size();
             auto result = pastPresentation(device, swap, &count, times.data());
             if (result == VK_SUCCESS || result == VK_INCOMPLETE)
-                for (uint32_t i = 0; i < count; ++i)
-                    cadence.observe(times[i].actualPresentTime);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const auto &completed = times[i];
+                    cadence.observe(completed.actualPresentTime);
+                    if (logPresents)
+                        fprintf(stderr, "[present] id=%u actual_ns=%llu desired_ns=%llu\n",
+                                completed.presentID, (unsigned long long)completed.actualPresentTime,
+                                (unsigned long long)completed.desiredPresentTime);
+                }
         }
-        return cadence.schedule(display_clock_ns(), wantVsync);
+        return schedulePresents ? cadence.schedule(display_clock_ns(), wantVsync) : 0;
     }
     VkPhysicalDeviceMemoryProperties memories{};
     struct PipelineKey {
@@ -538,6 +550,8 @@ struct Context {
     int specializeMode = 1;
     Shader *shaderTable[16]{};
     struct Specializer {
+        std::thread worker;
+        bool stopping = false; // under mutex
         std::mutex mutex;
         std::condition_variable wake;
         std::deque<PipelineKey> queue;
@@ -1167,6 +1181,7 @@ struct Context {
     void remember(const PipelineKey &key, VkPipeline pipeline);
     VkPipeline specialized(const PipelineKey &key);
     bool init(bool withWindow);
+    void stop_specializer();
     bool resize();
     Texture *acquire(bool vsync);
     bool present();
@@ -1575,8 +1590,12 @@ inline bool Context::init(bool withWindow) {
     i.flags = portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
     i.enabledExtensionCount = (uint32_t)exts.size();
     i.ppEnabledExtensionNames = exts.data();
+#ifdef EOD_R7_RELEASE
+    if (!instance) throw std::runtime_error("Plume Vulkan instance required");
+#else
     if (!instance)
         require(vkCreateInstance(&i, nullptr, &instance), "instance");
+#endif
 #if defined(_WIN32) || defined(EOD_PLUME)
     volkLoadInstance(instance);
 #endif
@@ -1653,7 +1672,10 @@ inline bool Context::init(bool withWindow) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     const char *timing = getenv("EOD_PRESENT_TIMING");
     // Fidelity bring-up uses ordinary presentation; high-refresh scheduling is opt-in.
-    displayTiming = surface && has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && timing && *timing == '1';
+    schedulePresents = timing && *timing == '1';
+    const char *feedback = getenv("EOD_PRESENT_FEEDBACK");
+    logPresents = feedback && *feedback == '1';
+    displayTiming = surface && has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && (schedulePresents || logPresents);
     if (displayTiming)
         dext.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     float priority = 1;
@@ -1685,11 +1707,15 @@ inline bool Context::init(bool withWindow) {
 #ifdef EOD_PLUME
     // plume's device: every extension above, dynamic rendering, and every supported core
     // feature (dual-source blend, depth clamp and anisotropy among them).
-    if (plumeInstance && !plume_device::create_device(physical, family, dext, core13, device, queue, queueMutex))
-        fprintf(stderr, "[vulkan] the GS creates its own device on plume's instance\n");
+    if (plumeInstance)
+        plume_device::create_device(physical, family, dext, core13, device, queue, queueMutex);
 #endif
+#ifdef EOD_R7_RELEASE
+    if (!device) throw std::runtime_error("Plume Vulkan device required");
+#else
     if (!device)
         require(vkCreateDevice(physical, &d, nullptr, &device), "device");
+#endif
 #if defined(_WIN32) || defined(EOD_PLUME)
     volkLoadDevice(device);
 #endif
@@ -1711,7 +1737,7 @@ inline bool Context::init(bool withWindow) {
             vkGetDeviceProcAddr(device, "vkGetPastPresentationTimingGOOGLE"));
         displayTiming = refreshDuration && pastPresentation;
         if (displayTiming)
-            fprintf(stderr, "[vulkan] refresh-grid presentation timing enabled\n");
+            fprintf(stderr, "[vulkan] presentation timing enabled (schedule=%d feedback=%d)\n", schedulePresents, logPresents);
     }
     push = has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
                ? (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR")
@@ -1754,8 +1780,8 @@ inline bool Context::init(bool withWindow) {
     if (const char *v = getenv("EOD_VK_SPECIALIZE"))
         specializeMode = std::clamp(atoi(v), 0, 2);
     if (specializeMode == 1) {
-        specializer = new Specializer; // lives for the process (no join at exit)
-        std::thread([this, sp = specializer] {
+        specializer = new Specializer;
+        specializer->worker = std::thread([this, sp = specializer] {
 #ifdef __APPLE__
             // Below the EE/GS threads: the compile (and Metal's compiler
             // service, which inherits the QoS) uses otherwise idle cores.
@@ -1765,7 +1791,8 @@ inline bool Context::init(bool withWindow) {
                 PipelineKey key;
                 {
                     std::unique_lock<std::mutex> lock(sp->mutex);
-                    sp->wake.wait(lock, [sp] { return !sp->queue.empty(); });
+                    sp->wake.wait(lock, [sp] { return sp->stopping || !sp->queue.empty(); });
+                    if (sp->stopping) return;
                     key = sp->queue.front();
                     sp->queue.pop_front();
                 }
@@ -1778,7 +1805,7 @@ inline bool Context::init(bool withWindow) {
                 sp->done.emplace_back(key, pipeline);
                 sp->ready.store(true, std::memory_order_release);
             }
-        }).detach();
+        });
     }
     VkFormat formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R16G16_UINT};
     uint32_t zero = 0;
@@ -1796,6 +1823,20 @@ inline bool Context::init(bool withWindow) {
         resize();
     }
     return true;
+}
+inline void Context::stop_specializer() {
+    if (!specializer) return;
+    {
+        std::lock_guard<std::mutex> lock(specializer->mutex);
+        specializer->stopping = true;
+    }
+    specializer->wake.notify_one();
+    if (specializer->worker.joinable()) specializer->worker.join();
+    // The GS no longer submits draws. These completed pipelines never entered its cache.
+    for (const auto &entry : specializer->done)
+        if (entry.second) vkDestroyPipeline(device, entry.second, nullptr);
+    delete specializer;
+    specializer = nullptr;
 }
 inline bool Context::resize() {
     cadence = {};
@@ -1865,6 +1906,9 @@ inline bool Context::resize() {
     }
     s.clipped = VK_TRUE;
     require(vkCreateSwapchainKHR(device, &s, nullptr, &swap), "swapchain");
+    // The SDL window may still be transitioning to fullscreen. The image
+    // extent returned by Vulkan is the geometry the player actually sees.
+    presentation::swapchain_aspect.store(drawable_aspect(extent.width, extent.height), std::memory_order_relaxed);
     vkGetSwapchainImagesKHR(device, swap, &n, nullptr);
     std::vector<VkImage> images(n);
     vkGetSwapchainImagesKHR(device, swap, &n, images.data());
@@ -1902,6 +1946,18 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     if (!swap || (uint32_t)w != extent.width || (uint32_t)h != extent.height)
         if (!resize())
             return nullptr;
+    // Submit the offscreen scene before waiting for the drawable. Otherwise
+    // ALL_COMMANDS waits on the swapchain semaphore even for the car and track.
+    static const bool early_scene_submit = [] {
+        const char *value = getenv("EOD_EARLY_SCENE_SUBMIT");
+        if (value) return value[0] == '1';
+#if defined(__APPLE__) && defined(EOD_R7_RELEASE)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    if (early_scene_submit && recording && !waitAcquire) submit(false, false);
     auto r = vkAcquireNextImageKHR(device, swap, UINT64_MAX, acquired, VK_NULL_HANDLE, &backIndex);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         resize();

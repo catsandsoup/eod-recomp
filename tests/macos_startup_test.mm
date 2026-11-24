@@ -34,6 +34,16 @@ int main() {
     DiscId wrong = id; wrong.elf_crc32 ^= 1;
     check(!mac_app_prepare(data,config,true,wrong), "wrong game version rejected");
     check(mac_app_prepare(data,config,true,id), "valid explicit disc accepted");
+    fs::path library = scratch / u8"Racing; Édition" / "Game Files";
+    fs::create_directories(library.parent_path());
+    fs::rename(data, library);
+    check(mac_app_install_disc(library.string(),config,id).empty(), "picker accepts an extracted library in place");
+    Config next_release;
+    check(config_load(config,next_release) && next_release.data_dir == library.string(),
+          "another release reads the exact custom disc location");
+    check(!fs::exists(fs::path(support) / "disc"), "choosing an extracted library does not copy it");
+    check(!mac_app_install_disc((scratch / "unavailable.iso").string(),config,id).empty(), "unavailable replacement rejected");
+    check(config_load(config,next_release) && next_release.data_dir == library.string(), "failed replacement preserves saved library");
     data.clear();
     std::string missing = (scratch / "absent-env").string();
     setenv("EOD_DATA",missing.c_str(),1);
@@ -47,6 +57,7 @@ int main() {
     check(std::string(getenv("EOD_MOD_DIR")) == "explicit-test-overlay", "explicit overlay preserved");
     unsetenv("EOD_MOD_DIR");
     std::string why;
+    check(mac_app_select_mods(false,&why) && why.empty(), "a bare public executable needs only the verified disc");
     check(!mac_app_activate_integrated(&why) && !why.empty(), "missing integrated content is an error, not native fallback");
     check(getenv("EOD_MOD_DIR") == nullptr, "failed activation leaves no overlay");
     setenv("EOD_NATIVE_ONLY", "1", 1);

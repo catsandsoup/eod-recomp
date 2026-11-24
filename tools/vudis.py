@@ -48,6 +48,10 @@ def upper(w):
     n = other.get(op2, '?s%02x' % op2)
     if n == 'nop':
         return 'nop ' + flags
+    if op2 in (0x1F, 0x2E):
+        return '%s.%s vf%d, vf%d %s' % (n, d, fs(w), ft(w), flags)
+    if op2 in (0x28, 0x29, 0x2A, 0x2C, 0x2D):
+        return '%s.%s ACC, vf%d, vf%d %s' % (n, d, fs(w), ft(w), flags)
     return '%s.%s vf%d, vf%d %s' % (n, d, ft(w), fs(w), flags)
 
 
@@ -95,8 +99,10 @@ def lower(w, addr):
          0x18: 'fmeq', 0x1A: 'fmand', 0x1B: 'fmor', 0x1C: 'fcget', 0x20: 'b', 0x21: 'bal', 0x24: 'jr',
          0x25: 'jalr', 0x28: 'ibeq', 0x29: 'ibne', 0x2C: 'ibltz', 0x2D: 'ibgtz', 0x2E: 'iblez', 0x2F: 'ibgez'}
     n = m.get(op, '?op%02x' % op)
-    if n in ('lq', 'sq', 'ilw', 'isw'):
-        return '%s.%s %s%d, %d(vi%d)' % (n, d, 'vf' if n in ('lq', 'sq') else 'vi', it, simm11 * 1, is_)
+    if n == 'sq':
+        return 'sq.%s vf%d, %d(vi%d)' % (d, is_, simm11, it)
+    if n in ('lq', 'ilw', 'isw'):
+        return '%s.%s %s%d, %d(vi%d)' % (n, d, 'vf' if n == 'lq' else 'vi', it, simm11, is_)
     if n in ('iaddiu', 'isubiu'):
         return '%s vi%d, vi%d, 0x%x' % (n, it, is_, (w & 0x7FF) | ((w >> 10) & 0x7800))
     if n.startswith('ib') or n in ('b', 'bal'):

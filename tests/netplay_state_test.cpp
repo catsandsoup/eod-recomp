@@ -1,7 +1,9 @@
 // Netplay state sync: wire format, quaternion/pose maths, remote-car smoothing, puppet writes.
 #include "core/memory.h"
 #include "netplay_car.h"
+#include "netplay_names.h"
 #include "netplay_wire.h"
+#include "netplay_battle.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,49 @@ static State make(float x, float z, float yaw, float vx, float vz) {
     return s;
 }
 int main() {
+    {
+        using namespace netplay;
+        BattleFrame host, guest;
+        host.tick = 480;
+        host.seats[1].deaths = 1;
+        host.seats[1].spawn_tick = 450;
+        host.seats[1].spawn.pose[9] = 23;
+        host.seats[0].kills = 1;
+        Writer w;
+        put_battle_frame(w, host, 2);
+        Reader full(w.b.data(), w.b.size());
+        require(get_battle_frame(full, 2, guest) && guest.seats[0].kills == 1 &&
+                guest.seats[1].spawn.pose[9] == 23 && guest.seats[1].deaths == 1, "Battle life round trip");
+        Reader short_frame(w.b.data(), w.b.size() - 1);
+        require(!get_battle_frame(short_frame, 2, guest) && guest.tick == 480, "truncated Battle spawn preserves last frame");
+        host.tick = 449;
+        Writer future;
+        put_battle_frame(future, host, 2);
+        Reader bad(future.b.data(), future.b.size());
+        require(!get_battle_frame(bad, 2, guest), "Battle spawn cannot come from a future simulation step");
+    }
+    {
+        using namespace netplay::names;
+        const Camera camera = {{2,3,4}, {{1,0,0}, {0,1,0}, {0,0,1}}, 320, -300, 640, 448};
+        Tag tag{};
+        require(project(camera, {2,3,14}, tag) && tag.x == .5f && tag.y == .5f, "tag at scene optical center");
+        require(project(camera, {3,4,14}, tag) && tag.x > .5f && tag.y < .5f, "tag moves right and up");
+        require(!project(camera, {2,3,3}, tag) && !project(camera, {100,3,14}, tag), "behind and off-screen tags culled");
+        const Tube rail = {{0,0,0}, {0,0,1}, 1, 2};
+        require(intersects(rail, {-5,0,0}, {5,0,0}), "tube body hides tag");
+        require(intersects(rail, {0,.5f,6}, {0,.5f,2.5f}), "rounded end hides tag along tube axis");
+        require(!intersects(rail, {0,1.5f,6}, {0,1.5f,-6}), "sightline clears tube");
+        const Box wall = {{0,0,0}, {{0,0,1},{0,1,0},{-1,0,0}}, {2,1,.25f}};
+        require(intersects(wall, {-5,0,0}, {5,0,0}), "rotated wall hides tag");
+        require(!intersects(wall, {-5,2,0}, {5,2,0}), "tag above wall remains visible");
+        const TerrainFace ground = {{{1,0,0}, {0,1,0}, {-1,-1,5}}, {0,1,0}, 0, 0};
+        require(intersects(ground, {1,2,1}, {1,-3,1}), "terrain hides tag");
+        require(!intersects(ground, {5,2,5}, {5,-3,5}), "outside terrain triangle remains visible");
+        require(enabled("No-Rules Race", 0) && !enabled("Demolition Derby", 0), "race and derby name defaults");
+        require(!enabled("No-Rules Race", toggle_bit("No-Rules Race")) &&
+                enabled("Demolition Derby", toggle_bit("Demolition Derby")), "host can override each mode group");
+    }
+
     // quaternion round trip over many orientations
     for (int i = 0; i < 200; ++i) {
         float yaw = i * 0.05f, c = std::cos(yaw), n = std::sin(yaw), p = std::sin(i * .13f) * .4f, cp = std::cos(p), sp = std::sin(p);
@@ -37,13 +82,17 @@ int main() {
     }
     // wire format
     {
-        State a = make(12.5f, -40.25f, 1.1f, 3.f, -4.f); a.ang[1] = .7f;
+        State a = make(12.5f, -40.25f, 1.1f, 3.f, -4.f); a.ang[1] = .7f; a.damage = .534291f; a.damage_stage = 3;
         netplay::Writer w; netplay::put_car(w, 5, 1234, a);
         netplay::Reader r(w.b.data(), w.b.size()); uint8_t slot; uint32_t tick; State b;
         require(netplay::get_car(r, slot, tick, b) && slot == 5 && tick == 1234, "wire header");
         require(std::fabs(b.pose[9] - 12.5f) < 1e-4f && std::fabs(b.pose[11] + 40.25f) < 1e-4f && std::fabs(b.vel[2] + 4.f) < 1e-4f, "wire position/velocity");
         for (int k = 0; k < 9; ++k) require(std::fabs(a.pose[k] - b.pose[k]) < 2e-3f, "wire orientation");
-        require(std::fabs(b.ang[1] - .7f) < 1e-3f && std::fabs(b.steer - .25f) < 1e-3f && b.gear == 3 && std::fabs(b.damage - .4f) < 1e-3f, "wire controls/damage");
+        require(std::fabs(b.ang[1] - .7f) < 1e-3f && std::fabs(b.steer - .25f) < 1e-3f && b.gear == 3 && b.damage == a.damage && b.damage_stage == 3, "wire controls/damage");
+        auto corrupted = w.b;
+        corrupted.back() = 255;
+        netplay::Reader invalid(corrupted.data(), corrupted.size());
+        require(!netplay::get_car(invalid, slot, tick, b), "invalid damage stage rejected");
         require(w.b.size() < 70, "snapshot stays compact");
         netplay::Reader bad(w.b.data(), 10); require(!netplay::get_car(bad, slot, tick, b), "truncated packet rejected");
     }
@@ -64,6 +113,53 @@ int main() {
         require(std::fabs(shown.pose[9] - expect) < 1.0f, "remote car trails by the interpolation delay");
         require(maxstep < 0.45f, "remote car moves smoothly (no jumps)");
     }
+    {
+        Remote nearby, distant;
+        State now, buffered;
+        for (uint32_t tick = 0; tick < 180; ++tick) {
+            // At 20 m/s an extra 100 ms of visual buffering moves a
+            // solid bumper two metres behind even the last received pose.
+            const uint32_t sender_tick = 100 + tick;
+            State leader = make(20.f * sender_tick / 60.f, 0, 0, 20, 0);
+            State follower = make(leader.pose[9] - 5, 0, 0, 20, 0);
+            State observer = make(leader.pose[9] - 100, 0, 0, 20, 0);
+            if (!(tick % 2)) {
+                State arrived = make(20.f * (sender_tick - 8) / 60.f, 0, 0, 20, 0);
+                nearby.push(sender_tick - 8, arrived);
+                distant.push(sender_tick - 8, arrived);
+            }
+            now = nearby.advance(100, nearby.proximity_to(follower), 266);
+            buffered = distant.advance(100, distant.proximity_to(observer), 266);
+            if (tick > 30) {
+                require(std::fabs(now.pose[9] - leader.pose[9]) < .55f, "nearby solid car keeps its bumper near the owner");
+                require(buffered.pose[9] + 3 < now.pose[9], "distant cars keep jitter protection");
+            }
+        }
+    }
+    {
+        Remote short_buffer, long_buffer;
+        State recent, delayed;
+        for (uint32_t tick = 0; tick < 240; ++tick) {
+            if (tick % 2 == 0) {
+                const State car = make(15.f * tick / 60.f, 0, 0, 15, 0);
+                short_buffer.push(tick, car);
+                long_buffer.push(tick, car);
+            }
+            recent = short_buffer.advance(60);
+            delayed = long_buffer.advance(140);
+        }
+        require(std::fabs((recent.pose[9] - delayed.pose[9]) - 1.2f) < .1f,
+                "80 ms of extra buffering at 15 m/s shifts the remote by 1.2 metres");
+    }
+    {
+        Remote remote;
+        auto intact = make(0, 0, 0, 10, 0);
+        auto hit = intact; hit.damage = .58f; hit.damage_stage = 3;
+        remote.push(1, intact); remote.advance();
+        remote.push(3, hit); remote.push(2, intact);
+        const auto shown = remote.advance();
+        require(shown.damage == hit.damage && shown.damage_stage == 3, "damage bypasses pose interpolation and stale snapshots");
+    }
     // a big correction is blended over several steps, never teleported
     {
         Remote live; State shown;
@@ -78,6 +174,31 @@ int main() {
         float at_stop = shown.pose[9];
         for (uint32_t t = 40; t < 400; ++t) shown = live.advance();
         require(shown.pose[9] > at_stop && shown.pose[9] < at_stop + 10.f * 0.5f, "late car is dead-reckoned briefly, then held");
+    }
+    // Prolonged loss hands a solid car to native physics until its owner resumes.
+    {
+        Remote remote;
+        State airborne = make(0, 0, 0, 0, 0);
+        airborne.pose[10] = 8;
+        remote.push(100, airborne);
+        for (unsigned i = 0; i < Remote::kStallSteps; ++i) {
+            require(!remote.stalled(), "short gaps keep the interpolated pose");
+            remote.push(100, airborne);  // the host may forward the last owner snapshot repeatedly
+            remote.advance();
+        }
+        remote.push(99, airborne);
+        require(remote.stalled(), "duplicate and reordered packets do not postpone native coasting");
+        State landed = airborne;
+        landed.pose[10] = .35f;
+        remote.follow_native(landed);
+        State owner = landed;
+        owner.pose[9] = 2.f;
+        owner.damage = .7f;
+        remote.push(174, owner);
+        State resumed = remote.advance();
+        require(!remote.stalled() && std::fabs(resumed.pose[10] - .35f) < .001f &&
+                resumed.pose[9] > 0 && resumed.pose[9] < 2 && resumed.damage == owner.damage,
+                "fresh owner state blends from the native landing and immediately restores confirmed damage");
     }
     // A long-delayed datagram cannot rewind a current-event remote timeline.
     {
@@ -97,8 +218,13 @@ int main() {
         MEM_SW(0x494D30, body); MEM_SW(0x494D28, 1); MEM_SW(0x3CE548, 1); MEM_SW(0x3CE4F8, car);
         require(body_of(car) == body, "body record located");
         State s = make(50, -20, 0.5f, 1, 2); write(car, s);
+        release_controls(car);
+        require(getf(car + kGas) == 0 && getf(car + kSteer) == 0 &&
+                ee_r32(car + kGear) == static_cast<uint32_t>(s.gear), "stalled owner coasts in its current gear");
         require(std::fabs(getf(body) - 50) < 1e-4f && std::fabs(getf(body + 8) + 20) < 1e-4f && std::fabs(getf(body + 0x50) - 1) < 1e-4f, "body updated");
         require(std::fabs(getf(car + 0x88) - 50) < 1e-4f && std::fabs(getf(car + 0x104) - 1) < 1e-4f, "car copies updated");
+        s.damage_stage = 3; write_condition(car, s);
+        require(getf(car + kDamage) == s.damage && ee_r32(car + 0x1BE8) == 3, "remote native health and impairment");
         float q[4] = {getf(body + 0x40), getf(body + 0x44), getf(body + 0x48), getf(body + 0x4C)};
         require(std::fabs(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3] - 1.f) < 1e-3f, "unit quaternion written");
         set_puppet(car, true); require(is_puppet(car), "puppet registered"); set_puppet(car, false); require(!is_puppet(car), "puppet removed");

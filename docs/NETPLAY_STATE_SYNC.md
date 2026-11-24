@@ -50,18 +50,42 @@ evidence patch is outside the repo (`online-build/abandoned-determinism-experime
    Host captures all native starting states (including rolling velocities), rejects coincident seats,
    and resends event-scoped GRID until every guest applies it once to every car, including its own,
    and sends GRID_ACK. Only then does the host issue GO. Grid/GO waits are bounded and failures abort.
-5. Race: event-scoped SNAP at 30 Hz. Guests send their own car to the host; the host sends every other car (its own,
-   the AI cars, other guests' cars) to each guest. 62 bytes per car. Guests never apply SNAP to their
-   own roster owner. Older/duplicate ticks and invalid/nonfinite states are discarded. A previous
-   event's datagram cannot populate a rematch timeline. Wire protocol 5 added the rules extension; protocol 6 adds the lobby's cheat tuning (turbo strength, chicken reload, blast force and size, in quarter units) to the lobby and start messages.
-6. End: when GameDoSingle returns to the main menu the lobby reopens (ONLINE tab).
+5. During the race, each guest sends its driven car to the host at 30 Hz. The host sends its car, AI cars and the other drivers to each guest. The receiver checks the event, seat owner and snapshot tick. Protocol 10 includes full-precision cumulative damage, the native damage stage, ranked Battle scores and ordered guest lobby heartbeats. Protocol 11 adds the native damage flash and camera shake to the owning driver’s impact checkpoint. Multiple contact points in one checkpoint retain the strongest native pulse. Both peers check the protocol version at admission. Remote cars take these values from the latest accepted state.
+6. The host collects the event outcome and sends the official standings for covered modes. Returning to the native menu restores the party lobby.
 
-## Smoothing (no ghosting)
-`netplay_car::Remote`: snapshots keyed by the sender's tick; play-head 6 ticks behind the newest;
-dead reckoning for up to 15 ticks when late, then hold; the shown car rides its own velocity and
-closes the position error 30% per step (50% beyond 8 m), so big corrections are blended over a few
-frames while the car stays solid. Contact is native on both machines: each game collides its own car
-with the other's puppet, so no hit event is needed in v1 (an owner-side impulse event is the next step).
+For a lap race, the host maps each driver's crossing to its monotonic clock. The earliest accepted crossing starts the 30-second finish window. A retry reporting an earlier crossing can shorten that window. At the cutoff the host allows 750 ms for reports of crossings already made. Finishes in the same clock millisecond tie by grid slot. Each client receives the same completed rows and host presentation time.
+
+Run `tools/test_online_completion.py EXE DISC EMPTY_OUTPUT_DIR race-four --impaired-results` to exercise lost finish reports and standings over an asymmetric 150 ms round trip with jitter and background packet loss. The runner measures the time from the host's outcome to each driver's results and the spread between clients. It checks that the wrecked player's Totalled banner gives way to results, that everyone returns to the lobby, and that the next round repeats the journey.
+
+For a live CPU race, run `tools/test_online_completion.py EXE DISC EMPTY_OUTPUT_DIR native-pack --public-garage relay --rotate-track`. Three copies of the game each drive their own network seat using the retail Hard racing AI. The host selects another venue after the first standings screen. The test checks each driver's controls, remote motion, competitive contact or passing, actual finish-line crossings, and both sets of standings. Add `--impaired-public-relay IPV4:PORT` to simulate latency and loss on the guest connections to the deployed relay. Add `--rendered-host` to use the host's normal display settings while the two guests run headless at 1×.
+
+`tools/test_online_party.py EXE DISC EMPTY_OUTPUT_DIR --lose-loading-host` kills the host after all three games leave the main menu and before GO. Both guests must return to their native menus with the retryable host-loss reason. They then form a new party, finish a race and receive the same two places using the original processes.
+
+With `--lose-results-guest`, all three drivers must first receive the same standings. Killing one guest during presentation leaves those places intact. The host and remaining guest must rematch in the same party, finish in a field with two human drivers, and return together.
+
+## Driving and car contact
+
+Beyond 50 m, remote cars use the configured interpolation buffer (six ticks by default). Inside 15 m they predict forward by the estimated one-way travel time, up to fifteen ticks. Between those distances the playback time changes continuously. The host measures distance against the whole field so two guests can trade a bumper hit while the host drives elsewhere. Guests account for both network legs when viewing another guest's car. After thirty world steps without a newer pose, the car coasts under native gravity and terrain contact with its last confirmed damage. If the host loses an owner's pose stream, it sends this coasting body to the other drivers. Fresh owner snapshots blend from the current body. The roster identifies remote human drivers during car construction so they receive the selected event's human damage tuning.
+
+Run the impact fixture with `--snapshot-stall --observer --airborne-m 8 --rtt-ms 0 --max-damage-delta 0` to cut snapshots to the third driver during an airborne impact and withhold the colliding guest's checkpoint acknowledgements. It checks the observed descent and landing during the interruption, continued local driving, repeated checkpoints, recovery of the owner's position and matching damage on all three drivers.
+
+At a damaging car-to-car hit, the host lets both native bodies carry their physical response through subsequent steps. It sends the affected guest an event- and seat-scoped post-contact body checkpoint. The guest keeps local controls and applies each newer checkpoint once. The host continues sending the final checkpoint until the owner echoes its revision in a snapshot. A guest that predicts contact first can render recoil and cosmetic dents while it waits for the authoritative competitive damage. It repeats its pre-impact approach for up to 600 ms to keep predicted recoil from changing the host's incoming collision.
+
+The impact fixture runs two game processes on Anoka, seeds a post-countdown high-speed approach, and measures the native response. Pass `--rtt-ms`, `--guest-to-host-share`, `--jitter-ms` and `--loss` to introduce loopback impairment. Use `--lateral-offset-m`, `--host-car` and `--guest-car` to vary the geometry and masses. `--max-damage-delta 0` checks scalar damage and stage on both views at fixture tick 120. `--max-impulse-difference .045` checks longitudinal momentum change on the host's pair. `--wreck-derby` starts the selected driver (host by default, or `--wreck-driver guest`) with 94 percent wear and checks that a native collision totals it, the surviving driver wins, and both return to the party. With `--observer`, a third game drives its own car from the native grid using a held accelerator. The test checks its throttle before and after contact, movement, 116 consecutive native steps and both damaged cars on all three machines. Pass `--guest-pair` to make both guests collide and the host drive the independent car. Each guest must apply its own ordered host checkpoints. The Derby case keeps both survivors racing after one wreck. All processes finish the native countdown before the test releases the seeded pair together inside the selected arena. Panel shapes, loose debris and detached wheels still need independent replication and acceptance tests.
+
+Use `--following follow` to place equal-speed cars 5.5 m apart at 72 km/h, `--following nudge` to close at 46 versus 36 km/h, or `--following ram` to close at 105 versus 36 km/h. The fixture seeds the approach once. The ordinary solver determines whether either bumper makes contact, how much momentum transfers and whether it causes damage. `--guest-pair` makes the two cars independently owned guests.
+
+Pass `--pack-collision --rtt-ms 100 --jitter-ms 4` to drive three independently owned cars into the same point from three approaches on Anoka. Every pair must register reciprocal native damage-producing contacts on the same step, with reciprocal impulses within 4.5 percent, and each driver must approach at 95 km/h or more. Both guests must apply their own ordered host checkpoints. At step 120, every copy must agree with its owner's damage scalar and stage. The 16-driver capacity and prolonged side contact require separate fixtures.
+
+The retail airborne crash camera pauses world physics for about three seconds. Its native eligibility check counts viewports. Each online machine has one viewport, so a collision can start that pause independently on both drivers. Online events skip the dedicated crash orbit at `0x001D3FB8`. The incident dispatcher, damage and normal driving cameras continue running. Solo play uses the original orbit. To check the full path with a third driver under throttle, run the impact fixture with `--airborne-m 4 --observer --rtt-ms 100 --check-crash-camera`. The test requires a native incident to request the orbit, the pause flag to stay clear and 120 consecutive native physics advances on every game.
+
+## Player gamertags
+
+The host controls **Player Gamertags** in the lobby. Races start with names on and Demolition Derby starts with names off. The room remembers a separate choice for each and sends the selected rule with the event start. The HUD labels human drivers, including the host. A driver who leaves the event loses their tag.
+
+The label follows the selected car’s roof and the local driving camera. The native world visibility pass at `0x3582B8` records the camera used by `WorldToScreen` before the HUD installs its own. Projected labels use the game viewport, a 150 m distance limit, and staggered sightline checks against active SCOL terrain and SOBL boxes and tubes. These collision shapes approximate visual occlusion. Decorative meshes can have no collision, and some physical barriers extend above the visible wall.
+
+Run `python3 -B tools/test_online_driver_names.py EXE DISC EMPTY_OUTPUT_DIR race` and repeat with a fresh output directory and `derby`. Each run opens a host and guest on Anoka, checks their names against native roof and camera samples, attempts a guest override and a mid-event host change, then verifies the host’s new setting on the rematch. The geometry assertions run in `netplay_state_sync`.
 
 ## References used
 * FlatOut / FlatOut 2 (Bugbear, closest genre match): host with standard dead reckoning of physics objects,
@@ -97,3 +121,12 @@ Native special vehicles without art (for example Trailer2/401), custom Cupcar/Ph
 added NASCAR paint identities show an explicit unavailable message. Installed custom UICAR entries
 can be flat livery/HUD swatches, so their existence alone does not qualify them as car portraits.
 The CT body texture is never used. Correct rendered custom portraits remain a separate asset task.
+
+
+### Joining a room with different game content
+
+Compatibility is checked against the effective gameplay files before assigning a seat. A host with recovery support includes its content fingerprint and the type of local content it loaded when declining an incompatible join. For a composed custom profile it can also report up to three package IDs and versions from the local Mod Manager inventory. The fingerprint governs admission even when two profiles share a name or package list.
+
+The joining game checks the player's disc, installed integrated packs and registered standalone profile in the background. If one matches, **Restart and Rejoin** starts a fresh instance with those files and repeats the original Garage Code, direct or crew join. The next normal launch uses the player's existing preferences. When no installed profile matches, the guest sees the host's setup requirements and keeps Retry and Back. New gameplay packages require the existing local installation path in World Studio. Only the compatibility metadata crosses the network.
+
+The two-process runner `tools/test_online_content_rejoin.py` covers original and integrated hosts, a relayed Garage Code, and a missing custom package. It checks for admission only after the verified local restart.

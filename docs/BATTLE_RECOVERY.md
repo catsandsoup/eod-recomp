@@ -348,6 +348,48 @@ The participant record's dead flag is master+`0x458 + slot*0x50`, death time
 Displayed/net score is **kills minus suicide penalties**. `0x00167D58` changes
 phase 1 (combat) to phase 2 (finished) at five net kills; phase 0 is countdown.
 
+For online Battle the host reads the ranking produced by `0x00167658` in
+phase 2. Every connected player receives the same places and signed net scores
+for human and AI cars. A wreck during combat remains eligible for respawn. A
+driver who left the round keeps their withdrawal or disconnect status in the
+results. Predictions on a guest cannot end the host’s match.
+
+The two-process `battle-scores` scenario in `tools/test_online_completion.py`
+starts two humans and four AI on Anoka. It seeds a four-point lead and invokes
+the native death callback to reach five. A guest wins the first event and an
+AI wins the rematch, despite an earlier winning prediction on the guest in
+both rounds. Both players must receive every row in the native order and
+return to the lobby after each event.
+
+The separate `battle-ram` scenario places the two human cars on opposing
+103 km/h approaches. It sets one driver to four net kills and the other to
+0.999 wear. The native contact must wreck that opponent, credit the fifth
+point to the driver who hit them, and produce the same winner on both games.
+The guest won the first event and the host won the rematch. Live projectile
+replication still needs a separate check.
+
+In online Battle the host also supplies live kills, deaths, penalties and the
+dead flag for each participant. A guest's ordinary SELECT request identifies
+the current event and death number. The host checks ownership and runs the
+retail respawn routine, including its two-second delay. A successful request
+produces one native spawn. Each client calls the native full-car reset and
+applies that host-selected pose. The host’s simulation tick at respawn separates new movement
+from delayed snapshots of the wreck. Clearing the pre-step interpolation and
+post-step pose caches keeps the restored car at the new spawn while packets are delayed. Repeated requests or state updates for the same
+life cannot reset the car again.
+
+The two-game `battle-respawn` case seeds prior damage, then uses native contact
+to wreck the guest without ending combat. The guest presses SELECT through the
+regular pad reader. Both peers must observe the host retain its point, the
+guest retain zero points, and the same zero-damage spawn on both systems.
+The guest then holds its native accelerator. Both games must see the restored
+car stay at the selected spawn on its first sample and drive more than two
+metres. With `--impaired-results`, the fixture drops the first three SELECT
+requests, the first three state packets that carry the new spawn, and the
+first three standings messages on a 150 ms asymmetric path.
+The final score in this fixture is supplied separately to exercise results and
+rematch. The fifth-point collision above tests a naturally scored finish.
+
 Humans see “Press the SELECT button to respawn.” Bots request the same native
 operation, `0x001671E8(master,slot)`, while dead and combat is active. It checks
 the native strict two-second delay before calling `0x001675C0`, which resets the

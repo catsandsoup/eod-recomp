@@ -39,6 +39,11 @@ int main() {
     if(pages!=1 || palette.touched[(0x2fc4>>5)+1])return 2;
     auto full=hw::page_coverage(0,1,PSMCT32,0,0,64,32);
     if(full.touched[0]!=0xffffffffu || full.complete[0]!=0xffffffffu)return 3;
+    // The retail saved-profile menu clear replaces all 70 Z16S pages.
+    const auto profile_depth = hw::page_coverage(0x2300, 10, PSMZ16S, 0, 0, 640, 448);
+    if (profile_depth.count != 70) return 9;
+    for (unsigned i = 0; i < profile_depth.count; ++i)
+        if (profile_depth.complete[profile_depth.pages[i]] != 0xffffffffu) return 10;
     auto partial=hw::page_coverage(0,1,PSMCT32,0,0,1,1);
     if(partial.touched[0]!=1 || partial.complete[0])return 4;
     uint32_t first,count;

@@ -3,6 +3,7 @@
 #ifdef EOD_VULKAN
 #include "../../core/r7_audit.h"
 #include <algorithm>
+#include <array>
 #include "core/trace.h"
 #include <atomic>
 #include <chrono>
@@ -44,6 +45,7 @@
 
 namespace gs {
 extern bool g_skip_frame; // gs_draw.cpp
+extern bool g_native_scene_clear_active; // gs.cpp
 namespace hw {
 #ifdef EOD_HW_SELECT
 namespace vulkan {  // one of two backends (gs_hw_select.cpp chooses)
@@ -79,6 +81,7 @@ ID3D11Device *g_dev;
 ID3D11DeviceContext *g_ctx;
 int g_scale = 1; // internal resolution multiplier
 
+#ifndef EOD_R7_RELEASE
 ID3D11VertexShader *g_vs_draw, *g_vs_pass;
 ID3D11PixelShader *g_ps_draw, *g_ps_convert_color, *g_ps_convert_depth, *g_ps_upload_color, *g_ps_upload_depth,
     *g_ps_readback_color, *g_ps_readback_depth, *g_ps_copy;
@@ -86,6 +89,12 @@ ID3D11InputLayout *g_layout;
 ID3D11Buffer *g_vb, *g_cb_draw, *g_cb_pass;
 constexpr UINT kVBBytes = 8 << 20;
 UINT g_vb_pos;
+#else
+ID3D11VertexShader *g_vs_pass;
+ID3D11PixelShader *g_ps_convert_color, *g_ps_convert_depth, *g_ps_upload_color, *g_ps_upload_depth,
+    *g_ps_readback_color, *g_ps_readback_depth, *g_ps_copy;
+ID3D11Buffer *g_cb_pass;
+#endif
 ID3D11SamplerState *g_point_clamp, *g_linear_clamp;
 ID3D11RasterizerState *g_rs_scissor, *g_rs_noscissor;
 ID3D11DepthStencilState *g_ds_off, *g_ds_write_always;
@@ -135,6 +144,7 @@ void page_dims(uint32_t psm, int &pw, int &ph) {
 
 // ---------------------------------------------------------------- shaders
 bool create_shaders() {
+#ifndef EOD_R7_RELEASE
     g_vs_draw = new vkgs::Shader;
     g_vs_draw->entry = "vs_draw";
     g_vs_draw->id = 0;
@@ -153,6 +163,7 @@ bool create_shaders() {
         info.pCode = k_spv_ps_draw;
         vkgs::require(vkCreateShaderModule(g_dev->device, &info, nullptr, &g_ps_draw->module), "shader ps_draw");
     }
+#endif
     g_vs_pass = new vkgs::Shader;
     g_vs_pass->entry = "vs_pass";
     g_vs_pass->id = 2;
@@ -434,6 +445,14 @@ struct HwVertex {
 };
 static_assert(sizeof(HwVertex) == 32, "vertex layout");
 
+bool g_state_valid;
+
+void bind_targets(Surface *rt, Surface *ds);
+void acquire(Surface *s, int x0, int y0, int x1, int y1);
+
+#ifdef EOD_R7_RELEASE
+inline void flush() {}
+#else
 struct DrawCB {
     float vp_scale[2], vp_offset[2];
     float zscale, zmax, lod_k, lod_l;
@@ -463,7 +482,6 @@ struct DrawState {
 };
 
 DrawState g_state;
-bool g_state_valid;
 std::vector<HwVertex> g_verts;
 
 std::unordered_map<uint32_t, ID3D11BlendState *> g_blend_cache;
@@ -537,9 +555,6 @@ ID3D11SamplerState *sampler(int idx) {
     }
     return g_samplers[(size_t)idx & 7];
 }
-
-void bind_targets(Surface *rt, Surface *ds);
-void acquire(Surface *s, int x0, int y0, int x1, int y1);
 
 void draw_batch(const DrawState &s, UINT first, UINT count, bool fail_pass) {
     EOD_ZONE("gs.draw_batch");
@@ -713,6 +728,7 @@ void flush() {
     } else draw_batch(s, first, count, false);
     g_stats.flushes++;
 }
+#endif  // !EOD_R7_RELEASE
 
 Surface *g_bound_rt, *g_bound_ds;
 
@@ -1613,6 +1629,7 @@ Surface *get_surface(uint32_t bp, uint32_t bw, uint32_t psm, bool depth, int row
 }
 
 // --------------------------------------------------------- texture cache
+#ifndef EOD_R7_RELEASE
 struct TexObj {
     ID3D11Texture2D *tex = nullptr;
     ID3D11ShaderResourceView *srv = nullptr; // a host replacement's srv holds its own reference
@@ -1623,11 +1640,13 @@ struct TexObj {
     uint64_t host = 0; // g_host_gpu key of the bound replacement, 0 = native
 };
 std::unordered_map<uint64_t, TexObj> g_tex;
+#endif
 uint64_t g_tex_bytes;
 
 // ------------------------------------------------- host texture replacements
 // docs/HOST_TEXTURE_REPLACEMENT.md. Keys are computed only on a texture-cache
 // miss and only when replacements are loaded or EOD_HOST_TEXTURE_LOG is set.
+#ifndef EOD_R7_RELEASE
 constexpr uint32_t kTexHostFlag = 0x8000; // F_TEX_HOST in gs_shaders_vk.hlsl
 struct HostGpu {
     ID3D11Texture2D *tex = nullptr;
@@ -1635,18 +1654,24 @@ struct HostGpu {
     uint64_t bytes = 0, last_use = 0;
     alpha_order::Range alpha;
 };
+#endif
 hosttex::Store g_host;
 bool g_host_on;   // replacements loaded
 FILE *g_host_log; // EOD_HOST_TEXTURE_LOG
 uint64_t g_host_budget = 1536ull << 20;
 uint32_t g_host_max_side;
+#ifndef EOD_R7_RELEASE
 std::unordered_map<uint64_t, HostGpu> g_host_gpu; // (entry << 1 | GS alpha domain) + 1
+#endif
 uint64_t g_host_gpu_bytes;
+#ifndef EOD_R7_RELEASE
 std::unordered_set<uint64_t> g_host_logged, g_host_noted;
+#endif
 struct HostStats {
     uint32_t hits, misses, fallbacks, uploads, evictions;
     double upload_ms;
 } g_hstats;
+#ifndef EOD_R7_RELEASE
 // validation shortcut: texture description -> (content key, VRAM clock when
 // checked)
 struct TexCheck {
@@ -1660,6 +1685,7 @@ inline uint64_t mix64(uint64_t h, uint64_t v) {
     h = (h << 27 | h >> 37) * 0xC2B2AE3D27D4EB4Full;
     return h;
 }
+#endif
 
 void block_dims(uint32_t psm, int &bw, int &bh, int &unit_bits) {
     switch (psm) {
@@ -1689,6 +1715,7 @@ void block_dims(uint32_t psm, int &bw, int &bh, int &unit_bits) {
     }
 }
 
+#ifndef EOD_R7_RELEASE
 // hash of the GS memory blocks holding a w x h texture level
 uint64_t hash_level(uint32_t tbp, uint32_t tbw, uint32_t psm, int w, int h) {
     const SwizzleTab *T = swizzle_table(psm, tbw);
@@ -2029,6 +2056,7 @@ ID3D11ShaderResourceView *host_texture(int idx, uint32_t native_alpha_high, alph
          g_host_gpu_bytes / 1048576.0);
     return g.srv;
 }
+#endif  // !EOD_R7_RELEASE
 
 void host_textures_init() {
     auto sink = [](const std::string &m) { WARN("%s", m.c_str()); };
@@ -2130,6 +2158,7 @@ TempTex *temp_texture(int w, int h) {
     return &t;
 }
 
+#ifndef EOD_R7_RELEASE
 // The pages a w x h rectangle of a buffer really touches (block by block;
 // page_range is conservative for buffers that don't start on a page).
 void exact_pages(uint32_t bp, uint32_t bw, uint32_t psm, int w, int h, std::vector<uint32_t> &out) {
@@ -2568,6 +2597,7 @@ bool push_sprite_slivers(const Env &e, const HwVertex &v0, const HwVertex &v1, c
         }
     return true;
 }
+#endif  // !EOD_R7_RELEASE
 
 } // namespace
 
@@ -2597,10 +2627,14 @@ bool start(bool with_window) {
                 std::fprintf(stderr, "[vulkan] RenderScale=%d limited to %dx by max image dimension %u\n",
                              g_config.render_scale, g_scale, properties.limits.maxImageDimension2D);
         }
-        if (!create_shaders() || !create_raw_textures())
+        if (!create_shaders() || !create_raw_textures()) {
+            g_dev->stop_specializer();
+            presentation::swapchain_aspect.store(-1, std::memory_order_relaxed);
             return false;
+        }
         host_textures_init();
         D3D11_BUFFER_DESC bd = {};
+#ifndef EOD_R7_RELEASE
         bd.ByteWidth = kVBBytes;
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
@@ -2609,6 +2643,11 @@ bool start(bool with_window) {
         bd.ByteWidth = (sizeof(DrawCB) + 15) & ~15u;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_cb_draw));
+#else
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+#endif
         bd.ByteWidth = (sizeof(PassCB) + 15) & ~15u;
         CHECK(g_dev->CreateBuffer(&bd, nullptr, &g_cb_pass));
         D3D11_SAMPLER_DESC smp = {};
@@ -2658,6 +2697,7 @@ bool start(bool with_window) {
         return true;
     } catch (const std::exception &e) {
         WARN("vulkan: %s", e.what());
+        if (g_dev) g_dev->stop_specializer();
         // SDL can now recreate the window for software rendering. Detach its
         // Vulkan surface first, including failures partway through initialization.
         if (g_dev && g_dev->device) {
@@ -2670,11 +2710,13 @@ bool start(bool with_window) {
             vkDestroySurfaceKHR(g_dev->instance, g_dev->surface, nullptr);
             g_dev->surface = VK_NULL_HANDLE;
         }
+        presentation::swapchain_aspect.store(-1, std::memory_order_relaxed);
         g_on = false;
         return false;
     }
 }
 
+#ifndef EOD_R7_RELEASE
 void draw_triangle(const Env &e, const Vertex &a, const Vertex &b, const Vertex &c) {
     ensure_state(e, 0);
     if (!g_state.rt)
@@ -2735,6 +2777,7 @@ void draw_point(const Env &e, const Vertex &a) {
     r7_audit::add(r7_audit::Counter::GsRaster);
     g_verts.push_back(hv(e, a, pack_rgba(a)));
 }
+#endif  // !EOD_R7_RELEASE
 
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h) {
     EOD_ZONE("gs.vram_written");
@@ -2909,7 +2952,11 @@ int g_last_aspect = -1;
 bool direct_movie_upload(int n, const Circuit &c) {
     static const bool enabled = [] {
         const char *value = getenv("EOD_NATIVE_MOVIE_SCANOUT");
+#ifdef EOD_R7_RELEASE
+        return !value || value[0] != '0';
+#else
         return value && value[0] == '1';
+#endif
     }();
     return enabled && g_dev->queueMutex && native::native_only_level() == 1 &&
            n == 1 && st.pmode == 0x66 && (c.fbp == 0 || c.fbp == 0x1680) &&
@@ -3020,7 +3067,7 @@ ID3D11ShaderResourceView *circuit_source(int n, const Circuit &c, float &x0, flo
 }
 
 // draws the display into rtv (size tw x th) at rectangle (rx, ry, rw, rh)
-void compose(ID3D11RenderTargetView *rtv, int tw, int th, int rx, int ry, int rw, int rh, bool smooth) {
+void compose(ID3D11RenderTargetView *rtv, int tw, int th, int rx, int ry, int rw, int rh, bool smooth, bool swapchain = false) {
     EOD_ZONE("gs.compose");
     Circuit c[2] = {g_last[0], g_last[1]};
     // circuit 1 over circuit 2 with PMODE.ALP (MMOD = 1) or opaque (as the
@@ -3042,6 +3089,19 @@ void compose(ID3D11RenderTargetView *rtv, int tw, int th, int rx, int ry, int rw
     for (int n = 1; n >= 0; n--) { // circuit 2 first, circuit 1 over it
         if (!srv[n])
             continue;
+        static const bool trace_geometry = getenv("EOD_CAMERA_TRACE") != nullptr;
+        if (trace_geometry) {
+            // Report on changes, including the movie/3D switch and window resizes.
+            static std::array<int, 10> previous[2][2]{};
+            const std::array<int, 10> geometry{tw, th, rx, ry, rw, rh, int(r[n][2] - r[n][0]),
+                                               int(r[n][3] - r[n][1]), g_scale, g_last_aspect};
+            if (geometry != previous[swapchain][n]) {
+                previous[swapchain][n] = geometry;
+                fprintf(stderr, "[camera] %s circuit=%d source=%dx%d renderScale=%d target=%dx%d rect=%d,%d %dx%d aspect=%d\n",
+                        swapchain ? "swapchain" : "capture", n, geometry[6], geometry[7], g_scale,
+                        tw, th, rx, ry, rw, rh, g_last_aspect);
+            }
+        }
         g_ctx->PSSetShaderResources(0, 1, &srv[n]);
         ID3D11SamplerState *ss[2] = {g_point_clamp, g_linear_clamp};
         g_ctx->PSSetSamplers(0, 2, ss);
@@ -3188,23 +3248,25 @@ bool g_shot_wanted, g_shot_done;
 std::vector<uint32_t> g_shot;
 int g_shot_w, g_shot_h;
 
-// Reads back the native GS image, or an explicitly sized display composition.
+// Capture the visible composition, or the requested raw/offscreen image.
 bool capture(std::vector<uint32_t> &rgba, int &w, int &h) {
     // No game image yet (the first-run / error screen runs before the game): the front end
-    // alone, at the explicit screenshot size.
+    // alone can still be captured at the drawable or explicit output size.
     const Circuit none{};
     const bool image = g_have_last && (g_last[0].on || g_last[1].on);
     const Circuit &c = !image ? none : g_last[0].on ? g_last[0] : g_last[1];
-    if (!image && !(overlay_in_screenshots() && getenv("EOD_SCREENSHOT_WIDTH") && getenv("EOD_SCREENSHOT_HEIGHT")))
-        return false;
     int shot_scale = 1;
     if (const char *scale = getenv("EOD_SCREENSHOT_SCALE"))
         shot_scale = std::clamp(atoi(scale), 1, g_scale);
-    const ScreenshotSize size=screenshot_size(image ? c.w : 640,image ? c.h : 448,shot_scale,getenv("EOD_SCREENSHOT_WIDTH"),getenv("EOD_SCREENSHOT_HEIGHT"));
+    const bool match_window = g_dev->surface && g_dev->swap && !getenv("EOD_SCREENSHOT_SCALE");
+    const ScreenshotSize size=screenshot_size(image ? c.w : 640,image ? c.h : 448,shot_scale,
+        getenv("EOD_SCREENSHOT_WIDTH"),getenv("EOD_SCREENSHOT_HEIGHT"),
+        match_window ? int(g_dev->extent.width) : 0, match_window ? int(g_dev->extent.height) : 0);
     if (!size.valid) {
         WARN("Vulkan screenshot: set both EOD_SCREENSHOT_WIDTH/HEIGHT to pixel dimensions from 1 to 8192");
         return false;
     }
+    if (!image && (!size.composed || !overlay_in_screenshots())) return false;
     w=size.width;h=size.height;
     flush();
     // TempTex dimensions are multiplied by internal scale. Round up only for
@@ -3317,14 +3379,20 @@ void show(bool vsync, bool fresh_scanout) {
             int x, y, w, h;
             platform_display_rect(g_dev->extent.width, g_dev->extent.height, &x, &y, &w, &h);
             if (g_have_last) {
-                compose(back, g_dev->extent.width, g_dev->extent.height, x, y, w, h, g_config.smooth_display);
+                compose(back, g_dev->extent.width, g_dev->extent.height, x, y, w, h, g_config.smooth_display, true);
                 if (fresh_scanout && editor_test_startup::state().hardware_composed())
                     std::fprintf(stderr, "[editor-test] Vulkan race scanout composed: frame=%llu size=%dx%d pmode=%llx dispfb=%llx/%llx\n",
                         (unsigned long long)g_frame_no, w, h, (unsigned long long)st.pmode,
                         (unsigned long long)st.dispfb[0], (unsigned long long)st.dispfb[1]);
             }
             draw_overlay(back, g_dev->extent.width, g_dev->extent.height);
-            if (g_dev->present() && g_have_last && editor_test_startup::state().hardware_presented())
+            const bool accepted = g_dev->present();
+            if (accepted && fresh_scanout && g_have_last)
+                presentation::fresh_game_presents.fetch_add(1, std::memory_order_relaxed);
+            if (accepted && g_dev->logPresents)
+                std::fprintf(stderr, "[scanout] id=%u frame=%llu fresh=%d composed=%d\n",
+                             g_dev->presentSequence, (unsigned long long)g_frame_no, fresh_scanout, g_have_last);
+            if (accepted && fresh_scanout && g_have_last && editor_test_startup::state().hardware_presented())
                 std::fprintf(stderr, "[editor-test] Vulkan race scanout present accepted: frame=%llu\n",
                     (unsigned long long)g_frame_no);
             g_stats.presents++;
@@ -3371,6 +3439,10 @@ void reset() {
     g_state_valid = false;
     for (TempTex &t : g_temp)
         t.src = nullptr;
+}
+
+void stop_pipeline_worker() {
+    if (g_dev) g_dev->stop_specializer();
 }
 
 void finish() {
@@ -3447,7 +3519,9 @@ void stats_line(char *buf, size_t size) {
     g_stats = Stats();
 }
 
+#ifndef EOD_R7_RELEASE
 #include "modern_vk.inc"
+#endif
 #include "native_bridge.inc"
 
 #ifdef EOD_HW_SELECT

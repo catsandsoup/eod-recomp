@@ -37,6 +37,8 @@ struct Object {
 #define M_CFIX 0x200
 #define M_SPEC 0x400
 #define M_FGE 0x800
+#define M_STORE_ZERO_A 0x4000u
+#define M_DISCARD_ZERO_A 0x8000u
 #define M_FAILED 0x80000000u
 
 #define C_GENERIC   0
@@ -195,14 +197,18 @@ float D_GGX(float NoH, float r) {
     const float k = r / max(1.0 - NoH * NoH + a * a, 1e-7);
     return k * k * (1.0 / PI);
 }
+// Filament 4.4.2 fast Smith-GGX correlated visibility (zero sqrts, visually matching exact)
 float V_SmithGGXCorrelated(float NoV, float NoL, float r) {
-    const float a2 = r * r;
-    const float gv = NoL * sqrt(NoV * NoV * (1.0 - a2) + a2);
-    const float gl = NoV * sqrt(NoL * NoL * (1.0 - a2) + a2);
+    const float gv = NoL * (NoV * (1.0 - r) + r);
+    const float gl = NoV * (NoL * (1.0 - r) + r);
     return 0.5 / max(gv + gl, 1e-7);
 }
-float3 F_Schlick(float3 f0, float VoH) { return f0 + (1.0 - f0) * pow(1.0 - VoH, 5.0); }
-float F_Schlick1(float f0, float VoH) { return f0 + (1.0 - f0) * pow(1.0 - VoH, 5.0); }
+float pow5(float x) {
+    const float x2 = x * x;
+    return x2 * x2 * x;
+}
+float3 F_Schlick(float3 f0, float VoH) { return f0 + (1.0 - f0) * pow5(saturate(1.0 - VoH)); }
+float F_Schlick1(float f0, float VoH) { return f0 + (1.0 - f0) * pow5(saturate(1.0 - VoH)); }
 float V_Kelemen(float LoH) { return 0.25 / max(LoH * LoH, 1e-4); }
 
 // Environment BRDF (Filament's DFG term, here the analytic fit of Karis 2014 in place of the LUT)
@@ -278,23 +284,30 @@ bool scene_projected(float4 projected) {
 // side, then survive a depth-thickness test after refinement. Off-screen, sky,
 // silhouettes and unresolvable rays retain the existing sky/ambient radiance.
 float4 scene_reflection(VOut i, float3 ray, float roughness, float visibility) {
-    const float edge = scene_edge_fade(i.pos.xy);
+    if (roughness >= 0.85 || visibility <= 0.01) return 0.0;
+    const float2 inv_view = 1.0 / scene_view.zw;
+    const float2 origin_uv = (i.pos.xy - scene_view.xy) * inv_view;
+    const float2 origin_edge = min(origin_uv, 1.0 - origin_uv);
+    const float edge = saturate(min(origin_edge.x, origin_edge.y) * 20.0);
     const float strength = (1.0 - smoothstep(0.42, 0.85, roughness)) * visibility * edge;
     if (strength <= 0.01) return 0.0;
     const float2 mapping = scene_depth_mapping();
     const float surface_z = scene_camera_distance(i.pos.z, mapping);
-    if (!(surface_z > 0.0 && surface_z < 150.0)) return 0.0;
+    if (!(surface_z > 0.0 && surface_z < 75.0)) return 0.0;
     const float4 origin = scene_clip(float4(i.mp, 1.0));
     const float4 direction = scene_clip(float4(ray, 0.0));
+    if (origin.w + direction.w * 0.85 <= 1e-6) return 0.0;
     float last_t = 0.0;
-    const float surface_scene_depth = scene_depth_at(i.pos.xy);
+    const int2 grid_max = int2(scene_grid.xy) - 1;
+    const float surface_scene_depth = scene_depth.Load(int3(clamp(int2(origin_uv * scene_grid.xy), 0, grid_max), 0));
     bool visible = !(surface_scene_depth > i.pos.z);
     [loop]
-    for (int step = 1; step <= 8; ++step) {
-        const float t = 0.25 + 0.38 * (step * step);
+    for (int step = 1; step <= 6; ++step) {
+        const float t = 0.30 + 0.55 * (step * step);
         float4 p = scene_project(origin + direction * t);
         if (!scene_projected(p)) break;
-        const float z = scene_depth_at(p.xy);
+        const float2 p_uv = (p.xy - scene_view.xy) * inv_view;
+        const float z = scene_depth.Load(int3(min(int2(p_uv * scene_grid.xy), grid_max), 0));
         if (z <= p.z) {
             visible = true;
             last_t = t;
@@ -302,25 +315,35 @@ float4 scene_reflection(VOut i, float3 ray, float roughness, float visibility) {
         }
         if (!visible) break;
 
+        // Keep the already sampled crossing. Refinement only changes the hit
+        // when a nearer sample also crosses the scene depth.
         float lo = last_t, hi = t;
+        float4 hit = p;
+        float hit_depth = z;
         [unroll]
-        for (int refine = 0; refine < 3; ++refine) {
+        for (int refine = 0; refine < 2; ++refine) {
             const float mid = (lo + hi) * 0.5;
             p = scene_project(origin + direction * mid);
-            if (scene_depth_at(p.xy) > p.z) hi = mid;
-            else lo = mid;
+            const float2 m_uv = (p.xy - scene_view.xy) * inv_view;
+            const float mid_depth = scene_depth.Load(int3(clamp(int2(m_uv * scene_grid.xy), 0, grid_max), 0));
+            if (mid_depth > p.z) {
+                hi = mid;
+                hit = p;
+                hit_depth = mid_depth;
+            } else lo = mid;
         }
-        p = scene_project(origin + direction * hi);
+        p = hit;
         if (!scene_projected(p)) break;
-        const float hit_depth = scene_depth_at(p.xy);
+        const float2 hit_uv = (p.xy - scene_view.xy) * inv_view;
         const float hit_z = scene_camera_distance(hit_depth, mapping);
         const float error = scene_camera_distance(p.z, mapping) - hit_z;
-        const float thickness = min(0.6, 0.10 + 0.016 * hit_z);
-        const float pixels = length((p.xy - i.pos.xy) * scene_grid.xy / scene_view.zw);
+        const float thickness = min(0.65, 0.12 + 0.018 * hit_z);
+        const float pixels = length((hit_uv - origin_uv) * scene_grid.xy);
         if (!(hit_depth > 0.0 && error >= 0.0 && error < thickness && hi > 0.45 && pixels > 1.5)) break;
-        const float confidence = strength * scene_edge_fade(p.xy) *
-            (1.0 - smoothstep(thickness * 0.45, thickness, error)) * (1.0 - smoothstep(12.0, 25.0, hi));
-        return float4(scene_color.SampleLevel(scene_sampler, scene_uv(p.xy), 0).rgb, confidence);
+        const float2 hit_edge = min(hit_uv, 1.0 - hit_uv);
+        const float confidence = strength * saturate(min(hit_edge.x, hit_edge.y) * 20.0) *
+            (1.0 - smoothstep(thickness * 0.45, thickness, error)) * (1.0 - smoothstep(11.0, 21.0, hi));
+        return float4(scene_color.SampleLevel(scene_sampler, hit_uv, 0).rgb, confidence);
     }
     return 0.0;
 }
@@ -350,7 +373,7 @@ float4 scene_transmission(VOut i, float3 direction, float2 water_slope) {
     if (!(z > 0.0 && water_z > z && depth > 0.07 && depth < 16.0)) return 0.0;
     const float confidence = scene_edge_fade(pixel) * smoothstep(0.07, 0.45, depth) *
                              (1.0 - smoothstep(8.0, 16.0, depth));
-    const float3 absorption = exp(-float3(0.14, 0.075, 0.052) * depth);
+    const float3 absorption = exp(-float3(0.16, 0.075, 0.048) * depth);
     return float4(scene_color.SampleLevel(scene_sampler, scene_uv(pixel), 0).rgb * absorption, confidence);
 }
 
@@ -403,93 +426,151 @@ float2 vfx_volume(float2 p, float t, float seed, float gap, float thickness,
     return saturate(float2((1.0 - transmittance) * intersection, hot));
 }
 
-POut shade_modern(VOut i, bool has_scene_inputs) {
+// A lit pipeline specializes only the material choices that change shader control
+// flow. All other entry points read the original per-draw flags.
+[[vk::constant_id(0)]] const uint lit_material = 0xFFFFFFFFu;
+
+POut shade_modern_impl(VOut i, bool has_scene_inputs, bool allow_discard, bool allow_pbr,
+                       bool allow_vfx, bool allow_water, bool allow_authored) {
     const uint m = obj.mode.x;
     const uint mz = obj.mode.z;
-    const bool authored = (mz & (1u << 31)) != 0;
-    const float4 sampled = tex.Sample(smp, i.uv);
+    const bool authored = allow_authored && ((mz & (1u << 31)) != 0);
+    bool known_lit = lit_material != 0xFFFFFFFFu;
+    const uint cls = known_lit ? (lit_material & 15u) : ((mz >> 27) & 15);
+    const bool is_vfx = allow_vfx && (cls >= C_VFX_FIRE && cls <= C_VFX_SPARK);
+    const uint profile = is_vfx && (obj.mode.w & VFX_VOLUME_ACTIVE) ? (mz >> 22) & 7 : 0;
+    const bool unlit = !allow_pbr || (!known_lit && (cls == C_UNLIT || is_vfx || (mz & (1u << 24)) != 0));
+    const bool textured = known_lit || ((m & M_TME) != 0);
+    const bool lit_textured = allow_pbr && !unlit && textured;
+    const bool need_height = lit_textured && (known_lit ? (lit_material & 16u) != 0 : ((mz >> 25) & 1) != 0);
+    const bool need_water = allow_water && has_scene_inputs && lit_textured && cls == C_WATER;
+    const bool quad_mask = ((mz >> 25) & 1) != 0;
+    const bool need_strip_uv = allow_vfx && (profile != 0) && !quad_mask;
+
+    // Sample texture and compute quad derivatives BEFORE any per-pixel discard,
+    // gated only by dynamically uniform push-constant flags so quad lanes stay intact.
+    const float4 sampled = textured ? tex.Sample(smp, i.uv) : float4(1.0, 1.0, 1.0, 1.0);
     const float4 ts = round(sampled * 255.0);
-    const float3 dpx = ddx(i.mp), dpy = ddy(i.mp);
-    const float hgt = dot(ts.rgb, float3(0.2126, 0.7152, 0.0722)) / 255.0;
-    const float dhx = ddx(hgt), dhy = ddy(hgt);
-    const float wave_height = dot(sampled.rgb, float3(0.2126, 0.7152, 0.0722));
-    const float2 wave_slope = float2(ddx(wave_height), ddy(wave_height));
-    const float2 water_slope = float2(ddx(i.pos.z), ddy(i.pos.z));
+    float3 dpx = float3(0, 0, 0), dpy = float3(0, 0, 0);
+    if (lit_textured || need_strip_uv) {
+        dpx = ddx(i.mp);
+        dpy = ddy(i.mp);
+    }
+    float dhx = 0.0, dhy = 0.0;
+    if (need_height) {
+        const float hgt = dot(ts.rgb, float3(0.2126, 0.7152, 0.0722)) * (1.0 / 255.0);
+        dhx = ddx(hgt);
+        dhy = ddy(hgt);
+    }
+    float2 wave_slope = float2(0, 0);
+    float2 water_slope = float2(0, 0);
+    if (need_water) {
+        const float wave_height = dot(sampled.rgb, float3(0.2126, 0.7152, 0.0722));
+        wave_slope = float2(ddx(wave_height), ddy(wave_height));
+        water_slope = float2(ddx(i.pos.z), ddy(i.pos.z));
+    }
+    float2 duvx = float2(0, 0), duvy = float2(0, 0);
+    if (need_strip_uv) {
+        duvx = ddx(i.uv);
+        duvy = ddy(i.uv);
+    }
 
     float3 v = i.c.rgb;
     float va = i.c.a;
-    const uint cls = (mz >> 27) & 15;
-    const bool is_vfx = cls >= C_VFX_FIRE && cls <= C_VFX_SPARK;
-    const uint profile = is_vfx && (obj.mode.w & VFX_VOLUME_ACTIVE) ? (mz >> 22) & 7 : 0;
-    const bool unlit = cls == C_UNLIT || is_vfx || (mz & (1u << 24)) != 0;
-    float3 V = normalize(i.mv);
-    float3 N;
-    if (i.mn.w > 0.5) {
-        N = normalize(i.mn.xyz);
-    } else {
-        N = normalize(cross(dpx, dpy));
-    }
-    if (dot(N, V) < 0) N = -N;
-    const float3 L = normalize(obj.light.xyz + float3(0, 1e-9, 0));
     float3 rgb;
     float a;
-    float a_game = 0.0;  // the alpha before the Modern VFX coverage: the alpha test is the game's
     float vfx_post_fog = 1.0;
     float3 albedo = float3(1, 1, 1);
-    if (m & M_TME) {
+    if (textured) {
         const float4 t = ts;
         const uint tfx = (m >> M_TFX_SHIFT) & 3;
         const bool tcc = (m & M_TCC) != 0;
-        albedo = t.rgb / 255.0;
+        albedo = t.rgb * (1.0 / 255.0);
         if (tfx == 0) {
-            rgb = floor(t.rgb * v / 128.0);
-            a = tcc ? floor(t.a * va / 128.0) : va;
+            rgb = floor(t.rgb * v * (1.0 / 128.0));
+            a = tcc ? floor(t.a * va * (1.0 / 128.0)) : va;
         } else if (tfx == 1) {
             rgb = t.rgb;
             a = tcc ? t.a : va;
         } else {
-            rgb = floor(t.rgb * v / 128.0) + ((m & M_SPEC) && !unlit ? 0.0 : va);
+            rgb = floor(t.rgb * v * (1.0 / 128.0)) + ((m & M_SPEC) && !unlit ? 0.0 : va);
             a = tcc ? (tfx == 2 ? t.a + va : t.a) : va;
         }
     } else {
         rgb = v;
         a = va;
     }
-    if (!unlit && (m & M_TME)) {
+
+    // Early alpha-test & zero-alpha cutout discard BEFORE PBR, SSR, water refraction, and VFX:
+    // on alpha-fail second passes (M_FAILED), both passing pixels (>= aref) and completely
+    // transparent cutout pixels (a == 0 with no depth write and SRC1_ALPHA blend) exit immediately.
+    // Opaque entry points pass allow_discard = false so no OpKill is emitted, unlocking
+    // hardware Early-Z and Apple Silicon TBDR Hidden Surface Removal (HSR).
+    const float a_game = min(a, 255.0);
+    if (allow_discard) {
+        if ((m & M_DISCARD_ZERO_A) && a_game == 0.0) discard;
+        if (m & M_ATE) {
+            const bool pass = alpha_pass(a_game, (m >> M_ATST_SHIFT) & 7, (float)(obj.mode.y & 0xFF));
+            if (m & M_FAILED) {
+                if (pass) discard;
+            } else if (!pass && (m & M_AFAIL_DISCARD)) {
+                discard;
+            }
+        }
+        // The blend unit retains destination RGB at zero coverage, but GS can
+        // still replace its alpha. Run the retail alpha test before this store.
+        if ((m & M_STORE_ZERO_A) && a_game == 0.0) {
+            POut transparent;
+            transparent.color = 0.0;
+            transparent.factor = 0.0;
+            return transparent;
+        }
+    }
+
+    if (lit_textured) {
+        const float3 V = normalize(i.mv);
+        float3 N = (i.mn.w > 0.5) ? normalize(i.mn.xyz) : normalize(cross(dpx, dpy));
+        if (dot(N, V) < 0) N = -N;
+        const float3 L = normalize(obj.light.xyz + float3(0, 1e-9, 0));
         const uint tfx = (m >> M_TFX_SHIFT) & 3;
-        if ((mz >> 25) & 1) {
+        if (need_height) {
             // normal from height: surface gradient (Mikkelsen 2010) of the texture luminance
-            const float scale = 0.04;
+            // Clamped slope prevents specular aliasing on oblique 4K surfaces.
+            const float scale = 0.075;
             const float3 r1 = cross(dpy, N), r2 = cross(N, dpx);
             const float det = dot(dpx, r1);
-            const float3 grad = sign(det) * (dhx * scale * r1 + dhy * scale * r2);
-            N = normalize(abs(det) * N - grad);
+            const float adet = abs(det);
+            if (adet > 1e-10) {
+                const float3 grad = (sign(det) / adet) * (dhx * scale * r1 + dhy * scale * r2);
+                N = normalize(N - grad * min(1.0, 0.42 / max(length(grad), 1e-6)));
+            }
         }
-        const float metal = (float)((mz >> 16) & 15) / 15.0;
-        const float rough = max((float)((mz >> 20) & 15) / 15.0, 0.045);
+        const float metal = known_lit && !(lit_material & 32u) ? 0.0 : (float)((mz >> 16) & 15) * (1.0 / 15.0);
+        float rough = max((float)((mz >> 20) & 15) * (1.0 / 15.0), 0.045);
+        if (cls == C_CHROME) rough = min(rough, 0.22);
         const float r = rough * rough;  // Filament: perceptual roughness squared
         const float3 up = oct_decode(obj.mode.w);
         // irradiance the game gives this pixel, 1.0 = 0x80: the VU1 light of lit draws, the baked
         // vertex light of prelit draws (multiplies albedo once, never relit)
-        float3 E = (tfx == 1) ? float3(1, 1, 1) : v / 128.0;
+        float3 E = (tfx == 1) ? float3(1, 1, 1) : v * (1.0 / 128.0);
         if (authored) {
             // Match the editor's two-sided fill for mixed strip winding, applied over baked light.
             const float ndl = abs(dot(N, L));
             const float hemi = saturate(abs(dot(N, up)) * 0.5 + 0.5);
             const float3 fill = lerp(float3(0.38, 0.38, 0.40), float3(0.58, 0.65, 0.76), hemi) * environment_params.w;
-            const float3 direct = (obj.diffuse.rgb / 128.0) * (0.26 * (ndl * 0.65 + 0.35) + 0.42 * ndl);
+            const float3 direct = (obj.diffuse.rgb * (1.0 / 128.0)) * (0.26 * (ndl * 0.65 + 0.35) + 0.42 * ndl);
             E *= clamp(fill + direct, 0.30, 1.35);
         }
         const float occl = saturate(dot(E, float3(0.2126, 0.7152, 0.0722)) * 1.5);
-        const float3 sun = obj.diffuse.rgb / 128.0;
-        if (has_scene_inputs && cls == C_WATER) {
+        const float3 sun = obj.diffuse.rgb * (1.0 / 128.0);
+        if (need_water) {
             // Animated 0x325728 geometry supplies the wave normal. Its texture
             // provides the small ripples between vertices via a surface gradient.
             const float3 r1 = cross(dpy, N), r2 = cross(N, dpx);
             const float det = dot(dpx, r1);
-            const float3 gradient = sign(det) * 0.16 * (wave_slope.x * r1 + wave_slope.y * r2) /
+            const float3 gradient = sign(det) * 0.18 * (wave_slope.x * r1 + wave_slope.y * r2) /
                                     max(abs(det), 1e-8);
-            N = normalize(N - gradient * min(1.0, 0.25 / max(length(gradient), 1e-8)));
+            N = normalize(N - gradient * min(1.0, 0.28 / max(length(gradient), 1e-8)));
         }
         const float NoV = max(dot(N, V), 1e-4);
         const float NoL = saturate(dot(N, L));
@@ -508,45 +589,47 @@ POut shade_modern(VOut i, bool has_scene_inputs) {
         const float3 sky = sky_radiance(R, up, rough);
         float3 indirect = lerp(sky * occl, E, metal);
         float4 reflected = 0.0;
-        float visibility = (m & M_FGE) ? saturate(i.f / 255.0) : 1.0;
+        float visibility = (m & M_FGE) ? saturate(i.f * (1.0 / 255.0)) : 1.0;
         if (authored) {
             const float t = saturate((length(i.mv) - environment_params.x) /
                                      max(1.0, environment_params.y - environment_params.x));
             visibility *= 1.0 - t * t * (3.0 - 2.0 * t) * environment_params.z;
         }
         if (has_scene_inputs && (cls == C_PAINT || cls == C_CHROME || cls == C_GLASS || cls == C_WATER)) {
-            reflected = scene_reflection(i, R, cls == C_PAINT ? 0.1 : rough, visibility);
-            const float weight = cls == C_CHROME ? 0.85 : cls == C_GLASS ? 0.75 : 0.6;
-            indirect = lerp(indirect, reflected.rgb * occl, weight * reflected.a);
+            const bool sky_only_ray = (cls == C_PAINT) && (dot(R, up) > 0.78);
+            if (!sky_only_ray) {
+                reflected = scene_reflection(i, R, cls == C_PAINT ? 0.12 : rough, visibility);
+                const float weight = cls == C_CHROME ? 0.90 : cls == C_GLASS ? 0.80 : cls == C_WATER ? 0.78 : 0.65;
+                indirect = lerp(indirect, reflected.rgb * occl, weight * reflected.a);
+            }
         }
         spec += indirect * (f0 * dfg.x + dfg.y);
         float3 col = diffuse + spec;
         if (cls == C_PAINT) {
-            // clear coat (Filament 4.9): roughness 0.1, f0 0.04
-            const float cr = 0.01;
+            // Dual-lobe automotive clear coat (Filament 4.9): crisp lacquer glint + smooth curve sheen,
+            // plus crisp grazing Fresnel sky/SSR reflection.
             const float Fc = F_Schlick1(0.04, LoH);
-            const float Frc = D_GGX(NoH, cr) * V_Kelemen(LoH) * Fc;
+            const float D_coat = D_GGX(NoH, 0.022) * 0.75 + D_GGX(NoH, 0.11) * 0.30;
+            const float Frc = D_coat * V_Kelemen(LoH) * Fc;
             const float Fcv = F_Schlick1(0.04, NoV);
-            // The two-band sky represents broad environment lighting. Integrate it with the
-            // material's DFG response; the point sun and resolved scene reflection keep the
-            // smooth coat so a valid glint stays sharp.
-            const float coat_sky_response = max(0.0, 0.04 * dfg.x + dfg.y);
-            const float3 coat = lerp(sky * coat_sky_response, reflected.rgb * Fcv, reflected.a * 0.7);
+            const float3 coat_sky = sky_radiance(R, up, 0.12);
+            const float3 coat = lerp(coat_sky * Fcv, reflected.rgb * Fcv, reflected.a * 0.85);
             col = col * (1.0 - Fcv) + (PI * Frc * NoL * sun + coat) * occl;
         }
-        // guardrails 4/5: never darker than the game's result. Baked (or VU1) light x albedo is the
-        // floor; the PBR terms only add on top of it (a metal's lost diffuse is not taken away)
-        col = max(col, albedo * E);
-        if (has_scene_inputs && cls == C_WATER) {
+        // Guardrails 4/5/6: never darker than Classic (albedo * E), and soft-rolloff high
+        // specular peaks so non-emissive surfaces keep vivid colour without clipping to 1.0.
+        const float3 base_floor = albedo * E;
+        const float3 extra = max(col - base_floor, 0.0);
+        col = max(min(base_floor + extra / (1.0 + extra * 0.40), 0.985), base_floor);
+        if (need_water) {
             const float fresnel = F_Schlick1(0.02, NoV);
             const float3 snell = refract(-V, N, 1.0 / 1.333);
             const float4 transmitted = scene_transmission(i, snell, water_slope);
             col = lerp(col, transmitted.rgb,
-                       transmitted.a * (1.0 - fresnel) * visibility * 0.58);
+                       transmitted.a * (1.0 - fresnel) * visibility * 0.64);
         }
         rgb = min(col * 255.0, 255.0);
     } else if (is_vfx) {
-        a_game = a;
         // Modern-only GPU procedural fire, smoke & sparks (stage R6 A2, A5): a tint (<= 1 per
         // channel) and a coverage mask (radial falloff x noise, <= 1) on the game's own result, so a
         // VFX card keeps the texture's alpha and detail and is never brighter than Classic. The
@@ -559,15 +642,16 @@ POut shade_modern(VOut i, bool has_scene_inputs) {
         const float2 p = luv * 2.0 - 1.0;
         const float r = length(p);
         const float t_sec = asfloat(obj.mode.w & ~VFX_VOLUME_ACTIVE);
-        const bool quad_mask = ((mz >> 25) & 1) != 0;
         const uint fade = (mz >> 20) & 3;
         float3 tint = float3(1, 1, 1);
         float cov = 1.0;
         if (profile != 0) {
             // For a strip, derive width from the UV-to-world footprint. Billboard
             // streams have a real particle radius directly from the retail call.
-            const float strip_width = length(dpx * ddy(i.uv.x) - dpy * ddx(i.uv.x))
-                / max(abs(ddx(i.uv.y) * ddy(i.uv.x) - ddy(i.uv.y) * ddx(i.uv.x)), 1.0e-5);
+            const float strip_width = need_strip_uv
+                ? length(dpx * duvy.x - dpy * duvx.x)
+                    / max(abs(duvx.y * duvy.x - duvy.y * duvx.x), 1.0e-5)
+                : 0.0;
             const float thickness = quad_mask ? max(0.025, i.mn.x * 0.52) : clamp(strip_width * 0.32, 0.035, 0.40);
             float gap = 1.0e6;
             if (has_scene_inputs) {
@@ -587,7 +671,7 @@ POut shade_modern(VOut i, bool has_scene_inputs) {
             const float turb = vfx_fbm(float2(p.x * 2.6, p.y * 2.2 + t_sec * 4.2));
             const float core = saturate(1.0 - r * 0.95 + (turb - 0.45) * 0.75);
             cov = quad_mask ? rad * saturate(0.45 + 0.85 * core) : saturate(0.68 + 0.50 * turb);
-            const float base_lum = dot(rgb, float3(0.299, 0.587, 0.114)) / 255.0;
+            const float base_lum = dot(rgb, float3(0.299, 0.587, 0.114)) * (1.0 / 255.0);
             const float heat = saturate(base_lum * (0.65 + 0.70 * core));
             const float3 bb = lerp(float3(1.0, 0.26, 0.04),
                                    lerp(float3(1.0, 0.68, 0.14), float3(1.0, 0.94, 0.76), smoothstep(0.55, 0.95, heat)),
@@ -623,7 +707,7 @@ POut shade_modern(VOut i, bool has_scene_inputs) {
     if (m & M_FGE) {
         const float3 fog = float3(obj.mode.y >> 8 & 0xFF, obj.mode.y >> 16 & 0xFF, obj.mode.y >> 24 & 0xFF);
         const float F = clamp(floor(i.f), 0.0, 255.0);
-        rgb = fog + floor(((rgb - fog) * F + 128.0) / 256.0);
+        rgb = fog + floor(((rgb - fog) * F + 128.0) * (1.0 / 256.0));
     }
     if (authored) {
         const float t = saturate((length(i.mv) - environment_params.x) / max(1.0, environment_params.y - environment_params.x));
@@ -631,27 +715,52 @@ POut shade_modern(VOut i, bool has_scene_inputs) {
         rgb = lerp(rgb, authored_fog_color.rgb * 255.0, fog);
     }
     rgb *= vfx_post_fog;
-    if (m & M_ATE) {
-        const bool pass = alpha_pass(is_vfx ? min(a_game, 255.0) : a, (m >> M_ATST_SHIFT) & 7, (float)(obj.mode.y & 0xFF));
-        if (m & M_FAILED) {
-            if (pass) discard;
-        } else if (!pass && (m & M_AFAIL_DISCARD)) {
-            discard;
-        }
-    }
     POut o;
     // The dual-source factor carries coverage. Keep the retail framebuffer
     // alpha visible to later draws that use destination alpha.
-    o.color = float4(rgb / 255.0, (profile != 0 ? min(a_game, 255.0) : a) / 255.0);
+    o.color = float4(rgb * (1.0 / 255.0), (profile != 0 ? a_game : a) * (1.0 / 255.0));
     const float c = (m & M_CFIX) ? (float)(obj.mode.z & 0xFF) : a;
-    o.factor = float4(0, 0, 0, saturate(c / 128.0));
+    o.factor = float4(0, 0, 0, saturate(c * (1.0 / 128.0)));
     return o;
 }
 
 POut ps_modern(VOut i) {
-    return shade_modern(i, false);
+    return shade_modern_impl(i, false, true, true, true, false, true);
 }
 
 POut ps_modern_scene(VOut i) {
-    return shade_modern(i, true);
+    return shade_modern_impl(i, true, true, true, true, true, true);
+}
+
+// Specialized zero-discard / low-register entry points for Early-Z + TBDR HSR:
+POut ps_modern_opaque(VOut i) {
+    return shade_modern_impl(i, false, false, true, false, false, false);
+}
+
+POut ps_modern_scene_opaque(VOut i) {
+    return shade_modern_impl(i, true, false, true, false, false, false);
+}
+
+POut ps_modern_water_opaque(VOut i) {
+    return shade_modern_impl(i, true, false, true, false, true, false);
+}
+
+POut ps_modern_unlit_opaque(VOut i) {
+    return shade_modern_impl(i, false, false, false, false, false, false);
+}
+
+POut ps_modern_pbr_ate(VOut i) {
+    return shade_modern_impl(i, false, true, true, false, false, false);
+}
+
+POut ps_modern_scene_ate(VOut i) {
+    return shade_modern_impl(i, true, true, true, false, false, false);
+}
+
+POut ps_modern_unlit_ate(VOut i) {
+    return shade_modern_impl(i, false, true, false, false, false, false);
+}
+
+POut ps_modern_depth_only(VOut i) {
+    return shade_modern_impl(i, false, true, false, false, false, false);
 }

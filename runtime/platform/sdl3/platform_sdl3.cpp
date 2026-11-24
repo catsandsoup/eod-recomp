@@ -254,12 +254,27 @@ void read_keyboard(HostPadState *out, keyboard_input::Context ctx) {
 
 void platform_configure_display(const PlatformConfig &cfg) {
     g_cfg=cfg;
+    presentation::set_drawable_size(cfg.width, cfg.height);
     const char *headless=getenv("EOD_HEADLESS");
     g_headless=cfg.headless || (headless && headless[0]=='1');
 }
 
+// SDL display queries run on the window thread. MoltenVK's equivalent can
+// synchronously dispatch to this thread while it is waiting for the GS worker.
+static void update_display_refresh() {
+    if (!g_window) return;
+    const auto *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window));
+    uint64_t period = 0;
+    if (mode && mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0)
+        period = 1000000000ull * mode->refresh_rate_denominator / mode->refresh_rate_numerator;
+    else if (mode && mode->refresh_rate >= 1)
+        period = uint64_t(1000000000.0 / mode->refresh_rate);
+    presentation::refresh_period_ns.store(period, std::memory_order_relaxed);
+}
+
 bool platform_init(const PlatformConfig &cfg) {
     g_cfg = cfg;
+    presentation::set_drawable_size(cfg.width, cfg.height);
     g_main_thread = std::this_thread::get_id();
     const char *h = getenv("EOD_HEADLESS");
     g_headless = cfg.headless || (h && h[0] == '1');
@@ -270,6 +285,11 @@ bool platform_init(const PlatformConfig &cfg) {
         ? sdl_input::keyboard_port_from_env() : g_config.keyboard_port - 1, explicit_keyboard_port);
     sdl_input::set_controller_layout(g_config.controller_layout == "modern");
     sdl_input::set_hints();
+#ifdef __APPLE__
+    // Use SDL's borderless desktop fullscreen. AppKit fullscreen Spaces put
+    // the entire game below the camera housing, shrinking the drawable.
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+#endif
     SDL_InitFlags flags = SDL_INIT_GAMEPAD | SDL_INIT_EVENTS;
     if (!g_headless) flags |= SDL_INIT_VIDEO;
     if (!SDL_Init(flags)) {
@@ -292,6 +312,9 @@ bool platform_init(const PlatformConfig &cfg) {
             fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
             return false;
         }
+        update_display_refresh();
+        int width, height;
+        if (SDL_GetWindowSizeInPixels(g_window, &width, &height)) presentation::set_drawable_size(width, height);
         if (!g_vulkan_window) {
         g_renderer = SDL_CreateRenderer(g_window, nullptr);
         if (!g_renderer) {
@@ -387,9 +410,26 @@ bool platform_pump() {
             std::fputs("[editor-test] first native race frame presented; showing game window\n", stderr);
         }
     }
+    // Scripted fullscreen measurements can reserve input for the recorded pad.
+    // SDL quit/window events remain live, including the window close button.
+    static const bool scripted_input_only = [] {
+        const char *value = getenv("EOD_SCRIPT_INPUT_ONLY");
+        return value && std::strcmp(value, "1") == 0 && pad_script_spec(0);
+    }();
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (scripted_input_only && (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP ||
+            e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+            e.type == SDL_EVENT_MOUSE_WHEEL || e.type == SDL_EVENT_MOUSE_MOTION)) continue;
         switch (e.type) {
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            update_display_refresh();
+            break;
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+            if (g_window && e.window.windowID == SDL_GetWindowID(g_window))
+                presentation::set_drawable_size(e.window.data1, e.window.data2);
+            break;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             for (int p = 0; p < kPorts; ++p) sdl_input::rumble(p, 0, 0);
             break;
@@ -423,7 +463,7 @@ bool platform_pump() {
             if (e.key.scancode == SDL_SCANCODE_F9 && g_window) {
                 if (!e.key.repeat && e.key.windowID == SDL_GetWindowID(g_window) &&
                     SDL_GetKeyboardFocus() == g_window && !overlay_key(0x78, true))
-                    modern::toggle_from_input();
+                    modern::toggle_from_input("keyboard F9");
                 break;
             }
 #endif

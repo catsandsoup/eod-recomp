@@ -392,7 +392,7 @@ def pie_staging_root() -> Path:
     return tdeod_support_dir() / "editor" / "pie_staging"
 
 
-def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = False) -> Path:
+def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = True) -> Path:
     """Locate the PIE executable for the current platform and renderer."""
     override = os.environ.get("EOD_PIE_EXE")
     if override:
@@ -403,13 +403,9 @@ def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = False) -> Path
     repository = here.parents[2]
     if sys.platform == "darwin":
         bundle_executable = Path("Eve of Destruction.app/Contents/MacOS/eod")
-        builds = (
-            ["build-mac-plume", "build-mac", "build-mac-release", "build"]
-            if prefer_plume
-            else ["build-mac-plume", "build-mac", "build-mac-release", "build"]
-        )
-        if not prefer_plume:
-            builds = ["build-mac", "build-mac-plume", "build-mac-release", "build"]
+        native_builds = ["build-mac-r7-release", "build-mac-plume"]
+        builds = (native_builds + ["build-mac"] if prefer_plume else ["build-mac"] + native_builds)
+        builds += ["build-mac-release", "build"]
         candidates = [
             gdir / "eod",
             gdir / bundle_executable,
@@ -445,19 +441,22 @@ def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = False) -> Path
     return candidates[0]
 
 
-def _render_pie_ini(pie_memcard_dir: Path, *, render_scale: int = 2, renderer_mode: str = "ps2") -> str:
-    """Build an isolated pie.ini so PIE never inherits RenderScale=6 (>4K) or touches real saves."""
-    rs = max(1, min(6, int(render_scale)))
-    renderer = "vulkan" if (renderer_mode == "plume" or sys.platform != "win32") else "vulkan"
+MAX_PIE_RENDER_SCALE = 8
+
+
+def _render_pie_ini(pie_memcard_dir: Path, render_scale: int) -> str:
+    """Use the editor-selected resolution and its private test memory card."""
     return (
         "; Isolated Play-In-Editor (PIE) configuration — keeps global eod.ini & memcard untouched\n\n"
         "[Video]\n"
-        f"Renderer={renderer}\n"
+        "Renderer=vulkan\n"
         "Fullscreen=0\n"
         "Width=1280\n"
         "Height=720\n"
-        "VSync=0\n"
-        f"RenderScale={rs}\n"
+        "VSync=1\n"
+        "FrameSkip=0\n"
+        "AspectRatio=display\n"
+        f"RenderScale={render_scale}\n"
         "DrawDistance=2\n\n"
         "[System]\n"
         f"MemoryCard={pie_memcard_dir}\n"
@@ -489,7 +488,7 @@ def build_pie_launch_spec(
 
     Matches `src/session_start.h`, `src/battle_bots.cpp`, `src/battle_driver.cpp`, and
     `runtime/render/native_renderer.cpp`:
-      - Career Free Roam (HomeBase): `EOD_DIRECT_START="mode=career;place=<place>"`
+      - Career Free Roam (HomeBase): `EOD_DIRECT_START="mode=career;place=<place>;car=<car>"`
       - Track Free Roam:
           * When a specific non-Battle template is chosen (e.g. `Figure-8 Jump Race`,
             `Jump Race`, `Gauntlet`), launches THAT exact template with `ai=0` (Forced
@@ -508,8 +507,8 @@ def build_pie_launch_spec(
     clean_car = canonicalize_car_name(car_name)
     trk_up = track_display_name.strip()
     rmode = "plume" if renderer_mode == "plume" else "ps2"
-    exe = resolve_eod_exe(gdir, prefer_plume=rmode == "plume")
-    rtag = "Plume HQ" if rmode == "plume" else "PS2 Fast"
+    exe = resolve_eod_exe(gdir)
+    rtag = "Plume HQ" if rmode == "plume" else "Classic"
 
     raw_ev = (event_name or "").strip()
     canon_ev = canonicalize_event_name(raw_ev)
@@ -523,8 +522,13 @@ def build_pie_launch_spec(
         and raw_ev.lower() != "career overworld (free roam)"
     )
 
-    if mode == "career_roam" or (mode == "free_roam" and trk_up.lower() in ("homebase", "home base", "career")):
-        direct = f"mode=career;place={free_roam_place or 'home'}"
+    career_start = (
+        mode == "career_roam"
+        or (mode == "free_roam" and trk_up.lower() in ("homebase", "home base", "career"))
+        or (mode == "event" and raw_ev.lower() == "career overworld (free roam)")
+    )
+    if career_start:
+        direct = f"mode=career;place={free_roam_place or 'home'};car={clean_car}"
         label = f"Career Free Roam ({free_roam_place or 'home'}) [{rtag}]"
     elif mode == "free_roam":
         if is_specific_template:
@@ -537,30 +541,26 @@ def build_pie_launch_spec(
             direct = f"mode=action;track={trk_up};event=Battle;car={clean_car};paint=0;humans=1;ai={roam_ai}"
             label = f"Free Roam (Battle, {roam_ai} AI) — {trk_up} ({clean_car}) [{rtag}]"
     else:
-        if raw_ev.lower() == "career overworld (free roam)":
-            direct = f"mode=career;place={free_roam_place or 'home'}"
-            label = f"Career Free Roam ({free_roam_place or 'home'}) [{rtag}]"
-        else:
-            ev_ai = max(0, min(12, int(ai_count))) if ai_count is not None else 8
-            parts = [
-                "mode=action",
-                f"track={trk_up}",
-                f"event={canon_ev}",
-                f"car={clean_car}",
-                "paint=0",
-                "humans=1",
-                f"ai={ev_ai}",
-            ]
-            if laps is not None:
-                parts.append(f"laps={max(1, min(50, int(laps)))}")
-            direct = ";".join(parts)
-            label = f"Event — {trk_up} · {canon_ev} ({ev_ai} AI · {clean_car}) [{rtag}]"
+        ev_ai = max(0, min(12, int(ai_count))) if ai_count is not None else 8
+        parts = [
+            "mode=action",
+            f"track={trk_up}",
+            f"event={canon_ev}",
+            f"car={clean_car}",
+            "paint=0",
+            "humans=1",
+            f"ai={ev_ai}",
+        ]
+        if laps is not None:
+            parts.append(f"laps={max(1, min(50, int(laps)))}")
+        direct = ";".join(parts)
+        label = f"Event — {trk_up} · {canon_ev} ({ev_ai} AI · {clean_car}) [{rtag}]"
 
     control_file = mdir / "pie_live_control.ini"
     pie_ini = mdir / "pie.ini"
     pie_memcard = mdir / "pie_memcard"
-    rs = max(1, min(6, int(pie_render_scale)))
-    pie_ini_text = _render_pie_ini(pie_memcard, render_scale=rs, renderer_mode=rmode)
+    rs = max(1, min(MAX_PIE_RENDER_SCALE, int(pie_render_scale)))
+    pie_ini_text = _render_pie_ini(pie_memcard, rs)
 
     env = dict(os.environ)
     env["EOD_MOD_DIR"] = str(mdir)
@@ -570,6 +570,7 @@ def build_pie_launch_spec(
     env["EOD_FAST_BOOT"] = "1"
     env["EOD_CONFIG_PATH"] = str(pie_ini)
     env["EOD_MEMCARD_DIR"] = str(pie_memcard)
+    env["EOD_MEMCARD"] = str(pie_memcard)
     env["EOD_RENDER_SCALE"] = str(rs)
     env["EOD_VSYNC"] = "0"
     env["EOD_DIRECT_START"] = direct
@@ -589,14 +590,15 @@ def build_pie_launch_spec(
     args = [str(exe), "--windowed", "--data", str(gdir), "--config", str(pie_ini)]
     if sync_all_events:
         env["EOD_OPT_TERRAIN_MASK"] = "0xFFFF"
+    env["EOD_PLUME"] = "1"
     if rmode == "plume":
-        env["EOD_PLUME"] = "1"
         env["EOD_NATIVE"] = "1"
         env["EOD_LOOK"] = "modern"
         args.extend(["--renderer", "vulkan", "--require-plume"])
     else:
-        env["EOD_NATIVE"] = "0"
-        env.pop("EOD_LOOK", None)
+        # Plume builds default to native Classic. Other builds retain their compiled renderer.
+        env.pop("EOD_NATIVE", None)
+        env["EOD_LOOK"] = "classic"
 
     return {
         "exe": str(exe),

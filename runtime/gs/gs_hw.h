@@ -77,6 +77,9 @@ void vblank();
 void reset();
 // Submits everything and waits for the GPU (replay timing).
 void finish();
+#ifdef EOD_VULKAN
+void stop_pipeline_worker();
+#endif
 // EOD_MODERN (modern_scene.h): the texture and blend state of a replaced batch, and the
 // modern pass of a frame into the current frame buffer (takes ownership).
 #if defined(_WIN32) || defined(EOD_VULKAN)
@@ -101,11 +104,13 @@ struct NativeSurfaces {
     int scale;                     // RenderScale
     uint64_t color_ownership, depth_ownership; // physical pages reacquired since the prior use
 };
-bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback = false);
+bool native_begin(const Env &e, bool depth, NativeSurfaces &out, bool require_no_readback = false, const int *bounds = nullptr);
 // Match allocated attachments and optionally require all pages to remain GPU-owned.
 // This check does not grow, acquire or write the attachments.
 bool native_cached_targets(const Env &e, uint64_t &color, uint64_t &depth, bool check_ownership);
-bool native_begin_depth_clear(const Env &e, NativeSurfaces &out);
+bool native_begin_depth_clear(const Env &e, NativeSurfaces &out, const int *bounds);
+struct NativeSubmission { uint64_t recording, completed; };
+NativeSubmission native_submission();
 void native_mark_bootstrap_depth_clear(const Env &e);
 void native_end();
 bool native_display_copy(const Env &e);

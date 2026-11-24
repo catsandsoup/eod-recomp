@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "../app/game_frontend.h"
+#include "../platform/keyboard_input.h"
 
 namespace fs = std::filesystem;
 
@@ -131,7 +132,12 @@ std::vector<ModEntry> discover_mods(const std::string &root) {
 Menu::Menu(Config &cfg) : cfg_(cfg) { mods_ = builtin_mods(); }
 Menu::~Menu() = default;
 
-void Menu::set_network(std::shared_ptr<game_frontend::Network> n) { net_ = std::move(n); }
+void Menu::set_network(std::shared_ptr<game_frontend::Network> n) {
+    net_ = std::move(n);
+    online_dialog_ = OnlineDialog::None;
+    joined_lobby_ = false;
+    join_attempt_.reset();
+}
 
 void Menu::rescan_mods() {
     std::vector<ModEntry> found = discover_mods(host_.mods_root);
@@ -183,6 +189,7 @@ void Menu::open() {
 }
 
 void Menu::set_tab(Tab t) {
+    if (t != Tab::Online && online_modal_title()) return;
     tab_ = t;
     details_ = false;
     status_.clear();
@@ -264,8 +271,8 @@ Row action(const char *id, const char *label, const std::string &value, const ch
 const char *kScales[] = {"AUTO (WINDOW)", "1X 640x448 (PS2)", "2X 1280x896", "3X 1920x1344", "4X 2560x1792",
                          "5X 3200x2240", "6X 3840x2688", "7X 4480x3136", "8X 5120x3584"};
 static_assert(sizeof(kScales) / sizeof(kScales[0]) == kMaxRenderScale + 1);
-const char *kAspects[] = {"auto", "4:3", "16:9", "16:10", "stretch"};
-const char *kAspectLabels[] = {"AUTO (GAME OPTION)", "4:3 (ORIGINAL)", "16:9 WIDESCREEN", "16:10 WIDESCREEN", "STRETCH"};
+const char *kAspects[] = {"display", "4:3", "16:9", "16:10", "stretch", "auto"};
+const char *kAspectLabels[] = {"MATCH DISPLAY", "4:3 (ORIGINAL)", "16:9 WIDESCREEN", "16:10 WIDESCREEN", "STRETCH", "AUTO (GAME OPTION)"};
 const char *kDetails[] = {"original", "high", "maximum"};
 
 int index_of(const char *const *list, int n, const std::string &v) {
@@ -276,6 +283,44 @@ int index_of(const char *const *list, int n, const std::string &v) {
 std::string upper(std::string s) {
     for (char &c : s) c = (char)toupper((unsigned char)c);
     return s;
+}
+std::string turbo_label(const Config &cfg, const HostInfo &host) {
+    const bool controller = !host.device[0].empty() && host.device[0] != "Keyboard";
+#ifdef _WIN32
+    const bool keyboard = true;  // Win32 always uses the racing layout on port 0.
+    const bool racing = true;
+    const bool modern = true;
+#else
+    const bool keyboard = host.device[0] == "Keyboard";
+    const bool racing = cfg.keyboard_layout == "racing";
+    const bool modern = cfg.controller_layout == "modern";
+#endif
+    std::vector<int> keys;
+    std::string binding;
+    auto append = [&](const std::string &input) {
+        if (!binding.empty()) binding += " / ";
+        binding += input;
+    };
+    if (keyboard) {
+        auto append_key = [&](int key) {
+            if (!key || key == 0x70 || (racing && keyboard_input::reserved(key)) ||
+                std::find(keys.begin(), keys.end(), key) != keys.end()) return;
+#ifndef _WIN32
+            if (key == 0x6D) return;  // The SDL keyboard backend has no Subtract mapping.
+#endif
+            keys.push_back(key);
+            append(upper(key_name(key)));
+        };
+        std::istringstream configured(cfg.keys[KEY_L2]);
+        for (std::string name; std::getline(configured, name, ',');) append_key(key_code(name));
+#ifdef _WIN32
+        // The driving backend adds these even when native L2 is rebound.
+        append_key('Q');
+        append_key('F');
+#endif
+    }
+    if (controller) append(modern ? "RIGHT STICK CLICK" : "LEFT TRIGGER");
+    return "TURBO BOOST [" + (binding.empty() ? "NO P1 BINDING" : binding) + "]";
 }
 std::string percent(int v) { return std::to_string(v) + "%"; }
 std::string curve_label(int v) {
@@ -301,9 +346,9 @@ void Menu::rows_graphics(std::vector<Row> &r) {
                        "Internal resolution the 3D is drawn at. Higher is sharper and needs a faster GPU; it also "
                        "supersamples (the anti-aliasing of this renderer). AUTO matches the display's pixel height. "
                        "7X and 8X require a compatible Vulkan GPU."));
-    r.push_back(choice("aspect", "ASPECT RATIO", kAspectLabels[index_of(kAspects, 5, cfg_.aspect)], "NEXT LAUNCH",
-                       "Display shape. 16:9 and 16:10 switch the game's own widescreen camera and HUD; menus and "
-                       "movies keep their 4:3 composition. Camera and composition change together on the next launch."));
+    r.push_back(choice("aspect", "ASPECT RATIO", kAspectLabels[index_of(kAspects, 6, cfg_.aspect)], "NEXT LAUNCH",
+                       "Match Display adjusts the camera and HUD to the window or fullscreen display. "
+                       "Movies retain their original 4:3 composition."));
     r.push_back(toggle("fullscreen", "FULLSCREEN", cfg_.fullscreen, "LIVE", "Borderless window over the whole screen."));
     r.push_back(toggle("vsync", "VSYNC", cfg_.vsync, vsync_note, "Waits for the display between frames: no tearing."));
     r.push_back(choice("smooth", "SCREEN FILTERING", cfg_.smooth_display ? "SMOOTH (BILINEAR)" : "SHARP (NEAREST)", "LIVE",
@@ -376,7 +421,8 @@ void Menu::rows_settings(std::vector<Row> &r) {
     };
     r.push_back(host_rule(toggle("durability", "PER-CAR DURABILITY", cfg_.car_durability, "LIVE",
                        "Each car's own damage scale from its files (the game's menus already rate cars by it).")));
-    r.push_back(host_rule(toggle("turbo", "TURBO BOOST (L2)", cfg_.cheat_turbo, "LIVE", "Optional cheat: L2 boosts.")));
+    r.push_back(host_rule(toggle("turbo", turbo_label(cfg_, host_).c_str(), cfg_.cheat_turbo, "LIVE",
+                                 "Hold the displayed driving input to boost while Turbo is on.")));
     auto amount = [](float v, const char *unit) { char t[24]; snprintf(t, sizeof t, "%.2f%s", v, unit); return std::string(t); };
     r.push_back(host_rule(choice("turbo_scale", "TURBO STRENGTH", amount(cfg_.turbo_scale, "X"), "LIVE",
                        "Push and top speed while boosting.")));
@@ -561,19 +607,72 @@ void Menu::rows_mods(std::vector<Row> &r) {
                        "Highway and Malt Shop challengers in Career free roam can take full damage and be wrecked."));
 }
 
+const char *Menu::online_modal_title() const {
+    if (tab_ != Tab::Online || error_active()) return nullptr;
+    switch (online_dialog_) {
+    case OnlineDialog::Connecting:
+        return join_attempt_ && join_attempt_->kind == game_frontend::Command::Kind::Host
+            ? "SETTING UP LOBBY" : "CONNECTING TO LOBBY";
+    case OnlineDialog::Failure: return joined_lobby_ ? "SESSION ENDED" : "CONNECTION FAILED";
+    case OnlineDialog::None: return nullptr;
+    }
+    return nullptr;
+}
+
+void Menu::remember_join(const game_frontend::Command &command) {
+    joined_lobby_ = false;
+    join_attempt_ = std::make_unique<game_frontend::Command>(command);
+}
+
+void Menu::submit_join(game_frontend::Command command) {
+    remember_join(command);
+    net_->submit(std::move(command));
+}
+
+void Menu::cancel_join() {
+    joined_lobby_ = false;
+    join_attempt_.reset();
+    online_dialog_ = OnlineDialog::None;
+    if (net_) net_->submit({game_frontend::Command::Kind::Cancel});
+}
+
 void Menu::rows_online(std::vector<Row> &r) {
     game_frontend::Snapshot s;
     if (net_) { net_->viewing_online(); s = net_->snapshot(); }
-    pic_track_ = s.track_pic; pic_car_ = s.car_pic;
     using P = game_frontend::Snapshot::Phase;
+    const bool connecting = s.phase == P::Connecting || s.phase == P::CheckingCompatibility || s.phase == P::Hosting;
     const bool connected = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
-    Row st = info("status", "STATUS", connected ? upper(s.status.empty() ? "CONNECTED" : s.status) : "NOT CONNECTED",
-                  "");
+    const bool failed = !connected && !s.error.empty();
+    online_dialog_ = connecting ? OnlineDialog::Connecting : failed ? OnlineDialog::Failure : OnlineDialog::None;
+    if (connecting || failed) {
+        pic_track_.clear();
+        pic_car_ = 0;
+        text_id_.clear();
+        details_ = false;
+        if (connecting) {
+            r.push_back(info("status", "STATUS", upper(s.status.empty() ? "CONNECTING" : s.status)));
+            if (s.can_cancel) r.push_back(action("leave", "CANCEL", "", "Stop connecting and go back to Online."));
+        } else {
+            Row error = info("error", joined_lobby_ ? "SESSION ENDED" : "COULD NOT CONNECT", s.error);
+            error.warn = true;
+            r.push_back(error);
+            if (s.checking_installed_content) r.push_back(info("profile_search", "CHECKING INSTALLED CONTENT", ""));
+            if (s.can_match_content) r.push_back(action("profile_match", "RESTART AND REJOIN", "",
+                "Restart with matching content already installed. Your usual profile stays selected for future launches."));
+            if (join_attempt_ && (!joined_lobby_ || s.retryable_error)) r.push_back(action("join_retry", joined_lobby_ ? "REJOIN" : "RETRY", "", "Try connecting to the same lobby again."));
+            r.push_back(action("join_back", "BACK", "", "Go back to Online."));
+        }
+        return;
+    }
+    if (s.phase == P::Lobby || s.phase == P::Racing) joined_lobby_ = true;
+    pic_track_ = s.track_pic;
+    pic_car_ = s.car_pic;
+    Row st = info("status", "CONNECTION", connected ? upper(s.status.empty() ? "CONNECTED" : s.status) : "NOT CONNECTED");
     st.warn = !connected;
     st.good = connected;
     r.push_back(st);
     if (!s.error.empty()) {
-        Row e = info("error", "MESSAGE", upper(s.error));
+        Row e = info("error", "MESSAGE", s.error);
         e.warn = true;
         r.push_back(e);
     }
@@ -588,7 +687,7 @@ void Menu::rows_online(std::vector<Row> &r) {
         if (s.players.empty()) r.push_back(info("noplayers", "PLAYERS", "WAITING FOR LOBBY"));
         for (const auto &p : s.players) {
             Row pr = info("player", ("P" + std::to_string(p.slot + 1) + "  " + upper(p.name)).c_str(),
-                          std::string(s.phase == P::Racing ? "IN RACE" : p.ready ? "READY" : "NOT READY") + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
+                          std::string(p.waiting ? "NEXT EVENT" : s.phase == P::Racing ? "IN RACE" : p.ready ? "READY" : "NOT READY") + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
             pr.good = p.ready || p.speaking;
             r.push_back(pr);
         }
@@ -600,27 +699,28 @@ void Menu::rows_online(std::vector<Row> &r) {
                           "5-character Garage Code.");
         code.kind = RowKind::Text;
         r.push_back(code);
-        Row addr = action("addr", "JOIN BY ADDRESS", text_id_ == "addr" ? text_ + "_" : "[ ENTER ADDRESS ]",
-                          "Example: 192.168.1.20:27015.");
-        addr.kind = RowKind::Text;
-        r.push_back(addr);
     }
     Row ready = toggle("ready", "READY", s.ready, "", "");
-    ready.enabled = connected && !s.is_host;
-    if (s.phase == P::Lobby && !s.is_host) r.push_back(ready);
+    if (s.phase == P::Lobby && !s.is_host) {
+        ready.enabled = s.ready || s.car_pic != 0;
+        if (!ready.enabled) ready.help = "Choose a drivable car before marking Ready.";
+        r.push_back(ready);
+    }
     if (s.is_host && (s.phase == P::Racing || s.phase == P::Loading)) {
         r.push_back(action("end_event", "BACK TO LOBBY", s.phase == P::Loading ? "[ CANCEL START ]" : "[ END RACE ]",
                            "Ends the race for everyone. Keeps the lobby open."));
     }
+    if (s.can_rejoin_lobby)
+        r.push_back(action("withdraw", "RETURN TO LOBBY", "[ LEAVE RACE ]",
+                           "Withdraw from this event and keep your place for the next one."));
     const bool guest_in_race = !s.is_host && s.phase == P::Racing;
-    Row leave = action("leave", s.is_host ? "CLOSE LOBBY" : guest_in_race ? "LEAVE MATCH" : "LEAVE / CANCEL",
-                       guest_in_race ? "[ LEAVE RACE ]" : "[ DISCONNECT ]",
+    Row leave = action("leave", s.is_host ? "CLOSE LOBBY" : guest_in_race ? "LEAVE PARTY" : "LEAVE LOBBY",
+                       "[ DISCONNECT ]",
                        guest_in_race ? "Disconnects you. Other players keep racing."
                                      : "");
     if (s.is_host) leave.help = "Disconnects everyone.";
     leave.enabled = connected || s.can_cancel;
 
-    if (!s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite, ""));
     if (!connected && !s.crew.empty()) {
         r.push_back(header("FRIENDS HOSTING NOW"));
         for (const auto &g : s.crew)
@@ -632,21 +732,36 @@ void Menu::rows_online(std::vector<Row> &r) {
             r.push_back(action(("lan:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", ""));
     }
     for (const auto &o : s.options) {
-        if (o.editable) r.push_back(choice(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), "", o.help.c_str()));
-        else r.push_back(info(("opt:" + o.id).c_str(), o.label.c_str(), upper(o.value), o.help.c_str()));
+        const std::string label = o.id == "rule_turbo" ? turbo_label(cfg_, host_) : o.label;
+        if (s.phase == P::Lobby && o.editable) r.push_back(choice(("opt:" + o.id).c_str(), label.c_str(), upper(o.value), "", o.help.c_str()));
+        else r.push_back(info(("opt:" + o.id).c_str(), label.c_str(), upper(o.value), o.help.c_str()));
     }
     if (s.is_host && s.phase == P::Lobby) {
-        Row start = action("start", "START EVENT", s.can_start ? "[ START ]" : "WAITING",
+        const bool alone = s.players.size() <= 1;
+        Row start = action("start", alone && s.can_start ? "START EVENT ALONE" : "START EVENT", s.can_start ? "[ START ]" : "WAITING",
                            s.can_start ? "" : s.status.c_str());
         start.enabled = s.can_start;
         r.push_back(start);
+    }
+    if (!connected || s.is_host) {
+        r.push_back(action("advanced", "ADVANCED CONNECTION OPTIONS", online_advanced_ ? "[ HIDE ]" : "[ SHOW ]",
+                           "Show direct connection details and network options."));
+        if (online_advanced_ && !connected) {
+            Row addr = action("addr", "JOIN BY ADDRESS", text_id_ == "addr" ? text_ + "_" : "[ ENTER ADDRESS ]",
+                              "Example: 192.168.1.20:27015.");
+            addr.kind = RowKind::Text;
+            r.push_back(addr);
+            r.push_back(choice("snapshot_buffer", "REMOTE CAR SMOOTHING", std::to_string(cfg_.snapshot_buffer_ms) + " ms", "",
+                               "Longer buffering smooths uneven packet arrivals. Shorter buffering shows recent movement sooner."));
+        }
+        if (online_advanced_ && !s.invite.empty()) r.push_back(info("invite", "YOUR ADDRESS", s.invite));
     }
     Row nick = action("nickname", "SCREEN NAME", text_id_ == "nickname" ? text_ + "_" :
                       (cfg_.nickname.empty() ? "RANDOM" : cfg_.nickname), "Leave blank for a random name.");
     nick.kind = RowKind::Text;
     r.push_back(nick);
     if (!connected) return;
-    Row mods = info("modset", "MOD SET / VERSION", s.content_problem.empty() ? (s.players.size() <= 1 ? "NO GUESTS" : "MATCHED") : upper(s.content_problem),
+    Row mods = info("modset", "GAME CONTENT", s.content_problem.empty() ? (s.players.size() <= 1 ? "WAITING FOR PLAYERS" : "MATCHED") : s.content_problem,
                     "Players need matching game content and gameplay mods. Music stays local.");
     mods.warn = !s.content_problem.empty();
     r.push_back(mods);
@@ -814,7 +929,7 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
         const int count = kMaxRenderScale + 1;
         cfg_.render_scale = (cfg_.render_scale + dir + count) % count;
 #endif
-    } else if (id == "aspect") cycle(kAspects, 5, cfg_.aspect);
+    } else if (id == "aspect") cycle(kAspects, 6, cfg_.aspect);
     else if (id == "fullscreen") { cfg_.fullscreen = !cfg_.fullscreen; fx.fullscreen = true; }
     else if (id == "vsync") cfg_.vsync = !cfg_.vsync;
     else if (id == "smooth") cfg_.smooth_display = !cfg_.smooth_display;
@@ -825,6 +940,7 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "mic" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::MicrophoneEnabled; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
     else if (id == "mute" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Muted; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
     else if (id == "deafen" && net_) { game_frontend::Command c{}; c.kind = game_frontend::Command::Kind::Deafened; c.enabled = !row.checked; net_->submit(c); fx.sound = Sound::Move; return; }
+    else if (id == "snapshot_buffer") step(cfg_.snapshot_buffer_ms, 60, 140, 20);
     else if (id == "fps") cfg_.show_fps = !cfg_.show_fps;
     else if (id == "modern") cfg_.modern_renderer = !cfg_.modern_renderer;
     else if (id == "m_shadows") step(cfg_.modern_shadows, 0, 150, 10);
@@ -898,10 +1014,22 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (id.compare(0, 3, "key") == 0 && id.size() > 3) { rebind_ = std::stoi(id.substr(3)); return; }
     if (id == "dev1" || id == "dev2") { fx.swap_ports = true; return; }
     game_frontend::Command c{};
-    if (id == "start" && net_) { c.kind = game_frontend::Command::Kind::Start; net_->submit(c); fx.close = true; return; }
-    if (id.compare(0, 4, "lan:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinAddress; c.text = id.substr(4); net_->submit(c); return; }
-    if (id.compare(0, 5, "crew:") == 0 && net_) { c.kind = game_frontend::Command::Kind::JoinCrew; c.text = id.substr(5); net_->submit(c); return; }
-    if (id == "host" && net_) { c.kind = game_frontend::Command::Kind::Host; net_->submit(c); return; }
+    if (id == "start" && net_) {
+        const auto s = net_->snapshot();
+        if (!s.is_host || s.phase != game_frontend::Snapshot::Phase::Lobby || !s.can_start) {
+            fx.sound = Sound::Error;
+            return;
+        }
+        net_->submit({game_frontend::Command::Kind::Start});
+        fx.close = true;
+        return;
+    }
+    if (id == "advanced") { online_advanced_ = !online_advanced_; return; }
+    if (id == "join_retry" && net_ && join_attempt_) { submit_join(*join_attempt_); return; }
+    if (id == "join_back" || (id == "leave" && online_modal_title())) { cancel_join(); return; }
+    if (id.compare(0, 4, "lan:") == 0 && net_) { submit_join({game_frontend::Command::Kind::JoinAddress, id.substr(4)}); return; }
+    if (id.compare(0, 5, "crew:") == 0 && net_) { submit_join({game_frontend::Command::Kind::JoinCrew, id.substr(5)}); return; }
+    if (id == "host" && net_) { submit_join({game_frontend::Command::Kind::Host}); return; }
     if (id == "code" || id == "addr" || id == "nickname") { text_id_ = id; text_ = id == "nickname" ? cfg_.nickname : ""; return; }
     if (id.compare(0,5,"kick:") == 0 && net_) {
         if (remove_player_ != id) { remove_player_=id; return; }
@@ -909,8 +1037,13 @@ void Menu::activate(const Row &row, Effects &fx) {
         remove_player_.clear(); return;
     }
     if (id == "ready" && net_) { c.kind = game_frontend::Command::Kind::Ready; c.enabled = !row.checked; net_->submit(c); return; }
+    if (id == "profile_match" && net_) { net_->submit({game_frontend::Command::Kind::MatchContent}); return; }
     if (id == "end_event" && net_) { c.kind = game_frontend::Command::Kind::EndEvent; net_->submit(c); return; }
-    if (id == "leave" && net_) { c.kind = game_frontend::Command::Kind::Disconnect; net_->submit(c); return; }
+    if (id == "withdraw" && net_ && net_->snapshot().can_rejoin_lobby) {
+        net_->submit({game_frontend::Command::Kind::RejoinLobby});
+        return;
+    }
+    if (id == "leave" && net_) { joined_lobby_ = false; join_attempt_.reset(); c.kind = game_frontend::Command::Kind::Disconnect; net_->submit(c); return; }
     if (id == "mic" && net_) { c.kind = game_frontend::Command::Kind::MicrophoneEnabled; c.enabled = !row.checked; net_->submit(c); return; }
     if (id == "mute" && net_) { c.kind = game_frontend::Command::Kind::Muted; c.enabled = !row.checked; net_->submit(c); return; }
     if (id == "deafen" && net_) { c.kind = game_frontend::Command::Kind::Deafened; c.enabled = !row.checked; net_->submit(c); return; }
@@ -938,6 +1071,10 @@ Effects Menu::update(const Input &in) {
     const Tab t = err ? Tab::Count : tab_;
     std::vector<Row> &rows = rows_for(t);
     int &sel = sel_[(int)t];
+    if (online_modal_title()) {
+        if (in.back) { cancel_join(); fx.sound = Sound::Back; return fx; }
+        if (in.close || in.prev_tab || in.next_tab) return fx;
+    }
     if (!rows.empty()) {
         sel = std::clamp(sel, 0, (int)rows.size() - 1);
         if (rows[sel].kind == RowKind::Header || rows[sel].kind == RowKind::Info) {
@@ -966,10 +1103,12 @@ Effects Menu::update(const Input &in) {
         if (in.accept || in.close) {
             if (net_ && (!text_.empty() || text_id_ == "nickname")) {
                 game_frontend::Command c{};
-                if (text_id_ == "nickname") dirty_ = true;
                 c.kind = text_id_ == "nickname" ? game_frontend::Command::Kind::Nickname : text_id_ == "code" ? game_frontend::Command::Kind::JoinCode : game_frontend::Command::Kind::JoinAddress;
                 c.text = text_;
-                net_->submit(c);
+                if (c.kind == game_frontend::Command::Kind::Nickname) {
+                    dirty_ = true;
+                    net_->submit(c);
+                } else submit_join(std::move(c));
             }
             text_id_.clear();
             fx.sound = Sound::Select;
@@ -1001,7 +1140,7 @@ Effects Menu::update(const Input &in) {
     const Row row = rows[sel];
     if (in.dx && row.enabled && (row.kind == RowKind::Choice || row.kind == RowKind::Toggle)) change(row, in.dx, fx);
     if (in.accept) activate(row, fx);
-    if (in.details && !err) { details_ = !details_; fx.sound = Sound::Select; }
+    if (in.details && !err && !online_modal_title()) { details_ = !details_; fx.sound = Sound::Select; }
     if (in.reset && !err && tab_ != Tab::Online) {
         reset_tab(tab_);
         dirty_ = true;

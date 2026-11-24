@@ -276,7 +276,13 @@ The script stays headless/muted and fails if replay falls back to software.
 
 ### Refresh-grid presentation (optional driver support)
 
-Experimental and **off by default** while 1:1 fidelity is the priority. With
+For fullscreen measurements, `EOD_PRESENT_FEEDBACK=1` records driver-reported
+presentation timestamps and their accepted scanout IDs. A `fresh=1 composed=1`
+scanout comes from a game frame with an active display circuit. `EOD_SCRIPT_INPUT_ONLY=1`
+with `EOD_PAD_SCRIPT` reserves SDL keyboard and mouse shortcuts for the duration
+of the replay so an F9 shortcut cannot change the look under measurement.
+
+Refresh-grid scheduling is experimental and **off by default**. With
 `EOD_PRESENT_TIMING=1` and `VK_GOOGLE_display_timing` advertised, the presenter learns
 its refresh phase from completed presentation feedback and requests future
 images near a fixed refresh grid. A 120 Hz display normally uses two refreshes
@@ -388,9 +394,9 @@ those numbers must not be reported as decoded movie frame rates.
 
 ## Display aspect and explicit output captures
 
-Native settings support 4:3, 16:9, 16:10 and Stretch. Aspect changes are saved
-for the next launch so composition and camera projection change together.
-The default remains 4:3. Window width/height are macOS logical points; a
+The Display aspect setting follows the drawable, including after a monitor or
+window-size change. The race camera widens horizontally and the HUD keeps its
+native proportions. Fixed 4:3, 16:9, 16:10, Auto and Stretch remain selectable. Window width/height are macOS logical points; a
 Retina drawable can contain more physical pixels. Internal scale 6 renders
 640×448 GS content at 3840×2688; it does not force a physical monitor into a
 3840×2160 or 3840×2400 output mode.

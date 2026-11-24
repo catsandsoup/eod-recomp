@@ -6,7 +6,10 @@
 #include "core/memory.h"
 #include "funcs.h"
 #include "session_start.h"
+#include "battle_layout.h"
+#include "netplay_hooks.h"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 
@@ -50,5 +53,27 @@ extern "C" void f_00167D58(void) {
         ee_w32(master + 0x460 + 0x50 * 1, ee_r32(master + 0x468 + 0x50 * 1) + 5);
         std::fprintf(stderr, "[BATTLE_END] gave participant 1 a winning lead after %ld updates\n", updates);
     }
+    const uint32_t master = arg_u32(0);
+    const uint16_t eligible = netplay_hooks::eligible_battle_slots ? netplay_hooks::eligible_battle_slots() : UINT16_MAX;
+    if (eligible == UINT16_MAX || ee_r32(master + 4) != 1) { f_00167D58_orig(); return; }
+
+    // Only the host's eligible competitors may trigger a native victory. Keep
+    // client combat/HUD updates running, including temporary deaths and respawns.
+    const uint32_t count = ee_r32(master + battle_layout::kCount);
+    std::array<uint32_t, battle_layout::kCapacity> saved_kills{};
+    uint16_t masked = 0;
+    for (uint32_t slot = 0; slot < count && slot < saved_kills.size(); ++slot) {
+        if (eligible & (1u << slot)) continue;
+        const uint32_t record = master + battle_layout::kParticipants + slot * battle_layout::kParticipantStride;
+        const uint32_t kills = ee_r32(record + 0x0C), penalties = ee_r32(record + 0x14);
+        if (static_cast<int32_t>(kills - penalties) < 5) continue;
+        saved_kills[slot] = kills;
+        masked |= static_cast<uint16_t>(1u << slot);
+        ee_w32(record + 0x0C, penalties + 4);
+    }
     f_00167D58_orig();
+    for (uint32_t slot = 0; masked; ++slot, masked >>= 1) {
+        if (masked & 1) ee_w32(master + battle_layout::kParticipants + slot * battle_layout::kParticipantStride + 0x0C,
+                              saved_kills[slot]);
+    }
 }

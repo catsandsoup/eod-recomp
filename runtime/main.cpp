@@ -6,6 +6,7 @@
 // DIR is the root of the game disc (the directory that contains
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
+#include "app/online_profile.h"
 #include "core/r7_audit.h"
 #include "core/frame_pacing.h"
 #include "core/eod_tracy.h"
@@ -15,6 +16,7 @@
 #ifdef _WIN32
 #include <process.h>
 #include "app/windows_disc.h"
+#include "app/windows_settings.h"
 #else
 #include <unistd.h>
 #endif
@@ -239,53 +241,18 @@ std::string dir_of(const char *path) {
 // EOD_NATIVE_ONLY != "1", read <TDEODRecomp>/profiles/active_profile.txt so mods
 // installed from World Studio or Mod Manager automatically load in standalone play.
 void apply_active_profile_if_unset(bool headless) {
-    if (headless) return;
+    if (headless || online_profile::selected_for_session()) return;
     if (const char *cur = getenv("EOD_MOD_DIR"); cur && *cur) return;
     if (const char *native = getenv("EOD_NATIVE_ONLY"); native && native[0] == '1') return;
 
-    std::filesystem::path support_dir;
-#ifdef __APPLE__
-    support_dir = std::filesystem::u8path(mac_app_support());
-#elif defined(_WIN32)
-    if (const char *local_app = getenv("LOCALAPPDATA"); local_app && *local_app) {
-        support_dir = std::filesystem::u8path(local_app) / "TDEODRecomp";
-    }
-#else
-    if (const char *xdg = getenv("XDG_DATA_HOME"); xdg && *xdg) {
-        support_dir = std::filesystem::u8path(xdg) / "TDEODRecomp";
-    } else if (const char *home = getenv("HOME"); home && *home) {
-        support_dir = std::filesystem::u8path(home) / ".local" / "share" / "TDEODRecomp";
-    }
-#endif
-    if (support_dir.empty()) return;
-
-    std::filesystem::path pointer_file = support_dir / "profiles" / "active_profile.txt";
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(pointer_file, ec)) return;
-    FILE *f = host_fopen(pointer_file.string().c_str(), "rb");
-    if (!f) return;
-    char buf[1024] = {};
-    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    std::string line(buf, got);
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
-        line.pop_back();
-    size_t start = 0;
-    while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) ++start;
-    line = line.substr(start);
-    if (line.empty()) return;
-
-    std::filesystem::path target = std::filesystem::u8path(line);
-    if (target.is_relative()) target = support_dir / "profiles" / target;
-    if (!std::filesystem::is_directory(target, ec)) return;
-    char data_check[1024] = {};
-    if (!platform_find_file(target.string().c_str(), "DATA", data_check, sizeof(data_check))) return;
+    const std::string target = online_profile::standalone_overlay();
+    if (target.empty()) return;
 #ifdef _WIN32
-    _putenv_s("EOD_MOD_DIR", target.string().c_str());
+    _putenv_s("EOD_MOD_DIR", target.c_str());
 #else
-    setenv("EOD_MOD_DIR", target.string().c_str(), 1);
+    setenv("EOD_MOD_DIR", target.c_str(), 1);
 #endif
-    fprintf(stderr, "[profile] Active standalone mod profile: %s\n", target.string().c_str());
+    fprintf(stderr, "[profile] Active standalone mod profile: %s\n", target.c_str());
 }
 
 }  // namespace
@@ -306,8 +273,11 @@ static void on_signal(int sig) {
 #include "ui/overlay.h"
 namespace {
 std::string g_setup_config;
+bool g_setup_selected_disc = false;
 std::string install_disc(const std::string &path) {
-    return mac_app_install_disc(path, g_setup_config, {ee_elf_size, ee_elf_crc32});
+    auto error = mac_app_install_disc(path, g_setup_config, {ee_elf_size, ee_elf_crc32});
+    g_setup_selected_disc = error.empty();
+    return error;
 }
 }  // namespace
 
@@ -343,8 +313,21 @@ static int run_setup_screen(PlatformConfig cfg, const std::string &config_path, 
         }
         const int r = overlay_error_result();
         if (r == 2) app_exit(0);
-        if (r == 1) {  // retry / disc installed: start again from the top with the same arguments
+        if (r == 1) {
             fflush(nullptr);
+            // A replacement chosen in the picker supersedes the unavailable
+            // --data or environment path that originally opened this screen.
+            if (g_setup_selected_disc) {
+                unsetenv("EOD_DATA");
+                std::vector<char *> args{argv[0]};
+                for (int i = 1; argv[i]; ++i) {
+                    if (!strcmp(argv[i], "--data") && argv[i + 1]) { ++i; continue; }
+                    args.push_back(argv[i]);
+                }
+                args.push_back(nullptr);
+                execv(argv[0], args.data());
+                return 1;
+            }
             execv(argv[0], argv);
             return 1;
         }
@@ -357,6 +340,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     windows_utf8_arguments(argc, argv);
 #endif
+    online_profile::initialize(argv);
 #ifdef __APPLE__
     mac_app_apply_bundle_defaults(); // persisted settings are loaded below
     mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
@@ -368,21 +352,36 @@ int main(int argc, char **argv) {
 #endif
     PlatformConfig cfg;
     std::string data_dir;
-    // settings: eod.ini next to the executable (--config or EOD_CONFIG_PATH overrides the path)
-    std::string config_path = dir_of(argv[0]) + "/eod.ini";
-#ifdef __APPLE__
-    config_path = mac_app_support() + "/eod.ini";
-#endif
-    if (const char *env_cfg = getenv("EOD_CONFIG_PATH"); env_cfg && *env_cfg) config_path = env_cfg;
+    std::string config_path;
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
+    if (config_path.empty()) {
+#ifdef _WIN32
+        config_path = windows_settings_path(dir_of(argv[0]));
+#else
+        if (const char *env_cfg = getenv("EOD_CONFIG_PATH"); env_cfg && *env_cfg) config_path = env_cfg;
+#ifdef __APPLE__
+        else config_path = mac_app_support() + "/eod.ini";
+#else
+        else config_path = dir_of(argv[0]) + "/eod.ini";
+#endif
+#endif
+    }
     config_load(config_path);
+    if (const char *look = getenv("EOD_LOOK")) {
+        if (*look == 'm' || *look == 'M') g_config.plume_modern = true;
+        if (*look == 'c' || *look == 'C') g_config.plume_modern = false;
+    }
     cfg.width = g_config.width;
     cfg.height = g_config.height;
     cfg.fullscreen = g_config.fullscreen;
-    cfg.aspect = display_aspect(g_config.aspect);
+    cfg.aspect = display_aspect(g_config.aspect, drawable_aspect(cfg.width, cfg.height));
     cfg.smooth = g_config.smooth_display;
     if (!g_config.data_dir.empty()) data_dir = g_config.data_dir;
+#ifdef _WIN32
+    if (const wchar_t *env_data = _wgetenv(L"EOD_DATA"); env_data && *env_data)
+        data_dir = std::filesystem::path(env_data).u8string();
+#endif
     const char *log_spec = getenv("EOD_LOG");
     const char *replay = nullptr;
     const char *vu_bench_file = nullptr;
@@ -406,6 +405,10 @@ int main(int argc, char **argv) {
         else if (a == "--config") next();
         else if (a == "--renderer") g_config.renderer = next();
         else if (a == "--require-plume") require_plume = true;
+        else if (a == "--modern" || a == "--classic") {
+            require_plume = true;
+            g_config.plume_modern = a == "--modern";
+        }
         else if (a == "--fullscreen") cfg.fullscreen = true;
         else if (a == "--windowed") cfg.fullscreen = false;
         else if (a == "--log") log_spec = next();
@@ -434,7 +437,7 @@ int main(int argc, char **argv) {
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
-                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume] [--modern|--classic]\n"
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
                    argv[0]);
@@ -442,7 +445,7 @@ int main(int argc, char **argv) {
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
-                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume] [--modern|--classic]\n"
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
                    "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
@@ -451,6 +454,11 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+#ifdef EOD_R7_RELEASE
+    // SDL must select a Vulkan-capable window even with an older renderer setting.
+    g_config.renderer = "vulkan";
+    require_plume = true;
+#endif
     if (require_plume) {
 #ifdef EOD_PLUME
         g_config.native_renderer = true;
@@ -500,7 +508,7 @@ int main(int argc, char **argv) {
             disc_problem = true;
         } else {
             apply_active_profile_if_unset(headless);
-            if (!mac_app_select_mods(headless, headless ? nullptr : &problem)) {
+            if (!online_profile::selected_for_session() && !mac_app_select_mods(headless, headless ? nullptr : &problem)) {
                 if (problem.empty()) return 1;
             }
         }
@@ -510,8 +518,13 @@ int main(int argc, char **argv) {
     platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.
     if (replay) { int result = gs_replay(replay, repeat); gs_shutdown(); return result; }
     if (vu_bench_file) {
+#ifdef EOD_R7_RELEASE
+        fprintf(stderr, "--vu-bench requires the separate reference build\n");
+        return 2;
+#else
         vu_init();
         return vu_bench(vu_bench_file, repeat);
+#endif
     }
 
 #ifdef HAVE_SSE
@@ -520,12 +533,12 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef _WIN32
-    if (data_dir.empty()) {
-        const char *env_data = getenv("EOD_DATA");
-        if (env_data && env_data[0]) data_dir = env_data;
-    }
     const bool disc_headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
     if (!windows_prepare_disc(data_dir, dir_of(argv[0]), disc_headless, {ee_elf_size, ee_elf_crc32})) return 1;
+    if (data_dir != g_config.data_dir) {
+        g_config.data_dir = data_dir;
+        if (!config_save(config_path)) std::fprintf(stderr, "Could not save the selected disc location.\n");
+    }
     apply_active_profile_if_unset(disc_headless);
 #elif !defined(__APPLE__)
     const bool disc_headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');

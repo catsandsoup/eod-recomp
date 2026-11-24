@@ -41,6 +41,23 @@ int main() {
     });worker.join();
     if(!independent || presentation::current(3)!=0) ++failures;
     presentation::set(-1);
+    const int panel = drawable_aspect(3024,1964);
+    if (!custom_aspect(panel) || presentation::from_tag(presentation::tag(panel)) != panel ||
+        drawable_aspect(1920,1080) != 1 || drawable_aspect(1920,1200) != 3 ||
+        drawable_aspect(640,480) != 0 || drawable_aspect(0,0) != 0) ++failures;
+    presentation::set_drawable_size(3024,1676);
+    presentation::swapchain_aspect.store(panel);
+    presentation::set_drawable_size(3024,1898);
+    if (presentation::active_drawable() != panel) ++failures;
+    presentation::swapchain_aspect.store(-1);
+    if (presentation::active_drawable() != drawable_aspect(3024,1898)) ++failures;
+    auto screen=screenshot_size(640,448,6,nullptr,nullptr,3024,1898);
+    if (!screen.composed || !screen.valid || screen.width!=3024 || screen.height!=1898) ++failures;
+    rect(panel,3024,1964,{0,0,3024,1964});
+    rect(panel,1512,982,{0,0,1512,982});
+    presentation::set(panel);
+    if (presentation::current(0) != panel) ++failures;
+    presentation::set(-1);
     rect(3,3840,2400,{0,0,3840,2400});
     rect(1,3840,2400,{0,120,3840,2160});
     rect(3,3840,2160,{192,0,3456,2160});
@@ -74,11 +91,12 @@ int main() {
     std::string file=(std::filesystem::temp_directory_path()/"eod-aspect-config.XXXXXX").string();
     int fd=mkstemp(file.data());if(fd<0)return 2;close(fd);
     Config saved,loaded;
-    if(saved.aspect!="auto") ++failures;  // upstream 1.0: the game's own widescreen option
-    saved.aspect="16:9";saved.width=1920;saved.height=1200;
-    for(int scale:{6,7,8}) {
+    if(saved.aspect!="display") ++failures;
+    saved.width=1920;saved.height=1200;
+    for (const char *aspect : {"display", "auto", "4:3", "16:9", "16:10", "stretch"}) for(int scale:{6,7,8}) {
+        saved.aspect=aspect;
         saved.render_scale=scale;
-        if(!config_save(file,saved) || !config_load(file,loaded) || loaded.aspect!="16:9" || loaded.render_scale!=scale)
+        if(!config_save(file,saved) || !config_load(file,loaded) || loaded.aspect!=aspect || loaded.render_scale!=scale)
             ++failures;
     }
     std::filesystem::remove(file);

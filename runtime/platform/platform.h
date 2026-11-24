@@ -7,7 +7,7 @@
 struct PlatformConfig {
     int width = 1280, height = 960;  // window client size
     bool fullscreen = false;         // borderless window over the whole monitor
-    int aspect = 0;                  // displayed image: 0 = 4:3, 1 = 16:9, 2 = stretch, 3 = 16:10
+    int aspect = 0;                  // displayed image: see display_rect.h for fixed and drawable ratios
     bool smooth = true;              // bilinear scaling of the image
     bool headless = false;     // no window (tests)
     bool vsync_throttle = true;
@@ -26,7 +26,7 @@ void platform_fatal_message(const char *msg);
 // Pumps OS events. Returns false when the user closed the window.
 bool platform_pump();
 
-// Display aspect ratio, changeable while running: 0 = 4:3, 1 = 16:9, 2 = stretched to the window.
+// Ordered per-frame display aspect code (see display_rect.h).
 void platform_set_aspect(int aspect);
 // Where the image goes in a client area of cw x ch (aspect ratio setting).
 void platform_display_rect(int cw, int ch, int *x, int *y, int *w, int *h);
