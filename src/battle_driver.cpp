@@ -5,6 +5,7 @@
 #include "battle_driver.h"
 #include "battle_bots.h"
 #include "netplay_puppet.h"
+#include "chicken_weapon.h"
 #include "battle_layout.h"
 #include "battle_navigation.h"
 #include "core/config.h"
@@ -38,16 +39,6 @@ void controls(uint32_t car,float steer,float gas,float brake,float handbrake,int
     // Native Derby 0x1975B0 keeps drivetrain engagement at one.
     // 0x1B7C is the rear-wheel brake input; zero engagement prevents drive.
     wf(car+0x1B78,1);wf(car+0x1B7C,handbrake);ee_w32(car+0x1B90,(uint32_t)gear);
-}
-uint32_t weapon_interface(uint32_t owner) {
-    uint32_t count=ee_r32(0x3CE4B8);
-    if(count>16) return 0;
-    for(uint32_t i=0;i<count;++i) {
-        uint32_t row=0x3CE3F8+i*12,iface=ee_r32(row+8);
-        if(ee_r32(row)!=owner || ee_r32(row+4)!=0 || iface<0x1DC || !valid(iface-0x1DC,0x228)) continue;
-        if(ee_r32(iface)==0x3F9528 && ee_r32(iface+12)==owner) return iface;
-    }
-    return 0;
 }
 void trigger(uint32_t iface,uint32_t car,bool down) {
     uint32_t sp=g_ee.r[29].uw[0];
@@ -154,7 +145,7 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
     }
     controls(car,steer,gas,brake,handbrake,reversing?-1:-10);
     if((ee_r32(0x3C4190)&9)!=9) return;
-    if(uint32_t iface=weapon_interface(slot)) {
+    if(uint32_t iface=chicken_weapon::interface_for(slot)) {
         float flight=range/(28+speed);
         float ax=tx+tvx*flight-x,az=tz+tvz*flight-z;
         float aim_length=std::max(std::hypot(ax,az),.01f);

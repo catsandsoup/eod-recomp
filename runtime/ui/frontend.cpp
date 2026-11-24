@@ -323,6 +323,13 @@ std::string turbo_label(const Config &cfg, const HostInfo &host) {
     return "TURBO BOOST [" + (binding.empty() ? "NO P1 BINDING" : binding) + "]";
 }
 std::string percent(int v) { return std::to_string(v) + "%"; }
+void incoming_voice_rows(std::vector<Row> &rows, const Config &cfg) {
+    rows.push_back(choice("voicevolume", "INCOMING VOICE VOLUME", percent(cfg.voice_volume), "LIVE",
+                          "Adjust other players from 0% (silent) to 200%."));
+    rows.back().slider_fraction = cfg.voice_volume / 200.0f;
+    rows.push_back(toggle("voicefocus", "LOWER GAME DURING SPEECH", cfg.lower_game_during_voice, "LIVE",
+                          "Temporarily lower the game while another player speaks. Turn off for a fixed game level."));
+}
 std::string curve_label(int v) {
     char b[32];
     snprintf(b, sizeof b, v == 100 ? "LINEAR" : "%.2f", v / 100.0);
@@ -395,6 +402,7 @@ void Menu::rows_settings(std::vector<Row> &r) {
     r.push_back(choice("volume", "MASTER VOLUME", percent(cfg_.volume), "LIVE",
                        "Overall game and voice volume."));
     r.push_back(choice("musicvolume", "MUSIC VOLUME", percent(cfg_.music_volume), "LIVE", "Turn down or mute your soundtrack independently of engines, effects and voice."));
+    incoming_voice_rows(r, cfg_);
     r.push_back(header("FRONT END"));
     r.push_back(toggle("pause", "PAUSE GAME IN THIS MENU", cfg_.pause_in_menu, "LIVE",
                        "Holds the game while this menu is open (never during online play)."));
@@ -767,6 +775,7 @@ void Menu::rows_online(std::vector<Row> &r) {
     r.push_back(mods);
 
     r.push_back(header("VOICE"));
+    incoming_voice_rows(r, cfg_);
     Row mic = toggle("mic", "MICROPHONE", s.microphone_enabled, "LIVE", "");
     mic.enabled = connected && s.voice;
     if (s.microphone_enabled && !s.microphone_capture) {
@@ -870,7 +879,7 @@ void Menu::reset_tab(Tab t) {
         }
         break;
     case Tab::Settings:
-        cfg_.audio = d.audio; cfg_.volume = d.volume; cfg_.music_volume = d.music_volume; cfg_.pause_in_menu = d.pause_in_menu; cfg_.unlock_all = d.unlock_all;
+        cfg_.audio = d.audio; cfg_.volume = d.volume; cfg_.music_volume = d.music_volume; cfg_.voice_volume = d.voice_volume; cfg_.lower_game_during_voice = d.lower_game_during_voice; cfg_.pause_in_menu = d.pause_in_menu; cfg_.unlock_all = d.unlock_all;
         cfg_.career_cheats = d.career_cheats; cfg_.battle_bots = d.battle_bots; cfg_.sp_battle_mode = d.sp_battle_mode;
         cfg_.manual_recovery = d.manual_recovery; cfg_.car_durability = d.car_durability; cfg_.cheat_turbo = d.cheat_turbo;
         cfg_.cheat_chickens = d.cheat_chickens; cfg_.cheat_invincible = d.cheat_invincible;
@@ -953,6 +962,8 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "m_grade") step(cfg_.modern_grade, 0, 200, 10);
     else if (id == "m_vignette") step(cfg_.modern_vignette, 0, 200, 10);
     else if (id == "audio") { cfg_.audio = !cfg_.audio; fx.audio = true; }
+    else if (id == "voicevolume") step(cfg_.voice_volume, 0, 200, 5);
+    else if (id == "voicefocus") cfg_.lower_game_during_voice = !cfg_.lower_game_during_voice;
     else if (id == "musicvolume") { step(cfg_.music_volume, 0, 100, 5); fx.audio = true; }
     else if (id == "volume") { step(cfg_.volume, 0, 100, 5); fx.audio = true; }
     else if (id == "pause") cfg_.pause_in_menu = !cfg_.pause_in_menu;
@@ -1138,8 +1149,12 @@ Effects Menu::update(const Input &in) {
     rows = rows_for(t);
     sel = std::clamp(sel, 0, (int)rows.size() - 1);
     const Row row = rows[sel];
+    if (row.enabled && row.id == "voicevolume" && in.slider_fraction >= 0) {
+        const int level = int(std::lround(std::clamp(in.slider_fraction, 0.0f, 1.0f) * 40)) * 5;
+        if (cfg_.voice_volume != level) { cfg_.voice_volume = level; dirty_ = true; }
+    }
     if (in.dx && row.enabled && (row.kind == RowKind::Choice || row.kind == RowKind::Toggle)) change(row, in.dx, fx);
-    if (in.accept) activate(row, fx);
+    if (in.accept && !(in.dx && row.slider_fraction >= 0)) activate(row, fx);
     if (in.details && !err && !online_modal_title()) { details_ = !details_; fx.sound = Sound::Select; }
     if (in.reset && !err && tab_ != Tab::Online) {
         reset_tab(tab_);

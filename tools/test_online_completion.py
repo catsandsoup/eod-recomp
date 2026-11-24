@@ -76,7 +76,7 @@ def await_output(processes, condition, timeout, reason):
 
 
 def launch(processes, exe, disc, root, name, mode, terminal, event, guests, endpoint=None, force_relay=False,
-           packaged_relay=False, physical_wreck=False, check_voice=False, mutual=False, battle_respawn=False, rendered=False, rotate_track=False, rendered_host=False):
+           packaged_relay=False, physical_wreck=False, check_voice=False, mutual=False, battle_respawn=False, rendered=False, rotate_track=False, rendered_host=False, pad_script=None):
     folder = root / name
     folder.mkdir()
     path = folder / "game.log"
@@ -87,7 +87,7 @@ def launch(processes, exe, disc, root, name, mode, terminal, event, guests, endp
         EOD_NETPLAY_NO_INTERNET="1", EOD_NETPLAY_NO_LAN="1", EOD_NETPLAY_CAR="Phantom",
         EOD_HEADLESS="1", EOD_SKIP_MOVIES="1", EOD_MUTE="1", EOD_NETPLAY_DEBUG="1",
         EOD_MEMCARD=str(folder / "card"), EOD_APP_SUPPORT=str(folder / "support"),
-        EOD_PAD_SCRIPT="400:0008,410:0000", EOD_LOG="-game",
+        EOD_PAD_SCRIPT=pad_script if pad_script is not None else "400:0008,410:0000", EOD_LOG="-game",
     )
     for key in ("EOD_NETPLAY_TEST_REMATCH", "EOD_NETPLAY_TEST_TERMINAL", "EOD_NETPLAY_TEST_IMPACT", "EOD_NETPLAY_TEST_NATIVE_LAP"):
         env.pop(key, None)
@@ -113,7 +113,7 @@ def launch(processes, exe, disc, root, name, mode, terminal, event, guests, endp
                    EOD_NETPLAY_CAR="Algar", EOD_NETPLAY_TRACK="Anoka")
         if mutual:
             env["EOD_NETPLAY_TEST_IMPACT_GATE"] = str(root / "impact-go")
-        if event == "Battle (4 AI)":
+        if event in ("Battle (4 AI)", "Battle (1v1, humans only)"):
             env.update(EOD_NETPLAY_TEST_BATTLE_FRAG="1", EOD_NETPLAY_TEST_IMPACT_GATE=str(root / "impact-go"))
     elif terminal is None:
         env.update(EOD_NETPLAY_TEST_NATIVE_LAP="1", EOD_NETPLAY_CAR="Moth", EOD_NETPLAY_TRACK="Anoka", EOD_AI_AUTODRIVE="0")
@@ -416,7 +416,10 @@ def main():
                         help="use a 150 ms asymmetric path with jitter, loss, and three lost finish and result reports")
     parser.add_argument("--impaired-public-relay", metavar="IPV4:PORT",
                         help="add 180 ms asymmetric RTT, ±8 ms jitter and 2%% loss between each guest and the public relay")
+    parser.add_argument("--human-battle", action="store_true", help="run the two-human online Battle roster")
     args = parser.parse_args()
+    if args.human_battle and args.scenario not in ("battle-ram", "battle-respawn"):
+        parser.error("--human-battle requires battle-ram or battle-respawn")
     garage = args.public_garage or args.garage_route
     packaged = bool(args.public_garage or args.packaged_relay_port)
     if args.impaired_results and garage:
@@ -466,6 +469,8 @@ def main():
     else:
         event = "Detention"
         schedule = {"host": f"{LAST_TICK}:objective", "guest": f"{FIRST_TICK}:wreck"}
+    if args.human_battle:
+        event = "Battle (1v1, humans only)"
     root.mkdir(parents=True, exist_ok=False)
     processes = {}
     guests = len(schedule) - 1
@@ -545,6 +550,14 @@ def main():
             230 if args.impaired_results or scenario in ("native-lap", "native-pack", "race-timeout", "objective") else 112,
             "peers did not reach the lobby after the second outcome",
         )
+        if args.human_battle:
+            for name, log in logs.items():
+                for event_id in (1, 2):
+                    segment = log.split(f"[netplay] event {event_id} '{event}' starting", 1)[1].split("[netplay] event ", 1)[0]
+                    binds = re.findall(r"bind slot=(\d+) owner=(\d+) car=\w+ type=(\w+)", segment)
+                    assert len(binds) == 2 and {owner for _, owner, _ in binds} == {"0", "1"}, (name, binds)
+                    local = "0" if name == "host" else "1"
+                    assert all(kind == ("50" if owner == local else "51") for _, owner, kind in binds)
         assert_results(logs, scenario)
         if scenario == "native-pack":
             assert_cpu_pack(logs)

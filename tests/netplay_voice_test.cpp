@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "netplay_voice.h"
 #include <algorithm>
 #include <cassert>
@@ -87,6 +90,38 @@ bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){r
 }
 }
 #ifdef EOD_HAVE_OPUS
+void quiet_microphone_playback() {
+    Session tx, rx;
+    assert(tx.start(nonce, 1, 0) && rx.start(nonce, 1, 1));
+    tx.set_transmit_enabled(true);
+    Packet packet;
+    Frame decoded;
+    bool speaking = true;
+    assert(rx.playout(0, decoded, &speaking) == Playback::Silence && !speaking);
+    for (unsigned i = 0; i < 25; ++i) {
+        Frame mic = input(i);
+        for (auto &sample : mic) sample /= 12;
+        assert(tx.encode(mic, packet));
+        assert(rx.receive(0, packet.bytes.data(), packet.size) == Receive::Accepted);
+        if (i == 0)
+            for (unsigned j = 0; j < StartupFrames; ++j) assert(rx.playout(0, decoded) == Playback::Priming);
+        assert(rx.playout(0, decoded, &speaking) == Playback::Decoded);
+    }
+    assert(speaking);
+    int peak = 0;
+    for (auto sample : decoded) peak = std::max(peak, std::abs(int(sample)));
+    assert(peak > 4000 && peak < 20000);
+    for (unsigned i = 0; i < 20; ++i) {
+        assert(tx.encode(Frame{}, packet));
+        assert(rx.receive(0, packet.bytes.data(), packet.size) == Receive::Accepted);
+        assert(rx.playout(0, decoded, &speaking) == Playback::Decoded);
+    }
+    assert(!speaking);
+    rx.set_peer_muted(0, true);
+    assert(tx.encode(input(0), packet));
+    assert(rx.receive(0, packet.bytes.data(), packet.size) == Receive::Accepted);
+    assert(rx.playout(0, decoded, &speaking) == Playback::Decoded && !speaking && silent(decoded));
+}
 void resumes_after_silence() {
  using namespace netplay::voice;
  Session tx,rx; assert(tx.start(nonce,1,0)&&rx.start(nonce,1,1));
@@ -99,6 +134,37 @@ void resumes_after_silence() {
  assert(decoded);
 }
 #endif
+void stereo_voice_balance() {
+ using namespace netplay::voice;
+ StereoMixer mixer;
+ Frame speech{}; speech.fill(7000);
+ std::array<int16_t, FrameSamples * 2> bed{}, stereo{};
+ for (size_t i = 0; i < FrameSamples; ++i) { bed[2*i] = 10000; bed[2*i+1] = -7000; }
+ for (int level : {0, 50, 100, 200}) {
+  stereo = bed;
+  mixer.mix(stereo.data(), FrameSamples, speech.data(), FrameSamples, 100, level, false);
+  const int voice = 7000 * level / 100;
+  assert(stereo[0] == 10000 + voice && stereo[1] == -7000 + voice);
+ }
+ stereo = bed;
+ mixer.mix(stereo.data(), FrameSamples, speech.data(), FrameSamples, 50, 100, false);
+ assert(stereo[0] == 13500 && stereo[1] == -3500);
+ stereo = bed;
+ mixer.mix(stereo.data(), FrameSamples, speech.data(), FrameSamples, 100, 100, true);
+ assert(stereo.back() == -1120 + 7000);
+ // Silence releases smoothly, even when there are no further remote packets.
+ for (int i=0; i<30; ++i) {
+  stereo = bed;
+  mixer.mix(stereo.data(), FrameSamples, nullptr, 0, 100, 100, true);
+ }
+ assert(stereo == bed);
+ speech.fill(32000); stereo.fill(12000);
+ mixer.mix(stereo.data(), FrameSamples, speech.data(), FrameSamples, 100, 200, false);
+ assert(stereo[0] < 32767 && stereo[0] > 30000);
+ stereo = bed;
+ mixer.mix(stereo.data(), FrameSamples, speech.data(), FrameSamples, 100, 0, true);
+ assert(stereo == bed);
+}
 void full_lobby_voice() {
  Session rx; assert(rx.start(nonce,1,MaxPeers-1));
  std::array<Session,MaxPeers-1> tx;
@@ -119,7 +185,9 @@ void full_lobby_voice() {
  assert(host.playout(MaxPeers-1,out)==Playback::Decoded&&!silent(out));
 }
 int main(){
+ stereo_voice_balance();
 #ifdef EOD_HAVE_OPUS
+ quiet_microphone_playback();
  assert(Session::available());resumes_after_silence();full_lobby_voice();lifecycle();reorder_loss_and_bounds();invalid_packets();separate_peers();mute_and_deafen();std::puts("Voice codec/session/jitter checks passed");
 #else
  Session s;assert(!Session::available()&&!s.start(nonce,1,0));Packet p;assert(!s.encode(input(0),p));Frame out;assert(s.playout(1,out)==Playback::Silence&&silent(out));std::puts("Voice unavailable fallback checks passed");

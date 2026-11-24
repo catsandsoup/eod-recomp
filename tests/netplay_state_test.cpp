@@ -4,6 +4,7 @@
 #include "netplay_names.h"
 #include "netplay_wire.h"
 #include "netplay_battle.h"
+#include "netplay_chicken.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,92 @@ static State make(float x, float z, float yaw, float vx, float vz) {
     return s;
 }
 int main() {
+    {
+        using namespace netplay;
+        ChickenEvent shot;
+        shot.slot = 3; shot.shot = 48; shot.life = 901;
+        shot.position = {3.5f, 1.2f, -8.f}; shot.velocity = {1.f, 2.f, 42.f};
+        Writer w;
+        put_chicken(w, shot);
+        ChickenEvent decoded;
+        Reader full(w.b.data(), w.b.size());
+        require(get_chicken(full, decoded) && decoded.shot == 48 &&
+                decoded.position == shot.position && decoded.velocity == shot.velocity, "chicken launch round trip");
+        Reader truncated(w.b.data(), w.b.size()-1);
+        require(!get_chicken(truncated, decoded), "chicken packet rejects missing velocity");
+        auto bad_shot = shot;
+        bad_shot.velocity[1] = std::numeric_limits<float>::quiet_NaN();
+        Writer invalid; put_chicken(invalid, bad_shot);
+        Reader bad(invalid.b.data(), invalid.b.size());
+        require(!get_chicken(bad, decoded), "chicken packet rejects nonfinite velocity");
+
+        auto prop = shot;
+        prop.action = ChickenAction::Prop;
+        prop.prop.type = chicken_prop::Type::Panel;
+        prop.prop.object = 2; prop.prop.part = 1u << 8; prop.prop.donor_life = 356;
+        prop.prop.pose = {1,0,0, 0,1,0, 0,0,1, -12,0.4f,43};
+        prop.prop.impulse = {-12500,6250,0};
+        prop.prop.point = {-11.7f,0.6f,42.9f};
+        Writer contact; put_chicken(contact, prop);
+        Reader contact_in(contact.b.data(), contact.b.size());
+        require(get_chicken(contact_in, decoded) && decoded.prop.impulse == prop.prop.impulse &&
+                decoded.prop.pose == prop.prop.pose && decoded.prop.point == prop.prop.point &&
+                decoded.prop.part == prop.prop.part && decoded.prop.donor_life == prop.prop.donor_life,
+                "host-selected loose part preserves identity, pose, impulse and contact point");
+        ChickenChannel sent_props, received_props;
+        auto contact_blast = shot; contact_blast.action = ChickenAction::Blast;
+        require(sent_props.queue(contact_blast) && sent_props.queue(prop), "queue blast and its prop contact");
+        sent_props.transmit(1, [&](uint32_t serial, const ChickenEvent &event) {
+            if (serial == 2) received_props.receive(serial, event); // initial blast datagram lost
+        });
+        std::vector<ChickenAction> delivered;
+        auto accept = [&](const ChickenEvent &event) { delivered.push_back(event.action); return true; };
+        received_props.apply(accept);
+        require(delivered.empty(), "prop waits behind its missing blast");
+        sent_props.transmit(100002, [&](uint32_t serial, const ChickenEvent &event) {
+            received_props.receive(serial, event); received_props.receive(serial, event);
+        });
+        received_props.apply(accept);
+        require(delivered == std::vector<ChickenAction>{ChickenAction::Blast, ChickenAction::Prop},
+                "retransmitted prop contact applies exactly once following the blast");
+
+        prop.prop.part = 3;
+        Writer bad_part; put_chicken(bad_part, prop);
+        Reader part_in(bad_part.b.data(), bad_part.b.size());
+        require(!get_chicken(part_in, decoded), "two combined panel bits cannot identify a detached part");
+
+        auto blast = shot; blast.action = ChickenAction::Blast;
+        auto next = shot; next.shot++;
+        ChickenChannel source, sink;
+        require(source.queue(shot) && source.queue(blast) && source.queue(next), "queue consecutive shots");
+        uint32_t applied = 0;
+        source.transmit(1, [&](uint32_t seq, const ChickenEvent &e) {
+            if (seq != 1) { sink.receive(seq, e); sink.receive(seq, e); }
+        });
+        sink.apply([&](const ChickenEvent &) { ++applied; return true; });
+        require(!applied, "a reordered blast waits for its dropped launch");
+        source.acknowledge(500); // impossible acknowledgement cannot discard the real launch
+        uint32_t retries = 0;
+        source.transmit(100002, [&](uint32_t seq, const ChickenEvent &e) {
+            ++retries; sink.receive(seq, e);
+        });
+        require(retries == 3, "unacknowledged events retransmitted");
+        std::vector<ChickenAction> effects;
+        sink.apply([&](const ChickenEvent &e) {
+            if (e.action == ChickenAction::Blast) return false; // native seat/life not ready
+            effects.push_back(e.action); return true;
+        });
+        require(sink.received() == 1, "wait for native replay before acknowledging a blast");
+        sink.apply([&](const ChickenEvent &e) { effects.push_back(e.action); return true; });
+        require(effects == std::vector<ChickenAction>{ChickenAction::Launch, ChickenAction::Blast, ChickenAction::Launch},
+                "lost, duplicate, reordered launch and blast replay in native order once");
+        source.transmit(200003, [&](uint32_t seq, const ChickenEvent &e) { sink.receive(seq, e); });
+        sink.apply([&](const ChickenEvent &) { ++applied; return true; });
+        require(!applied, "lost acknowledgement does not double-apply a native effect");
+        source.acknowledge(sink.received());
+        source.transmit(300004, [&](uint32_t, const ChickenEvent &) { ++applied; });
+        require(!applied, "completed stream stops sending");
+    }
     {
         using namespace netplay;
         BattleFrame host, guest;

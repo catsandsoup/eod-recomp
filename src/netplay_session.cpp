@@ -7,6 +7,8 @@
 #include "netplay_session.h"
 #include "battle_layout.h"
 #include "netplay_battle.h"
+#include "netplay_chicken.h"
+#include "battle_driver.h"
 #include "../runtime/core/cpu.h"
 #include <bitset>
 #include "netplay_content.h"
@@ -349,6 +351,7 @@ struct Peer {
     DamageFeedback impact_feedback;
     netplay_car::State impact_state;
     std::array<uint32_t, kMaxPlayers> bodywork_acks{};
+    ChickenChannel chickens;
     uint64_t latest_tick = 0; uint32_t latest_host_tick = 0; netplay_car::State latest; bool has_latest = false; uint64_t latest_at = 0;
 };
 struct LobbyPlayer { uint8_t id; std::string name; bool ready; std::string vname; uint16_t ping; bool waiting = false; };
@@ -407,6 +410,9 @@ struct Session::Impl {
     bool in_menu = false; uint32_t inject_count = 0;
     std::string strip;       // "Waiting for ..." shown over the game while players choose
     BattleFrame battle, received_battle;
+    ChickenChannel host_chickens; // guest's channel to its host
+    std::array<uint32_t, kMaxPlayers> chicken_serial{}, chicken_flying{}, chicken_last_blast{};
+    uint32_t prop_wait_tick = 0;
     std::array<Bodywork, kMaxPlayers> bodywork{};
     uint64_t next_bodywork_sample = 0;
     uint64_t last_battle_state = 0, last_respawn_request = 0;
@@ -552,6 +558,7 @@ struct Session::Impl {
     mutable std::mutex voice_mtx;
     std::vector<int16_t> voice_out;
     size_t voice_pos = 0;
+    netplay::voice::StereoMixer voice_mixer;
 
     void sync_voice() {
         const bool connected = (role == Role::Host) || (role == Role::Guest && lobby_received);
@@ -561,12 +568,19 @@ struct Session::Impl {
             voice.set_transmit_enabled(mic_enabled && !deafened);
             voice.set_microphone_muted(!mic_enabled || deafened);
             voice.set_deafened(deafened || muted_all);
+            if (deafened || muted_all) {
+                std::lock_guard<std::mutex> lock(voice_mtx);
+                voice_out.clear();
+                voice_pos = 0;
+                voice_mixer = {};
+            }
         } else {
             if (voice.active()) voice.stop();
             std::fill(std::begin(speaking_until), std::end(speaking_until), 0);
             std::lock_guard<std::mutex> lock(voice_mtx);
             voice_out.clear();
             voice_pos = 0;
+            voice_mixer = {};
             last_voice_playout = 0;
         }
         const bool want_mic = connected && voice.active() && mic_enabled && !deafened;
@@ -653,7 +667,9 @@ struct Session::Impl {
             for (uint8_t peer = 0; peer < netplay::voice::MaxPeers; ++peer) {
                 if (peer == local_id) continue;
                 netplay::voice::Frame pf;
-                auto res = voice.playout(peer, pf);
+                bool speaking = false;
+                auto res = voice.playout(peer, pf, &speaking);
+                if (speaking) speaking_until[peer] = t + 300000;
                 if (res == netplay::voice::Playback::Decoded || res == netplay::voice::Playback::Concealed) {
                     for (size_t i = 0; i < netplay::voice::FrameSamples; ++i) {
                         if (pf[i] != 0) any = true;
@@ -827,6 +843,132 @@ struct Session::Impl {
         }
         sendto(fd, (const char *)w.b.data(), (int)w.b.size(), 0, (const sockaddr *)&to, sizeof to);
     }
+    bool chickens_enabled() const {
+        return bound && go && !abort_requested && !result_until &&
+               (completion_mode == EventCompletionMode::Battle || (rules & netplay_hooks::Chickens));
+    }
+    uint32_t chicken_life(size_t slot) const {
+        return completion_mode == EventCompletionMode::Battle ? battle.seats[slot].spawn_tick : 0;
+    }
+    void trace_chicken(const char *verb, const ChickenEvent &e) const {
+        if (std::getenv("EOD_NETPLAY_DEBUG") || std::getenv("EOD_NETPLAY_TEST_CHICKEN"))
+            std::fprintf(stderr, "[netplay-chicken] %s event=%u slot=%u life=%u shot=%u tick=%u pos=%.3f,%.3f,%.3f vel=%.3f,%.3f,%.3f\n",
+                         verb, event_id, e.slot, e.life, e.shot, tick, e.position[0], e.position[1],
+                         e.position[2], e.velocity[0], e.velocity[1], e.velocity[2]);
+    }
+    void send_chickens(ChickenChannel &channel, const sockaddr_in &to) {
+        channel.transmit(now_us(), [&](uint32_t serial, const ChickenEvent &e) {
+            Writer w; w.u32(event_id); w.u32(serial); put_chicken(w, e);
+            send_to(to, K_CHICKEN, my_id, w);
+        });
+    }
+    void queue_chicken(Peer &peer, const ChickenEvent &e) {
+        if (!peer.chickens.queue(e)) {
+            // Even at the shortest cooldown a healthy link clears this queue
+            // in a fraction of its capacity. End only this unresponsive link.
+            Writer reason; reason.str("Event updates stopped reaching your game. Rejoin the lobby.", 96);
+            send_to(peer.addr, K_KICK, 0, reason);
+            peer.alive = false;
+            release_driver(peer);
+            return;
+        }
+        send_chickens(peer.chickens, peer.addr);
+    }
+    void broadcast_chicken(const ChickenEvent &e) {
+        for (auto &[id, peer] : peers)
+            if (peer.alive && peer.waiting_event != event_id) queue_chicken(peer, e);
+    }
+    void ack_chickens(const ChickenChannel &channel, const sockaddr_in &to) {
+        Writer w; w.u32(event_id); w.u32(channel.received());
+        send_to(to, K_CHICKEN_ACK, my_id, w);
+    }
+    void read_chicken(Reader &r, uint8_t kind, ChickenChannel &channel, const sockaddr_in &from,
+                      uint8_t owner) {
+        const uint32_t id = r.u32(), serial = r.u32();
+        if (!r.ok || id != event_id || !serial || !chickens_enabled()) return;
+        if (kind == K_CHICKEN_ACK) {
+            if (r.p == r.e) channel.acknowledge(serial);
+            return;
+        }
+        ChickenEvent e;
+        if (!get_chicken(r, e) || e.slot >= roster.size() ||
+            (role == Role::Host && (e.action != ChickenAction::Launch || roster[e.slot].owner != owner))) return;
+        channel.receive(serial, e);
+        if (serial <= channel.received()) ack_chickens(channel, from);
+    }
+    void apply_chickens(ChickenChannel &channel, const sockaddr_in &to, Peer *peer) {
+        const uint32_t previous = channel.received();
+        channel.apply([&](ChickenEvent e) {
+            const uint32_t life = chicken_life(e.slot);
+            if (e.life != life) {
+                // A host shot can outrun the separate Battle respawn packet.
+                // The next seat update releases it. Old-life FX are discarded.
+                if (e.action == ChickenAction::Prop && e.life < life) prop_wait_tick = 0;
+                return peer || e.life < life;
+            }
+            auto &serial = chicken_serial[e.slot];
+            auto &flying = chicken_flying[e.slot];
+            if (peer) {
+                if (e.shot <= serial) return true;
+                serial = e.shot;
+                if ((completion_mode != EventCompletionMode::Battle || !battle.seats[e.slot].dead) &&
+                    battle_chicken_replay_launch(e.slot, e.position.data(), e.velocity.data())) {
+                    flying = e.shot;
+                    trace_chicken("launch", e);
+                    broadcast_chicken(e);
+                } else {
+                    e.action = ChickenAction::Cancel;
+                    trace_chicken("reject", e);
+                    queue_chicken(*peer, e);
+                }
+                return true;
+            }
+            if (e.action == ChickenAction::Launch) {
+                if (static_cast<int>(e.slot) == my_slot) {
+                    trace_chicken("echo-launch", e); // local shot already used the native muzzle
+                    return true;
+                }
+                if (e.shot <= serial) return true;
+                if (!battle_chicken_replay_launch(e.slot, e.position.data(), e.velocity.data())) return false;
+                serial = flying = e.shot;
+                trace_chicken("replay-launch", e);
+            } else if (e.action == ChickenAction::Prop) {
+                if (e.shot != chicken_last_blast[e.slot]) { prop_wait_tick = 0; return true; }
+                const auto &hit = e.prop;
+                const bool debris = hit.type != chicken_prop::Type::Wobble;
+                if (debris && (hit.object >= roster.size() || chicken_life(hit.object) > hit.donor_life)) {
+                    prop_wait_tick = 0;
+                    return true;
+                }
+                if ((debris && chicken_life(hit.object) < hit.donor_life) || !chicken_prop::apply(e.slot, hit)) {
+                    // Bodywork and weapons arrive independently. Allow the donor's
+                    // detached part to spawn, then expire a missing/recycled part.
+                    if (!prop_wait_tick) prop_wait_tick = tick;
+                    if (tick - prop_wait_tick < 30) return false;
+                } else trace_chicken("replay-prop", e);
+                prop_wait_tick = 0;
+            } else if (e.shot == flying) {
+                if (e.action == ChickenAction::Blast) {
+                    if (!battle_chicken_replay_blast(e.slot, e.position.data())) return false;
+                    chicken_last_blast[e.slot] = e.shot;
+                    trace_chicken("replay-blast", e);
+                } else {
+                    battle_chicken_cancel(e.slot);
+                    trace_chicken("cancel", e);
+                }
+                flying = 0;
+            }
+            return true;
+        });
+        if (previous != channel.received()) ack_chickens(channel, to);
+        send_chickens(channel, to);
+    }
+    void sync_chickens() {
+        if (!chickens_enabled()) return;
+        if (role == Role::Guest) apply_chickens(host_chickens, host_addr, nullptr);
+        else for (auto &[id, peer] : peers)
+            if (peer.alive && peer.waiting_event != event_id) apply_chickens(peer.chickens, peer.addr, &peer);
+    }
     void sync_bodywork() {
         const uint64_t now = now_us();
         if (role == Role::Host && now < next_bodywork_sample) return;
@@ -878,6 +1020,13 @@ struct Session::Impl {
 
     // ---------------------------------------------------------------- lobby helpers
     std::string mode_name() const { return event_pick; }
+    bool human_battle() const { return event_pick == session_catalog::kHumanBattle; }
+    unsigned capacity() const { return human_battle() ? 2 : host_capacity; }
+    const char *human_battle_wait() const {
+        if (!human_battle() || alive_count() == 1) return nullptr;
+        return alive_count() == 0 ? "Waiting for a second driver" :
+               "Choose a larger event or reduce the lobby to two drivers";
+    }
     // ---- catalog-backed picks (guest context fills the catalog; see Session::menu_buttons)
     const session_catalog::Track *find_track(const std::string &n) const { for (auto &t : session_catalog::tracks()) if (t.name == n) return &t; return nullptr; }
     void ensure_defaults() {
@@ -925,7 +1074,7 @@ struct Session::Impl {
         {"tune_force","CHICKEN BLAST FORCE","X",netplay_hooks::ChickenForce}, {"tune_size","CHICKEN BLAST SIZE","X",netplay_hooks::ChickenSize}
     };
     void cycle(const std::string &what, int dir) {
-        if (what == "players" && role == Role::Host) {
+        if (what == "players" && role == Role::Host && !human_battle()) {
             host_capacity = std::clamp<int>((int)host_capacity + (dir >= 0 ? 1 : -1),1+alive_count(),kMaxPlayers);
             return;
         }
@@ -969,13 +1118,22 @@ struct Session::Impl {
         auto v = make_lobby();
         w.u8((uint32_t)v.size());
         for (auto &p : v) { w.u8(p.id); w.str(p.name, 16); w.u8((p.ready ? 1 : 0) | (p.waiting ? 2 : 0)); w.str(p.vname, 48); w.u16(p.ping); }
-        w.str(track_name, 40); w.u8(rules); w.u8(host_capacity);
+        w.str(track_name, 40); w.u8(rules); w.u8(capacity());
         for (uint8_t q : tuning) w.u8(q);
     }
     bool all_peers(bool (*pred)(const Peer &)) const { for (auto &kv : peers) if (kv.second.alive && !pred(kv.second)) return false; return true; }
     void release_driver(Peer &peer) {
         peer.has_latest = false;
         peer.impact_through = peer.impact_revision = 0;
+        // Keep a departed duel opponent under network control until event teardown.
+        if (event_name == session_catalog::kHumanBattle && go && (event_guest_mask & (1u << peer.id))) {
+            if (!result_until && !abort_requested) {
+                abort_requested = true;
+                strip = "Opponent left the 1v1 Battle. Returning to lobby.";
+                session_abort_event();
+            }
+            return;
+        }
         auto car = puppet_cars.find(peer.id);
         if (car != puppet_cars.end()) {
             netplay_car::set_puppet(car->second, false);
@@ -1062,7 +1220,7 @@ game_frontend::Snapshot Session::snapshot() const {
                 if (p.id) s.players.back().identity = d.peers.at(p.id).identity;
             }
             const bool joining = d.relay.has_joining_guest(t_now);
-            s.can_start = s.phase == S::Phase::Lobby && !joining && d.in_menu && session_catalog::ready() &&
+            s.can_start = s.phase == S::Phase::Lobby && !joining && !d.human_battle_wait() && d.in_menu && session_catalog::ready() &&
                           session_catalog::online_vehicle_is_drivable(d.my_vehicle) &&
                           d.all_peers([](const Peer &p) {
                               return p.at_menu && p.ready && session_catalog::online_vehicle_is_drivable(p.vehicle);
@@ -1070,9 +1228,10 @@ game_frontend::Snapshot Session::snapshot() const {
             if (!s.can_start && s.phase == S::Phase::Lobby) {
                 if (joining || !d.all_peers([](const Peer &p) { return p.lobby_heartbeat_received; }))
                     s.status = "Waiting for players to finish joining";
+                else if (const char *reason = d.human_battle_wait()) s.status = reason;
                 else s.status = d.in_menu ? "Waiting for game data or players to be ready" : "Waiting for the game main menu";
             }
-            s.options.push_back({"players","MAX PLAYERS",std::to_string(d.host_capacity),s.phase == S::Phase::Lobby,"Includes the host. Race capacity depends on the event."});
+            s.options.push_back({"players","MAX PLAYERS",std::to_string(d.capacity()),s.phase == S::Phase::Lobby && !d.human_battle(),"Includes the host. Race capacity depends on the event."});
             s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, true, ""});
             s.options.push_back({"mode", "MODE", d.mode_name(), true, ""});
         } else {
@@ -1273,6 +1432,7 @@ void Session::submit(game_frontend::Command c) {
         for (const auto &kv : d.peers) if (kv.second.alive && !kv.second.ready) { d.last_error = kv.second.name + " is not ready."; return; }
         if (!session_catalog::ready() || d.track_name.empty()) { d.last_error = "The game data is still loading. Wait a moment at the main menu, then press START."; return; }
         d.ensure_defaults();
+        if (const char *reason = d.human_battle_wait()) { d.last_error = reason; return; }
         if (!session_catalog::online_vehicle_is_drivable(d.my_vehicle)) {
             d.last_error = "Choose a drivable car before starting.";
             return;
@@ -1436,7 +1596,7 @@ void Session::auto_drive(uint64_t t) {
                 } else continue;
                 s.submit(command); sequence = seq;
                 std::fprintf(stderr, "[netplay-test] lobby seq=%u action=%s cap=%u rules=%u peers=%d\n",
-                             seq, action.c_str(), d.host_capacity, d.rules, d.alive_count());
+                             seq, action.c_str(), d.capacity(), d.rules, d.alive_count());
             }
         }
     }
@@ -1648,7 +1808,7 @@ void Session::poll() {
                     uint8_t id = 1;
                     while (id < kMaxPlayers && ((d.peers.count(id) && d.peers[id].alive) ||
                            (round_active && (d.event_guest_mask & (1u << id))))) ++id;
-                    if (id >= kMaxPlayers || 1 + d.alive_count() >= (int)d.host_capacity) { w.u8(3); d.send_to(from, K_REFUSE, 0, w); continue; }
+                    if (id >= kMaxPlayers || 1 + d.alive_count() >= (int)d.capacity()) { w.u8(3); d.send_to(from, K_REFUSE, 0, w); continue; }
                     Peer p; p.identity = ++d.next_peer_identity; p.addr = from; p.id = id; p.requested_name = nm; p.name = d.available_name(nm,id); p.last_heard = t;
                     p.join_attempt = attempt;
                     p.waiting_event = round_active ? d.event_id : 0;
@@ -1699,6 +1859,9 @@ void Session::poll() {
                 std::fprintf(stderr, "[netplay] %s left\n", p.name.c_str());
                 d.status = p.name + " left";
                 d.release_driver(p);
+            } else if (kind == K_CHICKEN || kind == K_CHICKEN_ACK) {
+                if (in_event_ && p.waiting_event != d.event_id)
+                    d.read_chicken(r, kind, p.chickens, p.addr, p.id);
             } else if (kind == K_DAMAGE_DETAIL_ACK) {
                 const uint32_t id = r.u32(), slot = r.u8(), revision = r.u32();
                 if (r.ok && r.p == r.e && in_event_ && d.bound && id == d.event_id && slot < d.roster.size() &&
@@ -1766,7 +1929,6 @@ void Session::poll() {
                 }
             } else if (kind == K_VOICE) {
                 if (d.voice.receive(sender, r.p, (size_t)(r.e - r.p)) == netplay::voice::Receive::Accepted) {
-                    if (sender < kMaxPlayers) d.speaking_until[sender] = t + 300000;
                     Writer w; w.b.assign(r.p, r.e);
                     for (auto &kv : d.peers)
                         if (kv.second.alive && kv.first != sender)
@@ -2002,6 +2164,9 @@ void Session::poll() {
                     d.completion_mode == EventCompletionMode::Battle && !d.abort_requested && !d.result_until &&
                     get_battle_frame(r, d.roster.size(), frame) && frame.tick > d.received_battle.tick)
                     d.received_battle = frame;
+            } else if (kind == K_CHICKEN || kind == K_CHICKEN_ACK) {
+                if (sender == 0 && in_event_)
+                    d.read_chicken(r, kind, d.host_chickens, d.host_addr, 0);
             } else if (kind == K_DAMAGE_DETAIL) {
                 const uint32_t id = r.u32(), slot = r.u8(), revision = r.u32(), spawn = r.u32();
                 if (!r.ok || sender != 0 || !in_event_ || !d.bound || !d.go || d.abort_requested || d.result_until ||
@@ -2025,7 +2190,8 @@ void Session::poll() {
                     id != d.event_id || !get_car(r, slot, revision, state) ||
                     slot != d.my_slot || revision <= d.impact_received) continue;
                 const DamageFeedback feedback{r.u32(), r.f32(), r.f32()};
-                if (!r.ok || r.p != r.e || feedback.tick > revision ||
+                const uint32_t life = d.completion_mode == EventCompletionMode::Battle ? r.u32() : 0;
+                if (sender != 0 || life != d.chicken_life(slot) || !r.ok || r.p != r.e || feedback.tick > revision ||
                     !(feedback.flash >= 0.f && feedback.flash <= .5f) ||
                     !(feedback.shake >= 0.f && feedback.shake <= .4f)) continue;
                 d.impact_feedback = feedback;
@@ -2045,9 +2211,7 @@ void Session::poll() {
                         d.remote[slot].push(tick, s);
                 }
             } else if (kind == K_VOICE) {
-                if (d.voice.receive(sender, r.p, (size_t)(r.e - r.p)) == netplay::voice::Receive::Accepted) {
-                    if (sender < kMaxPlayers) d.speaking_until[sender] = t + 300000;
-                }
+                d.voice.receive(sender, r.p, (size_t)(r.e - r.p));
             }
         }
     }
@@ -2394,17 +2558,15 @@ std::vector<names::Tag> Session::driver_tags() {
     static uint32_t traced_tick = 0;
     const bool sample = trace && (d.tick < traced_tick || d.tick - traced_tick >= 60);
     if (sample) traced_tick = d.tick;
+    const uint8_t local_owner = d.role == Impl::Role::Host ? 0 : d.my_id;
     for (size_t slot = 0; slot < d.roster.size(); ++slot) {
         const uint8_t owner = d.roster[slot].owner;
-        if (owner == 0xFF) continue;
+        if (owner == 0xFF || owner == local_owner) continue;
         const std::string *name = nullptr;
         if (d.role == Impl::Role::Host) {
-            if (owner == 0) name = &d.name;
-            else {
-                const auto peer = d.peers.find(owner);
-                if (peer != d.peers.end() && peer->second.alive && peer->second.waiting_event != d.event_id)
-                    name = &peer->second.name;
-            }
+            const auto peer = d.peers.find(owner);
+            if (peer != d.peers.end() && peer->second.alive && peer->second.waiting_event != d.event_id)
+                name = &peer->second.name;
         } else {
             for (const auto &driver : d.lobby_players)
                 if (driver.id == owner && !driver.waiting) { name = &driver.name; break; }
@@ -2468,10 +2630,10 @@ uint32_t Session::remote_humans() const { return in_event_ ? std::bitset<16>(d_-
 void Session::mix_voice(int16_t *stereo, int frames) {
     Impl &d = *d_;
     std::lock_guard<std::mutex> lk(d.voice_mtx);
-    if (d.voice_pos >= d.voice_out.size()) return;
+    const size_t count = std::min<size_t>(frames, d.voice_out.size() - d.voice_pos);
     if (const char *capture = std::getenv("EOD_NETPLAY_TEST_VOICE_PCM")) {
         static uint64_t samples_written = 0;
-        if (samples_written < 48000 * 15) {
+        if (count && samples_written < 48000 * 15) {
             FILE *f = std::fopen(capture, samples_written ? "ab" : "wb");
             if (f) {
                 const size_t n = std::min<size_t>((size_t)frames, d.voice_out.size() - d.voice_pos);
@@ -2481,12 +2643,9 @@ void Session::mix_voice(int16_t *stereo, int frames) {
             }
         }
     }
-    const int vol = std::clamp(g_config.volume, 0, 100);
-    for (int i = 0; i < frames && d.voice_pos < d.voice_out.size(); ++i, ++d.voice_pos) {
-        const int s = (int)d.voice_out[d.voice_pos] * vol / 100;
-        stereo[i * 2 + 0] = (int16_t)std::clamp(stereo[i * 2 + 0] + s, -32768, 32767);
-        stereo[i * 2 + 1] = (int16_t)std::clamp(stereo[i * 2 + 1] + s, -32768, 32767);
-    }
+    d.voice_mixer.mix(stereo, frames, count ? d.voice_out.data() + d.voice_pos : nullptr,
+                      count, g_config.volume, g_config.voice_volume, g_config.lower_game_during_voice);
+    d.voice_pos += count;
     if (d.voice_pos >= d.voice_out.size()) {
         d.voice_out.clear();
         d.voice_pos = 0;
@@ -2597,6 +2756,12 @@ void Session::roster_post(uint32_t description) {
     // 1116E0 appends one 0x56 trailer per driver for event types with the
     // trailer flag. These rows keep their native type and hitch partner.
     const uint32_t drivers = static_cast<uint32_t>(d.roster.size());
+    if (d.event_name == session_catalog::kHumanBattle &&
+        (drivers != 2 || d.roster[0].owner == d.roster[1].owner ||
+         d.roster[0].owner == 0xFF || d.roster[1].owner == 0xFF)) {
+        error_ = d.last_error = "Both drivers must be connected to start a 1v1 Battle.";
+        d.abort_requested = true; session_abort_event(); return;
+    }
     bool trailer_grid = drivers && count == 2 * drivers && (ee_r32(description + 0x9A4) & 0x800);
     for (uint32_t i = drivers; trailer_grid && i < count; ++i) {
         trailer_grid = ee_r32(rec(i)) == 0x56;
@@ -2826,6 +2991,8 @@ bool Session::battle_respawn(uint32_t master, uint32_t slot) {
         auto &life = d.battle.seats[slot];
         if (netplay_car::read(netplay_car::car_of_slot(slot), life.spawn)) {
             life.spawn_tick = d.tick;
+            if (d.chicken_flying[slot]) battle_chicken_cancel(slot);
+            d.chicken_flying[slot] = 0;
             d.bodywork[slot] = {};
             d.bodywork[slot].spawn = life.spawn_tick;
             d.last_battle_state = 0;
@@ -2862,6 +3029,8 @@ void Session::battle_frame(uint64_t now) {
                 const auto &host = d.received_battle.seats[i];
                 const uint32_t record = master + battle_layout::kParticipants + i * battle_layout::kParticipantStride;
                 if (host.spawn_tick > d.battle.seats[i].spawn_tick) {
+                    if (d.chicken_flying[i]) battle_chicken_cancel(i);
+                    d.chicken_flying[i] = 0;
                     // Invoke the complete native reset locally, then use the
                     // host's chosen transform. Each machine has its own RNG.
                     const EEState saved = g_ee;
@@ -2923,6 +3092,81 @@ void Session::battle_frame(uint64_t now) {
         const auto &p = kv.second;
         if (p.alive && p.waiting_event != d.event_id) d.send_to(p.addr, K_BATTLE_STATE, 0, w);
     }
+}
+
+int Session::chicken_authority() const {
+    if (!in_event_ || d_->role == Impl::Role::None) return -1;
+    return d_->role == Impl::Role::Host ? 1 : 0;
+}
+
+bool Session::chicken_player_slot(uint32_t slot) const {
+    return in_event_ && slot < d_->roster.size() && d_->roster[slot].owner != 0xFF;
+}
+
+void Session::chicken_launch(uint32_t slot, const float position[3], const float velocity[3]) {
+    auto &d = *d_;
+    if (!in_event_ || !d.chickens_enabled() || slot >= d.roster.size()) return;
+    const uint8_t owner = d.roster[slot].owner;
+    const bool host = d.role == Impl::Role::Host;
+    if (host ? (owner != 0 && owner != 0xFF) : (static_cast<int>(slot) != d.my_slot)) return;
+    ChickenEvent e;
+    e.slot = static_cast<uint8_t>(slot); e.life = d.chicken_life(slot);
+    e.shot = ++d.chicken_serial[slot]; d.chicken_flying[slot] = e.shot;
+    std::copy_n(position, 3, e.position.begin());
+    std::copy_n(velocity, 3, e.velocity.begin());
+    d.trace_chicken(host ? "launch" : "request", e);
+    if (host) {
+        d.broadcast_chicken(e);
+    } else if (d.host_chickens.queue(e)) {
+        d.send_chickens(d.host_chickens, d.host_addr);
+    } else {
+        d.last_error = "The host stopped receiving event updates.";
+        d.abort_requested = true;
+        session_abort_event();
+    }
+}
+
+void Session::chicken_blast(uint32_t slot, const float position[3]) {
+    auto &d = *d_;
+    if (slot >= d.roster.size()) return;
+    d.chicken_last_blast[slot] = 0;
+    if (!in_event_ || !d.chickens_enabled() || d.role != Impl::Role::Host || !d.chicken_flying[slot]) return;
+    ChickenEvent e;
+    e.action = ChickenAction::Blast; e.slot = static_cast<uint8_t>(slot);
+    e.life = d.chicken_life(slot); e.shot = d.chicken_flying[slot];
+    d.chicken_flying[slot] = 0;
+    std::copy_n(position, 3, e.position.begin());
+    d.chicken_last_blast[slot] = e.shot;
+    d.trace_chicken("blast", e);
+    d.broadcast_chicken(e);
+}
+
+void Session::chicken_prop_contact(uint32_t shooter, uint32_t body, uint32_t point, uint32_t impulse) {
+    auto &d = *d_;
+    if (!in_event_ || d.role != Impl::Role::Host || shooter >= d.roster.size() || !d.chicken_last_blast[shooter]) return;
+    ChickenEvent e;
+    if (!chicken_prop::capture(body, point, impulse, e.prop)) return;
+    if (e.prop.type != chicken_prop::Type::Wobble) {
+        if (e.prop.object >= d.roster.size()) return;
+        e.prop.donor_life = d.chicken_life(e.prop.object);
+    }
+    e.action = ChickenAction::Prop; e.slot = static_cast<uint8_t>(shooter);
+    e.shot = d.chicken_last_blast[shooter]; e.life = d.chicken_life(shooter);
+    d.trace_chicken("prop", e);
+    d.broadcast_chicken(e);
+}
+
+void Session::chicken_victim(uint32_t slot) {
+    auto &d = *d_;
+    if (!in_event_ || !d.chickens_enabled() || d.role != Impl::Role::Host || slot >= d.roster.size()) return;
+    if (std::getenv("EOD_NETPLAY_DEBUG") || std::getenv("EOD_NETPLAY_TEST_CHICKEN"))
+        std::fprintf(stderr, "[netplay-chicken] victim event=%u slot=%u tick=%u\n", d.event_id, slot, d.tick);
+    // A radial hit has no second car. Hold the recipient's host body through
+    // the native impulse and damage callbacks, then send its owner's checkpoint.
+    d.bodywork[slot].capture_until = d.tick + 36;
+    const auto peer = d.peers.find(d.roster[slot].owner);
+    if (peer != d.peers.end() && peer->second.alive && d.puppet_cars.count(peer->first))
+        peer->second.impact_through = d.tick + 12;
 }
 
 bool Session::car_contact(uint32_t victim, int32_t other_index, uint32_t other_car) {
@@ -3048,6 +3292,8 @@ void Session::step_begin() {
         d.my_slot = owned_slot;
         d.remote.clear(); d.shown.clear();
         d.battle = {}; d.received_battle = {};
+        d.host_chickens = {}; d.chicken_serial = {}; d.chicken_flying = {}; d.chicken_last_blast = {}; d.prop_wait_tick = 0;
+        for (auto &[id, peer] : d.peers) peer.chickens = {};
         d.bodywork = {}; d.next_bodywork_sample = 0;
         for (auto &kv : d.peers) kv.second.bodywork_acks.fill(0);
         d.last_battle_state = d.last_respawn_request = d.respawn_request = 0;
@@ -3085,14 +3331,21 @@ void Session::step_begin() {
         if (d.role == Impl::Role::Host) {
             d.initial_grid.clear(); d.grid_acks.clear();
             const bool impact_test = netplay_impact_fixture::enabled();
-            const bool impact_event = d.event_name == "Battle (4 AI)" || d.event_name == "Demolition Derby";
+            const bool test_battle = d.event_name == "Battle (4 AI)" || d.event_name == session_catalog::kHumanBattle;
+            const bool impact_event = test_battle || d.event_name == "Demolition Derby";
             const size_t fixture_size = (netplay_impact_fixture::pack_collision() || std::getenv("EOD_NETPLAY_TEST_OBSERVER")) ? 3 : 2;
             if (impact_test && (cars.size() != fixture_size || !impact_event || d.track_name != "Anoka")) {
                 fail_grid("Impact fixture requires its configured driver count on Anoka Battle or Demolition Derby."); return;
             }
+            unsigned ai_index = 0;
             for (uint32_t i = 0; i < cars.size(); ++i) {
                 netplay_car::State state;
                 if (!netplay_car::read(cars[i], state)) { fail_grid("The event created an invalid starting position."); return; }
+                if (test_battle && d.track_name == "Anoka") {
+                    const auto owner = d.roster[i].owner;
+                    netplay_impact_fixture::position_chicken_test_car(cars[i], owner, ai_index, state);
+                    if (owner == 0xff) ++ai_index;
+                }
                 for (const auto &other : d.initial_grid) {
                     float dist2 = 0;
                     for (int k = 9; k < 12; ++k) { const float delta = state.pose[k] - other.pose[k]; dist2 += delta * delta; }
@@ -3274,7 +3527,8 @@ void Session::step_begin() {
             d.predicted_impact_at = 0;
             d.last_impact_resolution = d.tick;
             netplay_car::State applied;
-            if (netplay_impact_fixture::enabled() && netplay_car::read(car, applied))
+            if ((netplay_impact_fixture::enabled() || std::getenv("EOD_NETPLAY_TEST_CHICKEN")) &&
+                netplay_car::read(car, applied))
                 std::fprintf(stderr, "[netplay-impact] reconciled event=%u tick=%u revision=%u slot=%d before_vx=%.6f vx=%.6f vz=%.6f damage=%.6f stage=%u\n",
                              d.event_id, d.tick, d.impact_applied, d.my_slot, local.vel[0],
                              applied.vel[0], applied.vel[2], applied.damage, applied.damage_stage);
@@ -3332,6 +3586,7 @@ void Session::step_begin() {
         netplay_car::write(car, d.shown[kv.first]);
         netplay_car::write_condition(car, d.shown[kv.first]);
     }
+    d.sync_chickens(); // replay at a world-step boundary, after placing all shooter bodies
     if (netplay_impact_fixture::enabled()) {
         const auto &obs = netplay_impact_fixture::observation;
         if (obs.started && obs.event == d.event_id && obs.tick <= 120 && d.role == Impl::Role::Host) {
@@ -3429,7 +3684,7 @@ void Session::step_end() {
                     if ((!p.impact_revision || p.impact_revision < p.impact_through) &&
                         netplay_car::read(netplay_car::car_of_slot(i), p.impact_state)) {
                         p.impact_revision = d.tick;
-                        if (netplay_impact_fixture::enabled())
+                        if (netplay_impact_fixture::enabled() || std::getenv("EOD_NETPLAY_TEST_CHICKEN"))
                             std::fprintf(stderr, "[netplay-impact] confirmed event=%u revision=%u slot=%zu vx=%.6f vz=%.6f damage=%.6f stage=%u\n",
                                          d.event_id, p.impact_revision, i, p.impact_state.vel[0], p.impact_state.vel[2],
                                          p.impact_state.damage, p.impact_state.damage_stage);
@@ -3440,6 +3695,7 @@ void Session::step_end() {
                         correction.u32(p.impact_feedback.tick);
                         correction.f32(p.impact_feedback.flash);
                         correction.f32(p.impact_feedback.shake);
+                        if (d.completion_mode == EventCompletionMode::Battle) correction.u32(d.battle.seats[i].spawn_tick);
                         d.send_to(p.addr, K_IMPACT_STATE, 0, correction);
                     }
                     break;
@@ -3480,6 +3736,12 @@ namespace {
 const bool g_registered = [] {
     namespace H = netplay_hooks;
     H::remote_driver_car = [](uint32_t car) { return session().remote_driver_car(car); };
+    H::chicken_authority = [] { return session().chicken_authority(); };
+    H::chicken_player_slot = [](uint32_t slot) { return session().chicken_player_slot(slot); };
+    H::chicken_launch = [](uint32_t slot, const float p[3], const float v[3]) { session().chicken_launch(slot, p, v); };
+    H::chicken_blast = [](uint32_t slot, const float p[3]) { session().chicken_blast(slot, p); };
+    H::chicken_prop_contact = [](uint32_t s, uint32_t b, uint32_t p, uint32_t i) { session().chicken_prop_contact(s, b, p, i); };
+    H::chicken_victim = [](uint32_t slot) { session().chicken_victim(slot); };
     H::eligible_battle_slots = [] { return session().eligible_battle_slots(); };
     H::car_contact = [](uint32_t car, int32_t other) { return session().car_contact(car, other); };
     H::damage_feedback = [](uint32_t car, float flash, float shake) { session().record_damage_feedback(car, flash, shake); };

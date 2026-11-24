@@ -18,7 +18,7 @@ static std::string sha256(const std::string&bytes){
     char out[65];for(int i=0;i<32;i++)snprintf(out+i*2,3,"%02x",d[i]);return out;
 }
 int main(int argc,char**argv){
-    if(argc!=2)return 1;
+    if(argc!=2 && !(argc==3 && std::string(argv[2])=="--public-release"))return 1;
     fs::create_directories(argv[1]);
     const fs::path root=fs::path(argv[1])/("integrated-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     if(!fs::create_directory(root))return 12;
@@ -42,6 +42,21 @@ int main(int argc,char**argv){
     require(!mac_app_activate_integrated(&why)&&why.find("RACE.RES")!=std::string::npos&&!getenv("EOD_MOD_DIR"),4); // not listed
     manifest(nullptr);
     require(mac_app_validate_integrated(content.string()).empty(),5);
+    if (argc == 3) {
+        auto check_public_start = [&] {
+            std::string problem;
+            require(mac_app_select_mods(false, &problem) && problem.empty() && !getenv("EOD_MOD_DIR"), 16);
+        };
+        check_public_start();
+        const fs::path cached = root / "bundle-mods/integrated";
+        fs::create_directories(cached.parent_path());
+        fs::rename(content, cached);
+        check_public_start();
+        setenv("EOD_MOD_DIR", cached.c_str(), 1);
+        require(mac_app_select_mods(false) && fs::path(getenv("EOD_MOD_DIR")) == cached, 17);
+        fs::remove_all(root);
+        return 0;
+    }
     require(mac_app_activate_integrated(&why)&&fs::path(getenv("EOD_MOD_DIR"))==content,6);
     unsetenv("EOD_MOD_DIR");
     {std::fstream f(content/"DATA/RES/CT.RES",std::ios::in|std::ios::out|std::ios::binary);f.seekp(3);f.put('Z');} // same size, one byte flipped

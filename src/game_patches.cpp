@@ -30,6 +30,8 @@
 #include "funcs.h"
 #include "game_patches.h"
 #include "battle_driver.h"
+#include "chicken_weapon.h"
+#include "netplay_puppet.h"
 #include "battle_layout.h"
 #include "hle_career.h"
 #include "iop/iop.h"
@@ -355,6 +357,14 @@ extern "C" void f_0017DA58(void) {
     if (netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale) > 0.0f && netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale) != 1.0f) {
         g_ee.fpr[13].f *= netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale);
     }
+    const int authority = netplay_hooks::chicken_authority ? netplay_hooks::chicken_authority() : -1;
+    if (authority == 0) return;
+    if (authority == 1 && netplay_hooks::chicken_blast && chicken_weapon::valid(arg_u32(0), 12)) {
+        float pos[3];
+        chicken_weapon::read3(arg_u32(0), pos);
+        chicken_weapon::trace("blast", arg_u32(1), pos);
+        netplay_hooks::chicken_blast(arg_u32(1), pos);
+    }
     f_0017DA58_orig();
 }
 
@@ -444,11 +454,12 @@ static void trace_battle() {
     for (uint32_t i = 0; i < count && i < battle_layout::kCapacity; ++i) {
         uint32_t car = ee_r32(0x00447458 + i * 4);
         if (!car || (car & 3) || car > EE_RAM_SIZE - 0x1C34) continue;
-        LOG(LOG_CORE, "[BATTLE_CAR] slot=%u car=%08x pos=%.3f,%.3f,%.3f vel=%.3f,%.3f,%.3f steer=%.3f gas=%.3f gear=%d dead=%u score=%d",
+        LOG(LOG_CORE, "[BATTLE_CAR] slot=%u car=%08x pos=%.3f,%.3f,%.3f vel=%.3f,%.3f,%.3f steer=%.3f gas=%.3f gear=%d dead=%u score=%d damage=%.6f",
             i, car, ee_rf(car+0x88), ee_rf(car+0x8C), ee_rf(car+0x90),
             ee_rf(car+0x104), ee_rf(car+0x108), ee_rf(car+0x10C),
             ee_rf(car+0x1B6C), ee_rf(car+0x1B70), (int)ee_r32(car+0x1B90),
-            ee_r32(master+0x458+i*0x50), (int)ee_r32(master+0x460+i*0x50)-(int)ee_r32(master+0x468+i*0x50));
+            ee_r32(master+0x458+i*0x50), (int)ee_r32(master+0x460+i*0x50)-(int)ee_r32(master+0x468+i*0x50),
+            ee_rf(car+0x1BEC));
     }
     for (uint32_t i = 0; i < ee_r32(0x003CE4B8) && i < 16; ++i) {
         uint32_t row = 0x003CE3F8 + i * 12, iface = ee_r32(row + 8);
@@ -481,8 +492,8 @@ static void trace_cheats(uint32_t cheats) {
     }
 }
 
-// Chicken trigger (weapon interface, car, &trigger held). Diagnostic only: with EOD_CHEAT_TRACE each shot
-// (armed state 2 with the trigger held) and each state the trigger is called in are logged.
+// Publish the native launch after the model's muzzle transform and velocity have
+// been calculated. Puppet triggers are driven by confirmed network events.
 extern "C" void f_0017E000_orig(void);
 extern "C" void f_0017E000(void) {
     static const bool enabled = getenv("EOD_CHEAT_TRACE") != nullptr;
@@ -496,7 +507,22 @@ extern "C" void f_0017E000(void) {
             last_state = state; last_held = held;
         }
     }
+    const uint32_t iface = arg_u32(0), car = arg_u32(1), input = arg_u32(2);
+    const int authority = netplay_hooks::chicken_authority ? netplay_hooks::chicken_authority() : -1;
+    if (authority >= 0 && netplay_car::is_puppet(car)) return;
+    const bool capture = authority >= 0 && netplay_hooks::chicken_launch &&
+        iface > chicken_weapon::kInterface && chicken_weapon::valid(iface - chicken_weapon::kInterface, 0x228) &&
+        chicken_weapon::valid(input, 4) && ee_r32(iface + 4) == 2 && ee_r32(input);
     f_0017E000_orig();
+    if (capture) {
+        const uint32_t body = iface - chicken_weapon::kInterface;
+        if (!ee_r32(body + 0x1F4)) return;
+        float pos[3], vel[3];
+        chicken_weapon::read3(body + 0x88, pos);
+        chicken_weapon::read3(body + 0x104, vel);
+        chicken_weapon::trace("launch", ee_r32(body + 0x1E8), pos);
+        netplay_hooks::chicken_launch(ee_r32(body + 0x1E8), pos, vel);
+    }
 }
 
 // Chicken reload start (weapon body in a0). Native writes the reload state (+0x1E0 = 0) and deadline

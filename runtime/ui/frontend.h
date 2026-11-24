@@ -43,6 +43,7 @@ struct Input {
     // mouse (window pixels; hit-testing uses the rectangles of the last View)
     bool mouse_moved = false, click = false;
     float mx = -1, my = -1, wheel = 0;
+    float slider_fraction = -1;  // pointer position on an adjustable track
 };
 
 // Auto-repeat for held directions (350 ms, then 100 ms).
@@ -68,6 +69,7 @@ struct Row {
     bool enabled = true;
     bool warn = false;  // drawn red (conflicts, errors)
     bool good = false;  // drawn green (connected, intact)
+    float slider_fraction = -1;  // 0..1 draws a track in the value area
     bool checked = false;  // Check rows
 };
 

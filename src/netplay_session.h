@@ -56,6 +56,12 @@ public:
     bool remote_driver_car(uint32_t car) const;
     uint16_t eligible_battle_slots() const;
     bool battle_respawn(uint32_t master, uint32_t slot);
+    int chicken_authority() const;
+    bool chicken_player_slot(uint32_t slot) const;
+    void chicken_launch(uint32_t slot, const float position[3], const float velocity[3]);
+    void chicken_blast(uint32_t slot, const float position[3]);
+    void chicken_prop_contact(uint32_t shooter, uint32_t body, uint32_t point, uint32_t impulse);
+    void chicken_victim(uint32_t slot);
     bool car_contact(uint32_t car, int32_t other_index, uint32_t other_car = 0);
     void record_damage_feedback(uint32_t car, float flash, float shake);
     bool step_allowed() const;                    // false while online grid is blocked/aborting

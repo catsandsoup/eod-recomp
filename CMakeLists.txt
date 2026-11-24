@@ -68,7 +68,7 @@ file(GLOB GEN_SOURCES ${GEN_DIR}/rec_*.c)
 list(APPEND GEN_SOURCES ${GEN_DIR}/table.c)
 
 # --------------------------------------------------------------------- runtime
-file(GLOB_RECURSE RUNTIME_SOURCES
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/runtime/core/*.c ${CMAKE_SOURCE_DIR}/runtime/core/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/kernel/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/hw/*.cpp
@@ -731,7 +731,11 @@ if(WIN32)
   target_sources(eod PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/eod_version.rc")
   # settings program (writes eod.ini, starts the game)
   enable_language(RC)
-  add_executable(eodsetup WIN32 ${CMAKE_SOURCE_DIR}/tools/setup/eodsetup.cpp ${CMAKE_SOURCE_DIR}/tools/setup/eodsetup.rc
+  configure_file(tools/setup/eodsetup.manifest "${CMAKE_CURRENT_BINARY_DIR}/eodsetup.manifest" @ONLY)
+  configure_file(tools/setup/eodsetup.rc "${CMAKE_CURRENT_BINARY_DIR}/eodsetup.rc" @ONLY)
+  set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/eodsetup.rc" PROPERTIES
+                              OBJECT_DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/eodsetup.manifest")
+  add_executable(eodsetup WIN32 ${CMAKE_SOURCE_DIR}/tools/setup/eodsetup.cpp "${CMAKE_CURRENT_BINARY_DIR}/eodsetup.rc"
                  ${CMAKE_SOURCE_DIR}/runtime/core/config.cpp ${CMAKE_SOURCE_DIR}/runtime/core/ps2mc.cpp
                  ${CMAKE_SOURCE_DIR}/runtime/core/eodsave.cpp)
   # Validate a changed disc library with the same disc ID and importer as the game.
@@ -799,6 +803,10 @@ if(APPLE)
   target_include_directories(eod_mac_mod_profile_test PRIVATE runtime runtime/include)
   target_link_libraries(eod_mac_mod_profile_test PRIVATE "-framework Cocoa")
   add_test(NAME mac_mod_profiles COMMAND eod_mac_mod_profile_test "${CMAKE_CURRENT_BINARY_DIR}/test-mac-mod-profiles")
+  if(Python3_FOUND)
+    add_test(NAME mac_public_mod_profile COMMAND ${Python3_EXECUTABLE}
+      "${CMAKE_SOURCE_DIR}/tests/macos_public_profile_test.py" $<TARGET_FILE:eod_mac_mod_profile_test>)
+  endif()
   option(EOD_MAC_APP "Build a local, ad-hoc signed macOS application bundle" OFF)
   if(EOD_MAC_APP)
     set(EOD_APP_OUTPUT "$ENV{HOME}/Library/Application Support/TDEODRecomp/local-build"

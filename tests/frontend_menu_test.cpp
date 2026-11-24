@@ -118,6 +118,21 @@ int main() {
     CHECK(cfg.volume == 100 && fx.audio);
     in.dx = -1; m.update(in);
     CHECK(cfg.volume == 95);
+    CHECK(cfg.voice_volume == 100 && cfg.lower_game_during_voice);
+    m.select(find(m, "voicevolume"));
+    for (int i = 0; i < 25; ++i) m.update(in);
+    CHECK(cfg.voice_volume == 0 && cfg.volume == 95 && cfg.music_volume == 100);
+    in.dx = 1;
+    for (int i = 0; i < 45; ++i) m.update(in);
+    CHECK(cfg.voice_volume == 200 && m.rows()[m.selected()].slider_fraction == 1.0f);
+    Input pointer;
+    pointer.slider_fraction = 0.37f; m.update(pointer);
+    CHECK(cfg.voice_volume == 75 && m.rows()[m.selected()].slider_fraction == 0.375f);
+    pointer.slider_fraction = 1; m.update(pointer);
+    CHECK(cfg.voice_volume == 200);
+    m.select(find(m, "voicefocus"));
+    m.update(in);
+    CHECK(!cfg.lower_game_during_voice && cfg.voice_volume == 200);
     // the update skips a selected header row
     m.select(0);
     m.update(none());
@@ -175,6 +190,11 @@ int main() {
         Config loaded;
         CHECK(loaded.mods.empty() && config_load(ini, loaded));
         CHECK(loaded.mods == cfg.mods);
+        CHECK(loaded.voice_volume == 200 && !loaded.lower_game_during_voice);
+        std::ofstream(root / "old.ini") << "[Audio]\nMusicVolume=35\nVolume=70\n";
+        Config old;
+        CHECK(config_load((root / "old.ini").string(), old));
+        CHECK(old.voice_volume == 100 && old.lower_game_during_voice && old.music_volume == 35 && old.volume == 70);
         Menu again(loaded);
         again.set_host(h);
         again.open();
@@ -244,6 +264,14 @@ int main() {
     net->snap.players.push_back({1, "Guest  Trailer2", true, false, false, true});
     CHECK(find(m, "host") < 0 && find(m, "code") < 0 && find(m, "addr") < 0);
     CHECK(find(m, "gcode") >= 0 && find(m, "player") >= 0);
+    m.select(find(m, "voicevolume"));
+    in = none(); in.dx = -1; m.update(in);
+    CHECK(cfg.voice_volume == 195 && net->got.back().kind == game_frontend::Command::Kind::JoinCode);
+    m.set_tab(Tab::Settings);
+    CHECK(m.rows()[find(m, "voicevolume")].value == "195%");
+    in = none(); in.reset = true; m.update(in);
+    CHECK(cfg.voice_volume == 100 && cfg.lower_game_during_voice);
+    m.set_tab(Tab::Online);
     // Controller moderation requires two accepts and binds confirmation to a
     // particular occupant, so a reused slot can never remove a later joiner.
     net->snap.players[0].identity = 41;

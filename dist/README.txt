@@ -22,9 +22,12 @@ End Race returns the party to the lobby. Close Lobby ends the session.
 The remaster menu stays live during an online race.
 
 AUDIO
-Settings includes master and music volume. Your music library and volume
-are local to your machine. Online includes a microphone toggle, mute others
-and deafen. Microphone transmission starts off.
+Settings > Audio has separate Master, Music and Incoming Voice Volume controls.
+Incoming voice defaults to 100% and can be adjusted from 0% to 200%. By
+default the game gets quieter while someone speaks. Turn off Lower Game
+During Speech to keep a fixed game level. Both preferences are also in
+Online > Voice when connected. Microphone transmission starts off. Mute
+Others silences incoming speech and Deafen also switches off transmission.
 
 SETTINGS
 Change graphics, controls, mods and audio in the remaster menu.

@@ -445,6 +445,20 @@ bool refresh() {
             if (ee_r32(cp + 4) != i) continue;
             const std::string name = guest_text(native(f_001252C0, {c}), 40);
             if (!name.empty()) {
+                constexpr uint32_t kBattle = 0x18000224;
+                if (ee_r32(cp + 8) == kBattle) {
+                    // Offer the human-only roster on any map with a Battle template.
+                    // Prefer the stock contest and present it under its online name.
+                    if (t.human_battle_contest.empty()) {
+                        t.human_battle_contest = name;
+                        t.events.push_back(kHumanBattle);
+                        t.event_types.push_back(kBattle);
+                    }
+                    if (ieq(name, "Battle")) {
+                        t.human_battle_contest = name;
+                        continue;
+                    }
+                }
                 t.events.push_back(name);
                 t.event_types.push_back(ee_r32(cp + 8));
             }
@@ -574,13 +588,19 @@ void arm_net(const netplay_hooks::StartInfo &info) {
     P = Plan{};
     P.net = true;
     P.req.event = info.event;
-    if (netplay_impact_fixture::enabled()) P.req.ai = 0;
+    if (info.event == session_catalog::kHumanBattle) {
+        for (const auto &track : session_catalog::tracks())
+            if (track.name == info.track) P.req.event = track.human_battle_contest;
+        P.req.ai = 0;
+    } else if (netplay_impact_fixture::enabled()) {
+        P.req.ai = 0;
+    }
     if (session_test_native_lap()) { P.req.laps = 1; P.req.ai = 0; }
     P.requested = true;
     P.armed = true;
     if (!info.track.empty()) {
         const int eve = find_eve(info.track);
-        const int contest = eve < 0 ? -1 : find_contest((uint32_t)eve, info.event);
+        const int contest = eve < 0 ? -1 : find_contest((uint32_t)eve, P.req.event);
         if (eve >= 0 && contest >= 0) {
             P.direct = true; P.eve = (uint32_t)eve; P.contest = (uint32_t)contest; P.car = info.car;
         } else {
@@ -1047,7 +1067,7 @@ extern "C" void f_00120650(void) {
         for (uint32_t i = 0; i < count && i < 64; ++i)
             if (ee_r32(tracker + kTrackerList + 4 * i) == P.contest) pos = (int)i;
         // Match by name if the catalog ID does not appear in the active tracker.
-        const std::string wanted = session_event_name(P.req);
+        const std::string wanted = P.net ? P.req.event : session_event_name(P.req);
         for (uint32_t i = 0; pos < 0 && i < count && i < 64; ++i)
             if (ieq(guest_text(native(f_001252C0, {ee_r32(tracker + kTrackerList + 4 * i)}), 40), wanted)) pos = (int)i;
         if (pos < 0) {

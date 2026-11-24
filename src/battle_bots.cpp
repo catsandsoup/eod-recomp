@@ -67,7 +67,8 @@ bool battle_bots_is_ai_slot(uint32_t slot) {
     // Ownership is established at world construction. The settings UI promises
     // changes on the next event; disabling live must not strand latched inputs.
     return slot < battle_layout::kCapacity && ee_r32(kEvent) == kBattle &&
-           (ai_slots & (1u << slot));
+           (ai_slots & (1u << slot)) &&
+           !(netplay_hooks::chicken_player_slot && netplay_hooks::chicken_player_slot(slot));
 }
 
 extern "C" void f_0012C158(void) {
@@ -107,15 +108,15 @@ extern "C" void f_0020FD48(void) {
     battle_description = description;
     battle_driver_reset();
     f_0020FD48_orig();
-    if (!ram_object(description, 0x9A8) || ee_r32(description + 0x9A4) != kBattle) return;
+    if (!ram_object(description, 0x9A8)) return;
+    const bool battle = ee_r32(description + 0x9A4) == kBattle;
     const uint32_t count = ee_r32(description + 0x98C);
-    // AI records come from BattleBots' fill to four or an added Battle (N AI)
-    // contest; native two-car Battle has none. BattleMaster holds kCapacity.
-    if (!count || count > battle_layout::kCapacity) return;
-    // More than four cars only arise from an added Battle (N AI) contest; four or
-    // fewer keep the optional BattleBots gate (native Battle AI stay unarmed) unless
-    // EOD_DIRECT_START explicitly requested AI bots.
-    if (!g_config.battle_bots && count <= 4 && session_ai_override() <= 0) return;
+    const bool online = netplay_hooks::event_active && netplay_hooks::event_active();
+    const bool online_weapons = online && (battle || netplay_hooks::rule(netplay_hooks::Chickens, false));
+    const bool battle_ai = battle && count <= battle_layout::kCapacity &&
+        (g_config.battle_bots || count > 4 || session_ai_override() > 0 || online);
+    // Trailer rows have no launchers. The native scene table holds twenty slots.
+    if (!count || count > kLegacyVisualCarSlots || (!battle_ai && !online_weapons)) return;
 
     // Keep the original function's complete return context. Constructor calls
     // use its restored stack and preserve their native memory side effects.
@@ -127,10 +128,17 @@ extern "C" void f_0020FD48(void) {
     // Registry count may not grow until after this bridge returns, so each
     // queued constructor must reserve one of its sixteen entries here.
     uint32_t reserved_weapon_count = ee_r32(kWeaponCount);
+    uint32_t scenes = 0;
+    for (uint32_t slot = 0; slot < kLegacyVisualCarSlots; ++slot)
+        if (ee_r32(kWeaponScenes + 4 * slot)) ++scenes;
+    reserved_weapon_count = std::max(reserved_weapon_count, scenes);
     for (uint32_t slot = 0; slot < count; ++slot) {
         const uint32_t record = description + 0x2C + slot * 0x78;
         if (ee_r32(record) != 0x51) continue;
-        ai_slots |= 1u << slot;
+        if (battle_ai) ai_slots |= 1u << slot;
+        // A remote human uses an AI-type car on this machine; the original
+        // constructor skips it even when Chicken Fight is enabled.
+        if (!battle_ai && !(netplay_hooks::chicken_player_slot && netplay_hooks::chicken_player_slot(slot))) continue;
         if (suppressed || reserved_weapon_count >= 16 ||
             !ram_object(eod_visual_car_slot_read(kVisualCarSlots + 4 * slot), 0x654) ||
             ee_r32(kWeaponScenes + 4 * slot) || !world_has_weapon_capacity()) continue;

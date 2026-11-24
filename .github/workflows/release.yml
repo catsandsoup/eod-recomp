@@ -159,6 +159,10 @@ jobs:
           sha256sum eod-win64.zip eod-win32.zip eod-linux-x86_64.tar.gz > SHA256SUMS
           files="eod-win64.zip eod-win32.zip eod-linux-x86_64.tar.gz SHA256SUMS"
           case "$tag" in
+            v1.1.1|v1.1.1-*)
+              gh release create "$tag" $files --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+                --title "Eve of Destruction Remaster 1.1.1 prerelease" --notes-file ../dist/prerelease-1.1.1.md --prerelease --latest=false
+              ;;
             v*)  # a version: full release with the notes from dist/release-v1.0.md
               sed "s/@VERSION@/${tag#v}/g; s/@COMMIT@/${GITHUB_SHA::7}/g" ../dist/release-v1.0.md > notes.md
               gh release create "$tag" $files --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \

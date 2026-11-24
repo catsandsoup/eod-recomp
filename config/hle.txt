@@ -60,7 +60,8 @@
 
 001B8370 wrap     # optional manual-only human countdown recovery
 0017DA58 wrap     # scale chicken explosion blast radius and impulse force
-0017E000 wrap     # chicken trigger: EOD_CHEAT_TRACE logs each shot (diagnostic)
+0017E000 wrap     # publish successful native chicken launches
+0017E718 wrap     # play the host-confirmed impact on online replicas
 0017E4D8 wrap     # chicken reload start: always initialised, so Chicken Fight can be switched on mid-race
 0018F2A8 wrap     # optional turbo boost scaling (speed cap and acceleration)
 001244A8 wrap     # optional single player battle mode injection into action eves

@@ -82,6 +82,8 @@ struct Config {
     // [Audio]
     bool audio = true;
     int music_volume = 100;
+    int voice_volume = 100;  // incoming chat, 0–200 percent
+    bool lower_game_during_voice = true;
     int volume = 100;  // percent
     // [Input] keyboard bindings: key names separated by commas (see key_code)
     std::string keys[KEY_COUNT];

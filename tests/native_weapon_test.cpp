@@ -19,6 +19,7 @@ uint32_t g_ee_trace[256], g_ee_trace_pos;
 void reference_0017E000();
 void reference_0017E4D8();
 void reference_0017E5C8();
+void reference_0017E718();
 }
 
 namespace {
@@ -171,7 +172,81 @@ void effects() {
     }
     require(MEM_LW(effect1 + 92) == 0 && MEM_LW(effect2 + 92) == 1, "effect modes retained");
 }
+
+// Feed the native collision callback a fixed world query. The real guest code
+// decides which bodies qualify, writes each contact, and accumulates the impulse.
+constexpr uint32_t candidates = 0x40000, nodes = 0x41000, classTable = 0x42000;
+constexpr uint32_t contactPool = 0x50000, eligibilityMethod = 0x12340;
+constexpr std::array<uint32_t, 7> targets = {car, 0x60000, 0x64000, 0x68000, 0x6c000, 0x70000, 0x74000};
+int blastEvents;
+
+void contact(uint32_t surface) {
+    R[4].ud[0] = body;
+    R[5].ud[0] = R[6].ud[0] = R[8].ud[0] = 0;
+    R[7].ud[0] = surface;
+    reference_0017E718();
+    require(R[29].uw[0] == stack, "collision callback must restore stack");
+}
+
+void radialContact() {
+    reset("native detonation and radial contact");
+    blastEvents = 0;
+    trigger(true);
+    putVec(body + 0x88, {0,0,0}); // deterministic impact point after launch
+    MEM_SW(body + 0x1f0, 1);      // collision processing enabled
+    MEM_SW(0x3ce3e8, targets.size());
+    MEM_SW(0x3ce3f0, contactPool);
+    MEM_SW(candidates, nodes);
+    MEM_SW(classTable + 60, eligibilityMethod);
+    const Vec positions[] = {{1.875f,0,0}, {-3.75f,0,0}, {0,0,5.625f}, {7.5f,0,0},
+                             {-8,0,0}, {0,0,0}, {1,0,0}};
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const uint32_t node = nodes + uint32_t(i) * 8;
+        MEM_SW(node, targets[i]);
+        MEM_SW(node + 4, i + 1 == targets.size() ? 0 : node + 8);
+        MEM_SW(targets[i] + 0x98, classTable);
+        putVec(targets[i] + 0x88, positions[i]);
+    }
+    contact(10);
+    require(blastEvents == 0 && MEM_LW(body + 0x1f4) == 1, "ineligible contact keeps the shot in flight");
+    contact(112);
+    require(blastEvents == 1 && MEM_LW(body + 0x1f4) == 0, "eligible contact detonates the shot");
+    require(MEM_LW(0x3ce3ec) == 3, "exactly three damage contacts, including the shooter");
+    const Vec expected[] = {{18750,9375,0}, {-12500,6250,0}, {0,3125,6250}};
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (i < 3) {
+            require(MEM_LW(targets[i] + 0x1d0) == 1, "one contact per affected body");
+            const uint32_t hit = MEM_LW(targets[i] + 0x190);
+            require(MEM_LW(hit + 32) == car, "damage contact records the original shooter");
+            require(MEM_LW(hit + 28) == 0x70, "damage contact records the native surface type");
+            expectVec(hit + 4, expected[i], "falloff and upward component at contact");
+            expectVec(targets[i] + 0x174, expected[i], "accumulated linear impulse");
+        } else {
+            require(MEM_LW(targets[i] + 0x1d0) == 0, "boundary, outside, coincident, or ineligible body excluded");
+            expectVec(targets[i] + 0x174, {0,0,0}, "excluded body gets no impulse");
+        }
+    }
+    contact(112);
+    require(blastEvents == 1 && MEM_LW(0x3ce3ec) == 3, "second contact cannot detonate the same shot twice");
+}
 } // namespace
+
+extern "C" void f_00179A08() {
+    require(R[4].uw[0] == 7, "blast resolves the launcher's registered owner");
+    R[2].ud[0] = car;
+}
+extern "C" void f_001D57A8() {
+    MEM_SW(R[4].uw[0], candidates);
+    MEM_SW(R[5].uw[0], 1);
+}
+extern "C" void ee_call(uint32_t address) {
+    require(address == eligibilityMethod, "expected shockwave eligibility predicate");
+    R[2].ud[0] = R[4].uw[0] != targets.back();
+}
+extern "C" void f_0012F3C8() { FPR[0].f = 0; } // centre the random contact-point offset
+extern "C" void f_00177348() { ++blastEvents; }
+extern "C" void f_0017D338() {} // enclosing contact callback
+extern "C" void f_00212600() { require(false, "unexpected alternate-mode blast"); }
 
 // Native pose copy is retained; stop at scene/bounds propagation and per-frame
 // physics/render work. None of these stubs changes weapon state or velocity.
@@ -193,6 +268,6 @@ extern "C" void ee_write32_slow(uint32_t, uint32_t) { require(false, "unexpected
 extern "C" void ee_write64_slow(uint32_t, uint64_t) { require(false, "unexpected slow write64"); }
 
 int main() {
-    battleAnglesAndSpeed(); featureFlags(); releaseRepressAfterCooldown(); effects();
-    std::printf("Native chicken weapon: %d checks passed (angles/speed, flags, cooldown, release/repress, effects)\n", checks);
+    battleAnglesAndSpeed(); featureFlags(); releaseRepressAfterCooldown(); effects(); radialContact();
+    std::printf("Native chicken weapon: %d checks passed (launch, cooldown, contact, attribution, radial impulse)\n", checks);
 }

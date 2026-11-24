@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "netplay_car.h"
 
 namespace netplay_impact_fixture {
 
@@ -22,6 +23,27 @@ inline bool enabled() {
         return test_session() && impact && std::strcmp(impact, "1") == 0;
     }();
     return on;
+}
+
+// Anoka Battle shooting range. Only seed the starting grid: the actual pad,
+// native AI, weapon, contact solver and damage path run throughout the test.
+inline void position_chicken_test_car(uint32_t car, uint8_t owner, unsigned ai_index, netplay_car::State &state) {
+    static const bool enabled = test_session() && std::getenv("EOD_NETPLAY_TEST_CHICKEN_GRID");
+    if (!enabled) return;
+    const bool human = owner != 0xff;
+    const float facing = human ? (owner == 0 ? 1.f : -1.f) : (ai_index % 2 == 0 ? 1.f : -1.f);
+    state.pose[0] = state.pose[1] = state.pose[3] = state.pose[5] = state.pose[7] = state.pose[8] = 0.f;
+    state.pose[2] = -facing;
+    state.pose[4] = 1.f;
+    state.pose[6] = facing;
+    // Humans face each other inside the stock splash radius at the midpoint.
+    // Each AI faces an opponent outside its minimum safe firing distance.
+    state.pose[9] = -facing * (human ? 5.f : 15.f);
+    state.pose[10] = .35f;
+    state.pose[11] = human ? -45.f : (ai_index < 2 ? 0.f : 40.f);
+    for (int axis = 0; axis < 3; ++axis)
+        state.vel[axis] = state.ang[axis] = 0.f;
+    netplay_car::write(car, state);
 }
 
 inline unsigned pair_slot(uint8_t owner) {

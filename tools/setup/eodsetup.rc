@@ -1,2 +1,2 @@
 // eodsetup.rc - visual styles manifest
-1 24 "eodsetup.manifest"
+1 24 "@CMAKE_CURRENT_BINARY_DIR@/eodsetup.manifest"

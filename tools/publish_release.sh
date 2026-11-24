@@ -39,5 +39,15 @@ if [[ -n ${EOD_WINDOWS_ARCHIVE:-} ]]; then
 fi
 (cd "$stage" && shasum -a 256 ./*.zip > SHA256SUMS)
 assets+=("$stage/SHA256SUMS")
-gh release create "$tag" "${assets[@]}" --repo "$repo" --target "$revision" --draft --title "Eve of Destruction Remaster ${tag#v}" --notes-file "$root/dist/release-v1.0.md"
-gh release edit "$tag" --repo "$repo" --draft=false --prerelease=false --latest
+notes="$root/dist/release-v1.0.md"
+title="Eve of Destruction Remaster ${tag#v}"
+release_flags=(--prerelease=false --latest)
+case "$tag" in
+  v1.1.1|v1.1.1-*)
+    title="Eve of Destruction Remaster 1.1.1 prerelease"
+    notes="$root/dist/prerelease-1.1.1.md"
+    release_flags=(--prerelease --latest=false)
+    ;;
+esac
+gh release create "$tag" "${assets[@]}" --repo "$repo" --target "$revision" --draft --title "$title" --notes-file "$notes" "${release_flags[0]}"
+gh release edit "$tag" --repo "$repo" --draft=false "${release_flags[@]}"

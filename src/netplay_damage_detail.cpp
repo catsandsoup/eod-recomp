@@ -51,7 +51,7 @@ bool valid(const uint8_t *data, size_t size) {
 }
 
 // Adjacent undented bones often share all seven bytes. Use a raw checkpoint
-// whenever run lengths would expand it. Even the largest raw model fits in 1,105 bytes.
+// whenever run lengths would expand it. Even the largest raw model fits in 1,126 bytes including the format byte.
 std::vector<uint8_t> pack(const std::vector<uint8_t> &detail) {
     if (!valid(detail.data(), detail.size())) return {};
     std::vector<uint8_t> encoded{1};

@@ -52,6 +52,13 @@ inline void (*track_chosen)(const std::string &) = nullptr;
 inline bool (*wait_track)(std::string &) = nullptr;
 inline bool (*remote_driver_car)(uint32_t car) = nullptr;
 inline uint16_t (*eligible_battle_slots)() = nullptr;
+// Native weapon callbacks use participant-table slots on every machine.
+inline int (*chicken_authority)() = nullptr; // -1 offline, 0 guest visual simulation, 1 host simulation
+inline bool (*chicken_player_slot)(uint32_t slot) = nullptr;
+inline void (*chicken_launch)(uint32_t slot, const float position[3], const float velocity[3]) = nullptr;
+inline void (*chicken_blast)(uint32_t slot, const float position[3]) = nullptr;
+inline void (*chicken_prop_contact)(uint32_t shooter, uint32_t body, uint32_t point, uint32_t impulse) = nullptr;
+inline void (*chicken_victim)(uint32_t slot) = nullptr;
 // Native Detention assigns its bus to the host's grid seat on every machine.
 inline int detention_bus_slot = -1;
 inline bool (*car_contact)(uint32_t victim, int32_t other_index) = nullptr;

@@ -355,7 +355,17 @@ void draw_menu(ImDrawList *dl, frontend::Menu &m, const Ctx &c, std::vector<Hit>
             text(d, 26 * s, vx1 - 12 * s, y + 9 * s, on ? kOrange : kGrey, ">");
             hits.push_back({vx0 - 6 * s, y, vx0 + 24 * s, y + rh, HitLeft, i});
             hits.push_back({vx1 - 24 * s, y, vx1 + 6 * s, y + rh, HitRight, i});
-            text(d, vpx, (vx0 + vx1 - tw) * 0.5f, y + 11 * s + (24 * s - vpx) * 0.5f, vc, r.value.c_str());
+            if (r.slider_fraction >= 0) {
+                const float left = vx0 + 28*s, right = vx1 - 28*s;
+                const float mid = y + 35*s, thumb = left + (right-left)*r.slider_fraction;
+                dl->AddLine(ImVec2(left, mid), ImVec2(right, mid), kGrey, 3*s);
+                dl->AddLine(ImVec2(left, mid), ImVec2(thumb, mid), kOrange, 3*s);
+                dl->AddCircleFilled(ImVec2(thumb, mid), 5*s, vc);
+                hits.push_back({left, y, right, y+rh, HitSlider, i});
+                text(d, vpx, (vx0 + vx1 - tw)*0.5f, y + 3*s, vc, r.value.c_str());
+            } else {
+                text(d, vpx, (vx0 + vx1 - tw) * 0.5f, y + 11 * s + (24 * s - vpx) * 0.5f, vc, r.value.c_str());
+            }
         } else {
             text(d, vpx, vx1 - tw, y + 11 * s + (24 * s - vpx) * 0.5f, vc, r.value.c_str());
         }

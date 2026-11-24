@@ -41,6 +41,7 @@
 #include "netplay_impact_fixture.h"
 #include "netplay_damage_detail.h"
 #include "netplay_hooks.h"
+#include "chicken_weapon.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -810,7 +811,28 @@ void netplay_damage::apply_parts(uint32_t car, uint16_t panels, uint8_t wheels, 
     g_ee = saved;
 }
 
-extern "C" void f_0017B918(void) { diff_run(0x0017B918, contact_record, f_0017B918_orig); }
+extern "C" void f_0017B918(void) {
+    // The native shockwave has already rejected objects outside its volume.
+    // A direct hit can include the shooter's own vehicle, which the ordinary
+    // two-car impact handoff deliberately skips.
+    if (reg(31) == 0x17DCD8 && netplay_hooks::chicken_prop_contact && reg(10))
+        netplay_hooks::chicken_prop_contact(ee_r32(reg(10) + 0x1DC), reg(4), reg(7), reg(6));
+    if (reg(31) == 0x17DCD8 && netplay_hooks::chicken_victim) {
+        const uint32_t count = ee_r32(0x48522C), car = reg(4);
+        for (uint32_t slot = 0; count <= 16 && slot < count; ++slot) {
+            if (ee_r32(0x447458 + 4 * slot) != car) continue;
+            netplay_hooks::chicken_victim(slot);
+            if (chicken_weapon::tracing()) {
+                float impulse[3];
+                chicken_weapon::read3(reg(6), impulse);
+                std::fprintf(stderr, "[chicken] phase=victim slot=%u victim=%u impulse=%.3f,%.3f,%.3f pre_damage=%.4f\n",
+                             reg(10) ? ee_r32(reg(10) + 0x1DC) : ~0u, slot, impulse[0], impulse[1], impulse[2], lf(car + 0x1BEC));
+            }
+            break;
+        }
+    }
+    diff_run(0x0017B918, contact_record, f_0017B918_orig);
+}
 // Impact checkpoints run between native physics steps. The host already handled
 // damage, scoring and debris. Apply just the native visual response for this owner.
 void netplay_hooks::apply_damage_feedback(uint32_t car, float flash, float shake) {

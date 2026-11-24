@@ -159,6 +159,8 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "ModernGrade")) c.modern_grade = num(0, 200);
         } else if (ieq(section, "Audio")) {
             if (ieq(k, "Enabled")) c.audio = to_bool(v);
+            else if (ieq(k, "VoiceVolume")) c.voice_volume = num(0, 200);
+            else if (ieq(k, "LowerGameDuringVoice")) c.lower_game_during_voice = num(0, 1) != 0;
             else if (ieq(k, "MusicVolume")) c.music_volume = num(0, 100);
             else if (ieq(k, "Volume")) c.volume = num(0, 100);
         } else if (ieq(section, "Input")) {
@@ -311,6 +313,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "\n[Audio]\n");
     fprintf(f, "Enabled=%d\n", c.audio ? 1 : 0);
     fprintf(f, "Volume=%d\nMusicVolume=%d\n", c.volume, c.music_volume);
+    fprintf(f, "VoiceVolume=%d\nLowerGameDuringVoice=%d\n", c.voice_volume, c.lower_game_during_voice);
     fprintf(f, "\n[Input]\n; keyboard keys for each PS2 button, separated by commas\n");
     for (int i = 0; i < KEY_COUNT; i++) fprintf(f, "%s=%s\n", kPadKeyNames[i], c.keys[i].c_str());
 #ifndef _WIN32

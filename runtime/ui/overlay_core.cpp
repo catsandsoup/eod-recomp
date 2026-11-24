@@ -66,7 +66,8 @@ std::vector<KeyEvent> g_keys;
 std::vector<unsigned> g_chars;
 std::string g_paste;
 float g_mx = -1, g_my = -1, g_wheel;
-bool g_mouse_moved, g_click;
+bool g_mouse_moved, g_click, g_mouse_down, g_dragging_slider;
+frontend_draw::Hit g_slider_track{};
 bool g_shift;
 
 // error screen
@@ -163,6 +164,7 @@ void load_menu_art() {
 void open_menu(bool open) {
     if (g_open == open) return;
     g_open = open;
+    g_dragging_slider = false;
     if (open) {
         load_menu_art();
         if (g_menu) {
@@ -338,6 +340,14 @@ frontend::Input gather_input(bool &toggled) {
         in.mx = g_mx;
         in.my = g_my;
         in.wheel = g_wheel;
+        // A held thumb follows the pointer beyond the ends of its track.
+        if (g_dragging_slider && g_menu) {
+            in.slider_fraction = std::clamp((g_mx - g_slider_track.x0) / (g_slider_track.x1 - g_slider_track.x0), 0.0f, 1.0f);
+            if (!g_mouse_down) g_dragging_slider = false;
+            g_mouse_moved = g_click = false;
+            g_wheel = 0;
+            return in;
+        }
         // hit-test the last drawn frame
         for (const frontend_draw::Hit &h : g_hits) {
             if (g_mx < h.x0 || g_mx >= h.x1 || g_my < h.y0 || g_my >= h.y1) continue;
@@ -346,6 +356,12 @@ frontend::Input gather_input(bool &toggled) {
                 if (g_click) in.accept = true;
             } else if (h.kind == frontend_draw::HitTab && g_click && g_menu) {
                 g_menu->set_tab((frontend::Tab)h.index);
+            } else if (h.kind == frontend_draw::HitSlider && g_click && g_menu) {
+                g_menu->select(h.index);
+                in.accept = false;
+                in.slider_fraction = (g_mx - h.x0) / (h.x1 - h.x0);
+                g_slider_track = h;
+                g_dragging_slider = g_mouse_down;
             } else if (h.kind == frontend_draw::HitLeft && g_click) {
                 if (g_menu) g_menu->select(h.index);
                 in.dx = -1;
@@ -525,6 +541,8 @@ void overlay_mouse_move(float x, float y) {
     g_mouse_moved = true;
 }
 void overlay_mouse_button(bool down) {
+    g_mouse_down = down;
+    if (!down && g_dragging_slider) g_mouse_moved = true;
     if (down && g_open) {
         g_click = true;
         g_glyphs = frontend::Glyphs::Keyboard;

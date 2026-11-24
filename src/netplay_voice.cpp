@@ -1,5 +1,6 @@
 #include "netplay_voice.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #ifdef EOD_HAVE_OPUS
 #include <opus.h>
@@ -10,12 +11,59 @@ constexpr uint16_t Version=1;
 [[maybe_unused]] void put(uint8_t* p,uint64_t n,unsigned count) { for(unsigned i=0;i<count;++i)p[count-i-1]=uint8_t(n>>(8*i)); }
 uint64_t get(const uint8_t* p,unsigned count) {uint64_t n=0;for(unsigned i=0;i<count;++i)n=(n<<8)|p[i];return n;}
 }
+void StereoMixer::mix(int16_t *stereo, int frames, const int16_t *speech, size_t count,
+                      int master, int volume, bool lower_game) {
+    constexpr float speech_game_gain = 0.16f;
+    constexpr float gain_range = 1.0f - speech_game_gain;
+    if (!lower_game || volume == 0 || master == 0) {
+        hold_ = 0;
+        game_gain_ = 1.0f;
+    }
+    if ((!count || volume == 0 || master == 0) && game_gain_ == 1.0f) return;
+    for (int i = 0; i < frames; ++i) {
+        const int sample = size_t(i) < count ? speech[i] : 0;
+        if (lower_game && volume && master && std::abs(sample) >= 1800)
+            hold_ = SampleRate / 6;
+        // Ramp down in 8 ms, hold across consonants, recover over 300 ms.
+        if (hold_) {
+            --hold_;
+            game_gain_ = std::max(speech_game_gain, game_gain_ - gain_range / 384);
+        } else {
+            game_gain_ = std::min(1.0f, game_gain_ + gain_range / 14400);
+        }
+        float voice = sample * (volume / 100.0f);
+        // Soft knee on boosted speech peaks before Master. Leaves normal levels linear.
+        const float excess = std::abs(voice) - 23500.0f;
+        if (excess > 0)
+            voice = std::copysign(23500.0f + 8500.0f * excess / (8500.0f + excess), voice);
+        voice *= master / 100.0f;
+        for (int ch = 0; ch < 2; ++ch) {
+            auto &out = stereo[2 * i + ch];
+            const float game = out * game_gain_;
+            float sum = game + voice;
+            // Taper only the added voice as it approaches the available headroom.
+            // If the game itself reached a rail, adding speech cannot push it further.
+            const float aligned_game = voice < 0 ? -game : game;
+            const float ceiling = (voice < 0 ? 32768.0f : 32767.0f) * master / 100.0f;
+            const float knee = std::max(ceiling * 0.90f, aligned_game);
+            const float over = aligned_game + std::abs(voice) - knee;
+            if (over > 0) {
+                const float room = std::max(0.0f, ceiling - knee);
+                const float limited = knee + over * room / (over + room);
+                sum = voice < 0 ? -limited : limited;
+            }
+            out = int16_t(std::clamp(std::lround(sum), -32768L, 32767L));
+        }
+    }
+}
+
 struct Session::Impl {
     bool running=false,transmit=false,mic_muted=false,deafen=false;
     uint64_t nonce=0;uint32_t epoch=0,sequence=0;uint8_t local=0;
     struct Entry {bool used=false;uint32_t seq=0;size_t size=0;std::array<uint8_t,MaxPayloadBytes> payload{};};
     struct Peer {
         bool muted=false,started=false;uint32_t next=0;unsigned priming=0, missing=0;
+        float gain = 1.0f;
         std::array<Entry,JitterFrames> queue{};
 #ifdef EOD_HAVE_OPUS
         OpusDecoder* decoder=nullptr;
@@ -28,6 +76,7 @@ struct Session::Impl {
     void flush(Peer& p) {
         p.queue={};
         p.missing=0;
+        p.gain=1.0f;
 #ifdef EOD_HAVE_OPUS
         if(p.decoder)opus_decoder_ctl(p.decoder,OPUS_RESET_STATE);
 #endif
@@ -135,7 +184,8 @@ Receive Session::receive(uint8_t sender,const uint8_t* data,size_t size){
     return Receive::Inactive;
 #endif
 }
-Playback Session::playout(uint8_t peer,Frame& pcm){
+Playback Session::playout(uint8_t peer,Frame& pcm,bool *speaking){
+    if (speaking) *speaking = false;
     pcm.fill(0);auto& s=*impl_;if(!s.running||peer>=MaxPeers||peer==s.local)return Playback::Silence;
 #ifdef EOD_HAVE_OPUS
     auto& p=s.peers[peer];if(!p.started)return Playback::Silence;
@@ -148,7 +198,33 @@ Playback Session::playout(uint8_t peer,Frame& pcm){
         p.missing=0;*slot={};result=Playback::Decoded;
         if(samples<0){samples=opus_decode(p.decoder,nullptr,0,pcm.data(),FrameSamples,0);result=Playback::Concealed;}
     }else{if(++p.missing>JitterFrames){s.flush(p);p.started=false;p.priming=0;return Playback::Silence;}samples=opus_decode(p.decoder,nullptr,0,pcm.data(),FrameSamples,0);result=Playback::Concealed;}
-    if(samples!=int(FrameSamples)||p.muted||s.deafen)pcm.fill(0);
+    if(samples!=int(FrameSamples)||p.muted||s.deafen) {
+        pcm.fill(0);
+    } else {
+        int peak = 0;
+        int64_t energy = 0;
+        for (int sample : pcm) {
+            peak = std::max(peak, std::abs(sample));
+            energy += int64_t(sample) * sample;
+        }
+        // Measure before applying gain. Noise, silence and loss concealment
+        // must not light a player's microphone or raise the noise floor.
+        const bool active = result == Playback::Decoded && peak >= 350 &&
+                            energy >= int64_t(FrameSamples) * 100 * 100;
+        if (speaking) *speaking = active;
+        float target = 1.0f;
+        if (active) {
+            const float rms = std::sqrt(float(energy) / FrameSamples);
+            target = std::clamp(7600.0f / rms, 0.25f, 24.0f);
+        }
+        if (result == Playback::Concealed) target = p.gain;
+        // Bring quiet speech up over a few frames, backing off immediately on
+        // loud transients. The master volume is applied later in the stereo mix.
+        p.gain = std::min(target, p.gain + (target - p.gain) * 0.25f);
+        if (peak) p.gain = std::min(p.gain, 29000.0f / peak);
+        if (p.gain != 1.0f)
+            for (auto &sample : pcm) sample = int16_t(std::lround(sample * p.gain));
+    }
     return result;
 #else
     return Playback::Silence;

@@ -137,6 +137,10 @@ bool mac_app_select_mods(bool headless, std::string *problem) {
         fprintf(stderr, "EOD_NATIVE_ONLY=1: launching the retail game without the integrated content\n");
         return true;
     }
+    // Public packages ship disc-only on both platforms. A previous personal
+    // build may have left an integrated pack in Application Support. It can
+    // still be selected explicitly or used to match a modded host.
+    if (bundle_flag(@"EODIntegratedContentOptional")) return true;
     // An unbundled game or an older public app may have no packaging metadata.
     // Only a build explicitly packaged with personal content requires the profile.
     const bool allow_missing = ![[[NSBundle mainBundle] infoDictionary][@"EODIntegratedContentOptional"] isEqual:@NO];

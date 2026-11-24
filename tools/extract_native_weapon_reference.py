@@ -7,9 +7,9 @@ import sys
 
 def main():
     source, target = map(pathlib.Path, sys.argv[1:])
-    # Keep trigger, cooldown, timer transition and pose copy native. Only the
-    # scene/physics boundary beneath these functions is provided by the test.
-    names = ("0017E000", "0017E4D8", "0017E5C8", "0017AF80")
+    # Keep the native trigger, cooldown, detonation, contact and impulse arithmetic.
+    names = ("0017E000", "0017E4D8", "0017E5C8", "0017AF80",
+             "0017E718", "0017DA58", "0017B918", "0017B818")
     functions = {}
     for path in sorted(source.glob("rec_*.c")):
         text = path.read_text()

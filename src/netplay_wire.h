@@ -1,7 +1,7 @@
 #pragma once
 // Netplay v2 wire format (state sync). Plain UDP datagrams, big endian, no host structs.
-// Every message except SNAP is idempotent state that is simply resent until the peer's
-// heartbeat shows it arrived, so no reliable-transport layer is needed.
+// Car snapshots are disposable. Chicken events have an ordered, acknowledged stream
+// per event and peer because multiple shots can occur between snapshots.
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -9,7 +9,7 @@
 #include "netplay_car.h"
 #include "netplay_event_completion.h"
 namespace netplay {
-constexpr uint16_t kMagic = 0x7D3E, kProtocol = 11;
+constexpr uint16_t kMagic = 0x7D3E, kProtocol = 13;
 constexpr int kMaxPlayers = 16;
 enum Kind : uint8_t {
     K_JOIN = 1, K_WELCOME, K_REFUSE, K_HEARTBEAT, K_LOBBY, K_START, K_TRACK, K_ROSTER, K_GO, K_END, K_LEAVE,
@@ -27,6 +27,7 @@ constexpr uint8_t K_FINISH_STATE = K_GRID_ACK + 1, K_FINISH_COUNTDOWN = K_FINISH
 constexpr uint8_t K_IMPACT_STATE = K_EVENT_RESULTS + 2;
 constexpr uint8_t K_BATTLE_STATE = K_IMPACT_STATE + 1, K_BATTLE_RESPAWN = K_BATTLE_STATE + 1;
 constexpr uint8_t K_DAMAGE_DETAIL = K_BATTLE_RESPAWN + 1, K_DAMAGE_DETAIL_ACK = K_DAMAGE_DETAIL + 1;
+constexpr uint8_t K_CHICKEN = K_DAMAGE_DETAIL_ACK + 1, K_CHICKEN_ACK = K_CHICKEN + 1;
 // guest phase, reported in heartbeats
 enum Phase : uint8_t { P_LOBBY = 0, P_STARTED, P_CAR_DONE, P_LOADED, P_RACING, P_DONE };
 

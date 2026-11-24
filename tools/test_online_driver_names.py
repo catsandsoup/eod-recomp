@@ -36,7 +36,9 @@ def main():
             geometry = re.search(rf"\[netplay-names\] event={event_id} terrain=(\d+) boxes=(\d+)", log)
             if not geometry or not all(int(count) > 0 for count in geometry.groups()):
                 return False
-            if {name for _, name, *_ in samples} != {"Host Driver", "Guest Driver"}:
+            local_owner = "0" if peer == "host" else "1"
+            assert all(owner != local_owner for owner, *_ in samples), f"{peer} showed its own roof label"
+            if not samples:
                 return False
             visible_on_peer = set()
             for owner, name, screen, shown, x, y, distance in samples:

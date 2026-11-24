@@ -13,6 +13,16 @@ struct Packet { std::array<uint8_t,MaxPacketBytes> bytes{}; size_t size=0; };
 enum class Receive { Accepted, Inactive, Invalid, WrongSession, WrongSender, Duplicate, Stale, OutsideWindow };
 enum class Playback { Silence, Priming, Decoded, Concealed };
 
+// Mixes decoded incoming speech with master-scaled stereo game output at 48 kHz.
+class StereoMixer {
+public:
+    void mix(int16_t *stereo, int frames, const int16_t *speech, size_t count,
+             int master, int volume, bool lower_game);
+private:
+    float game_gain_ = 1.0f;
+    unsigned hold_ = 0;
+};
+
 // Single owning voice worker thread; callers serialize commands from UI/network.
 // No sockets/devices/accounts. The authenticated outer connection supplies sender.
 // Capture/playout cadence is 20ms wall time, independent of simulation ticks.
@@ -37,7 +47,7 @@ public:
     bool encode(const Frame&,Packet&);
     Receive receive(uint8_t authenticated_sender,const uint8_t*,size_t);
     // Call once per remote peer every 20ms, even muted/deafened. Always writes PCM.
-    Playback playout(uint8_t peer,Frame&);
+    Playback playout(uint8_t peer,Frame&, bool *speaking = nullptr);
 private:
     struct Impl; std::unique_ptr<Impl> impl_;
 };

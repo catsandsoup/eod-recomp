@@ -58,9 +58,11 @@ int session_ai_override();
 // records 0x3CBEE4). refresh() calls guest code, so it must run in guest context (the pad-read hook
 // while the main menu is up). Used by the online lobby's TRACK / MODE / CAR / PAINT rows.
 namespace session_catalog {
+inline constexpr char kHumanBattle[] = "Battle (1v1, humans only)";
 struct Track {
     int eve = 0;
     std::string name;
+    std::string human_battle_contest;  // native Battle template for the online duel
     std::vector<std::string> events;
     std::vector<uint32_t> event_types;
 };

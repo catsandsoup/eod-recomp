@@ -5,8 +5,8 @@
 #include <vector>
 
 namespace netplay_damage {
-// The retail car has 157 dent slots. One full checkpoint fits in a single UDP datagram.
-constexpr unsigned kMaxBones = 157;
+// The retail car has 160 dent slots. One full checkpoint fits in a single UDP datagram.
+constexpr unsigned kMaxBones = 160;
 std::vector<uint8_t> capture(uint32_t car);
 std::vector<uint8_t> pack(const std::vector<uint8_t> &detail);
 std::vector<uint8_t> unpack(const uint8_t *data, size_t size);
