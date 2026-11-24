@@ -919,10 +919,17 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         key = XXH3_64bits_withSeed(identity, sizeof identity, 0x50534D5434ull);
     } else {
         uint64_t mip_hash = 0;
+        uint32_t max_page_gen = 0;
+        for (uint32_t i = 0; i < count; ++i)
+            max_page_gen = std::max(max_page_gen, gs::g_page_gen[(first + i) % gs::kPages]);
         if (levels) {
             for (uint32_t l = 1; l <= levels; l++) {
                 const uint64_t mv = base(l) | (uint64_t(pitch(l)) << 32);
                 mip_hash ^= mv + 0x9E3779B97F4A7C15ull + (mip_hash << 6) + (mip_hash >> 2);
+                uint32_t f2, c2;
+                gs::page_range(base(l), pitch(l), e.tpsm, 0, 0, std::max(1, (int)e.tw >> l), std::max(1, (int)e.th >> l), f2, c2);
+                for (uint32_t i = 0; i < c2; ++i)
+                    max_page_gen = std::max(max_page_gen, gs::g_page_gen[(f2 + i) % gs::kPages]);
             }
         }
         const uint32_t texa_bits = e.tpsm == gs::PSMCT32 ? 0u : (e.ta0 | (e.ta1 << 8) | (uint32_t(e.aem) << 16));
@@ -934,12 +941,12 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
             e.th,
             indexed ? palette_hash : 0ull,
             texa_bits | (levels << 17) | ((e.cpsm & 0x3Fu) << 20),
-            gs::g_vram_clock,
+            max_page_gen,
             mip_hash
         };
         have_memo_key = true;
-        // O(1) VRAM-write-generation memoization: skips page walk + 256-byte XXH3 hash (~5 ns).
-        if (const auto *hit = g_r.vram_memo.find(memo_key)) {
+        // O(1) per-texture page-generation memoization: stays hot even when unrelated VRAM pages change.
+        if (const auto *hit = g_r.vram_memo.find_direct(memo_key)) {
             if (auto *cached_tex = static_cast<Texture *>(hit->user_ptr)) {
                 cached_tex->last_use = g_r.vb;
                 return cached_tex;
@@ -967,7 +974,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
                 }
                 if (ok) {
                     address->stamp = gs::g_vram_clock;
-                    g_r.vram_memo.insert(memo_key, address->tex->key, address->tex);
+                    g_r.vram_memo.insert_direct(memo_key, address->tex->key, address->tex);
                     address->tex->last_use = g_r.vb;
                     return address->tex;
                 }
@@ -1009,12 +1016,12 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     if (const auto it = g_r.textures.find(key); it != g_r.textures.end()) {
         Texture *cached = it->second.get();
         if (address) address->tex = cached;
-        if (have_memo_key) g_r.vram_memo.insert(memo_key, key, cached);
+        if (have_memo_key) g_r.vram_memo.insert_direct(memo_key, key, cached);
         cached->last_use = g_r.vb;
         return cached;
     }
     if (cached_only) {
-        if (have_memo_key) g_r.vram_memo.insert(memo_key, key, nullptr);
+        if (have_memo_key) g_r.vram_memo.insert_direct(memo_key, key, nullptr);
         return nullptr;
     }
     auto next = std::make_shared<Texture>();
@@ -1048,7 +1055,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
         replacement_id = 1 + ((uint64_t)found << 33 | (uint64_t)(t.mat + 1) << 1 | (uint64_t)gs_alpha);
         if (const auto it = g_r.replacements.find(replacement_id); it != g_r.replacements.end()) {
             if (address) address->tex = it->second;
-            if (have_memo_key) g_r.vram_memo.insert(memo_key, key, it->second);
+            if (have_memo_key) g_r.vram_memo.insert_direct(memo_key, key, it->second);
             it->second->last_use = g_r.vb;
             return it->second;
         }
@@ -1132,7 +1139,7 @@ Texture *texture(const gs::Env &e, FrameStats &fs, uint32_t levels, bool exact_r
     }
     g_r.textures.emplace(key, std::move(next));
     if (address) address->tex = &t;
-    if (have_memo_key) g_r.vram_memo.insert(memo_key, key, &t);
+    if (have_memo_key) g_r.vram_memo.insert_direct(memo_key, key, &t);
     if (levels) g_mip_textures.fetch_add(1);
     g_r.decoded++;
     return &t;

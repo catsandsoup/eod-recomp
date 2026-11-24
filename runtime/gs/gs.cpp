@@ -2765,17 +2765,25 @@ void gs_vblank() {
         }
     }
     {
-        // speed in the window title, every second
-        static uint64_t tt0, tf0, tv0;
+        // speed in the window title, every second (honest game/drawn FPS)
+        static uint64_t tt0, tf0, tg0, tv0;
         uint64_t tnow = platform_time_us();
-        if (!tt0) tt0 = tnow, tf0 = g_flips, tv0 = g_frames;
+        if (!tt0) tt0 = tnow, tf0 = g_flips, tg0 = g_game_flips, tv0 = g_frames;
         if (tnow - tt0 >= 1000000) {
             double sec = (double)(tnow - tt0) / 1e6;
+            const double vb_fps = (double)(g_frames - tv0) / sec;
+            const double game_fps = (double)(g_game_flips - tg0) / sec;
+            const double drawn_fps = (double)(g_flips - tf0) / sec;
+            const double eff_fps = game_fps >= 1.0 ? std::min(vb_fps, game_fps) : vb_fps;
+            const double speed_pct = eff_fps * (100.0 / 59.94);
             char buf[96];
-            snprintf(buf, sizeof buf, "%.0f%% speed, %.0f fps", (double)(g_frames - tv0) / sec * (100.0 / 59.94),
-                     (double)(g_flips - tf0) / sec);
+            if (game_fps >= 1.0 && drawn_fps + 1.5 < game_fps) {
+                snprintf(buf, sizeof buf, "%.0f%% speed, %.0f/%.0f fps", speed_pct, drawn_fps, game_fps);
+            } else {
+                snprintf(buf, sizeof buf, "%.0f%% speed, %.0f fps", speed_pct, drawn_fps);
+            }
             platform_set_status(buf);
-            tt0 = tnow, tf0 = g_flips, tv0 = g_frames;
+            tt0 = tnow, tf0 = g_flips, tg0 = g_game_flips, tv0 = g_frames;
         }
     }
     {

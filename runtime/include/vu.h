@@ -74,6 +74,12 @@ void vu_execute(VUState *vu, uint32_t start_pc, VuLaunch launch = VuLaunch::Dire
                 uint32_t ee_ra = 0);
 /* Retire the verified VU1 MSCAL E-bit NOP and delay pair at 0x24D8. */
 bool vu_retire_mscal_nop(VUState *vu, uint32_t start_pc);
+/* Retire the verified VU1 A+D XGKICK-from-TOP program at 0x2538. */
+bool vu_retire_xgkick_top(VUState *vu, uint32_t start_pc, uint32_t top);
+/* Retire the verified VU1 GIFtag template setup program at 0x25F0. */
+bool vu_retire_giftag_setup(VUState *vu, uint32_t start_pc, uint32_t top);
+/* Retire the verified VU1 matrix/lighting setup program at 0x0000 (0 XGKICKs, bypass-only). */
+bool vu_retire_setup_0000(VUState *vu, uint32_t start_pc);
 /* Report producer-only PATH1 transport counts after the VIF worker drains. */
 void vu_report_world_strip_transport(void);
 void vu_report_census();

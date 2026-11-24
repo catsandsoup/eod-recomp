@@ -1727,6 +1727,65 @@ bool vu_retire_mscal_nop(VUState *vu, uint32_t pc) {
     return true;
 }
 
+bool vu_retire_xgkick_top(VUState *vu, uint32_t pc, uint32_t top) {
+    // Verified 23-instruction A+D state-packet kicker at 0x2538: copies TOP..TOP+nloop to TOP+0xC8 and XGKICKs.
+    static constexpr uint32_t kProg2538[] = {
+        0x800106BCu, 0x000002FFu, 0x01ED0800u, 0x000002FFu, 0x8000033Cu, 0x000002FFu,
+        0x8000033Cu, 0x000002FFu, 0x11E207FFu, 0x000002FFu, 0x80036BFCu, 0x000002FFu,
+        0x800218B4u, 0x000002FFu, 0x800110B0u, 0x000002FFu, 0x03E168C8u, 0x000002FFu,
+        0x10010803u, 0x000002FFu, 0x01EF0FFFu, 0x000002FFu, 0x01EE0FFEu, 0x000002FFu,
+        0x01ED0800u, 0x000002FFu, 0x800208F1u, 0x000002FFu, 0x03E178C7u, 0x000002FFu,
+        0x03E170C6u, 0x000002FFu, 0x58001FF8u, 0x000002FFu, 0x03E168C8u, 0x000002FFu,
+        0x800106BCu, 0x000002FFu, 0x100108C8u, 0x000002FFu, 0x80000EFCu, 0x000002FFu,
+        0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu,
+    };
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x2538 ||
+        std::memcmp(vu->micro + pc, kProg2538, sizeof(kProg2538)) != 0)
+        return false;
+    xgkick(vu, top);
+    vu->tpc = pc + 0xB0u;
+    vu->running = 0;
+    census_retire(*vu, pc, "retired_2538");
+    return true;
+}
+
+bool vu_retire_giftag_setup(VUState *vu, uint32_t pc, uint32_t top) {
+    // Verified 6-instruction GIFtag template setup at 0x25F0: mem[19]=mem[TOP], mem[18]=mem[TOP+1], 0 XGKICKs.
+    static constexpr uint32_t kProg25F0[] = {
+        0x800106BCu, 0x000002FFu, 0x01EE0800u, 0x000002FFu, 0x01ED0801u, 0x000002FFu,
+        0x03E07013u, 0x000002FFu, 0x03E06812u, 0x400002FFu, 0x8000033Cu, 0x000002FFu,
+    };
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x25F0 ||
+        std::memcmp(vu->micro + pc, kProg25F0, sizeof(kProg25F0)) != 0)
+        return false;
+    const uint32_t qmask = (vu->mem_mask + 1) / 16 - 1;
+    std::memcpy(vu->mem + (19u & qmask) * 16, vu->mem + (top & qmask) * 16, 16);
+    std::memcpy(vu->mem + (18u & qmask) * 16, vu->mem + ((top + 1u) & qmask) * 16, 16);
+    vu->tpc = pc + 0x28u;
+    vu->running = 0;
+    census_retire(*vu, pc, "retired_25f0");
+    return true;
+}
+
+bool vu_retire_setup_0000(VUState *vu, uint32_t pc) {
+    // Verified 78-instruction matrix/lighting setup at 0x0000 (0 XGKICKs, E-bit at +0x260).
+    // Safe to skip when Plume VU1 bypass is active so no bypassed draw reads VU1 matrix registers.
+    static constexpr uint32_t kHead0000[] = {
+        0x800106BCu, 0x000002FFu, 0x01E5000Du, 0x000002FFu,
+        0x01E8000Eu, 0x000002FFu, 0x01E40010u, 0x000002FFu,
+    };
+    if (vu_dispatch_observed() || vu->index != 1 || pc != 0x0000 ||
+        std::memcmp(vu->micro, kHead0000, sizeof(kHead0000)) != 0)
+        return false;
+    uint32_t e_hi = 0;
+    std::memcpy(&e_hi, vu->micro + 0x260 + 4, 4);
+    if ((e_hi & 0x40000000u) == 0) return false;
+    vu->tpc = 0x268u;
+    vu->running = 0;
+    census_retire(*vu, pc, "retired_0000");
+    return true;
+}
+
 #ifdef EOD_VULKAN
 namespace {
 constexpr uint32_t kWorldLeafPc = 0x270;

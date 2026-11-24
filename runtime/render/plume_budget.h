@@ -165,6 +165,11 @@ public:
         if (key.vram_write_gen < last_write_gen_) {
             clear();
         }
+        return find_direct(key);
+    }
+
+    // Lookup without monotonic-clock clearing (for per-texture max page_gen keys).
+    const Entry *find_direct(const VramTexMemoKey &key) {
         const size_t bucket = hash_key(key) & (kBuckets - 1);
         const auto &ways = buckets_[bucket];
         for (size_t w = 0; w < kWays; ++w) {
@@ -182,6 +187,10 @@ public:
             clear();
         }
         last_write_gen_ = key.vram_write_gen;
+        insert_direct(key, texture_key, user_ptr);
+    }
+
+    void insert_direct(const VramTexMemoKey &key, uint64_t texture_key, void *user_ptr = nullptr) {
         const size_t bucket = hash_key(key) & (kBuckets - 1);
         auto &ways = buckets_[bucket];
 

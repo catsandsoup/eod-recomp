@@ -115,6 +115,20 @@ void start_micro(Vif &v, uint32_t addr, VuLaunch launch,
             return;
         }
 #ifdef EOD_PLUME
+        if (launch == VuLaunch::Mscal && !g_vu1_start_hook && native::vu1_bypass_enabled()) {
+            if (addr == 0x2538 && vu_retire_xgkick_top(v.vu, addr, v.top)) {
+                r7_audit::add(r7_audit::Counter::Vu1Bypassed);
+                return;
+            }
+            if (addr == 0x25F0 && vu_retire_giftag_setup(v.vu, addr, v.top)) {
+                r7_audit::add(r7_audit::Counter::Vu1Bypassed);
+                return;
+            }
+            if (addr == 0x0000 && vu_retire_setup_0000(v.vu, addr)) {
+                r7_audit::add(r7_audit::Counter::Vu1Bypassed);
+                return;
+            }
+        }
         // The verified E-bit NOP pair is shared by ordinary MSCAL producers.
         static const char *nop_setting = std::getenv("EOD_NATIVE_CAMERA_NOP");
         if (launch == VuLaunch::Mscal && addr == 0x24D8 && (!nop_setting || nop_setting[0] != '0') &&
@@ -449,6 +463,12 @@ void do_unpack(Vif &v, uint32_t c, const uint32_t *data) {
 // Executes the complete commands at the start of w[0..n); returns the
 // number of words consumed.
 size_t run(Vif &v, const uint32_t *w, size_t n) {
+#ifdef EOD_PLUME
+    const bool skip_dead_unpack =
+        v.n == 1 && !g_vu1_start_hook && native::vu1_bypass_dma_tag(g_vif1_dma_tag);
+#else
+    const bool skip_dead_unpack = false;
+#endif
     size_t pos = 0;
     for (;;) {
         size_t left = n - pos;
@@ -536,7 +556,8 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         }
         default:
             if ((cmd & 0x60) == 0x60) {
-                do_unpack(v, c, d);
+                if (skip_dead_unpack && v.mode != 2) v.num = 0;
+                else do_unpack(v, c, d);
             } else {
                 WARN("VIF%d: unknown command %08x", v.n, c);
             }

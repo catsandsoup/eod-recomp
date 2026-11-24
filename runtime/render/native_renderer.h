@@ -48,6 +48,7 @@ bool sun_cascades_enabled();  // opt-in for the validated ordered scene path
 bool prepare();
 bool plume_ready();
 bool vu1_bypass_enabled();
+bool vu1_bypass_dma_tag(uint32_t tag);
 const editor_environment::Override *environment_override();
 void ee_environment_world(bool drawing);
 

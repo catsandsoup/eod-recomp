@@ -135,13 +135,16 @@ bool native_begin(const Env &e, bool want_depth, NativeSurfaces &out, bool requi
         }
     }
     g_ctx->barrier(2);
+    const uint64_t rt_own0 = rt->ownership;
+    const uint64_t ds_own0 = ds ? ds->ownership : 0;
     acquire(rt, 0, 0, cols, std::min(rows, rt->h));
     rt->version++;
     if (ds) {
         acquire(ds, 0, 0, cols, std::min(rows, ds->h));
         ds->version++;
     }
-    g_ctx->barrier(2);
+    if (rt->ownership != rt_own0 || (ds && ds->ownership != ds_own0))
+        g_ctx->barrier(2);
     out.cmd = (void *)g_ctx->cmd;
     out.color = (uint64_t)rt->tex->image;
     out.depth = ds ? (uint64_t)ds->tex->image : 0;

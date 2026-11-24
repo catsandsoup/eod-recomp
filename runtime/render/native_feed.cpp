@@ -2562,6 +2562,19 @@ bool vu1_bypass_enabled() {
 #endif
 }
 
+bool vu1_bypass_dma_tag(uint32_t tag) {
+    if (!vu1_bypass_enabled()) return false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_tags.upper_bound(tag);
+    if (it == g_tags.begin()) return false;
+    --it;
+    // Only skip UNPACKs on non-range mesh REF tags (cars, props, world, shadows).
+    // Range tags (imm/hud/water/particles) can carry inline state/0x2538 A+D packets.
+    if (it->second.range || tag >= it->second.end) return false;
+    if ((MEM_LW(tag + 4) & 0x7FFFFFFFu) != it->second.packet.batch + 0x38) return false;
+    return it->second.packet.mesh != 0 && it->second.packet.kind < KIND_COUNT;
+}
+
 bool vu1_start(uint32_t program, uint32_t itop, WorldTextureLod &world_lod,
                bool &clipped_world_continuation, bool *bypass_vu1) {
     if (bypass_vu1) *bypass_vu1 = false;
