@@ -129,7 +129,7 @@ class PropertiesPanel(QWidget):
     barrierHeightApplyRequested = Signal(int, float)  # rec_idx, target_top_above_ground
     clampSkyWallsRequested = Signal()
 
-    MARKER_KINDS = ["Spawn", "Start Grid", "Car", "Chicken", "Trigger", "Breaker", "Marker"]
+    MARKER_KINDS = ["Practice start", "Checkpoint", "Finish", "Waypoint", "Spawn", "Start Grid", "Car", "Chicken", "Trigger", "Breaker", "Marker"]
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -928,6 +928,7 @@ class PropertiesPanel(QWidget):
         self._current_marker = marker
         self._current_barrier_idx = -1
 
+        self.stack.widget(3).setEnabled(marker.kind != "Event reference")
         self.mk_title.setText(marker.name)
         self.mk_kind_lbl.setText(f"Kind: {marker.kind} · Source: {marker.source}")
         self.mk_name_ed.setText(marker.name)

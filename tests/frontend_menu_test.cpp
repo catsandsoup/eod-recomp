@@ -40,6 +40,7 @@ int main() {
         graphics.modern_renderer = true;
         graphics.modern_shadows = 40;
         Menu menu(graphics);
+        menu.set_tab(Tab::Graphics);
         menu.open();
         CHECK(find(menu, "plume_look") < 0 && find(menu, "modern") < 0);
         HostInfo host;
@@ -77,17 +78,18 @@ int main() {
     Config cfg;
     Menu m(cfg);
     m.open();
-    // tabs: L1/R1 cycle with wrap
-    CHECK(m.tab() == Tab::Graphics);
+    // tabs: L1/R1 cycle with wrap (Play | Mods | Graphics | Inputs | Settings)
+    CHECK(m.tab() == Tab::Play);
     Input in = none(); in.next_tab = true;
     Effects fx = m.update(in);
     CHECK(m.tab() == Tab::Mods && fx.sound == Sound::Tab);
     in = none(); in.prev_tab = true;
     m.update(in); m.update(in);
-    CHECK(m.tab() == Tab::Online);
+    CHECK(m.tab() == Tab::Settings);
     in = none(); in.next_tab = true;
     m.update(in);
-    CHECK(m.tab() == Tab::Graphics);
+    CHECK(m.tab() == Tab::Play);
+    m.set_tab(Tab::Graphics);
 
     // down/up move and wrap; headers are skipped
     int first = m.selected();
@@ -246,8 +248,9 @@ int main() {
     // online: commands reach the network interface; text entry
     auto net = std::make_shared<FakeNet>();
     m.set_network(net);
-    m.set_tab(Tab::Online);
-    CHECK(m.rows()[0].value == "NOT CONNECTED");
+    m.set_tab(Tab::Play);
+    m.set_session_kind(game_frontend::SessionKind::Online);
+    CHECK(m.rows()[find(m, "status")].value == "NOT CONNECTED");
     m.select(find(m, "host"));
     in = none(); in.accept = true; m.update(in);
     CHECK(net->got.size() == 1 && net->got[0].kind == game_frontend::Command::Kind::Host);
@@ -271,7 +274,30 @@ int main() {
     CHECK(m.rows()[find(m, "voicevolume")].value == "195%");
     in = none(); in.reset = true; m.update(in);
     CHECK(cfg.voice_volume == 100 && cfg.lower_game_during_voice);
-    m.set_tab(Tab::Online);
+    m.set_tab(Tab::Play);
+    net->snap.custom_maps = {{"bridge.eodmap", "Woodly Bridge"}};
+    m.select(find(m, "custom_map"));
+    in = none(); in.accept = true;
+    m.update(in);
+    CHECK(find(m, "start") < 0 && m.rows()[find(m, "map:")].checked);
+    m.select(find(m, "map:bridge.eodmap"));
+    m.update(in);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::SelectCustomMap &&
+          net->got.back().text == "bridge.eodmap");
+    net->snap.custom_map_id = "bridge.eodmap";
+    net->snap.custom_map_title = "Woodly Bridge";
+    CHECK(m.rows()[find(m, "custom_map")].value == "Woodly Bridge");
+    m.select(find(m, "custom_map"));
+    m.update(in);
+    CHECK(m.rows()[find(m, "map:bridge.eodmap")].checked);
+    m.select(find(m, "map:"));
+    m.update(in);
+    CHECK(net->got.back().kind == game_frontend::Command::Kind::SelectCustomMap && net->got.back().text.empty());
+    net->snap.is_host = false;
+    CHECK(m.rows()[find(m, "custom_map")].kind == RowKind::Info && find(m, "map:") < 0);
+    net->snap.is_host = true;
+    net->snap.custom_map_id.clear();
+    net->snap.custom_map_title.clear();
     // Controller moderation requires two accepts and binds confirmation to a
     // particular occupant, so a reused slot can never remove a later joiner.
     net->snap.players[0].identity = 41;
@@ -316,22 +342,24 @@ int main() {
     m.select(find(m, "withdraw"));
     m.update(in);
     CHECK(net->got.back().kind == game_frontend::Command::Kind::RejoinLobby);
+    // Settings stays strictly Audio / System / Driving / Network (zero match mutators or offline_gametype)
     m.set_tab(Tab::Settings);
-    CHECK(!m.rows()[find(m, "turbo")].enabled && !m.rows()[find(m, "chickens")].enabled && !m.rows()[find(m, "invincible")].enabled);
-    m.set_tab(Tab::Online);
+    CHECK(find(m, "offline_gametype") < 0 && find(m, "offline_ai_bots") < 0 && find(m, "bots") < 0 && find(m, "spbattle") < 0);
+    CHECK(find(m, "unified_fe") >= 0);
+    m.set_tab(Tab::Play);
     net->snap = {};
 
-    // Couch route: shoulders, D-pad, accept/back. The only typing is the code.
+    // Couch route: PLAY tab -> Online session -> Host / Join by Code
     Config couch_cfg;
     Menu couch(couch_cfg);
     couch.set_network(net);
     couch.open();
+    couch.set_session_kind(game_frontend::SessionKind::Online);
+    CHECK(couch.tab() == Tab::Play);
     Input shoulder = none(); shoulder.prev_tab = true;
-    couch.update(shoulder); // Graphics wraps left to Online
-    CHECK(couch.tab() == Tab::Online);
     Input down = none(); down.dy = 1;
     Input accept = none(); accept.accept = true;
-    couch.update(none());
+    couch.select(find(couch, "host"));
     CHECK(couch.rows()[couch.selected()].id == "host");
     couch.update(down);
     CHECK(couch.rows()[couch.selected()].id == "code");
@@ -358,9 +386,9 @@ int main() {
     CHECK(couch.pic_track().empty() && !couch.pic_car());
     CHECK(find(couch, "ready") < 0 && find(couch, "leave") >= 0);
     couch.update(shoulder);
-    CHECK(couch.tab() == Tab::Online);
+    CHECK(couch.tab() == Tab::Play);
     couch.set_tab(Tab::Graphics);
-    CHECK(couch.tab() == Tab::Online);
+    CHECK(couch.tab() == Tab::Play);
     net->snap.phase = game_frontend::Snapshot::Phase::Error;
     net->snap.error = "The lobby did not respond.";
     CHECK(find(couch, "profile_match") < 0);
@@ -441,14 +469,13 @@ int main() {
         HostInfo input_host;
         input_host.device[0] = "Keyboard";
         turbo_menu.set_host(input_host);
-        turbo_menu.set_tab(Tab::Settings);
+        turbo_menu.set_tab(Tab::Play);
+        turbo_menu.set_session_kind(game_frontend::SessionKind::Online);
 #ifdef _WIN32
         const std::string keyboard_label = "TURBO BOOST [J / Q / F]";
 #else
         const std::string keyboard_label = "TURBO BOOST [J]";
 #endif
-        CHECK(turbo_menu.rows()[find(turbo_menu, "turbo")].label == keyboard_label);
-        turbo_menu.set_tab(Tab::Online);
         net->snap.phase = game_frontend::Snapshot::Phase::Lobby;
         net->snap.is_host = true;
         net->snap.options = {{"rule_turbo", "TURBO BOOST", "ON", true, "Applies to all players."}};
@@ -516,6 +543,274 @@ int main() {
     CHECK(pe.update(p).dx == -1);
     p.buttons = 0; p.lx = 20;
     CHECK(pe.update(p).dx == -1);
+
+    // Unified PLAY Hub: Career, Solo, Split-Screen, Rules Drawer, Quick Rail Save Gate & Classic PS2 toggle
+    {
+        Config hub_cfg;
+        Menu hub(hub_cfg);
+        auto hnet = std::make_shared<FakeNet>();
+        hub.set_network(hnet);
+        hub.open();
+        CHECK(hub.tab() == Tab::Play);
+        CHECK(hub.session_kind() == game_frontend::SessionKind::Solo);
+
+        // Solo launch emits LaunchTransition (target=3)
+        hub.select(find(hub, "launch_solo"));
+        Input act = none(); act.accept = true;
+        Effects hfx = hub.update(act);
+        CHECK(hfx.close && !hnet->got.empty() &&
+              hnet->got.back().kind == game_frontend::Command::Kind::LaunchTransition &&
+              hnet->got.back().transition.target == 3 &&
+              hnet->got.back().transition.humans == 1);
+
+        // Split-Screen 4P launch emits LaunchTransition (target=4, humans=4)
+        hub.set_session_kind(game_frontend::SessionKind::SplitScreen);
+        hub.select(find(hub, "split_players"));
+        Input rt = none(); rt.dx = 1;
+        hub.update(rt); hub.update(rt); // 2P -> 3P -> 4P
+        CHECK(hub.split_players() == 4);
+        hub.select(find(hub, "launch_split"));
+        hub.update(act);
+        CHECK(hnet->got.back().kind == game_frontend::Command::Kind::LaunchTransition &&
+              hnet->got.back().transition.target == 4 &&
+              hnet->got.back().transition.humans == 4);
+
+        // Career Continue emits LaunchTransition (target=2) with selected warp target
+        hub.set_session_kind(game_frontend::SessionKind::Career);
+        hub.select(find(hub, "career_warp"));
+        hub.update(rt); hub.update(rt); hub.update(rt); // 0 -> 3 (Dealer)
+        CHECK(hub.career_warp_index() == 3);
+        hub.select(find(hub, "career_continue"));
+        hub.update(act);
+        CHECK(hnet->got.back().kind == game_frontend::Command::Kind::LaunchTransition &&
+              hnet->got.back().transition.target == 2 &&
+              hnet->got.back().transition.career_place == 3);
+
+        // Customize Rules Drawer: Tips (Tag) locks Chicken Fight with NO WEAPONS MODE
+        hub.set_session_kind(game_frontend::SessionKind::Solo);
+        hub.set_sub_screen(Menu::SubScreen::RulesDrawer);
+        hub.select(find(hub, "draft_preset"));
+        hub.update(rt); hub.update(rt); // Standard -> Battle Royale -> Tips (Tag)
+        CHECK(hub.mutator_draft().preset_id == 2 && !hub.mutator_draft().uses_weapons);
+        CHECK(hnet->got.back().kind == game_frontend::Command::Kind::UpdateMutatorDraft);
+        hub.set_rules_tab(1); // FEATS & WEAPONS
+        const int ch_idx = find(hub, "draft_chickens");
+        CHECK(ch_idx >= 0 && !hub.rows()[ch_idx].enabled && hub.rows()[ch_idx].note == "NO WEAPONS MODE");
+        // L1/R1 inside RulesDrawer switches sub-tabs (1 -> 2 PHYSICS & SCALE -> 3 BOTS & ROLES)
+        Input r1_rules = none(); r1_rules.next_tab = true;
+        hub.update(r1_rules);
+        CHECK(hub.rules_tab() == 2);
+        hub.select(find(hub, "draft_grav"));
+        hub.update(rt);
+        CHECK(hub.mutator_draft().gravity_scale > 1.05f &&
+              hnet->got.back().kind == game_frontend::Command::Kind::UpdateMutatorDraft);
+        hub.update(r1_rules);
+        CHECK(hub.rules_tab() == 3);
+        hub.select(find(hub, "draft_save_json"));
+        hub.update(act);
+        CHECK(hnet->got.back().kind == game_frontend::Command::Kind::SaveCustomGametype);
+        hub.set_sub_screen(Menu::SubScreen::None);
+
+        // Quick Rail Save Safety Gate when jumping out of Career
+        hnet->snap.ee_state = 6; // CareerRoam
+        hub.set_quick_rail(true);
+        hub.select(find(hub, "qr_jump_online"));
+        hub.update(act);
+        CHECK(hub.save_prompt_open());
+        hub.select(find(hub, "save_jump_save"));
+        hub.update(act);
+        CHECK(!hub.save_prompt_open() &&
+              hnet->got.back().kind == game_frontend::Command::Kind::LaunchTransition &&
+              hnet->got.back().transition.save_career_first);
+
+        // Phase 3: Visual Mode & Map Browser (Hero Cards, Categories, Custom Modes & .eodmap)
+        hnet->snap.retail_tracks = {"Anoka", "HomeBase", "Woodly"};
+        hnet->snap.custom_maps = {{"sky_arena.eodmap", "Sky Arena", "Anoka", "Tester"}};
+        hub.set_session_kind(game_frontend::SessionKind::Solo);
+        hub.select(find(hub, "open_mode_browser"));
+        hub.update(act);
+        CHECK(hub.sub_screen() == Menu::SubScreen::ModeBrowser);
+        CHECK(hub.browser_category() == 0);
+        auto mode_items = hub.browser_items();
+        CHECK(mode_items.size() >= 6 && mode_items[0].featured); // Hero featured cards at top
+        // L1/R1 switches category inside Mode Browser
+        Input r1 = none(); r1.next_tab = true;
+        hub.update(r1); CHECK(hub.browser_category() == 1); // RETAIL
+        hub.update(r1); CHECK(hub.browser_category() == 2); // PARTY & ARENA
+        hub.update(r1); CHECK(hub.browser_category() == 3); // MY CUSTOM MODES
+        auto custom_items = hub.browser_items();
+        CHECK(!custom_items.empty() && custom_items.back().is_save_new);
+        // Activate "+ SAVE CURRENT AS NEW MODE"
+        hub.set_browser_selected((int)custom_items.size() - 1);
+        hub.update(act);
+        CHECK(hub.sub_screen() == Menu::SubScreen::None);
+        CHECK(hnet->got.back().kind == game_frontend::Command::Kind::SaveCustomGametype);
+
+        // Map Browser: select installed .eodmap custom map
+        hub.select(find(hub, "open_map_browser"));
+        hub.update(act);
+        CHECK(hub.sub_screen() == Menu::SubScreen::MapBrowser);
+        hub.set_browser_category(2); // CUSTOM MAPS
+        auto map_items = hub.browser_items();
+        CHECK(map_items.size() == 1 && map_items[0].is_custom_map);
+        hub.update(act);
+        CHECK(hub.sub_screen() == Menu::SubScreen::None && hub.offline_custom_map() == "sky_arena.eodmap");
+
+        // Phase 6: Automated cross-mode soak (Hub -> Career -> Warp -> Save & Jump to Online -> Leave -> 4P Split-Screen -> Solo)
+        {
+            Config soak_cfg;
+            Menu soak(soak_cfg);
+            auto snet = std::make_shared<FakeNet>();
+            soak.set_network(snet);
+            soak.open();
+            // 1. Hub -> Career
+            soak.set_session_kind(game_frontend::SessionKind::Career);
+            soak.select(find(soak, "career_continue"));
+            soak.update(act);
+            CHECK(snet->got.back().transition.target == 2);
+            // 2. Career Free Roam -> Quick Rail -> Warp to Garage
+            snet->snap.ee_state = 6;
+            soak.set_quick_rail(true);
+            soak.select(find(soak, "qr_warp_garage"));
+            soak.update(act);
+            CHECK(snet->got.back().kind == game_frontend::Command::Kind::CareerWarp &&
+                  snet->got.back().value == 4.0f);
+            // 3. Career -> Save & Jump to Online
+            soak.set_quick_rail(true);
+            soak.select(find(soak, "qr_jump_online"));
+            soak.update(act);
+            CHECK(soak.save_prompt_open());
+            soak.select(find(soak, "save_jump_save"));
+            soak.update(act);
+            CHECK(snet->got.back().kind == game_frontend::Command::Kind::LaunchTransition &&
+                  snet->got.back().transition.save_career_first);
+            // 4. Online Host -> Leave
+            snet->snap.ee_state = 1;
+            soak.set_quick_rail(false);
+            soak.set_session_kind(game_frontend::SessionKind::Online);
+            soak.select(find(soak, "host"));
+            soak.update(act);
+            CHECK(snet->got.back().kind == game_frontend::Command::Kind::Host);
+            snet->snap.phase = game_frontend::Snapshot::Phase::Lobby;
+            snet->snap.is_host = true;
+            soak.select(find(soak, "leave"));
+            soak.update(act);
+            CHECK(snet->got.back().kind == game_frontend::Command::Kind::Disconnect);
+            snet->snap.phase = game_frontend::Snapshot::Phase::Offline;
+            snet->snap.is_host = false;
+            // 5. 4P Split-Screen -> Solo
+            soak.set_session_kind(game_frontend::SessionKind::SplitScreen);
+            soak.select(find(soak, "split_players"));
+            soak.update(rt); soak.update(rt);
+            soak.select(find(soak, "launch_split"));
+            soak.update(act);
+            CHECK(snet->got.back().transition.target == 4 && snet->got.back().transition.humans == 4);
+            soak.set_session_kind(game_frontend::SessionKind::Solo);
+            soak.select(find(soak, "launch_solo"));
+            soak.update(act);
+            CHECK(snet->got.back().transition.target == 3 && snet->got.back().transition.humans == 1);
+        }
+
+        // Classic PS2 Menus toggle flips UnifiedFrontEnd off and saves
+        hub.set_quick_rail(false);
+        hub.set_session_kind(game_frontend::SessionKind::Solo);
+        hub.select(find(hub, "classic_ps2_toggle"));
+        Effects cfx = hub.update(act);
+        CHECK(!hub_cfg.unified_frontend && cfx.save && cfx.close);
+
+        // Visual Car Browser: class categories (ALL..MODDED), Trailers/Caravans, and Modded cars
+        {
+            Config car_cfg;
+            Menu car_menu(car_cfg);
+            auto cnet = std::make_shared<FakeNet>();
+            car_menu.set_network(cnet);
+            car_menu.open();
+            car_menu.set_session_kind(game_frontend::SessionKind::Solo);
+            car_menu.select(find(car_menu, "open_car_browser"));
+            car_menu.update(act);
+            CHECK(car_menu.sub_screen() == Menu::SubScreen::CarBrowser);
+            CHECK(car_menu.browser_items().size() >= 7);
+            car_menu.set_browser_category(5); // TRAILERS
+            auto trailers = car_menu.browser_items();
+            CHECK(trailers.size() == 1 && trailers[0].is_trailer);
+            car_menu.set_browser_category(6); // MODDED
+            auto modded = car_menu.browser_items();
+            CHECK(modded.size() == 2 && modded[0].is_modded);
+            car_menu.update(act);
+            CHECK(car_menu.sub_screen() == Menu::SubScreen::None);
+            CHECK(car_menu.split_seats()[0].car_model == "Phantom");
+        }
+
+        // Host vs. Guest lifecycle: Guest read-only Rules Drawer, map download READY lock,
+        // Host SYNCING MAP roster indicator, MODS/SETTINGS online awareness, and discover_mods filtering
+        {
+            Config hg_cfg;
+            Menu guest(hg_cfg);
+            auto gnet = std::make_shared<FakeNet>();
+            gnet->snap.phase = game_frontend::Snapshot::Phase::Lobby;
+            gnet->snap.is_host = false;
+            gnet->snap.car_pic = 10;
+            gnet->snap.map_downloading = true;
+            gnet->snap.map_download_pct = 42;
+            gnet->snap.custom_map_title = "Sky Arena";
+            gnet->snap.mutator_draft.name = "Tips (Tag)";
+            gnet->snap.mutator_draft.uses_weapons = false;
+            gnet->snap.mutator_draft.gravity_scale = 0.70f;
+            guest.set_network(gnet);
+            guest.open();
+            guest.set_session_kind(game_frontend::SessionKind::Online);
+
+            // Guest READY must be disabled while map is downloading
+            const int rdy_i = find(guest, "ready");
+            CHECK(rdy_i >= 0);
+            const auto online_rows = guest.rows();
+            CHECK(!online_rows[rdy_i].enabled && online_rows[rdy_i].value.find("42%") != std::string::npos);
+
+            // Guest opens Rules Drawer -> read-only Info rows, edits rejected
+            const int rules_i = find(guest, "open_rules_drawer");
+            CHECK(rules_i >= 0 && online_rows[rules_i].label == "VIEW HOST RULES");
+            guest.select(rules_i);
+            guest.update(act);
+            CHECK(guest.sub_screen() == Menu::SubScreen::RulesDrawer);
+            const auto rrows = guest.rows();
+            CHECK(!rrows.empty() && rrows[0].label.find("HOST RULES (READ-ONLY)") != std::string::npos);
+            int preset_row = find(guest, "draft_preset");
+            CHECK(preset_row >= 0 && rrows[preset_row].kind == RowKind::Info);
+
+            // Guest MODS and SETTINGS tabs show online status
+            guest.set_tab(Tab::Mods);
+            CHECK(find(guest, "online_mod_banner") >= 0);
+            guest.set_tab(Tab::Settings);
+            const int rec_i = find(guest, "recovery");
+            CHECK(rec_i >= 0 && guest.rows()[rec_i].note == "HOST RULE ONLINE");
+
+            // Host sees SYNCING MAP for peer whose map_ready == false
+            gnet->snap.is_host = true;
+            gnet->snap.map_downloading = false;
+            gnet->snap.players = {
+                {0, "Host", true, false, false, false, 0, false, true},
+                {1, "Guest1", false, false, false, false, 7, false, false},
+            };
+            guest.set_tab(Tab::Play);
+            const auto hrows = guest.rows();
+            bool saw_syncing = false;
+            for (const auto &hr : hrows) {
+                if (hr.id == "player" && hr.value.find("SYNCING MAP") != std::string::npos) saw_syncing = true;
+            }
+            CHECK(saw_syncing);
+
+            // discover_mods ignores maps/ and gametypes/ folders
+            const fs::path tmp_mods = fs::temp_directory_path() / "eod_test_discover_mods_filter";
+            std::error_code ec;
+            fs::remove_all(tmp_mods, ec);
+            fs::create_directories(tmp_mods / "maps", ec);
+            fs::create_directories(tmp_mods / "gametypes", ec);
+            fs::create_directories(tmp_mods / "music", ec);
+            const auto found_mods = discover_mods(tmp_mods.string());
+            CHECK(found_mods.empty());
+            fs::remove_all(tmp_mods, ec);
+        }
+    }
 
     std::printf("%s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;

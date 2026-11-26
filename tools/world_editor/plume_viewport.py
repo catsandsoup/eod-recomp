@@ -15,7 +15,7 @@ BATCH = np.dtype([("first", "<u4"), ("count", "<u4"), ("slot", "<u4"), ("center"
 ALPHA_KIND = {"opaque": 0, "cutout": 1, "blend": 2}
 
 
-def pack_world(world, layers, slots):
+def pack_world(world, layers, slots, spans=None):
     """Bake visible placements, batching solid surfaces and keeping translucent parts separate."""
     vertices, solid, blended = [], {}, []
     base = 0
@@ -25,6 +25,7 @@ def pack_world(world, layers, slots):
         model = world.models.get(obj.model_key)
         if model is None:
             continue
+        first = base
         transform = obj.world_matrix()
         for part in model.parts:
             if not len(part.indices):
@@ -43,6 +44,8 @@ def pack_world(world, layers, slots):
             else:
                 solid.setdefault(slot, []).append(indices)
             base += len(src)
+        if spans is not None and base > first:
+            spans[obj.obj_id] = (first, base)
     if not vertices:
         return np.empty(0, dtype=VERTEX), np.empty(0, dtype="<u4"), np.empty(0, dtype=BATCH)
     index_parts, records, offset = [], [], 0
@@ -77,6 +80,10 @@ class PlumeViewport(QWidget):
         self.lib.eod_plume_view_destroy.restype = None
         self.lib.eod_plume_view_mesh.argtypes = [ptr, ptr, u32, ptr, u32, ptr, u32]
         self.lib.eod_plume_view_mesh.restype = ctypes.c_bool
+        self._patch = getattr(self.lib, "eod_plume_view_vertices", None)
+        if self._patch is not None:
+            self._patch.argtypes = [ptr, u32, ptr, u32]
+            self._patch.restype = ctypes.c_bool
         self.lib.eod_plume_view_texture.argtypes = [ptr, u32, u32, u32, u32, ctypes.c_char_p, ctypes.c_uint64]
         self.lib.eod_plume_view_texture.restype = ctypes.c_bool
         self.lib.eod_plume_view_clear_textures.argtypes = [ptr]
@@ -154,7 +161,9 @@ class PlumeViewport(QWidget):
             self._world = world
             self._slots.clear()
             self._resident.clear()
-        vertices, indices, batches = pack_world(world, layers, self._slots)
+        self._spans = {}
+        vertices, indices, batches = pack_world(world, layers, self._slots, self._spans)
+        self._packed = vertices, indices, batches
         used_slots = set(batches["slot"])
         for name, slot in self._slots.items():
             if slot in used_slots:
@@ -163,6 +172,33 @@ class PlumeViewport(QWidget):
                                             indices.ctypes.data, len(indices), batches.ctypes.data, len(batches)):
             raise RuntimeError("could not upload the current track geometry")
         self.triangles = len(indices) // 3
+
+    def move_placements(self, world, objects):
+        """Patch pre-existing, textured instances without repacking the rest of the map."""
+        vertices, indices, batches = self._packed
+        for obj in objects:
+            if obj.obj_id not in self._spans:
+                return False
+            first, end = self._spans[obj.obj_id]
+            at = first
+            transform = obj.world_matrix()
+            for part in world.models[obj.model_key].parts:
+                if not len(part.indices):
+                    continue
+                stop = at + len(part.vertices)
+                if stop > end:
+                    return False
+                vertices["xyz"][at:stop] = part.vertices[:, :3] @ transform[:3, :3].T + transform[:3, 3]
+                at = stop
+            if at != end:
+                return False
+            if self._patch is not None and not self._patch(self.handle, first, vertices[first:end].ctypes.data, end-first):
+                return False
+        if self._patch is not None:
+            return True
+        # Older viewport modules still display the moving textured object.
+        return self.lib.eod_plume_view_mesh(self.handle, vertices.ctypes.data, len(vertices), indices.ctypes.data,
+                                            len(indices), batches.ctypes.data, len(batches))
 
     def upload_overlay(self, top_verts: np.ndarray | None, depth_verts: np.ndarray | None) -> bool:
         """Upload 3D triangle overlays (gizmos, selection boxes, roads, markers, collision)."""

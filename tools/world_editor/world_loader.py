@@ -721,6 +721,35 @@ class RoadGraph:
                 out.append(e.a)
         return out
 
+    def lap_route_issue(self) -> tuple[int | None, str] | None:
+        """Check the directed primary lap. Alternate lines can have open ends."""
+        main = {nid: n for nid, n in self.nodes.items() if not n.is_side}
+        if len(main) < 3:
+            return next(iter(main), None), "A lap needs at least three main waypoints."
+        successors = {nid: [] for nid in main}
+        for edge in self.edges:
+            if edge.a in main and edge.b in main:
+                successors[edge.a].append(edge.b)
+        for nid, targets in successors.items():
+            if len(targets) != 1:
+                return nid, f"Waypoint {nid} has {len(targets)} forward main links. A lap needs one."
+            a, b = main[nid], main[targets[0]]
+            length = math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
+            if not math.isfinite(length) or length < 0.01:
+                return nid, f"Waypoint {nid} has a missing position or overlaps the next waypoint."
+        start = next((n.node_id for n in main.values() if n.retail_index == 0), min(main))
+        visited = set()
+        current = start
+        while current not in visited:
+            visited.add(current)
+            current = successors[current][0]
+        if current != start:
+            return current, f"The racing line loops back to waypoint {current} before reaching the start."
+        if len(visited) != len(main):
+            missing = next(nid for nid in main if nid not in visited)
+            return missing, f"Waypoint {missing} belongs to a separate loop. Connect it to the starting loop."
+        return None
+
     def node_kind(self, node_id: int) -> str:
         deg = len(self.neighbors(node_id))
         if deg <= 1:
@@ -796,6 +825,9 @@ class RoadGraph:
         return node, removed_edges
 
 
+BATTLE_SPAWN_LIMIT = 16  # Native BattleMaster holds sixteen 0x44-byte records.
+
+
 @dataclass
 class WorldMarker:
     marker_id: str
@@ -805,6 +837,12 @@ class WorldMarker:
     heading_deg: float = 0.0
     source: str = "Placed by the editor"
     note: str = ""
+    normal: tuple[float, float, float] = (0.0, 1.0, 0.0)
+
+    @property
+    def battle_spawn(self) -> bool:
+        # Older projects called their first derived race-grid guide "Spawn".
+        return self.kind == "Spawn" and not self.marker_id.startswith("m_start_")
 
 
 @dataclass
@@ -1222,6 +1260,17 @@ class TrackWorld:
     load_ms: float = 0.0
     cache_path: str | None = None
     _cache_backing: bytes | None = field(default=None, repr=False)
+
+    default_practice_start: str | None = None
+    retail_battle_spawn_ids: frozenset[str] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.retail_battle_spawn_ids = frozenset(m.marker_id for m in self.markers if m.battle_spawn)
+
+    def battle_spawns_changed(self) -> bool:
+        current = [m for m in self.markers if m.battle_spawn]
+        return (any(m.source != "Retail" for m in current)
+                or {m.marker_id for m in current} != self.retail_battle_spawn_ids)
 
     @property
     def total_triangles(self) -> int:
@@ -2201,7 +2250,7 @@ def _load_road_graphs(
 # Uncompressed numpy + struct buffers for ~50-100x faster repeat track opens.
 # ---------------------------------------------------------------------------
 _CACHE_MAGIC = b"EODCACHE"
-_CACHE_VERSION = 4
+_CACHE_VERSION = 5
 _CACHE_HEADER_FMT = "<8sIIIQQ"
 _CACHE_HEADER_SIZE = struct.calcsize(_CACHE_HEADER_FMT)
 _TRK_SHA_STAT_CACHE: dict[str, tuple[int, int, str]] = {}
@@ -2397,7 +2446,7 @@ def _save_track_cache(world: TrackWorld, cache_file: Path, lod: int = 0, include
         }
 
     markers_meta = [
-        [m.marker_id, m.name, m.kind, list(m.position), float(m.heading_deg), m.source, m.note]
+        [m.marker_id, m.name, m.kind, list(m.position), float(m.heading_deg), m.source, m.note, list(m.normal)]
         for m in world.markers
     ]
 
@@ -2633,6 +2682,7 @@ def _load_track_cache(
                 heading_deg=float(m[4]),
                 source=m[5],
                 note=m[6],
+                normal=tuple(m[7]) if len(m) > 7 else (0.0, 1.0, 0.0),
             )
             for m in meta["markers"]
         ]
@@ -2717,6 +2767,40 @@ def _load_track_dict(trk_p: Path, gdir: Path, trk_rel: str) -> dict[str, Any]:
     )
 
 
+def event_start_references(world: TrackWorld) -> list[WorldMarker]:
+    """Read authored XZ start positions and arena placement endpoints from the contest catalog."""
+    archive = world.game_dir / "DATA" / "RES" / "COMMON.RES"
+    member = f"{wc.track_display_name(world.trk_path).lower()}_eves.val"
+    if not archive.is_file():
+        return []
+    try:
+        entries = mb.directory(archive)
+        if not any(e["name"].lower() == member for e in entries):
+            return []
+        table = parse_binary_valt(payload(archive, member, entries)[0])
+    except (OSError, ValueError, struct.error):
+        return []
+    fields = {"start_point", "attacker_start", "gizmo_start", "wrangler_start", "arena_place_a", "arena_place_b"}
+    points = []
+    for section in table["sections"]:
+        pairs = dict(section["pairs"])
+        contest = pairs.get("event_type", section["name"])
+        for key, value in section["pairs"]:
+            if key.lower() not in fields:
+                continue
+            try:
+                x, z = map(float, value.split(","))
+                if not math.isfinite(x) or not math.isfinite(z):
+                    continue
+            except ValueError:
+                continue
+            points.append(WorldMarker(
+                f"ref/{section['name']}/{key}", f"{contest} · {key}".replace("_", " "),
+                "Event reference", (x, world.collision.ground_height(x, z), z),
+                source="Event catalog", note=f"{member} / {section['name']} / {key}"))
+    return points
+
+
 def _load_battle_respawn_markers(
     trk_p: Path,
     entries: list[dict[str, Any]],
@@ -2730,14 +2814,14 @@ def _load_battle_respawn_markers(
     try:
         raw, _ = payload(trk_p, hit["name"], entries, verify_crc=False)
         tv = parse_binary_valt(raw)
-        secs = {s["name"].lower(): dict(s.get("pairs", [])) for s in tv.get("sections", [])}
+        secs = {s["name"].lower(): s.get("pairs", []) for s in tv.get("sections", [])}
         resp = secs.get("respawn")
         if not resp:
             return []
-        for idx, (k, ref_sec) in enumerate(resp.items()):
+        for idx, (k, ref_sec) in enumerate(resp):
             if not k.startswith("@"):
                 continue
-            target = secs.get(str(ref_sec).lower())
+            target = dict(secs.get(str(ref_sec).lower(), []))
             if not target or "pt" not in target:
                 continue
             pt_parts = [float(v.strip()) for v in str(target["pt"]).split(",")[:2]]
@@ -3100,7 +3184,7 @@ def load_track_world(
                 WorldMarker(
                     marker_id=f"m_start_{slot}",
                     name="Start / Finish Grid P1" if slot == 0 else f"Start Grid P{slot + 1}",
-                    kind="Start Grid" if slot > 0 else "Spawn",
+                    kind="Start Grid",
                     position=(gx, gy, gz),
                     heading_deg=hdg,
                     source="Retail",

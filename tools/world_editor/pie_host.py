@@ -392,7 +392,7 @@ def pie_staging_root() -> Path:
     return tdeod_support_dir() / "editor" / "pie_staging"
 
 
-def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = True) -> Path:
+def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = True, creator_test: bool = False) -> Path:
     """Locate the PIE executable for the current platform and renderer."""
     override = os.environ.get("EOD_PIE_EXE")
     if override:
@@ -404,15 +404,18 @@ def resolve_eod_exe(game_dir: Path | str, *, prefer_plume: bool = True) -> Path:
     if sys.platform == "darwin":
         bundle_executable = Path("Eve of Destruction.app/Contents/MacOS/eod")
         native_builds = ["build-mac-r7-release", "build-mac-plume"]
+        if creator_test:
+            native_builds.reverse()
         builds = (native_builds + ["build-mac"] if prefer_plume else ["build-mac"] + native_builds)
         builds += ["build-mac-release", "build"]
         candidates = [
-            gdir / "eod",
-            gdir / bundle_executable,
+            *([] if creator_test else [gdir / "eod", gdir / bundle_executable]),
             bundle_root / "eod",
             bundle_root / bundle_executable,
             *(repository / build / "eod" for build in builds),
             *(repository / build / bundle_executable for build in builds),
+            gdir / "eod",
+            gdir / bundle_executable,
             tdeod_support_dir() / "local-build" / bundle_executable,
             Path.home() / "Applications" / bundle_executable,
             Path("/Applications") / bundle_executable,
@@ -482,7 +485,7 @@ def build_pie_launch_spec(
     free_cam: bool = False,
     laps: int | None = None,
     pie_render_scale: int = 2,
-    spawn_pos: tuple[float, float, float, float] | None = None,
+    map_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build exact process args and environment variables for PIE launch.
 
@@ -500,14 +503,14 @@ def build_pie_launch_spec(
       - Isolates PIE settings (`pie.ini`, `pie_memcard/`, configurable `RenderScale`) so global
         `eod.ini` (`RenderScale=6` >4K) and real Career saves are never touched or inherited.
       - Configures `EOD_PIE_CONTROL_FILE`, `EOD_OPT_TERRAIN_MASK`, `EOD_ARCADE_MODE`,
-        `EOD_AI_AUTODRIVE`, `EOD_FREE_CAM`, `EOD_SPAWN_POS`, and background joystick events.
+        `EOD_AI_AUTODRIVE`, `EOD_FREE_CAM`, and background joystick events.
     """
     gdir = Path(game_dir).resolve()
     mdir = Path(mod_dir).resolve()
     clean_car = canonicalize_car_name(car_name)
     trk_up = track_display_name.strip()
     rmode = "plume" if renderer_mode == "plume" else "ps2"
-    exe = resolve_eod_exe(gdir)
+    exe = resolve_eod_exe(gdir, creator_test=map_path is not None)
     rtag = "Plume HQ" if rmode == "plume" else "Classic"
 
     raw_ev = (event_name or "").strip()
@@ -580,14 +583,13 @@ def build_pie_launch_spec(
     env["EOD_ARCADE_MODE"] = (arcade_mode or "free_roam").strip().lower()
     env["EOD_AI_AUTODRIVE"] = "1" if ai_autodrive else "0"
     env["EOD_FREE_CAM"] = "1" if free_cam else "0"
-    if spawn_pos is not None:
-        sx, sy, sz, syaw = spawn_pos
-        env["EOD_SPAWN_POS"] = f"{float(sx):.3f},{float(sy):.3f},{float(sz):.3f},{float(syaw):.2f}"
-    else:
-        env.pop("EOD_SPAWN_POS", None)
     env.pop("EOD_NATIVE_ONLY", None)
     env["EOD_MODERN"] = "0"
     args = [str(exe), "--windowed", "--data", str(gdir), "--config", str(pie_ini)]
+    if map_path is not None:
+        env["EOD_EDITOR_MAP_TEST"] = "1"
+        env["EOD_EDITOR_TEST"] = "1"
+        args.extend(["--map", str(map_path)])
     if sync_all_events:
         env["EOD_OPT_TERRAIN_MASK"] = "0xFFFF"
     env["EOD_PLUME"] = "1"
@@ -616,7 +618,7 @@ def build_pie_launch_spec(
         "arcade_mode": env["EOD_ARCADE_MODE"],
         "ai_autodrive": bool(ai_autodrive),
         "free_cam": bool(free_cam),
-        "spawn_pos": spawn_pos,
+        "map_test": map_path is not None,
         "label": label,
         "env": env,
     }
@@ -1349,6 +1351,11 @@ class PieHostWidget(QWidget):
             self.pieStopped.emit()
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent)
+                and event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_F5)
+                and self.is_running and self._last_spec and self._last_spec.get("map_test")):
+            self.stop_pie()
+            return True
         if self.is_running and not self._popped_out and self._child_hwnd:
             etype = event.type()
             if obj is self.embed_container and etype in (

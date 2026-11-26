@@ -1,6 +1,11 @@
 // Tests the C++/native construction boundary with synthetic EE memory. Native
 // vehicle selection, driving and weapon physics need separate gameplay checks.
 #include "battle_bots.h"
+#include "mutator_hooks.h"
+#include "vfs/custom_map.h"
+
+extern "C" void f_00167A88();
+extern "C" void f_001673B8();
 #include "battle_layout.h"
 #include "core/config.h"
 #include "core/cpu.h"
@@ -215,6 +220,42 @@ void placement() {
     g_ee.r[4].ud[0] = master; g_ee.r[5].ud[0] = out; g_ee.r[6].ud[0] = 3; f_00167C70();
     require(placementOriginal == 1 && !grounding, "no respawn records: native behaviour only");
 }
+void mountedSpawns() {
+    using namespace eod::vfs;
+    reset();
+    constexpr uint32_t master = 0x62000, out = 0x64000;
+    auto map = std::make_shared<CustomMap>();
+    for (int i = 0; i < 40; ++i) {
+        map->grid_starts.push_back({{float(i), 12, 0}, {0, .8f, .6f}, 90});
+        map->battle_respawns.push_back({{float(200 + i), 100, 0}, {0, 1, 0}, 0});
+    }
+    require(global_vfs().mount(Layer::EphemeralPie, ".", "fixture", map), "map mount");
+    ee_w32(master + battle_layout::kRespawnCount, 9);
+    g_ee.r[4].ud[0] = master;
+    f_00167A88();
+    require(!ee_r32(master + battle_layout::kRespawnCount), "suppress native spawn table");
+    g_ee.r[5].ud[0] = out;
+    g_ee.r[6].ud[0] = 38;
+    placementOriginal = 0;
+    f_00167C70();
+    auto read = [](uint32_t addr) {
+        float f;
+        uint32_t u = ee_r32(addr);
+        std::memcpy(&f, &u, sizeof(f));
+        return f;
+    };
+    require(!placementOriginal && read(out + 0x24) == 38 && read(out + 0x10) == .8f &&
+            read(out + 0x14) == .6f && ee_r32(out + 0x44) == 2, "custom banked grid pose");
+    g_ee.r[4].ud[0] = master;
+    g_ee.r[5].ud[0] = 2;
+    for (unsigned i = 0; i < 40; ++i) {
+        f_001673B8();
+        require(read(g_ee.r[2].uw[0] + 0x24) == float(200 + (2 + i) % 40),
+                "all authored respawns are reachable");
+    }
+    global_vfs().unmount(Layer::EphemeralPie);
+}
+
 void killNames() {
     // The native lookup (0x119428) is replaced only inside the message draw of a Battle that has AI.
     constexpr uint32_t native = 0x1119428;
@@ -270,6 +311,8 @@ extern "C" void f_00166B50_orig() {
 extern "C" void f_00119428_orig() { g_ee.r[2].ud[0] = 0x1119428; }
 extern "C" void f_001116E0_orig() { ++resolveOriginal; resolvedDescription = arg_u32(0); }
 extern "C" void f_0012AEF0_orig() { ++rosterOriginal; std::memset(&g_ee, 0x11, sizeof(g_ee)); g_ee.r[16].ud[0] = 55; }
+extern "C" void f_00167A88_orig() {}
+extern "C" void f_001673B8_orig() {}
 extern "C" void f_00167C70_orig() {
     ++placementOriginal;
     const uint32_t out = arg_u32(1);
@@ -325,7 +368,21 @@ extern "C" void f_00227EE8() {
     std::memset(&g_ee, 0xA5, sizeof(g_ee));
 }
 
+void offlineMutatorWeaponOrder() {
+    reset();
+    mutator_hooks::reset();
+    mutator_hooks::on_offline_world_construct = [](uint32_t) {
+        mutator_hooks::active = true;
+        mutator_hooks::suppress_weapons = true;
+    };
+    makeWorld();
+    require(created.empty(), "on_offline_world_construct must run before weapon scene creation");
+    require(battle_bots_is_ai_slot(2) && battle_bots_is_ai_slot(3), "AI slots are still tracked when weapons are suppressed");
+    mutator_hooks::on_offline_world_construct = nullptr;
+    mutator_hooks::reset();
+}
+
 int main() {
-    countCases(); killNames(); weaponsAndIdentity(); capacity(); variantCounts(); placement(); mixedClasses();
+    countCases(); killNames(); weaponsAndIdentity(); offlineMutatorWeaponOrder(); capacity(); variantCounts(); mountedSpawns(); placement(); mixedClasses();
     std::puts("Battle construction bridge checks passed");
 }

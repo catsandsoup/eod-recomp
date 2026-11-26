@@ -16,16 +16,15 @@ constexpr uint32_t kMasterVtable = 0x003F7770;
 constexpr uint32_t kRespawnCount = 0x450;
 constexpr uint32_t kParticipants = 0x454;
 constexpr uint32_t kParticipantStride = 0x50;
-constexpr uint32_t kCapacity = 12;
-constexpr uint32_t kRanking = kParticipants + kCapacity * kParticipantStride;  // 0x814
-constexpr uint32_t kSpawnIndex = kRanking + kCapacity * 4;                     // 0x844
-constexpr uint32_t kCount = kSpawnIndex + 4;                                   // 0x848
-constexpr uint32_t kMasterSize = kCount + 4;                                   // 0x84C
-static_assert(kRanking == 0x814 && kSpawnIndex == 0x844 && kCount == 0x848 && kMasterSize == 0x84C);
+constexpr uint32_t kCapacity = 16;
+constexpr uint32_t kRanking = kParticipants + kCapacity * kParticipantStride;  // 0x954
+constexpr uint32_t kSpawnIndex = kRanking + kCapacity * 4;                     // 0x994
+constexpr uint32_t kCount = kSpawnIndex + 4;                                   // 0x998
+constexpr uint32_t kMasterSize = kCount + 4;                                   // 0x99C
+static_assert(kRanking == 0x954 && kSpawnIndex == 0x994 && kCount == 0x998 && kMasterSize == 0x99C);
 
-// Most cars a Battle may hold. Native 0x12C158 caps two humans at ten cars;
-// the twelve records leave headroom so no hook ever writes the last slot.
-constexpr uint32_t kMaxCars = 10;
+// Most cars a Battle may hold (lifted to 16 for full online multiplayer parity).
+constexpr uint32_t kMaxCars = 16;
 
 // Runtime-owned guest memory in EE kernel RAM (0x00083000-0x000FE000 is never
 // touched by the game or the HLE kernel: syscall table 0x10000, thread-exit

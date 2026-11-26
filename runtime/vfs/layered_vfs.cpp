@@ -101,7 +101,8 @@ bool find_case_insensitive_file(const fs::path &root, const fs::path &canonical_
 
 }  // namespace
 
-bool LayeredVfs::mount(Layer layer, const std::string &root_dir, const std::string &tag) {
+bool LayeredVfs::mount(Layer layer, const std::string &root_dir, const std::string &tag,
+                       std::shared_ptr<const CustomMap> map) {
     const size_t idx = layer_index(layer);
     if (idx >= kLayerCount || root_dir.empty()) return false;
 
@@ -122,6 +123,7 @@ bool LayeredVfs::mount(Layer layer, const std::string &root_dir, const std::stri
     layers_[idx].root = std::move(clean_root);
     layers_[idx].canonical_root = canonical.string();
     layers_[idx].tag = tag;
+    layers_[idx].map = std::move(map);
     return true;
 }
 
@@ -136,6 +138,13 @@ void LayeredVfs::unmount(Layer layer) {
 void LayeredVfs::clear() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto &slot : layers_) slot = MountSlot{};
+}
+
+std::shared_ptr<const CustomMap> LayeredVfs::current_map() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
+        if (it->map) return it->map;
+    return {};
 }
 
 bool LayeredVfs::is_mounted(Layer layer) const {

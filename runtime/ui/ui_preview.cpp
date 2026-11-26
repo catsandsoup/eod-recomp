@@ -29,6 +29,16 @@ struct Index {
         char found[1024];
         const char *mods = getenv("EOD_MOD_DIR");
         if (allow_mods && mods && *mods && platform_find_file(mods, rel, found, sizeof found)) path = found;
+        if (allow_mods && path.empty() && !g_root.empty()) {
+            // Also probe <game_root>/../mods/combined and <game_root>/mods/combined for integrated mod packs
+            const std::string candidates[] = {
+                g_root + "/mods/combined",
+                g_root + "/../mods/combined",
+            };
+            for (const auto &cand : candidates) {
+                if (platform_find_file(cand.c_str(), rel, found, sizeof found)) { path = found; break; }
+            }
+        }
         if (path.empty()) {
             if (g_root.empty() || !platform_find_file(g_root.c_str(), rel, found, sizeof found)) return false;
             path = found;
@@ -63,7 +73,15 @@ struct Index {
 std::string slug(const std::string &name) {
     std::string s;
     for (char c : name) if (std::isalnum((unsigned char)c)) s.push_back((char)std::tolower((unsigned char)c));
-    return s == "home" ? "homebase" : s;
+    if (s.size() > 2 && s.substr(s.size() - 2) == "mp") s.resize(s.size() - 2);
+    if (s == "home" || s == "homeba1") return "homebase";
+    if (s == "woodly" || s == "afton") return "afton";
+    if (s == "spring1") return "springfield";
+    if (s == "dennis1") return "dennison";
+    if (s == "hastin1") return "hastings";
+    if (s == "mankat1") return "mankato";
+    if (s == "bemidj1") return "bemidji";
+    return s;
 }
 }  // namespace
 
@@ -92,22 +110,28 @@ Pic track(const std::string &name) {
 }
 
 Pic car(uint32_t number) {
+    if (!number) return {};
     const std::string key = "c:" + std::to_string(number);
     auto it = g_cache.find(key);
     if (it != g_cache.end()) return it->second;
     Pic p;
     std::vector<uint8_t> t;
     ui_art::Image img;
-    const std::string entry = "uicar_" + std::to_string(number) + ".tm0";
-    // Added mod entries may be livery/HUD swatches rather than car portraits.
-    // Only native portrait identities are verified for this preview surface;
-    // custom cars stay explicitly unavailable until real portrait art is supplied.
-    if (g_add && g_retail_uicar.open("DATA/RES/UICAR.RES", false) &&
-        g_retail_uicar.entries.count(entry) && g_uicar.open("DATA/RES/UICAR.RES") &&
-        (g_uicar.read(entry, t) || g_retail_uicar.read(entry, t)) && ui_art::decode_tex(t, img)) {
-
-        p.tex = g_add(img.w, img.h, img.rgba.data());
-        p.aspect = (float)img.w / (float)img.h;
+    const std::string tm0_entry = "uicar_" + std::to_string(number) + ".tm0";
+    const std::string tex_entry = "uicar_" + std::to_string(number) + ".tex";
+    // Check modded UICAR.RES first (Phantom, NASCAR Cup Cars, custom cars), then retail UICAR.RES.
+    bool loaded = false;
+    if (g_add) {
+        if (g_uicar.open("DATA/RES/UICAR.RES", true)) {
+            loaded = (g_uicar.read(tm0_entry, t) || g_uicar.read(tex_entry, t)) && ui_art::decode_tex(t, img);
+        }
+        if (!loaded && g_retail_uicar.open("DATA/RES/UICAR.RES", false)) {
+            loaded = (g_retail_uicar.read(tm0_entry, t) || g_retail_uicar.read(tex_entry, t)) && ui_art::decode_tex(t, img);
+        }
+        if (loaded) {
+            p.tex = g_add(img.w, img.h, img.rgba.data());
+            p.aspect = (float)img.w / (float)img.h;
+        }
     }
     g_cache[key] = p;
     return p;

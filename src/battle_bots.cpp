@@ -1,7 +1,10 @@
 // Native Battle participant and weapon construction bridges. These hooks run
 // during session creation; they do not advance physics, weapons or the clock.
 #include "battle_bots.h"
+#include "vfs/custom_map.h"
 #include "netplay_hooks.h"
+#include "mutator_hooks.h"
+#include "mutator_presets.h"
 #include "battle_driver.h"
 #include "battle_events.h"
 #include "battle_layout.h"
@@ -24,6 +27,8 @@ extern "C" {
 void f_0012C158_orig(void);
 void f_0020FD48_orig(void);
 void f_00167C70_orig(void);
+void f_00167A88_orig(void);
+void f_001673B8_orig(void);
 void f_0012AEF0_orig(void);
 void f_001116E0_orig(void);
 void f_00119428_orig(void);
@@ -91,6 +96,12 @@ extern "C" void f_0012C158(void) {
         ret_s32(static_cast<int32_t>(total));
         return;
     }
+    const bool online = netplay_hooks::event_active && netplay_hooks::event_active();
+    if (!online && g_config.offline_ai_bots > 0 && humans >= 1 && humans <= 4) {
+        const uint32_t total = std::min(humans + static_cast<uint32_t>(g_config.offline_ai_bots), battle_layout::kMaxCars);
+        ret_s32(static_cast<int32_t>(total));
+        return;
+    }
     // This is before 12AEF0 fills the DAVMap and 111E10/1116E0 resolve
     // driver/vehicle IDs and Human/AI types. Do not append blank car records.
     // Variant 1 is "Battle (1v1)": the humans only, never AI.
@@ -112,53 +123,63 @@ extern "C" void f_0020FD48(void) {
     const bool battle = ee_r32(description + 0x9A4) == kBattle;
     const uint32_t count = ee_r32(description + 0x98C);
     const bool online = netplay_hooks::event_active && netplay_hooks::event_active();
-    const bool online_weapons = online && (battle || netplay_hooks::rule(netplay_hooks::Chickens, false));
+    // Run offline mutator construction BEFORE want_weapons evaluation so custom JSON
+    // and launch-scoped PendingOfflineMatch modes set mutator_hooks::suppress_weapons in time.
+    if (!online && mutator_hooks::on_offline_world_construct) {
+        mutator_hooks::on_offline_world_construct(description);
+    }
+    const bool offline_suppress_weapons = !online && battle && !mutator_hooks::active && g_config.offline_gametype > 0 &&
+        !mutator::preset_uses_weapons(static_cast<uint8_t>(
+            std::clamp(g_config.offline_gametype, 0, static_cast<int>(mutator::preset_count()) - 1)));
+    const bool want_weapons = !mutator_hooks::suppress_weapons && !offline_suppress_weapons;
+    const bool online_weapons = online && want_weapons && (battle || netplay_hooks::rule(netplay_hooks::Chickens, false));
     const bool battle_ai = battle && count <= battle_layout::kCapacity &&
-        (g_config.battle_bots || count > 4 || session_ai_override() > 0 || online);
+        (g_config.battle_bots || (!online && g_config.offline_ai_bots > 0) || count > 4 || session_ai_override() > 0 || online);
     // Trailer rows have no launchers. The native scene table holds twenty slots.
-    if (!count || count > kLegacyVisualCarSlots || (!battle_ai && !online_weapons)) return;
-
-    // Keep the original function's complete return context. Constructor calls
-    // use its restored stack and preserve their native memory side effects.
-    const EEState saved = g_ee;
-    f_002CE180(); // same native suppression gate used at 210010
-    const bool suppressed = g_ee.r[2].uw[0] != 0;
-    g_ee = saved;
-    // 227EE8 creates the scene now, but 213578/1758B8 queues physical creation.
-    // Registry count may not grow until after this bridge returns, so each
-    // queued constructor must reserve one of its sixteen entries here.
-    uint32_t reserved_weapon_count = ee_r32(kWeaponCount);
-    uint32_t scenes = 0;
-    for (uint32_t slot = 0; slot < kLegacyVisualCarSlots; ++slot)
-        if (ee_r32(kWeaponScenes + 4 * slot)) ++scenes;
-    reserved_weapon_count = std::max(reserved_weapon_count, scenes);
-    for (uint32_t slot = 0; slot < count; ++slot) {
-        const uint32_t record = description + 0x2C + slot * 0x78;
-        if (ee_r32(record) != 0x51) continue;
-        if (battle_ai) ai_slots |= 1u << slot;
-        // A remote human uses an AI-type car on this machine; the original
-        // constructor skips it even when Chicken Fight is enabled.
-        if (!battle_ai && !(netplay_hooks::chicken_player_slot && netplay_hooks::chicken_player_slot(slot))) continue;
-        if (suppressed || reserved_weapon_count >= 16 ||
-            !ram_object(eod_visual_car_slot_read(kVisualCarSlots + 4 * slot), 0x654) ||
-            ee_r32(kWeaponScenes + 4 * slot) || !world_has_weapon_capacity()) continue;
-
-        g_ee.r[4].ud[0] = slot;
-        g_ee.r[5].ud[0] = 0;
-        f_0017DE78();
-        const bool has_weapon = g_ee.r[2].uw[0] != 0;
+    if (count && count <= kLegacyVisualCarSlots && (battle_ai || online_weapons)) {
+        // Keep the original function's complete return context. Constructor calls
+        // use its restored stack and preserve their native memory side effects.
+        const EEState saved = g_ee;
+        f_002CE180(); // same native suppression gate used at 210010
+        const bool suppressed = g_ee.r[2].uw[0] != 0;
         g_ee = saved;
-        if (has_weapon) continue;
+        // 227EE8 creates the scene now, but 213578/1758B8 queues physical creation.
+        // Registry count may not grow until after this bridge returns, so each
+        // queued constructor must reserve one of its sixteen entries here.
+        uint32_t reserved_weapon_count = ee_r32(kWeaponCount);
+        uint32_t scenes = 0;
+        for (uint32_t slot = 0; slot < kLegacyVisualCarSlots; ++slot)
+            if (ee_r32(kWeaponScenes + 4 * slot)) ++scenes;
+        reserved_weapon_count = std::max(reserved_weapon_count, scenes);
+        for (uint32_t slot = 0; slot < count; ++slot) {
+            const uint32_t record = description + 0x2C + slot * 0x78;
+            if (ee_r32(record) != 0x51) continue;
+            if (battle_ai) ai_slots |= 1u << slot;
+            if (!want_weapons) continue;
+            // A remote human uses an AI-type car on this machine; the original
+            // constructor skips it even when Chicken Fight is enabled.
+            if (!battle_ai && !(netplay_hooks::chicken_player_slot && netplay_hooks::chicken_player_slot(slot))) continue;
+            if (suppressed || reserved_weapon_count >= 16 ||
+                !ram_object(eod_visual_car_slot_read(kVisualCarSlots + 4 * slot), 0x654) ||
+                ee_r32(kWeaponScenes + 4 * slot) || !world_has_weapon_capacity()) continue;
 
-        // 210028 calls this for Human records only. Its native factory derives
-        // launch offsets from the car model, creates the scene, and queues
-        // physical weapon initialization with the proper owner ID.
-        g_ee.r[4].ud[0] = slot;
-        g_ee.r[5].ud[0] = 0x51;
-        g_ee.r[6].ud[0] = record + 0x44;
-        f_00227EE8();
-        g_ee = saved;
-        reserved_weapon_count = std::max(reserved_weapon_count + 1, ee_r32(kWeaponCount));
+            g_ee.r[4].ud[0] = slot;
+            g_ee.r[5].ud[0] = 0;
+            f_0017DE78();
+            const bool has_weapon = g_ee.r[2].uw[0] != 0;
+            g_ee = saved;
+            if (has_weapon) continue;
+
+            // 210028 calls this for Human records only. Its native factory derives
+            // launch offsets from the car model, creates the scene, and queues
+            // physical weapon initialization with the proper owner ID.
+            g_ee.r[4].ud[0] = slot;
+            g_ee.r[5].ud[0] = 0x51;
+            g_ee.r[6].ud[0] = record + 0x44;
+            f_00227EE8();
+            g_ee = saved;
+            reserved_weapon_count = std::max(reserved_weapon_count + 1, ee_r32(kWeaponCount));
+        }
     }
 }
 
@@ -196,6 +217,60 @@ extern "C" void f_00119428(void) {
     f_00119428_orig();
 }
 
+namespace {
+void write_map_pose(uint32_t out, const eod::vfs::MapSpawn &spawn) {
+    using Point = eod::vfs::MapPoint;
+    const Point &up = spawn.normal;
+    const double yaw = spawn.heading * (3.141592653589793 / 180.);
+    auto cross = [](const Point &a, const Point &b) -> Point {
+        return {a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
+    };
+    Point right = cross(up, {float(std::sin(yaw)), 0, float(std::cos(yaw))});
+    float length = std::hypot(right[0], right[1], right[2]);
+    if (length < .00001f) {
+        right = cross(up, {0, 1, 0});
+        length = std::hypot(right[0], right[1], right[2]);
+    }
+    for (float &v : right) v /= length;
+    const Point forward = cross(right, up);
+    // The native transform adds 0.376m of clearance along the surface normal.
+    Point position = spawn.position;
+    for (size_t i = 0; i < 3; ++i) position[i] += .376f * up[i];
+    for (const Point &row : {right, up, forward, position}) {
+        for (float v : row) {
+            uint32_t bits;
+            std::memcpy(&bits, &v, 4);
+            ee_w32(out, bits);
+            out += 4;
+        }
+    }
+    for (unsigned i = 0; i < 0x14; i += 4) ee_w32(out + i, 0);
+}
+}
+
+// These are the three BattleMaster methods that construct and consume the
+// fixed-size guest records. Map spawns live in the host-side, immutable mount.
+extern "C" void f_00167A88(void) {
+    auto map = eod::vfs::active_map();
+    if (!map || !map->replace_retail_spawns) { f_00167A88_orig(); return; }
+    uint32_t master = arg_u32(0);
+    ee_w32(master + battle_layout::kRespawnCount, 0);
+    ee_w32(master + battle_layout::kSpawnIndex, 0);
+}
+
+extern "C" void f_001673B8(void) {
+    auto map = eod::vfs::active_map();
+    if (!map || !map->replace_retail_spawns) { f_001673B8_orig(); return; }
+    const auto &poses = map->battle_respawns.empty() ? map->grid_starts : map->battle_respawns;
+    uint32_t master = arg_u32(0);
+    uint32_t sequence = ee_r32(master + battle_layout::kSpawnIndex);
+    ee_w32(master + battle_layout::kSpawnIndex, sequence + 1);
+    // The caller consumes this guest pointer synchronously.
+    uint32_t out = battle_layout::kScratch + 0x100;
+    write_map_pose(out, poses[(uint64_t(sequence) + arg_u32(1)) % poses.size()]);
+    g_ee.r[2].ud[0] = out;
+}
+
 // Initial Battle placement (vtable +0x64): native places car i on respawn
 // record (rotation + i) % count. Tracks ship five to eight records, so in a
 // larger Battle two cars would share one pose. The first `count` cars keep the
@@ -204,27 +279,19 @@ extern "C" void f_00119428(void) {
 // the record from (pt, dir) in the first place.
 extern "C" void f_00167C70(void) {
     const uint32_t master = arg_u32(0), out = arg_u32(1), index = arg_u32(2);
+    auto map = eod::vfs::active_map();
+    if (map && map->replace_retail_spawns && ram_object(out, 0x48)) {
+        const auto &poses = map->grid_starts.empty() ? map->battle_respawns : map->grid_starts;
+        write_map_pose(out, poses[index % poses.size()]);
+        ee_w32(out + 0x44, 2);
+        g_ee.r[2].ud[0] = 1;
+        return;
+    }
     f_00167C70_orig();
     if (!ram_object(master, battle_layout::kMasterSize) || ee_r32(master) != battle_layout::kMasterVtable ||
         !ram_object(out, 0x48)) return;
     auto f = [](uint32_t a) { const uint32_t u = ee_r32(a); float v; std::memcpy(&v, &u, 4); return v; };
     auto put = [](uint32_t a, float v) { uint32_t u; std::memcpy(&u, &v, 4); ee_w32(a, u); };
-    // Play-From-Camera / Placed Spawn Marker override for human player slot 0
-    if (index == 0) {
-        if (const char *sp = std::getenv("EOD_SPAWN_POS"); sp && *sp) {
-            float sx = 0.0f, sy = 0.0f, sz = 0.0f, heading_deg = 0.0f;
-            const int got = std::sscanf(sp, "%f,%f,%f,%f", &sx, &sy, &sz, &heading_deg);
-            if (got >= 3 && std::isfinite(sx) && std::isfinite(sy) && std::isfinite(sz)) {
-                const float rad = (got >= 4 && std::isfinite(heading_deg)) ? (heading_deg * 0.01745329252f) : 0.0f;
-                const float c = std::cos(rad), s = std::sin(rad);
-                put(out + 0x00, c);    put(out + 0x04, 0.0f); put(out + 0x08, -s);
-                put(out + 0x0C, 0.0f); put(out + 0x10, 1.0f); put(out + 0x14, 0.0f);
-                put(out + 0x18, s);    put(out + 0x1C, 0.0f); put(out + 0x20, c);
-                put(out + 0x24, sx);   put(out + 0x28, sy);   put(out + 0x2C, sz);
-                return;
-            }
-        }
-    }
     const uint32_t records = ee_r32(master + battle_layout::kRespawnCount);
     if (!records || records > 16 || index < records || index >= battle_layout::kCapacity) return;
     const uint32_t lap = index / records; // 1, 2, ...
@@ -350,7 +417,8 @@ extern "C" void f_0012AEF0(void) {
         ? battle_layout::kContestTable + contest * battle_layout::kContestStride : 0;
     const uint32_t variant = cp ? battle_events_ai_for_contest(cp) : 0;
     const bool is_battle_cp = cp && ram_object(cp, 0x14) && ee_r32(cp + 8) == kBattle;
-    pending_mix = (variant > 1 || (is_battle_cp && session_ai_override() > 0)) ? 1 : 0;
+    const bool online = netplay_hooks::event_active && netplay_hooks::event_active();
+    pending_mix = (variant > 1 || (is_battle_cp && (session_ai_override() > 0 || (!online && g_config.offline_ai_bots > 0)))) ? 1 : 0;
 }
 
 extern "C" void f_001116E0(void) {

@@ -62,6 +62,11 @@ typedef struct VUState VUState;
 extern VUState g_vu0;
 extern VUState g_vu1;
 
+/* EE producer 0x2EF6E0, whose VIF0 chain uploads the ribbon program. */
+int eod_ribbon_strip_build(void);
+void eod_ribbon_next_vertex(void);
+void eod_vu0_interlock(void);
+
 /* Run a single macro-mode (COP2) instruction on VU0. */
 #ifdef EOD_R7_RELEASE
 void eod_unretired_vu0_macro(uint32_t instr);

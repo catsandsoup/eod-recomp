@@ -229,6 +229,29 @@ void careerAddsOneScaledBattle() {
     require(ee_r32(0x3C4CF8) == 4, "a repeated callback does not add a second Battle");
 }
 
+void blankCreatorSession() {
+    reset();
+    section(welch_eve, welch_root, "eve", {{"track", "EmptyTrack"}, {"hidden", "yes"}});
+    eve(1, "EmptyTrack", welch_eve, 1);
+    const uint32_t old_count = ee_r32(0x3C4CF8);
+    require(battle_events_begin_blank_map(0) == -1, "ordinary Eve does not receive a creator row");
+    const int id = battle_events_begin_blank_map(1);
+    require(id == static_cast<int>(old_count) && battle_events_begin_blank_map(1) == id,
+            "the hidden blank arena gets one temporary Battle");
+    const uint32_t c = contests + old_count * 0x28;
+    require(ee_r32(c + 4) == 1 && ee_r32(c + 8) == battle && ee_r32(c + 36) == 1 &&
+            ee_r32(eves + 0x84 + 0x70) == 2, "tracker can select the new enabled event");
+    g_ee.r[4].ud[0] = c;
+    f_001515B8();
+    const uint32_t root = ee_r32(0x3CD5C8);
+    require(external_calls == 0 && ee_r32(root) == 0x3F2190 && ee_r32(root + 4) == 0 &&
+            read(0x3CD5D0) == "*EmptyTrack.trk/c_battle.va0", "blank creator layout needs no disc member");
+    battle_events_end_blank_map();
+    battle_events_end_blank_map();
+    require(ee_r32(0x3C4CF8) == old_count && ee_r32(eves + 0x84 + 0x70) == 1 && !ee_r32(c + 8),
+            "return to menu restores the stock test Eve and contest count");
+}
+
 void welchExternalTable() {
     reset(); f_001244A8();
     const uint32_t c = contests + 5 * 0x28;
@@ -294,6 +317,6 @@ extern "C" void f_00135BB0() {
 
 int main() {
     writeAlternate();
-    actionAppendsBothVariantsEverywhere(); multiplayerAddsWelch(); gates(); careerAddsOneScaledBattle(); welchExternalTable();
+    actionAppendsBothVariantsEverywhere(); multiplayerAddsWelch(); gates(); careerAddsOneScaledBattle(); welchExternalTable(); blankCreatorSession();
     std::puts("Battle event exposure checks passed");
 }

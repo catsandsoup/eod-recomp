@@ -13,7 +13,7 @@ struct ImFont;
 
 namespace frontend_draw {
 
-enum HitKind { HitRow, HitTab, HitLeft, HitRight, HitSlider };
+enum HitKind { HitRow, HitTab, HitLeft, HitRight, HitSlider, HitBrowserTile, HitBrowserCat, HitSubTab };
 struct Hit {
     float x0, y0, x1, y1;
     HitKind kind;

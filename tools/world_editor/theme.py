@@ -361,6 +361,12 @@ QToolButton {{
     padding: 4px 8px;
     font-weight: 500;
 }}
+QToolBar#CreatorActions, QToolBar#CreatorPalette {{
+    padding: 0px 5px;
+}}
+QToolBar#CreatorActions QToolButton, QToolBar#CreatorPalette QToolButton {{
+    padding: 0px 7px;
+}}
 QToolButton:hover {{
     background-color: {BG_HOVER};
     border-color: {BORDER};

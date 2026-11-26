@@ -2,9 +2,9 @@
 
 **A native x64/ARM64 static recompilation and modern remaster of the 2004 demolition derby classic (*SLUS_209.10*) — now featuring a hardware-accelerated 3D World Editor with Unreal-style Play-In-Editor (PIE), full track & collision sculpting, AI pathfinding tools, live 4K texture swapping, and online multiplayer.**
 
-[**Download Remaster 1.0 (Windows x64 & macOS)**](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0) · [**Step-by-Step Modding Tutorials**](docs/TUTORIALS.md) · [**World Editor Guide**](docs/WORLD_EDITOR.md) · [**Technical Wiki**](docs/wiki/Home.md) · [**Engine Documentation Index**](docs/INDEX.md)
+[**Download the remaster (Windows x64 & macOS)**](https://github.com/catsandsoup/eod-recomp/releases) · [**Step-by-Step Modding Tutorials**](docs/TUTORIALS.md) · [**World Editor Guide**](docs/WORLD_EDITOR.md) · [**Technical Wiki**](docs/wiki/Home.md) · [**Engine Documentation Index**](docs/INDEX.md)
 
-> **Active development continues.** Remaster 1.0 is the stable download. Expect further improvements to rendering, split-screen draw distance, and mod tools in future releases. [Renderer development status](docs/NATIVE_RENDERER_SUCCESS.md)
+> For a test build, select the entry marked **Pre-release** on the Releases page and download its player archive under **Assets**. [Renderer development status](docs/NATIVE_RENDERER_SUCCESS.md)
 
 ![A yellow school bus leans into Mankato’s banked turn alongside the field](docs/img/gallery/eod-mankato-bus.jpg)
 
@@ -174,10 +174,12 @@ Drop your own **MP3, AAC, FLAC, or WAV** files into your custom music folder and
 
 ### Playing the Game
 
-1. **Download the release.** Unzip the [Windows x64 or macOS release archive](https://github.com/catsandsoup/eod-recomp/releases/tag/v1.0).
+1. **Download the release.** Choose the version you want and unzip its [Windows x64 or macOS player archive](https://github.com/catsandsoup/eod-recomp/releases).
 2. **Launch the game.** Run **`eod.exe`** on Windows or **`Eve of Destruction.app`** on macOS.
 3. **Select your retail PS2 `.ISO`.** Point the first-launch prompt at your North American *Test Drive: Eve of Destruction* (`SLUS_209.10`) `.ISO`. The game extracts and verifies `DATA/` automatically and remembers your installation.
 4. **Drive!** Press **`F1`** (or **Start + Select**) for the in-game remaster menu, and **`F9`** to toggle between Classic PS2 and Modern high-resolution rendering.
+
+**Updating an existing installation.** Close the game and unzip the new release into a fresh folder. Start that folder’s `eod.exe` (Windows) or `Eve of Destruction.app` (Mac). `eodsetup.exe` opens Windows settings. Press **F1** in the running game to check the version in the remaster menu header. If a shortcut still opens the older build, point it at the newly extracted game.
 
 ### Launching the 3D World Editor (Windows 11)
 

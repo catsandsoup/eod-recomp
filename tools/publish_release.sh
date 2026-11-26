@@ -48,6 +48,11 @@ case "$tag" in
     notes="$root/dist/prerelease-1.1.1.md"
     release_flags=(--prerelease --latest=false)
     ;;
+  v1.1.2|v1.1.2-*)
+    title="Eve of Destruction Remaster 1.1.2 prerelease"
+    notes="$root/dist/prerelease-1.1.2.md"
+    release_flags=(--prerelease --latest=false)
+    ;;
 esac
 gh release create "$tag" "${assets[@]}" --repo "$repo" --target "$revision" --draft --title "$title" --notes-file "$notes" "${release_flags[0]}"
 gh release edit "$tag" --repo "$repo" --draft=false "${release_flags[@]}"

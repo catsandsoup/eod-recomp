@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         or bool(prefs.get("skip_home_hub", False))
         or os.environ.get("EOD_SKIP_HOME_HUB") == "1"
     )
-    initial_track = args.track or str(prefs.get("last_track", "AFTON"))
+    initial_track = args.track or str(prefs.get("last_track", "EMPTYT_1"))
 
     window = EodWorldEditorWindow(
         game_dir=args.game_dir,

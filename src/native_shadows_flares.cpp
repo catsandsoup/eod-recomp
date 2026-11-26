@@ -462,7 +462,20 @@ void flare_render() {
         call(f_00304970, 0x304E10);
     }
 
-    for (int32_t i = 0; i < lw(kPointLightCount); i++) {
+    const int32_t pl_count = lw(kPointLightCount);
+    if (!diff_in_original_side() && pl_count > 0) {
+        float pl_xyz[32][3];
+        const uint32_t n = (uint32_t)(pl_count > 32 ? 32 : pl_count);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t light = kPointLightBase + i * 0x2Cu;
+            const uint32_t bx = lwu(light + 0x04), by = lwu(light + 0x08), bz = lwu(light + 0x0C);
+            std::memcpy(&pl_xyz[i][0], &bx, 4);
+            std::memcpy(&pl_xyz[i][1], &by, 4);
+            std::memcpy(&pl_xyz[i][2], &bz, 4);
+        }
+        native::ee_point_lights(pl_xyz, n);
+    }
+    for (int32_t i = 0; i < pl_count; i++) {
         const uint32_t light = kPointLightBase + (uint32_t)i * 0x2Cu;
         set(4, (int32_t)light);
         set_f(12, fu(dt));

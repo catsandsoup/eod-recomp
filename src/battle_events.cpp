@@ -59,6 +59,8 @@ unsigned load_depth = 0;
 std::array<uint8_t, kContestCapacity> variant_ai{};     // 0: native contest
 std::array<uint32_t, kContestCapacity> variant_section{};
 std::string alternate_root_override;
+constexpr uint32_t kBlankSection = kSections + 0x100, kBlankLayout = kSections + 0x180;
+uint32_t blank_contest = UINT32_MAX;
 uint32_t produced_mode = 0, produced_total = 0; // last table this module completed
 
 bool object(uint32_t address, uint32_t size) {
@@ -261,8 +263,8 @@ GuestText write_texts() {
 // A generic native-shaped Battle descriptor (retail ones are exactly
 // event_type=battle, max_cars=2) owned by the runtime, for a track whose
 // catalog has none. Its root is the Eve's own VAL root.
-uint32_t synthesized_battle_section(const GuestText &t, uint32_t root) {
-    const uint32_t section = kSections, pairs = kSections + 0x20;
+uint32_t synthesized_battle_section(const GuestText &t, uint32_t root, uint32_t section = kSections) {
+    const uint32_t pairs = section + 0x20;
     ee_w32(section, kSectionVtable);
     ee_w32(section + 4, t.battle);
     ee_w32(section + 8, 0);
@@ -469,6 +471,48 @@ uint32_t battle_events_ai_for_contest(uint32_t contest) {
     return variant_ai[index];
 }
 
+int battle_events_begin_blank_map(uint32_t eve_index) {
+    if (ee_r32(kMode) != kArcade || eve_index >= ee_r32(kEveCount) || eve_index >= kEveCapacity) return -1;
+    const uint32_t eve = kEves + eve_index * kEveStride;
+    if (!string_equals(eve + 8, "EmptyTrack", true)) return -1;
+    const uint32_t count = ee_r32(kContestCount);
+    if (count > kContestCapacity) return -1;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t cp = kContestTable + i * kContestStride;
+        if (ee_r32(cp + 4) == eve_index && ee_r32(cp + 8) == kBattle) return static_cast<int>(i);
+    }
+    const uint32_t original = ee_r32(eve + 0x80), current = ee_r32(eve + 0x70);
+    if (!object(original, 0x1C) || !valid_section_chain(original) || count == kContestCapacity ||
+        current >= kPerEve) return -1;
+    const uint32_t section = synthesized_battle_section(write_texts(), ee_r32(original + 0x18), kBlankSection);
+    // No c_battle.va0 is shipped on EMPTYT_1.TRK. The creator supplies spawn
+    // transforms, and the native optional scenery lookups accept an empty VAL.
+    ee_w32(kBlankLayout, kRootVtable);
+    ee_w32(kBlankLayout + 4, 0);
+    ee_w32(kBlankLayout + 8, 0);
+    ee_w32(kBlankLayout + 12, kBlankLayout + 16);
+    const std::array<uint32_t, 10> record = {count, eve_index, kBattle, 0, 2, 0, 1, 0, section, 1};
+    const uint32_t cp = kContestTable + count * kContestStride;
+    for (uint32_t i = 0; i < record.size(); ++i) ee_w32(cp + 4 * i, record[i]);
+    ee_w32(kContestCount, count + 1);
+    ee_w32(eve + 0x70, current + 1);
+    blank_contest = count;
+    return static_cast<int>(count);
+}
+
+void battle_events_end_blank_map() {
+    if (blank_contest == UINT32_MAX) return;
+    const uint32_t index = blank_contest;
+    blank_contest = UINT32_MAX;
+    const uint32_t cp = kContestTable + index * kContestStride, eve = ee_r32(cp + 4);
+    if (ee_r32(kContestCount) != index + 1 || ee_r32(cp + 0x20) != kBlankSection ||
+        eve >= ee_r32(kEveCount) || eve >= kEveCapacity) return;
+    const uint32_t count_addr = kEves + eve*kEveStride + 0x70;
+    ee_w32(count_addr, ee_r32(count_addr)-1);
+    ee_w32(kContestCount, index);
+    for (uint32_t i = 0; i < kContestStride; i += 4) ee_w32(cp + i, 0);
+}
+
 void battle_events_set_alternate_root(const char *path) { alternate_root_override = path ? path : ""; }
 
 extern "C" void f_001244A8(void) {
@@ -527,8 +571,8 @@ extern "C" void f_001515B8(void) {
         const uint32_t eve_index = ee_r32(contest + 4);
         const uint32_t eve = eve_index < ee_r32(kEveCount) ? kEves + eve_index * kEveStride : 0;
         const std::string track = eve ? text(eve + 8) : std::string();
-        uint32_t layout = 0;
-        if (eve && !native_battle_section(ee_r32(eve + 0x80))) {
+        uint32_t layout = ee_r32(contest + 0x20) == kBlankSection ? kBlankLayout : 0;
+        if (!layout && eve && !native_battle_section(ee_r32(eve + 0x80))) {
             const std::vector<uint8_t> image = read_alternate(track);
             if (!image.empty()) {
                 for (size_t i = 0; i < image.size(); ++i) ee_w8(kExternalTable + static_cast<uint32_t>(i), image[i]);

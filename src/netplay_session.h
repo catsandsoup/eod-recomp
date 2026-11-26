@@ -49,6 +49,7 @@ public:
     bool active() const;                          // true whenever hosting, connecting, in lobby, or racing
     bool is_host() const;
     uint32_t remote_humans() const;               // extra cars the roster needs (Battle size)
+    int online_ai_override() const;               // host AI bot count override (-1 = event default, 0..15)
     void roster_pre(uint32_t description);        // before 0x1116E0 resolves names
     void roster_post(uint32_t description);
     void step_begin();                            // world-step hooks

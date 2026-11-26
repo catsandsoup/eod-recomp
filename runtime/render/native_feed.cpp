@@ -2,6 +2,7 @@
 #include "core/trace.h"
 #include "native_renderer.h"
 #include "editor_environment.h"
+#include "vfs/custom_map.h"
 
 #include <algorithm>
 #include <cmath>
@@ -352,6 +353,11 @@ std::vector<uint8_t> g_bytes;
 
 // ---- shared EE <-> VIF1 (g_mutex) ----
 std::mutex g_mutex;
+struct CustomWorldDraw {
+    Packet packet;
+    std::shared_ptr<const eod::vfs::CustomMap> map;
+};
+std::map<uint32_t, CustomWorldDraw> g_custom_world_packets;
 std::map<uint32_t, SceneClear> g_scene_clear_packets;
 std::map<uint32_t, DisplayCopy> g_display_copy_packets;
 std::map<uint32_t, ShadowPass> g_shadow_pass_packets;
@@ -467,6 +473,7 @@ struct Upload {
 std::unordered_map<uint32_t, Upload> g_uploads;  // packet -> upload (the latest build of that packet)
 uint32_t g_vu[kVuQwords][4];                     // the bone qwords as the uploads in effect left them
 uint32_t g_vu_from[kVuQwords];                   // packet that wrote each qword (0 = none yet)
+uint8_t  g_vu_comps[kVuQwords];                  // component count (3=dent/quad, 4=bone matrix) of last write
 uint32_t g_applied = 0;                          // material packet last applied
 uint64_t g_applied_frame = ~0ull;
 struct SkinCounts {
@@ -610,6 +617,69 @@ uint32_t mesh_for(uint32_t batch, uint64_t vb, bool world = false, CacheEntry **
     for (const vifmesh::Part &p : g_scratch.parts)
         for (uint32_t i = 0; i < p.index_count; i++)
             m->indices.push_back(p.first_vertex + g_scratch.indices[p.first_index + i]);
+    // 2026 Remaster: compute smooth area-weighted vertex normals (with 45-deg crease split) for
+    // prelit world geometry (n[3] == 0). Classic ignores n[0..2] when n[3] == 0; Modern uses them
+    // to eliminate flat-shaded facets on hills, banked turns and curved walls.
+    if (world && m->indices.size() >= 3 && !m->vertices.empty()) {
+        const size_t nv = m->vertices.size();
+        const size_t nt = m->indices.size() / 3;
+        struct FaceN { float x, y, z; };
+        std::vector<FaceN> fn(nt);
+        std::vector<float> vnx(nv, 0.0f), vny(nv, 0.0f), vnz(nv, 0.0f);
+        // Hash coincident positions (quantized to 1 cm) so adjacent strips weld smoothly
+        auto pos_key = [](const float p[3]) -> uint64_t {
+            const int64_t ix = (int64_t)std::llround(p[0] * 100.0f);
+            const int64_t iy = (int64_t)std::llround(p[1] * 100.0f);
+            const int64_t iz = (int64_t)std::llround(p[2] * 100.0f);
+            return ((uint64_t)(ix & 0x1FFFFF) << 42) | ((uint64_t)(iy & 0x1FFFFF) << 21) | (uint64_t)(iz & 0x1FFFFF);
+        };
+        std::unordered_map<uint64_t, FaceN> weld;
+        weld.reserve(nv);
+        for (size_t t = 0; t < nt; ++t) {
+            const uint32_t i0 = m->indices[t * 3], i1 = m->indices[t * 3 + 1], i2 = m->indices[t * 3 + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+            const auto &v0 = m->vertices[i0], &v1 = m->vertices[i1], &v2 = m->vertices[i2];
+            const float e1x = v1.p[0] - v0.p[0], e1y = v1.p[1] - v0.p[1], e1z = v1.p[2] - v0.p[2];
+            const float e2x = v2.p[0] - v0.p[0], e2y = v2.p[1] - v0.p[1], e2z = v2.p[2] - v0.p[2];
+            const float nx = e1y * e2z - e1z * e2y;
+            const float ny = e1z * e2x - e1x * e2z;
+            const float nz = e1x * e2y - e1y * e2x;
+            fn[t] = {nx, ny, nz};
+            const uint32_t idx[3] = {i0, i1, i2};
+            for (uint32_t vi : idx) {
+                vnx[vi] += nx; vny[vi] += ny; vnz[vi] += nz;
+                auto &w = weld[pos_key(m->vertices[vi].p)];
+                // Flip-consistent accumulation if strip winding alternates
+                const float d = w.x * nx + w.y * ny + w.z * nz;
+                const float s = (d < 0.0f) ? -1.0f : 1.0f;
+                w.x += nx * s; w.y += ny * s; w.z += nz * s;
+            }
+        }
+        for (size_t vi = 0; vi < nv; ++vi) {
+            Vertex &v = m->vertices[vi];
+            if (v.n[3] != 0) continue;
+            const float l_loc = std::sqrt(vnx[vi] * vnx[vi] + vny[vi] * vny[vi] + vnz[vi] * vnz[vi]);
+            if (l_loc < 1e-6f) continue;
+            const float lx = vnx[vi] / l_loc, ly = vny[vi] / l_loc, lz = vnz[vi] / l_loc;
+            const auto it = weld.find(pos_key(v.p));
+            float rx = lx, ry = ly, rz = lz;
+            if (it != weld.end()) {
+                const float lw = std::sqrt(it->second.x * it->second.x + it->second.y * it->second.y + it->second.z * it->second.z);
+                if (lw > 1e-6f) {
+                    const float wx = it->second.x / lw, wy = it->second.y / lw, wz = it->second.z / lw;
+                    const float cos_a = std::fabs(lx * wx + ly * wy + lz * wz);
+                    // Only smooth across angles < 45 deg (preserve sharp 90-deg curbs, hay bales, walls!)
+                    if (cos_a > 0.707f) {
+                        const float s = (lx * wx + ly * wy + lz * wz) < 0.0f ? -1.0f : 1.0f;
+                        rx = wx * s; ry = wy * s; rz = wz * s;
+                    }
+                }
+            }
+            v.n[0] = (int8_t)std::lround(std::fmax(-127.0f, std::fmin(127.0f, rx * 127.0f)));
+            v.n[1] = (int8_t)std::lround(std::fmax(-127.0f, std::fmin(127.0f, ry * 127.0f)));
+            v.n[2] = (int8_t)std::lround(std::fmax(-127.0f, std::fmin(127.0f, rz * 127.0f)));
+        }
+    }
     c.hash = h;
     c.id = m->id;
     c.k_delta = m->k_delta;
@@ -951,6 +1021,8 @@ void ee_packet_reserved(uint32_t addr, uint32_t qwc, uint32_t ra, const SceneCle
     const bool spr = g_in_sprite && (ra == kSpriteReserveRa || ra == kAtlasReserveRa);
     const uint32_t end = addr + (qwc ? qwc : 1) * 16;
     std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_custom_world_packets.empty())
+        g_custom_world_packets.erase(g_custom_world_packets.lower_bound(addr), g_custom_world_packets.lower_bound(end));
     auto clear_it = g_scene_clear_packets.lower_bound(addr);
     if (clear_it != g_scene_clear_packets.begin()) {
         auto prev = std::prev(clear_it);
@@ -1099,6 +1171,63 @@ void ee_world_pass(int32_t pass, uint32_t) {
     if (describe && MEM_LW(kMlist)) describe_mlist(MEM_LW(kMlist));
 }
 
+void ee_custom_world(uint32_t tag, std::shared_ptr<const eod::vfs::CustomMap> map) {
+    static std::weak_ptr<const eod::vfs::CustomMap> last_map;
+    static uint32_t mesh_id;
+    if (last_map.lock() != map) {
+        last_map = map;
+        mesh_id = g_next_mesh++;
+    }
+    if (enabled()) roll(kernel_vblank_count());
+    Packet p{};
+    p.kind = KIND_WORLD;
+    p.mesh = mesh_id;
+    p.frame = g_frame_vb;
+    p.serial = g_serial++;
+    p.itop = 0x80;
+    p.texture_key = p.layer = -1;
+    p.model[0] = p.model[5] = p.model[10] = 1.0f;
+    fill_camera(p);
+    p.flags = 0x2C0; // opaque colour, depth test and depth write
+    p.fge = 0;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_custom_world_packets[tag] = {p, std::move(map)};
+    if (enabled()) ++g_wc.leaves;
+}
+
+void vif_custom_world(uint32_t tag) {
+    CustomWorldDraw draw;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto found = g_custom_world_packets.find(tag);
+        if (found == g_custom_world_packets.end()) return;
+        draw = std::move(found->second);
+        g_custom_world_packets.erase(found);
+    }
+    // Upload once per selected map, even if several split-screen cameras draw it.
+    static uint32_t last_mesh;
+    if (last_mesh != draw.packet.mesh) {
+        auto mesh = std::make_unique<Mesh>();
+        mesh->id = draw.packet.mesh;
+        mesh->replaces = last_mesh;
+        mesh->vertices.resize(draw.map->vertices.size());
+        for (size_t i = 0; i < mesh->vertices.size(); ++i) {
+            Vertex &v = mesh->vertices[i];
+            std::copy_n(draw.map->vertices[i].data(), 3, v.p);
+            for (int c = 0; c < 3; ++c) {
+                const float color = i < draw.map->colors.size() ? draw.map->colors[i][c] : 1.f;
+                v.c[c] = uint8_t(std::lround(std::clamp(color, 0.f, 1.f) * 255.f));
+            }
+            v.c[3] = 0x80;
+        }
+        mesh->indices = draw.map->indices;
+        last_mesh = mesh->id;
+        Mesh *owned = mesh.release();
+        post(CMD_CUSTOM_WORLD_MESH, &owned, sizeof owned);
+    }
+    post(CMD_CUSTOM_WORLD, &draw.packet, sizeof draw.packet);
+}
+
 void ee_world_pass_end() {
     g_leaves.clear();
     if (g_leaves.capacity() > 4096) g_leaves.shrink_to_fit();  // released when unused
@@ -1160,6 +1289,7 @@ void apply_material() {
         const uint32_t q = (u.qword + i) % kVuQwords;
         for (uint32_t c = 0; c < 4; c++) g_vu[q][c] = c < u.comps ? u.data[i * u.comps + c] : 0;
         g_vu_from[q] = m;
+        g_vu_comps[q] = (uint8_t)u.comps;
     }
 }
 
@@ -1252,15 +1382,72 @@ std::shared_ptr<Mesh> posed_mesh(const CacheEntry &c, const Packet &p) {
                     v.n[i] = (int8_t)std::lround(std::fmax(-128.0f, std::fmin(127.0f, n)));
                 }
         } else {
-            const uint32_t a = k.bone[0] + 143u, b = k.bone[1] + 143u;
+            const uint32_t a = (k.bone[0] + 143u) % kVuQwords, b = (k.bone[1] + 143u) % kVuQwords;
             note(a);
             note(b);
             // mulaz / maddaw / maddw: wa D[a] + wb D[b] + p * 1
-            for (int i = 0; i < 3; i++) out[i] = vf(a, i) * k.weight[0] + vf(b, i) * k.weight[1] + v.p[i];
+            // Guard against stale 4x4 bone-palette floats left in qwords 0x90.. when a detached
+            // panel or non-dented sub-mesh draws without a fresh V3-32 dent upload.
+            const bool va_ok = (g_vu_comps[a] == 3);
+            const bool vb_ok = (g_vu_comps[b] == 3);
+            for (int i = 0; i < 3; i++) {
+                float da = va_ok ? vf(a, i) : 0.0f;
+                float db = vb_ok ? vf(b, i) : 0.0f;
+                if (!std::isfinite(da) || std::fabs(da) > 2.5f) da = 0.0f;
+                if (!std::isfinite(db) || std::fabs(db) > 2.5f) db = 0.0f;
+                out[i] = da * k.weight[0] + db * k.weight[1] + v.p[i];
+            }
         }
         // the program projects (x, y, z, w) with the raw w lane: the same point is (x, y, z) / w
         const float iw = (w != 0.0f && w != 1.0f) ? 1.0f / w : 1.0f;
         for (int i = 0; i < 3; i++) v.p[i] = out[i] * iw;
+    }
+    // 2026 Remaster: recompute surface normals on dented car panels directly from the deformed
+    // triangle geometry so crumpled hoods, doors and fenders catch crisp specular creases and reflections.
+    if (!matrix && look_modern() && m->indices.size() >= 3) {
+        const size_t nv = m->vertices.size();
+        std::vector<float> nx(nv, 0.0f), ny(nv, 0.0f), nz(nv, 0.0f);
+        for (size_t t = 0; t + 2 < m->indices.size(); t += 3) {
+            const uint32_t i0 = m->indices[t], i1 = m->indices[t + 1], i2 = m->indices[t + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+            const auto &v0 = m->vertices[i0], &v1 = m->vertices[i1], &v2 = m->vertices[i2];
+            const float e1x = v1.p[0] - v0.p[0], e1y = v1.p[1] - v0.p[1], e1z = v1.p[2] - v0.p[2];
+            const float e2x = v2.p[0] - v0.p[0], e2y = v2.p[1] - v0.p[1], e2z = v2.p[2] - v0.p[2];
+            const float fnx = e1y * e2z - e1z * e2y;
+            const float fny = e1z * e2x - e1x * e2z;
+            const float fnz = e1x * e2y - e1y * e2x;
+            const uint32_t idx[3] = {i0, i1, i2};
+            for (uint32_t vi : idx) {
+                const auto &orig = c.base[vi];
+                if (orig.n[3] == 0) continue;
+                const float d = fnx * orig.n[0] + fny * orig.n[1] + fnz * orig.n[2];
+                const float s = d < 0.0f ? -1.0f : 1.0f;
+                nx[vi] += fnx * s;
+                ny[vi] += fny * s;
+                nz[vi] += fnz * s;
+            }
+        }
+        for (size_t vi = 0; vi < nv; ++vi) {
+            Vertex &v = m->vertices[vi];
+            if (v.n[3] == 0) continue;
+            const auto &orig = c.base[vi];
+            const float dx = v.p[0] - orig.p[0], dy = v.p[1] - orig.p[1], dz = v.p[2] - orig.p[2];
+            const float disp2 = dx * dx + dy * dy + dz * dz;
+            if (disp2 < 1e-5f) continue;
+            const float len = std::sqrt(nx[vi] * nx[vi] + ny[vi] * ny[vi] + nz[vi] * nz[vi]);
+            if (len < 1e-6f) continue;
+            const float blend = std::fmin(1.0f, std::sqrt(disp2) * 12.0f);
+            const float ox = orig.n[0] / 127.0f, oy = orig.n[1] / 127.0f, oz = orig.n[2] / 127.0f;
+            float rx = ox * (1.0f - blend) + (nx[vi] / len) * blend;
+            float ry = oy * (1.0f - blend) + (ny[vi] / len) * blend;
+            float rz = oz * (1.0f - blend) + (nz[vi] / len) * blend;
+            const float rlen = std::sqrt(rx * rx + ry * ry + rz * rz);
+            if (rlen > 1e-6f) {
+                v.n[0] = (int8_t)std::lround(std::fmax(-127.0f, std::fmin(127.0f, (rx / rlen) * 127.0f)));
+                v.n[1] = (int8_t)std::lround(std::fmax(-127.0f, std::fmin(127.0f, (ry / rlen) * 127.0f)));
+                v.n[2] = (int8_t)std::lround(std::fmax(-127.0f, std::fmin(127.0f, (rz / rlen) * 127.0f)));
+            }
+        }
     }
     if (matrix) g_sc.matrix++;
     else g_sc.offset++;
@@ -1313,7 +1500,7 @@ void ee_vu1_upload(uint32_t packet, uint32_t qword, uint32_t comps, uint32_t cou
 }
 
 void ee_pose_check(uint32_t packet, uint32_t bones, uint32_t count) {
-    if (!enabled()) return;
+    if (!skin_check() || !enabled()) return;
     auto it = g_uploads.find(packet);
     if (it == g_uploads.end()) return;
     const Upload &u = it->second;
@@ -1839,8 +2026,7 @@ void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y,
     g_retail_split_y = retail_split_y;
     g_retail_quad_view = retail_quad_view;
     g_hybrid_shadow_cascades = sun_cascades_enabled() && look_modern() && retail_single_view &&
-                              !g_shadow_cam.editor_environment && !g_shadow_cam.fge &&
-                              sun_cascades::daylight(g_shadow_cam.fogcol);
+                              !g_shadow_cam.editor_environment;
     // 0x363480: intensity = (alpha >> 1) + (alpha >> 7) in GS 0..128 alpha units
     const int32_t half = (alpha - (alpha >> 31)) >> 1;
     const int32_t adj = (alpha < 0 ? alpha + 0x7F : alpha) >> 7;

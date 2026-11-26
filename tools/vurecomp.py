@@ -735,10 +735,12 @@ class Prog:
             out[ld] = pcs
         return out
 
-    def emit(self, name):
-        out = ["void %s(VUState *vu, uint32_t entry) {" % name,
-               "    Ctx c;",
-               "    c.vu = vu;",
+    def emit(self, name, fixed_entry=False):
+        params = "VUState *vu" if fixed_entry else "VUState *vu, uint32_t entry"
+        out = ["void %s(%s) {" % (name, params)]
+        if not fixed_entry:
+            out += ["    Ctx c;", "    c.vu = vu;"]
+        out += [
                "    Scoreboard &sb = g_score[vu->index];",
                "    bool take = false;",
                "    uint32_t jr = 0;",
@@ -747,13 +749,16 @@ class Prog:
                "    (void)jr;",
                "    (void)sb;",
                "    vu->running = 1;",
-               "    vu->flag_pipe = 1;",
-               "    switch (entry) {"]
+               "    vu->flag_pipe = 1;"]
         bl = self.blocks()
-        for e in self.entries:
-            out.append("    case 0x%04X: goto L_%04X;" % (e, e))
-        out.append("    default: vu_interp(vu, entry); return;")
-        out.append("    }")
+        if fixed_entry:
+            assert len(self.entries) == 1
+            out.append("    goto L_%04X;" % self.entries[0])
+        else:
+            out.append("    switch (entry) {")
+            for e in self.entries:
+                out.append("    case 0x%04X: goto L_%04X;" % (e, e))
+            out += ["    default: vu_interp(vu, entry); return;", "    }"]
         for ld, pcs in sorted(bl.items()):
             n = len(pcs)
             regs = [self.pair_regs(p) for p in pcs]
@@ -765,7 +770,7 @@ class Prog:
                 src.append(s_)
                 needt.update(s_)
             out.append("L_%04X: {" % ld)
-            if os.environ.get("VUREC_COUNT"):  # profiling: block execution counts (see vu_blk_hit)
+            if not fixed_entry and os.environ.get("VUREC_COUNT"):  # profiling: block execution counts (see vu_blk_hit)
                 out.append('    vu_blk_hit("%s", 0x%04X, %d);' % (name, ld, n))
             out.append("    cyc = vu->cycle;")
             if needt:

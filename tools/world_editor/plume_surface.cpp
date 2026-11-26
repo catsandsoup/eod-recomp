@@ -301,6 +301,17 @@ struct Surface {
         return true;
     }
 
+    bool replace_vertices(uint32_t first, const Vertex *vertices, uint32_t count) {
+        const uint32_t capacity = vertex_bytes / sizeof(Vertex);
+        if (!mesh || !vertices || first > capacity || count > capacity - first) return false;
+        finish_frame();
+        auto *dst = static_cast<Vertex *>(mesh->map());
+        if (!dst) return false;
+        std::memcpy(dst + first, vertices, size_t(count) * sizeof(Vertex));
+        mesh->unmap();
+        return true;
+    }
+
     bool replace_overlay(const float *top_verts, uint32_t top_count, const float *depth_verts, uint32_t depth_count) {
         EOD_ZONE_SCOPED_N("plume.overlay");
         finish_frame();
@@ -491,6 +502,15 @@ EOD_VIEWPORT_API bool eod_plume_view_texture(Surface *surface, uint32_t slot, ui
 
 EOD_VIEWPORT_API void eod_plume_view_clear_textures(Surface *surface) {
     if (surface) surface->clear_textures();
+}
+
+EOD_VIEWPORT_API bool eod_plume_view_vertices(Surface *surface, uint32_t first, const native::scene::Vertex *vertices,
+                                             uint32_t count) {
+    try {
+        return surface && surface->replace_vertices(first, vertices, count);
+    } catch (...) {
+        return false;
+    }
 }
 
 EOD_VIEWPORT_API bool eod_plume_view_overlay(Surface *surface, const float *top_verts, uint32_t top_vert_count,

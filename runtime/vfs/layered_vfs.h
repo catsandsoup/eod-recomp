@@ -2,11 +2,14 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <cstdint>
 #include <shared_mutex>
 #include <string>
 
 namespace eod::vfs {
+
+struct CustomMap;
 
 enum class Layer : uint8_t {
     RetailBase = 0,
@@ -27,7 +30,9 @@ class LayeredVfs {
 
     // Live hot-mount (or atomically replace) a host directory at the specified layer.
     // Returns false if root_dir is empty or does not refer to an existing directory.
-    bool mount(Layer layer, const std::string &root_dir, const std::string &tag = "");
+    bool mount(Layer layer, const std::string &root_dir, const std::string &tag = "",
+               std::shared_ptr<const CustomMap> map = {});
+    std::shared_ptr<const CustomMap> current_map() const;
 
     // Cleanly unmount a layer (e.g. ServerSession on disconnect, EphemeralPie on PIE stop).
     void unmount(Layer layer);
@@ -52,6 +57,7 @@ class LayeredVfs {
         std::string root;
         std::string canonical_root;
         std::string tag;
+        std::shared_ptr<const CustomMap> map;
     };
 
     bool resolve_range(const std::string &rel_path, int top_layer, int bottom_layer,

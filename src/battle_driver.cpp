@@ -1,4 +1,5 @@
 #include "netplay_hooks.h"
+#include "mutator_hooks.h"
 // Battle has no native AI controller: arena factory 0x138288 chooses NullDriver.
 // Supply its missing input policy after the native AICar update, not
 // at vblank. NullDriver does not join the native driver update list. Native cars retain physics, damage, recovery and weapon ownership.
@@ -76,31 +77,81 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
         }
         return;
     }
+    const bool tips_mode = mutator_hooks::is_tips_active();
+    const uint8_t tips_in = mutator_hooks::tips_tagger_slot();
     auto opponent=[&](uint32_t index)->uint32_t {
         if(index>=count || index==slot || ee_r32(master+0x458+index*0x50)) return 0;
+        if(tips_mode && (mutator_hooks::hud.eliminated_mask & (1u << index))) return 0;
         uint32_t c=ee_r32(0x447458+index*4);
-        return valid(c,0x1C34) && std::isfinite(rf(c+0x88)) && std::isfinite(rf(c+0x90))?c:0;
+        if(!valid(c,0x1C34) || !std::isfinite(rf(c+0x88)) || !std::isfinite(rf(c+0x90))) return 0;
+        if(tips_mode && ee_r32(c+0x1BE8)>=10u) return 0;
+        return c;
     };
-    uint32_t target=opponent(s.target);
-    if(!target || now>=s.choose_at) {
-        float best=1e30f;uint32_t chosen=UINT32_MAX;
-        for(uint32_t i=0;i<count;++i) if(uint32_t c=opponent(i)) {
-            float dx=rf(c+0x88)-x,dz=rf(c+0x90)-z;
-            float score=dx*dx+dz*dz;
-            if(i==s.target) score*=.7f; // avoid switching on every near pass
-            if(score<best){best=score;chosen=i;}
+    bool tips_fleeing = false;
+    float flee_dx = 0.0f, flee_dz = 0.0f;
+    uint32_t target = 0;
+    if (tips_mode && tips_in < count && slot != tips_in) {
+        const uint32_t it_car = ee_r32(0x447458 + tips_in * 4);
+        if (valid(it_car, 0x1C34) && std::isfinite(rf(it_car + 0x88)) && std::isfinite(rf(it_car + 0x90))) {
+            tips_fleeing = true;
+            target = it_car;
+            float away_x = x - rf(it_car + 0x88), away_z = z - rf(it_car + 0x90);
+            float away_len = std::hypot(away_x, away_z);
+            if (away_len > 0.01f) { away_x /= away_len; away_z /= away_len; }
+            else { away_x = rf(car + 0x7C); away_z = rf(car + 0x84); }
+            // Blend a gentle pull toward arena center when far out so fleeing bots curve smoothly
+            float cx = 0.0f, cz = 0.0f;
+            const uint32_t rcount = ee_r32(master + battle_layout::kRespawnCount);
+            if (rcount > 0 && rcount <= 16) {
+                double sx = 0.0, sz = 0.0;
+                uint32_t vn = 0;
+                for (uint32_t i = 0; i < rcount; ++i) {
+                    const uint32_t rec = master + 0x10u + i * 0x44u;
+                    const float rxp = rf(rec + 0x24u), rzp = rf(rec + 0x2Cu);
+                    if (std::isfinite(rxp) && std::isfinite(rzp)) { sx += rxp; sz += rzp; ++vn; }
+                }
+                if (vn > 0) { cx = static_cast<float>(sx / vn); cz = static_cast<float>(sz / vn); }
+            }
+            const float to_cx = cx - x, to_cz = cz - z;
+            const float dist_c = std::hypot(to_cx, to_cz);
+            if (dist_c > 35.0f) {
+                const float pull = std::clamp((dist_c - 35.0f) / 60.0f, 0.0f, 0.65f);
+                away_x = away_x * (1.0f - pull) + (to_cx / dist_c) * pull;
+                away_z = away_z * (1.0f - pull) + (to_cz / dist_c) * pull;
+            }
+            flee_dx = away_x * 25.0f;
+            flee_dz = away_z * 25.0f;
         }
-        s.target=chosen;s.choose_at=now+.65f;target=opponent(chosen);
+    }
+    if (!tips_fleeing) {
+        target = opponent(s.target);
+        if (tips_mode && slot == tips_in && s.target < count && mutator_hooks::slot_tips_immune(s.target)) {
+            target = 0;
+        }
+        if (!target || now >= s.choose_at) {
+            float best = 1e30f; uint32_t chosen = UINT32_MAX;
+            for (int pass = 0; pass < (tips_mode && slot == tips_in ? 2 : 1) && chosen == UINT32_MAX; ++pass) {
+                for (uint32_t i = 0; i < count; ++i) if (uint32_t c = opponent(i)) {
+                    if (pass == 0 && tips_mode && slot == tips_in && mutator_hooks::slot_tips_immune(i)) continue;
+                    float dx = rf(c + 0x88) - x, dz = rf(c + 0x90) - z;
+                    float score = dx * dx + dz * dz;
+                    if (i == s.target) score *= .7f; // avoid switching on every near pass
+                    if (score < best) { best = score; chosen = i; }
+                }
+            }
+            s.target = chosen; s.choose_at = now + .65f; target = opponent(chosen);
+        }
     }
     if(!target){controls(car,0,0,1,0,-10);s.blocked=0;return;}
     float vx=rf(car+0x104),vz=rf(car+0x10C),speed=std::hypot(vx,vz);
     float rx=rf(car+0x64),rz=rf(car+0x6C),fx=rf(car+0x7C),fz=rf(car+0x84);
     float tx=rf(target+0x88),tz=rf(target+0x90),tvx=rf(target+0x104),tvz=rf(target+0x10C);
     float range=std::hypot(tx-x,tz-z),lead=std::min(range/(speed+12),1.0f);
-    float dx=tx+tvx*lead-x,dz=tz+tvz*lead-z;
+    float dx = tips_fleeing ? flee_dx : (tx + tvx * lead - x);
+    float dz = tips_fleeing ? flee_dz : (tz + tvz * lead - z);
     battle_navigation::Point waypoint;
-    const bool course_available=navigation.refresh({nullptr,navigation_word});
-    const bool routing=course_available &&
+    const bool course_available = !tips_fleeing && navigation.refresh({nullptr,navigation_word});
+    const bool routing = course_available &&
         navigation.waypoint(slot,s.target,{x,z},{fx,fz},speed,{tx,tz},waypoint);
     if(routing) {dx=waypoint.x-x;dz=waypoint.z-z;}
     static const bool trace=std::getenv("EOD_BATTLE_TRACE")!=nullptr;
@@ -144,6 +195,7 @@ void drive(uint32_t slot,uint32_t car,uint32_t master,uint32_t count) {
         if(front<.1f && speed>9){handbrake=.35f;}
     }
     controls(car,steer,gas,brake,handbrake,reversing?-1:-10);
+    if (mutator_hooks::is_tips_active()) return;
     if((ee_r32(0x3C4190)&9)!=9) return;
     if(uint32_t iface=chicken_weapon::interface_for(slot)) {
         float flight=range/(28+speed);
@@ -179,7 +231,6 @@ struct PieLiveControl {
 };
 PieLiveControl g_pie_ctrl{};
 uint32_t g_pie_poll_counter = 0;
-bool g_spawn_pos_applied = false;
 
 int parse_arcade_mode_value(const char *v) {
     if (!v) return 0;
@@ -227,37 +278,6 @@ void poll_pie_live_control() {
     if (const char *v = parse_kv("grip_boost")) g_pie_ctrl.grip_boost = std::clamp((float)std::atof(v), 0.3f, 3.0f);
     if (const char *v = parse_kv("ride_height_delta")) g_pie_ctrl.ride_height_delta = std::clamp((float)std::atof(v), -1.5f, 2.5f);
     if (const char *v = parse_kv("arcade_mode")) g_pie_ctrl.arcade_mode = parse_arcade_mode_value(v);
-}
-
-void maybe_apply_spawn_pos_override(uint32_t car) {
-    if (g_spawn_pos_applied) return;
-    const char *sp = std::getenv("EOD_SPAWN_POS");
-    if (!sp || !*sp) {
-        g_spawn_pos_applied = true;
-        return;
-    }
-    float sx = 0.0f, sy = 0.0f, sz = 0.0f, heading_deg = 0.0f;
-    const int got = std::sscanf(sp, "%f,%f,%f,%f", &sx, &sy, &sz, &heading_deg);
-    if (got < 3 || !std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(sz)) {
-        g_spawn_pos_applied = true;
-        return;
-    }
-    g_spawn_pos_applied = true;
-    // Car transform matrix (3x3 rows + pos at +0x64..+0x90) and linear velocity (+0x104..+0x10C)
-    wf(car + 0x88, sx);
-    wf(car + 0x8C, sy);
-    wf(car + 0x90, sz);
-    wf(car + 0x104, 0.0f);
-    wf(car + 0x108, 0.0f);
-    wf(car + 0x10C, 0.0f);
-    if (got >= 4 && std::isfinite(heading_deg)) {
-        const float rad = heading_deg * 0.01745329252f;
-        const float c = std::cos(rad), s = std::sin(rad);
-        // Right = (c, 0, -s), Up = (0, 1, 0), Forward = (s, 0, c)
-        wf(car + 0x64, c);  wf(car + 0x68, 0.0f); wf(car + 0x6C, -s);
-        wf(car + 0x70, 0.0f); wf(car + 0x74, 1.0f); wf(car + 0x78, 0.0f);
-        wf(car + 0x7C, s);  wf(car + 0x80, 0.0f); wf(car + 0x84, c);
-    }
 }
 
 void sync_opt_terrain_mask() {
@@ -416,7 +436,6 @@ void apply_live_car_tuner_and_arcade(uint32_t player_car) {
 void battle_driver_reset(){
     states={};
     navigation.reset();
-    g_spawn_pos_applied=false;
     g_pie_ctrl.applied_ride_height=0.0f;
     g_pie_ctrl.ride_height_car=0;
 }
@@ -430,7 +449,6 @@ void pie_update_player(uint32_t car) {
     if (!valid(car, 0x1C34) || netplay_car::is_puppet(car)) return;
     sync_opt_terrain_mask();
     poll_pie_live_control();
-    maybe_apply_spawn_pos_override(car);
     // The HumanDriver writes the pedals and steering even when the pad is idle.
     // Apply ILIN input here after those writes and before the next physics step.
     if (g_pie_ctrl.ai_autodrive && !ee_r32(0x44744C) && !ee_r32(0x447454)) {

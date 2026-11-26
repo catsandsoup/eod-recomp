@@ -112,7 +112,7 @@ def load_editor_prefs(path: Path | None = None) -> dict[str, Any]:
     fp = Path(path) if path is not None else prefs_path()
     defaults: dict[str, Any] = {
         "skip_home_hub": False,
-        "last_track": "AFTON",
+        "last_track": "EMPTYT_1",
     }
     if not fp.is_file():
         return defaults
@@ -564,7 +564,7 @@ class HomeHubDialog(QDialog):
 
     def _populate_tracks(self) -> None:
         self.lst_tracks.clear()
-        want_last = str(self.prefs.get("last_track", "AFTON")).upper()
+        want_last = str(self.prefs.get("last_track", "EMPTYT_1")).upper()
         select_row = 0
         for idx, tp in enumerate(self.tracks):
             disp = wc.track_display_name(tp)

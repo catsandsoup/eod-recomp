@@ -2609,7 +2609,7 @@ bool start(bool with_window) {
         g_dev = g_ctx = new vkgs::Context;
         vkgs::ctx = g_dev;
         if (!g_dev->init(with_window))
-            return false;
+            throw std::runtime_error("Vulkan context setup failed");
         // Auto (RenderScale=0): the scale nearest the display's pixel height
         // (e.g. 1800-pixel Retina 1440x900: 4, 2560x1792), not the next one up,
         // which would render ~1.6x the pixels only to downsample them.
@@ -2627,11 +2627,10 @@ bool start(bool with_window) {
                 std::fprintf(stderr, "[vulkan] RenderScale=%d limited to %dx by max image dimension %u\n",
                              g_config.render_scale, g_scale, properties.limits.maxImageDimension2D);
         }
-        if (!create_shaders() || !create_raw_textures()) {
-            g_dev->stop_specializer();
-            presentation::swapchain_aspect.store(-1, std::memory_order_relaxed);
-            return false;
-        }
+        if (!create_shaders())
+            throw std::runtime_error("could not create the Vulkan shaders");
+        if (!create_raw_textures())
+            throw std::runtime_error("could not allocate the Vulkan textures");
         host_textures_init();
         D3D11_BUFFER_DESC bd = {};
 #ifndef EOD_R7_RELEASE
@@ -2712,7 +2711,25 @@ bool start(bool with_window) {
         }
         presentation::swapchain_aspect.store(-1, std::memory_order_relaxed);
         g_on = false;
+#ifdef EOD_R7_RELEASE
+        std::string adapter;
+        if (g_dev && g_dev->physical) {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(g_dev->physical, &properties);
+            adapter = std::string("\nGPU: ") + properties.deviceName + " (Vulkan " +
+                      std::to_string(VK_API_VERSION_MAJOR(properties.apiVersion)) + "." +
+                      std::to_string(VK_API_VERSION_MINOR(properties.apiVersion)) + ")";
+        }
+#ifdef _WIN32
+        const char *help = "Install the latest graphics driver available for your GPU and retry. "
+                           "If the problem persists, include this message and your GPU model in a bug report.";
+#else
+        const char *help = "Include this message, your OS version and GPU model in a bug report.";
+#endif
+        fatal("The Vulkan renderer could not start.\n%s%s\n\n%s", e.what(), adapter.c_str(), help);
+#else
         return false;
+#endif
     }
 }
 

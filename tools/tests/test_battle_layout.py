@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class BattleLayoutTests(unittest.TestCase):
     def test_header_constants(self):
         b = recomp.BATTLE
-        self.assertEqual((b['kRanking'], b['kSpawnIndex'], b['kCount'], b['kMasterSize']), (0x814, 0x844, 0x848, 0x84C))
+        self.assertEqual((b['kRanking'], b['kSpawnIndex'], b['kCount'], b['kMasterSize']), (0x954, 0x994, 0x998, 0x99C))
         self.assertEqual(b['kContestTable'], 0x90000)
         self.assertEqual(b['kContestCapacity'], 512)
         self.assertLessEqual(b['kContestTable'] + b['kContestCapacity'] * b['kContestStride'], b['kStrings'])

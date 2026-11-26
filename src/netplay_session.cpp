@@ -5,10 +5,15 @@
 #include <ws2tcpip.h>
 #endif
 #include "netplay_session.h"
+#include "netplay_peer_activity.h"
+#include "netplay_lobby_maps.h"
 #include "battle_layout.h"
 #include "netplay_battle.h"
 #include "netplay_chicken.h"
 #include "battle_driver.h"
+#include "mutator_engine.h"
+#include "mutator_hooks.h"
+#include "mutator_presets.h"
 #include "../runtime/core/cpu.h"
 #include <bitset>
 #include "netplay_content.h"
@@ -20,6 +25,7 @@
 #include "netplay_relay.h"
 #include "netplay_online_wire.h"
 #include "netplay_voice.h"
+#include "catalog_cache.h"
 #include "session_start.h"
 #include "../runtime/platform/platform.h"
 #include "../runtime/ui/overlay.h"
@@ -63,7 +69,6 @@ static void set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NON
 namespace netplay {
 namespace {
 constexpr uint16_t kGamePort = 27015, kDiscoveryPort = 27014;
-constexpr uint64_t kPeerTimeoutUs = 5000000;
 constexpr uint64_t kResultsDisplayUs = 7000000;
 constexpr uint64_t kResultsLeadUs = 400000;
 constexpr uint32_t kNativeRaceState = 0x003D1A70;
@@ -335,11 +340,14 @@ struct Peer {
     bool ready = false, at_menu = true, car_done = false, got_track = false, got_roster = false, got_go = false, got_start = false;
     bool lobby_heartbeat_received = false;
     uint32_t heartbeat_serial = 0;
+    uint64_t next_map_send = 0;
+    std::string verified_map;
     uint32_t vehicle = 0;
     std::string vname;
     uint8_t phase = P_LOBBY;
     uint32_t seen_event = 0, waiting_event = 0;
-    uint64_t last_heard = 0, last_lobby = 0;
+    PeerActivity activity;
+    uint64_t last_lobby = 0;
     uint32_t ping_ms = 0;
     uint32_t last_ts_sent = 0;
     bool alive = true;
@@ -364,6 +372,10 @@ struct Session::Impl {
     enum class Role { None, Host, Guest } role = Role::None;
     uint16_t port = 0;
     std::string status, name = default_name();
+    maps::LobbyMaps maps;
+    std::filesystem::path map_directory() const {
+        return std::filesystem::u8path(g_config_path).parent_path() / "mods" / "maps";
+    }
     // host side
     std::map<uint8_t, Peer> peers;
     uint8_t rules = 0;
@@ -375,7 +387,8 @@ struct Session::Impl {
     uint8_t tuning[netplay_hooks::TuneCount] = {7, 4, 4, 12};   // lobby cheat tuning in quarter units (netplay_hooks::Tune)
     unsigned host_capacity = kMaxPlayers;
     uint64_t next_peer_identity = 0;
-    int ai_count = 0;
+    int ai_count = 0;       // 0 = OFF (humans only), 1..15 = explicit AI bots, 16 = FILL TO MAX
+    int lobby_ai_count = 0; // replicated host ai_count for guests
     // lobby picks: the host owns TRACK and MODE (event), every player owns CAR and PAINT
     std::string track_name, event_pick, lobby_track;
     std::string my_model; int my_paint = 0;
@@ -385,7 +398,8 @@ struct Session::Impl {
     sockaddr_in host_addr{};
     uint8_t my_id = 0;
     bool welcomed = false, lobby_received = false;
-    uint64_t last_join = 0, last_hb = 0, host_last_heard = 0;
+    uint64_t last_join = 0, last_hb = 0;
+    PeerActivity host_activity;
     uint32_t heartbeat_serial = 0;
     uint32_t last_host_ts = 0;
     std::vector<LobbyPlayer> lobby_players;
@@ -405,6 +419,18 @@ struct Session::Impl {
     uint32_t grid_event = 0, applied_grid_event = 0;
     std::vector<netplay_car::State> initial_grid;
     std::map<uint8_t, uint32_t> grid_acks;
+    bool event_has_mutator = false;
+    uint32_t mutator_applied_event = 0;
+    std::map<uint8_t, uint32_t> mutator_acks;
+    std::map<uint8_t, uint32_t> mutator_round_acks;
+    uint64_t last_mutator_round_send = 0;
+    uint64_t last_mutator_trigger_send = 0;
+    uint8_t gametype_preset = mutator::PRESET_STANDARD;
+    uint8_t lobby_gametype_preset = mutator::PRESET_STANDARD;
+    game_frontend::MutatorDraft host_mutator_draft{};
+    bool has_host_mutator_draft = false;
+    uint32_t host_mutator_serial = 0;
+    PendingOfflineMatch last_offline_match{};
     uint8_t my_phase = P_LOBBY;
     uint64_t last_menu_tick = 0;
     bool in_menu = false; uint32_t inject_count = 0;
@@ -808,7 +834,7 @@ struct Session::Impl {
         EOD_CLOSESOCK(fd); fd = -1;
         return false;
     }
-    void close_game() { relay.stop(fd); relay_presence_at = 0; online_stop(); if (fd >= 0) EOD_CLOSESOCK(fd); fd = -1; }
+    void close_game() { maps.clear(); relay.stop(fd); relay_presence_at = 0; online_stop(); if (fd >= 0) EOD_CLOSESOCK(fd); fd = -1; }
     void fail_guest_join(std::string message) {
         if (welcomed) { Writer w; send_to(host_addr, K_LEAVE, my_id, w); }
         last_error = std::move(message);
@@ -1018,9 +1044,94 @@ struct Session::Impl {
     }
     sockaddr_in addr_of(uint32_t ip_host, uint16_t p) { sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(ip_host); a.sin_port = htons(p); return a; }
 
+    static void populate_draft_from_config(game_frontend::MutatorDraft &out, const mutator::GametypeConfig &cfg, uint8_t preset_id) {
+        out = game_frontend::MutatorDraft{};
+        out.preset_id = preset_id;
+        out.id = cfg.id;
+        out.name = cfg.name;
+        out.rule_flags = cfg.base_rule_flags;
+        out.feat_bits = cfg.base_feats;
+        out.tips_fuse_sec = cfg.tips_fuse_sec;
+        out.fiesta_interval_sec = cfg.fiesta_interval_sec;
+        out.shuffle_rounds = cfg.shuffle_rounds;
+        out.rounds_to_win = cfg.rounds_to_win;
+        out.gravity_scale = cfg.base_traits.gravity_scale;
+        out.mass_scale = cfg.base_traits.mass_scale;
+        out.grip_scale = cfg.base_traits.grip_scale;
+        out.torque_scale = cfg.base_traits.torque_scale;
+        out.top_speed_scale = cfg.base_traits.top_speed_scale;
+        out.damage_taken_scale = cfg.base_traits.damage_taken_scale;
+        out.chicken_force_scale = cfg.base_traits.chicken_force_scale;
+        out.chicken_radius_scale = cfg.base_traits.chicken_radius_scale;
+        out.chicken_reload_sec = cfg.base_traits.chicken_reload_sec;
+        out.uses_weapons = mutator::config_uses_weapons(cfg);
+        for (const auto &tr : cfg.base_triggers) {
+            if (tr.kind == mutator::TriggerKind::RingOut) {
+                out.storm_radius_m = tr.extents[0];
+                out.storm_shrink_mps = tr.shrink_rate_mps;
+                out.storm_dps = tr.dps_outside;
+                break;
+            }
+        }
+        out.custom_json = mutator::serialize_gametype_json(cfg);
+        out.summary_lines.push_back(preset_id < mutator::preset_count() ? mutator::preset_description(preset_id) : "Custom Gametype");
+        if (!out.uses_weapons) out.summary_lines.push_back("Weapons: OFF (Mode Enforced)");
+        else if (out.feat_bits & (mutator::FB_CHICKEN_STRAIGHT | mutator::FB_CHICKEN_MORTAR))
+            out.summary_lines.push_back("Weapons: Chickens ON");
+        if (out.rule_flags & mutator::RF_TIPS_TAG) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "Personal Fuse: %.0fs | Immunity: 3.5s", out.tips_fuse_sec);
+            out.summary_lines.push_back(buf);
+        }
+    }
+    void send_lobby_mutator_draft(const sockaddr_in *single_peer = nullptr) {
+        if (role != Role::Host) return;
+        mutator::GametypeConfig cfg;
+        std::string err;
+        bool ok = false;
+        if (has_host_mutator_draft && !host_mutator_draft.custom_json.empty()) {
+            ok = mutator::parse_gametype_json(host_mutator_draft.custom_json, cfg, err);
+        } else if (gametype_preset != mutator::PRESET_STANDARD) {
+            ok = mutator::build_preset(gametype_preset, cfg);
+        } else {
+            cfg.id = "standard";
+            cfg.name = "Standard (Vanilla)";
+            ok = true;
+        }
+        if (!ok) return;
+        Writer mw;
+        mw.u32(0); // event_id = 0 -> pre-start lobby draft sync
+        mutator::put_mutator_config(mw, cfg);
+        if (single_peer) {
+            send_to(*single_peer, K_MUTATOR_CONFIG, 0, mw);
+        } else {
+            for (auto &kv : peers) {
+                if (kv.second.alive) send_to(kv.second.addr, K_MUTATOR_CONFIG, 0, mw);
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- lobby helpers
     std::string mode_name() const { return event_pick; }
-    bool human_battle() const { return event_pick == session_catalog::kHumanBattle; }
+    std::string mode_display_name() const {
+        const uint8_t preset = (role == Role::Host) ? gametype_preset : lobby_gametype_preset;
+        if (preset != mutator::PRESET_STANDARD) return mutator::preset_label(preset);
+        return (role == Role::Host) ? event_pick : lobby_event;
+    }
+    std::string battle_event_for_track(const session_catalog::Track *t) const {
+        if (!t) return {};
+        if (!maps.id.empty()) return t->human_battle_contest;
+        std::string fallback;
+        for (size_t i = 0; i < t->events.size() && i < t->event_types.size(); ++i) {
+            if (t->event_types[i] != 0x18000224u) continue;
+            if (t->events[i] != session_catalog::kHumanBattle) return t->events[i];
+            if (fallback.empty()) fallback = t->events[i];
+        }
+        return !fallback.empty() ? fallback : t->human_battle_contest;
+    }
+    bool human_battle() const {
+        return gametype_preset == mutator::PRESET_STANDARD && event_pick == session_catalog::kHumanBattle;
+    }
     unsigned capacity() const { return human_battle() ? 2 : host_capacity; }
     const char *human_battle_wait() const {
         if (!human_battle() || alive_count() == 1) return nullptr;
@@ -1028,7 +1139,15 @@ struct Session::Impl {
                "Choose a larger event or reduce the lobby to two drivers";
     }
     // ---- catalog-backed picks (guest context fills the catalog; see Session::menu_buttons)
-    const session_catalog::Track *find_track(const std::string &n) const { for (auto &t : session_catalog::tracks()) if (t.name == n) return &t; return nullptr; }
+    const session_catalog::Track *find_track(const std::string &name) const {
+        for (const auto &track : session_catalog::tracks())
+            if (track.name == name) return &track;
+        if (!maps.base_arena.empty()) {
+            const auto *canvas = session_catalog::track_for_arena(maps.base_arena);
+            if (canvas && canvas->name == name) return canvas;
+        }
+        return nullptr;
+    }
     void ensure_defaults() {
         if (!session_catalog::ready()) return;
         if (!find_track(track_name)) {
@@ -1039,7 +1158,17 @@ struct Session::Impl {
             track_name = t->name; event_pick.clear();
         }
         const session_catalog::Track *t = find_track(track_name);
-        if (t && std::find(t->events.begin(), t->events.end(), event_pick) == t->events.end()) {
+        if (t && role == Role::Host && !maps.id.empty()) {
+            event_pick = t->human_battle_contest;
+        } else if (t && role == Role::Host && gametype_preset != mutator::PRESET_STANDARD) {
+            const std::string bev = battle_event_for_track(t);
+            if (!bev.empty()) {
+                event_pick = bev;
+            } else {
+                gametype_preset = mutator::PRESET_STANDARD;
+                event_pick = t->events.empty() ? std::string() : t->events[0];
+            }
+        } else if (t && std::find(t->events.begin(), t->events.end(), event_pick) == t->events.end()) {
             const int idx = std::getenv("EOD_NETPLAY_MODE") ? std::atoi(std::getenv("EOD_NETPLAY_MODE")) % 3 : 0;
             const char *fixture = netplay_impact_fixture::test_session() ? std::getenv("EOD_NETPLAY_TEST_EVENT") : nullptr;
             const auto wanted = fixture ? fixture : kDefaultEvents[idx];
@@ -1074,12 +1203,17 @@ struct Session::Impl {
         {"tune_force","CHICKEN BLAST FORCE","X",netplay_hooks::ChickenForce}, {"tune_size","CHICKEN BLAST SIZE","X",netplay_hooks::ChickenSize}
     };
     void cycle(const std::string &what, int dir) {
+        if (!maps.id.empty() && what == "track") return;
         if (what == "players" && role == Role::Host && !human_battle()) {
             host_capacity = std::clamp<int>((int)host_capacity + (dir >= 0 ? 1 : -1),1+alive_count(),kMaxPlayers);
             return;
         }
         if (what == "driver_names" && role == Role::Host) {
             rules ^= names::toggle_bit(mode_name());
+            return;
+        }
+        if (what == "ai_bots" && role == Role::Host && !human_battle()) {
+            ai_count = (ai_count + (dir >= 0 ? 1 : 16)) % 17;
             return;
         }
         for (const auto &opt : rule_options) if (what == opt.id) {
@@ -1099,7 +1233,50 @@ struct Session::Impl {
             track_name = ts[step(ts.size(), cur)].name;
         } else if (what == "mode" && role == Role::Host) {
             const session_catalog::Track *t = find_track(track_name);
-            if (t && !t->events.empty()) { size_t cur = 0; for (size_t i = 0; i < t->events.size(); ++i) if (t->events[i] == event_pick) cur = i; event_pick = t->events[step(t->events.size(), cur)]; }
+            if (t) {
+                struct ModeEntry { uint8_t preset; std::string contest; };
+                std::vector<ModeEntry> entries;
+                const std::string bev = battle_event_for_track(t);
+                if (!maps.id.empty()) {
+                    if (!bev.empty()) entries.push_back({mutator::PRESET_STANDARD, bev});
+                } else {
+                    for (const auto &ev : t->events) entries.push_back({mutator::PRESET_STANDARD, ev});
+                }
+                if (!bev.empty()) {
+                    for (uint8_t p = 1; p < mutator::preset_count(); ++p) {
+                        entries.push_back({p, bev});
+                    }
+                }
+                if (!entries.empty()) {
+                    size_t cur = 0;
+                    for (size_t i = 0; i < entries.size(); ++i) {
+                        if (entries[i].preset == gametype_preset &&
+                            (gametype_preset != mutator::PRESET_STANDARD || entries[i].contest == event_pick)) {
+                            cur = i;
+                            break;
+                        }
+                    }
+                    const auto &next = entries[step(entries.size(), cur)];
+                    gametype_preset = next.preset;
+                    event_pick = next.contest;
+                    mutator::GametypeConfig cfg;
+                    if (gametype_preset != mutator::PRESET_STANDARD && mutator::build_preset(gametype_preset, cfg)) {
+                        populate_draft_from_config(host_mutator_draft, cfg, gametype_preset);
+                        has_host_mutator_draft = true;
+                    } else {
+                        has_host_mutator_draft = false;
+                        host_mutator_draft = {};
+                    }
+                    send_lobby_mutator_draft();
+                }
+            }
+        } else if (what.compare(0, 10, "car_model:") == 0) {
+            const std::string want = what.substr(10);
+            auto models = session_catalog::models();
+            if (std::find(models.begin(), models.end(), want) != models.end()) {
+                my_model = want;
+                my_paint = 0;
+            }
         } else if (what == "car") {
             auto models = session_catalog::models(); size_t cur = 0;
             for (size_t i = 0; i < models.size(); ++i) if (models[i] == my_model) cur = i;
@@ -1120,8 +1297,10 @@ struct Session::Impl {
         for (auto &p : v) { w.u8(p.id); w.str(p.name, 16); w.u8((p.ready ? 1 : 0) | (p.waiting ? 2 : 0)); w.str(p.vname, 48); w.u16(p.ping); }
         w.str(track_name, 40); w.u8(rules); w.u8(capacity());
         for (uint8_t q : tuning) w.u8(q);
+        w.str(maps.offer.hash, 64); w.u32(maps.offer.size); w.str(maps.offer.title, 160);
+        w.u8(gametype_preset);
     }
-    bool all_peers(bool (*pred)(const Peer &)) const { for (auto &kv : peers) if (kv.second.alive && !pred(kv.second)) return false; return true; }
+    template <typename Predicate> bool all_peers(Predicate pred) const { for (auto &kv : peers) if (kv.second.alive && !pred(kv.second)) return false; return true; }
     void release_driver(Peer &peer) {
         peer.has_latest = false;
         peer.impact_through = peer.impact_revision = 0;
@@ -1149,7 +1328,10 @@ struct Session::Impl {
     int alive_count() const { int n = 0; for (auto &kv : peers) n += kv.second.alive; return n; }
 };
 
-Session::Session() : d_(new Impl) {}
+Session::Session() : d_(new Impl) {
+    // Session teardown may release a mounted archive during process shutdown.
+    (void)eod::vfs::global_vfs();
+}
 Session::~Session() { if (d_->mic_open) platform_mic_close(); d_->close_game(); if (d_->disc_fd >= 0) EOD_CLOSESOCK(d_->disc_fd); netplay_online::Online::wait_cleanup(2500); }
 
 // ====================================================================== UI side
@@ -1197,6 +1379,18 @@ game_frontend::Snapshot Session::snapshot() const {
         s.status = s.phase == S::Phase::Results ? "Returning to lobby" :
                    s.phase == S::Phase::Racing ? "Racing" :
                    s.phase == S::Phase::Loading ? "Loading race" : d.status;
+        s.custom_map_id = d.maps.id;
+        s.custom_map_title = d.maps.offer.title;
+        s.lobby_ai_count = s.is_host ? d.ai_count : d.lobby_ai_count;
+        s.lobby_capacity = s.is_host ? static_cast<int>(d.capacity()) : static_cast<int>(d.lobby_capacity);
+        s.map_verified = (d.maps.verified == d.maps.offer.hash);
+        s.map_downloading = (d.role == Impl::Role::Guest && !s.map_verified && d.maps.offer.size > 0);
+        s.map_download_pct = s.map_downloading
+            ? static_cast<int>(std::min<uint64_t>(100, 100ULL * d.maps.download.received_bytes() / d.maps.offer.size))
+            : (s.map_verified ? 100 : 0);
+        if (d.role == Impl::Role::Host) s.custom_maps = d.maps.catalog;
+        else if (s.map_downloading)
+            s.status = "Receiving " + d.maps.offer.title + " (" + std::to_string(s.map_download_pct) + "%)";
         s.can_cancel = true;
         s.invite = d.role == Impl::Role::Host ? d.host_address : "";
         s.address = s.invite;
@@ -1217,13 +1411,18 @@ game_frontend::Snapshot Session::snapshot() const {
                 const bool mtd = p.id != local_id && (d.muted_all || d.deafened);
                 s.players.push_back({p.id, p.name + (p.id == local_id ? " (YOU)  " : "  ") + (detention && p.id == 0 ? "SCHOOL BUS" : p.vname) + (p.id ? "  " + std::to_string(p.ping) + "ms" : ""), p.ready, mtd, false, spk});
                 s.players.back().waiting = p.waiting;
-                if (p.id) s.players.back().identity = d.peers.at(p.id).identity;
+                if (p.id) {
+                    const Peer &peer = d.peers.at(p.id);
+                    s.players.back().identity = peer.identity;
+                    s.players.back().map_ready = (peer.verified_map == d.maps.offer.hash);
+                }
             }
             const bool joining = d.relay.has_joining_guest(t_now);
             s.can_start = s.phase == S::Phase::Lobby && !joining && !d.human_battle_wait() && d.in_menu && session_catalog::ready() &&
                           session_catalog::online_vehicle_is_drivable(d.my_vehicle) &&
-                          d.all_peers([](const Peer &p) {
-                              return p.at_menu && p.ready && session_catalog::online_vehicle_is_drivable(p.vehicle);
+                          d.all_peers([&](const Peer &p) {
+                              return p.at_menu && p.ready && p.verified_map == d.maps.offer.hash &&
+                                     session_catalog::online_vehicle_is_drivable(p.vehicle);
                           });
             if (!s.can_start && s.phase == S::Phase::Lobby) {
                 if (joining || !d.all_peers([](const Peer &p) { return p.lobby_heartbeat_received; }))
@@ -1231,9 +1430,16 @@ game_frontend::Snapshot Session::snapshot() const {
                 else if (const char *reason = d.human_battle_wait()) s.status = reason;
                 else s.status = d.in_menu ? "Waiting for game data or players to be ready" : "Waiting for the game main menu";
             }
+            auto ai_label = [](int v) -> std::string {
+                if (v <= 0) return "OFF";
+                if (v >= 16) return "FILL TO MAX";
+                return std::to_string(v);
+            };
             s.options.push_back({"players","MAX PLAYERS",std::to_string(d.capacity()),s.phase == S::Phase::Lobby && !d.human_battle(),"Includes the host. Race capacity depends on the event."});
-            s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, true, ""});
-            s.options.push_back({"mode", "MODE", d.mode_name(), true, ""});
+            s.options.push_back({"ai_bots","AI BOTS",ai_label(d.ai_count),s.phase == S::Phase::Lobby && !d.human_battle(),"AI opponents to add: OFF (humans only), 1-15, or FILL TO MAX."});
+            s.options.push_back({"track", "TRACK", d.track_name.empty() ? "Loading game data..." : d.track_name, d.maps.id.empty(), ""});
+            s.options.push_back({"mode", "MODE", d.mode_display_name(), s.phase == S::Phase::Lobby,
+                                 d.gametype_preset != mutator::PRESET_STANDARD ? mutator::preset_description(d.gametype_preset) : ""});
         } else {
             for (auto &p : d.lobby_players) {
                 const bool spk = p.id < kMaxPlayers && t_now < d.speaking_until[p.id];
@@ -1246,9 +1452,16 @@ game_frontend::Snapshot Session::snapshot() const {
             if (s.phase == S::Phase::Lobby && d.waiting_event && d.waiting_event == d.event_id)
                 s.status = "In lobby for the next event";
             else if (s.phase == S::Phase::Lobby && s.ready) s.status = "Waiting for host";
+            auto ai_label = [](int v) -> std::string {
+                if (v <= 0) return "OFF";
+                if (v >= 16) return "FILL TO MAX";
+                return std::to_string(v);
+            };
             s.options.push_back({"players","MAX PLAYERS",std::to_string(d.lobby_capacity),false,"Host only."});
+            s.options.push_back({"ai_bots","AI BOTS",ai_label(d.lobby_ai_count),false,"Host only."});
             s.options.push_back({"track", "TRACK", d.lobby_track, false, "Host only."});
-            s.options.push_back({"mode", "MODE", d.lobby_event, false, "Host only."});
+            s.options.push_back({"mode", "MODE", d.mode_display_name(), false,
+                                 d.lobby_gametype_preset != mutator::PRESET_STANDARD ? mutator::preset_description(d.lobby_gametype_preset) : "Host only."});
         }
         if (detention) {
             s.options.push_back({"detention_role", "YOUR ROLE", s.is_host ? "BUS DRIVER" : "RUNNER", false,
@@ -1276,6 +1489,151 @@ game_frontend::Snapshot Session::snapshot() const {
     uint64_t t = now_us();
     for (auto &kv : d.lan) if (t - kv.second.seen < 4000000) s.lan.push_back({kv.second.name, kv.first, kv.second.players});
     s.strip = d.strip;
+
+    // Unified Front-End persistent catalog & live state (Phases 2-5)
+    s.catalog_ready = session_catalog::ready();
+    s.ee_state = static_cast<int>(session_ee_state());
+    for (const auto &tr : session_catalog::tracks()) s.retail_tracks.push_back(tr.name);
+    s.retail_cars = session_catalog::models();
+    // Build full class-sorted Car Catalog (Compact -> Midsize -> Muscle -> Special -> Trailers -> Modded)
+    {
+        auto class_order = [](const session_catalog::Vehicle &v) -> int {
+            if (v.is_modded) return 5;
+            if (v.is_trailer) return 4;
+            switch (v.car_class) {
+            case 0: return 0; // Compact
+            case 1: return 1; // Midsize
+            case 2: return 2; // Muscle
+            default: return 3; // Special
+            }
+        };
+        auto class_label = [](int ord) -> const char * {
+            switch (ord) {
+            case 0: return "COMPACT";
+            case 1: return "MIDSIZE";
+            case 2: return "MUSCLE";
+            case 3: return "SPECIAL";
+            case 4: return "TRAILERS";
+            default: return "MODDED";
+            }
+        };
+        std::map<std::string, size_t> seen;
+        for (const auto &v : session_catalog::vehicles()) {
+            if (v.name.empty() || !v.number) continue;
+            auto it = seen.find(v.name);
+            if (it != seen.end()) {
+                s.car_catalog[it->second].paint_count++;
+                continue;
+            }
+            const int ord = class_order(v);
+            game_frontend::CarEntry ce;
+            ce.model = v.name;
+            ce.category = class_label(ord);
+            ce.car_class = v.car_class;
+            ce.vehicle_num = v.number;
+            ce.paint_count = 1;
+            ce.is_trailer = v.is_trailer;
+            ce.is_modded = v.is_modded;
+            seen[v.name] = s.car_catalog.size();
+            s.car_catalog.push_back(std::move(ce));
+        }
+        std::stable_sort(s.car_catalog.begin(), s.car_catalog.end(), [](const game_frontend::CarEntry &a, const game_frontend::CarEntry &b) {
+            auto rank = [](const game_frontend::CarEntry &c) {
+                if (c.is_modded) return 5;
+                if (c.is_trailer) return 4;
+                return (int)std::min<uint32_t>(c.car_class, 3);
+            };
+            const int ra = rank(a), rb = rank(b);
+            if (ra != rb) return ra < rb;
+            return a.model < b.model;
+        });
+    }
+    if (d.role == Impl::Role::None) {
+        s.custom_maps.clear();
+        for (const auto &cm : catalog_cache::global().maps()) {
+            s.custom_maps.push_back({cm.filename, cm.title, cm.base_arena, cm.author});
+        }
+    }
+    // Modes catalog: Retail + Party & Arena + Custom JSON
+    for (uint8_t pid = mutator::PRESET_BATTLE_ROYALE; pid < mutator::PRESET_CUSTOM_JSON; ++pid) {
+        game_frontend::GameModeEntry me;
+        me.id = "preset:" + std::to_string(pid);
+        me.name = mutator::preset_label(pid);
+        me.category = "PARTY & ARENA";
+        me.description = mutator::preset_description(pid);
+        me.preset_id = pid;
+        me.uses_weapons = mutator::preset_uses_weapons(pid);
+        me.featured = (pid == mutator::PRESET_TIPS_TAG || pid == mutator::PRESET_BATTLE_ROYALE || pid == mutator::PRESET_DESTRUCTIONWARE);
+        s.modes.push_back(std::move(me));
+    }
+    for (const auto &cg : catalog_cache::global().gametypes()) {
+        game_frontend::GameModeEntry me;
+        me.id = cg.config.id;
+        me.name = cg.config.name;
+        me.category = "MY CUSTOM MODES";
+        me.description = "Custom gametype from " + cg.filename;
+        me.default_track = cg.config.default_track;
+        me.is_custom_json = true;
+        me.uses_weapons = mutator::config_uses_weapons(cg.config);
+        s.modes.push_back(std::move(me));
+    }
+    // Career summary from EE RAM (0x003D9384 = CareerSaveInfo)
+    if (g_ram) {
+        const uint32_t save_ptr = ee_r32(0x003D9384);
+        if (save_ptr && !(save_ptr & 3) && save_ptr <= EE_RAM_SIZE - 0xE7C && ee_r32(save_ptr) == 0x43726572u) {
+            s.career.loaded = true;
+            s.career.money = static_cast<int>(ee_r32(save_ptr + 0x80 + 0x08));
+            s.career.garage_count = static_cast<int>(ee_r32(save_ptr + 0x80 + 0x10));
+            s.career.garage_cap = g_config.career_garage_expansion ? 16 : 4;
+            s.career.rank = static_cast<int>(ee_r32(save_ptr + 0xCE8));
+            int done_eves = 0;
+            for (uint32_t i = 0; i < 40; ++i) {
+                if (ee_r8(save_ptr + 0xCE8 + 0x118 + i) != 0xFF) ++done_eves;
+            }
+            s.career.events_done = done_eves;
+        }
+    }
+    if (d.has_host_mutator_draft) {
+        s.mutator_draft = d.host_mutator_draft;
+    } else if (d.role != Impl::Role::None) {
+        const uint8_t active_preset = (d.role == Impl::Role::Host) ? d.gametype_preset : d.lobby_gametype_preset;
+        mutator::GametypeConfig pcfg;
+        if (active_preset != mutator::PRESET_STANDARD && mutator::build_preset(active_preset, pcfg)) {
+            Impl::populate_draft_from_config(s.mutator_draft, pcfg, active_preset);
+        }
+    }
+    // Build 16-slot fixed roster
+    s.roster_16.resize(16);
+    for (uint8_t i = 0; i < 16; ++i) s.roster_16[i].slot = i;
+    for (const auto &pl : s.players) {
+        if (pl.slot < 16) {
+            auto &sl = s.roster_16[pl.slot];
+            sl.occupied = true;
+            sl.is_ai = false;
+            sl.is_host = (pl.slot == 0);
+            sl.ready = pl.ready;
+            sl.speaking = pl.speaking;
+            sl.muted = pl.muted;
+            sl.waiting = pl.waiting;
+            sl.map_ready = pl.map_ready;
+            sl.name = pl.name;
+            sl.identity = pl.identity;
+        }
+    }
+    if (mutator_hooks::active) {
+        for (uint8_t i = 0; i < 16; ++i) {
+            if (!mutator_hooks::slots[i].active) continue;
+            game_frontend::ScoreboardRow row;
+            row.slot = i;
+            row.name = (i < s.roster_16.size() && s.roster_16[i].occupied) ? s.roster_16[i].name : ("CAR " + std::to_string(i + 1));
+            row.role = mutator::role_id_name(mutator_hooks::slots[i].role);
+            row.score = mutator_hooks::slots[i].score;
+            row.alive = (mutator_hooks::hud.eliminated_mask & (1u << i)) == 0;
+            row.is_tagger = (mutator_hooks::hud.tips_in_slot == i);
+            row.fuse_sec = row.is_tagger ? mutator_hooks::hud.tips_fuse_sec : 0.0f;
+            s.scoreboard.push_back(std::move(row));
+        }
+    }
     return s;
 }
 
@@ -1305,6 +1663,14 @@ void Session::submit(game_frontend::Command c) {
     const bool joining = c.kind == K::Host || c.kind == K::JoinCode || c.kind == K::JoinAddress || c.kind == K::JoinCrew;
     if (joining) {
         if (in_event_ || d.role != Impl::Role::None) return;
+        if (eod::vfs::global_vfs().is_mounted(eod::vfs::Layer::EphemeralPie) && eod::vfs::active_map()) {
+            if (d.in_menu) {
+                eod::vfs::global_vfs().unmount(eod::vfs::Layer::EphemeralPie);
+            } else {
+                d.last_error = "Leave the local map playtest before entering an online lobby.";
+                return;
+            }
+        }
         d.profile_check.reset();
         if (c.kind != K::Host) d.guest_invite = c;
         else d.guest_invite.reset();
@@ -1319,6 +1685,8 @@ void Session::submit(game_frontend::Command c) {
         d.lobby_players.clear();
         d.lobby_track.clear();
         d.lobby_event.clear();
+        d.lobby_gametype_preset = mutator::PRESET_STANDARD;
+        d.lobby_ai_count = 0;
         d.last_host_ts = 0;
         d.heartbeat_serial = 0;
         d.handshake_started = 0;
@@ -1352,6 +1720,7 @@ void Session::submit(game_frontend::Command c) {
         d.load_friends();
         d.host_address = local_ip() + ":" + std::to_string(d.port);
         d.role = Impl::Role::Host; d.peers.clear(); d.ensure_defaults(); d.status = "Waiting for friends"; d.my_phase = P_LOBBY;
+        d.maps.inventory(d.map_directory());
         d.my_vehicle = d.my_vehicle ? d.my_vehicle : 0;
         d.code = std::getenv("EOD_NETPLAY_CODE") ? std::getenv("EOD_NETPLAY_CODE") : Impl::new_code();
         d.route_text = "Looking for the best route...";
@@ -1370,7 +1739,7 @@ void Session::submit(game_frontend::Command c) {
         if (!d.open(0, false)) { d.last_error = "Could not open the network port."; return; }
         d.role = Impl::Role::Guest; d.host_addr = d.addr_of(ip, port); d.welcomed = false; d.last_join = 0;
         d.joining_online = false; d.join_tag = 0; d.targets.clear(); d.join_note.clear(); d.remembered = false; d.join_started = now_us();
-        d.host_last_heard = now_us(); d.status = "Connecting..."; d.guest_ready = false;
+        d.status = "Connecting..."; d.guest_ready = false;
         std::fprintf(stderr, "[netplay] joining %s from local port %d\n", c.text.c_str(), [&] { sockaddr_in me{}; socklen_t ml = sizeof me; getsockname(d.fd, (sockaddr *)&me, &ml); return (int)ntohs(me.sin_port); }());
         break;
     }
@@ -1395,7 +1764,7 @@ void Session::submit(game_frontend::Command c) {
         d.code = c.kind == K::JoinCode ? secret : std::string();
         d.join_secret = secret; d.join_tag = netplay_online::join_tag(secret);
         d.joining_online = true; d.targets.clear(); d.remembered = false; d.join_started = now_us(); d.guest_ready = false;
-        d.host_last_heard = now_us(); d.status = "Connecting..."; d.join_note = "Looking for " + (c.kind == K::JoinCode ? "game " + shown : shown + "'s game") + "...";
+        d.status = "Connecting..."; d.join_note = "Looking for " + (c.kind == K::JoinCode ? "game " + shown : shown + "'s game") + "...";
         d.route_text = "Looking for the best route...";
         if (GarageRelay::configured()) {
             d.relay.start(secret, false);
@@ -1414,8 +1783,31 @@ void Session::submit(game_frontend::Command c) {
         d.name = d.role == Impl::Role::Host ? d.available_name(requested, 0) : requested;
         break;
     }
+    case K::SelectCustomMap: {
+        if (d.role != Impl::Role::Host || d.pending_start || in_event_ || d.maps.id == c.text) return;
+        if (!d.maps.select(c.text, d.last_error)) return;
+        if (!c.text.empty()) {
+            auto *track = session_catalog::track_for_arena(d.maps.base_arena);
+            if (!track || track->human_battle_contest.empty()) {
+                d.maps.clear();
+                for (auto &entry : d.peers) entry.second.ready = false;
+                d.last_lobby_send = 0;
+                d.last_error = "This map needs an installed arena with a Battle event.";
+                return;
+            }
+            d.track_name = track->name;
+            d.ensure_defaults();
+        }
+        for (auto &entry : d.peers) entry.second.ready = false;
+        d.last_lobby_send = 0;
+        break;
+    }
     case K::Ready:
         if (d.role == Impl::Role::Guest && d.lobby_received && !in_event_ && !d.pending_start) {
+            if (c.enabled && d.maps.verified != d.maps.offer.hash) {
+                d.last_error = "Waiting for the verified host map.";
+                break;
+            }
             if (c.enabled && !session_catalog::online_vehicle_is_drivable(d.my_vehicle)) {
                 d.last_error = "Choose a drivable car before marking Ready.";
                 break;
@@ -1429,9 +1821,21 @@ void Session::submit(game_frontend::Command c) {
         if (d.relay.has_joining_guest(now_us())) { d.last_error = "Waiting for players to finish joining"; return; }
         if (!d.in_menu) { d.last_error = "Go back to the game's main menu first (leave the current event), then press START."; return; }
         for (auto &kv : d.peers) if (kv.second.alive && !kv.second.at_menu) { d.last_error = kv.second.name + " is not at the main menu yet."; return; }
+        if (!d.all_peers([&](const Peer &p) { return p.verified_map == d.maps.offer.hash; })) {
+            d.last_error = "Waiting for players to verify the selected map.";
+            return;
+        }
         for (const auto &kv : d.peers) if (kv.second.alive && !kv.second.ready) { d.last_error = kv.second.name + " is not ready."; return; }
         if (!session_catalog::ready() || d.track_name.empty()) { d.last_error = "The game data is still loading. Wait a moment at the main menu, then press START."; return; }
         d.ensure_defaults();
+        if (!d.maps.id.empty()) {
+            const auto *arena = session_catalog::track_for_arena(d.maps.base_arena);
+            if (!arena || arena->name != d.track_name || arena->human_battle_contest.empty() ||
+                d.mode_name() != arena->human_battle_contest) {
+                d.last_error = "The host map requires its original Battle arena.";
+                return;
+            }
+        }
         if (const char *reason = d.human_battle_wait()) { d.last_error = reason; return; }
         if (!session_catalog::online_vehicle_is_drivable(d.my_vehicle)) {
             d.last_error = "Choose a drivable car before starting.";
@@ -1448,6 +1852,29 @@ void Session::submit(game_frontend::Command c) {
         for (const auto &item : d.peers)
             if (item.second.alive) d.event_guest_mask |= uint16_t(1u << item.first);
         d.event_id++; d.start_info = {d.mode_name(), d.track_name, d.event_id, (uint32_t)now_us() ^ 0x5bd1e995u, d.my_vehicle, true};
+        {
+            mutator::GametypeConfig preset_cfg;
+            std::string draft_err;
+            if (d.has_host_mutator_draft && !d.host_mutator_draft.custom_json.empty() &&
+                mutator::parse_gametype_json(d.host_mutator_draft.custom_json, preset_cfg, draft_err)) {
+                mutator::engine().set_config(preset_cfg);
+            } else if (mutator::build_preset(d.gametype_preset, preset_cfg)) {
+                mutator::engine().set_config(preset_cfg);
+            } else {
+                mutator::engine().clear_config();
+                if (const char *env_path = std::getenv("EOD_GAMETYPE_JSON"); env_path && *env_path) {
+                    std::string err;
+                    if (!mutator::engine().load_file(env_path, err))
+                        std::fprintf(stderr, "[netplay] failed to load EOD_GAMETYPE_JSON '%s': %s\n", env_path, err.c_str());
+                }
+            }
+        }
+        d.event_has_mutator = mutator::engine().has_config();
+        d.mutator_applied_event = d.event_has_mutator ? d.event_id : 0;
+        d.mutator_acks.clear();
+        d.mutator_round_acks.clear();
+        d.last_mutator_round_send = 0;
+        d.last_mutator_trigger_send = 0;
         d.event_name = d.mode_name(); d.pending_start = true; d.have_track = false; d.have_roster = false; d.go = false; d.grid_event = d.applied_grid_event = 0; d.initial_grid.clear(); d.grid_acks.clear(); d.car_done = false; d.loaded_sent = false;
         for (auto &kv : d.peers) { Peer &p = kv.second; p.got_start = p.got_track = p.got_roster = p.got_go = p.car_done = false; p.seen_event = 0; p.phase = P_LOBBY; }
         d.status = "Starting event";
@@ -1509,10 +1936,11 @@ void Session::submit(game_frontend::Command c) {
     case K::Option: {
         if (d.role == Impl::Role::None || d.pending_start || in_event_) return;
         if (d.role == Impl::Role::Guest && !d.lobby_received) return;
-        if (d.role == Impl::Role::Guest && (c.text == "car" || c.text == "paint")) {
+        if (d.role == Impl::Role::Guest && (c.text == "car" || c.text == "paint" || c.text.compare(0, 10, "car_model:") == 0)) {
             d.guest_ready = false;
             d.last_hb = 0;
         }
+        if ((c.text == "track" || c.text == "mode") && !d.maps.id.empty()) return;
         d.cycle(c.text, c.value >= 0 ? 1 : -1);
         break;
     }
@@ -1528,6 +1956,83 @@ void Session::submit(game_frontend::Command c) {
         d.deafened = c.enabled;
         d.sync_voice();
         break;
+    case K::LaunchTransition: {
+        SessionTransition tr;
+        tr.target = static_cast<TransitionTarget>(c.transition.target);
+        tr.save_career_first = c.transition.save_career_first;
+        tr.new_career = c.transition.new_career;
+        tr.classic_career_hub = c.transition.classic_career_hub;
+        tr.online_arg = c.transition.online_arg;
+        tr.career_warp.active = (c.transition.career_place >= 0);
+        tr.career_warp.target_place = c.transition.career_place;
+        tr.career_warp.target_eve = c.transition.career_eve;
+        tr.offline.active = (tr.target == TransitionTarget::Solo || tr.target == TransitionTarget::SplitScreen);
+        tr.offline.track = c.transition.track;
+        tr.offline.event = c.transition.event;
+        tr.offline.custom_map_id = c.transition.custom_map_id;
+        tr.offline.gametype_preset = c.transition.gametype_preset;
+        tr.offline.has_custom_mutator = !c.transition.mutator_json.empty();
+        tr.offline.mutator_json = c.transition.mutator_json;
+        tr.offline.humans = c.transition.humans;
+        tr.offline.ai_bots = c.transition.ai_bots;
+        tr.offline.laps = c.transition.laps;
+        tr.offline.seat_vehicles = c.transition.seat_vehicles;
+        tr.offline.seat_paints = c.transition.seat_paints;
+        tr.offline.seat_cars = c.transition.seat_cars;
+        if (tr.offline.active) d.last_offline_match = tr.offline;
+        if (d.role != Impl::Role::None && (tr.target == TransitionTarget::Career || tr.target == TransitionTarget::Solo || tr.target == TransitionTarget::SplitScreen)) {
+            d.role = Impl::Role::None;
+            d.close_game();
+            d.lobby_players.clear();
+            d.sync_voice();
+        }
+        session_request_transition(tr);
+        break;
+    }
+    case K::UpdateMutatorDraft: {
+        if (d.role == Impl::Role::Guest) return;
+        d.host_mutator_draft = c.draft;
+        d.has_host_mutator_draft = true;
+        if (d.role == Impl::Role::Host && c.draft.preset_id < mutator::preset_count()) {
+            d.gametype_preset = c.draft.preset_id;
+            d.ensure_defaults();
+        }
+        ++d.host_mutator_serial;
+        if (d.role == Impl::Role::Host && !in_event_) {
+            d.send_lobby_mutator_draft();
+            d.last_lobby_send = 0;
+        }
+        break;
+    }
+    case K::SaveCustomGametype: {
+        mutator::GametypeConfig cfg;
+        std::string err, out_path;
+        if (!c.draft.custom_json.empty() && mutator::parse_gametype_json(c.draft.custom_json, cfg, err)) {
+            catalog_cache::global().save_gametype(overlay_platform_mods_root(), cfg, out_path, err);
+        }
+        break;
+    }
+    case K::CareerWarp: {
+        career_warp_arm(static_cast<int>(c.value), -1, 2);
+        break;
+    }
+    case K::CareerSaveNow: {
+        std::fprintf(stderr, "[CAREER] Quick Rail save requested\n");
+        break;
+    }
+    case K::NextRound: {
+        std::fprintf(stderr, "[MUTATOR] Host requested Next Round\n");
+        break;
+    }
+    case K::InstantRematch: {
+        if (d.last_offline_match.active) {
+            SessionTransition tr;
+            tr.target = d.last_offline_match.humans > 1 ? TransitionTarget::SplitScreen : TransitionTarget::Solo;
+            tr.offline = d.last_offline_match;
+            session_request_transition(tr);
+        }
+        break;
+    }
     default: break;
     }
 }
@@ -1679,17 +2184,17 @@ void Session::poll() {
             d.lan[sockaddr_text(a)] = {a, nm, pc, t};
         }
     }
-    // Remembered friends: while the ONLINE tab is open (and no game is joined/hosted) look for hosts among them.
+    // Remembered friends: keep LAN + Crew discovery live whenever idle (role == None)
+    // across Unified Hub, Career, Solo, and Split-Screen. Only pause when hosting/joined.
     if (d.role == Impl::Role::None && !std::getenv("EOD_NETPLAY_NO_INTERNET")) {
-        const bool tab_open = t - d.ui_seen < 3000000;
         d.load_friends();
-        if (tab_open && !d.friends.empty()) {
+        if (!d.friends.empty()) {
             if (d.fd < 0) d.open(0, false);
             if (d.fd >= 0 && !d.online_on && !d.relay.active()) {
                 if (GarageRelay::configured()) d.relay.start("", false);
                 else { d.online_start(false); d.watch_jobs(); }
             }
-        } else if ((d.online_on || d.relay.active()) && !tab_open) {
+        } else if (d.online_on || d.relay.active()) {
             d.close_game(); d.crew.clear(); d.route_text.clear();
         }
     }
@@ -1787,7 +2292,7 @@ void Session::poll() {
                     d.send_to(from, K_REFUSE, 0, w); continue;
                 }
                 const auto attempt = r.p < r.e ? r.str() : std::string();
-                if (!r.ok || (!attempt.empty() && attempt.size() != 32)) continue;
+                if (!r.ok || r.p != r.e || sender != 0 || (!attempt.empty() && attempt.size() != 32)) continue;
                 if (pp && !attempt.empty() && !pp->join_attempt.empty() && pp->join_attempt != attempt) continue;
                 if (!pp && !attempt.empty()) {
                     // A direct JOIN can reach the host even when its reply
@@ -1809,7 +2314,7 @@ void Session::poll() {
                     while (id < kMaxPlayers && ((d.peers.count(id) && d.peers[id].alive) ||
                            (round_active && (d.event_guest_mask & (1u << id))))) ++id;
                     if (id >= kMaxPlayers || 1 + d.alive_count() >= (int)d.capacity()) { w.u8(3); d.send_to(from, K_REFUSE, 0, w); continue; }
-                    Peer p; p.identity = ++d.next_peer_identity; p.addr = from; p.id = id; p.requested_name = nm; p.name = d.available_name(nm,id); p.last_heard = t;
+                    Peer p; p.identity = ++d.next_peer_identity; p.addr = from; p.id = id; p.requested_name = nm; p.name = d.available_name(nm,id);
                     p.join_attempt = attempt;
                     p.waiting_event = round_active ? d.event_id : 0;
                     p.at_menu = false; // Wait for the guest's first lobby heartbeat.
@@ -1823,15 +2328,31 @@ void Session::poll() {
                 w.str(d.checked_content.value,16);
                 d.relay.admit(attempt, t);
                 d.send_to(from, K_WELCOME, 0, w);
-                pp->last_heard = t;
+                if (!in_event_ && (d.has_host_mutator_draft || d.gametype_preset != mutator::PRESET_STANDARD)) {
+                    d.send_lobby_mutator_draft(&from);
+                }
+                pp->activity.heard();
                 d.status = std::to_string(1 + d.alive_count()) + " players in the lobby";
                 continue;
             }
             auto it = d.peers.find(sender);
             if (it == d.peers.end() || !it->second.alive || !same_addr(it->second.addr, from)) continue;
             Peer &p = it->second;
-            p.last_heard = t;
-            if (kind == K_HEARTBEAT) {
+            if (kind == K_MAP_REQUEST) {
+                const auto hash = r.str();
+                const uint32_t first = r.u32(), missing = r.u32();
+                if (!r.ok || r.p != r.e || !missing || hash != d.maps.offer.hash ||
+                    first >= d.maps.offer.chunks() || t < p.next_map_send) continue;
+                p.next_map_send = t + 12000;
+                for (uint32_t i = 0; i < maps::window_chunks; ++i) {
+                    if (!(missing & (uint32_t(1) << i))) continue;
+                    std::vector<uint8_t> data;
+                    if (!d.maps.read_chunk(first + i, data)) continue;
+                    Writer packet; packet.str(hash, 64); packet.u32(first + i);
+                    packet.b.insert(packet.b.end(), data.begin(), data.end());
+                    d.send_to(p.addr, K_MAP_CHUNK, 0, packet);
+                }
+            } else if (kind == K_HEARTBEAT) {
                 const auto requested = clean_name(r.str());
                 const bool ready = r.u8();
                 const auto vehicle = r.u32();
@@ -1840,12 +2361,15 @@ void Session::poll() {
                 const auto seen_event = r.u32();
                 const auto flags = r.u8(), echo = r.u32();
                 const auto serial = r.u32();
+                const auto verified_map = r.p == r.e ? std::string() : r.str();
                 if (!r.ok || r.p != r.e || phase > P_DONE ||
                     (p.lobby_heartbeat_received && static_cast<int32_t>(serial - p.heartbeat_serial) <= 0)) continue;
+                p.activity.heard();
                 p.heartbeat_serial = serial;
                 if (requested != p.requested_name) { p.requested_name = requested; p.name = d.available_name(requested, p.id); }
                 p.lobby_heartbeat_received = true;
-                p.ready = ready; p.vehicle = vehicle; p.vname = std::move(vehicle_name); p.phase = (uint8_t)phase; p.seen_event = seen_event;
+                p.verified_map = verified_map;
+                p.ready = ready && verified_map == d.maps.offer.hash; p.vehicle = vehicle; p.vname = std::move(vehicle_name); p.phase = (uint8_t)phase; p.seen_event = seen_event;
                 p.at_menu = flags & 1; p.got_track = flags & 2; p.got_roster = flags & 4; p.got_go = flags & 8; p.got_start = flags & 16; p.car_done = flags & 32;
                 if ((flags & 64) && seen_event == d.event_id && in_event_ && d.go &&
                     p.waiting_event != d.event_id) {
@@ -1869,6 +2393,13 @@ void Session::poll() {
             } else if (kind == K_GRID_ACK) {
                 const uint32_t id = r.u32();
                 if (r.ok && id == d.event_id && d.grid_event == id) d.grid_acks[p.id] = id;
+            } else if (kind == K_MUTATOR_CONFIG_ACK) {
+                const uint32_t id = r.u32();
+                if (r.ok && r.p == r.e && id == d.event_id && d.event_has_mutator) d.mutator_acks[p.id] = id;
+            } else if (kind == K_MUTATOR_ROUND_ACK) {
+                const uint32_t id = r.u32(), serial = r.u32();
+                if (r.ok && r.p == r.e && id == d.event_id && serial > d.mutator_round_acks[p.id])
+                    d.mutator_round_acks[p.id] = serial;
             } else if (kind == K_RESULT_CLOCK) {
                 const auto sent = r.u32();
                 if (!r.ok || r.p != r.e) continue;
@@ -1915,6 +2446,7 @@ void Session::poll() {
                     (d.completion_mode == EventCompletionMode::Battle && life != d.battle.seats[slot].spawn_tick) || (p.has_latest && tick <= p.latest_tick)) continue;
                 if (netplay_impact_fixture::observation.started && netplay_impact_fixture::pair_slot(p.id) < netplay_impact_fixture::collider_count() &&
                     tick <= netplay_impact_fixture::kStartTick) continue;
+                p.activity.heard();
                 p.latest = s; p.latest_tick = tick; p.latest_host_tick = d.tick; p.has_latest = true; p.latest_at = t;
                 if (p.impact_through && p.impact_revision >= p.impact_through && ack == p.impact_revision) {
                     p.impact_through = 0;
@@ -1941,17 +2473,17 @@ void Session::poll() {
                 for (auto &a : d.targets) if (same_addr(a, from)) { d.host_addr = from; break; }
             }
             if (!same_addr(from, d.host_addr)) { static int warned = 0; if (warned++ < 5) std::fprintf(stderr, "[netplay] ignoring packet kind %u from %s (host is %s)\n", kind, sockaddr_text(from).c_str(), sockaddr_text(d.host_addr).c_str()); continue; }
-            d.host_last_heard = t;
             if (kind == K_WELCOME) {
                 if (d.welcomed || sender != 0) continue;
                 const uint8_t assigned = (uint8_t)r.u8();
                 uint8_t raw[16]; for (auto &b : raw) b = (uint8_t)r.u8();
                 const auto content = r.str();
-                if (!r.ok || assigned == 0 || assigned >= kMaxPlayers) continue;
+                if (!r.ok || r.p != r.e || assigned == 0 || assigned >= kMaxPlayers) continue;
                 if (content != d.checked_content.value) {
                     d.fail_guest_join("Game content does not match the host. Install the same gameplay mods.");
                     return;
                 }
+                d.host_activity.heard();
                 d.my_id = assigned;
                 d.welcomed = true;
                 if (d.relay.active()) {
@@ -2003,9 +2535,9 @@ void Session::poll() {
                 const auto phase_flags = r.u8();
                 const auto phase = phase_flags & 0x3f;
                 std::string event = r.str();
-                (void)r.u8(); // host AI count
+                const uint32_t remote_ai = r.u8(); // host AI count (0=OFF, 1..15, 16=FILL TO MAX)
                 const uint32_t count = r.u8();
-                if (!r.ok || phase > P_DONE || count < 2 || count > kMaxPlayers) continue;
+                if (!r.ok || phase > P_DONE || remote_ai > 16u || count < 2 || count > kMaxPlayers) continue;
                 std::vector<LobbyPlayer> players;
                 players.reserve(count);
                 bool seen[kMaxPlayers] = {};
@@ -2026,8 +2558,26 @@ void Session::poll() {
                 if (!r.ok || !seen[0] || !seen[d.my_id]) continue;
                 std::string track = r.str(); const uint8_t rules = r.u8(); const uint8_t capacity = r.u8();
                 uint8_t tune[netplay_hooks::TuneCount]; for (uint8_t &q : tune) q = (uint8_t)r.u8();
-                if (!r.ok || capacity < count || capacity > kMaxPlayers) continue;
+                maps::Offer remote;
+                uint8_t remote_preset = mutator::PRESET_STANDARD;
+                if (r.p != r.e) {
+                    remote.hash = r.str(); remote.size = r.u32(); remote.title = r.str();
+                    if (r.p != r.e) remote_preset = static_cast<uint8_t>(r.u8());
+                }
+                if (!r.ok || r.p != r.e || !remote.valid() || remote_preset >= mutator::preset_count() || capacity < count || capacity > kMaxPlayers) continue;
                 if (d.lobby_received && static_cast<int32_t>(stamp - d.last_host_ts) < 0) continue;
+                if (!d.lobby_received || stamp != d.last_host_ts) d.host_activity.heard();
+                if (remote.hash != d.maps.offer.hash) {
+                    if (in_event_ || d.pending_start) continue;
+                    d.guest_ready = false;
+                    std::string error;
+                    if (!d.maps.receive_offer(d.map_directory(), remote, error)) {
+                        d.fail_guest_join("Host map unavailable: " + error);
+                        return;
+                    }
+                    d.maps.last_progress = now_us();
+                    d.last_hb = 0;
+                }
                 d.last_host_ts = stamp;
                 d.host_clock.anchor(stamp, static_cast<uint32_t>(t / 1000));
                 d.host_phase = (uint8_t)phase;
@@ -2047,6 +2597,8 @@ void Session::poll() {
                 d.lobby_players = std::move(players);
                 d.lobby_event = std::move(event);
                 d.lobby_track = std::move(track);
+                d.lobby_gametype_preset = remote_preset;
+                d.lobby_ai_count = static_cast<int>(remote_ai);
                 if (!in_event_ && !d.pending_start) {
                     d.rules = rules;
                     for (int i = 0; i < netplay_hooks::TuneCount; ++i)
@@ -2064,17 +2616,41 @@ void Session::poll() {
                     for (const LobbyPlayer &player : d.lobby_players)
                         if (player.id == 0) { d.remember(player.name, d.join_secret); break; }
                 }
+            } else if (kind == K_MAP_CHUNK) {
+                if (!d.lobby_received || sender != 0 || d.maps.offer.hash == d.maps.verified) continue;
+                const auto hash = r.str(); const auto index = r.u32();
+                if (!r.ok || hash != d.maps.offer.hash) continue;
+                std::string error;
+                if (d.maps.download.accept(index, r.p, size_t(r.e - r.p), error)) {
+                    d.maps.last_progress = now_us();
+                    if (d.maps.download.complete() && d.maps.finish_download(error)) d.last_hb = 0;
+                }
+                if (!error.empty()) { d.fail_guest_join("Host map download failed: " + error); return; }
             } else if (kind == K_START) {
                 if (!d.lobby_received) continue;
                 uint32_t id = r.u32(); std::string ev = r.str(); uint32_t seed = r.u32(); std::string tr = r.str(); uint8_t rules = r.u8();
                 uint8_t tune[netplay_hooks::TuneCount]; for (uint8_t &q : tune) q = (uint8_t)r.u8();
                 const uint16_t participants = (uint16_t)r.u16();
-                if (r.ok && id > d.event_id && (participants & (1u << d.my_id))) {
+                const auto event_map = r.p == r.e ? std::string() : r.str();
+                const uint32_t has_mutator_byte = r.p == r.e ? 0u : r.u8();
+                if (r.ok && r.p == r.e && has_mutator_byte <= 1u && event_map == d.maps.verified && event_map == d.maps.offer.hash && id > d.event_id && (participants & (1u << d.my_id))) {
+                    if (!event_map.empty()) {
+                        const auto map = eod::vfs::active_map();
+                        auto *arena = map ? session_catalog::track_for_arena(map->base_arena) : nullptr;
+                        if (!arena || arena->name != tr || arena->human_battle_contest.empty() ||
+                            arena->human_battle_contest != ev) {
+                            d.fail_guest_join("The host map and its Battle event do not match.");
+                            return;
+                        }
+                    }
                     d.event_guest_mask = participants;
                     d.waiting_event = 0;
                     d.ensure_defaults();
                     for (int i = 0; i < netplay_hooks::TuneCount; ++i) d.tuning[i] = std::clamp(tune[i], netplay_hooks::tune_ranges[i].lo, netplay_hooks::tune_ranges[i].hi);
                     d.rules = rules; d.event_id = id; d.event_name = ev; d.pending_start = true; d.start_info = {ev, tr, id, seed, d.my_vehicle, false};
+                    d.event_has_mutator = (has_mutator_byte != 0);
+                    d.mutator_applied_event = 0;
+                    if (!d.event_has_mutator) mutator::engine().clear_config();
                     d.have_track = false; d.have_roster = false; d.go = false; d.grid_event = d.applied_grid_event = 0; d.initial_grid.clear(); d.grid_acks.clear(); d.car_done = false; d.loaded_sent = false; d.my_phase = P_LOBBY;
                     if (overlay_menu_open()) overlay_toggle();
                 }
@@ -2101,8 +2677,49 @@ void Session::poll() {
                 if (id == d.event_id && d.applied_grid_event == id) {
                     Writer ack; ack.u32(id); d.send_to(d.host_addr, K_GRID_ACK, d.my_id, ack);
                 }
+            } else if (kind == K_MUTATOR_CONFIG) {
+                const uint32_t id = r.u32();
+                mutator::GametypeConfig cfg;
+                if (r.ok && mutator::get_mutator_config(r, cfg) && r.p == r.e) {
+                    if (id == 0 && !in_event_) {
+                        // Pre-start lobby draft sync from Host -> Guest
+                        d.has_host_mutator_draft = true;
+                        Impl::populate_draft_from_config(d.host_mutator_draft, cfg, d.lobby_gametype_preset);
+                    } else if (id == d.event_id && d.event_has_mutator) {
+                        if (d.mutator_applied_event != id) {
+                            mutator::engine().set_config(cfg);
+                            d.mutator_applied_event = id;
+                        }
+                        Writer ack; ack.u32(id); d.send_to(d.host_addr, K_MUTATOR_CONFIG_ACK, d.my_id, ack);
+                    }
+                }
+            } else if (kind == K_MUTATOR_ROUND) {
+                const uint32_t id = r.u32();
+                mutator::RoundPacket pkt;
+                if (r.ok && id == d.event_id && in_event_ && d.bound && d.go &&
+                    mutator::get_mutator_round(r, pkt) && r.p == r.e) {
+                    const uint8_t prev_warp = mutator::engine().warp_gen();
+                    if (mutator::engine().apply_remote_round(pkt, d.tick) && pkt.warp_gen != prev_warp) {
+                        // Invalidate pre-warp impact checkpoints & puppet buffers
+                        d.predicted_impact_at = 0;
+                        d.impact_applied = d.impact_received;
+                        for (auto &kv : d.remote) kv.second.reset();
+                        d.shown.clear();
+                    }
+                    Writer ack; ack.u32(id); ack.u32(pkt.round_serial);
+                    d.send_to(d.host_addr, K_MUTATOR_ROUND_ACK, d.my_id, ack);
+                }
+            } else if (kind == K_MUTATOR_TRIGGER) {
+                const uint32_t id = r.u32();
+                mutator::TriggerSyncPacket pkt;
+                if (r.ok && id == d.event_id && in_event_ && d.bound && d.go &&
+                    mutator::get_mutator_triggers(r, pkt) && r.p == r.e) {
+                    mutator::engine().apply_remote_triggers(pkt);
+                }
             } else if (kind == K_GO) {
-                uint32_t id = r.u32(); if (r.ok && id == d.event_id && d.applied_grid_event == id) d.go = true;
+                uint32_t id = r.u32();
+                if (r.ok && id == d.event_id && d.applied_grid_event == id &&
+                    (!d.event_has_mutator || d.mutator_applied_event == id)) d.go = true;
             } else if (kind == K_END) {
                 uint32_t id = r.u32();
                 if (r.ok && id == d.event_id && d.pending_start) {
@@ -2191,7 +2808,9 @@ void Session::poll() {
                     slot != d.my_slot || revision <= d.impact_received) continue;
                 const DamageFeedback feedback{r.u32(), r.f32(), r.f32()};
                 const uint32_t life = d.completion_mode == EventCompletionMode::Battle ? r.u32() : 0;
-                if (sender != 0 || life != d.chicken_life(slot) || !r.ok || r.p != r.e || feedback.tick > revision ||
+                const uint32_t my_car = netplay_car::car_of_slot(slot);
+                const bool stale_warp = my_car && state.warp_gen != mutator_hooks::warp_gen_for_car(my_car);
+                if (sender != 0 || stale_warp || life != d.chicken_life(slot) || !r.ok || r.p != r.e || feedback.tick > revision ||
                     !(feedback.flash >= 0.f && feedback.flash <= .5f) ||
                     !(feedback.shake >= 0.f && feedback.shake <= .4f)) continue;
                 d.impact_feedback = feedback;
@@ -2200,16 +2819,21 @@ void Session::poll() {
             } else if (kind == K_SNAP) {
                 const uint32_t id = r.u32();
                 if (!r.ok || id != d.event_id || !in_event_ || !d.bound || !d.go) continue;
-                uint32_t n_cars = r.u8();
+                const uint32_t n_cars = r.u8();
+                if (sender != 0 || !n_cars || n_cars > d.roster.size()) continue;
+                bool valid = true;
                 for (uint32_t i = 0; i < n_cars && r.ok; ++i) {
                     uint8_t slot; uint32_t tick; netplay_car::State s;
-                    if (!get_car(r, slot, tick, s)) break;
+                    if (!get_car(r, slot, tick, s) || slot >= d.roster.size() || d.roster[slot].owner == d.my_id) {
+                        valid = false;
+                        break;
+                    }
                     if (netplay_impact_fixture::observation.started && slot < d.roster.size() &&
                         netplay_impact_fixture::pair_slot(d.roster[slot].owner) < netplay_impact_fixture::collider_count() && tick <= netplay_impact_fixture::kStartTick) continue;
-                    if (slot < d.roster.size() && d.roster[slot].owner != d.my_id &&
-                        (d.completion_mode != EventCompletionMode::Battle || tick > d.battle.seats[slot].spawn_tick))
+                    if (d.completion_mode != EventCompletionMode::Battle || tick > d.battle.seats[slot].spawn_tick)
                         d.remote[slot].push(tick, s);
                 }
+                if (valid && r.ok && r.p == r.e) d.host_activity.heard();
             } else if (kind == K_VOICE) {
                 d.voice.receive(sender, r.p, (size_t)(r.e - r.p));
             }
@@ -2240,7 +2864,7 @@ void Session::poll() {
         // timeouts
         for (auto &kv : d.peers) {
             Peer &p = kv.second;
-            if (p.alive && t - p.last_heard > kPeerTimeoutUs) {
+            if (p.alive && p.activity.expired()) {
                 p.alive = false; d.status = p.name + " lost connection";
                 std::fprintf(stderr, "[netplay] %s timed out\n", p.name.c_str());
                 d.release_driver(p);
@@ -2271,7 +2895,11 @@ void Session::poll() {
             for (auto &kv : d.peers) {
                 Peer &p = kv.second; if (!p.alive || p.waiting_event == d.event_id) continue;
                 if (!p.got_start || p.seen_event != d.event_id) {
-                    Writer w; w.u32(d.event_id); w.str(d.event_name, 40); w.u32(d.start_info.seed); w.str(d.start_info.track, 40); w.u8(d.rules); for (uint8_t q : d.tuning) w.u8(q); w.u16(d.event_guest_mask); d.send_to(p.addr, K_START, 0, w);
+                    Writer w; w.u32(d.event_id); w.str(d.event_name, 40); w.u32(d.start_info.seed); w.str(d.start_info.track, 40); w.u8(d.rules); for (uint8_t q : d.tuning) w.u8(q); w.u16(d.event_guest_mask); w.str(d.maps.offer.hash, 64); w.u8(d.event_has_mutator ? 1u : 0u); d.send_to(p.addr, K_START, 0, w);
+                }
+                if (d.event_has_mutator && d.mutator_acks[p.id] != d.event_id) {
+                    Writer mw; mw.u32(d.event_id); mutator::put_mutator_config(mw, mutator::engine().config());
+                    d.send_to(p.addr, K_MUTATOR_CONFIG, 0, mw);
                 }
                 if (d.have_track && !p.got_track) { Writer w; w.u32(d.event_id); w.str(d.track, 40); d.send_to(p.addr, K_TRACK, 0, w); }
                 if (d.have_roster && !p.got_roster) {
@@ -2285,6 +2913,41 @@ void Session::poll() {
                     d.send_to(p.addr, K_GRID, 0, grid);
                 }
                 if (d.go && !p.got_go) { Writer w; w.u32(d.event_id); d.send_to(p.addr, K_GO, 0, w); }
+            }
+        }
+        // Replicate host-authoritative micro-round transitions & role changes reliably (10 Hz until acked)
+        if (in_event_ && d.bound && d.go && d.event_has_mutator && mutator::engine().has_round_packet() &&
+            t - d.last_mutator_round_send >= 100000) {
+            const uint32_t serial = mutator::engine().round_serial();
+            bool any_pending = false;
+            for (const auto &kv : d.peers) {
+                const Peer &p = kv.second;
+                if (p.alive && p.waiting_event != d.event_id && d.mutator_round_acks[p.id] < serial) {
+                    any_pending = true; break;
+                }
+            }
+            if (any_pending) {
+                d.last_mutator_round_send = t;
+                Writer rw; rw.u32(d.event_id); mutator::put_mutator_round(rw, mutator::engine().latest_round_packet());
+                for (const auto &kv : d.peers) {
+                    const Peer &p = kv.second;
+                    if (p.alive && p.waiting_event != d.event_id && d.mutator_round_acks[p.id] < serial) {
+                        d.send_to(p.addr, K_MUTATOR_ROUND, 0, rw);
+                    }
+                }
+            }
+        }
+        // Replicate live trigger zones, shrinking storm radius, flag carrier & chain tethers (10 Hz)
+        if (in_event_ && d.bound && d.go && d.event_has_mutator &&
+            mutator::engine().has_live_sync_state() && t - d.last_mutator_trigger_send >= 100000) {
+            d.last_mutator_trigger_send = t;
+            Writer tw; tw.u32(d.event_id);
+            mutator::put_mutator_triggers(tw, mutator::engine().build_trigger_packet(d.tick));
+            for (const auto &kv : d.peers) {
+                const Peer &p = kv.second;
+                if (p.alive && p.waiting_event != d.event_id) {
+                    d.send_to(p.addr, K_MUTATOR_TRIGGER, 0, tw);
+                }
             }
         }
         // Results survive teardown and are resent until each peer returns to the lobby.
@@ -2322,6 +2985,19 @@ void Session::poll() {
             d.send_to(lo, K_BEACON, 0, w);
         }
     } else if (d.role == Impl::Role::Guest) {
+        if (d.lobby_received && d.maps.offer.hash != d.maps.verified) {
+            if (t > d.maps.last_progress && t - d.maps.last_progress > 30000000) {
+                d.fail_guest_join("Host map transfer stalled. Rejoin to try again.");
+                return;
+            }
+            const auto window = d.maps.download.window();
+            if (t >= d.maps.next_request || window.first >= d.maps.last_window + maps::window_chunks) {
+                Writer request; request.str(d.maps.offer.hash, 64); request.u32(window.first); request.u32(window.missing);
+                d.send_to(d.host_addr, K_MAP_REQUEST, d.my_id, request);
+                d.maps.last_window = window.first;
+                d.maps.next_request = t + 150000;
+            }
+        }
         if (!d.lobby_received && d.relay.ready() && !d.targets.empty() && !GarageRelay::relayed(d.targets.front()) &&
             d.handshake_started && t - d.handshake_started >= 2500000) {
             d.targets.assign(1, d.relay.peer(1));
@@ -2432,9 +3108,10 @@ void Session::poll() {
             w.u8((at_menu ? 1 : 0) | (d.have_track ? 2 : 0) | (d.have_roster ? 4 : 0) | (d.go ? 8 : 0) | ((d.event_id && (d.pending_start || in_event_ || d.my_phase != P_LOBBY)) ? 16 : 0) | (d.car_done ? 32 : 0) | ((d.waiting_event && d.waiting_event == d.event_id) ? 64 : 0));
             w.u32(d.last_host_ts);
             w.u32(++d.heartbeat_serial);
+            w.str(d.maps.verified, 64);
             d.send_to(d.host_addr, K_HEARTBEAT, d.my_id, w);
         }
-        if (t - d.host_last_heard > kPeerTimeoutUs) {
+        if (d.host_activity.expired()) {
             d.last_error = "Lost connection to the host.";
             d.retryable_loss = true;
             for (auto &kv : d.puppet_cars) netplay_car::set_puppet(kv.second, false);
@@ -2476,11 +3153,17 @@ void Session::menu_leave() { d_->in_menu = false; }
 uint16_t Session::menu_buttons() {
     Impl &d = *d_;
     if (netplay_hooks::title_screen && active()) return (d.inject_count++ % 12 < 3) ? 0x0008 : 0;
-    if (d.in_menu && !session_catalog::ready() && (d.role != Impl::Role::None || now_us() - d.ui_seen < 3000000)) { session_catalog::refresh(); d.ensure_defaults(); }
+    if (d.in_menu && !session_catalog::ready()) { session_catalog::refresh(); d.ensure_defaults(); }
     // A fast rematch may be requested while the native menu is still opening.
     // Pulse Confirm until the main selection actually exits its input loop.
-    if (!netplay_hooks::main_selection_active || (!d.pending_start && !in_event_) ||
-        d.abort_requested || d.role == Impl::Role::None) return 0;
+    if (!netplay_hooks::main_selection_active) return 0;
+    // Unified PLAY Hub offline/Career launch while native Main Menu selection loop is already running:
+    // pulse Confirm so f_00270C10_orig() exits and caller 0x002A16D8 dispatches the armed transition.
+    if (session_transition_pending()) {
+        const uint32_t c = d.inject_count++;
+        return ((c % 6) < 2) ? 0x4000 : 0;
+    }
+    if ((!d.pending_start && !in_event_) || d.abort_requested || d.role == Impl::Role::None) return 0;
     const uint32_t c = d.inject_count++;
     if ((c % 6) >= 2) return 0;
     StartInfo info;
@@ -2504,8 +3187,22 @@ bool Session::take_start(StartInfo &out) {
     d.name_geometry_ready = false;
     d.name_camera = {};
     names::on_world_view = nullptr;
-    if (names::enabled(d.event_name, d.rules))
-        names::on_world_view = [] { session().d_->name_camera = names::read_world_camera(); };
+    if (names::enabled(d.event_name, d.rules) || d.event_has_mutator) {
+        names::on_world_view = [] {
+            const names::Camera cam = names::read_world_camera();
+            session().d_->name_camera = cam;
+            auto &wc = mutator_hooks::world_camera;
+            for (int i = 0; i < 3; ++i) {
+                wc.position[i] = cam.position[i];
+                for (int j = 0; j < 3; ++j) wc.axes[i][j] = cam.axes[i][j];
+            }
+            wc.horizontal_scale = cam.horizontal_scale;
+            wc.vertical_scale = cam.vertical_scale;
+            wc.width = cam.width;
+            wc.height = cam.height;
+            wc.valid = cam.width > 0.f && cam.height > 0.f;
+        };
+    }
     d.tag_sight = {};
     d.my_phase = P_STARTED; d.tick = 0; d.bound = false; d.my_slot = -1; d.remote.clear(); d.puppet_cars.clear(); d.roster.clear(); d.have_roster = false;
     d.have_track = d.role == Impl::Role::Host ? false : false; d.strip.clear();
@@ -2812,6 +3509,7 @@ void Session::event_ended() {
     names::on_world_view = nullptr;
     Impl &d = *d_;
     netplay_hooks::detention_bus_slot = -1;
+    mutator::engine().reset_match();
     if (!in_event_) return;
     in_event_ = false;
     d.abort_requested = false;
@@ -3358,7 +4056,8 @@ void Session::step_begin() {
             d.grid_event = d.applied_grid_event = d.event_id;
             if (!wait_until([&] {
                     for (const auto &kv : d.peers) if (kv.second.alive && kv.second.waiting_event != d.event_id &&
-                        (kv.second.seen_event != d.event_id || kv.second.phase < P_LOADED || d.grid_acks[kv.first] != d.event_id)) return false;
+                        (kv.second.seen_event != d.event_id || kv.second.phase < P_LOADED || d.grid_acks[kv.first] != d.event_id ||
+                         (d.event_has_mutator && d.mutator_acks[kv.first] != d.event_id))) return false;
                     return true;
                 }, 45000, "Waiting for everyone to confirm the starting grid") || d.abort_requested) {
                 fail_grid("Not everyone confirmed a valid starting grid."); return;
@@ -3406,6 +4105,7 @@ void Session::step_begin() {
             std::fprintf(stderr, "[netplay-test] active type=%08x mode=%u participant_mask=%04x\n",
                          active_event, static_cast<unsigned>(d.completion_mode), participants);
         d.my_phase = P_RACING; d.bound = true; d.tick = 0;
+        mutator::engine().on_world_bound(d.event_id, d.start_info.seed, d.role == Impl::Role::Host, d.my_slot);
         if (netplay_impact_fixture::enabled() && (cars.size() == 2 || cars.size() == 3)) {
             auto &observation = netplay_impact_fixture::observation;
             observation = {};
@@ -3587,6 +4287,7 @@ void Session::step_begin() {
         netplay_car::write_condition(car, d.shown[kv.first]);
     }
     d.sync_chickens(); // replay at a world-step boundary, after placing all shooter bodies
+    mutator::engine().tick(d.tick);
     if (netplay_impact_fixture::enabled()) {
         const auto &obs = netplay_impact_fixture::observation;
         if (obs.started && obs.event == d.event_id && obs.tick <= 120 && d.role == Impl::Role::Host) {
@@ -3731,6 +4432,16 @@ void Session::step_end() {
     }
 }
 
+int Session::online_ai_override() const {
+    const Impl &d = *d_;
+    if (!in_event_ || d.role != Impl::Role::Host || d.human_battle()) return -1;
+    if (d.ai_count >= 16) {
+        const int humans = 1 + d.alive_count();
+        return std::max(0, static_cast<int>(d.capacity()) - humans);
+    }
+    return std::clamp(d.ai_count, 0, 15);
+}
+
 Session &session() { static Session s; return s; }
 namespace {
 const bool g_registered = [] {
@@ -3758,6 +4469,7 @@ const bool g_registered = [] {
     H::active = [] { return session().active(); };
     H::is_host = [] { return session().is_host(); };
     H::remote_humans = [] { return session().remote_humans(); };
+    H::online_ai_override = [] { return session().online_ai_override(); };
     H::roster_pre = [](uint32_t d) { session().roster_pre(d); };
     H::roster_post = [](uint32_t d) { session().roster_post(d); };
     return true;

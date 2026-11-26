@@ -25,6 +25,7 @@
 #include "core/cpu.h"
 #include "core/eodsave.h"
 #include "netplay_hooks.h"
+#include "mutator_hooks.h"
 #include "core/log.h"
 #include "core/memory.h"
 #include "funcs.h"
@@ -290,8 +291,10 @@ extern "C" void f_0018AFE0(void) {
 // This covers P1-P4 regardless of world slot, leaving AI damage native.
 // Existing damage and already detached panels are not repaired.
 static bool invincible_human(uint32_t car) {
-    return netplay_hooks::rule(netplay_hooks::Invincible, g_config.cheat_invincible) && car && !(car & 3) &&
-        car <= EE_RAM_SIZE - 0x1E4 && (ee_r32(car + 0x1E0) == 0x50 ||
+    if (!car || (car & 3) || car > EE_RAM_SIZE - 0x1E4) return false;
+    if (mutator_hooks::car_invincible(car)) return true;
+    return netplay_hooks::rule(netplay_hooks::Invincible, g_config.cheat_invincible) &&
+        (ee_r32(car + 0x1E0) == 0x50 ||
         (netplay_hooks::remote_driver_car && netplay_hooks::remote_driver_car(car)));
 }
 extern "C" void f_0018AD20_orig(void);
@@ -303,6 +306,16 @@ extern "C" void car_apply_collision_damage(void);  // 0x18CA98 as readable C++ (
 extern "C" void f_0018CA98(void) {
     const uint32_t car = g_ee.r[4].uw[0];
     if (!invincible_human(car)) {
+        if (const auto *slot_st = mutator_hooks::state_for_car(car)) {
+            const uint32_t saved_cheats = ee_r32(0x003C4190);
+            uint32_t masked = saved_cheats;
+            if (slot_st->feat_bits & mutator::FB_ONE_HIT_KILLS) masked |= 0x101u;
+            else masked &= ~0x100u;
+            if (masked != saved_cheats) ee_w32(0x003C4190, masked);
+            car_apply_collision_damage();
+            if (masked != saved_cheats) ee_w32(0x003C4190, (ee_r32(0x003C4190) & ~0x101u) | (saved_cheats & 0x101u));
+            return;
+        }
         car_apply_collision_damage();
         return;
     }
@@ -322,16 +335,27 @@ extern "C" void f_0018CA98(void) {
 // rest of that update intact, and preserve changes to every unrelated flag.
 extern "C" void f_001B5840_orig(void);
 extern "C" void f_001B5840(void) {
+    if (mutator_hooks::on_world_tick) mutator_hooks::on_world_tick();
     const uint32_t flags = ee_r32(0x003C4190);
     // The inline feat targets the selected driver, not every world car:
     // 1B5C00 indexes 485230 by 485280; driver+4 is its car.
     const uint32_t index = ee_r32(0x00485280), count = ee_r32(0x0048522C);
     const uint32_t driver = index < count && count <= 16 ? ee_r32(0x00485230 + index * 4) : 0;
     const uint32_t car = driver && !(driver & 3) && driver <= EE_RAM_SIZE - 8 ? ee_r32(driver + 4) : 0;
-    const bool suppress_timer = (flags & 0x40) && invincible_human(car);
-    if (suppress_timer) ee_w32(0x003C4190, flags & ~0x40u);
+    uint32_t desired = flags;
+    if (const auto *slot_st = mutator_hooks::state_for_car(car)) {
+        if ((slot_st->feat_bits & mutator::FB_DEADLY_AMBITION) && !invincible_human(car)) {
+            desired |= 0x41u;
+        } else {
+            desired &= ~0x40u;
+        }
+    } else if ((flags & 0x40u) && invincible_human(car)) {
+        desired &= ~0x40u;
+    }
+    const bool changed = (desired != flags);
+    if (changed) ee_w32(0x003C4190, desired);
     f_001B5840_orig();
-    if (suppress_timer) ee_w32(0x003C4190, ee_r32(0x003C4190) | 0x40u);
+    if (changed) ee_w32(0x003C4190, (ee_r32(0x003C4190) & ~0x41u) | (flags & 0x41u));
 }
 
 // Chicken weapon explosion shockwave handler (called on chicken detonation at 0x0017E7FC).
@@ -351,11 +375,19 @@ extern "C" void f_0017DA58(void) {
                 ee_rf(position + 4), ee_rf(position + 8),
                 g_ee.fpr[12].f, g_ee.fpr[13].f);
     }
-    if (netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale) > 0.0f && netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale) != 1.0f) {
-        g_ee.fpr[12].f *= netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale);
+    const int attacker_slot = static_cast<int>(g_ee.r[5].uw[0]);
+    const auto *slot_st = mutator_hooks::state_for_slot(attacker_slot);
+    const float radius_scale = slot_st
+        ? slot_st->traits.chicken_radius_scale
+        : netplay_hooks::tuned(netplay_hooks::ChickenSize, g_config.chicken_radius_scale);
+    const float force_scale = slot_st
+        ? slot_st->traits.chicken_force_scale
+        : netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale);
+    if (radius_scale > 0.0f && radius_scale != 1.0f) {
+        g_ee.fpr[12].f *= radius_scale;
     }
-    if (netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale) > 0.0f && netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale) != 1.0f) {
-        g_ee.fpr[13].f *= netplay_hooks::tuned(netplay_hooks::ChickenForce, g_config.chicken_force_scale);
+    if (force_scale > 0.0f && force_scale != 1.0f) {
+        g_ee.fpr[13].f *= force_scale;
     }
     const int authority = netplay_hooks::chicken_authority ? netplay_hooks::chicken_authority() : -1;
     if (authority == 0) return;
@@ -393,13 +425,51 @@ extern "C" void f_0018F2A8(void) {
             }
         }
     }
-    f_0018F2A8_orig();
+    const auto *pre_slot_st = (car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000) ? mutator_hooks::state_for_car(car) : nullptr;
+    if (pre_slot_st) {
+        const uint32_t saved_cheats = ee_r32(0x003C4190);
+        uint32_t masked = saved_cheats & ~0x9Bu;
+        const uint32_t fb = pre_slot_st->feat_bits;
+        if (fb & mutator::FB_TURBO) masked |= 0x03u;
+        if (fb & (mutator::FB_CHICKEN_STRAIGHT | mutator::FB_CHICKEN_MORTAR | mutator::FB_RAIN_CHICKENS)) {
+            masked |= 0x09u;
+            if ((fb & mutator::FB_CHICKEN_MORTAR) == mutator::FB_CHICKEN_MORTAR) masked |= 0x10u;
+            if (fb & mutator::FB_RAIN_CHICKENS) masked |= 0x80u;
+        }
+        ee_w32(0x003C4190, masked);
+        f_0018F2A8_orig();
+        ee_w32(0x003C4190, saved_cheats);
+    } else {
+        f_0018F2A8_orig();
+    }
     // The contestant table is in starting-grid order. Use the native human
     // input device to identify local pad zero, regardless of grid position.
     if (driver && !(driver & 3) && driver <= EE_RAM_SIZE - 0x38 && ee_r32(driver + 0x34) == 0) {
         pie_update_player(car);
     }
-    if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
+    const auto *slot_st = (car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000) ? mutator_hooks::state_for_car(car) : nullptr;
+    const bool turbo_allowed = slot_st
+        ? ((slot_st->feat_bits & mutator::FB_TURBO) != 0)
+        : netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo);
+    if (slot_st && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
+        (std::fabs(slot_st->traits.torque_scale - 1.0f) > 0.01f || std::fabs(slot_st->traits.top_speed_scale - 1.0f) > 0.01f)) {
+        const float gas = ee_rf(car + 0x1B70);
+        if (gas > 0.1f) {
+            const float fx = ee_rf(car + 0x7C), fy = ee_rf(car + 0x80), fz = ee_rf(car + 0x84);
+            const float vx = ee_rf(car + 0x104), vy = ee_rf(car + 0x108), vz = ee_rf(car + 0x10C);
+            const float fwd_spd = vx * fx + vy * fy + vz * fz;
+            const float cap = 44.444447f * slot_st->traits.top_speed_scale;
+            if (fwd_spd < cap) {
+                const float extra = (slot_st->traits.torque_scale - 1.0f) * 14.0f * gas * (1.0f / 60.0f);
+                if (extra != 0.0f) {
+                    ee_wf(car + 0x104, vx + fx * extra);
+                    ee_wf(car + 0x108, vy + fy * extra);
+                    ee_wf(car + 0x10C, vz + fz * extra);
+                }
+            }
+        }
+    }
+    if (turbo_allowed && car && !(car & 3) && car <= EE_RAM_SIZE - 0x2000 &&
         driver && !(driver & 3) && driver <= EE_RAM_SIZE - 4) {
         uint32_t vtbl = ee_r32(driver);
         uint32_t is_l2_fn = (vtbl && !(vtbl & 3) && vtbl <= EE_RAM_SIZE - 0x30) ? ee_r32(vtbl + 0x2C) : 0;
@@ -414,8 +484,11 @@ extern "C" void f_0018F2A8(void) {
 
         const uint32_t cheats = ee_r32(0x003C4190);
         if (l2_pressed) {
+            const float scale = slot_st
+                ? std::max(slot_st->traits.top_speed_scale, 1.25f)
+                : netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale);
             // Turbo boost while L2 is held:
-            if (netplay_hooks::rule(netplay_hooks::Turbo, g_config.cheat_turbo) && (cheats & 0x3) == 0x3 && netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale) > 1.0f) {
+            if ((slot_st || (cheats & 0x3) == 0x3) && scale > 1.0f) {
                 float fwd_x = ee_rf(car + 0x7C);
                 float fwd_y = ee_rf(car + 0x80);
                 float fwd_z = ee_rf(car + 0x84);
@@ -425,10 +498,10 @@ extern "C" void f_0018F2A8(void) {
                 float vel_z = ee_rf(car + 0x10C);
 
                 float forward_speed = vel_x * fwd_x + vel_y * fwd_y + vel_z * fwd_z;
-                float speed_cap = 44.444447f * netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale);
+                float speed_cap = 44.444447f * scale;
 
                 if (forward_speed < speed_cap) {
-                    float extra_accel = (netplay_hooks::tuned(netplay_hooks::TurboStrength, g_config.turbo_scale) - 1.0f) * 20.0f;
+                    float extra_accel = (scale - 1.0f) * 20.0f;
                     float dt = 1.0f / 60.0f;
                     ee_wf(car + 0x104, vel_x + fwd_x * extra_accel * dt);
                     ee_wf(car + 0x108, vel_y + fwd_y * extra_accel * dt);
@@ -508,12 +581,28 @@ extern "C" void f_0017E000(void) {
         }
     }
     const uint32_t iface = arg_u32(0), car = arg_u32(1), input = arg_u32(2);
+    if (mutator_hooks::suppress_weapons) return;
     const int authority = netplay_hooks::chicken_authority ? netplay_hooks::chicken_authority() : -1;
     if (authority >= 0 && netplay_car::is_puppet(car)) return;
     const bool capture = authority >= 0 && netplay_hooks::chicken_launch &&
         iface > chicken_weapon::kInterface && chicken_weapon::valid(iface - chicken_weapon::kInterface, 0x228) &&
         chicken_weapon::valid(input, 4) && ee_r32(iface + 4) == 2 && ee_r32(input);
-    f_0017E000_orig();
+    const auto *slot_st = mutator_hooks::state_for_car(car);
+    if (slot_st) {
+        const uint32_t saved_cheats = ee_r32(0x003C4190);
+        uint32_t masked = (saved_cheats & ~0x98u);
+        const uint32_t fb = slot_st->feat_bits;
+        if (fb & (mutator::FB_CHICKEN_STRAIGHT | mutator::FB_CHICKEN_MORTAR | mutator::FB_RAIN_CHICKENS)) {
+            masked |= 0x09u;
+            if ((fb & mutator::FB_CHICKEN_MORTAR) == mutator::FB_CHICKEN_MORTAR) masked |= 0x10u;
+            if (fb & mutator::FB_RAIN_CHICKENS) masked |= 0x80u;
+        }
+        ee_w32(0x003C4190, masked);
+        f_0017E000_orig();
+        ee_w32(0x003C4190, saved_cheats);
+    } else {
+        f_0017E000_orig();
+    }
     if (capture) {
         const uint32_t body = iface - chicken_weapon::kInterface;
         if (!ee_r32(body + 0x1F4)) return;
@@ -536,8 +625,13 @@ extern "C" void f_0017E4D8(void) {
     const uint32_t body = g_ee.r[4].uw[0];
     f_0017E4D8_orig();
     if (!body || (body & 3) || body > EE_RAM_SIZE - 0x1E8) return;
-    // Reload time: 3 s natively; the player's setting, or the lobby's during an online event.
-    const float reload = netplay_hooks::tuned(netplay_hooks::ChickenReload, g_config.chicken_reload);
+    // Reload time: 3 s natively; per-slot mutator trait if active, else lobby/personal setting.
+    float reload = netplay_hooks::tuned(netplay_hooks::ChickenReload, g_config.chicken_reload);
+    if (body <= EE_RAM_SIZE - 0x1EC) {
+        if (const auto *slot_st = mutator_hooks::state_for_slot(static_cast<int>(ee_r32(body + 0x1E8)))) {
+            reload = slot_st->traits.chicken_reload_sec;
+        }
+    }
     const uint32_t cheats = ee_r32(0x003C4190);
     if ((cheats & 0x9) == 0x9 && reload == 3.0f) return;   // native already wrote exactly this
     ee_w32(body + 0x1E0, 0);
@@ -609,8 +703,11 @@ void game_patches_vblank() {
 
     // Track button suppression to protect driving and pause menus
     s_suppressed_pad0_buttons = 0;
-    if (netplay_hooks::event_active && netplay_hooks::event_active()) {
-        // Suppress native PS2 freeze-pause (PAD_START) during an online race; START opens the live overlay instead.
+    const bool in_unified_gameplay = g_config.unified_frontend && g_ram &&
+        (ee_r32(0x00437BB8) != 0 || ee_r32(0x003CDA04) != 0);
+    if ((netplay_hooks::event_active && netplay_hooks::event_active()) || in_unified_gameplay) {
+        // Suppress native PS2 freeze-pause (PAD_START) during online races and Unified Front-End
+        // gameplay; START opens Screen D Quick Pause Rail instead.
         s_suppressed_pad0_buttons |= PAD_START;
     }
 

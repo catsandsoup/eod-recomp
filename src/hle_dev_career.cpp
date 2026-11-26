@@ -18,15 +18,22 @@ void f_002D58E8_orig(void);
 }
 
 extern "C" void f_002D58E8(void) {
-    static bool done = false;
-    // EOD_CAREER_EVE=<n>, or eve=<n> in a Career direct start (EOD_DIRECT_START="mode=career;eve=<n>").
+    static bool env_done = false;
+    // EOD_CAREER_EVE=<n>, eve=<n> in EOD_DIRECT_START, or resettable PendingCareerWarp::target_eve.
     const char *text = std::getenv("EOD_CAREER_EVE");
-    const SessionRequest *warp = career_warp_request();
-    const bool wanted = (text && *text) || (warp && warp->eve >= 0);
-    if (!done && wanted) {
-        done = true;
-        const uint32_t eve = (warp && warp->eve >= 0) ? static_cast<uint32_t>(warp->eve)
-                                                       : static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
+    const SessionRequest *warp_req = career_warp_request();
+    PendingCareerWarp &pending = career_warp_state();
+    int target_eve = -1;
+    if (pending.target_eve >= 0) {
+        target_eve = pending.target_eve;
+        pending.target_eve = -1;
+    } else if (!env_done && ((text && *text) || (warp_req && warp_req->eve >= 0))) {
+        env_done = true;
+        target_eve = (warp_req && warp_req->eve >= 0) ? warp_req->eve
+                                                      : static_cast<int>(std::strtoul(text, nullptr, 0));
+    }
+    if (target_eve >= 0) {
+        const uint32_t eve = static_cast<uint32_t>(target_eve);
         ee_w32(0x004AAFC8, eve);  // chosen Eve (read by 0x2E2F28)
         ee_w32(0x004AAFCC, 1);    // its "chosen" flag (set by 0x2E2F38)
         std::fprintf(stderr, "[CAREER_EVE] entering Eve %u\n", eve);

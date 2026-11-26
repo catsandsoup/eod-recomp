@@ -4,6 +4,8 @@
 #include "core/cpu.h"
 #include "core/memory.h"
 #include <cstdio>
+int battle_events_begin_blank_map(uint32_t) { return -1; }
+void battle_events_end_blank_map() {}
 EEState g_ee{};
 uint8_t *g_ram = nullptr;
 [[noreturn]] void fatal(const char *, ...) { std::abort(); }  // developer EOD_FATAL_TEST path; never reached here
@@ -37,6 +39,9 @@ uint64_t kernel_vblank_count() { return 0; }
 void arcade_mod_badges_run_menu(uint32_t, void (*run_menu)()) { run_menu(); }
 extern "C" {
 }
+extern "C" {
+void f_00270C10(void);
+}
 int main() {
     using session_catalog::is_online_driver_choice;
     CHECK(is_online_driver_choice({14, "Moth", 0}));
@@ -60,7 +65,7 @@ int main() {
     CHECK(!session_parse("track=Anoka;event=No-Rules Race;car=Phantom;laps=51", r, e));
     CHECK(!session_parse("track=Anoka;event=No-Rules Race;car=Phantom;laps=1.5", r, e));
     CHECK(!session_parse("mode=career;laps=5", r, e));
-    CHECK(!session_parse("track=Anoka;event=No-Rules Race;car=Phantom;humans=2;laps=5", r, e));
+    CHECK(session_parse("track=Anoka;event=No-Rules Race;car=Phantom;humans=2;laps=5", r, e) && r.humans == 2 && r.laps == 5);
     CHECK(!session_parse("track=Anoka;event=x;car=y;bogus=1", r, e));
     CHECK(!session_parse("mode=career;track=a;event=b;car=c", r, e));
     CHECK(session_parse("mode=career", r, e) && r.mode == "career" && r.place == "home" && r.eve == -1);
@@ -72,8 +77,75 @@ int main() {
     CHECK(!session_parse("mode=career;eve=99", r, e));
     CHECK(!session_parse("track=a;event=b;car=c;place=home", r, e));
     CHECK(session_parse("track=a;event=b;car=c;humans=2", r, e) && r.humans == 2);
-    CHECK(!session_parse("track=a;event=b;car=c;humans=2;ai=0", r, e));
+    CHECK(session_parse("track=a;event=b;car=c;humans=2;ai=4", r, e) && r.humans == 2 && r.ai == 4);
     CHECK(!session_parse("track=a;event=b;car=c;humans=5", r, e));
     CHECK(!session_parse("track=a;event=b", r, e));
+
+    // PendingOfflineMatch lifecycle & session_ai_override
+    PendingOfflineMatch off;
+    off.track = "Anoka";
+    off.event = "Battle";
+    off.humans = 4;
+    off.ai_bots = 8;
+    off.laps = 5;
+    off.gametype_preset = 2;
+    session_set_pending_offline(off);
+    CHECK(session_pending_offline().active);
+    CHECK(session_ai_override() == 8);
+    session_clear_pending_offline();
+    CHECK(!session_pending_offline().active);
+    CHECK(session_ai_override() == -1);
+
+    // Resettable PendingCareerWarp lifecycle
+    career_warp_arm(3, 5, 10);
+    CHECK(career_warp_state().active && career_warp_state().target_place == 3 && career_warp_state().target_eve == 5);
+    career_warp_clear();
+    CHECK(!career_warp_state().active && career_warp_state().target_place == -1);
+
+    // Mock Career & Action state unwind -> MainMenu (0x002A1298)
+    std::vector<uint8_t> ram(EE_RAM_SIZE, 0);
+    g_ram = ram.data();
+    ee_w32(0x003C4C04, 0x130); // Career mode
+    ee_w32(0x003CDA04, 0x10000); // HomeDriver active (CareerRoam)
+    ee_w32(0x003D937C, 1); // New Career flag
+    CHECK(session_ee_state() == EEStateKind::CareerRoam);
+
+    SessionTransition tr;
+    tr.target = TransitionTarget::Hub;
+    session_request_transition(tr);
+    CHECK(session_unwind_active());
+    CHECK(ee_r32(0x003D937C) == 0); // Cleared for clean exit
+
+    // Career Hub MenuRun (0x0036AB8C) must return 7 (Exit Career)
+    g_ee.r[31].ud[0] = 0x0036AB8C;
+    f_00270C10();
+    CHECK(g_ee.r[2].sw[0] == 7);
+
+    // Career Exit confirm dialog (0x00272030) must return -2 (Yes)
+    g_ee.r[31].ud[0] = 0x00272030;
+    f_00270C10();
+    CHECK(g_ee.r[2].sw[0] == -2);
+
+    // EveHasMoreEvents (0x00120FB8) must return 0 during unwind
+    f_00120FB8();
+    CHECK(g_ee.r[2].sw[0] == 0);
+
+    // Simulate CareerRun teardown clearing HomeDriver (0x003CDA04) and restoring kMode=0x12F
+    ee_w32(0x003CDA04, 0);
+    ee_w32(0x003C4C04, 0x12F);
+    // Reaching f_002A1298 clears unwind flags
+    f_002A1298();
+    CHECK(!session_unwind_active());
+    CHECK(session_ee_state() == EEStateKind::MainMenu);
+
+    // Synchronous Main Menu Career transition returns 15 without pulsing CROSS
+    SessionTransition go_career;
+    go_career.target = TransitionTarget::Career;
+    session_request_transition(go_career);
+    g_ee.r[31].ud[0] = 0x002A16D8;
+    f_00270C10();
+    CHECK(g_ee.r[2].sw[0] == 15);
+    session_cancel_transition();
+    g_ram = nullptr;
     return failures ? 1 : 0;
 }

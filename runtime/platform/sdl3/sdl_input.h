@@ -21,7 +21,7 @@
 
 namespace sdl_input {
 
-constexpr int kPorts = 2;
+constexpr int kPorts = 4;
 
 // SDL hints for HIDAPI (Xbox 360 pads over libusb on macOS); call before SDL_Init.
 void set_hints();

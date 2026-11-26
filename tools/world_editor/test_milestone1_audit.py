@@ -16,7 +16,7 @@ Covers every item in docs/WORLD_EDITOR_LIFECYCLE_AUDIT.md Executive Diagnosis & 
   12. Tab transform tool cycle (Move -> Rotate -> Scale) + Ghost R shortcut priority
   13. Remembered mod output dir, dirty guards on destructive actions, zero disc/mods/ pollution
   14. Cars (0) category filter ('car-wreck') + post-PIE car catalog restart
-  15. Custom Spawn Point (EOD_SPAWN_POS / Play From Camera) + 6-DOF Free Cam & live control
+  15. Custom Spawn Point (portable map / Play From Camera) + 6-DOF Free Cam & live control
   16. Section 1.1: macOS/Windows resolve_eod_exe & GAME_EXE_LABEL + unified macOS AppData helper
 """
 
@@ -384,7 +384,7 @@ class TestMilestone1Audit(unittest.TestCase):
             vp.close()
 
     # ------------------------------------------------------------------
-    # Audit #12: Tab cycles Move -> Rotate -> Scale + Ghost R priority
+    # Audit #12: Tab toggles drawers + Ghost R priority
     # ------------------------------------------------------------------
     def test_12_tab_tool_cycle_and_ghost_rotate_priority(self) -> None:
         app = _qapp()
@@ -394,10 +394,11 @@ class TestMilestone1Audit(unittest.TestCase):
                 win.select_tool("move")
                 self.assertEqual(win.viewport.active_tool, "move")
 
-                for expected in ("rotate", "scale", "move"):
+                for drawers_open in (True, False):
                     ev_tab = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Tab, Qt.KeyboardModifier.NoModifier)
                     app.sendEvent(win.viewport, ev_tab)
-                    self.assertEqual(win.viewport.active_tool, expected)
+                    self.assertEqual(any(win._side_panel_requests.values()), drawers_open)
+                    self.assertEqual(win.viewport.active_tool, "move")
 
                 self.assertTrue(win.act_tool_move.isChecked())
 
@@ -441,7 +442,7 @@ class TestMilestone1Audit(unittest.TestCase):
             self.assertNotIn("disc/mods", txt, f"Found disc/mods hardcode in {py.name}")
 
     # ------------------------------------------------------------------
-    # Audit #15: EOD_SPAWN_POS (Play From Camera) & 6-DOF Free Cam
+    # Audit #15: Portable map preview & 6-DOF Free Cam
     # ------------------------------------------------------------------
     def test_15_custom_spawn_pos_and_6dof_free_cam(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,9 +452,9 @@ class TestMilestone1Audit(unittest.TestCase):
                 mode="free_roam",
                 free_cam=True,
                 arcade_mode="tag",
-                spawn_pos=(12.5, 3.25, -44.0, 135.0),
+                map_path=tdir / "test.eodmap",
             )
-            self.assertEqual(spec["env"]["EOD_SPAWN_POS"], "12.500,3.250,-44.000,135.00")
+            self.assertEqual(spec["args"][spec["args"].index("--map") + 1], str(tdir / "test.eodmap"))
             self.assertEqual(spec["env"]["EOD_FREE_CAM"], "1")
             self.assertEqual(spec["env"]["EOD_ARCADE_MODE"], "tag")
 
@@ -462,7 +463,7 @@ class TestMilestone1Audit(unittest.TestCase):
         bot_src = (REPO_ROOT / "src" / "battle_bots.cpp").read_text(encoding="utf-8")
         self.assertIn("free_cam", cam_src.lower())
         self.assertIn("free_cam", drv_src)
-        self.assertIn("EOD_SPAWN_POS", bot_src)
+        self.assertIn("active_map()", bot_src)
 
     # ------------------------------------------------------------------
     # Section 1.1: macOS resolve_eod_exe / zero eod.exe label + unified AppData helper

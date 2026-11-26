@@ -1,4 +1,5 @@
 #include "netplay_car.h"
+#include "mutator_hooks.h"
 #include "../runtime/core/memory.h"
 #include <algorithm>
 #include <cmath>
@@ -23,7 +24,7 @@ bool is_human(uint32_t car) { return valid(car, 0x1C34) && ee_r32(car + kType) =
 
 uint32_t attached_trailer(uint32_t tow_car) {
     const uint32_t entities = ee_r32(0x3CE548);
-    if (!valid(tow_car, 0x1C34) || entities > 20) return 0;
+    if (!valid(tow_car, 0x1C34) || entities > 32) return 0;
     uint32_t found = 0;
     for (uint32_t i = 0; i < entities; ++i) {
         const uint32_t entity = ee_r32(0x3CE4F8 + 4 * i);
@@ -44,7 +45,7 @@ uint32_t body_of(uint32_t car) {
     // pointer table. The old address scan could find only body zero.
     const uint32_t count = ee_r32(0x3CE548), body_count = ee_r32(0x494D28);
     const uint32_t base = ee_r32(0x494D30);
-    if (!count || count > 20 || body_count != count || !valid(base, count * 0xB0)) return 0;
+    if (!count || count > 32 || body_count != count || !valid(base, count * 0xB0)) return 0;
     for (uint32_t i = 0; i < count; ++i)
         if (ee_r32(0x3CE4F8 + 4 * i) == car) return base + i * 0xB0;
     return 0;
@@ -74,6 +75,7 @@ bool read(uint32_t car, State &s) {
     s.steer = rf(car + kSteer); s.gas = rf(car + kGas); s.brake = rf(car + kBrake); s.handbrake = rf(car + kHandbrake);
     s.gear = (int32_t)ee_r32(car + kGear); s.damage = rf(car + kDamage);
     s.damage_stage = ee_r32(car + 0x1BE8);
+    s.warp_gen = mutator_hooks::warp_gen_for_car(car);
     return valid_state(s);
 }
 void matrix_to_quat(const float m[9], float q[4]) {
@@ -162,12 +164,20 @@ void Remote::push(uint32_t tick, const State &s) {
     // Event changes reset this timeline explicitly. A very late UDP packet in
     // the same event must never masquerade as a restarted sender clock.
     if (!ring_.empty() && tick <= ring_.back().tick) return;
-    if (stalled()) {
+    if (warp_gen_init_ && s.warp_gen != warp_gen_) {
+        // Atomic coordinate warp: flush interpolation history so the remote
+        // puppet snaps cleanly to its new position instead of streaking across the arena.
+        ring_.clear();
+        head_init_ = false;
+        shown_init_ = false;
+    } else if (stalled()) {
         // The native body has moved during the gap. Resume from that body
         // without interpolating through poses from before the outage.
         ring_.clear();
         head_init_ = false;
     }
+    warp_gen_init_ = true;
+    warp_gen_ = s.warp_gen;
     steps_since_sample_ = 0;
     ring_.push_back({tick, s});
     if (ring_.size() > 90) ring_.erase(ring_.begin(), ring_.begin() + 30);

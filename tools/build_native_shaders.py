@@ -40,9 +40,29 @@ MODERN_ENTRIES = [
 ]
 SUN_SRC = os.path.join(ROOT, "runtime", "render", "native_sun_cascades.hlsl")
 SUN_OUT = os.path.join(ROOT, "runtime", "render", "native_sun_cascades_spv.inc")
-SUN_ENTRIES = [("vs_sun_caster", "vs"), ("vs_sun_receiver", "vs"), ("ps_sun_receiver", "ps")]
+SUN_ENTRIES = [
+    ("vs_sun_caster", "vs"),
+    ("vs_sun_caster_ate", "vs"),
+    ("ps_sun_caster_ate", "ps"),
+    ("vs_sun_receiver", "vs"),
+    ("ps_sun_receiver", "ps"),
+]
+POST_SRC = os.path.join(ROOT, "runtime", "render", "native_post.hlsl")
+POST_OUT = os.path.join(ROOT, "runtime", "render", "native_post_spv.inc")
+POST_ENTRIES = [
+    ("vs_post_quad", "vs"),
+    ("ps_gtao_contact", "ps"),
+    ("ps_ao_blur", "ps"),
+    ("ps_hdr_atmo", "ps"),
+    ("ps_taa_resolve", "ps"),
+    ("ps_bloom_prefilter", "ps"),
+    ("ps_bloom_down", "ps"),
+    ("ps_bloom_up", "ps"),
+    ("ps_auto_exposure", "ps"),
+    ("ps_remaster_composite", "ps"),
+]
 JOBS = {"classic": (SRC, OUT, ENTRIES), "modern": (MODERN_SRC, MODERN_OUT, MODERN_ENTRIES),
-        "sun": (SUN_SRC, SUN_OUT, SUN_ENTRIES)}
+        "sun": (SUN_SRC, SUN_OUT, SUN_ENTRIES), "post": (POST_SRC, POST_OUT, POST_ENTRIES)}
 
 
 def main():

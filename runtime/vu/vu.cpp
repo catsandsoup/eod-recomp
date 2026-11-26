@@ -32,6 +32,7 @@
 #include <cstdlib>
 
 #include "../core/log.h"
+#include "../core/cpu.h"
 #include "../gs/gs.h"
 #include "../hw/offload.h"
 #include "../kernel/kernel.h"
@@ -93,6 +94,13 @@ inline uint32_t f2u(float f) {
     memcpy(&u, &f, 4);
     return u;
 }
+
+// FMAC results are readable 4 cycles after issue: slot (cycle & 3) holds the
+// VF components written by the pair issued at `stamp`.
+struct Scoreboard {
+    uint64_t lo[4], hi[4], stamp[4];
+};
+Scoreboard g_score[2];
 
 #ifndef EOD_R7_RELEASE
 struct Ctx {
@@ -531,6 +539,8 @@ void upper(Ctx &c, uint32_t ins) {
     }
 }
 
+#endif
+
 // --------------------------------------------------------------- lower
 inline uint8_t *vu_qword(VUState *vu, uint32_t addr_qw) {
     if (vu->index == 0 && (addr_qw & 0x400)) {
@@ -548,8 +558,6 @@ inline void set_vi(VUState *vu, int r, uint32_t v) {
 
 inline int16_t vis(VUState *vu, int r) { return (int16_t)vu->vi[r]; }
 
-#endif
-
 __attribute__((always_inline)) inline void sync_pipes(VUState *vu) {
     if (vu->q_busy && vu->cycle >= vu->q_ready) {
         vu->q = vu->q_pending;
@@ -561,7 +569,6 @@ __attribute__((always_inline)) inline void sync_pipes(VUState *vu) {
     }
 }
 
-#ifndef EOD_R7_RELEASE
 void q_pipeline_set(VUState *vu, float v, int latency) {
     if (vu->q_busy) {  // divider busy: stall until the previous result is out
         if (vu->cycle < vu->q_ready) vu->cycle = vu->q_ready;
@@ -572,6 +579,7 @@ void q_pipeline_set(VUState *vu, float v, int latency) {
     vu->q_busy = 1;
 }
 
+#ifndef EOD_R7_RELEASE
 void p_pipeline_set(VUState *vu, float v, int latency) {
     if (vu->p_busy) {
         if (vu->cycle < vu->p_ready) vu->cycle = vu->p_ready;
@@ -600,7 +608,6 @@ void flush_p(VUState *vu) {
     }
 }
 
-#ifndef EOD_R7_RELEASE
 // DIV / SQRT / RSQRT on the selected fields' values
 void lower_div_f(VUState *vu, int kind, float fs, float ft) {
     fs = vu_clamp(fs);
@@ -634,6 +641,7 @@ void lower_div_f(VUState *vu, int kind, float fs, float ft) {
     vu->status |= (vu->status & 0x30) << 6;
 }
 
+#ifndef EOD_R7_RELEASE
 void lower_div(VUState *vu, uint32_t ins, int kind) {
     int fsf = (ins >> 21) & 3, ftf = (ins >> 23) & 3;
     lower_div_f(vu, kind, vu->vf[FS(ins)].f[fsf], vu->vf[FT(ins)].f[ftf]);
@@ -1067,13 +1075,6 @@ inline void reg_bits(int reg, int mask, uint64_t &lo, uint64_t &hi) {
     else hi |= (uint64_t)(mask & 15) << ((reg - 16) * 4);
 }
 
-// FMAC results are readable 4 cycles after issue: slot (cycle & 3) holds the
-// VF components written by the pair issued at `stamp`.
-struct Scoreboard {
-    uint64_t lo[4], hi[4], stamp[4];
-};
-Scoreboard g_score[2];
-
 void decode_pair(DecPair &d, uint32_t lo, uint32_t hi) {
     d.lo = lo;
     d.hi = hi;
@@ -1239,6 +1240,8 @@ struct VuProg {
 };
 }  // namespace
 
+#endif
+
 // Scoreboard stall / write for compiled code (same as vu_interp's).
 #define VU_STALL(ulo, uhi)                                                                    \
     do {                                                                                      \
@@ -1296,11 +1299,11 @@ struct VuProg {
 #endif
 #endif
 
-#ifdef VU_REC
 namespace {
 // Helpers for the compiled programs: upper FMAC results as SSE vectors
 // (same IEEE single operations as apply_t, lanes with an Inf/NaN result
 // redone by the scalar code), committed under the dest mask.
+#ifdef VU_REC
 alignas(16) const uint32_t g_vu_dmask[16][4] = {
 #define M(d) {(d) & 8 ? ~0u : 0u, (d) & 4 ? ~0u : 0u, (d) & 2 ? ~0u : 0u, (d) & 1 ? ~0u : 0u}
     M(0), M(1), M(2), M(3), M(4), M(5), M(6), M(7), M(8), M(9), M(10), M(11), M(12), M(13), M(14), M(15)
@@ -1355,6 +1358,8 @@ __attribute__((always_inline)) inline void vu_store(float *dst, __m128 v) {
         _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(m, v), _mm_andnot_ps(m, _mm_loadu_ps(dst))));
     }
 }
+
+#endif
 
 __attribute__((always_inline)) inline void vu_flags(VUState *vu, __m128 v, int dest) {
     VUReg r;
@@ -1503,6 +1508,13 @@ __attribute__((always_inline)) inline void vu_clip_v(VUState *vu, __m128 sv, __m
     vu_flag_push(vu, 1, f);
 }
 
+// Single-entry translation of the strip producer's ELF payload. All branches
+// and arithmetic are compiled, including the E-bit delay and Q/flag latency.
+#include "ribbon_strip.inc"
+}  // namespace
+
+#ifdef VU_REC
+namespace {
 // VUREC_COUNT=1 tools/vurecomp.py: counts block executions (printed by --vu-bench)
 struct BlkStat {
     uint64_t hits, pairs;
@@ -1569,6 +1581,7 @@ static bool sb_same(const Scoreboard &a, const Scoreboard &b, uint64_t cycle) {
 }
 #endif
 
+#ifndef EOD_R7_RELEASE
 // EOD_VU_REC=file [EOD_VU_REC_AT=vblank] [EOD_VU_REC_N=n]: records the state
 // before each micro program run (n runs from that vblank on) for
 // --vu-bench, which replays them and times the micro programs alone.
@@ -2627,6 +2640,47 @@ static Scoreboard vehicle_return_score(uint64_t end) {
 
 #endif
 
+extern "C" void eod_vu0_interlock(void) {
+    flush_q(&g_vu0);
+    flush_p(&g_vu0);
+}
+
+extern "C" void eod_ribbon_next_vertex(void) {
+    eod_vu0_interlock();
+    for (int vf = 1; vf <= 2; ++vf) {
+        const uint32_t source = g_vu0.vi[2];
+        memcpy(&g_vu0.vf[vf], vu_qword(&g_vu0, source), sizeof(VUReg));
+        set_vi(&g_vu0, 2, source + 1);
+    }
+}
+
+extern "C" int eod_ribbon_strip_build(void) {
+    // Only the first 520 bytes are uploaded. Other resident programs can
+    // change the unused tail of VU0 micro memory between consecutive runs.
+    static uint32_t generation = ~0u;
+    static bool matches;
+    if (generation != g_vu_micro_gen[0]) {
+        uint64_t hash = 0xcbf29ce484222325ull;
+        for (unsigned i = 0; i < 65 * 8; ++i)
+            hash = (hash ^ g_vu0.micro[i]) * 0x100000001b3ull;
+        matches = hash == 0xb9d3382219d4dc97ull;
+        generation = g_vu_micro_gen[0];
+    }
+#ifndef EOD_R7_RELEASE
+    if (vu_dispatch_observed()) {
+        vu0_macro(0x4A000038);
+        return 0;
+    }
+#endif
+    if (!matches) {
+        vu0_macro(0x4A000038);
+        return 0;
+    }
+    eod_vu0_interlock();
+    ribbon_strip(&g_vu0);
+    return 1;
+}
+
 extern "C" void eod_vehicle_physics_step(void) {
     VUState& vu = g_vu0;
 #ifdef EOD_R7_RELEASE
@@ -2672,7 +2726,13 @@ extern "C" void eod_vehicle_physics_step(void) {
         return;
     }
 #endif
-    vehicle_dynamics_step(vu);
+    const unsigned body_idx = g_ee.r[7].uw[0];
+    const float body_gravity = vehicle_dynamics_get_body_gravity(body_idx);
+    if (body_gravity != 9.81f) {
+        vehicle_dynamics_step_with_gravity(vu, body_gravity);
+    } else {
+        vehicle_dynamics_step(vu);
+    }
 #ifndef EOD_R7_RELEASE
     g_score[0] = vehicle_return_score(vu.cycle);
 #endif

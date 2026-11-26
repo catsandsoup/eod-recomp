@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QInputDialog,
+    QLineEdit,
     QLabel,
     QMainWindow,
     QMenu,
@@ -30,11 +32,14 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from creator_props import ensure_creator_prop
 from dialogs import CustomRaceDialog, PackageModDialog, ReplaceModelDialog, VehicleTunerDialog
+from eodmap import export_eodmap, snapshot_for_export, spawn_data
 from explorer_panel import ExplorerPanel
 from home_hub import (
     HomeHubDialog,
@@ -47,6 +52,7 @@ from pie_host import (
     MAX_PIE_RENDER_SCALE,
     PieHostWidget,
     build_pie_launch_spec,
+    resolve_eod_exe,
     pie_staging_root,
     tdeod_support_dir,
 )
@@ -72,6 +78,7 @@ from project_state import (
     ReplaceTextureCommand,
     ScatterPlaceCommand,
     SetAllWallsNoclipCommand,
+    SetPracticeStartCommand,
     SplitRoadEdgeCommand,
     TransformMarkerCommand,
     TransformObjectCommand,
@@ -148,9 +155,9 @@ class EodWorldEditorWindow(QMainWindow):
         self.game_dir = Path(game_dir) if game_dir else default_game_dir()
         self.project_name = "Untitled World"
         self.project_path: Path | None = None
+        self._export_author = ""
         self._mod_output_dir: Path | None = None
-        self._saved_undo_index: int = 0
-        self._pending_pie_spawn_pos: tuple[float, float, float, float] | None = None
+        self._nonundo_dirty = False
         self._custom_car_archives: list[Path] = []
         self.world: TrackWorld | None = None
         self.undo_stack = QUndoStack(self)
@@ -183,7 +190,7 @@ class EodWorldEditorWindow(QMainWindow):
         # Core panels: Left Explorer | Center (Autosave Banner + OpenGL Viewport / Embedded PIE) | Right Properties
         self.explorer = ExplorerPanel()
         self.viewport = ViewportGL()
-        self._pie_render_scale = 6 if self.viewport.render_mode == "plume" else 2
+        self._pie_render_scale = 2
         self.pie_host = PieHostWidget()
         self.center_stack = QStackedWidget()
         self.center_stack.addWidget(self.viewport)  # Page 0: OpenGL 3.3 Core Editor
@@ -234,12 +241,13 @@ class EodWorldEditorWindow(QMainWindow):
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setSizes([308, 902, 330])
         self.splitter.setChildrenCollapsible(False)
-        self._side_panel_requests = {"explorer": True, "inspector": True}
+        self._side_panel_requests = {"explorer": False, "inspector": False}
         self._compact_panel = "explorer"
         self.setCentralWidget(self.splitter)
 
         self._build_menu_bar()
         self._build_toolbar()
+        self._fit_side_panels()
         self._build_status_bar()
         self._connect_signals()
         self._update_window_chrome()
@@ -268,11 +276,12 @@ class EodWorldEditorWindow(QMainWindow):
 
         if auto_load:
             if project_file and Path(project_file).is_file():
-                self.open_project_file(Path(project_file))
+                self.open_project_file(Path(project_file), background=True)
             elif show_home_hub:
                 QTimer.singleShot(0, self.open_home_hub)
             elif self.available_tracks:
-                target = self.available_tracks[0]
+                target = next((p for p in self.available_tracks if p.stem.upper() == "EMPTYT_1"),
+                              self.available_tracks[0])
                 if initial_track:
                     want = initial_track.upper().removesuffix(".TRK")
                     for tp in self.available_tracks:
@@ -290,10 +299,11 @@ class EodWorldEditorWindow(QMainWindow):
         enable_windows_dark_titlebar(self)
 
     def _is_dirty(self) -> bool:
-        return bool(self.world is not None and (self.undo_stack.index() != self._saved_undo_index or self._autosave_dirty))
+        return bool(self.world is not None and (not self.undo_stack.isClean() or self._nonundo_dirty))
 
     def _mark_saved(self) -> None:
-        self._saved_undo_index = self.undo_stack.index()
+        self.undo_stack.setClean()
+        self._nonundo_dirty = False
         self._autosave_dirty = False
         if hasattr(self.properties, "set_project_dirty"):
             self.properties.set_project_dirty(False)
@@ -330,6 +340,7 @@ class EodWorldEditorWindow(QMainWindow):
         if self._autosave_token is not None:
             self._autosave_token.cancel()
         self._cancel_active_job()
+        self._car_job_gen += 1
         if self._car_token is not None:
             self._car_token.cancel()
         self.explorer._cancel_thumb_worker()
@@ -341,13 +352,12 @@ class EodWorldEditorWindow(QMainWindow):
     # Window Title & Right-Aligned World Badge
     # -----------------------------------------------------------------------
     def _update_window_chrome(self) -> None:
-        trk = self.world.track_name if self.world else "NO TRACK"
         dirty_mark = " *" if self._is_dirty() else ""
         self._sync_walls_noclip_action()
+        self.act_export_map.setEnabled(self.world is not None)
+        self.act_test_map.setEnabled(self.world is not None)
         self.act_package_mod.setEnabled(self.world is not None)
-        self.setWindowTitle(
-            f"EOD World Editor \u2013 Test Drive: Eve of Destruction \u2013 {trk} [{self.project_name}{dirty_mark}]"
-        )
+        self.setWindowTitle(f"{self.project_name}{dirty_mark} — EOD World Editor")
         self.world_badge.setText(f"World: {self.project_name}{dirty_mark}")
         if self.world:
             self.lbl_zone.setText(f"Track: {self.world.display_name} ({self.world.track_name})")
@@ -375,13 +385,17 @@ class EodWorldEditorWindow(QMainWindow):
         )
         self.act_save = m_file.addAction(svg_icon("save"), "Save Project", self.save_project, QKeySequence.StandardKey.Save)
         m_file.addAction("Save Project As...", self.save_project_as)
+        m_file.addAction("New From Saved Template...", lambda: self.open_project_dialog(as_template=True))
+        m_file.addAction("New Blank Canvas", self.new_blank_canvas)
         m_file.addSeparator()
+        self.act_export_map = m_file.addAction(svg_icon("save", "#2ecc71"), "Export .eodmap",
+                                               self.export_map_dialog, QKeySequence("Ctrl+Shift+E"))
         self.act_export_mod = m_file.addAction(
             svg_icon("save", "#2ecc71"), "Export Mod Layer...", self.write_mod_layer_dialog, QKeySequence("Ctrl+Shift+S")
         )
         m_file.addAction("Export Mod Layer As...", lambda: self.write_mod_layer_dialog(prompt_dir=True))
         self.act_package_mod = m_file.addAction(
-            "Package Mod as .eodmod...", self.package_mod_dialog, QKeySequence("Ctrl+Shift+E")
+            "Package Mod as .eodmod...", self.package_mod_dialog
         )
         m_file.addAction("Mod Manager && Profiles...", self.open_mod_manager)
         m_file.addSeparator()
@@ -416,7 +430,7 @@ class EodWorldEditorWindow(QMainWindow):
         m_world.addAction("Reload Track from Retail Disc", self.reload_current_track)
         m_world.addAction("Open DATA/TRACKS Folder", self.open_tracks_folder)
         m_world.addSeparator()
-        m_world.addAction(svg_icon("launch", "#2ecc71"), "Play Free Roam (PIE)", lambda: self.start_pie("free_roam"), QKeySequence("F5"))
+        self.act_test_map = m_world.addAction(svg_icon("launch", "#2ecc71"), "Test (F5)", self.toggle_map_test, QKeySequence("F5"))
         m_world.addAction(
             svg_icon("launch", "#38bdf8"),
             "Play From Camera (PIE)",
@@ -466,7 +480,7 @@ class EodWorldEditorWindow(QMainWindow):
         m_obj.addAction(svg_icon("move"), "Move Tool", lambda: self.select_tool("move"), QKeySequence("G"))
         m_obj.addAction(svg_icon("rotate"), "Rotate Tool (or Rotate Ghost)", self._shortcut_rotate_or_ghost, QKeySequence("R"))
         m_obj.addAction(svg_icon("scale"), "Scale Tool", lambda: self.select_tool("scale"), QKeySequence("T"))
-        m_obj.addAction("Cycle Move / Rotate / Scale (Tab)", self.viewport.cycle_transform_tool)
+        m_obj.addAction("Cycle Move / Rotate / Scale", self.viewport.cycle_transform_tool)
         m_obj.addAction(svg_icon("place"), "Place Mode (Cursor Preview)", lambda: self.select_tool("place"), QKeySequence("P"))
         m_obj.addAction(svg_icon("scatter"), "Scatter / Paint Brush", lambda: self.select_tool("scatter"), QKeySequence("B"))
         m_obj.addSeparator()
@@ -484,8 +498,9 @@ class EodWorldEditorWindow(QMainWindow):
         # 6. Markers
         m_mk = mb.addMenu("&Markers")
         m_mk.addAction(svg_icon("marker"), "Place Marker at View Target", lambda: self.add_marker_at_camera("Marker"))
-        m_mk.addAction("Place Start Grid Slot", lambda: self.add_marker_at_camera("Start Grid", prefix="StartGrid"))
-        m_mk.addAction("Place Spawn Point", lambda: self.add_marker_at_camera("Spawn"))
+        m_mk.addAction("Browse Spawn Points", lambda: self.explorer.tabs.setCurrentWidget(self.explorer.spawns_tab))
+        m_mk.addAction("Place Race Grid Guide", lambda: self.add_marker_at_camera("Start Grid", prefix="StartGrid"))
+        m_mk.addAction("Place Battle Respawn", lambda: self.add_marker_at_camera("Spawn"))
         m_mk.addAction("Place Chicken Marker", lambda: self.add_marker_at_camera("Chicken"))
         m_mk.addAction("Place Event Trigger", lambda: self.add_marker_at_camera("Trigger"))
         m_mk.addAction("Toggle Markers Visibility", lambda: self.act_v_markers.trigger())
@@ -544,6 +559,8 @@ class EodWorldEditorWindow(QMainWindow):
         m_races.addAction(self.act_sync_events)
         m_races.addSeparator()
         m_races.addAction("Jump Camera to Start / Finish Grid", self._jump_to_start_grid)
+        m_races.addAction("Practice From Selected Spawn or Waypoint", self.practice_selected_point)
+        m_races.addAction("Check AI Lap Route", self.check_ai_lap_route)
         m_races.addAction("Show Track ILIN Racing Lines Summary...", self._show_races_summary)
 
         # 13. Collision
@@ -573,6 +590,18 @@ class EodWorldEditorWindow(QMainWindow):
         menu.addAction(act)
         return act
 
+    def toggle_drawers(self):
+        show = not any(self._side_panel_requests.values())
+        self._side_panel_requests = {"explorer": show, "inspector": show}
+        self._fit_side_panels()
+        self.viewport.setFocus()
+
+    def toggle_map_test(self):
+        if self.pie_host.is_running:
+            self.stop_pie()
+        else:
+            self.start_pie("free_roam")
+
     def _request_side_panel(self, panel: str, show: bool) -> None:
         self._side_panel_requests[panel] = show
         if show:
@@ -588,10 +617,6 @@ class EodWorldEditorWindow(QMainWindow):
         compact = self.width() < minimum
         if compact and all(visible.values()):
             visible = {panel: panel == self._compact_panel for panel in visible}
-        if hasattr(self, "main_toolbar"):
-            style = (Qt.ToolButtonStyle.ToolButtonIconOnly if self.width() < 1400
-                     else Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            self.main_toolbar.setToolButtonStyle(style)
         if hasattr(self, "_lbl_pie_event"):
             compact_tb = self.width() < 1100
             self._lbl_pie_event.setText("Ev" if compact_tb else "Event")
@@ -619,37 +644,45 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main Toolbar")
+        tb.setObjectName("CreatorActions")
         self.main_toolbar = tb
         tb.setMovable(False)
         tb.setIconSize(QSize(15, 15))
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
-        self.addToolBarBreak()
+
         settings = QToolBar("Play In Editor Settings")
         self.settings_toolbar = settings
         settings.setMovable(False)
         settings.setIconSize(QSize(15, 15))
         self.addToolBar(settings)
 
-        tb.addAction(svg_icon("new_world"), "New", self.new_project)
-        tb.addAction(svg_icon("open_world"), "Open", self.open_project_dialog)
-        tb.addAction(svg_icon("save"), "Save", self.save_project)
-        tb.addAction(svg_icon("save", "#2ecc71"), "Write Mod", self.write_mod_layer_dialog)
-        tb.addSeparator()
+        tb.addAction(self.act_test_map)
+        tb.addAction(self.act_export_map)
+        self.act_pie_roam = self.act_test_map
+        tb.addAction(svg_icon("layers"), "Drawers (Tab)", self.toggle_drawers)
+        self.viewport.drawersToggleRequested.connect(self.toggle_drawers)
+        if not self.menuBar().isNativeMenuBar():
+            menu_button = QToolButton(tb)
+            menu_button.setText("Menu")
+            menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menus = QMenu(menu_button)
+            menus.addActions(self.menuBar().actions())
+            menu_button.setMenu(menus)
+            tb.addWidget(menu_button)
+            self.menuBar().hide()
+        self._view_menu.addAction(settings.toggleViewAction())
+        settings.hide()
 
-        # Unreal Engine 4/5 Style Play-In-Editor (PIE) Group + Instant On-Demand Mode/Car/AI Pickers
-        self.act_pie_roam = tb.addAction(svg_icon("launch", "#2ecc71"), "Free Roam", lambda: self.start_pie("free_roam"))
-        self.act_pie_roam.setToolTip("Compile mod layer and launch Open-Track Free Roam (Battle, Solo/AI) directly inside the viewport (F5)")
-
-        self.act_pie_from_cam = tb.addAction(svg_icon("launch", "#38bdf8"), "Play Here", self.play_from_camera)
+        self.act_pie_from_cam = settings.addAction(svg_icon("launch", "#38bdf8"), "Play Here", self.play_from_camera)
         self.act_pie_from_cam.setToolTip(
             "Play From Camera: spawn directly at your current 3D editor camera position (Ctrl/Cmd+Shift+F5)"
         )
 
-        self.act_pie_event = tb.addAction(svg_icon("race", "#60a5fa"), "Play Event", lambda: self.start_pie("event"))
+        self.act_pie_event = settings.addAction(svg_icon("race", "#60a5fa"), "Play Event", lambda: self.start_pie("event"))
         self.act_pie_event.setToolTip("Compile mod layer and launch the selected Event / Race & Car directly inside the viewport (Shift+F5)")
 
-        self.act_pie_stop = tb.addAction(svg_icon("stop", "#ff7b86"), "Stop", self.stop_pie)
+        self.act_pie_stop = settings.addAction(svg_icon("stop", "#ff7b86"), "Stop", self.stop_pie)
         self.act_pie_stop.setEnabled(False)
         self.act_pie_stop.setToolTip("Stop Play-In-Editor and return to 3D Editor (Esc)")
 
@@ -694,9 +727,9 @@ class EodWorldEditorWindow(QMainWindow):
         self.spn_pie_ai.valueChanged.connect(self._on_pie_picker_changed)
         settings.addWidget(self.spn_pie_ai)
 
-        tb.addAction(self.act_sync_events)
-        tb.addAction(svg_icon("race", "#fbbf24"), "Race Setup", self.open_custom_race_dialog)
-        self.act_vehicle_tuner = tb.addAction(svg_icon("car", "#fbbf24"), "Car Tuner", self.open_vehicle_tuner_dialog)
+        settings.addAction(self.act_sync_events)
+        settings.addAction(svg_icon("race", "#fbbf24"), "Race Setup", self.open_custom_race_dialog)
+        self.act_vehicle_tuner = settings.addAction(svg_icon("car", "#fbbf24"), "Car Tuner", self.open_vehicle_tuner_dialog)
         self.act_vehicle_tuner.setToolTip("Open Live PIE Vehicle Boost / Handling Tuner & NASCAR / Custom Car Tools")
 
         self.cmb_renderer_mode = QComboBox()
@@ -731,7 +764,7 @@ class EodWorldEditorWindow(QMainWindow):
         self._lbl_pie_scale = QLabel("PIE Scale")
         settings.addWidget(self._lbl_pie_scale)
         settings.addWidget(self.cmb_pie_scale)
-        tb.addSeparator()
+
 
         # Transform & Lumion/Twinmotion Placement Tools
         self.tool_group = QActionGroup(self)
@@ -740,7 +773,7 @@ class EodWorldEditorWindow(QMainWindow):
         self.act_tool_move = QAction(svg_icon("move"), "Move", self)
         self.act_tool_move.setCheckable(True)
         self.act_tool_move.setChecked(True)
-        self.act_tool_move.setToolTip("Move tool (G)")
+        self.act_tool_move.setToolTip("Move (G): drag a selected piece to slide it, scroll while dragging to lift, or drag an axis for precision. Esc cancels a body drag.")
         self.act_tool_move.triggered.connect(lambda: self.select_tool("move"))
 
         self.act_tool_rotate = QAction(svg_icon("rotate"), "Rotate", self)
@@ -750,7 +783,7 @@ class EodWorldEditorWindow(QMainWindow):
 
         self.act_tool_scale = QAction(svg_icon("scale"), "Scale", self)
         self.act_tool_scale.setCheckable(True)
-        self.act_tool_scale.setToolTip("Scale tool (T, or Tab to cycle Move/Rotate/Scale)")
+        self.act_tool_scale.setToolTip("Scale tool (T)")
         self.act_tool_scale.triggered.connect(lambda: self.select_tool("scale"))
 
         self.act_tool_place = QAction(svg_icon("place", "#67e8f9"), "Place", self)
@@ -777,7 +810,7 @@ class EodWorldEditorWindow(QMainWindow):
             self.act_tool_road,
         ):
             self.tool_group.addAction(act)
-            tb.addAction(act)
+            settings.addAction(act)
 
         # Grid & Angle Snap toggles + Environment / Skybox
         settings.addSeparator()
@@ -801,12 +834,60 @@ class EodWorldEditorWindow(QMainWindow):
         self._view_menu.addAction(self.act_grid_snap)
         self._view_menu.addAction(self.act_angle_snap)
 
+        hotbar = QToolBar("Build palette", self)
+        hotbar.setObjectName("CreatorPalette")
+        hotbar.setMovable(False)
+        hotbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        hotbar.setIconSize(QSize(16, 16))
+        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, hotbar)
+        slots = [("Start Gate", "race", "#64ed90", "Practice start"),
+                 ("Respawn", "car", "#ff9c47", "Spawn"),
+                 ("Checkpoint", "race", "#52dcf2", "Checkpoint"),
+                 ("Finish", "race", "#52dcf2", "Finish"),
+                 ("Ramp", "road", "#efa25d", "ramp"),
+                 ("Track Deck", "road", "#b0ceff", "deck"),
+                 ("Prop", "place", "#e8c582", "creator:barrier"),
+                 ("Waypoint", "road", "#b392f0", "Waypoint"),
+                 ("Cone", "place", "#ff915e", "creator:cone")]
+        for number, (label, icon, color, kind) in enumerate(slots, 1):
+            action = hotbar.addAction(svg_icon(icon, color), f"{number}  {label}")
+            action.triggered.connect(lambda checked=False, k=kind: self.activate_build_piece(k))
+            action.setShortcut(QKeySequence(str(number)))
+            action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            self.viewport.addAction(action)
+
+    def activate_build_piece(self, kind):
+        if self.world is None:
+            return
+        if kind in ("deck", "ramp"):
+            name = f"creator_{kind}"
+            key = f"road:{name}"
+            if key not in self.world.models:
+                plan = make_jump_ramp_plan(length=24., height=0. if kind == "deck" else 4.)
+                plan.name = name
+                for cp in plan.points:
+                    cp.barrier_left = cp.barrier_right = "none"
+                plan.surface_tex, plan.wear_tex, plan.barrier_tex, plan.deck_tex, _ = self._pick_procedural_textures()
+                built = build_road_mesh(plan)
+                self.world.models[key] = built.model
+                self.world.procedural_roads.append(plan.to_dict())
+            self._activate_ghost_place_for(key)
+        elif kind.startswith("creator:"):
+            ensure_creator_prop(self.world, kind)
+            self.viewport.ensure_gl_textures()
+            self._activate_ghost_place_for(kind)
+        else:
+            self.place_start_with_mouse(kind)
+        self.viewport.setFocus()
+
     # -----------------------------------------------------------------------
     # Bottom Status Bar (with Non-Blocking Background Progress + Cancel)
     # -----------------------------------------------------------------------
     def _build_status_bar(self) -> None:
-        sb = QStatusBar()
-        self.setStatusBar(sb)
+        # Keep status, progress and log access in the free space beside Test and Export.
+        sb = QStatusBar(self.main_toolbar)
+        sb.setSizeGripEnabled(False)
+        self.main_toolbar.addWidget(sb)
 
         self.lbl_status = ElidedLabel("Ready")
         self.lbl_status.setContentsMargins(6, 0, 6, 0)
@@ -947,6 +1028,7 @@ class EodWorldEditorWindow(QMainWindow):
 
     def _cancel_active_job(self) -> None:
         if self._active_token is not None:
+            self._job_gen += 1
             self._active_token.cancel()
             self._active_token = None
         self._hide_progress()
@@ -959,6 +1041,12 @@ class EodWorldEditorWindow(QMainWindow):
         # Explorer -> MainWindow
         self.explorer.trackSelected.connect(self._on_explorer_track_selected)
         self.explorer.objectPicked.connect(self._select_object_by_id)
+        self.explorer.tabs.currentChanged.connect(self._on_explorer_tab_changed)
+        self.explorer.addPracticeStartRequested.connect(lambda: self.place_start_with_mouse("Practice start"))
+        self.explorer.defaultPracticeRequested.connect(self.set_selected_practice_start)
+        self.explorer.swapSpawnRoleRequested.connect(self.swap_spawn_role)
+        self.explorer.practiceSelectedRequested.connect(self.practice_selected_point)
+        self.explorer.addBattleSpawnRequested.connect(lambda: self.add_marker_at_camera("Spawn"))
         self.explorer.markerPicked.connect(self._select_marker_by_id)
         self.explorer.roadLineSelected.connect(self._switch_road_line)
         self.explorer.modelPlaceRequested.connect(self._place_model_in_front_of_camera)
@@ -973,6 +1061,8 @@ class EodWorldEditorWindow(QMainWindow):
         self.viewport.objectSelected.connect(self._on_viewport_obj_selected)
         self.viewport.selectionChanged.connect(self._on_viewport_selection_changed)
         self.viewport.roadNodeSelected.connect(self._on_viewport_road_selected)
+        self.viewport.markerStamped.connect(self._stamp_start)
+        self.viewport.markerDuplicateCompleted.connect(self._on_marker_duplicate)
         self.viewport.markerSelected.connect(self._on_viewport_marker_selected)
         self.viewport.barrierSelected.connect(self._on_viewport_barrier_selected)
         self.viewport.objectTransformed.connect(self._on_viewport_obj_transformed)
@@ -1038,7 +1128,9 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     def _attach_loaded_world(self, world: TrackWorld) -> None:
         self.world = world
+        self._cancel_pending_autosave()
         self.undo_stack.clear()
+        self._nonundo_dirty = False
         self._autosave_dirty = False
         self.autosave_banner.hide()
         self._pending_recovery_path = None
@@ -1049,6 +1141,7 @@ class EodWorldEditorWindow(QMainWindow):
             self._pending_event_template = None
         self.viewport.set_world(world)
         self.explorer.set_world(world)
+        self._on_explorer_tab_changed(self.explorer.tabs.currentIndex())
         self.explorer.set_available_tracks(self.available_tracks, world.trk_path)
         self.properties.show_nothing()
         self._update_window_chrome()
@@ -1137,6 +1230,8 @@ class EodWorldEditorWindow(QMainWindow):
             return
         self._active_token = None
         self._hide_progress()
+        if getattr(self, "_pending_blank_gen", None) == gen:
+            self.project_name, self.project_path, self._mod_output_dir = "Untitled blank map", None, None
         self._attach_loaded_world(world)
 
     def _on_bg_failed(self, gen: int, err: str) -> None:
@@ -1208,7 +1303,7 @@ class EodWorldEditorWindow(QMainWindow):
         """Execute the chosen Home Hub action (also directly callable from headless tests)."""
         action = hub.result_action
         if action == "open_project" and hub.selected_project_file and hub.selected_project_file.is_file():
-            self.open_project_file(hub.selected_project_file)
+            self.open_project_file(hub.selected_project_file, background=True)
             return
 
         if action == "vehicle_importer":
@@ -1258,7 +1353,7 @@ class EodWorldEditorWindow(QMainWindow):
 
     def _on_undo_index_changed(self, _idx: int) -> None:
         if self.world is not None:
-            self._autosave_dirty = self.undo_stack.index() != self._saved_undo_index
+            self._autosave_dirty = True
             if hasattr(self.properties, "set_project_dirty"):
                 self.properties.set_project_dirty(self._is_dirty())
             self._update_window_chrome()
@@ -1269,18 +1364,18 @@ class EodWorldEditorWindow(QMainWindow):
             return None
         if not force and not self._autosave_dirty:
             return None
+        if not force and (self.viewport._lmb_down or self._autosave_token is not None):
+            return None
         if self.pie_host.is_running and not force:
             return None
         target = autosave_path_for(self.project_path, self.world.track_name, self.project_name)
         doc = build_project_overlay_dict(self.project_name, self.world, self.viewport.camera_state())
         self._autosave_dirty = False
+        self._cancel_pending_autosave()
         if synchronous:
             saved = save_autosave_snapshot(target, doc)
             self.append_log(f"[Autosave] Saved crash-safe snapshot -> {saved.name}", verbose=True)
             return saved
-        if self._autosave_token is not None:
-            self._autosave_token.cancel()
-        self._autosave_gen += 1
         token = CancelToken(self._autosave_gen)
         self._autosave_token = token
         worker = FunctionWorker(
@@ -1290,9 +1385,23 @@ class EodWorldEditorWindow(QMainWindow):
             token=token,
             label="Autosaving project",
         )
+        worker.signals.failed.connect(self._on_autosave_failed)
         worker.signals.finished.connect(self._on_autosave_done)
         start_worker(worker, priority=-1)
         return target
+
+    def _cancel_pending_autosave(self):
+        self._autosave_gen += 1
+        if self._autosave_token is not None:
+            self._autosave_token.cancel()
+            self._autosave_token = None
+
+    def _on_autosave_failed(self, gen: int, reason: str) -> None:
+        if gen == self._autosave_gen:
+            self._autosave_token = None
+            self._autosave_dirty = True
+            self.set_action_status("Autosave failed. Your edits are open. Save As to choose another location.")
+            self.append_log(reason, force_open=True)
 
     def _on_autosave_done(self, gen: int, saved_path: Path) -> None:
         if gen == self._autosave_gen:
@@ -1323,7 +1432,13 @@ class EodWorldEditorWindow(QMainWindow):
             self.autosave_banner.hide()
             return False
         path = self._pending_recovery_path
-        doc = apply_project_overlay(self.world, path)
+        try:
+            recovered = load_track_world(self.world.trk_path, self.game_dir, include_cars=True)
+            doc = apply_project_overlay(recovered, path)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.set_action_status(f"Recovery failed. Current map retained. {exc}")
+            return False
+        self._attach_loaded_world(recovered)
         if doc.get("project_name"):
             self.project_name = str(doc["project_name"])
         if doc.get("camera"):
@@ -1336,7 +1451,7 @@ class EodWorldEditorWindow(QMainWindow):
         self.explorer.refresh_counts()
         self._update_window_chrome()
         self._sync_pie_pickers_from_world()
-        self._autosave_dirty = True
+        self._autosave_dirty = self._nonundo_dirty = True
         self._pending_recovery_path = None
         self.autosave_banner.hide()
         self.set_action_status(f"Recovered autosave -> {path.name}")
@@ -1344,6 +1459,7 @@ class EodWorldEditorWindow(QMainWindow):
 
     def discard_pending_autosave(self) -> None:
         if self.world is not None:
+            self._cancel_pending_autosave()
             clear_autosave(self.project_path, self.world.track_name, self.project_name)
         self._pending_recovery_path = None
         self.autosave_banner.hide()
@@ -1373,7 +1489,7 @@ class EodWorldEditorWindow(QMainWindow):
         self.project_name = name.strip()
         self.project_path = None
         self._mod_output_dir = None
-        self._saved_undo_index = 0
+        self._nonundo_dirty = False
         self._autosave_dirty = False
         if self.world is not None:
             self.load_track_async(self.world.trk_path)
@@ -1381,20 +1497,30 @@ class EodWorldEditorWindow(QMainWindow):
         self._sync_pie_pickers_from_world()
         self.set_action_status(f"Started new world project '{self.project_name}'")
 
-    def open_project_dialog(self) -> None:
+    def new_blank_canvas(self) -> None:
+        canvas = next((p for p in self.available_tracks if p.stem.upper() == "EMPTYT_1"), None)
+        if canvas is None:
+            self.set_action_status("EmptyTrack is missing from this game data.")
+            return
+        if self._confirm_discard_changes("open the blank canvas"):
+            self.load_track_async(canvas)
+            self._pending_blank_gen = self._job_gen
+
+    def open_project_dialog(self, *, as_template: bool = False) -> None:
         if not self._confirm_discard_changes("open another project"):
             return
         start_dir = self._default_project_dir().parent
         if not start_dir.is_dir():
             start_dir = Path.home() / "Documents"
         fn, _ = QFileDialog.getOpenFileName(
-            self, "Open World Project", str(start_dir), "EOD World Project (*.eodworld.json);;JSON (*.json)"
+            self, "Choose a project to use as a template" if as_template else "Open World Project", str(start_dir), "EOD World Project (*.eodworld.json);;JSON (*.json)"
         )
         if fn:
-            self.open_project_file(Path(fn))
+            self.open_project_file(Path(fn), as_template=as_template, background=True)
 
-    def open_project_file(self, path: Path) -> None:
-        try:
+    def open_project_file(self, path: Path, *, as_template: bool = False, background: bool = False) -> None:
+        # Stage against a fresh world. A malformed or unavailable project keeps the current scene intact.
+        def read_world(*, token=None, progress=None):
             raw = json.loads(path.read_text(encoding="utf-8"))
             trk_rel = raw.get("trk_rel", "")
             trk_path = (self.game_dir / trk_rel) if trk_rel else None
@@ -1403,21 +1529,50 @@ class EodWorldEditorWindow(QMainWindow):
                 trk_path = next((p for p in self.available_tracks if p.stem.upper() == want), None)
             if trk_path is None:
                 raise FileNotFoundError(f"Track {raw.get('track')} not found in {self.game_dir}")
-            self.load_track(trk_path, include_cars=True)
-            assert self.world is not None
-            doc = apply_project_overlay(self.world, path)
-            self.project_name = doc.get("project_name", path.stem)
-            self.project_path = path
-            if doc.get("camera"):
-                self.viewport.apply_camera_state(doc["camera"])
-            for tname, ta in self.world.textures.items():
-                if ta.is_replaced:
-                    self.viewport.update_gl_texture(tname)
-            self.viewport.mark_collision_dirty()
-            self.viewport.mark_scene_dirty()
-            self.explorer.refresh_counts()
-            self._mark_saved()
-            self._sync_pie_pickers_from_world()
+            world = load_track_world(trk_path, self.game_dir, include_cars=True, token=token, progress=progress)
+            doc = apply_project_overlay(world, path)
+            return world, doc, path, as_template
+
+        self._cancel_active_job()
+        self._job_gen += 1
+        if background:
+            token = CancelToken(self._job_gen)
+            self._active_token = token
+            self._show_progress(5, f"Opening {path.name}...")
+            worker = FunctionWorker(read_world, token=token, label="Opening map project")
+            worker.signals.finished.connect(self._finish_project_open)
+            worker.signals.progress.connect(self._on_bg_progress)
+            worker.signals.failed.connect(self._on_bg_failed)
+            worker.signals.cancelled.connect(self._on_bg_cancelled)
+            start_worker(worker, priority=10)
+            return
+        try:
+            self._attach_project(*read_world())
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Project Failed", str(exc))
+
+    def _finish_project_open(self, gen, result) -> None:
+        if gen == self._job_gen:
+            self._active_token = None
+            self._hide_progress()
+            self._attach_project(*result)
+
+    def _attach_project(self, world, doc, path, as_template):
+        self.project_name = doc.get("project_name", path.stem) + (" copy" if as_template else "")
+        self.project_path = None if as_template else path
+        self._mod_output_dir = None
+        self._attach_loaded_world(world)
+        if doc.get("camera"):
+            self.viewport.apply_camera_state(doc["camera"])
+        for tname, ta in self.world.textures.items():
+            if ta.is_replaced:
+                self.viewport.update_gl_texture(tname)
+        self.viewport.mark_collision_dirty()
+        self.viewport.mark_scene_dirty()
+        self.explorer.refresh_counts()
+        self._mark_saved()
+        self._sync_pie_pickers_from_world()
+        if not as_template:
             record_recent_project(
                 path,
                 self.project_name,
@@ -1425,10 +1580,13 @@ class EodWorldEditorWindow(QMainWindow):
                 display_name=self.world.display_name,
                 event_template=self.world.active_event_template,
             )
-            self.check_autosave_recovery(path)
-            self.set_action_status(f"Opened project '{self.project_name}' from {path.name}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Open Project Failed", str(exc))
+        self.check_autosave_recovery(self.project_path)
+        self.set_action_status(f"Opened project '{self.project_name}' from {path.name}")
+        unresolved = [o for o in world.objects if not o.deleted and o.model_key not in world.models]
+        if unresolved:
+            self.set_action_status(f"Opened with {len(unresolved)} missing model references. Placements are retained.")
+            for key in sorted({o.model_key for o in unresolved}):
+                self.append_log(f"Missing model {key}", force_open=True)
 
     def save_project(self) -> None:
         if self.world is None:
@@ -1449,6 +1607,7 @@ class EodWorldEditorWindow(QMainWindow):
             event_template=self.world.active_event_template,
             thumbnail_path=thumb,
         )
+        self._cancel_pending_autosave()
         clear_autosave(saved, self.world.track_name, self.project_name)
         self._mark_saved()
         self.autosave_banner.hide()
@@ -1486,6 +1645,7 @@ class EodWorldEditorWindow(QMainWindow):
             event_template=self.world.active_event_template,
             thumbnail_path=thumb,
         )
+        self._cancel_pending_autosave()
         clear_autosave(saved, self.world.track_name, self.project_name)
         self._mark_saved()
         self.autosave_banner.hide()
@@ -1551,6 +1711,47 @@ class EodWorldEditorWindow(QMainWindow):
                 QMessageBox.information(self, "Mod Layer Written", summary)
         except Exception as exc:
             QMessageBox.critical(self, "Export Mod Layer Failed", str(exc))
+
+    def export_map_dialog(self) -> None:
+        if self.world is None:
+            return
+        self.properties.flush_pending_edits()
+        config_file = os.environ.get("EOD_CONFIG_PATH")
+        support_dir = os.environ.get("EOD_APP_SUPPORT")
+        if config_file:
+            root = Path(config_file).expanduser().resolve().parent
+        elif sys.platform in ("darwin", "win32"):
+            root = Path(support_dir) if support_dir else tdeod_support_dir()
+        else:
+            root = resolve_eod_exe(self.game_dir).parent
+        directory = root / "mods" / "maps"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            directory = self.project_path.parent if self.project_path else Path.home() / "Documents"
+
+        dialog = QFileDialog(self, "Export custom map", str(directory), "EOD Map (*.eodmap)")
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setDefaultSuffix("eodmap")
+        dialog.selectFile(self._project_slug() + ".eodmap")
+        author_field = QLineEdit(self._export_author, dialog)
+        layout = dialog.layout()
+        row = layout.rowCount()
+        layout.addWidget(QLabel("Author", dialog), row, 0)
+        layout.addWidget(author_field, row, 1)
+        if not dialog.exec():
+            return
+        author = author_field.text().strip()
+        path = Path(dialog.selectedFiles()[0])
+        if path.suffix.lower() != ".eodmap":
+            path = path.with_name(path.name + ".eodmap")
+        try:
+            export_eodmap(self.world, self.project_name, path, author=author)
+            self._export_author = author
+            self.set_action_status(f"Exported {path}")
+        except (ValueError, OSError, KeyError) as exc:
+            QMessageBox.warning(self, "Map export", str(exc))
 
     def package_mod_dialog(self) -> None:
         if self.world is None:
@@ -1656,7 +1857,7 @@ class EodWorldEditorWindow(QMainWindow):
         mod_dir: Path,
         mode: str,
         vehicle: RegisteredVehicle | None = None,
-        spawn_pos: tuple[float, float, float, float] | None = None,
+        map_path: Path | None = None,
     ) -> dict[str, Any]:
         """Build a live PIE launch spec directly from the toolbar pickers, Sync All Events, and Arcade Mode."""
         assert self.world is not None
@@ -1690,23 +1891,48 @@ class EodWorldEditorWindow(QMainWindow):
             ai_autodrive=self.pie_host.btn_ai_drive.isChecked(),
             free_cam=self.pie_host.btn_free_cam.isChecked(),
             pie_render_scale=pie_scale,
-            spawn_pos=spawn_pos,
+            map_path=map_path,
+
         )
         if vehicle is not None:
             spec["label"] += f" · {vehicle.chassis} #{vehicle.number}"
-        if spawn_pos is not None:
-            spec["label"] += " · Camera Spawn"
         return spec
+
+    def swap_spawn_role(self) -> None:
+        marker = self.viewport.selected_marker
+        if not self.world or not marker or not (marker.battle_spawn or marker.kind == "Practice start"):
+            self.set_action_status("Select a Battle or practice start to change its role.")
+            return
+        kind = "Practice start" if marker.battle_spawn else "Spawn"
+        self.undo_stack.push(EditMarkerMetaCommand(marker, marker.name, marker.kind, marker.name, kind,
+                                                   self._refresh_after_edit))
+        self.set_action_status(f"{marker.name} is now a {'Battle start' if kind == 'Spawn' else 'practice start'}.")
+
+    def practice_selected_point(self) -> None:
+        if self.world is None:
+            return
+        marker = self.viewport.selected_marker
+        if marker and (marker.battle_spawn or marker.kind in ("Start Grid", "Practice start")):
+            x, y, z = marker.position
+            yaw = marker.heading_deg
+        else:
+            graph = self.world.road_graph
+            node = graph.nodes.get(self.viewport.selected_road_node_id)
+            if node is None:
+                self.set_action_status("Select a Battle spawn, race grid guide or racing-line waypoint to practise here.")
+                return
+            x, y, z = node.x, node.y, node.z
+            dx, _, dz = graph.node_direction(node.node_id)
+            yaw = math.degrees(math.atan2(dx, dz))
+        self.start_pie("free_roam", spawn_pos=(x, y + 1.2, z, yaw))
 
     def play_from_camera(self) -> None:
         """Launch PIE Free Roam spawning directly at the current 3D editor camera position."""
         if self.world is None:
             return
         cx, cy, cz = (float(self.viewport.cam_pos[0]), float(self.viewport.cam_pos[1]), float(self.viewport.cam_pos[2]))
-        gy = self.world.collision.ground_height(cx, cz)
-        spawn_y = max(gy + 1.2, min(cy, gy + 12.0))
         yaw = float(self.viewport.cam_yaw)
-        self.start_pie("free_roam", spawn_pos=(cx, spawn_y, cz, yaw))
+        self.start_pie("free_roam", spawn_pos=(cx, cy, cz, yaw))
 
     def start_pie(
         self,
@@ -1742,13 +1968,30 @@ class EodWorldEditorWindow(QMainWindow):
         self._pending_pie_mod_dir = mod_dir
         self._pending_pie_mode = mode
         self._pending_pie_profile = profile
-        self._pending_pie_spawn_pos = spawn_pos
-        self._show_progress(10, f"Compiling mod layer for PIE ({mode})...")
+        self._show_progress(10, "Preparing playtest…")
 
         if vehicle is not None:
             worker = FunctionWorker(
                 build_vehicle_pie_layer, snapshot_world_for_bake(self.world), self.project_name, vehicle,
                 token=token, label="Composing registered vehicle for PIE",
+            )
+        elif profile is None and mode == "free_roam":
+            if spawn_pos is None:
+                spawns = spawn_data(self.world)
+                if not (spawns["grid_starts"] or spawns["battle_respawns"]):
+                    spawn_pos = (*map(float, self.viewport.cam_pos), float(self.viewport.cam_yaw))
+            def prepare_map(world, title, pose, **kwargs):
+                overlay = tempfile.TemporaryDirectory(prefix="eod-map-test-")
+                try:
+                    root = Path(overlay.name)
+                    result = export_eodmap(world, title, root / "test.eodmap", preview_start=pose, **kwargs)
+                    return dict(result, pie_overlay=overlay, pie_layer=root, bake_mode="eodmap")
+                except BaseException:
+                    overlay.cleanup()
+                    raise
+            worker = FunctionWorker(
+                prepare_map, snapshot_for_export(self.world), self.project_name, spawn_pos,
+                token=token, label="Exporting test map",
             )
         elif profile is None:
             worker = FunctionWorker(
@@ -1779,35 +2022,21 @@ class EodWorldEditorWindow(QMainWindow):
 
         self._sync_custom_cars_into_mod_dir(Path(mod_dir))
 
-        cms = float(report.get("compile_ms", 0.0)) if isinstance(report, dict) else 0.0
-        bmode = str(report.get("bake_mode", "full")).upper() if isinstance(report, dict) else "FULL"
-        placed_total = int(report.get("editor_placed_objects", 0)) if isinstance(report, dict) else 0
-        compiled_total = int(report.get("custom_objects_compiled", 0)) if isinstance(report, dict) else 0
-        warnings_list = list(report.get("warnings") or []) if isinstance(report, dict) else []
-        for w_msg in warnings_list:
-            self.append_log(f"[PIE][WARN] {w_msg}", force_open=True)
-        self.profiler.record_phase("mod_compile", cms, detail=bmode)
-        self.set_action_status(
-            f"Mod compiled ({bmode} {cms:.2f} ms, placed {compiled_total}/{placed_total}) — launching PIE..."
-        )
+        if report.get("eodmap"):
+            self.set_action_status("Opening test map…")
+        else:
+            for message in report.get("warnings", []):
+                self.append_log(f"[PIE] {message}", force_open=True)
+            self.profiler.record_phase("mod_compile", float(report.get("compile_ms", 0)),
+                                       detail=report.get("bake_mode", "full"))
 
         vehicle = report.get("pie_vehicle")
-        spawn_pos = self._pending_pie_spawn_pos
-        if spawn_pos is None and self.world.markers:
-            sp_mk = next((m for m in self.world.markers if m.kind in ("Spawn", "Start Grid")), None)
-            if sp_mk is not None:
-                spawn_pos = (float(sp_mk.position[0]), float(sp_mk.position[1]) + 1.0, float(sp_mk.position[2]), float(sp_mk.heading_deg))
-        spec = self.build_current_pie_spec(mod_dir, mode, vehicle=vehicle, spawn_pos=spawn_pos)
+        spec = self.build_current_pie_spec(mod_dir, mode, vehicle=vehicle, map_path=report.get("eodmap"))
+        if report.get("eodmap"):
+            spec["label"] = self.project_name
         if report.get("pie_profile"):
             spec["label"] += f" · Profile {report['pie_profile']}"
-        self.append_log(
-            f"[PIE] {bmode} compile finished in {cms:.2f} ms (placed {compiled_total}/{placed_total}). "
-            f"Launching {spec['exe']} | {spec['direct_start']} "
-            f"| sync_all={self.world.sync_all_events} arcade={spec.get('arcade_mode')} "
-            f"| scale={spec.get('pie_render_scale')}x | EOD_NATIVE={spec['env'].get('EOD_NATIVE')} "
-            f"EOD_LOOK={spec['env'].get('EOD_LOOK', 'original')}",
-            verbose=True,
-        )
+        self.append_log(f"[PIE] Opening {report.get('eodmap') or spec['direct_start']}", verbose=True)
         self.center_stack.setCurrentWidget(self.pie_host)
         self.act_pie_stop.setEnabled(True)
         self.profiler.begin_phase("pie_launch")
@@ -1851,6 +2080,7 @@ class EodWorldEditorWindow(QMainWindow):
         self._cleanup_profile_pie_overlay()
         self.act_pie_stop.setEnabled(False)
         self.center_stack.setCurrentWidget(self.viewport)
+        self.activateWindow()
         self.viewport.setFocus()
         self.viewport.update()
         # Resume any paused background thumbnail & car-library scans so Explorer never stays blank!
@@ -1867,7 +2097,7 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     def _shortcut_rotate_or_ghost(self) -> None:
         """Route `R` to rotate Ghost Preview when in Place Mode, otherwise switch to Rotate Tool."""
-        if self.viewport.active_tool == "place":
+        if self.viewport.active_tool in ("place", "place_marker"):
             self.viewport.ghost_yaw = (self.viewport.ghost_yaw + self.viewport.angle_snap_step) % 360.0
             self.set_action_status(f"Ghost rotation: {self.viewport.ghost_yaw:.0f}°")
             self.viewport.update()
@@ -1899,6 +2129,9 @@ class EodWorldEditorWindow(QMainWindow):
         ev = self.cmb_pie_event.currentText().strip() or "All Templates (Combined)"
         car = self.cmb_pie_car.currentText().strip() or "Algar"
         ai = int(self.spn_pie_ai.value())
+        cfg = self.world.custom_race
+        if (ev, car, ai) != (cfg.event_type, cfg.player_car, cfg.ai_count):
+            self._nonundo_dirty = self._autosave_dirty = True
         self.world.custom_race.event_type = ev
         self.world.custom_race.event_name = ev
         self.world.custom_race.player_car = car
@@ -1913,6 +2146,8 @@ class EodWorldEditorWindow(QMainWindow):
 
     def _toggle_sync_all_events(self, checked: bool) -> None:
         if self.world is not None:
+            if self.world.sync_all_events != bool(checked):
+                self._nonundo_dirty = self._autosave_dirty = True
             self.world.sync_all_events = bool(checked)
             self.world.custom_race.sync_all_events = bool(checked)
             self.viewport.mark_scene_dirty()
@@ -2005,6 +2240,10 @@ class EodWorldEditorWindow(QMainWindow):
             self.explorer.layer_checks["collision"].blockSignals(False)
 
     def _toggle_markers(self, on: bool) -> None:
+        check = self.explorer.layer_checks["markers"]
+        check.blockSignals(True)
+        check.setChecked(on)
+        check.blockSignals(False)
         self.viewport.show_markers = on
         self.viewport.update()
 
@@ -2107,7 +2346,8 @@ class EodWorldEditorWindow(QMainWindow):
     def _on_viewport_marker_selected(self, marker: WorldMarker | None) -> None:
         self.properties.show_marker(marker)
         if marker is not None:
-            self.set_action_status(f"Selected {marker.kind}: {marker.name}")
+            hint = " · Drag the centre freely or an arrow for one axis" if marker.kind != "Event reference" else ""
+            self.set_action_status(f"{marker.name} ({marker.kind}){hint}")
 
     def _on_viewport_barrier_selected(self, rec_idx: int) -> None:
         if self.world is None or rec_idx < 0 or rec_idx >= len(self.world.collision.sobl_records):
@@ -2120,10 +2360,22 @@ class EodWorldEditorWindow(QMainWindow):
 
     def _show_viewport_context_menu(self, global_pos: QPoint) -> None:
         obj = self.viewport.selected_obj
-        if obj is None or obj.deleted:
-            return
-        sel_cnt = len([o for o in self.viewport.selected_objects if not o.deleted])
+        cursor = self.viewport.mapFromGlobal(global_pos)
+        origin, direction = self.viewport.screen_ray(cursor.x(), cursor.y())
+        surface = self.viewport.placement_surface(origin, direction, custom_only=True)
         menu = QMenu(self)
+        if surface is not None:
+            hit, normal = surface
+            point = tuple(map(float, hit))
+            yaw = self.viewport.cam_yaw
+            menu.addAction("Set Start Here", lambda: self._stamp_start("Practice start", point, yaw, normal))
+            menu.addAction("Set Start Here and Test", lambda: self._stamp_start("Practice start", point, yaw, normal, drive=True))
+        if obj is None or obj.deleted:
+            if not menu.isEmpty():
+                menu.exec(global_pos)
+            return
+        menu.addSeparator()
+        sel_cnt = len([o for o in self.viewport.selected_objects if not o.deleted])
         menu.addAction(svg_icon("replace", "#93c5fd"), "Replace Selection With...", lambda: self.replace_object_with_dialog(obj))
         menu.addAction("Select All Similar", lambda: self.select_similar_objects(obj))
         menu.addAction(svg_icon("trash", "#ff99a2"), "Delete All Similar", lambda: self.delete_similar_objects(obj))
@@ -2145,20 +2397,31 @@ class EodWorldEditorWindow(QMainWindow):
             self.viewport.select_object(obj)
             self.viewport.frame_selection()
 
+    def _on_explorer_tab_changed(self, _index: int) -> None:
+        spawns = self.explorer.tabs.currentWidget() is self.explorer.spawns_tab
+        self.viewport.spawn_browser_open = spawns
+        if spawns:
+            self.act_v_markers.setChecked(True)
+        self.viewport.event_starts = self.explorer.event_starts if spawns else []
+        if self.viewport.selected_marker and self.viewport.selected_marker.kind == "Event reference":
+            self.viewport.select_marker(None)
+        self.viewport._markers_dirty = True
+        self.viewport.update()
+
     def _select_marker_by_id(self, marker_id: str) -> None:
         if self.world is None:
             return
-        mk = next((m for m in self.world.markers if m.marker_id == marker_id), None)
+        mk = next((m for m in (*self.world.markers, *self.explorer.event_starts) if m.marker_id == marker_id), None)
         if mk is not None:
+            self.act_v_markers.setChecked(True)
             self.viewport.select_marker(mk)
-            c = np.array(mk.position, dtype=np.float32)
-            self.viewport.cam_pos = c + np.array([-22.0, 16.0, -22.0], dtype=np.float32)
-            self.viewport.look_at(c)
-            self.viewport.update()
+            self.viewport.frame_selection()
 
     def _switch_road_line(self, line_name: str) -> None:
         if self.world is None or line_name not in self.world.all_road_graphs:
             return
+        if self.world.road_graph.line_name != line_name:
+            self._nonundo_dirty = self._autosave_dirty = True
         self.world.road_graph = self.world.all_road_graphs[line_name]
         self.world.custom_race.ilin_line = line_name
         self.viewport.selected_road_node_id = None
@@ -2397,6 +2660,14 @@ class EodWorldEditorWindow(QMainWindow):
         pos = (src.position[0] + 4.0, src.position[1], src.position[2] + 4.0)
         self._place_model_at(src.model_key, pos[0], pos[1], pos[2], rot=src.rotation_hpr, scale=src.scale)
 
+    def _next_placed_id(self) -> str:
+        # Reopening a project restores IDs, including those held by undo commands.
+        while True:
+            obj_id = f"ed_{self._placed_counter:04d}"
+            self._placed_counter += 1
+            if not any(o.obj_id == obj_id for o in self.world.objects):
+                return obj_id
+
     def _build_placed_object(
         self,
         model_key: str,
@@ -2409,10 +2680,12 @@ class EodWorldEditorWindow(QMainWindow):
         if self.world is None or model_key not in self.world.models:
             return None
         wm = self.world.models[model_key]
-        obj_id = f"ed_{self._placed_counter:04d}"
-        self._placed_counter += 1
+        obj_id = self._next_placed_id()
         y_adj = y - float(wm.bbox_min[1]) * scale[1]
         cat = wm.category if wm.category != "prop-catalog" else "dyno"
+        layer = self.explorer.layer_checks.get(cat)
+        if layer is not None and not layer.isChecked():
+            layer.setChecked(True)
         return WorldObject(
             obj_id=obj_id,
             name=wm.name,
@@ -2463,6 +2736,7 @@ class EodWorldEditorWindow(QMainWindow):
             return
         self.viewport.ensure_gl_textures()
         self.undo_stack.push(PlaceObjectCommand(self.world, obj, self._refresh_after_edit))
+        self.viewport.select_object(obj)
         self.set_action_status(f"Stamped {obj.name} at ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
 
     def _on_scatter_stroke(self, items: list[dict[str, Any]]) -> list[WorldObject]:
@@ -2553,8 +2827,7 @@ class EodWorldEditorWindow(QMainWindow):
         for box in built.wall_boxes:
             self.world.collision.custom_boxes.append(self._wall_box_to_custom_box(box))
 
-        obj_id = f"ed_{self._placed_counter:04d}"
-        self._placed_counter += 1
+        obj_id = self._next_placed_id()
         pivot = tuple(float(v) for v in wm.pivot)
         obj = WorldObject(
             obj_id=obj_id,
@@ -2701,8 +2974,7 @@ class EodWorldEditorWindow(QMainWindow):
             return None
         self.world.procedural_roads.append(entry)
 
-        obj_id = f"ed_{self._placed_counter:04d}"
-        self._placed_counter += 1
+        obj_id = self._next_placed_id()
         pivot = tuple(float(v) for v in wm.pivot)
         obj = WorldObject(
             obj_id=obj_id,
@@ -2838,8 +3110,7 @@ class EodWorldEditorWindow(QMainWindow):
         else:
             place_pos = pivot
 
-        obj_id = f"ed_{self._placed_counter:04d}"
-        self._placed_counter += 1
+        obj_id = self._next_placed_id()
         obj = WorldObject(
             obj_id=obj_id,
             name=wm.name,
@@ -3241,30 +3512,86 @@ class EodWorldEditorWindow(QMainWindow):
     # -----------------------------------------------------------------------
     # Marker / Spawn / Start Grid / Trigger Operations (Undoable + 3D Gizmos)
     # -----------------------------------------------------------------------
+    def quick_place_model(self, key: str) -> None:
+        if self.world and key in self.world.models:
+            self._activate_ghost_place_for(key)
+        else:
+            self.set_action_status("This model is unavailable on this canvas. Open Models to choose a local piece.")
+
+    def set_selected_practice_start(self):
+        marker = self.viewport.selected_marker
+        if not marker or marker.kind != "Practice start":
+            self.set_action_status("Select a practice start first.")
+            return
+        if marker.marker_id != self.world.default_practice_start:
+            self.undo_stack.push(SetPracticeStartCommand(self.world, marker, self._refresh_after_edit))
+
+    def _stamp_start(self, kind, point, yaw, normal=(0., 1., 0.), *, drive=False):
+        if kind != "Practice start":
+            return self.add_marker_at_position(kind, point, yaw, normal=normal)
+        self.undo_stack.beginMacro("Place practice start")
+        try:
+            marker = self.add_marker_at_position(kind, point, yaw, normal=normal)
+            if marker:
+                self.set_selected_practice_start()
+        finally:
+            self.undo_stack.endMacro()
+        if marker:
+            self.set_action_status("Start placed. Press F5 to drive from here.")
+            if drive:
+                self.start_pie("free_roam")
+        return marker
+
+    def place_start_with_mouse(self, kind: str) -> None:
+        if not self._can_add_marker(kind):
+            return
+        self.viewport.place_marker_kind = kind
+        self.act_v_markers.setChecked(True)
+        self.select_tool("place_marker")
+        self.viewport.setFocus()
+
+    def _can_add_marker(self, kind: str) -> bool:
+        return self.world is not None
+
     def add_marker_at_camera(self, kind: str, prefix: str | None = None) -> WorldMarker | None:
         if self.world is None:
             return None
         fwd, _, _ = self.viewport.camera_vectors()
-        p = self.viewport.cam_pos + fwd * 22.0
-        gy = self.world.collision.ground_height(float(p[0]), float(p[2]))
+        surface = self.viewport.placement_surface(self.viewport.cam_pos, fwd, free_space=True)
+        if surface is None:
+            return None
+        point, normal = surface
+        return self.add_marker_at_position(kind, tuple(point), self.viewport.cam_yaw, prefix, normal=normal)
+
+    def add_marker_at_position(self, kind: str, pos: tuple, yaw: float, prefix: str | None = None,
+                               *, normal=(0., 1., 0.)) -> WorldMarker | None:
+        if not self._can_add_marker(kind):
+            return None
+        while any(m.marker_id == f"mk_{self._marker_counter:04d}" for m in self.world.markers):
+            self._marker_counter += 1
         mid = f"mk_{self._marker_counter:04d}"
         self._marker_counter += 1
         mk = WorldMarker(
             marker_id=mid,
             name=f"{prefix or kind}_{self._marker_counter - 1}",
             kind=kind,
-            position=(float(p[0]), gy, float(p[2])),
-            heading_deg=float(self.viewport.cam_yaw),
+            position=tuple(float(v) for v in pos),
+            heading_deg=float(yaw),
+            normal=tuple(map(float, normal)),
             source="Placed by the editor",
         )
         self.undo_stack.push(AddMarkerCommand(self.world, mk, self._refresh_after_edit))
         self.act_v_markers.setChecked(True)
         self.viewport.select_marker(mk)
-        self.set_action_status(f"Placed {kind} '{mk.name}' at ({p[0]:.1f}, {gy:.1f}, {p[2]:.1f})")
+        self.set_action_status(f"Placed {kind} '{mk.name}' at ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
         return mk
 
-    def _on_viewport_marker_transformed(self, mk: WorldMarker, old_p, old_h: float, new_p, new_h: float, label: str) -> None:
-        self.undo_stack.push(TransformMarkerCommand(mk, old_p, old_h, new_p, new_h, self._refresh_after_edit, label))
+    def _on_marker_duplicate(self, marker: WorldMarker) -> None:
+        self.undo_stack.push(AddMarkerCommand(self.world, marker, self._refresh_after_edit))
+        self.viewport.select_marker(marker)
+
+    def _on_viewport_marker_transformed(self, mk: WorldMarker, old_p, old_h: float, new_p, new_h: float, label: str, normal=None) -> None:
+        self.undo_stack.push(TransformMarkerCommand(mk, old_p, old_h, new_p, new_h, self._refresh_after_edit, label, new_normal=normal))
         self.set_action_status(f"{label}: {mk.name}")
 
     def _on_prop_marker_edited(self, mk: WorldMarker, pos, heading: float) -> None:
@@ -3281,17 +3608,21 @@ class EodWorldEditorWindow(QMainWindow):
         self.set_action_status(f"Updated marker '{mk.name}' ({mk.kind})")
 
     def _snap_marker_to_ground(self, mk: WorldMarker) -> None:
-        if self.world is None:
+        if self.world is None or mk not in self.world.markers:
             return
-        gy = self.world.collision.ground_height(mk.position[0], mk.position[2])
-        new_p = (mk.position[0], gy, mk.position[2])
-        self.undo_stack.push(
-            TransformMarkerCommand(mk, mk.position, mk.heading_deg, new_p, mk.heading_deg, self._refresh_after_edit, "Snap marker")
-        )
-        self.set_action_status(f"Snapped {mk.name} to ground (Y={gy:.2f} m)")
+        origin = np.asarray(mk.position) + (0., .15, 0.)
+        surface = self.viewport.placement_surface(origin, np.array([0., -1., 0.]))
+        if surface is None:
+            self.set_action_status(f"No visible surface below {mk.name}.")
+            return
+        point, normal = surface
+        self.undo_stack.push(TransformMarkerCommand(
+            mk, mk.position, mk.heading_deg, tuple(point), mk.heading_deg, self._refresh_after_edit,
+            "Snap marker", new_normal=normal))
+        self.set_action_status(f"Snapped {mk.name} to the surface at Y={point[1]:.2f} m")
 
     def _delete_marker(self, mk: WorldMarker) -> None:
-        if self.world is None:
+        if self.world is None or mk not in self.world.markers:
             return
         self.undo_stack.push(DeleteMarkerCommand(self.world, mk, self._refresh_after_edit))
         self.viewport.select_marker(None)
@@ -3364,6 +3695,23 @@ class EodWorldEditorWindow(QMainWindow):
             f"GRAF Leaves: {self.world.graf_summary.get('leaves', 0):,}",
         )
 
+    def check_ai_lap_route(self) -> None:
+        if self.world is None:
+            return
+        graph = self.world.road_graph
+        issue = graph.lap_route_issue()
+        if issue is None:
+            count = sum(not n.is_side for n in graph.nodes.values())
+            self.set_action_status(f"{graph.line_name} • {count} waypoints form a closed lap. Shift+F5 to drive the event.")
+            return
+        node_id, message = issue
+        if node_id is not None:
+            self.select_tool("road")
+            self.act_v_roads.setChecked(True)
+            self.viewport.select_road_node(node_id)
+            self.viewport.frame_selection()
+        self.set_action_status(f"{graph.line_name} • {message}")
+
     def _show_races_summary(self) -> None:
         if self.world is None:
             return
@@ -3405,13 +3753,14 @@ class EodWorldEditorWindow(QMainWindow):
             "  • W / A / S / D: Fly horizontally  |  Q / E: Down / Up\n"
             "  • Shift: 2.8x fly boost  |  F: Frame selection\n\n"
             "Editing & Play-In-Editor:\n"
-            "  • Tab: Cycle Move / Rotate / Scale  |  G: Move  |  R: Rotate (or +15° in Place Mode)  |  T: Scale\n"
+            "  • Tab: Show or hide drawers  |  G: Move  |  R: Rotate (or +15° in Place Mode)  |  T: Scale\n"
             "  • P: Place Cursor Mode  |  B: Scatter Brush  |  Alt+Drag: Duplicate & Drag\n"
             f"  • End / {mod}+G: Drop selected object or marker to terrain\n"
             f"  • {mod}+D: Duplicate  |  F2: Export to Blender OBJ  |  {del_key}: Delete\n"
             f"  • {mod}+Z / {mod}+Shift+Z: Undo / Redo\n"
-            f"  • {mod}+S: Save project  |  {mod}+Shift+S: Export Mod Layer\n"
-            f"  • F5: Free Roam (PIE)  |  {mod}+Shift+F5: Play From Camera  |  Shift+F5: Play Event  |  F4 (in-game): 6-DOF Free Cam",
+            "  • Keys 1–9 select a build piece. Click the surface to place it.\n"
+            f"  • {mod}+S saves the editable project. {mod}+Shift+E exports a portable map.\n"
+            "  • F5 tests the current map. Esc or F5 returns to the editor.",
         )
 
     def _show_about_dialog(self) -> None:

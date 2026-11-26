@@ -11,19 +11,19 @@
 // tab to defaults, L2/R2 move a mod in the load order. The native game menus are
 // untouched: this front end only holds recomp settings, mods and online setup.
 #pragma once
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "../app/game_frontend.h"
 #include "../core/config.h"
-
-namespace game_frontend { class Network; struct Command; struct Snapshot; }
 
 namespace frontend {
 
-enum class Tab { Graphics, Mods, Settings, Inputs, Online, Count };
+enum class Tab { Play, Mods, Graphics, Inputs, Settings, Count };
 const char *tab_name(Tab t);
 
 // Which prompts to draw: follows the last device that pressed something.
@@ -124,7 +124,7 @@ enum class PlumeLook { Unavailable, Classic, Modern };
 // Live facts the host supplies each frame (device names, mods root, version...).
 struct HostInfo {
     std::string version = "0.0.0";
-    std::string device[2];          // "DualShock 4", "Keyboard", "None"
+    std::string device[4];          // "DualShock 4", "Keyboard", "None" (ports 0..3)
     std::string mods_root;          // where discover_mods looks
     bool pause_supported = true;
     PlumeLook plume_look = PlumeLook::Unavailable;
@@ -186,6 +186,57 @@ public:
     int scroll() const { return scroll_[error_active() ? (int)Tab::Count : (int)tab_]; }
     void set_scroll(int s) { scroll_[error_active() ? (int)Tab::Count : (int)tab_] = s; }
 
+    // PLAY Hub state (Screen A: Career / Solo / 2-4P Split-Screen / 16P Online)
+    game_frontend::SessionKind session_kind() const { return session_kind_; }
+    void set_session_kind(game_frontend::SessionKind k);
+    int split_players() const { return split_players_; }
+    const std::array<game_frontend::SplitSeatConfig, 4> &split_seats() const { return split_seats_; }
+    const game_frontend::MutatorDraft &mutator_draft() const { return mutator_draft_; }
+    int career_warp_index() const { return career_warp_idx_; }
+    int offline_ai_bots() const { return offline_ai_bots_; }
+    int offline_laps() const { return offline_laps_; }
+    const std::string &offline_track() const { return offline_track_; }
+    const std::string &offline_event() const { return offline_event_; }
+    const std::string &offline_custom_map() const { return offline_custom_map_; }
+    uint8_t offline_preset() const { return offline_preset_; }
+    int distinct_chassis_count() const;
+
+    // Screen B (Visual Mode, Map & Car Browser) & Screen C (Customize Rules Drawer) state
+    enum class SubScreen : uint8_t { None = 0, ModeBrowser, MapBrowser, CarBrowser, RulesDrawer };
+    SubScreen sub_screen() const { return sub_screen_; }
+    void set_sub_screen(SubScreen s);
+    int browser_category() const { return browser_cat_; }
+    void set_browser_category(int c);
+    int browser_selected() const { return browser_sel_; }
+    void set_browser_selected(int idx) { browser_sel_ = idx; }
+    struct BrowserItem {
+        std::string id;
+        std::string title;
+        std::string subtitle;
+        std::string badge;
+        std::string track_art; // UIBIG.RES track key for thumbnail
+        uint32_t car_num = 0;  // UICAR.RES vehicle number for car portrait
+        uint8_t preset_id = 0;
+        bool is_custom_map = false;
+        bool is_custom_mode = false;
+        bool is_car = false;
+        bool is_trailer = false;
+        bool is_modded = false;
+        bool is_save_new = false;
+        bool featured = false;
+    };
+    std::vector<BrowserItem> browser_items() const;
+    void activate_browser_item(int idx, Effects &fx);
+    int rules_tab() const { return rules_tab_; } // 0=MODE RULES, 1=FEATS & WEAPONS, 2=PHYSICS & SCALE, 3=BOTS & ROLES
+    void set_rules_tab(int t);
+
+    // Screen D (In-Match Translucent Pause Rail) state
+    bool quick_rail_open() const { return quick_rail_; }
+    void set_quick_rail(bool on);
+    bool quick_scoreboard_open() const { return quick_scoreboard_; }
+    bool save_prompt_open() const { return save_prompt_; }
+    bool classic_ps2_mode() const { return !cfg_.unified_frontend; }
+
     // The menu's own defaults per tab (Triangle / Y); exposed for tests.
     void reset_tab(Tab t);
 
@@ -193,14 +244,22 @@ private:
     std::string pic_track_;
     uint32_t pic_car_ = 0;
     void rebuild(Tab t);
+    void rows_play(std::vector<Row> &r);
     void rows_graphics(std::vector<Row> &r);
     void rows_mods(std::vector<Row> &r);
     void rows_settings(std::vector<Row> &r);
     void rows_inputs(std::vector<Row> &r);
     void rows_online(std::vector<Row> &r);
+    void rows_rules_drawer(std::vector<Row> &r);
+    void rows_quick_rail(std::vector<Row> &r);
     void rows_error(std::vector<Row> &r);
     void submit_join(game_frontend::Command command);
     void cancel_join();
+    void close_map_picker();
+    void sync_draft_from_preset(uint8_t preset_id);
+    void push_mutator_draft();
+    void launch_offline_match(bool split);
+    void launch_career(bool classic_hub, bool new_career);
     void change(const Row &row, int dir, Effects &fx);
     void activate(const Row &row, Effects &fx);
     void move_selection(int dy);
@@ -213,7 +272,26 @@ private:
     enum class OnlineDialog { None, Connecting, Failure } online_dialog_ = OnlineDialog::None;
     bool online_advanced_ = false;
     bool joined_lobby_ = false;
-    Tab tab_ = Tab::Graphics;
+    Tab tab_ = Tab::Play;
+    game_frontend::SessionKind session_kind_ = game_frontend::SessionKind::Solo;
+    int split_players_ = 2;
+    std::array<game_frontend::SplitSeatConfig, 4> split_seats_{};
+    std::string offline_track_ = "Anoka";
+    std::string offline_event_ = "Battle (8 AI)";
+    std::string offline_custom_map_;
+    uint8_t offline_preset_ = 0;
+    int offline_ai_bots_ = -1; // -1 = Fill/Auto, 0..15 explicit
+    int offline_laps_ = 3;
+    int career_warp_idx_ = 0;  // 0 = Home Base .. 7 = Troy's Place
+    game_frontend::MutatorDraft mutator_draft_{};
+    SubScreen sub_screen_ = SubScreen::None;
+    int browser_cat_ = 0;
+    int browser_sel_ = 0;
+    int rules_tab_ = 0;
+    bool quick_rail_ = false;
+    bool quick_scoreboard_ = false;
+    bool save_prompt_ = false;
+    game_frontend::TransitionRequest pending_save_jump_{};
     int sel_[(int)Tab::Count + 1] = {};
     int scroll_[(int)Tab::Count + 1] = {};
     std::vector<Row> rows_[(int)Tab::Count + 1];  // [Count] = error screen
@@ -221,6 +299,7 @@ private:
     std::shared_ptr<MusicSource> music_;
     std::vector<MusicSong> music_songs_;  // as of the last rows_mods()
     bool music_open_ = false;
+    int map_return_row_ = -1;
     std::string remove_player_;
     bool details_ = false;
     int rebind_ = -1;

@@ -188,7 +188,7 @@ void on_added(SDL_JoystickID id) {
     if (p < 0) p = free_port();
     if (p < 0) {
         SDL_CloseGamepad(gp);
-        fprintf(stderr, "[input] %s connected, but both player ports are taken\n", pad_name(id));
+        fprintf(stderr, "[input] %s connected, but all %d player ports are taken\n", pad_name(id), kPorts);
         return;
     }
     g_port_identity[p] = key;

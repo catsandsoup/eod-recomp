@@ -69,6 +69,7 @@ inline bool (*event_active)() = nullptr;
 inline bool (*active)() = nullptr;
 inline bool (*is_host)() = nullptr;
 inline uint32_t (*remote_humans)() = nullptr;
+inline int (*online_ai_override)() = nullptr;
 inline void (*roster_pre)(uint32_t) = nullptr;
 inline void (*roster_post)(uint32_t) = nullptr;
 }  // namespace netplay_hooks

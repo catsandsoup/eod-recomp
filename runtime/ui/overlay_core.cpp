@@ -27,6 +27,9 @@
 #include "ui_art.h"
 #include "ui_preview.h"
 #include "../../src/netplay_session.h"
+#include "../../src/mutator_hooks.h"
+#include "../../src/session_start.h"
+#include "../../src/catalog_cache.h"
 extern uint64_t kernel_vblank_count();
 extern uint64_t kernel_menu_hold_frames();
 
@@ -54,7 +57,7 @@ std::unique_ptr<frontend::Menu> g_menu;
 std::unique_ptr<game_frontend::Command> g_resumed_invite;
 std::shared_ptr<game_frontend::Network> g_net;
 ImFont *g_font_main;
-menu_input::PadEdges g_pads[2];
+menu_input::PadEdges g_pads[4];
 frontend::Repeater g_rep_x, g_rep_y;
 frontend::Glyphs g_glyphs = frontend::Glyphs::PlayStation;
 bool g_release_wait;  // the game stays neutral until the closing buttons are released
@@ -172,7 +175,7 @@ void open_menu(bool open) {
             g_menu->open();
         }
         g_release_wait = false;
-        for (int p = 0; p < 2; p++) {
+        for (int p = 0; p < 4; p++) {
             HostPadState s;
             overlay_platform_pad(p, &s);
             g_pads[p].reset(s.connected ? s.buttons : 0);  // the chord's buttons are not menu presses
@@ -254,7 +257,7 @@ void display_size(int &w, int &h) {
 void refresh_host() {
     frontend::HostInfo hi;
     hi.version = EOD_RECOMP_VERSION;
-    for (int p = 0; p < 2; p++) {
+    for (int p = 0; p < 4; p++) {
         bool xbox = false;
         hi.device[p] = overlay_platform_device(p, &xbox);
     }
@@ -272,13 +275,15 @@ frontend::Input gather_input(bool &toggled) {
     const uint64_t now = platform_time_us() / 1000;
     int dx = 0, dy = 0;
     toggled = false;
-    for (int p = 0; p < 2; p++) {
+    for (int p = 0; p < 4; p++) {
         HostPadState s;
         overlay_platform_pad(p, &s);
         menu_input::PadFrame f = g_pads[p].update(s);
         if (f.toggle) { toggled = true; continue; }
-        if (!g_open && netplay::session().event_active() && (f.pressed & PAD_START) && !(f.held & PAD_SELECT)) {
-            if (g_menu) g_menu->set_tab(frontend::Tab::Online);
+        const bool in_gameplay = netplay::session().event_active() ||
+            (g_config.unified_frontend && g_ram && (ee_r32(0x00437BB8) != 0 || ee_r32(0x003CDA04) != 0));
+        if (!g_open && in_gameplay && (f.pressed & PAD_START) && !(f.held & PAD_SELECT)) {
+            if (g_menu) g_menu->set_quick_rail(true);
             toggled = true;
             continue;
         }
@@ -368,6 +373,13 @@ frontend::Input gather_input(bool &toggled) {
             } else if (h.kind == frontend_draw::HitRight && g_click) {
                 if (g_menu) g_menu->select(h.index);
                 in.dx = 1;
+            } else if (h.kind == frontend_draw::HitBrowserTile && g_menu) {
+                if (g_mouse_moved || g_click) g_menu->set_browser_selected(h.index);
+                if (g_click) in.accept = true;
+            } else if (h.kind == frontend_draw::HitBrowserCat && g_click && g_menu) {
+                g_menu->set_browser_category(h.index);
+            } else if (h.kind == frontend_draw::HitSubTab && g_click && g_menu) {
+                g_menu->set_rules_tab(h.index);
             }
         }
         if (g_wheel != 0 && g_menu) in.dy = g_wheel > 0 ? -1 : 1;
@@ -480,7 +492,27 @@ void pump_paused_audio() {
 }  // namespace
 
 // --------------------------------------------------------------------------- API
-void overlay_enable() { g_available = true; }
+void overlay_enable() {
+    g_available = true;
+    catalog_cache::global().refresh(overlay_platform_mods_root());
+    session_set_hub_arrival_handler([] {
+        if (!g_available || !g_config.unified_frontend) return;
+        const char *headless = std::getenv("EOD_HEADLESS");
+        if (headless && headless[0] == '1') return;
+        const char *direct = std::getenv("EOD_DIRECT_START");
+        if (direct && direct[0]) return;
+        const char *pad_script = std::getenv("EOD_PAD_SCRIPT");
+        if (pad_script && pad_script[0]) return;
+        const char *net_auto = std::getenv("EOD_NETPLAY_AUTO");
+        if (net_auto && net_auto[0]) return;
+        ensure_context();
+        if (g_menu) {
+            g_menu->set_quick_rail(false);
+            g_menu->set_tab(frontend::Tab::Play);
+        }
+        if (!g_open) open_menu(true);
+    });
+}
 const char *overlay_renderer_look_label(RendererLook look) {
     switch (look) {
     case RendererLook::Classic: return "RENDERER: CLASSIC";
@@ -512,10 +544,15 @@ bool overlay_in_screenshots() {
 bool overlay_key(int vk, bool down) {
     if (vk == 0x10) g_shift = down;
     if (!g_available) return false;
-    // F1 (and Cmd+, on the Mac) opens/closes it. During an online race, Esc also opens the non-pausing
-    // Online overlay instead of triggering the PS2 single-player freeze-pause.
-    if (!g_open && down && vk == 0x1B && netplay::session().event_active()) {
-        overlay_show_online();
+    // F1 (and Cmd+, on the Mac) opens/closes the full menu. During gameplay (online or Unified Front-End
+    // Career/Solo/Split-Screen), Esc opens the Screen D translucent Quick Pause Rail.
+    const bool in_gameplay = netplay::session().event_active() ||
+        (g_config.unified_frontend && g_ram && (ee_r32(0x00437BB8) != 0 || ee_r32(0x003CDA04) != 0));
+    if (!g_open && down && vk == 0x1B && in_gameplay) {
+        if (!g_context) ensure_context();
+        if (g_menu) g_menu->set_quick_rail(true);
+        open_menu(true);
+        play(frontend::Sound::Select);
         return true;
     }
     if (down && vk == 0x70) {
@@ -560,8 +597,8 @@ void overlay_show_error(const std::string &title, const std::string &message, bo
     g_open = true;
 }
 bool overlay_fatal_screen(const std::string &title, const std::string &message) {
+    if (!g_available) return false;  // Renderer startup failed before the overlay could draw.
     g_fatal_screen = true;
-    g_available = true;
     ensure_context();
     load_menu_art();
     g_disc_handler = nullptr;
@@ -582,7 +619,11 @@ int overlay_error_result() { return g_error_result; }
 void overlay_show_online() {
     if (!g_available) return;
     ensure_context();
-    if (g_menu) g_menu->set_tab(frontend::Tab::Online);
+    if (g_menu) {
+        g_menu->set_quick_rail(false);
+        g_menu->set_tab(frontend::Tab::Play);
+        g_menu->set_session_kind(game_frontend::SessionKind::Online);
+    }
     if (!g_open) { open_menu(true); play(frontend::Sound::Select); }
 }
 
@@ -661,16 +702,18 @@ void overlay_frame() {
     if (!g_available) return;
     const uint64_t renderer_notice = g_renderer_notice.load(std::memory_order_relaxed);
     const bool show_renderer_look = renderer_notice && (renderer_notice >> kRendererLookBits) > platform_time_us();
+    const bool mutator_hud_visible = mutator_hooks::hud.visible &&
+        (netplay::session().event_active() || (g_ram && ee_r32(0x0048522C) != 0 && ee_r32(0x003CF194) != 0));
     if (!g_context) {
         // the chord before the first use (no context yet: nothing else to do)
         bool toggled = false;
-        for (int p = 0; p < 2; p++) {
+        for (int p = 0; p < 4; p++) {
             HostPadState s;
             overlay_platform_pad(p, &s);
             if (g_pads[p].update(s).toggle) toggled = true;
         }
         if (toggled || g_open) { ensure_context(); g_open = false; open_menu(true); play(frontend::Sound::Select); }
-        if (!g_open && !g_config.show_fps && !show_renderer_look && netplay::session().strip().empty() && tags.empty()) return;
+        if (!g_open && !g_config.show_fps && !show_renderer_look && !mutator_hud_visible && netplay::session().strip().empty() && tags.empty()) return;
     }
     ensure_context();
     refresh_host();
@@ -701,7 +744,7 @@ void overlay_frame() {
     }
     if (g_release_wait) {
         bool any = false;
-        for (int p = 0; p < 2; p++) {
+        for (int p = 0; p < 4; p++) {
             HostPadState s;
             overlay_platform_pad(p, &s);
             any |= s.connected && s.buttons;
@@ -712,7 +755,7 @@ void overlay_frame() {
     const std::string strip = netplay::session().strip();
     const auto *event_results = netplay::session().event_results();
     const std::vector<std::string> speakers = netplay::session().speakers();
-    if (!g_open && !g_config.show_fps && !show_renderer_look && strip.empty() && speakers.empty() && !event_results && tags.empty()) {
+    if (!g_open && !g_config.show_fps && !show_renderer_look && !mutator_hud_visible && strip.empty() && speakers.empty() && !event_results && tags.empty()) {
         if (g_published_any) {
             g_published_any = false;
             std::lock_guard<std::mutex> lk(g_pub_mtx);
@@ -758,6 +801,248 @@ void overlay_frame() {
     }
     if (g_open) frontend_draw::draw_menu(dl, *g_menu, c, g_hits);
     else g_hits.clear();
+    if (!g_open && mutator_hud_visible) {
+        const auto &mh = mutator_hooks::hud;
+        const bool tips_beacon = ((mh.active_rule_flags & mutator::RF_TIPS_TAG) != 0) &&
+            mh.tips_in_slot < mutator::kMaxSlots;
+        // 3D-projected trigger zones, shrinking Battle Royale storm ring, CTF flags, chain tethers & Tips "IN!" beacon
+        if (mutator_hooks::world_camera.valid &&
+            (!mutator_hooks::active_triggers.empty() || !mutator_hooks::active_chains.empty() || tips_beacon)) {
+            const int requested = presentation::requested.load(std::memory_order_relaxed);
+            const auto rect = display_rect(requested >= 0 ? requested : display_aspect(g_config.aspect, presentation::active_drawable()), w, h);
+            const auto &wc = mutator_hooks::world_camera;
+            netplay::names::Camera cam{};
+            for (int i = 0; i < 3; ++i) {
+                cam.position[i] = wc.position[i];
+                for (int j = 0; j < 3; ++j) cam.axes[i][j] = wc.axes[i][j];
+            }
+            cam.horizontal_scale = wc.horizontal_scale;
+            cam.vertical_scale = wc.vertical_scale;
+            cam.width = wc.width;
+            cam.height = wc.height;
+
+            auto proj_screen = [&](float wx, float wy, float wz, ImVec2 &out_pt) -> bool {
+                netplay::names::Tag tg;
+                if (!netplay::names::project(cam, {wx, wy, wz}, tg)) return false;
+                out_pt = ImVec2(rect.x + tg.x * rect.width, rect.y + tg.y * rect.height);
+                return true;
+            };
+            auto rgba_to_u32 = [](uint32_t rgba, uint8_t alpha_override = 0) -> ImU32 {
+                const uint8_t r = (uint8_t)((rgba >> 16) & 0xFF);
+                const uint8_t g = (uint8_t)((rgba >> 8) & 0xFF);
+                const uint8_t b = (uint8_t)(rgba & 0xFF);
+                const uint8_t a = alpha_override ? alpha_override : (uint8_t)((rgba >> 24) & 0xFF);
+                return IM_COL32(r, g, b, a);
+            };
+
+            dl->PushClipRect(ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.width, rect.y + rect.height), true);
+            const float line_scale = std::max(1.0f, rect.height / 720.f);
+
+            for (const auto &tr : mutator_hooks::active_triggers) {
+                if (!tr.active) continue;
+                const ImU32 col = rgba_to_u32(tr.color_rgba, 220);
+                const ImU32 col_hi = rgba_to_u32(tr.color_rgba, 110);
+                if (tr.kind == mutator::TriggerKind::RingOut || tr.kind == mutator::TriggerKind::Cylinder ||
+                    tr.kind == mutator::TriggerKind::Sphere) {
+                    constexpr int kSegs = 48;
+                    const float wall_h = (tr.kind == mutator::TriggerKind::RingOut) ? 14.0f : std::min(tr.extents[1], 10.0f);
+                    for (int i = 0; i < kSegs; ++i) {
+                        const float a0 = (2.0f * 3.14159265f * i) / kSegs;
+                        const float a1 = (2.0f * 3.14159265f * (i + 1)) / kSegs;
+                        const float x0 = tr.center[0] + std::cos(a0) * tr.radius;
+                        const float z0 = tr.center[2] + std::sin(a0) * tr.radius;
+                        const float x1 = tr.center[0] + std::cos(a1) * tr.radius;
+                        const float z1 = tr.center[2] + std::sin(a1) * tr.radius;
+                        ImVec2 p0, p1, q0, q1;
+                        if (proj_screen(x0, tr.center[1] + 0.5f, z0, p0) && proj_screen(x1, tr.center[1] + 0.5f, z1, p1)) {
+                            dl->AddLine(p0, p1, col, 2.5f * line_scale);
+                        }
+                        if (proj_screen(x0, tr.center[1] + wall_h, z0, q0) && proj_screen(x1, tr.center[1] + wall_h, z1, q1)) {
+                            dl->AddLine(q0, q1, col_hi, 1.5f * line_scale);
+                        }
+                        if ((i % 4) == 0 && proj_screen(x0, tr.center[1] + 0.5f, z0, p0) && proj_screen(x0, tr.center[1] + wall_h, z0, q0)) {
+                            dl->AddLine(p0, q0, col_hi, 1.5f * line_scale);
+                        }
+                    }
+                } else if (tr.kind == mutator::TriggerKind::OBB) {
+                    const float c = std::cos(tr.yaw_rad), s = std::sin(tr.yaw_rad);
+                    const float hx = tr.extents[0], hz = tr.extents[2];
+                    const float sx[4] = {-hx, hx, hx, -hx}, sz[4] = {-hz, -hz, hz, hz};
+                    ImVec2 lo[4], hi[4];
+                    bool lo_ok[4], hi_ok[4];
+                    for (int k = 0; k < 4; ++k) {
+                        const float wx = tr.center[0] + sx[k] * c - sz[k] * s;
+                        const float wz = tr.center[2] + sx[k] * s + sz[k] * c;
+                        lo_ok[k] = proj_screen(wx, tr.center[1] + 0.4f, wz, lo[k]);
+                        hi_ok[k] = proj_screen(wx, tr.center[1] + std::min(tr.extents[1], 8.0f), wz, hi[k]);
+                    }
+                    for (int k = 0; k < 4; ++k) {
+                        const int nk = (k + 1) & 3;
+                        if (lo_ok[k] && lo_ok[nk]) dl->AddLine(lo[k], lo[nk], col, 2.5f * line_scale);
+                        if (hi_ok[k] && hi_ok[nk]) dl->AddLine(hi[k], hi[nk], col_hi, 1.5f * line_scale);
+                        if (lo_ok[k] && hi_ok[k]) dl->AddLine(lo[k], hi[k], col_hi, 1.5f * line_scale);
+                    }
+                } else if (tr.kind == mutator::TriggerKind::Flag) {
+                    ImVec2 base, top;
+                    if (proj_screen(tr.center[0], tr.center[1], tr.center[2], base) &&
+                        proj_screen(tr.center[0], tr.center[1] + 4.5f, tr.center[2], top)) {
+                        dl->AddLine(base, top, IM_COL32(255, 230, 80, 240), 2.5f * line_scale);
+                        const float d = 9.0f * line_scale;
+                        ImVec2 dia[4] = {ImVec2(top.x, top.y - d), ImVec2(top.x + d, top.y),
+                                         ImVec2(top.x, top.y + d), ImVec2(top.x - d, top.y)};
+                        dl->AddConvexPolyFilled(dia, 4, col);
+                    }
+                }
+            }
+
+            // Glowing spring-damper chain tethers between linked cars
+            for (const auto &ch : mutator_hooks::active_chains) {
+                const uint32_t ca = netplay_car::car_of_slot(ch.slot_a);
+                const uint32_t cb = netplay_car::car_of_slot(ch.slot_b);
+                if (!ca || !cb || ca > EE_RAM_SIZE - 0x94u || cb > EE_RAM_SIZE - 0x94u) continue;
+                auto rflt = [](uint32_t a) { uint32_t u = ee_r32(a); float f; std::memcpy(&f, &u, 4); return f; };
+                const float ax = rflt(ca + 0x88u), ay = rflt(ca + 0x8Cu) + 0.8f, az = rflt(ca + 0x90u);
+                const float bx = rflt(cb + 0x88u), by = rflt(cb + 0x8Cu) + 0.8f, bz = rflt(cb + 0x90u);
+                const float dist = std::sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay) + (bz - az) * (bz - az));
+                const bool taut = dist > ch.rest_len_m;
+                const ImU32 chain_col = taut ? IM_COL32(255, 96, 48, 245) : IM_COL32(245, 200, 90, 215);
+                ImVec2 pa, pb;
+                if (proj_screen(ax, ay, az, pa) && proj_screen(bx, by, bz, pb)) {
+                    dl->AddLine(pa, pb, chain_col, (taut ? 4.0f : 2.5f) * line_scale);
+                }
+            }
+
+            // Pulsing 3D red vertical beacon beam + diamond + "IN!" label above current Tips tagger
+            if (tips_beacon && g_ram) {
+                const uint32_t in_car = netplay_car::car_of_slot(mh.tips_in_slot);
+                if (in_car && in_car <= EE_RAM_SIZE - 0x94u) {
+                    auto rflt = [](uint32_t a) { uint32_t u = ee_r32(a); float f; std::memcpy(&f, &u, 4); return f; };
+                    const float cx = rflt(in_car + 0x88u), cy = rflt(in_car + 0x8Cu), cz = rflt(in_car + 0x90u);
+                    const float pulse = 0.5f + 0.5f * static_cast<float>(std::sin(static_cast<double>(now / 1000) * 0.012));
+                    ImVec2 p_base, p_top;
+                    if (proj_screen(cx, cy + 1.2f, cz, p_base) &&
+                        proj_screen(cx, cy + 8.5f + 1.5f * pulse, cz, p_top)) {
+                        const uint8_t glow_a = static_cast<uint8_t>(110 + static_cast<int>(120.f * pulse));
+                        dl->AddLine(p_base, p_top, IM_COL32(255, 40, 40, glow_a), (7.5f + 3.0f * pulse) * line_scale);
+                        dl->AddLine(p_base, p_top, IM_COL32(255, 225, 190, 240), 2.5f * line_scale);
+                        const float d = (10.f + 4.f * pulse) * line_scale;
+                        ImVec2 dia[4] = {ImVec2(p_top.x, p_top.y - d), ImVec2(p_top.x + d, p_top.y),
+                                         ImVec2(p_top.x, p_top.y + d), ImVec2(p_top.x - d, p_top.y)};
+                        dl->AddConvexPolyFilled(dia, 4, IM_COL32(255, 48, 48, 245));
+                        dl->AddPolyline(dia, 4, IM_COL32(255, 245, 220, 255), ImDrawFlags_Closed, 2.0f * line_scale);
+                        const float lbl_px = 18.f * line_scale;
+                        const char *lbl = "IN!";
+                        const ImVec2 lsz = g_font_main->CalcTextSizeA(lbl_px, FLT_MAX, 0.f, lbl);
+                        const float lx = p_top.x - lsz.x * 0.5f;
+                        const float ly = p_top.y - d - lsz.y - 6.f * line_scale;
+                        dl->AddRectFilled(ImVec2(lx - 6.f * line_scale, ly - 2.f * line_scale),
+                                          ImVec2(lx + lsz.x + 6.f * line_scale, ly + lsz.y + 2.f * line_scale),
+                                          IM_COL32(180, 18, 18, 230), 4.f * line_scale);
+                        dl->AddText(g_font_main, lbl_px, ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), lbl);
+                    }
+                }
+            }
+            dl->PopClipRect();
+        }
+
+        const float scale = (float)h / 720.f;
+        const float title_px = 20.f * scale;
+        const float sub_px = 14.f * scale;
+        const float pad_x = 16.f * scale, pad_y = 8.f * scale;
+
+        char header[160];
+        if (mh.active_rule_flags & mutator::RF_TIPS_TAG) {
+            if (mh.local_role == mutator::RoleId::Tagger && mh.tips_in_slot < mutator::kMaxSlots) {
+                std::snprintf(header, sizeof(header), "YOU'RE IN!  |  FUSE %.1fs", mh.tips_fuse_sec);
+            } else if (mh.tips_in_slot < mutator::kMaxSlots) {
+                std::snprintf(header, sizeof(header), "RUN!  |  ALIVE: %u  |  FUSE %.1fs",
+                              (unsigned)mh.tips_alive_count, mh.tips_fuse_sec);
+            } else {
+                std::snprintf(header, sizeof(header), "TIPS (TAG)  |  ALIVE: %u", (unsigned)mh.tips_alive_count);
+            }
+        } else if (mh.total_rounds > 0 && mh.remaining_sec > 0.0f) {
+            const int secs = (int)std::ceil(mh.remaining_sec);
+            std::snprintf(header, sizeof(header), "ROUND %u/%u  |  %s  |  %d:%02d",
+                          mh.round_number, mh.total_rounds, mh.round_title.c_str(), secs / 60, secs % 60);
+        } else if (mh.remaining_sec > 0.0f) {
+            const int secs = (int)std::ceil(mh.remaining_sec);
+            std::snprintf(header, sizeof(header), "%s  |  %d:%02d",
+                          mh.round_title.c_str(), secs / 60, secs % 60);
+        } else {
+            std::snprintf(header, sizeof(header), "%s", mh.round_title.c_str());
+        }
+
+        std::string badges;
+        auto add_badge = [&](const char *b) {
+            if (!badges.empty()) badges += "  ";
+            badges += b;
+        };
+        switch (mh.local_role) {
+        case mutator::RoleId::Survivor:   add_badge("[SURVIVOR]"); break;
+        case mutator::RoleId::Infected:   add_badge("[INFECTED]"); break;
+        case mutator::RoleId::Juggernaut: add_badge("[JUGGERNAUT]"); break;
+        case mutator::RoleId::VIP:        add_badge("[VIP]"); break;
+        case mutator::RoleId::Bus:        add_badge("[BUS]"); break;
+        case mutator::RoleId::Tagger:     add_badge("[IN! - TAG SOMEONE]"); break;
+        default: break;
+        }
+        if (mh.active_rule_flags & mutator::RF_INFECTION_TAG) {
+            char ib[48];
+            std::snprintf(ib, sizeof(ib), "[SURV:%u  INF:%u]", (unsigned)mh.survivors_alive, (unsigned)mh.infected_count);
+            add_badge(ib);
+        }
+        if (mh.storm_radius_m > 0.5f) {
+            char sb[32];
+            std::snprintf(sb, sizeof(sb), "[STORM %.0fm]", mh.storm_radius_m);
+            add_badge(sb);
+        }
+        if (mh.active_rule_flags & mutator::RF_CHAIN_TETHER) add_badge("[CHAINED]");
+        if (mh.local_direction_sign < 0) add_badge("[REVERSED]");
+        if (std::fabs(mh.local_gravity_scale - 1.0f) > 0.05f) {
+            char gb[24];
+            std::snprintf(gb, sizeof(gb), "[GRAV %.2fx]", mh.local_gravity_scale);
+            add_badge(gb);
+        }
+        if (mh.local_feat_bits & mutator::FB_INVINCIBLE) add_badge("[INVINCIBLE]");
+        if (mh.local_feat_bits & mutator::FB_ONE_HIT_KILLS) add_badge("[1-HIT]");
+        if (mh.local_feat_bits & mutator::FB_DEADLY_AMBITION) add_badge("[DEADLY AMBITION]");
+        if (mh.local_feat_bits & mutator::FB_RAIN_CHICKENS) add_badge("[CHICKEN RAIN]");
+        else if (mh.local_feat_bits & (mutator::FB_CHICKEN_STRAIGHT | mutator::FB_CHICKEN_MORTAR)) add_badge("[CHICKENS]");
+        if (mh.local_feat_bits & mutator::FB_TURBO) add_badge("[TURBO]");
+
+        const ImVec2 h_sz = g_font_main->CalcTextSizeA(title_px, (float)w * 0.9f, 0.f, header);
+        const ImVec2 b_sz = badges.empty() ? ImVec2(0, 0) : g_font_main->CalcTextSizeA(sub_px, (float)w * 0.9f, 0.f, badges.c_str());
+        const float box_w = std::max(h_sz.x, b_sz.x) + 2.f * pad_x;
+        const float box_h = h_sz.y + (badges.empty() ? 0.f : b_sz.y + 4.f * scale) + 2.f * pad_y;
+        const float box_x = ((float)w - box_w) * 0.5f;
+        const float box_y = 14.f * scale;
+        const bool tips_critical = (mh.active_rule_flags & mutator::RF_TIPS_TAG) &&
+            mh.tips_in_slot < mutator::kMaxSlots && mh.tips_fuse_sec < 5.0f;
+        const ImU32 border = (tips_critical || (mh.remaining_sec > 0.0f && mh.remaining_sec <= 5.0f))
+            ? IM_COL32(255, 72, 64, 240)
+            : (mh.remaining_sec > 0.0f && mh.remaining_sec <= 10.0f)
+                ? IM_COL32(255, 196, 48, 230)
+                : IM_COL32(240, 140, 36, 200);
+        dl->AddRectFilled(ImVec2(box_x, box_y), ImVec2(box_x + box_w, box_y + box_h), IM_COL32(14, 14, 18, 196), 8.f * scale);
+        dl->AddRect(ImVec2(box_x, box_y), ImVec2(box_x + box_w, box_y + box_h), border, 8.f * scale, 0, 2.f * scale);
+        dl->AddText(g_font_main, title_px, ImVec2(box_x + (box_w - h_sz.x) * 0.5f, box_y + pad_y),
+                    IM_COL32(255, 250, 238, 255), header);
+        if (!badges.empty()) {
+            dl->AddText(g_font_main, sub_px, ImVec2(box_x + (box_w - b_sz.x) * 0.5f, box_y + pad_y + h_sz.y + 4.f * scale),
+                        IM_COL32(255, 210, 110, 255), badges.c_str());
+        }
+        if (!mh.zone_warning.empty()) {
+            const float warn_px = 18.f * scale;
+            const ImVec2 w_sz = g_font_main->CalcTextSizeA(warn_px, (float)w * 0.85f, 0.f, mh.zone_warning.c_str());
+            const float wx = ((float)w - w_sz.x) * 0.5f - 14.f * scale;
+            const float wy = box_y + box_h + 8.f * scale;
+            const bool danger = mh.zone_warning.find("OUTSIDE") != std::string::npos;
+            dl->AddRectFilled(ImVec2(wx, wy), ImVec2(wx + w_sz.x + 28.f * scale, wy + w_sz.y + 10.f * scale),
+                              danger ? IM_COL32(160, 22, 22, 220) : IM_COL32(24, 96, 48, 220), 6.f * scale);
+            dl->AddText(g_font_main, warn_px, ImVec2(wx + 14.f * scale, wy + 5.f * scale),
+                        IM_COL32(255, 255, 255, 255), mh.zone_warning.c_str());
+        }
+    }
     if (show_renderer_look && (!g_open || g_menu->tab() != frontend::Tab::Graphics)) {
         const auto look = static_cast<RendererLook>(renderer_notice & kRendererLookMask);
         const char *label = overlay_renderer_look_label(look);

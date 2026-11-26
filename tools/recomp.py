@@ -13,6 +13,7 @@ code stays readable and the behaviour can be tuned in one place.
 """
 import argparse
 import json
+import hashlib
 import os
 import sys
 
@@ -950,6 +951,28 @@ class FuncEmitter:
                 body.append("  " + call)
                 k += len(expected)
                 continue
+            if self.start == 0x002EF6E0:
+                if va == 0x002EF96C:
+                    if w != 0x4A000038:
+                        raise SystemExit("unexpected ribbon VCALLMS at %08x" % va)
+                    body.append("  eod_ribbon_strip_build();")
+                    k += 1
+                    continue
+                if w == 0x4BE1137C:
+                    # LQI VF1,(VI2++) and LQI VF2,(VI2++) return a position
+                    # and its attributes before the EE stores either qword.
+                    if addrs[k+1] != va+4 or g.word(va+4) != 0x4BE2137C or va+4 in self.labels:
+                        raise SystemExit("unexpected ribbon readback at %08x" % va)
+                    body.append("  eod_ribbon_next_vertex();")
+                    k += 2
+                    continue
+                if w in (0x48461801, 0x48C21000, 0x4A0002FF):
+                    call = {0x48461801: set_s32(6, "(vu0_sync(), VU0.vi[3] & 0xffffu)"),
+                            0x48C21000: "VU0.vi[2] = R[2].uw[0] & 0xffffu;",
+                            0x4A0002FF: "eod_vu0_interlock();"}[w]
+                    body.append("  " + call)
+                    k += 1
+                    continue
             if self.start == 0x001DE7B0:
                 if va == 0x1DEA4C:
                     if w != 0x4A000038:
@@ -1082,6 +1105,19 @@ def main():
 
     elf = Elf(os.path.join(ROOT, "SLUS_209.10"))
     check_patch_sites(elf)
+    # This VIF0 DMA chain uploads exactly 65 pairs to address zero. The
+    # producer at 0x2EF6E0 draws the returned list with ImmediateVertex.
+    from vurecomp import Prog
+    payload = elf.file_offset(0x003BD2C8)
+    code = elf.data[payload:payload + 65 * 8]
+    if (elf.read32(0x003BD2C4) != 0x4A410000 or
+            hashlib.sha256(code).hexdigest() != "394294ebf9a48171d5b8faa78eb533d9e5a84c47efc8be3eb5984f9a2dae02d8"):
+        raise SystemExit("unexpected ribbon microprogram")
+    ribbon = Prog(0, code.ljust(4096, b"\0"), [0], flags=True)
+    ribbon.analyze()
+    ribbon_code = "\n".join(ribbon.emit("ribbon_strip", fixed_entry=True))
+    os.makedirs(args.out, exist_ok=True)
+    write_if_changed(os.path.join(args.out, "ribbon_strip.inc"), ribbon_code + "\n")
     fj = json.load(open(os.path.join(ROOT, "build", "functions.json")))
     funcs = {f["addr"]: f for f in fj["functions"]}
     tables = {int(k): v for k, v in fj["jump_tables"].items()}

@@ -8,10 +8,11 @@ namespace {
 } // namespace
 
 plume::RenderDescriptorSetDesc texture_desc() {
-    static const plume::RenderDescriptorRange ranges[2] = {
+    static const plume::RenderDescriptorRange ranges[3] = {
         plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::TEXTURE, 0, 1),
-        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::SAMPLER, 1, 1)};
-    return plume::RenderDescriptorSetDesc(ranges, 2);
+        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::SAMPLER, 1, 1),
+        plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::TEXTURE, 2, 1)};
+    return plume::RenderDescriptorSetDesc(ranges, 3);
 }
 
 plume::RenderDescriptorSetDesc environment_desc() {

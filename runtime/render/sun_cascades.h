@@ -12,8 +12,8 @@ using Vec3 = std::array<double, 3>;
 using Rows = std::array<std::array<double, 4>, 4>;
 
 constexpr uint32_t kResolution = 2048;
-constexpr double kNearBlendStart = 18.0, kNearBlendEnd = 25.0;
-constexpr double kFarFadeStart = 84.0, kFarFadeEnd = 104.0;
+constexpr double kNearBlendStart = 20.0, kNearBlendEnd = 28.0;
+constexpr double kFarFadeStart = 105.0, kFarFadeEnd = 135.0;
 
 inline bool daylight(uint32_t fog) {
     // The initial supported race has a bright authored horizon. Keep black and dark night skies unchanged.
@@ -45,8 +45,8 @@ inline View make_view(Vec3 camera, Vec3 forward, Vec3 toward_sun, uint32_t resol
     const Vec3 up = std::abs(z[1]) < 0.96 ? Vec3{0, 1, 0} : Vec3{0, 0, 1};
     const Vec3 x = unit(cross(up, z));
     view.axis = {x, cross(z, x), z};
-    // Near overlap for car bodies and the road, far reach for track buildings and banks.
-    view.box = {Box{{}, 24.0, 72.0}, Box{{}, 120.0, 168.0}};
+    // Near overlap for car bodies and the road, far reach for track buildings, quarry walls and banks.
+    view.box = {Box{{}, 28.0, 84.0}, Box{{}, 144.0, 196.0}};
     const double res = static_cast<double>(std::max(1u, resolution));
     for (size_t i = 0; i < view.box.size(); ++i) {
         Box &box = view.box[i];

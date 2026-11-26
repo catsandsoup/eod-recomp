@@ -249,31 +249,36 @@ void test_rock_candy_with_keyboard() {
     CHECK(read_port(1).buttons==PAD_CROSS, "focus return restores held gamepad input");
     set_button(rc, SDL_GAMEPAD_BUTTON_SOUTH, false);
 
-    // a second pad: both ports now have a pad (the keyboard shares player 1)
-    Pad ms;
+    // With port 0 reserved for keyboard and 4 player ports: 2nd pad takes P3 (port 2),
+    // 3rd pad takes P4 (port 3), 4th pad joins keyboard on P1 (port 0), and 5th waits (-1).
+    Pad ms, p4, p1_pad, extra;
     attach(ms, 0x045E, 0x028E, "Xbox 360 Controller");
-    CHECK(sdl_input::port_of(ms.id) == 0, "second pad joins the keyboard on player 1 (port %d)",
+    CHECK(sdl_input::port_of(ms.id) == 2, "second pad takes player 3 while port 0 is reserved (port %d)",
           sdl_input::port_of(ms.id));
     // players are independent
     set_button(ms, SDL_GAMEPAD_BUTTON_SOUTH, true);
     set_axis(rc, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
-    HostPadState p1 = read_port(0), p2 = read_port(1);
-    CHECK(p1.buttons == PAD_CROSS && p1.pressure[11] == 0, "P1 only Cross: %04x", p1.buttons);
+    HostPadState p3s = read_port(2), p2 = read_port(1);
+    CHECK(p3s.buttons == PAD_CROSS && p3s.pressure[11] == 0, "P3 only Cross: %04x", p3s.buttons);
     CHECK(p2.buttons == PAD_R2 && p2.pressure[11] == 255, "P2 only R2: %04x", p2.buttons);
     set_button(ms, SDL_GAMEPAD_BUTTON_SOUTH, false);
     set_axis(rc, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kTriggerRest);
 
-    // a third pad waits for a free port
-    Pad extra;
-    attach(extra, 0x0E6F, 0x021F, "PDP Xbox 360 Rock Candy");
-    CHECK(sdl_input::port_of(extra.id) == -1, "third pad has no port");
+    attach(p4, 0x0E6F, 0x021F, "PDP Xbox 360 Rock Candy P4");
+    CHECK(sdl_input::port_of(p4.id) == 3, "third pad is player 4 (port %d)", sdl_input::port_of(p4.id));
+    attach(p1_pad, 0x0E6F, 0x031F, "PDP Xbox 360 Rock Candy P1");
+    CHECK(sdl_input::port_of(p1_pad.id) == 0, "fourth pad joins keyboard on player 1 (port %d)", sdl_input::port_of(p1_pad.id));
+    attach(extra, 0x0E6F, 0x041F, "PDP Xbox 360 Rock Candy Extra");
+    CHECK(sdl_input::port_of(extra.id) == -1, "fifth pad has no port");
 
     // hot-plug: unplugging player 2 frees the port; the waiting pad takes it
     sdl_input::rumble(1, 1, 200);
     detach(rc);
     CHECK(sdl_input::port_of(rc.id) == -1, "unplugged pad left its port");
     CHECK(sdl_input::port_of(extra.id) == 1, "waiting pad took player 2 (port %d)", sdl_input::port_of(extra.id));
-    CHECK(sdl_input::port_of(ms.id) == 0, "player 1 unaffected");
+    CHECK(sdl_input::port_of(ms.id) == 2, "player 3 unaffected");
+    detach(p4);
+    detach(p1_pad);
     detach(extra);
     CHECK(!sdl_input::port_gamepad(1), "player 2 empty after unplug");
     HostPadState gone = read_port(1);
@@ -288,7 +293,7 @@ void test_rock_candy_with_keyboard() {
     CHECK(sdl_input::port_of(rc.id) == 1, "re-plugged pad is player 2 again (port %d)", sdl_input::port_of(rc.id));
     set_button(rc, SDL_GAMEPAD_BUTTON_START, true);
     CHECK(read_port(1).buttons == PAD_START, "re-plugged pad reads");
-    // unplugging player 1's pad leaves the keyboard there
+    // unplugging remaining pads leaves the keyboard on player 1
     detach(ms);
     CHECK(!sdl_input::port_gamepad(0) && sdl_input::port_of(rc.id) == 1, "player 1 back to keyboard only");
     detach(rc);
@@ -364,7 +369,7 @@ void test_keyboard_on_player_2() {
 // Saved KeyboardPort=1 (port 0) must not hand the first controller to P2.
 void test_saved_keyboard_port_does_not_take_controller_p1() {
     sdl_input::set_keyboard_port(0);  // what a saved KeyboardPort=1 produces at runtime
-    Pad a, b, c;
+    Pad a, b, c, d, e;
     attach(a, 0x045E, 0x028E, "Xbox 360 Controller");
     CHECK(sdl_input::port_of(a.id) == 0, "first controller is P1 despite saved KeyboardPort=1 (port %d)",
           sdl_input::port_of(a.id));
@@ -376,11 +381,15 @@ void test_saved_keyboard_port_does_not_take_controller_p1() {
     set_button(a, SDL_GAMEPAD_BUTTON_SOUTH, false);
     attach(b, 0x0E6F, 0x011F, "PDP Xbox 360 Rock Candy");
     CHECK(sdl_input::port_of(b.id) == 1, "second controller is P2 (port %d)", sdl_input::port_of(b.id));
-    attach(c, 0x045E, 0x028E, "Xbox 360 Controller");
-    CHECK(sdl_input::port_of(c.id) == -1, "third controller waits");
+    attach(c, 0x045E, 0x028E, "Xbox 360 Controller P3");
+    CHECK(sdl_input::port_of(c.id) == 2, "third controller is P3 (port %d)", sdl_input::port_of(c.id));
+    attach(d, 0x045E, 0x028E, "Xbox 360 Controller P4");
+    CHECK(sdl_input::port_of(d.id) == 3, "fourth controller is P4 (port %d)", sdl_input::port_of(d.id));
+    attach(e, 0x045E, 0x028E, "Xbox 360 Controller Extra");
+    CHECK(sdl_input::port_of(e.id) == -1, "fifth controller waits");
     detach(a);
-    CHECK(sdl_input::port_of(b.id) == 1 && sdl_input::port_of(c.id) == 0, "waiting pad takes freed P1, P2 stays P2");
-    detach(c);
+    CHECK(sdl_input::port_of(b.id) == 1 && sdl_input::port_of(e.id) == 0, "waiting pad takes freed P1, P2 stays P2");
+    detach(c); detach(d); detach(e);
     attach(a, 0x045E, 0x028E, "Xbox 360 Controller");
     CHECK(sdl_input::port_of(a.id) == 0, "reconnect returns to P1");
     detach(a); detach(b);
@@ -416,8 +425,8 @@ void test_modern_triggers() {
     CHECK(menu.pressure[11] > 100 && menu.pressure[6] == 0, "menu retains raw trigger pressure");
 
     set_axis(b, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
-    HostPadState other = read_port(0);
-    CHECK(other.buttons == PAD_SQUARE && other.pressure[7] == 255 && other.pressure[6] == 0, "P1 LT brakes independently");
+    HostPadState other = read_port(sdl_input::port_of(b.id));
+    CHECK(other.buttons == PAD_SQUARE && other.pressure[7] == 255 && other.pressure[6] == 0, "other pad LT brakes independently");
     set_axis(a, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -30000);
     s = read_port(1);
     CHECK(s.buttons == 0 && s.pressure[6] > 0 && s.pressure[6] <= sdl_input::kTriggerDigital, "light RT pressure without digital Cross");

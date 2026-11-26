@@ -17,6 +17,7 @@ struct State {
     int32_t gear = 0;
     float damage = 0;
     uint32_t damage_stage = 0;
+    uint8_t warp_gen = 0;
 };
 constexpr uint32_t kPose = 0x64, kVel = 0x104, kAngVel = 0x110, kSteer = 0x1B6C, kGas = 0x1B70,
                    kBrake = 0x1B74, kHandbrake = 0x1B7C, kGear = 0x1B90, kDamage = 0x1BEC, kType = 0x1E0;
@@ -53,7 +54,7 @@ public:
     State advance(int buffer_ms = 100, float proximity = 0, unsigned rtt_ms = 0);
     bool stalled() const { return steps_since_sample_ == kStallSteps; }
     void follow_native(const State &s) { shown_ = s; }
-    void reset() { ring_.clear(); head_init_ = false; shown_init_ = false; steps_since_sample_ = 0; }
+    void reset() { ring_.clear(); head_init_ = false; shown_init_ = false; steps_since_sample_ = 0; warp_gen_init_ = false; warp_gen_ = 0; }
     float newest_tick() const { return ring_.empty() ? 0.f : (float)ring_.back().tick; }
 private:
     struct Entry { uint32_t tick; State s; };
@@ -61,6 +62,8 @@ private:
     float head_ = 0;
     unsigned steps_since_sample_ = 0;
     bool head_init_ = false, shown_init_ = false;
+    bool warp_gen_init_ = false;
+    uint8_t warp_gen_ = 0;
     State shown_;
     State sample(float tick) const;
 };

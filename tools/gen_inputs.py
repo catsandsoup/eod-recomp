@@ -22,6 +22,7 @@ INPUTS = (
     "src/battle_layout.h",
     "tools/analyze.py",
     "tools/recomp.py",
+    "tools/vurecomp.py",
     "tools/elf.py",
     "tools/gen_inputs.py",
 )

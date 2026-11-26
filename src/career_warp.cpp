@@ -46,23 +46,38 @@ extern "C" void f_0016FE48(void) {
         std::fprintf(stderr, "[CAREER_WARP] trace %d: area %u (zone %d, pending %d, driving %d)\n", tick, ee_r32(kArea),
                      (int)ee_r32(home + 3056), (int)ee_r32(home + 3060), (int)ee_r32(home + 3064));
     }
-    const SessionRequest *req = career_warp_request();
-    if (!req || req->place == "here" || req->place == "Here") return;
-    static int frames = 0, after = -1;
-    static bool done = false;
-    ++frames;
-    static const int settle = std::getenv("EOD_CAREER_WARP_DELAY") ? std::atoi(std::getenv("EOD_CAREER_WARP_DELAY")) : kSettleFrames;
-    if (!done && frames >= settle && ee_r32(kHome)) {
-        done = true;
-        const int place = career_place_index(req->place);
-        std::fprintf(stderr, "[CAREER_WARP] teleport to %s (area %d), from area %u\n", career_place_name(place), place, ee_r32(kArea));
-        // As the pause menu's Jump To does (0x112F18 opens the pause, 0x113490 closes it): the world is paused
-        // around the teleport and resumed right after it (this update does not run while the world is paused).
-        const bool was_paused = call(f_001766E8, 0) != 0;
-        if (!was_paused) { call(f_00176710, 0); call(f_002393B8, 0); }
-        call(f_0016F488, (uint32_t)place);
-        if (!was_paused) { call(f_001766F8, 0); call(f_002393A8, 0); }
-        after = 0;
+    // Resettable PendingCareerWarp: reusable from both cold-boot direct start
+    // and mid-Career Unified Front-End / Pause Rail warp requests.
+    PendingCareerWarp &warp = career_warp_state();
+    if (!warp.active) {
+        const SessionRequest *req = career_warp_request();
+        if (req && !req->place.empty() && req->place != "here" && req->place != "Here") {
+            static bool boot_armed = false;
+            if (!boot_armed) {
+                boot_armed = true;
+                const int settle = std::getenv("EOD_CAREER_WARP_DELAY") ? std::atoi(std::getenv("EOD_CAREER_WARP_DELAY")) : kSettleFrames;
+                career_warp_arm(career_place_index(req->place), req->eve, settle);
+            }
+        }
+    }
+    static int after = -1;
+    if (warp.active && warp.target_place >= 0 && warp.target_place < kCareerPlaces) {
+        ++warp.frames_elapsed;
+        if (warp.frames_elapsed >= warp.delay_frames && ee_r32(kHome)) {
+            const int place = warp.target_place;
+            warp.active = false;
+            warp.target_place = -1;
+            warp.frames_elapsed = 0;
+            std::fprintf(stderr, "[CAREER_WARP] teleport to %s (area %d), from area %u\n",
+                         career_place_name(place), place, ee_r32(kArea));
+            // As the pause menu's Jump To does (0x112F18 opens the pause, 0x113490 closes it): the world is paused
+            // around the teleport and resumed right after it (this update does not run while the world is paused).
+            const bool was_paused = call(f_001766E8, 0) != 0;
+            if (!was_paused) { call(f_00176710, 0); call(f_002393B8, 0); }
+            call(f_0016F488, (uint32_t)place);
+            if (!was_paused) { call(f_001766F8, 0); call(f_002393A8, 0); }
+            after = 0;
+        }
     }
     if (after >= 0 && after <= 600 && after % 30 == 0) {
         const uint32_t home = ee_r32(kHome);

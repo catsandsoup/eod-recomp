@@ -32,7 +32,7 @@ struct Vec {
     float operator[](int i) const { return x[i]; }
 };
 struct Solver {
-
+    float gravity = 9.81f;
     uint32_t subnormal{};
     bool divideZero{};
     float observe(float f) {
@@ -91,7 +91,7 @@ struct Solver {
             halfOmega[i] = mul(angular[i], 0.5f);
             float acceleration = mul(force[i], inverse[3]);
             if (i == 1)
-                acceleration = sub(acceleration, 9.81f);
+                acceleration = sub(acceleration, gravity);
             linear[i] = add(bounded(linear[i], -200, 200), mul(acceleration, dt));
             pos[i] = add(pos[i], mul(linear[i], dt));
             force[i] = torque[i] = 0;
@@ -464,5 +464,27 @@ struct Solver {
                     (vu.mac & 0xf000 ? 8 : 0);
     }
 };
+float g_body_gravity[kMaxVehiclePhysicsBodies] = {
+    9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f,
+    9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f,
+    9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f,
+    9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f, 9.81f,
+};
 } // namespace
-void vehicle_dynamics_step(VUState& state) { Solver{}.run(state); }
+void vehicle_dynamics_step(VUState& state) { Solver{9.81f}.run(state); }
+void vehicle_dynamics_step_with_gravity(VUState& state, float gravity_mps2) {
+    const float g = std::isfinite(gravity_mps2) ? (gravity_mps2 < 0.0f ? 0.0f : (gravity_mps2 > 50.0f ? 50.0f : gravity_mps2)) : 9.81f;
+    Solver{g}.run(state);
+}
+void vehicle_dynamics_set_body_gravity(unsigned body_index, float gravity_mps2) {
+    if (body_index >= kMaxVehiclePhysicsBodies) return;
+    g_body_gravity[body_index] = std::isfinite(gravity_mps2)
+        ? (gravity_mps2 < 0.0f ? 0.0f : (gravity_mps2 > 50.0f ? 50.0f : gravity_mps2))
+        : 9.81f;
+}
+float vehicle_dynamics_get_body_gravity(unsigned body_index) {
+    return body_index < kMaxVehiclePhysicsBodies ? g_body_gravity[body_index] : 9.81f;
+}
+void vehicle_dynamics_reset_gravity() {
+    for (float &g : g_body_gravity) g = 9.81f;
+}

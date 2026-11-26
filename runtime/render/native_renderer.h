@@ -33,6 +33,7 @@ struct Env;
 struct Vertex;
 }
 namespace editor_environment { struct Override; }
+namespace eod::vfs { struct CustomMap; }
 
 namespace native {
 
@@ -117,6 +118,11 @@ void ee_world_leaf(uint32_t ref_qword, uint32_t part, uint32_t matrix_packet, ui
 void ee_world_record(bool committed);
 void ee_world_material(int32_t slot);
 void ee_world_pass_end();
+// A zero-length DMA CNT carrying this VIF NOP places the authored world draw
+// in the same ordered stream as the retail view. Only a tagged reservation draws.
+inline constexpr uint32_t kCustomWorldNop = 0x00454F44;
+void ee_custom_world(uint32_t dma_tag, std::shared_ptr<const eod::vfs::CustomMap> map);
+void vif_custom_world(uint32_t dma_tag);
 // WaterDraw 0x325728: begin (before ImmediateBegin 0x35DF10, whose packets are the water's), each
 // vertex ImmediateVertex 0x361708 accepted (colour word, strip flag = draws a triangle, guest
 // address of {xyz, colour, -, st}), end (after ImmediateEnd 0x361BC8; drawn = false when
@@ -149,6 +155,7 @@ void ee_shadow_batch(uint32_t batch, uint32_t pass, uint32_t clip_flag, uint32_t
 void ee_shadow_end();
 // FlareRender 0x304D50: each texture bucket emits 2D quads through 0x35DF10 / 0x361708 / 0x361BC8.
 void ee_flare_begin(uint32_t tex_slot);
+void ee_point_lights(const float (*xyz)[3], uint32_t count);
 bool ee_in_flare();
 void ee_flare_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
 void ee_flare_end(bool drawn);
@@ -381,7 +388,7 @@ enum : uint32_t { CMD_OBJ = 0, CMD_OFF = 1, CMD_MESH = 2, CMD_SCENE_CLEAR = 3, C
                   CMD_BOOTSTRAP_QUAD = 5, CMD_WORLD_TEXTURE_LOD = 6, CMD_WORLD_TEXTURE_INDICES = 7,
                   CMD_WORLD_STRIP_CHECK = 8, CMD_QUEUE_MATERIAL = 9, CMD_QUEUE_STRIP = 10,
                   CMD_DIRECT_FINALIZE = 11, CMD_TEXTURE_UPLOAD = 12, CMD_MATERIAL_STATE = 13, CMD_SHADOW_BLEND = 14, CMD_TEXTURE_FENCE = 15,
-                  CMD_TRANSIENT_MESH = 16 };
+                  CMD_TRANSIENT_MESH = 16, CMD_CUSTOM_WORLD = 17, CMD_CUSTOM_WORLD_MESH = 18 };
 
 // Model space -> GS screen (x, y in GS primitive coordinates, z in GS depth units, w) as
 // a[row][col] for column vectors: the camera packet 0x35B3D0 (viewport x projection, VU1 q5..8),

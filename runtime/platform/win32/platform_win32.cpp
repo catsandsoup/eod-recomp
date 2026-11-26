@@ -22,6 +22,7 @@
 
 #include "../../../src/netplay_hooks.h"
 #include "../../core/config.h"
+#include "../../app/windows_settings.h"
 #include "../../core/memory.h"
 #include "../../ui/overlay.h"
 #include "../platform.h"
@@ -74,23 +75,28 @@ void load_xinput() {
     }
 }
 
+void set_window_rect(HWND window, const RECT &bounds) {
+    SetWindowPos(window, nullptr, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
 void toggle_fullscreen() {
     DWORD style = GetWindowLong(g_hwnd, GWL_STYLE);
     if (!g_fullscreen) {
         MONITORINFO mi = {sizeof mi};
         if (GetWindowPlacement(g_hwnd, &g_prev_placement) &&
             GetMonitorInfo(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            g_fullscreen = true;
             SetWindowLong(g_hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
             SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
                          mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            g_fullscreen = true;
         }
     } else {
+        g_fullscreen = false;
         SetWindowLong(g_hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(g_hwnd, &g_prev_placement);
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        g_fullscreen = false;
     }
 }
 
@@ -143,6 +149,22 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(h, &ps);
         return 0;
     }
+    case WM_DPICHANGED: {
+        const RECT &suggested = *reinterpret_cast<const RECT *>(lp);
+        MONITORINFO monitor{sizeof(MONITORINFO)};
+        if (g_fullscreen && GetMonitorInfo(MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST), &monitor))
+            set_window_rect(h, monitor.rcMonitor);
+        else
+            set_window_rect(h, suggested);
+        return 0;
+    }
+    case WM_DISPLAYCHANGE:
+        if (g_fullscreen) {
+            MONITORINFO monitor{sizeof(MONITORINFO)};
+            if (GetMonitorInfo(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &monitor))
+                set_window_rect(h, monitor.rcMonitor);
+        }
+        break;
     case WM_SIZE:
         presentation::set_drawable_size(LOWORD(lp), HIWORD(lp));
         break;
@@ -160,6 +182,10 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g_keys[wp & 255] = false;
         return 0;
     case WM_KEYDOWN:
+        if ((wp == VK_ESCAPE || wp == VK_F5) && getenv("EOD_EDITOR_MAP_TEST")) {
+            g_quit = true;
+            return 0;
+        }
         if (wp == VK_F11) toggle_fullscreen();
         if (wp == VK_F9 && !(lp & (1 << 30)) && GetFocus() == h) modern::toggle_from_input("keyboard F9");
         g_keys[wp & 255] = true;
@@ -263,10 +289,24 @@ void platform_shutdown() {
 }
 
 void platform_fatal_message(const char *msg) {
-    // headless runs (EOD_HEADLESS=1, automated tests) end on stderr; a dialog would wait for a click
+    std::string detail = msg;
+    const auto support = windows_support_folder();
+    std::error_code ec;
+    if (!support.empty()) {
+        std::filesystem::create_directories(support, ec);
+        if (FILE *file = _wfopen((support / L"crash.log").c_str(), L"a")) {
+            SYSTEMTIME now;
+            GetLocalTime(&now);
+            const bool wrote = std::fprintf(file, "[%04u-%02u-%02u %02u:%02u:%02u] %s\n",
+                unsigned(now.wYear), unsigned(now.wMonth), unsigned(now.wDay),
+                unsigned(now.wHour), unsigned(now.wMinute), unsigned(now.wSecond), msg) >= 0;
+            if (std::fclose(file) == 0 && wrote)
+                detail += "\n\nSaved to crash.log in the game settings folder.";
+        }
+    }
     const char *h = getenv("EOD_HEADLESS");
-    if (h && h[0] == '1') return;
-    MessageBoxA(g_hwnd, msg, "Eve of Destruction - fatal error", MB_OK | MB_ICONERROR);
+    if (g_cfg.headless || (h && h[0] == '1')) return;
+    MessageBoxA(g_hwnd, detail.c_str(), "Eve of Destruction - fatal error", MB_OK | MB_ICONERROR);
 }
 
 bool platform_pump() {
@@ -397,8 +437,8 @@ void build_key_map() {
 
 void platform_get_pad(int port, HostPadState *out) {
     *out = HostPadState();
-    if (port >= 2) {
-        if (pad_script_state(port, out) && overlay_captures_input()) {
+    if (port < 0 || port >= 4) {
+        if (port >= 0 && pad_script_state(port, out) && overlay_captures_input()) {
             *out = HostPadState();
             out->connected = true;
         }

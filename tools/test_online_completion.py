@@ -76,7 +76,7 @@ def await_output(processes, condition, timeout, reason):
 
 
 def launch(processes, exe, disc, root, name, mode, terminal, event, guests, endpoint=None, force_relay=False,
-           packaged_relay=False, physical_wreck=False, check_voice=False, mutual=False, battle_respawn=False, rendered=False, rotate_track=False, rendered_host=False, pad_script=None):
+           packaged_relay=False, physical_wreck=False, check_voice=False, mutual=False, battle_respawn=False, rendered=False, rotate_track=False, rendered_host=False, pad_script=None, mod_dir=None):
     folder = root / name
     folder.mkdir()
     path = folder / "game.log"
@@ -89,6 +89,8 @@ def launch(processes, exe, disc, root, name, mode, terminal, event, guests, endp
         EOD_MEMCARD=str(folder / "card"), EOD_APP_SUPPORT=str(folder / "support"),
         EOD_PAD_SCRIPT=pad_script if pad_script is not None else "400:0008,410:0000", EOD_LOG="-game",
     )
+    if mod_dir is not None:
+        env["EOD_MOD_DIR"] = str(mod_dir.resolve())
     for key in ("EOD_NETPLAY_TEST_REMATCH", "EOD_NETPLAY_TEST_TERMINAL", "EOD_NETPLAY_TEST_IMPACT", "EOD_NETPLAY_TEST_NATIVE_LAP"):
         env.pop(key, None)
     display_args = ["--headless"]
@@ -398,6 +400,7 @@ def main():
     parser.add_argument("disc", type=Path)
     parser.add_argument("root", type=Path)
     parser.add_argument("scenario", choices=("race", "race-four", "race-timeout", "derby", "objective", "battle-scores", "battle-ram", "battle-respawn", "native-lap", "native-pack", "native-wreck", "native-mutual"))
+    parser.add_argument("--guest-mod-dir", type=Path, help="composed mod profile for guest processes")
     network = parser.add_mutually_exclusive_group()
     network.add_argument("--public-garage", choices=("auto", "relay"),
                          help="use the public endpoint packaged in the game; auto leaves route selection to the game")
@@ -523,7 +526,7 @@ def main():
                     guest_endpoint = f"127.0.0.1:{path.port}"
                 launch(processes, exe, disc, root, name, mode, terminal, event, guests, guest_endpoint, force,
                        packaged_relay=packaged and not args.impaired_public_relay, physical_wreck=scenario in ("native-wreck", "native-mutual", "battle-ram", "battle-respawn"), battle_respawn=scenario == "battle-respawn",
-                       check_voice=args.check_voice, mutual=scenario == "native-mutual", rendered=args.rendered, rotate_track=args.rotate_track, rendered_host=args.rendered_host)
+                       check_voice=args.check_voice, mutual=scenario == "native-mutual", rendered=args.rendered, rotate_track=args.rotate_track, rendered_host=args.rendered_host, mod_dir=args.guest_mod_dir)
         if scenario in ("battle-ram", "battle-respawn", "native-mutual"):
             # Headless worlds may reach the same countdown tick far apart in wall time.
             # Release both approaches together so a late snapshot cannot pre-empt the collision.

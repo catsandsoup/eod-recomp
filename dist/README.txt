@@ -6,8 +6,14 @@ GET STARTED
 Unzip the download and open eod.exe. Choose your North American PS2 game
 ISO when asked. If you already extracted your disc, choose SLUS_209.10
 inside that folder. The game remembers the library for future releases.
-You can unzip the next release into a different folder and open eod.exe.
 To change the saved location, open eodsetup.exe and choose Game data.
+
+UPDATING
+Close the game, unzip the new release into a fresh folder, and start that
+folder's eod.exe. eodsetup.exe opens the settings utility. Press F1 in
+the running game and check the version in the remaster menu header
+against the release you downloaded. If a shortcut opens the old version,
+point it at the new eod.exe.
 
 CONTROLS
 Xbox and PlayStation controllers are supported. Start + Select opens the

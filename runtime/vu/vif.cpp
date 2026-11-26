@@ -512,7 +512,9 @@ size_t run(Vif &v, const uint32_t *w, size_t n) {
         const uint32_t *d = &w[pos + 1];
         v.code = c;
         switch (cmd) {
-        case 0x00: break;  // NOP
+        case 0x00: // NOP
+            if (c == native::kCustomWorldNop && v.n == 1) native::vif_custom_world(g_vif1_dma_tag);
+            break;
         case 0x01: v.cycle = imm; break;  // STCYCL
         case 0x02:  // OFFSET
             v.ofst = imm & 0x3FF;

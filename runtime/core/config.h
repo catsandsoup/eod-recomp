@@ -105,6 +105,7 @@ struct Config {
     std::string memcard_dir;  // empty: <game folder>/memcard
     std::string data_dir;     // empty: the executable's folder
     bool pause_in_menu = true;  // the game stops while the in-game menu (F1) is open
+    bool unified_frontend = true; // boot into Unified PLAY Hub at Main Menu (false = Classic PS2 Menus)
     bool fast_boot = true;      // instant PC boot: skip intros, title screen, memcard & loading holds
     bool skip_intros = true;    // skip startup .PSS intro movies (Atari / Infogrames / Monster Games)
     bool skip_memcard = true;   // skip PS2 memory card boot hold/prompt delays (save still loads)
@@ -130,6 +131,8 @@ struct Config {
     float chicken_reload = 3.0f;       // seconds between chicken shots (3 = original)
     bool battle_bots = true;          // fill Battle to four cars with AI; restart event to apply
     bool sp_battle_mode = true;        // inject Battle Mode into single player action menus with AI
+    int offline_gametype = 0;          // 0 = Standard (Vanilla), 1..7 = offline Mutator preset
+    int offline_ai_bots = 0;           // 0 = Auto (event default), 1..15 = explicit offline AI bots
     // Career unlocks (docs/CAREER_UNLOCKS.md); all on out of the box, each live in the MODS tab
     bool career_money = true;          // Career money never below a floor (raise-to-floor on an idle frame)
     bool career_rank = true;           // Career rank held at the top (stored 1, shown 1st) without ending the Career

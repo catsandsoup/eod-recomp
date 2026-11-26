@@ -2,8 +2,13 @@
 #include "vu.h"
 
 #ifdef __cplusplus
+constexpr unsigned kMaxVehiclePhysicsBodies = 32;
 // Precondition: the retail staged body, wheel and tuning records occupy qwords 0..65.
 void vehicle_dynamics_step(VUState &state);
+void vehicle_dynamics_step_with_gravity(VUState &state, float gravity_mps2);
+void vehicle_dynamics_set_body_gravity(unsigned body_index, float gravity_mps2);
+float vehicle_dynamics_get_body_gravity(unsigned body_index);
+void vehicle_dynamics_reset_gravity();
 extern "C" {
 #endif
 

@@ -199,6 +199,8 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "ChickenReload")) { const float r = (float)atof(v.c_str()); if (r >= 0.25f && r <= 10.0f) c.chicken_reload = r; }
             else if (ieq(k, "BattleBots")) c.battle_bots = to_bool(v);
             else if (ieq(k, "SinglePlayerBattle") || ieq(k, "SPBattle")) c.sp_battle_mode = to_bool(v);
+            else if (ieq(k, "OfflineGametype")) c.offline_gametype = num(0, 15);
+            else if (ieq(k, "OfflineAIBots")) c.offline_ai_bots = num(0, 15);
             else if (ieq(k, "Invincible") || ieq(k, "GodMode")) c.cheat_invincible = to_bool(v);
             else if (ieq(k, "CareerMoney")) c.career_money = to_bool(v);
             else if (ieq(k, "CareerRank")) c.career_rank = to_bool(v);
@@ -224,6 +226,7 @@ bool config_load(const std::string &path, Config &c) {
             if (ieq(k, "MemoryCard")) c.memcard_dir = v;
             else if (ieq(k, "DataPath")) c.data_dir = v;
             else if (ieq(k, "PauseInMenu")) c.pause_in_menu = to_bool(v);
+            else if (ieq(k, "UnifiedFrontEnd")) c.unified_frontend = to_bool(v);
             else if (ieq(k, "FastBoot")) c.fast_boot = to_bool(v);
             else if (ieq(k, "SkipIntros")) c.skip_intros = to_bool(v);
             else if (ieq(k, "SkipMemcard")) c.skip_memcard = to_bool(v);
@@ -256,6 +259,7 @@ bool config_load(const std::string &path, Config &c) {
     if (const char *e = getenv("EOD_UNIVERSAL_PARTS")) c.career_universal_parts = to_bool(e);
     if (const char *e = getenv("EOD_MULTISTAGE_UPGRADES")) c.career_multistage_upgrades = to_bool(e);
     if (const char *e = getenv("EOD_GARAGE_EXPANSION")) c.career_garage_expansion = to_bool(e);
+    if (const char *e = getenv("EOD_UNIFIED_FRONTEND")) c.unified_frontend = to_bool(e);
     if (const char *e = getenv("EOD_FAST_BOOT")) c.fast_boot = to_bool(e);
     if (const char *e = getenv("EOD_SKIP_INTROS")) c.skip_intros = to_bool(e);
     if (const char *e = getenv("EOD_SKIP_MOVIES")) c.skip_intros = to_bool(e);
@@ -350,6 +354,8 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "ChickenReload=%.2f    ; seconds between chicken shots (default 3.0)\n", c.chicken_reload);
     fprintf(f, "BattleBots=%d         ; 1: fill Battle to four participants; restart event to apply\n", c.battle_bots ? 1 : 0);
     fprintf(f, "SinglePlayerBattle=%d ; 1: inject Battle Mode into single player action menus with AI\n", c.sp_battle_mode ? 1 : 0);
+    fprintf(f, "OfflineGametype=%d    ; 0: Standard (Vanilla), 1..7: offline Mutator Gametype preset\n", c.offline_gametype);
+    fprintf(f, "OfflineAIBots=%d      ; 0: Auto, 1..15: explicit offline AI bot count\n", c.offline_ai_bots);
     fprintf(f, "CareerMoney=%d        ; 1: Career money never drops below $10,000 (winnings still add)\n", c.career_money ? 1 : 0);
     fprintf(f, "CareerRank=%d         ; 1: Career rank held at the top (shown 1st) without ending the Career\n", c.career_rank ? 1 : 0);
     fprintf(f, "OpenCareer=%d         ; 1: every Career shop, upgrade, time challenge, Troy's Place and Eve open from the start\n", c.career_open ? 1 : 0);
@@ -373,6 +379,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "MemoryCard=%s\n", c.memcard_dir.c_str());
     fprintf(f, "DataPath=%s\n", c.data_dir.c_str());
     fprintf(f, "PauseInMenu=%d        ; the game stops while the in-game menu (F1) is open\n", c.pause_in_menu ? 1 : 0);
+    fprintf(f, "UnifiedFrontEnd=%d    ; 1: boot into Unified PLAY Hub; 0: Classic PS2 Menus\n", c.unified_frontend ? 1 : 0);
     fprintf(f, "FastBoot=%d           ; 1: skip intros, title screen, memcard & loading screen hold delays\n", c.fast_boot ? 1 : 0);
     fprintf(f, "SkipIntros=%d         ; 1: skip startup .PSS intro movies\n", c.skip_intros ? 1 : 0);
     fprintf(f, "SkipMemcard=%d        ; 1: skip PS2 memory card boot hold/prompt delays (save still loads)\n", c.skip_memcard ? 1 : 0);

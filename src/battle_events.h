@@ -21,3 +21,8 @@ uint32_t battle_events_career_ai(const char *eve_name);
 // Test hook: directory holding TRACKS/<TRACK>/c_battle.va0 (default
 // $EOD_MOD_DIR/battle-alternates).
 void battle_events_set_alternate_root(const char *path);
+
+// Temporarily expose a Battle contest on the hidden EmptyTrack Eve for a mounted
+// creator world. End it after the session returns to its native menu.
+int battle_events_begin_blank_map(uint32_t eve);
+void battle_events_end_blank_map();

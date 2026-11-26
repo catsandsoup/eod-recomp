@@ -1,6 +1,7 @@
 // Netplay state sync: wire format, quaternion/pose maths, remote-car smoothing, puppet writes.
 #include "core/memory.h"
 #include "netplay_car.h"
+#include "netplay_peer_activity.h"
 #include "netplay_names.h"
 #include "netplay_wire.h"
 #include "netplay_battle.h"
@@ -30,7 +31,24 @@ static State make(float x, float z, float yaw, float vx, float vz) {
     std::memcpy(s.pose, m, sizeof m); s.pose[9] = x; s.pose[10] = 1; s.pose[11] = z; s.vel[0] = vx; s.vel[2] = vz; s.steer = .25f; s.gas = 1; s.gear = 3; s.damage = .4f;
     return s;
 }
+static uint64_t simulated_time;
+uint64_t platform_time_us() { return simulated_time; }
+
 int main() {
+    netplay::PeerActivity peer;
+    simulated_time = 100;
+    peer.heard();
+    // The next poll takes six seconds to drain, and accepts a packet at its end.
+    simulated_time += 6000000;
+    peer.heard();
+    simulated_time += 1;
+    if (peer.expired()) return 1;
+    simulated_time -= 2;
+    if (peer.expired()) return 1;
+    simulated_time += 5000001;
+    if (peer.expired()) return 1;
+    ++simulated_time;
+    if (!peer.expired()) return 1;
     {
         using namespace netplay;
         ChickenEvent shot;

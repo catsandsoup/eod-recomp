@@ -10,6 +10,7 @@
 
 #include "../app/game_frontend.h"
 #include "../platform/keyboard_input.h"
+#include "../../src/mutator_presets.h"
 
 namespace fs = std::filesystem;
 
@@ -17,11 +18,11 @@ namespace frontend {
 
 const char *tab_name(Tab t) {
     switch (t) {
-    case Tab::Graphics: return "GRAPHICS";
+    case Tab::Play: return "PLAY";
     case Tab::Mods: return "MODS";
-    case Tab::Settings: return "SETTINGS";
+    case Tab::Graphics: return "GRAPHICS";
     case Tab::Inputs: return "INPUTS";
-    case Tab::Online: return "ONLINE";
+    case Tab::Settings: return "SETTINGS";
     default: return "";
     }
 }
@@ -74,6 +75,7 @@ std::vector<ModEntry> builtin_mods() {
 }
 
 namespace {
+std::string upper(std::string s);
 std::string json_field(const std::string &text, const char *key) {
     const std::string k = std::string("\"") + key + "\"";
     size_t at = text.find(k);
@@ -98,7 +100,7 @@ std::vector<ModEntry> discover_mods(const std::string &root) {
     std::vector<fs::path> dirs;
     for (const auto &e : fs::directory_iterator(root, ec)) {
         const std::string name = e.path().filename().string();
-        if (name.empty() || name[0] == '.' || name == "integrated" || name == "music") continue;  // music/: the Custom Music folder
+        if (name.empty() || name[0] == '.' || name == "integrated" || name == "music" || name == "maps" || name == "gametypes") continue;  // music/: Custom Music; maps/ & gametypes/: custom maps & modes
         if (e.is_directory(ec)) dirs.push_back(e.path());
     }
     std::sort(dirs.begin(), dirs.end());
@@ -129,8 +131,395 @@ std::vector<ModEntry> discover_mods(const std::string &root) {
 }
 
 // ------------------------------------------------------------------ menu
-Menu::Menu(Config &cfg) : cfg_(cfg) { mods_ = builtin_mods(); }
+Menu::Menu(Config &cfg) : cfg_(cfg) {
+    mods_ = builtin_mods();
+    static const char *kDefaultCars[4] = {"Gladiator", "Outlaw", "Bulldog", "Bus"};
+    for (int i = 0; i < 4; ++i) {
+        split_seats_[i].active = (i < split_players_);
+        split_seats_[i].pad_port = i;
+        split_seats_[i].car_model = kDefaultCars[i];
+        split_seats_[i].paint = i;
+    }
+    sync_draft_from_preset(mutator::PRESET_STANDARD);
+}
 Menu::~Menu() = default;
+
+void Menu::set_session_kind(game_frontend::SessionKind k) {
+    session_kind_ = k;
+    sub_screen_ = SubScreen::None;
+    sel_[(int)Tab::Play] = 0;
+    scroll_[(int)Tab::Play] = 0;
+}
+
+void Menu::set_sub_screen(SubScreen s) {
+    sub_screen_ = s;
+    browser_sel_ = 0;
+    if (s == SubScreen::RulesDrawer) {
+        sel_[(int)Tab::Play] = 0;
+        scroll_[(int)Tab::Play] = 0;
+    }
+}
+
+void Menu::set_browser_category(int c) {
+    const int max_c = sub_screen_ == SubScreen::CarBrowser ? 6 : sub_screen_ == SubScreen::MapBrowser ? 2 : 3;
+    browser_cat_ = std::clamp(c, 0, max_c);
+    browser_sel_ = 0;
+}
+
+std::vector<Menu::BrowserItem> Menu::browser_items() const {
+    std::vector<BrowserItem> out;
+    game_frontend::Snapshot snap;
+    if (net_) snap = net_->snapshot();
+
+    if (sub_screen_ == SubScreen::CarBrowser) {
+        // 0=ALL, 1=COMPACT, 2=MIDSIZE, 3=MUSCLE, 4=SPECIAL, 5=TRAILERS, 6=MODDED
+        static const char *kCatNames[7] = {"ALL", "COMPACT", "MIDSIZE", "MUSCLE", "SPECIAL", "TRAILERS", "MODDED"};
+        std::vector<game_frontend::CarEntry> cars = snap.car_catalog;
+        if (cars.empty()) {
+            // Fallback list when unit-tested without EE RAM
+            cars = {
+                {"Algar", "COMPACT", 0, 1, 4, false, false},
+                {"Gladiator", "MIDSIZE", 1, 10, 6, false, false},
+                {"Outlaw", "MUSCLE", 2, 107, 5, false, false},
+                {"Bus", "SPECIAL", 3, 505, 2, false, false},
+                {"Trailer", "TRAILERS", 3, 400, 1, true, false},
+                {"Phantom", "MODDED", 2, 775, 2, false, true},
+                {"Cup Car", "MODDED", 4, 777, 3, false, true},
+            };
+        }
+        for (const auto &c : cars) {
+            if (browser_cat_ > 0 && c.category != kCatNames[browser_cat_]) continue;
+            BrowserItem it;
+            it.id = "car:" + c.model;
+            it.title = upper(c.model);
+            it.subtitle = c.category + "  •  " + std::to_string(c.paint_count) + (c.paint_count == 1 ? " PAINT" : " PAINTS");
+            it.badge = c.is_modded ? "MODDED" : c.is_trailer ? "TRAILER" : c.category;
+            it.car_num = c.vehicle_num;
+            it.is_car = true;
+            it.is_trailer = c.is_trailer;
+            it.is_modded = c.is_modded;
+            out.push_back(std::move(it));
+        }
+        return out;
+    }
+    if (sub_screen_ == SubScreen::MapBrowser) {
+        // 0 = ALL, 1 = RETAIL TRACKS, 2 = CUSTOM MAPS (.eodmap)
+        if (browser_cat_ == 0 || browser_cat_ == 1) {
+            std::vector<std::string> tracks = snap.retail_tracks;
+            if (tracks.empty()) {
+                tracks = {"Anoka", "Bemidji", "Dennison", "Hastings", "HomeBase", "Mankato", "Springfield", "Welch", "Woodly"};
+            }
+            for (const auto &t : tracks) {
+                BrowserItem it;
+                it.id = "track:" + t;
+                it.title = upper(t);
+                it.subtitle = "RETAIL ARENA";
+                it.badge = "RETAIL";
+                it.track_art = t;
+                out.push_back(std::move(it));
+            }
+        }
+        if (browser_cat_ == 0 || browser_cat_ == 2) {
+            for (const auto &cm : snap.custom_maps) {
+                BrowserItem it;
+                it.id = "cmap:" + cm.id;
+                it.title = upper(cm.title.empty() ? cm.id : cm.title);
+                it.subtitle = cm.author.empty() ? cm.id : ("BY " + upper(cm.author));
+                it.badge = "CUSTOM MAP";
+                it.track_art = cm.base_arena.empty() ? "Anoka" : cm.base_arena;
+                it.is_custom_map = true;
+                out.push_back(std::move(it));
+            }
+        }
+        return out;
+    }
+
+    // ModeBrowser: 0=ALL, 1=RETAIL, 2=PARTY & ARENA, 3=MY CUSTOM MODES
+    if (browser_cat_ == 0 || browser_cat_ == 2) {
+        static const struct { uint8_t preset; const char *art; bool feat; } kParty[] = {
+            {mutator::PRESET_TIPS_TAG,        "Anoka",       true},
+            {mutator::PRESET_BATTLE_ROYALE,   "HomeBase",    true},
+            {mutator::PRESET_DESTRUCTIONWARE, "Woodly",      true},
+            {mutator::PRESET_INFECTION,       "Hastings",    false},
+            {mutator::PRESET_FIESTA_ROULETTE, "Springfield", false},
+            {mutator::PRESET_CHAIN_GANG,      "Mankato",     false},
+        };
+        for (const auto &p : kParty) {
+            BrowserItem it;
+            it.id = "preset:" + std::to_string(p.preset);
+            it.title = mutator::preset_label(p.preset);
+            it.subtitle = mutator::preset_description(p.preset);
+            it.badge = p.feat ? "FEATURED" : "PARTY & ARENA";
+            it.track_art = p.art;
+            it.preset_id = p.preset;
+            it.featured = p.feat;
+            out.push_back(std::move(it));
+        }
+    }
+    if (browser_cat_ == 0 || browser_cat_ == 1) {
+        static const struct { const char *name; const char *art; const char *desc; } kRetail[] = {
+            {"Battle (8 AI)",       "Anoka",       "Open-arena combat with 8 AI opponents."},
+            {"Battle (4 AI)",       "Welch",       "Classic 4-AI Battle arena."},
+            {"No-Rules Race",       "Woodly",      "Full-contact oval & dirt racing."},
+            {"Figure-8 Jump Race",  "Hastings",    "High-speed intersection mayhem."},
+            {"Demolition Derby",    "Dennison",    "Last car running in the pit."},
+            {"School Bus",          "Springfield", "Heavyweight bus carnage."},
+            {"Trailer Race",        "Mankato",     "Tow trailers through traffic."},
+        };
+        for (const auto &rt : kRetail) {
+            BrowserItem it;
+            it.id = std::string("retail:") + rt.name;
+            it.title = upper(rt.name);
+            it.subtitle = rt.desc;
+            it.badge = "RETAIL";
+            it.track_art = rt.art;
+            it.preset_id = mutator::PRESET_STANDARD;
+            out.push_back(std::move(it));
+        }
+    }
+    if (browser_cat_ == 0 || browser_cat_ == 3) {
+        for (const auto &m : snap.modes) {
+            if (!m.is_custom_json) continue;
+            BrowserItem it;
+            it.id = "custom:" + m.id;
+            it.title = upper(m.name);
+            it.subtitle = m.description;
+            it.badge = "CUSTOM JSON";
+            it.track_art = m.default_track.empty() ? "Anoka" : m.default_track;
+            it.is_custom_mode = true;
+            out.push_back(std::move(it));
+        }
+        BrowserItem add;
+        add.id = "save_new_mode";
+        add.title = "+ SAVE CURRENT AS NEW MODE";
+        add.subtitle = "Writes current ruleset to mods/gametypes/<id>.json";
+        add.badge = "CREATE";
+        add.track_art = offline_track_.empty() ? "Anoka" : offline_track_;
+        add.is_save_new = true;
+        out.push_back(std::move(add));
+    }
+    return out;
+}
+
+void Menu::activate_browser_item(int idx, Effects &fx) {
+    const auto items = browser_items();
+    if (idx < 0 || idx >= (int)items.size()) { fx.sound = Sound::Error; return; }
+    const auto &it = items[idx];
+    fx.sound = Sound::Select;
+    if (it.is_save_new) {
+        push_mutator_draft();
+        if (net_) {
+            game_frontend::Command sc{};
+            sc.kind = game_frontend::Command::Kind::SaveCustomGametype;
+            sc.draft = mutator_draft_;
+            net_->submit(std::move(sc));
+        }
+        set_status("Saved custom mode to mods/gametypes/");
+        sub_screen_ = SubScreen::None;
+        return;
+    }
+    if (sub_screen_ == SubScreen::CarBrowser) {
+        if (it.is_car && it.id.compare(0, 4, "car:") == 0) {
+            const std::string model = it.id.substr(4);
+            split_seats_[0].car_model = model;
+            split_seats_[0].vehicle_num = it.car_num;
+            split_seats_[0].paint = 0;
+            pic_car_ = it.car_num;
+            if (net_ && session_kind_ == game_frontend::SessionKind::Online) {
+                game_frontend::Command opt{};
+                opt.kind = game_frontend::Command::Kind::Option;
+                opt.text = "car_model:" + model;
+                net_->submit(std::move(opt));
+            }
+        }
+        sub_screen_ = SubScreen::None;
+        return;
+    }
+    if (sub_screen_ == SubScreen::MapBrowser) {
+        if (it.is_custom_map) {
+            offline_custom_map_ = it.id.substr(5);
+            offline_track_ = it.track_art;
+            if (net_ && session_kind_ == game_frontend::SessionKind::Online) {
+                net_->submit({game_frontend::Command::Kind::SelectCustomMap, offline_custom_map_});
+            }
+        } else {
+            offline_custom_map_.clear();
+            offline_track_ = it.id.substr(6);
+            if (net_ && session_kind_ == game_frontend::SessionKind::Online) {
+                net_->submit({game_frontend::Command::Kind::SelectCustomMap, ""});
+            }
+        }
+        sub_screen_ = SubScreen::None;
+        return;
+    }
+    // ModeBrowser selection
+    if (it.id.compare(0, 7, "preset:") == 0) {
+        offline_preset_ = it.preset_id;
+        offline_event_ = "Battle";
+        sync_draft_from_preset(it.preset_id);
+        push_mutator_draft();
+    } else if (it.id.compare(0, 7, "retail:") == 0) {
+        offline_preset_ = mutator::PRESET_STANDARD;
+        offline_event_ = it.id.substr(7);
+        sync_draft_from_preset(mutator::PRESET_STANDARD);
+        push_mutator_draft();
+    } else if (it.is_custom_mode) {
+        offline_preset_ = mutator::PRESET_CUSTOM_JSON;
+        mutator_draft_.id = it.id.substr(7);
+        mutator_draft_.name = it.title;
+        push_mutator_draft();
+    }
+    sub_screen_ = SubScreen::None;
+}
+
+void Menu::set_rules_tab(int t) {
+    rules_tab_ = std::clamp(t, 0, 3);
+    sel_[(int)Tab::Play] = 0;
+    scroll_[(int)Tab::Play] = 0;
+}
+
+void Menu::set_quick_rail(bool on) {
+    quick_rail_ = on;
+    quick_scoreboard_ = false;
+    save_prompt_ = false;
+    sub_screen_ = SubScreen::None;
+    if (on) {
+        tab_ = Tab::Play;
+        sel_[(int)Tab::Play] = 0;
+        scroll_[(int)Tab::Play] = 0;
+    }
+}
+
+int Menu::distinct_chassis_count() const {
+    std::vector<std::string> seen;
+    const int n = session_kind_ == game_frontend::SessionKind::SplitScreen ? split_players_ : 1;
+    for (int i = 0; i < n && i < 4; ++i) {
+        const std::string &m = split_seats_[i].car_model;
+        if (!m.empty() && std::find(seen.begin(), seen.end(), m) == seen.end()) seen.push_back(m);
+    }
+    return (int)seen.size();
+}
+
+void Menu::sync_draft_from_preset(uint8_t preset_id) {
+    mutator_draft_ = game_frontend::MutatorDraft{};
+    mutator_draft_.preset_id = preset_id;
+    mutator::GametypeConfig cfg;
+    if (mutator::build_preset(preset_id, cfg)) {
+        mutator_draft_.id = cfg.id;
+        mutator_draft_.name = cfg.name;
+        mutator_draft_.rule_flags = cfg.base_rule_flags;
+        mutator_draft_.feat_bits = cfg.base_feats;
+        mutator_draft_.tips_fuse_sec = cfg.tips_fuse_sec;
+        mutator_draft_.fiesta_interval_sec = cfg.fiesta_interval_sec;
+        mutator_draft_.shuffle_rounds = cfg.shuffle_rounds;
+        mutator_draft_.rounds_to_win = cfg.rounds_to_win;
+        mutator_draft_.gravity_scale = cfg.base_traits.gravity_scale;
+        mutator_draft_.mass_scale = cfg.base_traits.mass_scale;
+        mutator_draft_.grip_scale = cfg.base_traits.grip_scale;
+        mutator_draft_.torque_scale = cfg.base_traits.torque_scale;
+        mutator_draft_.top_speed_scale = cfg.base_traits.top_speed_scale;
+        mutator_draft_.damage_taken_scale = cfg.base_traits.damage_taken_scale;
+        mutator_draft_.chicken_force_scale = cfg.base_traits.chicken_force_scale;
+        mutator_draft_.chicken_radius_scale = cfg.base_traits.chicken_radius_scale;
+        mutator_draft_.chicken_reload_sec = cfg.base_traits.chicken_reload_sec;
+        mutator_draft_.uses_weapons = mutator::config_uses_weapons(cfg);
+        for (const auto &tr : cfg.base_triggers) {
+            if (tr.kind == mutator::TriggerKind::RingOut) {
+                mutator_draft_.storm_radius_m = tr.extents[0];
+                mutator_draft_.storm_shrink_mps = tr.shrink_rate_mps;
+                mutator_draft_.storm_dps = tr.dps_outside;
+                break;
+            }
+        }
+        mutator_draft_.custom_json = mutator::serialize_gametype_json(cfg);
+    } else {
+        mutator_draft_.id = "standard";
+        mutator_draft_.name = "Standard (Vanilla)";
+        mutator_draft_.uses_weapons = true;
+    }
+    mutator_draft_.summary_lines.clear();
+    mutator_draft_.summary_lines.push_back(mutator::preset_description(preset_id));
+    if (!mutator_draft_.uses_weapons) mutator_draft_.summary_lines.push_back("Weapons: OFF (Mode Enforced)");
+    else if (mutator_draft_.feat_bits & (mutator::FB_CHICKEN_STRAIGHT | mutator::FB_CHICKEN_MORTAR))
+        mutator_draft_.summary_lines.push_back("Weapons: Chickens ON");
+    if (mutator_draft_.rule_flags & mutator::RF_TIPS_TAG) {
+        char buf[64];
+        snprintf(buf, sizeof buf, "Personal Fuse: %.0fs | Immunity: 3.5s", mutator_draft_.tips_fuse_sec);
+        mutator_draft_.summary_lines.push_back(buf);
+    }
+}
+
+void Menu::push_mutator_draft() {
+    mutator::GametypeConfig cfg;
+    if (!mutator::build_preset(mutator_draft_.preset_id, cfg)) {
+        cfg.id = mutator_draft_.id.empty() ? "custom_rules" : mutator_draft_.id;
+        cfg.name = mutator_draft_.name.empty() ? "Custom Rules" : mutator_draft_.name;
+    }
+    cfg.base_rule_flags = mutator_draft_.rule_flags;
+    cfg.base_feats = mutator_draft_.feat_bits;
+    cfg.tips_fuse_sec = mutator_draft_.tips_fuse_sec;
+    cfg.fiesta_interval_sec = mutator_draft_.fiesta_interval_sec;
+    cfg.shuffle_rounds = mutator_draft_.shuffle_rounds;
+    cfg.rounds_to_win = mutator_draft_.rounds_to_win;
+    cfg.base_traits.gravity_scale = mutator_draft_.gravity_scale;
+    cfg.base_traits.mass_scale = mutator_draft_.mass_scale;
+    cfg.base_traits.grip_scale = mutator_draft_.grip_scale;
+    cfg.base_traits.torque_scale = mutator_draft_.torque_scale;
+    cfg.base_traits.top_speed_scale = mutator_draft_.top_speed_scale;
+    cfg.base_traits.damage_taken_scale = mutator_draft_.damage_taken_scale;
+    cfg.base_traits.chicken_force_scale = mutator_draft_.chicken_force_scale;
+    cfg.base_traits.chicken_radius_scale = mutator_draft_.chicken_radius_scale;
+    cfg.base_traits.chicken_reload_sec = mutator_draft_.chicken_reload_sec;
+    for (auto &tr : cfg.base_triggers) {
+        if (tr.kind == mutator::TriggerKind::RingOut) {
+            tr.extents[0] = tr.extents[2] = mutator_draft_.storm_radius_m;
+            tr.shrink_rate_mps = mutator_draft_.storm_shrink_mps;
+            tr.dps_outside = mutator_draft_.storm_dps;
+        }
+    }
+    cfg.sanitize();
+    mutator_draft_.uses_weapons = mutator::config_uses_weapons(cfg);
+    mutator_draft_.custom_json = mutator::serialize_gametype_json(cfg);
+    if (net_) {
+        game_frontend::Command cmd{};
+        cmd.kind = game_frontend::Command::Kind::UpdateMutatorDraft;
+        cmd.draft = mutator_draft_;
+        net_->submit(std::move(cmd));
+    }
+}
+
+void Menu::launch_offline_match(bool split) {
+    if (!net_) return;
+    game_frontend::Command cmd{};
+    cmd.kind = game_frontend::Command::Kind::LaunchTransition;
+    cmd.transition.target = split ? 4 : 3; // SplitScreen = 4, Solo = 3
+    cmd.transition.track = offline_track_.empty() ? "Anoka" : offline_track_;
+    cmd.transition.event = offline_preset_ > 0 ? "Battle" : (offline_event_.empty() ? "Battle (8 AI)" : offline_event_);
+    cmd.transition.custom_map_id = offline_custom_map_;
+    cmd.transition.gametype_preset = offline_preset_;
+    cmd.transition.mutator_json = offline_preset_ > 0 ? mutator_draft_.custom_json : "";
+    cmd.transition.humans = split ? std::clamp(split_players_, 2, 4) : 1;
+    cmd.transition.ai_bots = offline_ai_bots_;
+    cmd.transition.laps = offline_laps_;
+    for (int i = 0; i < 4; ++i) {
+        cmd.transition.seat_cars[i] = split_seats_[i].car_model;
+        cmd.transition.seat_paints[i] = split_seats_[i].paint;
+        cmd.transition.seat_vehicles[i] = split_seats_[i].vehicle_num;
+    }
+    net_->submit(std::move(cmd));
+}
+
+void Menu::launch_career(bool classic_hub, bool new_career) {
+    if (!net_) return;
+    game_frontend::Command cmd{};
+    cmd.kind = game_frontend::Command::Kind::LaunchTransition;
+    cmd.transition.target = 2; // Career = 2
+    cmd.transition.career_place = classic_hub ? -1 : career_warp_idx_;
+    cmd.transition.career_eve = -1;
+    cmd.transition.classic_career_hub = classic_hub;
+    cmd.transition.new_career = new_career;
+    net_->submit(std::move(cmd));
+}
 
 void Menu::set_network(std::shared_ptr<game_frontend::Network> n) {
     net_ = std::move(n);
@@ -178,6 +567,7 @@ void Menu::store_mods() {
 }
 
 void Menu::open() {
+    close_map_picker();
     remove_player_.clear();
     details_ = false;
     music_open_ = false;
@@ -189,7 +579,11 @@ void Menu::open() {
 }
 
 void Menu::set_tab(Tab t) {
-    if (t != Tab::Online && online_modal_title()) return;
+    if (t != Tab::Play && online_modal_title()) return;
+    if (t != Tab::Play) {
+        close_map_picker();
+        sub_screen_ = SubScreen::None;
+    }
     tab_ = t;
     details_ = false;
     status_.clear();
@@ -218,15 +612,13 @@ void Menu::rebuild(Tab t) {
     std::vector<Row> &r = rows_[(int)t];
     // A roster update may insert rows above the selected control.
     const int old = sel_[(int)t];
-    const std::string selected = t == Tab::Online && old >= 0 && old < (int)r.size() ? r[old].id : "";
+    const std::string selected = t == Tab::Play && old >= 0 && old < (int)r.size() ? r[old].id : "";
     r.clear();
     switch (t) {
-    case Tab::Graphics: rows_graphics(r); break;
-    case Tab::Mods: rows_mods(r); break;
-    case Tab::Settings: rows_settings(r); break;
-    case Tab::Inputs: rows_inputs(r); break;
-    case Tab::Online: {
-        rows_online(r);
+    case Tab::Play: {
+        if (quick_rail_) rows_quick_rail(r);
+        else if (sub_screen_ == SubScreen::RulesDrawer) rows_rules_drawer(r);
+        else rows_play(r);
         if (!selected.empty()) {
             auto it = std::find_if(r.begin(), r.end(), [&](const Row &row) { return row.id == selected; });
             if (it != r.end()) sel_[(int)t] = (int)(it - r.begin());
@@ -234,6 +626,10 @@ void Menu::rebuild(Tab t) {
         }
         break;
     }
+    case Tab::Mods: rows_mods(r); break;
+    case Tab::Graphics: rows_graphics(r); break;
+    case Tab::Inputs: rows_inputs(r); break;
+    case Tab::Settings: rows_settings(r); break;
     default: rows_error(r); break;
     }
 }
@@ -401,48 +797,36 @@ void Menu::rows_settings(std::vector<Row> &r) {
     r.push_back(toggle("audio", "SOUND", cfg_.audio, "LIVE", "All game sound on or off."));
     r.push_back(choice("volume", "MASTER VOLUME", percent(cfg_.volume), "LIVE",
                        "Overall game and voice volume."));
-    r.push_back(choice("musicvolume", "MUSIC VOLUME", percent(cfg_.music_volume), "LIVE", "Turn down or mute your soundtrack independently of engines, effects and voice."));
+    r.push_back(choice("musicvolume", "MUSIC VOLUME", percent(cfg_.music_volume), "LIVE",
+                       "Turn down or mute your soundtrack independently of engines, effects and voice."));
     incoming_voice_rows(r, cfg_);
-    r.push_back(header("FRONT END"));
+    r.push_back(header("FRONT END & BOOT"));
+    r.push_back(toggle("unified_fe", "UNIFIED PLAY HUB", cfg_.unified_frontend, "LIVE",
+                       "Boot into the unified PC/Console PLAY Hub. Turn OFF for Classic PS2 Menus."));
     r.push_back(toggle("pause", "PAUSE GAME IN THIS MENU", cfg_.pause_in_menu, "LIVE",
                        "Holds the game while this menu is open (never during online play)."));
-    r.push_back(header("GAMEPLAY OPTIONS"));
-    r.push_back(toggle("unlock", "UNLOCK ALL", cfg_.unlock_all, "NEXT LAUNCH",
-                       "All tracks, cars, dares and feat prizes unlocked out of the box."));
-    r.push_back(toggle("career_cheats", "CHEATS IN CAREER", cfg_.career_cheats, "LIVE",
-                       "Lets unlocked cheat feats work in Career too."));
-    r.push_back(toggle("bots", "BATTLE BOTS", cfg_.battle_bots, "NEXT EVENT",
-                       "Fills Battle to four cars with AI opponents using native weapons and respawns."));
-    r.push_back(toggle("spbattle", "SINGLE PLAYER BATTLE", cfg_.sp_battle_mode, "NEXT MENU",
-                       "Adds Battle to the solo Action tracks."));
-    r.push_back(toggle("recovery", "MANUAL RECOVERY ONLY", cfg_.manual_recovery, "LIVE",
+    r.push_back(toggle("fast_boot", "FAST BOOT", cfg_.fast_boot, "NEXT LAUNCH",
+                       "Skips startup intro movies, title screen, and artificial loading delays."));
+    r.push_back(toggle("skip_memcard", "SKIP MEMCARD DELAYS", cfg_.skip_memcard, "NEXT LAUNCH",
+                       "Skips PS2 memory card boot hold delays while still loading your save."));
+    r.push_back(header("DRIVING & NETWORK"));
+    bool online_connected = false;
+    if (net_) {
+        const auto p = net_->snapshot().phase;
+        online_connected = (p != game_frontend::Snapshot::Phase::Offline &&
+                            p != game_frontend::Snapshot::Phase::Disconnected &&
+                            p != game_frontend::Snapshot::Phase::Error);
+    }
+    r.push_back(toggle("recovery", "MANUAL RECOVERY ONLY", cfg_.manual_recovery, online_connected ? "HOST RULE ONLINE" : "LIVE",
                        "No automatic wrong-way or upside-down countdown for humans; SELECT still recovers. AI unchanged."));
-    const bool guest_online = [&] {
-        if (!net_) return false;
-        const auto s = net_->snapshot();
-        using P = game_frontend::Snapshot::Phase;
-        return s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
-    }();
-    auto host_rule = [&](Row row) {
-        if (guest_online) { row.enabled = false; row.note = "HOST RULES"; }
-        return row;
-    };
-    r.push_back(host_rule(toggle("durability", "PER-CAR DURABILITY", cfg_.car_durability, "LIVE",
-                       "Each car's own damage scale from its files (the game's menus already rate cars by it).")));
-    r.push_back(host_rule(toggle("turbo", turbo_label(cfg_, host_).c_str(), cfg_.cheat_turbo, "LIVE",
-                                 "Hold the displayed driving input to boost while Turbo is on.")));
-    auto amount = [](float v, const char *unit) { char t[24]; snprintf(t, sizeof t, "%.2f%s", v, unit); return std::string(t); };
-    r.push_back(host_rule(choice("turbo_scale", "TURBO STRENGTH", amount(cfg_.turbo_scale, "X"), "LIVE",
-                       "Push and top speed while boosting.")));
-    r.push_back(host_rule(toggle("chickens", "CHICKEN FIGHT (L2)", cfg_.cheat_chickens, "LIVE", "Optional cheat: L2 fires chickens.")));
-    r.push_back(host_rule(choice("chicken_reload", "CHICKEN RELOAD", amount(cfg_.chicken_reload, " S"), "LIVE",
-                       "Seconds between shots. The original is 3.")));
-    r.push_back(host_rule(choice("chicken_force", "CHICKEN BLAST FORCE", amount(cfg_.chicken_force_scale, "X"), "LIVE",
-                       "How hard a blast throws cars.")));
-    r.push_back(host_rule(choice("chicken_size", "CHICKEN BLAST SIZE", amount(cfg_.chicken_radius_scale, "X"), "LIVE",
-                       "How far a blast reaches.")));
-    r.push_back(host_rule(toggle("invincible", "INVINCIBLE HUMANS", cfg_.cheat_invincible, "LIVE",
-                       "Optional cheat: human players take no damage; AI stay vulnerable.")));
+    r.push_back(toggle("durability", "PER-CAR DURABILITY", cfg_.car_durability, online_connected ? "HOST RULE ONLINE" : "LIVE",
+                       "Each car's own damage scale from its files (the game's menus already rate cars by it)."));
+    Row nick = action("nickname", "SCREEN NAME", text_id_ == "nickname" ? text_ + "_" :
+                      (cfg_.nickname.empty() ? "RANDOM" : cfg_.nickname), "Leave blank for a random name.");
+    nick.kind = RowKind::Text;
+    r.push_back(nick);
+    r.push_back(choice("snapshot_buffer", "REMOTE CAR SMOOTHING", std::to_string(cfg_.snapshot_buffer_ms) + " ms", "LIVE",
+                       "Longer buffering smooths uneven packet arrivals. Shorter buffering shows recent movement sooner."));
 }
 
 void Menu::rows_inputs(std::vector<Row> &r) {
@@ -572,6 +956,19 @@ void Menu::rows_mods(std::vector<Row> &r) {
         r.push_back(action("musicback", "BACK", on == 0 && skipped == 0 ? "" : std::to_string(on) + " ON", "Back to the mods."));
         return;
     }
+    bool online_connected = false;
+    if (net_) {
+        const auto p = net_->snapshot().phase;
+        online_connected = (p != game_frontend::Snapshot::Phase::Offline &&
+                            p != game_frontend::Snapshot::Phase::Disconnected &&
+                            p != game_frontend::Snapshot::Phase::Error);
+    }
+    if (online_connected) {
+        Row ol = info("online_mod_banner", "ONLINE SESSION", "CONTENT MATCHED (MUSIC STAYS LOCAL)",
+                      "Gameplay mods are verified with the host when joining. Custom Music stays local to your PC.");
+        ol.good = true;
+        r.push_back(ol);
+    }
     if (music_) {
         int ready = 0, skipped = 0;
         for (const MusicSong &m : music_songs_) {
@@ -600,7 +997,11 @@ void Menu::rows_mods(std::vector<Row> &r) {
     }
     if (mods_.empty() && !music_) r.push_back(info("nomods", "NO MODS", ""));
     // Career unlocks (docs/CAREER_UNLOCKS.md): all on out of the box, saved under [Cheats] in eod.ini
-    r.push_back(header("CAREER UNLOCKS"));
+    r.push_back(header(online_connected ? "CAREER UNLOCKS & CHEATS (OFFLINE ONLY)" : "CAREER UNLOCKS & CHEATS"));
+    r.push_back(toggle("unlock", "UNLOCK ALL", cfg_.unlock_all, "NEXT LAUNCH",
+                       "All tracks, cars, dares and feat prizes unlocked out of the box."));
+    r.push_back(toggle("career_cheats", "CHEATS IN CAREER", cfg_.career_cheats, "LIVE",
+                       "Lets unlocked cheat feats work in Career too."));
     r.push_back(toggle("cu_money", "CAREER MONEY FLOOR", cfg_.career_money, "LIVE",
                        "Career money never drops below $10,000, so every car and part can be bought. Winnings still add."));
     r.push_back(toggle("cu_rank", "CAREER RANK ON TOP", cfg_.career_rank, "LIVE",
@@ -616,7 +1017,7 @@ void Menu::rows_mods(std::vector<Row> &r) {
 }
 
 const char *Menu::online_modal_title() const {
-    if (tab_ != Tab::Online || error_active()) return nullptr;
+    if (tab_ != Tab::Play || error_active()) return nullptr;
     switch (online_dialog_) {
     case OnlineDialog::Connecting:
         return join_attempt_ && join_attempt_->kind == game_frontend::Command::Kind::Host
@@ -644,10 +1045,261 @@ void Menu::cancel_join() {
     if (net_) net_->submit({game_frontend::Command::Kind::Cancel});
 }
 
+void Menu::close_map_picker() {
+    if (map_return_row_ >= 0) {
+        sel_[int(Tab::Play)] = map_return_row_;
+        map_return_row_ = -1;
+    }
+}
+
+void Menu::rows_play(std::vector<Row> &r) {
+    using SK = game_frontend::SessionKind;
+    using P = game_frontend::Snapshot::Phase;
+    game_frontend::Snapshot s;
+    if (net_) {
+        net_->viewing_online();
+        s = net_->snapshot();
+    }
+    const bool net_busy = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
+    const bool net_failed = !net_busy && !s.error.empty();
+    if (net_busy || net_failed) {
+        session_kind_ = SK::Online;
+        rows_online(r);
+        return;
+    }
+    static const char *kSessionLabels[4] = {"CAREER", "SOLO QUICK PLAY", "2P-4P SPLIT-SCREEN", "ONLINE MULTIPLAYER"};
+    r.push_back(choice("play_session", "SESSION", kSessionLabels[(int)session_kind_], "LIVE",
+                       "Switch seamlessly between Career, Solo Quick Play, 2-4P Local Split-Screen, and 16P Online Multiplayer."));
+    if (session_kind_ == SK::Online) {
+        rows_online(r);
+        return;
+    }
+    online_dialog_ = OnlineDialog::None;
+    pic_track_ = offline_track_;
+    pic_car_ = split_seats_[0].vehicle_num;
+    if (session_kind_ == SK::Career) {
+        static const char *kPlaces[8] = {
+            "HOME BASE", "MALT SHOP (TJ'S)", "CHOOSE NEXT EVE", "DEALER (SCRAPYARD)",
+            "GARAGE & UPGRADES", "TIME GATE 1", "TIME GATE 2", "TROY'S PLACE"
+        };
+        r.push_back(header("CAREER COMMAND CENTER"));
+        r.push_back(action("career_continue", "CONTINUE CAREER", "[ PLAY ]",
+                           "Jump straight into Career Free Roam at your selected warp destination."));
+        r.push_back(choice("career_warp", "WARP TARGET", kPlaces[std::clamp(career_warp_idx_, 0, 7)], "LIVE",
+                           "Destination in Career Free Roam when continuing Career."));
+        r.push_back(action("career_classic_hub", "CLASSIC PS2 HUB", "[ OPEN HUB ]",
+                           "Enter the native PS2 Career Homebase menu directly."));
+        r.push_back(action("career_new", "NEW CAREER", "[ START NEW ]",
+                           "Begin a fresh Career from rank 100."));
+        r.push_back(action("classic_ps2_toggle", "CLASSIC PS2 MENUS", "[ SWITCH ]",
+                           "Return to the original PS2 main menu shell (press F1 anytime to come back)."));
+        return;
+    }
+    const bool split = (session_kind_ == SK::SplitScreen);
+    r.push_back(header(split ? "LOCAL SPLIT-SCREEN SETUP" : "SOLO MATCH SETUP"));
+    if (split) {
+        r.push_back(choice("split_players", "PLAYERS", std::to_string(split_players_) + "P", "NEXT MATCH",
+                           "Number of local split-screen seats (2P, 3P, or 4P multitap)."));
+    }
+    const std::string mode_val = offline_preset_ > 0 ? mutator::preset_label(offline_preset_) : upper(offline_event_);
+    r.push_back(choice("play_mode", "MODE", mode_val, "NEXT MATCH",
+                       "Cycle retail events or Party & Arena mutator modes. Press X/Square for Visual Mode Browser."));
+    r.push_back(choice("play_track", "MAP", offline_custom_map_.empty() ? upper(offline_track_) : upper(offline_custom_map_), "NEXT MATCH",
+                       "Choose any of the 17 retail tracks or an installed .eodmap custom arena."));
+    if (!split) {
+        r.push_back(choice("seat0_car", "CAR", upper(split_seats_[0].car_model), "NEXT MATCH",
+                           "Choose your vehicle model."));
+        r.push_back(choice("seat0_paint", "PAINT", "PAINT " + std::to_string(split_seats_[0].paint + 1), "NEXT MATCH",
+                           "Cycle paint schemes for your selected car."));
+    } else {
+        for (int i = 0; i < split_players_ && i < 4; ++i) {
+            const std::string id = "seat" + std::to_string(i) + "_car";
+            const std::string lbl = "P" + std::to_string(i + 1) + " CAR";
+            r.push_back(choice(id.c_str(), lbl.c_str(),
+                               upper(split_seats_[i].car_model) + " (#" + std::to_string(split_seats_[i].paint + 1) + ")",
+                               "NEXT MATCH",
+                               "Independent per-seat car selection (up to 6 distinct chassis across all 16 cars)."));
+        }
+    }
+    r.push_back(choice("play_laps", "LAPS", std::to_string(offline_laps_) + " LAPS", "NEXT MATCH",
+                       "Lap count override for lap-based races (1-50)."));
+    const std::string ai_str = offline_ai_bots_ < 0 ? "FILL (AUTO)"
+                             : offline_ai_bots_ == 0 ? "OFF (0 BOTS)"
+                             : std::to_string(offline_ai_bots_) + " BOTS";
+    r.push_back(choice("play_ai", "AI BOTS", ai_str, "NEXT MATCH",
+                       "Number of AI opponents to spawn (up to 16 total cars)."));
+    r.push_back(action("open_mode_browser", "BROWSE MODES", "[ VISUAL BROWSER ]",
+                       "Open the Trackmania-style Visual Mode Browser (Hero Cards + Categorized Grid)."));
+    r.push_back(action("open_map_browser", "BROWSE MAPS", "[ TRACKS & .EODMAP ]",
+                       "Browse all 17 retail tracks and installed .eodmap custom maps."));
+    r.push_back(action("open_car_browser", "BROWSE CARS", "[ BY CLASS & MODS ]",
+                       "Visual Car Selector sorted by class (Compact, Midsize, Muscle, Special, Trailers & Modded)."));
+    r.push_back(action("open_rules_drawer", "CUSTOMIZE RULES", "[ X / CONFIGURE ]",
+                       "Tune mode rules, weapons/feats, physics traits, and save custom JSON gametypes."));
+    Row launch = action(split ? "launch_split" : "launch_solo",
+                        split ? "START SPLIT-SCREEN" : "LAUNCH SOLO EVENT",
+                        "[ >>> LAUNCH <<< ]",
+                        "Launch directly into the configured match.");
+    launch.good = true;
+    r.push_back(launch);
+    r.push_back(action("classic_ps2_toggle", "CLASSIC PS2 MENUS", "[ SWITCH ]",
+                       "Close the Unified PLAY Hub and use the native PS2 menus."));
+}
+
+void Menu::rows_rules_drawer(std::vector<Row> &r) {
+    static const char *kTabs[4] = {"MODE RULES", "FEATS & WEAPONS", "PHYSICS & SCALE", "BOTS & ROLES"};
+    game_frontend::Snapshot snap;
+    if (net_) snap = net_->snapshot();
+    using P = game_frontend::Snapshot::Phase;
+    const bool online_connected = snap.phase != P::Offline && snap.phase != P::Disconnected && snap.phase != P::Error;
+    const bool guest_ro = online_connected && !snap.is_host;
+    const auto &draft = (guest_ro && !snap.mutator_draft.name.empty()) ? snap.mutator_draft : mutator_draft_;
+
+    r.push_back(header((std::string(guest_ro ? "HOST RULES (READ-ONLY)  -  " : "CUSTOMIZE RULES  -  ") + kTabs[std::clamp(rules_tab_, 0, 3)]).c_str()));
+    r.push_back(choice("rules_subtab", "SECTION", kTabs[std::clamp(rules_tab_, 0, 3)], "LIVE",
+                       "Switch between Mode Rules, Feats & Weapons, Physics & Scale, and Bots & Roles."));
+    auto fmt = [](float v, const char *u) { char b[32]; snprintf(b, sizeof b, "%.2f%s", v, u); return std::string(b); };
+    auto ro_choice = [&](const char *id, const char *lbl, const std::string &val, const char *note, const char *help) {
+        return guest_ro ? info(id, lbl, val, "Controlled by the host.") : choice(id, lbl, val, note, help);
+    };
+    auto ro_toggle = [&](const char *id, const char *lbl, bool on, const char *note, const char *help) {
+        return guest_ro ? info(id, lbl, on ? "ON" : "OFF", "Controlled by the host.") : toggle(id, lbl, on, note, help);
+    };
+    if (rules_tab_ == 0) {
+        r.push_back(ro_choice("draft_preset", "BASE PRESET", mutator::preset_label(draft.preset_id), "LIVE",
+                              mutator::preset_description(draft.preset_id)));
+        r.push_back(ro_choice("draft_fuse", "TIPS FUSE", fmt(draft.tips_fuse_sec, " S"), "LIVE",
+                              "Personal Hot Potato fuse duration in Tips (Tag) mode."));
+        r.push_back(ro_choice("draft_storm_r", "STORM START RADIUS", fmt(draft.storm_radius_m, " M"), "LIVE",
+                              "Initial safe-zone storm radius in Battle Royale."));
+        r.push_back(ro_choice("draft_storm_s", "STORM SHRINK RATE", fmt(draft.storm_shrink_mps, " M/S"), "LIVE",
+                              "How fast the Battle Royale storm closes in."));
+        r.push_back(ro_choice("draft_storm_dps", "STORM DAMAGE", fmt(draft.storm_dps * 100.0f, "%/S"), "LIVE",
+                              "Damage per second outside the safe zone."));
+        r.push_back(ro_choice("draft_fiesta", "FIESTA INTERVAL", fmt(draft.fiesta_interval_sec, " S"), "LIVE",
+                              "Seconds between trait & weapon rerolls in Fiesta Roulette."));
+        r.push_back(ro_toggle("draft_shuffle", "SHUFFLE MICRO-ROUNDS", draft.shuffle_rounds, "LIVE",
+                              "Randomize DestructionWare micro-round order."));
+    } else if (rules_tab_ == 1) {
+        const bool wp_ok = draft.uses_weapons;
+        r.push_back(ro_toggle("draft_turbo", "TURBO BOOST", (draft.feat_bits & mutator::FB_TURBO) != 0, "LIVE",
+                              "Enable L2 / Right-Stick Turbo Boost."));
+        Row ch = ro_toggle("draft_chickens", "CHICKEN FIGHT", (draft.feat_bits & mutator::FB_CHICKEN_STRAIGHT) != 0,
+                           wp_ok ? "LIVE" : "NO WEAPONS MODE", "Enable straight-shot explosive chickens.");
+        if (!guest_ro) ch.enabled = wp_ok;
+        r.push_back(ch);
+        Row cr = ro_choice("draft_chicken_reload", "CHICKEN RELOAD", fmt(draft.chicken_reload_sec, " S"),
+                           wp_ok ? "LIVE" : "NO WEAPONS MODE", "Seconds between chicken shots.");
+        if (!guest_ro) cr.enabled = wp_ok;
+        r.push_back(cr);
+        Row cf = ro_choice("draft_chicken_force", "CHICKEN BLAST FORCE", fmt(draft.chicken_force_scale, "X"),
+                           wp_ok ? "LIVE" : "NO WEAPONS MODE", "Explosion knockback impulse multiplier.");
+        if (!guest_ro) cf.enabled = wp_ok;
+        r.push_back(cf);
+        r.push_back(ro_toggle("draft_ohk", "ONE-HIT KILLS", (draft.feat_bits & mutator::FB_ONE_HIT_KILLS) != 0, "LIVE",
+                              "Qualifying impacts instantly wreck opponents."));
+        r.push_back(ro_toggle("draft_deadly", "DEADLY AMBITION", (draft.feat_bits & mutator::FB_DEADLY_AMBITION) != 0, "LIVE",
+                              "1st-place car gradually loses health."));
+        r.push_back(ro_toggle("draft_invincible", "INVINCIBLE CARS", (draft.feat_bits & mutator::FB_INVINCIBLE) != 0, "LIVE",
+                              "Suppresses mechanical wreck damage."));
+    } else if (rules_tab_ == 2) {
+        r.push_back(ro_choice("draft_grav", "GRAVITY SCALE", fmt(draft.gravity_scale, "X"), "LIVE",
+                              "Multiplies world gravity (0.25x Moon -> 2.50x Heavy)."));
+        r.push_back(ro_choice("draft_mass", "CAR MASS SCALE", fmt(draft.mass_scale, "X"), "LIVE",
+                              "Multiplies vehicle collision mass."));
+        r.push_back(ro_choice("draft_grip", "TIRE GRIP SCALE", fmt(draft.grip_scale, "X"), "LIVE",
+                              "Scales tire traction (low = ice drift, high = slot-car grip)."));
+        r.push_back(ro_choice("draft_torque", "ENGINE TORQUE", fmt(draft.torque_scale, "X"), "LIVE",
+                              "Scales drive acceleration and boost impulse."));
+        r.push_back(ro_choice("draft_speed", "TOP SPEED CAP", fmt(draft.top_speed_scale, "X"), "LIVE",
+                              "Scales maximum speed limit."));
+        r.push_back(ro_choice("draft_dmg", "DAMAGE TAKEN", fmt(draft.damage_taken_scale, "X"), "LIVE",
+                              "Scales collision damage received."));
+    } else {
+        const int shown_ai = online_connected ? snap.lobby_ai_count : offline_ai_bots_;
+        const std::string ai_str = shown_ai < 0 || shown_ai >= 16 ? "FILL (AUTO)"
+                                 : shown_ai == 0 ? "OFF (0 BOTS)"
+                                 : std::to_string(shown_ai) + " BOTS";
+        r.push_back(ro_choice("play_ai", "AI BOT FILL", ai_str, "NEXT MATCH",
+                              "Control AI opponent fill count up to 16 total cars."));
+        if (!guest_ro) {
+            r.push_back(action("draft_save_json", "SAVE AS CUSTOM JSON", "[ SAVE TO MODS/GAMETYPES ]",
+                               "Auto-slugs and saves this ruleset to mods/gametypes/<id>.json (no keyboard required)."));
+        }
+    }
+    r.push_back(action("rules_back", "DONE / BACK TO LOBBY", "[ BACK ]", "Return to the PLAY lobby."));
+}
+
+void Menu::rows_quick_rail(std::vector<Row> &r) {
+    game_frontend::Snapshot s;
+    if (net_) s = net_->snapshot();
+    const bool in_career = (s.ee_state == 5 || s.ee_state == 6 || s.ee_state == 7);
+    const bool in_online = (s.phase == game_frontend::Snapshot::Phase::Racing ||
+                            s.phase == game_frontend::Snapshot::Phase::Loading);
+    if (save_prompt_) {
+        r.push_back(header("LEAVE CAREER?"));
+        r.push_back(action("save_jump_save", "SAVE & SWITCH", "[ SAVE FIRST ]",
+                           "Save Career progress to Memory Card + Extended Garage before switching modes."));
+        r.push_back(action("save_jump_discard", "SWITCH WITHOUT SAVING", "[ DISCARD ]",
+                           "Exit Career cleanly without saving."));
+        r.push_back(action("save_jump_cancel", "CANCEL", "[ STAY ]", "Return to the pause rail."));
+        return;
+    }
+    r.push_back(header("QUICK PAUSE"));
+    r.push_back(action("qr_resume", "RESUME DRIVING", "[ PLAY ]", "Close the quick rail and return to the action."));
+    r.push_back(action("qr_scoreboard", "LIVE SCOREBOARD & RULES", quick_scoreboard_ ? "[ HIDE ]" : "[ SHOW ]",
+                       "View live 16-slot roster, scores, roles, and active mutator rules."));
+    if (in_career) {
+        r.push_back(header("CAREER QUICK ACTIONS"));
+        r.push_back(action("qr_career_save", "SAVE CAREER NOW", "[ SAVE ]",
+                           "Save your Career progress and extended garage immediately."));
+        r.push_back(action("qr_warp_home", "WARP: HOME BASE", "[ WARP ]", "Teleport to your Trailer."));
+        r.push_back(action("qr_warp_dealer", "WARP: DEALER", "[ WARP ]", "Teleport to Sweeny's Scrapyard."));
+        r.push_back(action("qr_warp_garage", "WARP: GARAGE", "[ WARP ]", "Teleport to Upgrades & Paint."));
+        r.push_back(action("qr_warp_malt", "WARP: MALT SHOP", "[ WARP ]", "Teleport to TJ's Diner."));
+        r.push_back(action("qr_warp_troy", "WARP: TROY'S PLACE", "[ WARP ]", "Teleport to Troy's Place."));
+        r.push_back(action("qr_warp_eve", "WARP: NEXT EVE", "[ WARP ]", "Teleport to Choose Eve."));
+    } else if (!in_online) {
+        r.push_back(action("qr_rematch", "INSTANT REMATCH", "[ RESTART ]", "Relaunch this match immediately."));
+    } else if (s.is_host) {
+        r.push_back(action("qr_next_round", "NEXT ROUND", "[ ADVANCE ]", "Advance to the next micro-round."));
+        r.push_back(action("end_event", "BACK TO ONLINE LOBBY", "[ END RACE ]", "End the event and keep the room open."));
+    }
+    r.push_back(header("SWITCH MODE / JUMP TO"));
+    const std::string crew_badge = s.crew.empty() ? "" : (" (" + std::to_string(s.crew.size()) + " CREW)");
+    r.push_back(action("qr_jump_online", ("ONLINE MULTIPLAYER" + crew_badge).c_str(), "[ JUMP ]",
+                       "Jump straight to Online Multiplayer (auto-unwinds cleanly)."));
+    if (!in_career) {
+        r.push_back(action("qr_jump_career", "CAREER MODE", "[ JUMP ]", "Jump straight to Career Free Roam."));
+    }
+    r.push_back(action("qr_jump_hub", "RETURN TO PLAY HUB", "[ HUB ]",
+                       "Exit current session cleanly and return to the Unified PLAY Hub."));
+    r.push_back(action("qr_full_menu", "FULL MENU (MODS / GRAPHICS)", "[ OPEN ]",
+                       "Open the full tabbed menu for Mods, Graphics, Inputs, and Settings."));
+}
+
 void Menu::rows_online(std::vector<Row> &r) {
     game_frontend::Snapshot s;
     if (net_) { net_->viewing_online(); s = net_->snapshot(); }
     using P = game_frontend::Snapshot::Phase;
+    const bool can_select_map = s.phase == P::Lobby && s.is_host;
+    if (!can_select_map) close_map_picker();
+    if (map_return_row_ >= 0) {
+        r.push_back(header("SELECT MAP"));
+        auto add_map = [&](const std::string &id, const std::string &label, const std::string &help) {
+            Row row = action(("map:" + id).c_str(), label.c_str(), "", help.c_str());
+            row.kind = RowKind::Check;
+            row.checked = id == s.custom_map_id;
+            r.push_back(std::move(row));
+        };
+        add_map("", "RETAIL TRACK", "Use the track selected in the lobby.");
+        for (const auto &map : s.custom_maps)
+            add_map(map.id, map.title.empty() ? map.id : map.title, map.id);
+        if (s.custom_maps.empty())
+            r.push_back(info("empty_maps", "NO CUSTOM MAPS", "Place .eodmap files in mods/maps beside eod.ini before hosting."));
+        r.push_back(action("map_back", "BACK", "", "Return to the lobby."));
+        return;
+    }
     const bool connecting = s.phase == P::Connecting || s.phase == P::CheckingCompatibility || s.phase == P::Hosting;
     const bool connected = s.phase != P::Offline && s.phase != P::Disconnected && s.phase != P::Error;
     const bool failed = !connected && !s.error.empty();
@@ -694,9 +1346,14 @@ void Menu::rows_online(std::vector<Row> &r) {
         r.push_back(header(("PLAYERS (" + std::to_string(s.players.size()) + ")").c_str()));
         if (s.players.empty()) r.push_back(info("noplayers", "PLAYERS", "WAITING FOR LOBBY"));
         for (const auto &p : s.players) {
+            std::string pstate = p.waiting ? "NEXT EVENT"
+                               : s.phase == P::Racing ? "IN RACE"
+                               : !p.map_ready ? "SYNCING MAP"
+                               : p.ready ? "READY" : "NOT READY";
             Row pr = info("player", ("P" + std::to_string(p.slot + 1) + "  " + upper(p.name)).c_str(),
-                          std::string(p.waiting ? "NEXT EVENT" : s.phase == P::Racing ? "IN RACE" : p.ready ? "READY" : "NOT READY") + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
-            pr.good = p.ready || p.speaking;
+                          pstate + (p.speaking ? " - SPEAKING" : "") + (p.muted ? " - MUTED" : ""));
+            pr.good = p.map_ready && (p.ready || p.speaking);
+            pr.warn = !p.map_ready;
             r.push_back(pr);
         }
     }
@@ -710,8 +1367,14 @@ void Menu::rows_online(std::vector<Row> &r) {
     }
     Row ready = toggle("ready", "READY", s.ready, "", "");
     if (s.phase == P::Lobby && !s.is_host) {
-        ready.enabled = s.ready || s.car_pic != 0;
-        if (!ready.enabled) ready.help = "Choose a drivable car before marking Ready.";
+        if (s.map_downloading) {
+            ready.enabled = false;
+            ready.value = "DOWNLOADING MAP (" + std::to_string(s.map_download_pct) + "%)";
+            ready.help = "Downloading and verifying the host's custom map before you can ready up.";
+        } else {
+            ready.enabled = s.ready || s.car_pic != 0;
+            if (!ready.enabled) ready.help = "Choose a drivable car before marking Ready.";
+        }
         r.push_back(ready);
     }
     if (s.is_host && (s.phase == P::Racing || s.phase == P::Loading)) {
@@ -739,10 +1402,24 @@ void Menu::rows_online(std::vector<Row> &r) {
         for (const auto &g : s.lan)
             r.push_back(action(("lan:" + g.address).c_str(), upper(g.name).c_str(), "[ JOIN ]  " + std::to_string(g.players) + " PLAYING", ""));
     }
+    const std::string map_name = s.custom_map_title.empty() ? s.custom_map_id : s.custom_map_title;
+    if (can_select_map)
+        r.push_back(action("custom_map", "MAP", map_name.empty() ? "RETAIL TRACK" : map_name,
+                           "Choose an installed custom map or race on the retail track."));
+    else if (connected && !map_name.empty())
+        r.push_back(info("custom_map", "MAP", map_name, "Selected by the host."));
     for (const auto &o : s.options) {
         const std::string label = o.id == "rule_turbo" ? turbo_label(cfg_, host_) : o.label;
         if (s.phase == P::Lobby && o.editable) r.push_back(choice(("opt:" + o.id).c_str(), label.c_str(), upper(o.value), "", o.help.c_str()));
         else r.push_back(info(("opt:" + o.id).c_str(), label.c_str(), upper(o.value), o.help.c_str()));
+    }
+    if (s.phase == P::Lobby) {
+        r.push_back(action("open_car_browser", "BROWSE CARS", "[ BY CLASS & MODS ]",
+                           "Visual Car Selector sorted by class (Compact, Midsize, Muscle, Special, Trailers & Modded)."));
+        r.push_back(action("open_rules_drawer", s.is_host ? "CUSTOMIZE RULES" : "VIEW HOST RULES",
+                           s.is_host ? "[ X / CONFIGURE ]" : "[ READ-ONLY ]",
+                           s.is_host ? "Tune mode rules, weapons/feats, and physics traits for this lobby."
+                                     : "Inspect the host's active mode rules, weapons, and physics settings."));
     }
     if (s.is_host && s.phase == P::Lobby) {
         const bool alone = s.players.size() <= 1;
@@ -967,10 +1644,115 @@ void Menu::change(const Row &row, int dir, Effects &fx) {
     else if (id == "musicvolume") { step(cfg_.music_volume, 0, 100, 5); fx.audio = true; }
     else if (id == "volume") { step(cfg_.volume, 0, 100, 5); fx.audio = true; }
     else if (id == "pause") cfg_.pause_in_menu = !cfg_.pause_in_menu;
+    else if (id == "unified_fe") cfg_.unified_frontend = !cfg_.unified_frontend;
+    else if (id == "fast_boot") cfg_.fast_boot = !cfg_.fast_boot;
+    else if (id == "skip_memcard") cfg_.skip_memcard = !cfg_.skip_memcard;
+    else if (id == "play_session") {
+        const int next = ((int)session_kind_ + (dir >= 0 ? 1 : 3)) % 4;
+        session_kind_ = (game_frontend::SessionKind)next;
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "career_warp") {
+        career_warp_idx_ = (career_warp_idx_ + (dir >= 0 ? 1 : 7)) % 8;
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "split_players") {
+        split_players_ = 2 + ((split_players_ - 2 + (dir >= 0 ? 1 : 2)) % 3);
+        for (int i = 0; i < 4; ++i) split_seats_[i].active = (i < split_players_);
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "play_mode") {
+        const int n = (int)mutator::preset_count();
+        offline_preset_ = (uint8_t)(((int)offline_preset_ + (dir >= 0 ? 1 : n - 1)) % n);
+        sync_draft_from_preset(offline_preset_);
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "play_track") {
+        std::vector<std::string> tracks;
+        if (net_) tracks = net_->snapshot().retail_tracks;
+        if (tracks.empty()) tracks = {"Anoka", "Bemidji", "Dennison", "Hastings", "HomeBase", "Mankato", "Springfield", "Welch", "Woodly"};
+        int idx = 0;
+        for (size_t i = 0; i < tracks.size(); ++i) if (tracks[i] == offline_track_) { idx = (int)i; break; }
+        offline_track_ = tracks[(idx + (dir >= 0 ? 1 : (int)tracks.size() - 1)) % tracks.size()];
+        offline_custom_map_.clear();
+        fx.sound = Sound::Move;
+        return;
+    } else if (id.compare(0, 4, "seat") == 0 && id.size() >= 9 && id.compare(5, 4, "_car") == 0) {
+        const int seat = std::clamp(id[4] - '0', 0, 3);
+        std::vector<std::string> cars;
+        if (net_) cars = net_->snapshot().retail_cars;
+        if (cars.empty()) cars = {"Gladiator", "Outlaw", "Bulldog", "Bus", "Phantom", "Algar", "Hearse", "Raven"};
+        int idx = 0;
+        for (size_t i = 0; i < cars.size(); ++i) if (cars[i] == split_seats_[seat].car_model) { idx = (int)i; break; }
+        split_seats_[seat].car_model = cars[(idx + (dir >= 0 ? 1 : (int)cars.size() - 1)) % cars.size()];
+        split_seats_[seat].vehicle_num = 0;
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "seat0_paint") {
+        split_seats_[0].paint = (split_seats_[0].paint + (dir >= 0 ? 1 : 5)) % 6;
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "play_laps") {
+        offline_laps_ = std::clamp(offline_laps_ + dir, 1, 50);
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "play_ai") {
+        offline_ai_bots_ = std::clamp(offline_ai_bots_ + dir, -1, 15);
+        fx.sound = Sound::Move;
+        return;
+    } else if (id == "rules_subtab") {
+        rules_tab_ = (rules_tab_ + (dir >= 0 ? 1 : 3)) % 4;
+        fx.sound = Sound::Tab;
+        return;
+    } else if (id.compare(0, 6, "draft_") == 0) {
+        if (net_) {
+            const auto snap = net_->snapshot();
+            using P = game_frontend::Snapshot::Phase;
+            if (snap.phase != P::Offline && snap.phase != P::Disconnected && snap.phase != P::Error && !snap.is_host) {
+                fx.sound = Sound::Error;
+                return;
+            }
+        }
+        if (id == "draft_preset") {
+            const int n = (int)mutator::preset_count();
+            const uint8_t next = (uint8_t)(((int)mutator_draft_.preset_id + (dir >= 0 ? 1 : n - 1)) % n);
+            offline_preset_ = next;
+            sync_draft_from_preset(next);
+            push_mutator_draft();
+            fx.sound = Sound::Move;
+            return;
+        } else if (id == "draft_fuse") { mutator_draft_.tips_fuse_sec = std::clamp(mutator_draft_.tips_fuse_sec + dir * 5.0f, 5.0f, 120.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_storm_r") { mutator_draft_.storm_radius_m = std::clamp(mutator_draft_.storm_radius_m + dir * 10.0f, 20.0f, 250.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_storm_s") { mutator_draft_.storm_shrink_mps = std::clamp(mutator_draft_.storm_shrink_mps + dir * 0.25f, 0.0f, 10.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_storm_dps") { mutator_draft_.storm_dps = std::clamp(mutator_draft_.storm_dps + dir * 0.02f, 0.0f, 1.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_fiesta") { mutator_draft_.fiesta_interval_sec = std::clamp(mutator_draft_.fiesta_interval_sec + dir * 5.0f, 5.0f, 120.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_shuffle") { mutator_draft_.shuffle_rounds = !mutator_draft_.shuffle_rounds; push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_turbo") { mutator_draft_.feat_bits ^= mutator::FB_TURBO; push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_chickens") { mutator_draft_.feat_bits ^= mutator::FB_CHICKEN_STRAIGHT; push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_chicken_reload") { mutator_draft_.chicken_reload_sec = std::clamp(mutator_draft_.chicken_reload_sec + dir * 0.25f, 0.25f, 10.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_chicken_force") { mutator_draft_.chicken_force_scale = std::clamp(mutator_draft_.chicken_force_scale + dir * 0.25f, 0.25f, 8.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_ohk") { mutator_draft_.feat_bits ^= mutator::FB_ONE_HIT_KILLS; push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_deadly") { mutator_draft_.feat_bits ^= mutator::FB_DEADLY_AMBITION; push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_invincible") { mutator_draft_.feat_bits ^= mutator::FB_INVINCIBLE; push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_grav") { mutator_draft_.gravity_scale = std::clamp(mutator_draft_.gravity_scale + dir * 0.10f, 0.10f, 4.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_mass") { mutator_draft_.mass_scale = std::clamp(mutator_draft_.mass_scale + dir * 0.15f, 0.25f, 5.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_grip") { mutator_draft_.grip_scale = std::clamp(mutator_draft_.grip_scale + dir * 0.10f, 0.20f, 3.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_torque") { mutator_draft_.torque_scale = std::clamp(mutator_draft_.torque_scale + dir * 0.10f, 0.25f, 3.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_speed") { mutator_draft_.top_speed_scale = std::clamp(mutator_draft_.top_speed_scale + dir * 0.10f, 0.40f, 3.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        else if (id == "draft_dmg") { mutator_draft_.damage_taken_scale = std::clamp(mutator_draft_.damage_taken_scale + dir * 0.10f, 0.0f, 5.0f); push_mutator_draft(); fx.sound = Sound::Move; return; }
+        return;
+    }
     else if (id == "unlock") cfg_.unlock_all = !cfg_.unlock_all;
     else if (id == "career_cheats") cfg_.career_cheats = !cfg_.career_cheats;
     else if (id == "bots") cfg_.battle_bots = !cfg_.battle_bots;
     else if (id == "spbattle") cfg_.sp_battle_mode = !cfg_.sp_battle_mode;
+    else if (id == "offline_gametype") {
+        const int n = static_cast<int>(mutator::preset_count());
+        cfg_.offline_gametype = (std::clamp(cfg_.offline_gametype, 0, n - 1) + (dir >= 0 ? 1 : n - 1)) % n;
+    }
+    else if (id == "offline_ai_bots") {
+        cfg_.offline_ai_bots = (std::clamp(cfg_.offline_ai_bots, 0, 15) + (dir >= 0 ? 1 : 15)) % 16;
+    }
     else if (id == "recovery") cfg_.manual_recovery = !cfg_.manual_recovery;
     else if (id == "durability") cfg_.car_durability = !cfg_.car_durability;
     else if (id == "turbo") cfg_.cheat_turbo = !cfg_.cheat_turbo;
@@ -1025,6 +1807,122 @@ void Menu::activate(const Row &row, Effects &fx) {
     if (id.compare(0, 3, "key") == 0 && id.size() > 3) { rebind_ = std::stoi(id.substr(3)); return; }
     if (id == "dev1" || id == "dev2") { fx.swap_ports = true; return; }
     game_frontend::Command c{};
+    if (id == "custom_map" && row.kind == RowKind::Action) {
+        map_return_row_ = selected();
+        sel_[int(Tab::Play)] = 1;
+        scroll_[int(Tab::Play)] = 0;
+        return;
+    }
+    if (id == "open_mode_browser") { set_sub_screen(SubScreen::ModeBrowser); return; }
+    if (id == "open_map_browser") { set_sub_screen(SubScreen::MapBrowser); return; }
+    if (id == "open_car_browser") { set_sub_screen(SubScreen::CarBrowser); return; }
+    if (id == "open_rules_drawer") { set_sub_screen(SubScreen::RulesDrawer); return; }
+    if (id == "rules_back") { set_sub_screen(SubScreen::None); fx.sound = Sound::Back; return; }
+    if (id == "draft_save_json" && net_) {
+        push_mutator_draft();
+        game_frontend::Command sc{};
+        sc.kind = game_frontend::Command::Kind::SaveCustomGametype;
+        sc.draft = mutator_draft_;
+        net_->submit(std::move(sc));
+        set_status("Saved custom gametype to mods/gametypes/");
+        return;
+    }
+    if (id == "launch_solo") { launch_offline_match(false); fx.close = true; return; }
+    if (id == "launch_split") { launch_offline_match(true); fx.close = true; return; }
+    if (id == "career_continue") { launch_career(false, false); fx.close = true; return; }
+    if (id == "career_classic_hub") { launch_career(true, false); fx.close = true; return; }
+    if (id == "career_new") { launch_career(false, true); fx.close = true; return; }
+    if (id == "classic_ps2_toggle") {
+        cfg_.unified_frontend = false;
+        dirty_ = true;
+        fx.save = true;
+        fx.close = true;
+        return;
+    }
+    // Screen D Quick Rail actions
+    if (id == "qr_resume") { quick_rail_ = false; fx.close = true; return; }
+    if (id == "qr_scoreboard") { quick_scoreboard_ = !quick_scoreboard_; return; }
+    if (id == "qr_full_menu") { quick_rail_ = false; tab_ = Tab::Mods; return; }
+    if (id == "qr_career_save" && net_) {
+        net_->submit({game_frontend::Command::Kind::CareerSaveNow});
+        set_status("Career saved to Memory Card");
+        return;
+    }
+    if (id.compare(0, 8, "qr_warp_") == 0 && net_) {
+        int place = 0;
+        if (id == "qr_warp_home") place = 0;
+        else if (id == "qr_warp_malt") place = 1;
+        else if (id == "qr_warp_eve") place = 2;
+        else if (id == "qr_warp_dealer") place = 3;
+        else if (id == "qr_warp_garage") place = 4;
+        else if (id == "qr_warp_troy") place = 7;
+        game_frontend::Command wc{};
+        wc.kind = game_frontend::Command::Kind::CareerWarp;
+        wc.value = (float)place;
+        net_->submit(std::move(wc));
+        quick_rail_ = false;
+        fx.close = true;
+        return;
+    }
+    if (id == "qr_rematch" && net_) {
+        net_->submit({game_frontend::Command::Kind::InstantRematch});
+        quick_rail_ = false;
+        fx.close = true;
+        return;
+    }
+    if (id == "qr_next_round" && net_) {
+        net_->submit({game_frontend::Command::Kind::NextRound});
+        quick_rail_ = false;
+        fx.close = true;
+        return;
+    }
+    if ((id == "qr_jump_online" || id == "qr_jump_career" || id == "qr_jump_hub") && net_) {
+        const auto snap = net_->snapshot();
+        const bool in_career = (snap.ee_state == 5 || snap.ee_state == 6 || snap.ee_state == 7);
+        game_frontend::TransitionRequest req{};
+        if (id == "qr_jump_career") { req.target = 2; req.career_place = career_warp_idx_; }
+        else { req.target = 1; } // Hub (and set session kind to Online if qr_jump_online)
+        if (id == "qr_jump_online") session_kind_ = game_frontend::SessionKind::Online;
+        if (in_career) {
+            pending_save_jump_ = req;
+            save_prompt_ = true;
+            sel_[(int)Tab::Play] = 0;
+            return;
+        }
+        game_frontend::Command jc{};
+        jc.kind = game_frontend::Command::Kind::LaunchTransition;
+        jc.transition = req;
+        net_->submit(std::move(jc));
+        quick_rail_ = false;
+        if (id == "qr_jump_career") fx.close = true;
+        return;
+    }
+    if ((id == "save_jump_save" || id == "save_jump_discard") && net_) {
+        pending_save_jump_.save_career_first = (id == "save_jump_save");
+        game_frontend::Command jc{};
+        jc.kind = game_frontend::Command::Kind::LaunchTransition;
+        jc.transition = pending_save_jump_;
+        net_->submit(std::move(jc));
+        save_prompt_ = false;
+        quick_rail_ = false;
+        if (pending_save_jump_.target == 2) fx.close = true;
+        return;
+    }
+    if (id == "save_jump_cancel") { save_prompt_ = false; fx.sound = Sound::Back; return; }
+    if (id == "map_back") { close_map_picker(); fx.sound = Sound::Back; return; }
+    if (id.compare(0, 4, "map:") == 0 && net_) {
+        const auto s = net_->snapshot();
+        const auto file = id.substr(4);
+        const bool installed = file.empty() || std::any_of(s.custom_maps.begin(), s.custom_maps.end(),
+            [&](const auto &map) { return map.id == file; });
+        close_map_picker();
+        if (!s.is_host || s.phase != game_frontend::Snapshot::Phase::Lobby || !installed) {
+            fx.sound = Sound::Error;
+            return;
+        }
+        net_->submit({game_frontend::Command::Kind::SelectCustomMap, file});
+        return;
+    }
     if (id == "start" && net_) {
         const auto s = net_->snapshot();
         if (!s.is_host || s.phase != game_frontend::Snapshot::Phase::Lobby || !s.can_start) {
@@ -1126,10 +2024,41 @@ Effects Menu::update(const Input &in) {
         }
         return fx;
     }
+    // Screen B: Visual Mode, Map & Car Browser controller navigation
+    if (!err && tab_ == Tab::Play && !quick_rail_ &&
+        (sub_screen_ == SubScreen::ModeBrowser || sub_screen_ == SubScreen::MapBrowser || sub_screen_ == SubScreen::CarBrowser)) {
+        if (in.back || in.close) { sub_screen_ = SubScreen::None; fx.sound = Sound::Back; return fx; }
+        const int max_cat = sub_screen_ == SubScreen::CarBrowser ? 7 : sub_screen_ == SubScreen::MapBrowser ? 3 : 4;
+        if (in.prev_tab || in.next_tab) {
+            browser_cat_ = (browser_cat_ + (in.next_tab ? 1 : max_cat - 1)) % max_cat;
+            browser_sel_ = 0;
+            fx.sound = Sound::Tab;
+            return fx;
+        }
+        const auto items = browser_items();
+        const int n = (int)items.size();
+        if (n > 0) {
+            browser_sel_ = std::clamp(browser_sel_, 0, n - 1);
+            if (in.dx) { browser_sel_ = (browser_sel_ + in.dx + n) % n; fx.sound = Sound::Move; }
+            if (in.dy) { browser_sel_ = std::clamp(browser_sel_ + in.dy * 3, 0, n - 1); fx.sound = Sound::Move; }
+            if (in.accept) { activate_browser_item(browser_sel_, fx); return fx; }
+        }
+        return fx;
+    }
+    // Screen C: Customize Rules Drawer L1/R1 switches sub-tabs (MODE RULES | FEATS & WEAPONS | PHYSICS & SCALE | BOTS & ROLES)
+    if (!err && tab_ == Tab::Play && !quick_rail_ && sub_screen_ == SubScreen::RulesDrawer &&
+        (in.prev_tab || in.next_tab)) {
+        rules_tab_ = (rules_tab_ + (in.next_tab ? 1 : 3)) % 4;
+        sel_[(int)Tab::Play] = 0;
+        scroll_[(int)Tab::Play] = 0;
+        fx.sound = Sound::Tab;
+        return fx;
+    }
     // mouse: hovering a row selects it (rows are hit-tested by the view and passed via select())
     if (in.close && !err) { fx.close = true; fx.sound = Sound::Back; return fx; }
     if (!err && (in.prev_tab || in.next_tab)) {
         int n = (int)Tab::Count;
+        close_map_picker();
         tab_ = (Tab)(((int)tab_ + (in.next_tab ? 1 : -1) + n) % n);
         details_ = false;
         status_.clear();
@@ -1137,11 +2066,14 @@ Effects Menu::update(const Input &in) {
         return fx;
     }
     if (in.back) {
+        if (save_prompt_) { save_prompt_ = false; fx.sound = Sound::Back; return fx; }
+        if (sub_screen_ != SubScreen::None) { sub_screen_ = SubScreen::None; fx.sound = Sound::Back; return fx; }
+        if (map_return_row_ >= 0) { close_map_picker(); fx.sound = Sound::Back; return fx; }
         if (!remove_player_.empty()) { remove_player_.clear(); fx.sound=Sound::Back; return fx; }
         if (music_open_) { music_open_ = false; sel_[(int)Tab::Mods] = 0; scroll_[(int)Tab::Mods] = 0; fx.sound = Sound::Back; return fx; }
         if (details_) { details_ = false; fx.sound = Sound::Back; return fx; }
         if (err && browse_) { browse_ = false; sel_[(int)Tab::Count] = 0; fx.sound = Sound::Back; return fx; }
-        if (!err) { fx.close = true; fx.sound = Sound::Back; }
+        if (!err) { quick_rail_ = false; fx.close = true; fx.sound = Sound::Back; }
         return fx;
     }
     if (in.dy) { move_selection(in.dy); fx.sound = Sound::Move; details_ = false; }
@@ -1155,8 +2087,15 @@ Effects Menu::update(const Input &in) {
     }
     if (in.dx && row.enabled && (row.kind == RowKind::Choice || row.kind == RowKind::Toggle)) change(row, in.dx, fx);
     if (in.accept && !(in.dx && row.slider_fraction >= 0)) activate(row, fx);
-    if (in.details && !err && !online_modal_title()) { details_ = !details_; fx.sound = Sound::Select; }
-    if (in.reset && !err && tab_ != Tab::Online) {
+    if (in.details && !err && !online_modal_title()) {
+        if (tab_ == Tab::Play && !quick_rail_ && sub_screen_ == SubScreen::None) {
+            set_sub_screen(SubScreen::RulesDrawer);
+        } else {
+            details_ = !details_;
+        }
+        fx.sound = Sound::Select;
+    }
+    if (in.reset && !err && tab_ != Tab::Play) {
         reset_tab(tab_);
         dirty_ = true;
         fx.sound = Sound::Select;
@@ -1177,7 +2116,7 @@ Effects Menu::update(const Input &in) {
 }
 
 std::string Menu::copy_text() {
-    if (!net_ || tab_ != Tab::Online) return {};
+    if (!net_ || tab_ != Tab::Play) return {};
     std::string code = net_->snapshot().code;
     if (!code.empty()) set_status("Garage Code " + code + " copied");
     return code;

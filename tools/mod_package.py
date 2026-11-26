@@ -471,6 +471,10 @@ def from_overlay(overlay, disc, package_id, version, out, name=None):
     for rel in sorted(files):
         if not rel.upper().startswith("DATA/"):
             continue
+        # The editor emits a collision preview alongside its native track.
+        # Gameplay collision is packaged through the SCOL/SOBL archive members.
+        if rel.lower().endswith(".eodcol") and (overlay / rel).with_suffix(".TRK").is_file():
+            continue
         source, spelled = retail_archive(disc, rel)
         archives.append((source, spelled, overlay / rel, cached_file_sha(source)))
     return _package_archives(archives, disc, package_id, version, out, name, overlay, files)

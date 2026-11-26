@@ -46,7 +46,7 @@ from theme import (
 from thumbnails import THUMB_H, THUMB_W, ThumbnailCache, render_model_thumbnail_qimage
 from viewport_gl import MIME_MODEL_KEY
 from workers import CancelToken, ThumbnailBatchWorker, start_worker
-from world_loader import TrackWorld, WorldMarker, WorldModel, WorldObject
+from world_loader import event_start_references, TrackWorld, WorldMarker, WorldModel, WorldObject
 
 
 class ModelGridWidget(QListWidget):
@@ -107,6 +107,11 @@ class ExplorerPanel(QWidget):
 
     trackSelected = Signal(str)          # .TRK file path
     objectPicked = Signal(str)           # obj_id
+    addPracticeStartRequested = Signal()
+    swapSpawnRoleRequested = Signal()
+    practiceSelectedRequested = Signal()
+    defaultPracticeRequested = Signal()
+    addBattleSpawnRequested = Signal()
     markerPicked = Signal(str)           # marker_id
     roadLineSelected = Signal(str)       # .ild name
     modelPlaceRequested = Signal(str)    # model_key (double-click or Place button)
@@ -122,6 +127,7 @@ class ExplorerPanel(QWidget):
         self.setMinimumWidth(275)
         self.setMaximumWidth(420)
         self.world: TrackWorld | None = None
+        self.event_starts: list[WorldMarker] = []
         self.thumb_cache = ThumbnailCache()
         self._thumb_gen: int = 0
         self._thumb_token: CancelToken | None = None
@@ -160,6 +166,7 @@ class ExplorerPanel(QWidget):
         self._build_sections_tab()
         # Tab 3: Layers
         self._build_layers_tab()
+        self._build_spawns_tab()
 
         # Default to Models tab (matches clean-room workflow with 2-col preview grid!)
         self.tabs.setCurrentIndex(1)
@@ -215,6 +222,7 @@ class ExplorerPanel(QWidget):
         lay.setContentsMargins(4, 6, 4, 4)
         lay.setSpacing(5)
 
+        self._asset_page = 0
         self.model_search = QLineEdit()
         self.model_search.setPlaceholderText("Search assets")
         self.model_search.setToolTip("Search models, cars, wrecks and textures")
@@ -247,6 +255,21 @@ class ExplorerPanel(QWidget):
         self.model_grid.modelPlaceRequested.connect(self.modelPlaceRequested.emit)
         self.model_grid.currentItemChanged.connect(self._on_model_item_changed)
         lay.addWidget(self.model_grid, 1)
+
+        self.asset_pages = QWidget()
+        page_row = QHBoxLayout(self.asset_pages)
+        page_row.setContentsMargins(0, 0, 0, 0)
+        self.prev_assets = QPushButton("Previous")
+        self.next_assets = QPushButton("Next")
+        self.asset_range = QLabel()
+        self.asset_range.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.prev_assets.clicked.connect(lambda: self._rebuild_model_grid(page=self._asset_page - 1))
+        self.next_assets.clicked.connect(lambda: self._rebuild_model_grid(page=self._asset_page + 1))
+        page_row.addWidget(self.prev_assets)
+        page_row.addWidget(self.asset_range, 1)
+        page_row.addWidget(self.next_assets)
+        self.asset_pages.hide()
+        lay.addWidget(self.asset_pages)
 
         act_row = QGridLayout()
         act_row.setSpacing(4)
@@ -302,6 +325,54 @@ class ExplorerPanel(QWidget):
 
         self.tabs.addTab(w, "Track")
 
+    def _build_spawns_tab(self) -> None:
+        self.spawns_tab = QWidget()
+        layout = QVBoxLayout(self.spawns_tab)
+        self.spawn_tree = QTreeWidget()
+        self.spawn_tree.setHeaderLabels(["Spawn point", "Source"])
+        self.spawn_tree.setColumnWidth(0, 170)
+        self.spawn_tree.currentItemChanged.connect(lambda item, _: self._on_scene_tree_click(item, 0) if item else None)
+        layout.addWidget(self.spawn_tree)
+        self.add_spawn = QPushButton("Add Battle respawn at view target")
+        self.add_spawn.setEnabled(False)
+        self.add_spawn.clicked.connect(self.addBattleSpawnRequested.emit)
+        layout.addWidget(self.add_spawn)
+        for label, signal in (("Place practice start with mouse", self.addPracticeStartRequested),
+                              ("Use selected start for F5", self.defaultPracticeRequested),
+                              ("Switch selected start between practice and Battle", self.swapSpawnRoleRequested),
+                              ("Drive from selected start", self.practiceSelectedRequested)):
+            button = QPushButton(label)
+            button.clicked.connect(signal.emit)
+            layout.addWidget(button)
+        self.tabs.addTab(self.spawns_tab, "Spawns")
+
+    def _refresh_spawns(self) -> None:
+        previous = self.spawn_tree.currentItem()
+        selected = previous.data(0, Qt.ItemDataRole.UserRole) if previous else None
+        self.spawn_tree.blockSignals(True)
+        self.spawn_tree.clear()
+        battle = [m for m in self.world.markers if m.battle_spawn]
+        guides = [m for m in self.world.markers if m.kind == "Start Grid" or m.marker_id.startswith("m_start_")]
+        for title, markers in ((f"Battle respawns ({len(battle)})", battle),
+                               ("Race grid guides", guides), ("Contest starts and arena endpoints", self.event_starts),
+                               ("Practice starts", [m for m in self.world.markers if m.kind == "Practice start"])):
+            group = QTreeWidgetItem(self.spawn_tree, [title])
+            for m in markers:
+                origin = "Preset" if m.marker_id in self.world.retail_battle_spawn_ids else "Custom"
+                if m.marker_id.startswith("m_start_"):
+                    origin = "ILIN guide"
+                if m.kind == "Event reference":
+                    origin = "Reference"
+                row = QTreeWidgetItem(group, [m.name, "F5 start" if m.kind == "Practice start" and m.marker_id == self.world.default_practice_start else origin])
+                row.setData(0, Qt.ItemDataRole.UserRole, ("marker", m.marker_id))
+                row.setToolTip(0, m.note or "Select to frame and edit this point")
+                if selected == ("marker", m.marker_id):
+                    self.spawn_tree.setCurrentItem(row)
+            group.setExpanded(True)
+        self.spawn_tree.blockSignals(False)
+        self.add_spawn.setEnabled(True)
+        self.add_spawn.setToolTip("Place a custom Battle respawn.")
+
     def _build_layers_tab(self) -> None:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -352,6 +423,7 @@ class ExplorerPanel(QWidget):
 
     def set_world(self, world: TrackWorld) -> None:
         self.world = world
+        self.event_starts = event_start_references(world)
         self.thumb_cache.clear()
         self._cancel_thumb_worker()
         self.refresh_model_categories()
@@ -430,6 +502,7 @@ class ExplorerPanel(QWidget):
             if k in self.layer_checks:
                 self.layer_checks[k].setText(text)
         self._refresh_scene_tree()
+        self._refresh_spawns()
 
     def _refresh_scene_tree(self) -> None:
         self.scene_tree.clear()
@@ -478,7 +551,7 @@ class ExplorerPanel(QWidget):
         self._thumb_gen += 1
         self._thumb_item_map.clear()
 
-    def _rebuild_model_grid(self) -> None:
+    def _rebuild_model_grid(self, *_filter_change, page: int = 0) -> None:
         with get_profiler().zone("explorer.rebuild_grid", "ui"):
             self._cancel_thumb_worker()
             self.model_grid.clear()
@@ -510,7 +583,15 @@ class ExplorerPanel(QWidget):
                 matched.sort(key=lambda m: m.name.lower())
 
             to_render: list[tuple[str, WorldModel]] = []
-            for m in matched[:400]:
+            page_size = 400
+            self._asset_page = min(max(0, page), max(0, (len(matched) - 1) // page_size))
+            start = self._asset_page * page_size
+            end = min(start + page_size, len(matched))
+            self.asset_range.setText(f"{start + 1}–{end} of {len(matched)}" if matched else "0 assets")
+            self.prev_assets.setEnabled(start > 0)
+            self.next_assets.setEnabled(end < len(matched))
+            self.asset_pages.setVisible(len(matched) > page_size)
+            for m in matched[start:end]:
                 label = f"{m.name}\n{m.tri_count} tris"
                 item = QListWidgetItem(self._placeholder_icon, label)
                 item.setData(Qt.ItemDataRole.UserRole, m.key)

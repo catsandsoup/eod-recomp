@@ -9,7 +9,7 @@
 #include "netplay_car.h"
 #include "netplay_event_completion.h"
 namespace netplay {
-constexpr uint16_t kMagic = 0x7D3E, kProtocol = 13;
+constexpr uint16_t kMagic = 0x7D3E, kProtocol = 15;
 constexpr int kMaxPlayers = 16;
 enum Kind : uint8_t {
     K_JOIN = 1, K_WELCOME, K_REFUSE, K_HEARTBEAT, K_LOBBY, K_START, K_TRACK, K_ROSTER, K_GO, K_END, K_LEAVE,
@@ -28,6 +28,10 @@ constexpr uint8_t K_IMPACT_STATE = K_EVENT_RESULTS + 2;
 constexpr uint8_t K_BATTLE_STATE = K_IMPACT_STATE + 1, K_BATTLE_RESPAWN = K_BATTLE_STATE + 1;
 constexpr uint8_t K_DAMAGE_DETAIL = K_BATTLE_RESPAWN + 1, K_DAMAGE_DETAIL_ACK = K_DAMAGE_DETAIL + 1;
 constexpr uint8_t K_CHICKEN = K_DAMAGE_DETAIL_ACK + 1, K_CHICKEN_ACK = K_CHICKEN + 1;
+constexpr uint8_t K_MAP_REQUEST = K_CHICKEN_ACK + 1, K_MAP_CHUNK = K_MAP_REQUEST + 1;
+constexpr uint8_t K_MUTATOR_CONFIG = K_MAP_CHUNK + 1, K_MUTATOR_CONFIG_ACK = K_MUTATOR_CONFIG + 1;
+constexpr uint8_t K_MUTATOR_ROUND = K_MUTATOR_CONFIG_ACK + 1, K_MUTATOR_ROUND_ACK = K_MUTATOR_ROUND + 1;
+constexpr uint8_t K_MUTATOR_TRIGGER = K_MUTATOR_ROUND_ACK + 1;
 // guest phase, reported in heartbeats
 enum Phase : uint8_t { P_LOBBY = 0, P_STARTED, P_CAR_DONE, P_LOADED, P_RACING, P_DONE };
 
@@ -93,7 +97,7 @@ inline void put_car(Writer &w, uint8_t slot, uint32_t tick, const netplay_car::S
     if (q[3] < 0) for (float &v : q) v = -v;
     for (float v : q) w.i16(v, 32000.f);
     w.i16(s.steer, 30000.f); w.i16(s.gas, 30000.f); w.i16(s.brake, 30000.f); w.u8(s.handbrake > .5f); w.u8((uint8_t)(int8_t)s.gear);
-    w.f32(s.damage); w.u8(s.damage_stage);
+    w.u8(s.warp_gen); w.f32(s.damage); w.u8(s.damage_stage);
 }
 inline bool get_car(Reader &r, uint8_t &slot, uint32_t &tick, netplay_car::State &s) {
     slot = (uint8_t)r.u8(); tick = r.u32();
@@ -103,7 +107,7 @@ inline bool get_car(Reader &r, uint8_t &slot, uint32_t &tick, netplay_car::State
     float q[4]; for (float &v : q) v = r.i16(32000.f);
     netplay_car::quat_to_matrix(q, s.pose);
     s.steer = r.i16(30000.f); s.gas = r.i16(30000.f); s.brake = r.i16(30000.f); s.handbrake = r.u8() ? 1.f : 0.f; s.gear = (int8_t)r.u8();
-    s.damage = r.f32(); s.damage_stage = r.u8();
+    s.warp_gen = static_cast<uint8_t>(r.u8()); s.damage = r.f32(); s.damage_stage = r.u8();
     return r.ok && s.damage >= 0 && s.damage <= 4 && s.damage_stage <= 12 && netplay_car::valid_state(s);
 }
 }  // namespace netplay

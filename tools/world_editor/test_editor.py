@@ -138,21 +138,19 @@ class TestPieLaunchSpec(unittest.TestCase):
                 window.show()
                 app.processEvents()
                 self.assertEqual(window.size().toTuple(), (800, 540))
-                self.assertTrue(window.explorer.isVisible())
+                self.assertFalse(window.explorer.isVisible())
                 self.assertFalse(window.properties.isVisible())
-                self.assertTrue(window.cmb_pie_event.isVisible())
-                self.assertTrue(window.cmb_pie_car.isVisible())
-                self.assertTrue(window.cmb_renderer_mode.isVisible())
+                self.assertFalse(window.settings_toolbar.isVisible())
+                self.assertTrue(window.main_toolbar.widgetForAction(window.act_export_map).isVisible())
+                self.assertTrue(window.main_toolbar.widgetForAction(window.act_test_map).isVisible())
+                window.settings_toolbar.show()
                 native_available = bool(window.viewport._discover_plume_library())
-                self.assertEqual(window.cmb_pie_scale.currentData(), 6 if native_available else 2)
+                self.assertEqual(window.cmb_pie_scale.currentData(), 2)
                 self.assertEqual(window.cmb_renderer_mode.currentData(), "plume" if native_available else "ps2")
                 self.assertEqual(window.cmb_renderer_mode.currentData(), window.viewport.render_mode)
                 window.cmb_pie_scale.setCurrentIndex(window.cmb_pie_scale.findData(8))
                 self.assertEqual(window._pie_render_scale, 8)
-                for toolbar in (window.main_toolbar, window.settings_toolbar):
-                    for action in toolbar.actions():
-                        if not action.isSeparator():
-                            self.assertTrue(toolbar.widgetForAction(action).isVisible(), action.text())
+                window.settings_toolbar.hide()
                 window.act_panel_inspector.trigger()
                 window.center_stack.setCurrentWidget(window.pie_host)
                 app.processEvents()
@@ -338,6 +336,84 @@ class TestEodWorldEditor(unittest.TestCase):
                 f"ilin_nodes={len(w.road_graph.nodes)} ({w.road_graph.line_name}, {len(w.all_road_graphs)} lines), "
                 f"scol_tris={w.collision.scol_count}, sobl_boxes={w.collision.sobl_boxes}, start_grid={len(grid_markers)}"
             )
+
+    def test_spawn_browser_and_native_records_survive_project_reopen(self) -> None:
+        window = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        window.world = world
+        window.viewport.set_world(world)
+        window.explorer.set_world(world)
+        window.explorer.tabs.setCurrentWidget(window.explorer.spawns_tab)
+        tree = window.explorer.spawn_tree
+        self.assertEqual(tree.topLevelItem(0).childCount(), 5)
+        self.assertGreater(tree.topLevelItem(2).childCount(), 0)
+        first, second = [m for m in world.markers if m.battle_spawn][:2]
+        window.explorer.add_spawn.click()
+        new = window.viewport.selected_marker
+        self.assertTrue(new.battle_spawn)
+        self.assertEqual(tree.topLevelItem(0).childCount(), 6)
+        window._on_prop_marker_edited(second, (13.0, 2.0, -7.0), 90.0)
+        window._delete_marker(first)
+        window.undo_stack.undo()
+        self.assertIn(first, world.markers)
+        raw, _ = wl.payload(world.trk_path, "c_battle.va0", world.entries)
+        def sections(blob):
+            return {entry["name"]: entry["pairs"] for entry in wl.parse_binary_valt(blob)["sections"]}
+        original = sections(raw)
+        built = sections(ps._compile_battle_spawns(raw, world))
+        self.assertEqual(built["respawn"][:5], original["respawn"])
+        self.assertEqual(len(built["respawn"]), 6)
+        self.assertEqual(built["objects"], original["objects"])
+        self.assertEqual(built["$0000$a"], original["$0000$a"])
+        self.assertEqual(dict(built["$0001$b"])["pt"], "13, -7")
+        added = dict(built[built["respawn"][-1][1]])
+        self.assertEqual(len(added["pt"].split(",")), 2)
+        window._delete_marker(first)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "course.eodworld.json"
+            ps.save_project_overlay(path, "Course", world)
+            fresh = wl.load_track_world(world.trk_path, self.game_dir, include_cars=False)
+            ps.apply_project_overlay(fresh, path)
+            self.assertNotIn(first.marker_id, {m.marker_id for m in fresh.markers})
+            self.assertEqual(sections(ps._compile_battle_spawns(raw, fresh)), sections(ps._compile_battle_spawns(raw, world)))
+            doc = json.loads(path.read_text())
+            doc.pop("deleted_battle_spawn_ids")
+            doc["markers"] = [m for m in doc["markers"] if m["marker_id"] not in world.retail_battle_spawn_ids]
+            path.write_text(json.dumps(doc))
+            fresh = wl.load_track_world(world.trk_path, self.game_dir, include_cars=False)
+            ps.apply_project_overlay(fresh, path)
+            self.assertEqual(sum(m.battle_spawn for m in fresh.markers), 6)
+
+    def test_asset_pages_and_deselected_placements(self) -> None:
+        window = EodWorldEditorWindow(game_dir=self.game_dir, auto_load=False)
+        world = wl.load_track_world(self.afton_world.trk_path, self.game_dir, include_cars=False)
+        window.world = world
+        window.viewport.set_world(world)
+        browser = window.explorer
+        browser.set_world(world)
+        keys = set()
+        while True:
+            keys.update(browser.model_grid.item(i).data(Qt.ItemDataRole.UserRole)
+                        for i in range(browser.model_grid.count()))
+            if not browser.next_assets.isEnabled():
+                break
+            browser.next_assets.click()
+        self.assertEqual(keys, set(world.models))
+        browser.model_search.setText("W_Jump4B")
+        self.assertEqual(browser._asset_page, 0)
+        browser.layer_checks["event-prop"].setChecked(False)
+        ramp = window._place_model_at("mod:w_jump4b.mod", 10.0, 20.0, 30.0)
+        window.viewport.select_object(None)
+        self.assertTrue(window.viewport.layer_visibility[ramp.category])
+        self.assertTrue(world.object_visible_in_event_template(ramp))
+        self.assertIs(world.object_by_id(ramp.obj_id), ramp)
+        # Simulate a fresh window with previously saved object IDs.
+        window._placed_counter = 1
+        other = window._place_model_at(ramp.model_key, 12.0, 20.0, 30.0)
+        self.assertNotEqual(other.obj_id, ramp.obj_id)
+        window.undo_stack.undo()
+        self.assertIs(world.object_by_id(ramp.obj_id), ramp)
+        self.assertIsNone(world.object_by_id(other.obj_id))
 
     def test_03_thumbnail_rendering_scenery_and_cars(self) -> None:
         first_model = next(iter(self.afton_world.models.values()))

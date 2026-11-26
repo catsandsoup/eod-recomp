@@ -580,7 +580,10 @@ struct Context {
     SDL_Window *window{};
 #endif
     VkExtent2D extent{};
-    VkFormat swapFormat{};
+    // The surface can select an image extent different from the window's pixel size.
+    int windowWidthAtResize = 0, windowHeightAtResize = 0;
+    VkSwapchainCreateInfoKHR swapConfig{};
+    VkResult swapStatus = VK_SUCCESS;
     std::vector<Texture *> back;
     VkSemaphore acquired{}, complete{};
     uint32_t backIndex{};
@@ -1182,7 +1185,7 @@ struct Context {
     VkPipeline specialized(const PipelineKey &key);
     bool init(bool withWindow);
     void stop_specializer();
-    bool resize();
+    bool resize(bool checkChanges = false);
     Texture *acquire(bool vsync);
     bool present();
 };
@@ -1591,7 +1594,7 @@ inline bool Context::init(bool withWindow) {
     i.enabledExtensionCount = (uint32_t)exts.size();
     i.ppEnabledExtensionNames = exts.data();
 #ifdef EOD_R7_RELEASE
-    if (!instance) throw std::runtime_error("Plume Vulkan instance required");
+    if (!instance) throw std::runtime_error("could not create a Vulkan instance through the installed loader");
 #else
     if (!instance)
         require(vkCreateInstance(&i, nullptr, &instance), "instance");
@@ -1711,7 +1714,7 @@ inline bool Context::init(bool withWindow) {
         plume_device::create_device(physical, family, dext, core13, device, queue, queueMutex);
 #endif
 #ifdef EOD_R7_RELEASE
-    if (!device) throw std::runtime_error("Plume Vulkan device required");
+    if (!device) throw std::runtime_error("the Vulkan driver could not create the requested graphics device");
 #else
     if (!device)
         require(vkCreateDevice(physical, &d, nullptr, &device), "device");
@@ -1838,7 +1841,64 @@ inline void Context::stop_specializer() {
     delete specializer;
     specializer = nullptr;
 }
-inline bool Context::resize() {
+inline bool Context::resize(bool checkChanges) {
+    int w, h;
+    window_pixels(window, w, h);
+    if (w <= 0 || h <= 0)
+        return false;
+    VkSurfaceCapabilitiesKHR caps;
+    require(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps), "surface caps");
+    uint32_t n;
+    require(vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &n, nullptr), "count surface formats");
+    if (!n) throw std::runtime_error("the Vulkan driver reported no display formats for this window");
+    std::vector<VkSurfaceFormatKHR> formats(n);
+    require(vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &n, formats.data()), "read surface formats");
+    if (!n) throw std::runtime_error("the Vulkan driver reported no display formats for this window");
+    formats.resize(n);
+    auto format = formats[0];
+    for (auto f : formats)
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+            format = f;
+            break;
+        }
+    VkExtent2D size = caps.currentExtent;
+    if (size.width == UINT32_MAX)
+        size = {(uint32_t)std::clamp(w, (int)caps.minImageExtent.width, (int)caps.maxImageExtent.width),
+                  (uint32_t)std::clamp(h, (int)caps.minImageExtent.height, (int)caps.maxImageExtent.height)};
+    if (!size.width || !size.height) return false; // minimized surface, even if the window still has a size
+    VkSwapchainCreateInfoKHR s{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    s.surface = surface;
+    s.minImageCount = std::max(2u, caps.minImageCount);
+    if (caps.maxImageCount)
+        s.minImageCount = std::min(s.minImageCount, caps.maxImageCount);
+    s.imageFormat = format.format;
+    s.imageColorSpace = format.colorSpace;
+    s.imageExtent = size;
+    s.imageArrayLayers = 1;
+    s.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    s.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    s.preTransform = caps.currentTransform;
+    s.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    s.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!wantVsync) {
+        uint32_t count = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &count, nullptr);
+        std::vector<VkPresentModeKHR> modes(count);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &count, modes.data());
+        for (auto mode : modes)
+            if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                s.presentMode = mode;
+                break;
+            }
+    }
+    s.clipped = VK_TRUE;
+    // SUBOPTIMAL still permits presentation. Some compositors report it every
+    // frame; a replacement with identical parameters would only drain the queue.
+    if (checkChanges && s.imageExtent.width == extent.width && s.imageExtent.height == extent.height &&
+        s.imageFormat == swapConfig.imageFormat && s.imageColorSpace == swapConfig.imageColorSpace &&
+        s.preTransform == swapConfig.preTransform && s.minImageCount == swapConfig.minImageCount &&
+        s.presentMode == swapConfig.presentMode)
+        return true;
     cadence = {};
     refreshQueryCountdown = 0;
     submit();
@@ -1858,54 +1918,11 @@ inline bool Context::resize() {
     if (swap)
         vkDestroySwapchainKHR(device, swap, nullptr);
     swap = VK_NULL_HANDLE;
-    int w, h;
-    window_pixels(window, w, h);
-    if (w <= 0 || h <= 0)
-        return false;
-    VkSurfaceCapabilitiesKHR caps;
-    require(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps), "surface caps");
-    uint32_t n;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &n, nullptr);
-    std::vector<VkSurfaceFormatKHR> formats(n);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &n, formats.data());
-    auto format = formats[0];
-    for (auto f : formats)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
-            format = f;
-            break;
-        }
-    swapFormat = format.format;
-    extent = caps.currentExtent;
-    if (extent.width == UINT32_MAX)
-        extent = {(uint32_t)std::clamp(w, (int)caps.minImageExtent.width, (int)caps.maxImageExtent.width),
-                  (uint32_t)std::clamp(h, (int)caps.minImageExtent.height, (int)caps.maxImageExtent.height)};
-    VkSwapchainCreateInfoKHR s{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
-    s.surface = surface;
-    s.minImageCount = std::max(2u, caps.minImageCount);
-    if (caps.maxImageCount)
-        s.minImageCount = std::min(s.minImageCount, caps.maxImageCount);
-    s.imageFormat = format.format;
-    s.imageColorSpace = format.colorSpace;
-    s.imageExtent = extent;
-    s.imageArrayLayers = 1;
-    s.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    s.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    s.preTransform = caps.currentTransform;
-    s.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    s.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    if (!wantVsync) {
-        uint32_t count = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &count, nullptr);
-        std::vector<VkPresentModeKHR> modes(count);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &count, modes.data());
-        for (auto mode : modes)
-            if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-                s.presentMode = mode;
-                break;
-            }
-    }
-    s.clipped = VK_TRUE;
     require(vkCreateSwapchainKHR(device, &s, nullptr, &swap), "swapchain");
+    swapConfig = s;
+    extent = size;
+    windowWidthAtResize = w;
+    windowHeightAtResize = h;
     // The SDL window may still be transitioning to fullscreen. The image
     // extent returned by Vulkan is the geometry the player actually sees.
     presentation::swapchain_aspect.store(drawable_aspect(extent.width, extent.height), std::memory_order_relaxed);
@@ -1918,11 +1935,11 @@ inline bool Context::resize() {
         t->image = image;
         t->desc.Width = extent.width;
         t->desc.Height = extent.height;
-        t->desc.Format = swapFormat;
+        t->desc.Format = swapConfig.imageFormat;
         VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         v.image = image;
         v.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        v.format = swapFormat;
+        v.format = swapConfig.imageFormat;
         v.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         require(vkCreateImageView(device, &v, nullptr, &t->view), "swap view");
         back.push_back(t);
@@ -1943,9 +1960,11 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     window_pixels(window, w, h);
     if (w <= 0 || h <= 0)
         return nullptr;
-    if (!swap || (uint32_t)w != extent.width || (uint32_t)h != extent.height)
-        if (!resize())
-            return nullptr;
+    const bool sizeChanged = w != windowWidthAtResize || h != windowHeightAtResize;
+    if (!swap || sizeChanged || swapStatus != VK_SUCCESS) {
+        if (!resize(swap && !sizeChanged && swapStatus == VK_SUBOPTIMAL_KHR)) return nullptr;
+        swapStatus = VK_SUCCESS;
+    }
     // Submit the offscreen scene before waiting for the drawable. Otherwise
     // ALL_COMMANDS waits on the swapchain semaphore even for the car and track.
     static const bool early_scene_submit = [] {
@@ -1959,8 +1978,8 @@ inline Texture *Context::acquire(bool /*frameVsync*/) {
     }();
     if (early_scene_submit && recording && !waitAcquire) submit(false, false);
     auto r = vkAcquireNextImageKHR(device, swap, UINT64_MAX, acquired, VK_NULL_HANDLE, &backIndex);
+    swapStatus = r;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-        resize();
         return nullptr;
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
@@ -2006,10 +2025,12 @@ inline bool Context::present() {
         QueueLock lock(queueMutex);
         r = vkQueuePresentKHR(queue, &p);
     }
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
-        resize();
-    else
-        require(r, "present");
+    // Consume the acquired image before processing either WSI status. Check
+    // again on the next acquire, when the drawable may have been restored.
+    if (r != VK_SUCCESS) {
+        if (r != VK_ERROR_OUT_OF_DATE_KHR && r != VK_SUBOPTIMAL_KHR) require(r, "present");
+        swapStatus = r;
+    }
     return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
 }
 using ID3D11Texture2D = vkgs::Texture;

@@ -10,6 +10,7 @@ from road_builder import (
     build_road_mesh,
     make_banked_oval_plan,
     make_bridge_plan,
+    make_jump_ramp_plan,
 )
 from road_collision import (
     SURFACE_OBJECT,
@@ -163,6 +164,19 @@ class TestRoadCollision(unittest.TestCase):
         self.assertTrue(np.array_equal(unpacked.aabb_max, mesh.aabb_max))
         self.assertEqual(unpacked.wall_boxes, mesh.wall_boxes)
         self.assertEqual(pack_eodcol(unpacked), blob)
+
+    def test_takeoff_open_gap_and_landing_are_distinct_contact_surfaces(self) -> None:
+        """A sidecar geometry check, independent of vehicle suspension and native gameplay."""
+        takeoff = build_road_mesh(make_jump_ramp_plan(start=(0, 0, 0), length=40, height=5.5, width=14))
+        landing = build_road_mesh(make_bridge_plan(start=(0, 5.5, 50), end=(0, 5.5, 90), deck_height=0, width=14))
+        surface = build_unified_collision_32bit([takeoff, landing], [], {})
+        restored = unpack_eodcol(pack_eodcol(surface))
+        heights = [query_ground_y_32bit(restored, 0, z) for z in range(1, 40)]
+        self.assertTrue(all(y is not None for y in heights))
+        self.assertTrue(all(-.01 <= b-a < .5 for a,b in zip(heights, heights[1:])))
+        for x in (-1.0, 1.0):
+            self.assertIsNone(query_ground_y_32bit(restored, x, 45))
+            self.assertAlmostEqual(query_ground_y_32bit(restored, x, 55), 5.5, delta=.1)
 
     def test_synthesize_road_graph_closed_and_open_with_banking(self) -> None:
         oval_plan = make_banked_oval_plan()

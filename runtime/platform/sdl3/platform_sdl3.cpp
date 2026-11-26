@@ -343,9 +343,7 @@ void platform_shutdown() {
     SDL_Quit();
 }
 
-// A fatal error never opens an OS dialog (no NSAlert / SDL message box). The message goes to
-// crash.log next to the settings, and, in a windowed run, onto the in-game error screen, which
-// holds the stopped game on screen until the player chooses QUIT.
+// Save the technical details even when there is no working renderer to draw the error screen.
 static std::string fatal_log_path() {
 #ifdef __APPLE__
     return mac_app_support() + "/crash.log";
@@ -393,9 +391,12 @@ void platform_fatal_message(const char *msg) {
     if (g_audio) SDL_PauseAudioStreamDevice(g_audio);  // the stopped game would otherwise loop its last buffer
 #ifndef EOD_DISPLAY_BACKEND_TEST
     // Plain words only; the technical message is in crash.log.
-    overlay_fatal_screen("SOMETHING WENT WRONG",
-                         "The game ran into a problem and has to start over. "
-                         "Choose RETURN TO TITLE SCREEN to start the game again.");
+    if (!overlay_fatal_screen("SOMETHING WENT WRONG",
+                              "The game ran into a problem and has to start over. "
+                              "Choose RETURN TO TITLE SCREEN to start the game again.")) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Eve of Destruction", msg, g_window);
+        app_exit(3);
+    }
     relaunch_game();
     app_exit(0);  // no relaunch possible: close cleanly (the details are in crash.log)
 #endif
@@ -406,6 +407,7 @@ bool platform_pump() {
     // the readiness acknowledgement after a real race image has been presented.
     if (g_window && g_editor_window_hidden && editor_test_startup::state().ready()) {
         if (SDL_ShowWindow(g_window)) {
+            SDL_RaiseWindow(g_window);
             g_editor_window_hidden = false;
             std::fputs("[editor-test] first native race frame presented; showing game window\n", stderr);
         }
@@ -458,6 +460,8 @@ bool platform_pump() {
             overlay_key(scancode_to_vk(e.key.scancode), false);
             break;
         case SDL_EVENT_KEY_DOWN:
+            if ((e.key.scancode == SDL_SCANCODE_ESCAPE || e.key.scancode == SDL_SCANCODE_F5) &&
+                getenv("EOD_EDITOR_MAP_TEST")) return false;
             time_key_event(e.key);
 #ifndef EOD_DISPLAY_BACKEND_TEST
             if (e.key.scancode == SDL_SCANCODE_F9 && g_window) {

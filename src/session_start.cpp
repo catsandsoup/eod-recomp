@@ -11,8 +11,10 @@
 //             then 0x2A30B0 runs the same track screen (0x2C7340) and event setup (0x120650)
 //   0x120650  per-event setup (EveTracker at 0x3C4BF8 -> contest -> roster -> session description)
 //   0x120BE8  SelectEvent(pos): tracker vtable +0x14 (0x121850: pending = pos) then 0x3C4BE8 = 1, the flag the in-world event list sets
+#include "vfs/custom_map.h"
 #include "session_start.h"
 #include "battle_layout.h"
+#include "battle_events.h"
 #include "netplay_hooks.h"
 #include "netplay_impact_fixture.h"
 
@@ -125,7 +127,19 @@ struct Plan {
     // mode=career: the main menu answers Career once; the Career's opening screens are answered until the hub
     // has said Drive Around (then src/career_warp.cpp takes over in free roam).
     bool career = false, career_entered = false, career_driving = false;
+    bool career_classic_hub = false; // true = stop at native Career Hub instead of auto Drive Around
 } P;
+
+PendingOfflineMatch g_pending_offline{};
+PendingCareerWarp g_career_warp{};
+SessionTransition g_pending_transition{};
+bool g_unwind_active = false;
+bool g_unwind_career = false;
+EEStateKind g_ee_state = EEStateKind::Boot;
+void (*g_online_transition_handler)(const SessionTransition &) = nullptr;
+void (*g_hub_arrival_handler)() = nullptr;
+void (*g_career_save_handler)() = nullptr;
+void arm_offline_match_plan(const PendingOfflineMatch &m);
 
 void log(const char *fmt, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
     std::fprintf(stderr, "[SESSION] ");
@@ -163,6 +177,14 @@ int find_eve(const std::string &track) {
             }
     }
     return -1;
+}
+
+// EmptyTrack is a hidden developer Eve. Its sole retail contest is a 100-lap
+// normal race. Only a creator map mounted on this physical arena may offer it.
+bool blank_creator_eve(int eve) {
+    if (eve < 0 || !ieq(guest_text(kEves + eve*kEveStride + 8, 32), "EmptyTrack")) return false;
+    const auto map = eod::vfs::active_map();
+    return map && map->replace_retail_spawns && find_eve(map->base_arena) == eve;
 }
 
 bool has_active_contest(uint32_t eve) {
@@ -429,6 +451,17 @@ bool g_ready = false;
 }
 bool ready() { return g_ready; }
 const std::vector<Track> &tracks() { return g_tracks; }
+const Track *track_for_arena(const std::string &arena) {
+    const int eve = find_eve(arena);
+    for (const auto &track : g_tracks) if (track.eve == eve) return &track;
+    if (blank_creator_eve(eve)) {
+        static thread_local Track blank;
+        blank = {eve, guest_text(kEves + eve*kEveStride + 0x28, 40), "Battle",
+                 {kHumanBattle, "Battle"}, {0x18000224, 0x18000224}};
+        return &blank;
+    }
+    return nullptr;
+}
 const std::vector<Vehicle> &vehicles() { return g_vehicles; }
 bool refresh() {
     if (g_ready) return true;
@@ -469,7 +502,12 @@ bool refresh() {
         const uint32_t v = table + i * kVehicleStride;
         Vehicle e; e.number = ee_r32(v + 4); e.name = guest_text(v + 8, 32); e.record = v;
         // 111C78 asks 12A2F0 for vehicles with bit 0 set when appending trailers.
-        e.is_trailer = (ee_r32(v + 0x44) & 1u) != 0;
+        e.is_trailer = (ee_r32(v + 0x44) & 1u) != 0 || (e.number >= 400 && e.number <= 413) ||
+                       ieq(e.name.substr(0, std::min<size_t>(7, e.name.size())), "trailer") ||
+                       ieq(e.name.substr(0, std::min<size_t>(6, e.name.size())), "camper") ||
+                       ieq(e.name.substr(0, std::min<size_t>(7, e.name.size())), "caravan");
+        e.car_class = ee_r32(v + 0x40);
+        e.is_modded = (e.car_class >= 4) || (e.number >= 775 && e.number <= 789) || (e.number >= 800);
         if (!e.name.empty()) g_vehicles.push_back(e);
     }
     g_ready = !g_tracks.empty() && !g_vehicles.empty();
@@ -524,9 +562,20 @@ namespace {
 
 void start() {
     const char *text = std::getenv("EOD_DIRECT_START");
-    if (!text || !*text) return;
+    auto map = eod::vfs::active_map();
+    if (!map && (!text || !*text)) return;
     std::string err;
-    if (!session_parse(text, P.req, err)) { log("EOD_DIRECT_START rejected: "); std::fprintf(stderr, "[SESSION]   %s\n", err.c_str()); return; }
+    if (text && *text && !session_parse(text, P.req, err)) {
+        std::fprintf(stderr, "[SESSION] %s\n", err.c_str());
+        return;
+    }
+    if (map) {
+        P.req.mode = "action";
+        P.req.track = map->base_arena;
+        P.req.event = "Battle";
+        P.req.ai = 0;
+        if (P.req.car.empty()) P.req.car = "Algar";
+    }
     P.requested = true;
     if (P.req.mode == "career") {
         P.career = true;
@@ -545,6 +594,7 @@ void start() {
     const int eve = split ? -1 : find_eve(P.req.track);
     if (!split && eve < 0) { std::fprintf(stderr, "[SESSION] unknown track '%s'\n", P.req.track.c_str()); return; }
     const std::string event = session_event_name(P.req);
+    if (blank_creator_eve(eve)) battle_events_begin_blank_map(static_cast<uint32_t>(eve));
     const int contest = split ? -1 : find_contest((uint32_t)eve, event);
     if (!split && contest < 0) { std::fprintf(stderr, "[SESSION] Eve %d has no event '%s'\n", eve, event.c_str()); return; }
     const long car = find_car(P.req.car, P.req.paint);
@@ -600,6 +650,7 @@ void arm_net(const netplay_hooks::StartInfo &info) {
     P.armed = true;
     if (!info.track.empty()) {
         const int eve = find_eve(info.track);
+        if (blank_creator_eve(eve)) battle_events_begin_blank_map(static_cast<uint32_t>(eve));
         const int contest = eve < 0 ? -1 : find_contest((uint32_t)eve, P.req.event);
         if (eve >= 0 && contest >= 0) {
             P.direct = true; P.eve = (uint32_t)eve; P.contest = (uint32_t)contest; P.car = info.car;
@@ -611,6 +662,104 @@ void arm_net(const netplay_hooks::StartInfo &info) {
                  info.host ? "host" : "guest", P.direct ? "direct" : "native screens");
 }
 const bool g_arm_registered = [] { netplay_hooks::arm = &arm_net; return true; }();
+
+void arm_offline_match_plan(const PendingOfflineMatch &m) {
+    P = Plan{};
+    P.requested = true;
+    P.req.mode = "action";
+    P.req.track = m.track;
+    P.req.event = m.event;
+    P.req.humans = std::clamp(m.humans, 1, 4);
+    P.req.ai = m.ai_bots;
+    P.req.laps = m.laps;
+    P.req.seat_vehicles = m.seat_vehicles;
+    P.req.seat_paints = m.seat_paints;
+    P.req.seat_cars = m.seat_cars;
+    P.req.local_human_mask = m.local_human_mask ? m.local_human_mask : static_cast<uint16_t>((1u << P.req.humans) - 1u);
+    if (!m.seat_cars[0].empty()) P.req.car = m.seat_cars[0];
+    else if (m.seat_vehicles[0] != 0) P.req.car = std::to_string(m.seat_vehicles[0]);
+    P.req.paint = m.seat_paints[0];
+
+    if (ee_r32(kEveCount) == 0 || ee_r32(kMode) != kActionMode) native(f_00123958);
+    const bool split = P.req.humans > 1;
+    const int eve = split ? -1 : find_eve(P.req.track);
+    if (!split && eve < 0) {
+        std::fprintf(stderr, "[SESSION] offline launch: unknown track '%s'\n", P.req.track.c_str());
+        P = Plan{};
+        return;
+    }
+    const std::string event = session_event_name(P.req);
+    if (!split && blank_creator_eve(eve)) battle_events_begin_blank_map(static_cast<uint32_t>(eve));
+    const int contest = split ? -1 : find_contest(static_cast<uint32_t>(eve), event);
+    if (!split && contest < 0) {
+        std::fprintf(stderr, "[SESSION] offline launch: track '%s' has no event '%s'\n", P.req.track.c_str(), event.c_str());
+        P = Plan{};
+        return;
+    }
+    long car = m.seat_vehicles[0] ? static_cast<long>(m.seat_vehicles[0]) : find_car(P.req.car, P.req.paint);
+    if (car < 0) {
+        const auto &vehs = session_catalog::vehicles();
+        for (const auto &v : vehs) {
+            if (session_catalog::is_online_driver_choice(v)) { car = static_cast<long>(v.number); break; }
+        }
+    }
+    if (car < 0) {
+        std::fprintf(stderr, "[SESSION] offline launch: no valid vehicle found\n");
+        P = Plan{};
+        return;
+    }
+    P.car = static_cast<uint32_t>(car);
+    if (!split) {
+        P.eve = static_cast<uint32_t>(eve);
+        P.contest = static_cast<uint32_t>(contest);
+    }
+    P.armed = true;
+}
+int consume_main_menu_transition() {
+    if (g_pending_transition.target == TransitionTarget::None) return 0;
+    const SessionTransition tr = g_pending_transition;
+    g_pending_transition = SessionTransition{};
+    battle_events_end_blank_map();
+    eod::vfs::global_vfs().unmount(eod::vfs::Layer::EphemeralPie);
+    if (ee_r32(kMode) != kActionMode) native(f_00123958);
+    switch (tr.target) {
+    case TransitionTarget::Career:
+        P = Plan{};
+        P.career = true;
+        P.career_entered = true;
+        P.career_classic_hub = tr.classic_career_hub;
+        if (tr.career_warp.active || tr.career_warp.target_eve >= 0) {
+            career_warp_arm(tr.career_warp.target_place, tr.career_warp.target_eve, tr.career_warp.delay_frames);
+        } else {
+            career_warp_clear();
+        }
+        log("transition -> CAREER (15)");
+        return 15;
+    case TransitionTarget::Solo:
+    case TransitionTarget::SplitScreen:
+        session_set_pending_offline(tr.offline);
+        arm_offline_match_plan(tr.offline);
+        if (P.armed) {
+            log("transition -> ACTION (16), humans=%u", (uint32_t)P.req.humans);
+            return 16;
+        }
+        session_clear_pending_offline();
+        return 0;
+    case TransitionTarget::OnlineHost:
+    case TransitionTarget::OnlineJoinCode:
+    case TransitionTarget::OnlineJoinAddress:
+    case TransitionTarget::OnlineJoinCrew:
+        if (netplay_hooks::menu_enter) netplay_hooks::menu_enter();
+        if (g_online_transition_handler) g_online_transition_handler(tr);
+        return 0;
+    case TransitionTarget::Hub:
+        if (g_hub_arrival_handler) g_hub_arrival_handler();
+        return 0;
+    case TransitionTarget::None:
+    default:
+        return 0;
+    }
+}
 } // namespace
 
 bool session_parse(const char *text, SessionRequest &out, std::string &err) {
@@ -633,14 +782,13 @@ bool session_parse(const char *text, SessionRequest &out, std::string &err) {
         else if (key == "car") r.car = val;
         else if (key == "paint") { if (!number(val, v) || v < 0 || v > 63) { err = "bad paint '" + val + "'"; return false; } r.paint = (int)v; }
         else if (key == "humans") { if (!number(val, v) || v < 1 || v > 4) { err = "bad humans '" + val + "'"; return false; } r.humans = (int)v; }
-        else if (key == "ai") { if (!number(val, v) || v < 0 || v > 12) { err = "bad ai '" + val + "'"; return false; } r.ai = (int)v; }
+        else if (key == "ai") { if (!number(val, v) || v < 0 || v > 15) { err = "bad ai '" + val + "'"; return false; } r.ai = (int)v; }
         else if (key == "laps") { if (!number(val, v) || v < 1 || v > 50) { err = "bad laps '" + val + "'"; return false; } r.laps = (int)v; }
         else if (key == "place") r.place = val;
         else if (key == "eve") { if (!number(val, v) || v < 0 || v > 63) { err = "bad eve '" + val + "'"; return false; } r.eve = (int)v; }
         else { err = "unknown key '" + key + "'"; return false; }
     }
-    if (r.humans > 1 && r.ai >= 0) { err = "humans > 1 takes no ai= (head-to-head races have no AI roster choice)"; return false; }
-    if (r.laps >= 0 && (r.humans > 1 || r.mode != "action")) { err = "laps= requires single-player Action"; return false; }
+    if (r.laps >= 0 && r.mode != "action") { err = "laps= requires Action mode"; return false; }
     if (r.mode == "career") {
         if (!r.track.empty() || !r.event.empty() || r.ai >= 0)
             { err = "career takes place= and eve= (and optional car=), not track/event/ai"; return false; }
@@ -688,6 +836,87 @@ const char *career_place_name(int index) { return index >= 0 && index < kCareerP
 
 const SessionRequest *career_warp_request() { return P.career ? &P.req : nullptr; }
 
+void career_warp_arm(int place, int eve, int delay_frames) {
+    g_career_warp.active = (place >= 0 && place < kCareerPlaces);
+    g_career_warp.target_place = g_career_warp.active ? place : -1;
+    g_career_warp.target_eve = eve;
+    g_career_warp.delay_frames = std::max(0, delay_frames);
+    g_career_warp.frames_elapsed = 0;
+}
+
+void career_warp_clear() {
+    g_career_warp = PendingCareerWarp{};
+}
+
+PendingCareerWarp &career_warp_state() { return g_career_warp; }
+
+void session_set_pending_offline(const PendingOfflineMatch &m) {
+    g_pending_offline = m;
+    g_pending_offline.active = true;
+}
+
+const PendingOfflineMatch &session_pending_offline() { return g_pending_offline; }
+
+void session_clear_pending_offline() { g_pending_offline = PendingOfflineMatch{}; }
+
+void session_set_online_transition_handler(void (*fn)(const SessionTransition &)) {
+    g_online_transition_handler = fn;
+}
+
+void session_set_hub_arrival_handler(void (*fn)()) {
+    g_hub_arrival_handler = fn;
+}
+
+bool session_transition_pending() { return g_pending_transition.target != TransitionTarget::None; }
+
+bool session_unwind_active() { return g_unwind_active || g_unwind_career; }
+
+EEStateKind session_ee_state() {
+    if (!g_ram) return g_ee_state;
+    if (ee_r32(0x003CDA04) != 0) return EEStateKind::CareerRoam;
+    if (ee_r32(0x003C4C04) == 0x130) {
+        return ee_r32(0x00437BB8) != 0 ? EEStateKind::CareerEve : EEStateKind::CareerHub;
+    }
+    if (P.net && P.armed) return EEStateKind::OnlineMatch;
+    if (ee_r32(0x003C4C04) == kHeadToHeadMode) return EEStateKind::SplitScreen;
+    if (ee_r32(0x00437BB8) != 0) return EEStateKind::SoloAction;
+    return g_ee_state;
+}
+
+void session_cancel_transition() {
+    g_pending_transition = SessionTransition{};
+    g_unwind_active = false;
+    g_unwind_career = false;
+}
+
+void session_request_transition(const SessionTransition &t) {
+    g_pending_transition = t;
+    const EEStateKind st = session_ee_state();
+    if (st != EEStateKind::MainMenu && st != EEStateKind::Boot) {
+        g_unwind_active = true;
+        if (st == EEStateKind::CareerHub || st == EEStateKind::CareerRoam || st == EEStateKind::CareerEve) {
+            if (t.save_career_first && g_career_save_handler) {
+                g_career_save_handler();
+            }
+            g_unwind_career = true;
+            // Clear Career Free Roam HomeDriver driving flag / New Career loop flag (0x003D937C)
+            if (g_ram) ee_w32(0x003D937C, 0);
+        }
+        session_abort_event();
+    }
+}
+
+int session_ai_override() {
+    if (netplay_hooks::online_ai_override) {
+        const int ov = netplay_hooks::online_ai_override();
+        if (ov >= 0) return ov;
+    }
+    if (g_pending_offline.active && g_pending_offline.ai_bots >= 0) {
+        return g_pending_offline.ai_bots;
+    }
+    return (P.requested && P.req.mode == "action") ? P.req.ai : -1;
+}
+
 bool session_test_native_lap() {
     static const bool enabled = [] {
         const char *fixture = std::getenv("EOD_NETPLAY_TEST_NATIVE_LAP");
@@ -701,10 +930,6 @@ std::string session_event_name(const SessionRequest &r) {
     return r.event;
 }
 
-int session_ai_override() {
-    return (P.requested && P.req.mode == "action") ? P.req.ai : -1;
-}
-
 // Title screen ("press the START button", start.lyt): returns 1 once the player passed it.
 // A direct start or FastBoot (default ON in eod.ini) jumps straight to the Main Menu.
 extern "C" void f_002BEC08(void) {
@@ -712,7 +937,7 @@ extern "C" void f_002BEC08(void) {
     // error screen and crash.log (a windowed run; headless runs just log and abort).
     if (std::getenv("EOD_FATAL_TEST")) fatal("developer panic test (EOD_FATAL_TEST)");
     const char *text = std::getenv("EOD_DIRECT_START");
-    if (text && *text) {
+    if ((text && *text) || eod::vfs::active_map()) {
         std::fprintf(stderr, "[SESSION] title screen skipped (EOD_DIRECT_START)\n");
         ret_s32(1);
         return;
@@ -732,8 +957,45 @@ extern "C" void f_002BEC08(void) {
 
 extern "C" void f_002A1298(void) {
     eod_profile::mark_main_menu();
+    g_ee_state = EEStateKind::MainMenu;
+    // Unconditional first-entry warmup while kMode == 0x12F (Action), BEFORE any
+    // EOD_DIRECT_START="mode=career" or Career transition switches kMode to 0x130.
+    if (!session_catalog::ready()) {
+        session_catalog::refresh();
+    }
     static bool tried = false;
-    if (!tried) { tried = true; start(); if (std::getenv("EOD_CATALOG_DUMP") && session_catalog::refresh()) session_catalog::dump(); }
+    if (!tried) {
+        tried = true;
+        start();
+        battle_events_end_blank_map();
+        eod::vfs::global_vfs().unmount(eod::vfs::Layer::EphemeralPie);
+        if (std::getenv("EOD_CATALOG_DUMP") && session_catalog::refresh()) session_catalog::dump();
+    }
+    // Clear unwind flags and previous launch-scoped offline match on arrival at MainMenu.
+    if (g_unwind_active || g_unwind_career) {
+        g_unwind_active = false;
+        g_unwind_career = false;
+        battle_events_end_blank_map();
+        eod::vfs::global_vfs().unmount(eod::vfs::Layer::EphemeralPie);
+        if (ee_r32(kMode) != kActionMode) native(f_00123958);
+        P = Plan{};
+    }
+    if (P.armed && !P.net && (P.car_done || P.players_done || P.event_done)) {
+        battle_events_end_blank_map();
+        session_clear_pending_offline();
+        P = Plan{};
+    }
+    if (P.career && P.career_entered) {
+        P.career = false;
+        P.career_entered = false;
+        P.career_driving = false;
+        P.career_classic_hub = false;
+    }
+    // Consume any queued SessionTransition cleanly from MainMenu (kMode == 0x12F).
+    if (const int code = consume_main_menu_transition()) {
+        ret_s32(code);
+        return;
+    }
     if (P.career && !P.career_entered) {
         // MainMenuUpdate's result 15 is CAREER: the dispatcher (0x2A2720, table 0x414460) runs the Career driver
         // 0x112298 exactly as when the player picks it. Nothing of the main menu has been built yet.
@@ -743,10 +1005,12 @@ extern "C" void f_002A1298(void) {
         return;
     }
     if (P.net) {   // the online event that was running has returned to the main menu
+        battle_events_end_blank_map();
         P = Plan{};
         if (netplay_hooks::event_ended) netplay_hooks::event_ended();
     }
     if (netplay_hooks::menu_enter) netplay_hooks::menu_enter();
+    if (g_hub_arrival_handler) g_hub_arrival_handler();
     f_002A1298_orig();
     if (netplay_hooks::menu_leave) netplay_hooks::menu_leave();
 }
@@ -822,24 +1086,62 @@ extern "C" void f_00270C10(void) {
         }
     }
     if (caller == 0x002A16D8) {
+        // Synchronous transition dispatch from MainMenu without waiting on native input.
+        if (const int code = consume_main_menu_transition()) {
+            ret_s32(code);
+            return;
+        }
         netplay_hooks::main_selection_active = true;
         f_00270C10_orig();
         netplay_hooks::main_selection_active = false;
-        // The main dispatcher maps result 16 to Arcade. Preserve MenuRun cleanup.
+        // The main dispatcher maps result 16 to Arcade, 15 to Career.
         if (P.armed && P.net) ret_s32(16);
+        else if (const int code = consume_main_menu_transition()) ret_s32(code);
         return;
     }
-    if (caller == 0x002C1108 && P.armed && P.net) {
-        ret_s32(P.mode_answered ? -1 : 0); // Arcade: Race on entry, Back on return.
-        return;
+    if (caller == 0x002C1108) {
+        if (g_unwind_active) { ret_s32(-1); return; }
+        if (P.armed && (P.net || g_pending_offline.active)) {
+            ret_s32(P.mode_answered ? -1 : 0); // Arcade: Race on entry, Back on return.
+            return;
+        }
     }
-    if (P.armed && P.net && caller == 0x002C0DC8) {
-        if (!P.mode_answered) { P.mode_answered = true; ret_s32(1); log("online: single/multi prompt answered 'single'"); }
-        else ret_s32(-1);
-        return;
+    if (caller == 0x002C0DC8) {
+        if (g_unwind_active) { ret_s32(-1); return; }
+        if (P.armed && P.net) {
+            if (!P.mode_answered) { P.mode_answered = true; ret_s32(1); log("online: single/multi prompt answered 'single'"); }
+            else ret_s32(-1);
+            return;
+        }
+        if (P.armed && g_pending_offline.active) {
+            if (!P.mode_answered) {
+                P.mode_answered = true;
+                ret_s32(P.req.humans > 1 ? 0 : 1); // 1 = Single, 0 = Multi (Head-to-Head)
+                log("offline: single/multi prompt answered %u", P.req.humans > 1 ? 0u : 1u);
+            } else {
+                ret_s32(-1);
+            }
+            return;
+        }
     }
-    if (caller == 0x002B8120 && P.armed && !P.net && P.req.humans > 1 && head_to_head_menu()) return;
-    if (P.career && P.career_entered && !P.career_driving) {
+    if (caller == 0x002B8120) {
+        if (g_unwind_active) { ret_s32(1); return; }
+        if (P.armed && !P.net && P.req.humans > 1 && head_to_head_menu()) return;
+    }
+    if (g_unwind_career) {
+        if (caller == 0x0036AB8C) {
+            ee_w32(0x003D937C, 0); // Clear New Career flag read by f_002DE1A0
+            log("career unwind: hub answered Exit Career (7)");
+            ret_s32(7);
+            return;
+        }
+        if (caller == 0x00272030) {
+            log("career unwind: auto-confirmed Exit dialog (-2)");
+            ret_s32(-2);
+            return;
+        }
+    }
+    if (P.career && P.career_entered && !P.career_driving && !P.career_classic_hub) {
         // A fresh Career's opening screens (callers from EOD_MENU_RUN_TRACE): the tutorial note (0x3861B4) and the
         // "select Drive Around" note (0x383C94) close with -2; the Career hub (0x36AB8C) answers Drive Around (4).
         // The loading screens (0x2C1A0C) run natively.
@@ -859,8 +1161,8 @@ extern "C" void f_00270C10(void) {
 // When the online event finishes and unwinds back to the outer loop, P.car_done is already
 // true, so returning 0 exits GameDoSingle back to ArcadeSingleOrMultiPromptScreen (0x2C0BB8).
 extern "C" void f_002A75E0(void) {
-    if (P.armed && P.net && P.car_done) {
-        log("online: car screen unwind -> leave GameDoSingle");
+    if (g_unwind_active || (P.armed && (P.net || g_pending_offline.active) && P.car_done)) {
+        log("car screen unwind -> leave GameDoSingle");
         ret_s32(0);
         return;
     }
@@ -912,16 +1214,50 @@ bool head_to_head_menu() {
         P.armed = false;
         return false;
     }
-    // The native roster resolves human ownership by vehicle number. Reusing a
-    // number drops the earlier seat. Keep P1's paint and use other paints of
-    // the requested model for the other seats.
-    const auto cars = split_vehicle_numbers(P.car, (size_t)P.req.humans);
+    // Resolve per-seat vehicles (seat_vehicles[i] / seat_cars[i] + seat_paints[i]),
+    // keeping vehicle numbers unique across seats (native roster keys humans by vehicle number).
+    const auto fallback_cars = split_vehicle_numbers(P.car, (size_t)P.req.humans);
+    std::vector<uint32_t> cars;
+    cars.reserve((size_t)P.req.humans);
+    for (int i = 0; i < P.req.humans; ++i) {
+        long chosen = -1;
+        if (P.req.seat_vehicles[i] != 0) {
+            chosen = static_cast<long>(P.req.seat_vehicles[i]);
+        } else if (!P.req.seat_cars[i].empty()) {
+            chosen = find_car(P.req.seat_cars[i], P.req.seat_paints[i]);
+        }
+        if (chosen > 0 && std::find(cars.begin(), cars.end(), static_cast<uint32_t>(chosen)) == cars.end()) {
+            cars.push_back(static_cast<uint32_t>(chosen));
+            continue;
+        }
+        bool added = false;
+        for (uint32_t fb : fallback_cars) {
+            if (std::find(cars.begin(), cars.end(), fb) == cars.end()) {
+                cars.push_back(fb);
+                added = true;
+                break;
+            }
+        }
+        if (!added) {
+            // Fall back to any remaining drivable vehicle from kVehicleTable
+            const uint32_t table = ee_r32(kVehicleTable), count = ee_r32(kVehicleCount);
+            for (uint32_t k = 0; k < count && k < 4096; ++k) {
+                const uint32_t num = ee_r32(table + k * kVehicleStride + 4);
+                if (num && std::find(cars.begin(), cars.end(), num) == cars.end()) {
+                    cars.push_back(num);
+                    added = true;
+                    break;
+                }
+            }
+        }
+    }
     if (cars.size() < (size_t)P.req.humans) {
-        log("head-to-head: vehicle %u has too few paint records for %u seats, using native join lobby",
-            P.car, (uint32_t)P.req.humans);
+        log("head-to-head: could not resolve %u distinct vehicles, using native join lobby",
+            (uint32_t)P.req.humans);
         P.armed = false;
         return false;
     }
+    P.req.local_human_mask = static_cast<uint16_t>((1u << P.req.humans) - 1u);
     P.players_done = true;
     for (uint32_t i = 0; i < (uint32_t)P.req.humans; ++i) {
         const uint32_t join = native(f_002B9858); // Sets active and increments the join count.
@@ -944,8 +1280,8 @@ bool head_to_head_menu() {
 // When the online event finishes and unwinds back to the middle loop, P.track_done is already
 // true, so returning 0 exits the middle loop back to the outer loop (f_002A75E0).
 extern "C" void f_002C7340(void) {
-    if (P.armed && P.net && P.track_done) {
-        log("online: track screen unwind -> outer loop");
+    if (g_unwind_active || (P.armed && (P.net || g_pending_offline.active) && P.track_done)) {
+        log("track screen unwind -> outer loop");
         ret_s32(0);
         return;
     }
@@ -1051,6 +1387,8 @@ extern "C" void f_00120650(void) {
             // Native EventSetupSelectInitial below builds the selected event's roster
             // before GameDoHeadToHead can enter the race.
             const uint32_t contest = ee_r32(tracker + kTrackerList + 4 * (uint32_t)pos);
+            selected_contest = contest;
+            laps = P.req.laps;
             native(f_00120BE8, {(uint32_t)pos});
             log("head-to-head: selected tracker position %u (contest %u)", (uint32_t)pos, contest);
         } else {
@@ -1138,8 +1476,8 @@ extern "C" void f_00120650(void) {
 // (0x2A2FC4). Once the single online event has run (P.event_done is true), returning 0 exits
 // the inner Eve loop instead of opening the native in-world Eve event selection screen (0x11F640).
 extern "C" void f_00120FB8(void) {
-    if (P.armed && P.net && P.event_done) {
-        log("online: event finished -> leave Eve inner loop");
+    if (g_unwind_active || (P.armed && (P.net || g_pending_offline.active) && P.event_done)) {
+        log("event finished / unwind -> leave Eve inner loop");
         ret_s32(0);
         return;
     }

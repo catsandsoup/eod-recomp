@@ -25,6 +25,7 @@
 #include "core/memory.h"
 #include "render/native_renderer.h"
 #include "render/world_visibility.h"
+#include "vfs/custom_map.h"
 
 #include <cmath>
 #include <cstdint>
@@ -238,6 +239,17 @@ void world_frame_render() {
     call(f_003582B8, 0x214BDC);
     set(4, 0);
     call(f_00358BD0, 0x214BE4);
+    if (auto map = eod::vfs::active_map(); map && !map->indices.empty()) {
+        set(4, 1);
+        call(f_0035DEE0, 0x214BE4);
+        const uint32_t tag = reg(2);
+        if (tag) {
+            sq(tag, 0x10000000u, native::kCustomWorldNop);
+            set(4, 1);
+            call(f_0035CBB8, 0x214BE4);
+            if (reg(2)) native::ee_custom_world(tag, std::move(map));
+        }
+    }
     if (!split) {
         set(4, 8);
         call(f_0034DFE0, 0x214BF4);

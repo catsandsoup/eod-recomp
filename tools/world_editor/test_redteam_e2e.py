@@ -568,12 +568,13 @@ class TestRedTeamE2E(unittest.TestCase):
                 self.assertFalse(vp._timer.isActive(), f"Modifier chord latched flight timer for key={key}")
                 np.testing.assert_allclose(vp.cam_pos, cam_before, atol=1e-6)
 
-            # Tab 3x cycles Move -> Rotate -> Scale -> Move
+            # Tab opens and closes drawers
             win.select_tool("move")
-            for expected in ("rotate", "scale", "move"):
+            for drawers_open in (True, False):
                 ev_tab = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Tab, Qt.KeyboardModifier.NoModifier)
                 self.app.sendEvent(vp, ev_tab)
-                self.assertEqual(vp.active_tool, expected)
+                self.assertEqual(any(win._side_panel_requests.values()), drawers_open)
+                self.assertEqual(vp.active_tool, "move")
 
             # Fuzz single-key hotkeys G, R, T, P, B, Escape without crash
             for k in (Qt.Key.Key_G, Qt.Key.Key_R, Qt.Key.Key_T, Qt.Key.Key_P, Qt.Key.Key_B, Qt.Key.Key_Escape):
@@ -606,6 +607,15 @@ class TestRedTeamE2E(unittest.TestCase):
             probe_idx = vp._pick_aabb_objs.index(probe_obj)
             np.testing.assert_allclose(vp._pick_aabb_lo[probe_idx], ref_lo, atol=1e-3)
             np.testing.assert_allclose(vp._pick_aabb_hi[probe_idx], ref_hi, atol=1e-3)
+            # Object drags patch the existing row without scanning the rest of the scene.
+            previous_lo = vp._pick_aabb_lo
+            probe_obj.position = (orig_pos[0] - 4.0, orig_pos[1] + 3.0, orig_pos[2])
+            vp.mark_objects_dirty([probe_obj])
+            vp._ensure_pick_aabb_cache()
+            self.assertIs(vp._pick_aabb_lo, previous_lo)
+            lo, hi = probe_obj.world_aabb(world.models[probe_obj.model_key])
+            np.testing.assert_allclose(vp._pick_aabb_lo[probe_idx], lo, atol=1e-3)
+            np.testing.assert_allclose(vp._pick_aabb_hi[probe_idx], hi, atol=1e-3)
             probe_obj.position = orig_pos
             vp.mark_scene_dirty()
 

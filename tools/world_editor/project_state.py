@@ -14,6 +14,7 @@ import re
 import shutil
 import struct
 import tempfile
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -24,6 +25,7 @@ from PIL import Image
 from PySide6.QtGui import QUndoCommand, QUndoStack
 
 from world_loader import (
+    BATTLE_SPAWN_LIMIT,
     CustomRaceConfig,
     EnvironmentState,
     MeshPart,
@@ -39,6 +41,7 @@ from world_loader import (
     parse_bppt,
     query_bppt_plane,
 )
+from creator_props import ensure_creator_prop
 import road_builder
 import road_collision
 import road_spline
@@ -477,6 +480,21 @@ class ModifyRoadLanesCommand(QUndoCommand):
         self.on_change()
 
 
+class SetPracticeStartCommand(QUndoCommand):
+    def __init__(self, world, marker, on_change):
+        super().__init__("Set default practice start")
+        self.world, self.marker, self.on_change = world, marker, on_change
+        self.previous = world.default_practice_start
+
+    def redo(self):
+        self.world.default_practice_start = self.marker.marker_id
+        self.on_change()
+
+    def undo(self):
+        self.world.default_practice_start = self.previous
+        self.on_change()
+
+
 class AddMarkerCommand(QUndoCommand):
     def __init__(self, world: TrackWorld, marker: WorldMarker, on_change: Callable[[], None]):
         super().__init__(f"Add {marker.kind}: {marker.name}")
@@ -500,6 +518,7 @@ class DeleteMarkerCommand(QUndoCommand):
         super().__init__(f"Delete {marker.name}")
         self.world = world
         self.marker = marker
+        self.index = world.markers.index(marker)
         self.on_change = on_change
 
     def redo(self) -> None:
@@ -509,7 +528,7 @@ class DeleteMarkerCommand(QUndoCommand):
 
     def undo(self) -> None:
         if self.marker not in self.world.markers:
-            self.world.markers.append(self.marker)
+            self.world.markers.insert(self.index, self.marker)
         self.on_change()
 
 
@@ -523,12 +542,15 @@ class TransformMarkerCommand(QUndoCommand):
         new_hdg: float,
         on_change: Callable[[], None],
         label: str = "Transform marker",
+        new_normal: tuple[float, float, float] | None = None,
     ):
         super().__init__(label)
         self.marker = marker
         self.old_pos = tuple(old_pos)
         self.old_hdg = float(old_hdg)
         self.old_source = marker.source
+        self.old_normal = marker.normal
+        self.new_normal = marker.normal if new_normal is None else tuple(new_normal)
         self.new_pos = tuple(new_pos)
         self.new_hdg = float(new_hdg)
         self.on_change = on_change
@@ -536,12 +558,14 @@ class TransformMarkerCommand(QUndoCommand):
     def redo(self) -> None:
         self.marker.position = self.new_pos
         self.marker.heading_deg = self.new_hdg
+        self.marker.normal = self.new_normal
         self.marker.source = "Placed by the editor"
         self.on_change()
 
     def undo(self) -> None:
         self.marker.position = self.old_pos
         self.marker.heading_deg = self.old_hdg
+        self.marker.normal = self.old_normal
         self.marker.source = self.old_source
         self.on_change()
 
@@ -1532,6 +1556,7 @@ def build_project_overlay_dict(
             "heading_deg": m.heading_deg,
             "source": m.source,
             "note": m.note,
+            "normal": list(m.normal),
         }
         for m in world.markers
     ]
@@ -1552,6 +1577,9 @@ def build_project_overlay_dict(
         "active_road_line": world.road_graph.line_name,
         "camera": dict(camera_state) if camera_state else {},
         "environment": world.environment.to_dict(),
+        "active_event_template": world.active_event_template,
+        "sync_all_events": world.sync_all_events,
+        "include_lod_twins": world.include_lod_twins,
         "custom_race": world.custom_race.to_dict(),
         "replaced_textures": replaced_tex_doc,
         "sobl_barrier_edits": sobl_edits_doc,
@@ -1564,7 +1592,12 @@ def build_project_overlay_dict(
         "procedural_roads": list(world.procedural_roads),
         "roads": roads_doc,
         "markers": markers_doc,
+        "default_practice_start": world.default_practice_start,
+        "deleted_battle_spawn_ids": sorted(world.retail_battle_spawn_ids - {m.marker_id for m in world.markers}),
     }
+
+
+_save_commit_lock = threading.Lock()
 
 
 def atomic_write_json(
@@ -1573,16 +1606,27 @@ def atomic_write_json(
     *,
     tmp_suffix: str = ".autosave.tmp",
     compact: bool = False,
+    token: Any = None,
 ) -> Path:
     """Crash-safe atomic JSON write (`<target><tmp_suffix>` -> `os.replace`)."""
     out = Path(target_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(out.name + tmp_suffix)
-    text = (json.dumps(doc, separators=(",", ":")) if compact else json.dumps(doc, indent=2)) + "\n"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-    os.replace(tmp, out)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=out.parent, prefix=out.name + ".",
+                                         suffix=tmp_suffix, delete=False) as f:
+            tmp = Path(f.name)
+            json.dump(doc, f, separators=(",", ":") if compact else None, indent=None if compact else 2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        with _save_commit_lock:
+            if token is not None and token.is_cancelled:
+                raise InterruptedError("Autosave superseded")
+            os.replace(tmp, out)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     return out
 
 
@@ -1618,7 +1662,7 @@ def save_autosave_snapshot(
     """Background-worker friendly atomic autosave (`<project>.autosave.tmp` -> `os.replace`)."""
     if token is not None and token.is_cancelled:
         raise InterruptedError("Autosave cancelled")
-    return atomic_write_json(Path(target_path), doc, tmp_suffix=".autosave.tmp", compact=True)
+    return atomic_write_json(Path(target_path), doc, tmp_suffix=".autosave.tmp", compact=True, token=token)
 
 
 def find_newer_autosave(
@@ -1651,12 +1695,13 @@ def clear_autosave(
     project_name: str = "",
 ) -> None:
     cand = autosave_path_for(project_path, track_name or "TRACK", project_name or "Untitled")
-    for p in (cand, cand.with_name(cand.name + ".autosave.tmp")):
-        try:
-            if p.is_file():
-                p.unlink()
-        except Exception:
-            pass
+    with _save_commit_lock:
+        for p in (cand, cand.with_name(cand.name + ".autosave.tmp")):
+            try:
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
 
 
 def save_project_overlay(
@@ -1773,21 +1818,20 @@ def apply_project_overlay(world: TrackWorld, path: Path | str) -> dict[str, Any]
 
     for add in doc.get("added_objects", []):
         mkey = add["model_key"]
-        if mkey not in world.models:
-            continue
-        wm = world.models[mkey]
+        ensure_creator_prop(world, mkey)
+        wm = world.models.get(mkey)
         obj = WorldObject(
             obj_id=add["obj_id"],
-            name=add.get("name", wm.name),
+            name=add.get("name", wm.name if wm else mkey),
             model_key=mkey,
             source="Placed by the editor",
-            category=add.get("category", wm.category),
-            subtype=add.get("subtype", wm.subtype),
+            category=add.get("category", wm.category if wm else "missing"),
+            subtype=add.get("subtype", wm.subtype if wm else ""),
             section_mlist=add.get("section_mlist", "editor_layer"),
-            model_store=wm.model_store,
-            hash_hex=wm.hash_hex,
-            tri_count=wm.tri_count,
-            textures=list(wm.textures),
+            model_store=wm.model_store if wm else "unresolved",
+            hash_hex=wm.hash_hex if wm else "",
+            tri_count=wm.tri_count if wm else 0,
+            textures=list(wm.textures) if wm else [],
             position=tuple(float(v) for v in add["position"]),
             rotation_hpr=tuple(float(v) for v in add["rotation_hpr"]),
             scale=tuple(float(v) for v in add["scale"]),
@@ -1811,6 +1855,10 @@ def apply_project_overlay(world: TrackWorld, path: Path | str) -> dict[str, Any]
         world.environment = EnvironmentState.from_dict(doc["environment"])
     if "custom_race" in doc:
         world.custom_race = CustomRaceConfig.from_dict(doc["custom_race"])
+    world.sync_all_events = bool(doc.get("sync_all_events", world.custom_race.sync_all_events))
+    world.custom_race.sync_all_events = world.sync_all_events
+    world.active_event_template = doc.get("active_event_template", world.active_event_template)
+    world.include_lod_twins = bool(doc.get("include_lod_twins", world.include_lod_twins))
 
     # Restore replaced textures if PNG files still exist
     for tname, png_p in doc.get("replaced_textures", {}).items():
@@ -1878,7 +1926,9 @@ def apply_project_overlay(world: TrackWorld, path: Path | str) -> dict[str, Any]
     if active_line and active_line in world.all_road_graphs:
         world.road_graph = world.all_road_graphs[active_line]
 
+    world.default_practice_start = doc.get("default_practice_start")
     if "markers" in doc:
+        presets = [m for m in world.markers if m.marker_id in world.retail_battle_spawn_ids]
         world.markers = [
             WorldMarker(
                 marker_id=m["marker_id"],
@@ -1888,9 +1938,14 @@ def apply_project_overlay(world: TrackWorld, path: Path | str) -> dict[str, Any]
                 heading_deg=float(m.get("heading_deg", 0.0)),
                 source=m.get("source", "Placed by the editor"),
                 note=str(m.get("note", "")),
+                normal=tuple(float(v) for v in m.get("normal", (0.0, 1.0, 0.0))),
             )
             for m in doc["markers"]
         ]
+        # Early track caches and their autosaves omitted native Battle presets.
+        absent = set(doc.get("deleted_battle_spawn_ids", []))
+        loaded = {m.marker_id for m in world.markers}
+        world.markers.extend(m for m in presets if m.marker_id not in absent | loaded)
 
     return doc
 
@@ -3634,6 +3689,53 @@ def _encode_road_graph_to_ild(orig_ild: bytes, graph: RoadGraph) -> tuple[bytes,
     return rebuilt, (len(rebuilt) != len(orig_ild))
 
 
+def _compile_battle_spawns(raw: bytes, world: TrackWorld) -> bytes:
+    """Keep native slot references stable and append authored slots in placement order."""
+    markers = {m.marker_id: m for m in world.markers if m.battle_spawn}
+    if not 1 <= len(markers) <= BATTLE_SPAWN_LIMIT:
+        raise ValueError(f"Battle needs 1–{BATTLE_SPAWN_LIMIT} spawn points.")
+    table = valt.parse_binary_valt(raw)
+    sections = {s["name"].lower(): s for s in table["sections"]}
+    root = sections.get("respawn")
+    if root is None:
+        raise ValueError("This Battle layout has no respawn section.")
+    refs = []
+
+    def coordinates(marker):
+        x, _, z = marker.position
+        angle = math.radians(marker.heading_deg)
+        if not all(math.isfinite(v) for v in (x, z, angle)):
+            raise ValueError(f"Invalid Battle spawn coordinates for {marker.name}")
+        return {"dir": f"{math.sin(angle):.9g}, {math.cos(angle):.9g}", "pt": f"{x:.9g}, {z:.9g}"}
+
+    for idx, (key, target) in enumerate(root["pairs"]):
+        ident = f"m_battle_respawn_{idx}"
+        if ident not in world.retail_battle_spawn_ids:
+            refs.append((key, target))
+            continue
+        marker = markers.pop(ident, None)
+        if marker is None:
+            continue
+        refs.append((key, target))
+        if marker.source != "Retail":
+            section = sections[target.lower()]
+            updates = coordinates(marker)
+            section["pairs"] = [(k, updates.pop(k.lower(), v)) for k, v in section["pairs"]]
+            section["pairs"].extend(updates.items())
+
+    seq = max((int(name[1:5]) for name in sections if name.startswith("$") and name[1:5].isdigit()), default=-1) + 1
+    for marker in markers.values():
+        name = f"${seq:04d}$editor_spawn"
+        refs.append((f"@editor_spawn{seq}", name))
+        table["sections"].append({"name": name, "pairs": list(coordinates(marker).items())})
+        seq += 1
+    if len(refs) > BATTLE_SPAWN_LIMIT:
+        raise ValueError("The native Battle respawn table is full.")
+    root["pairs"] = refs
+    table["root_count"] = table["unk1"]
+    return valt.compile_binary_valt(table)
+
+
 def _compile_custom_objects_into_trk(
     mod_trk_path: Path,
     world: TrackWorld,
@@ -3647,10 +3749,7 @@ def _compile_custom_objects_into_trk(
     rebuilt `.ild` road lines, placed spawn markers, and optional `all_walls_noclip`
     obstacle.val wall flatten) into the modded 0TSR v6 `.TRK` archive cleanly.
     """
-    custom_spawns = [
-        m for m in world.markers if m.kind in ("Spawn", "Start Grid", "Car") and m.source != "Retail"
-    ]
-    if not custom_objs and not extra_sobl_boxes and not extra_members and not all_walls_noclip and not custom_spawns:
+    if not custom_objs and not extra_sobl_boxes and not extra_members and not all_walls_noclip and not world.battle_spawns_changed():
         return 0
 
     with tempfile.TemporaryDirectory(prefix="eod_trk_repack_") as tmp_dir:
@@ -3751,6 +3850,8 @@ def _compile_custom_objects_into_trk(
             # Resolve unique (model_key, quantized_scale) -> dyno_name
             dyno_cache: dict[tuple[str, tuple[float, float, float]], str] = {}
             dyno_counter = 1
+            resident_models = {e["name"].lower(): e["name"] for e in entries_meta
+                               if e["fourcc"].strip() == "MODL" and not e.get("is_extractable")}
 
             for obj in custom_objs:
                 q_scale = (round(obj.scale[0], 3), round(obj.scale[1], 3), round(obj.scale[2], 3))
@@ -3767,12 +3868,26 @@ def _compile_custom_objects_into_trk(
                         warnings.append(f"Skipped in-game compile for {obj.name}: no standalone MODL source")
                         continue
                     dyno_name = f"edp_{dyno_counter:03d}"
+                    while f"{dyno_name}.mod" in existing_lower:
+                        dyno_counter += 1
+                        dyno_name = f"edp_{dyno_counter:03d}"
                     mod_member_name = f"{dyno_name}.mod"
                     dyno_counter += 1
-
-                    # Write resident .mod member (placed BEFORE SFX0 tail so SPU shrink keeps it resident!)
-                    (tmp_p / mod_member_name).write_bytes(mod_bytes)
-                    if mod_member_name.lower() not in existing_lower:
+                    # Reuse native geometry already resident in the track or shared
+                    # race archive. Only a new/baked model needs a new archive member.
+                    reuse_model = None
+                    if obj.model_key.startswith("mod:"):
+                        original = resident_models.get(obj.model_key[4:].lower())
+                        if original and (tmp_p / original).read_bytes() == mod_bytes:
+                            reuse_model = original
+                        source, _, member = world.models[obj.model_key].model_store.partition("::")
+                        if (source.upper() == "DATA/RES/RACE.RES" and q_scale == (1.0, 1.0, 1.0)
+                                and member.lower() == obj.model_key[4:].lower() and member.lower() not in existing_lower):
+                            reuse_model = member
+                    if reuse_model:
+                        mod_member_name = reuse_model
+                    else:
+                        (tmp_p / mod_member_name).write_bytes(mod_bytes)
                         _insert_resident_meta(
                             {
                                 "name": mod_member_name,
@@ -3921,71 +4036,10 @@ def _compile_custom_objects_into_trk(
                     except Exception as exc:
                         warnings.append(f"Inject custom objects into {va0_name} warning: {exc}")
 
-        respawn_patched = False
-        if custom_spawns:
-            ordered_spawns = custom_spawns + [
-                m for m in world.markers if m.kind in ("Spawn", "Start Grid", "Car") and m.source == "Retail"
-            ]
-            for va0_name in all_va0_names:
-                va0_path = tmp_p / va0_name
-                if not va0_path.is_file():
-                    continue
-                try:
-                    vmodel = valt.parse_binary_valt(va0_path.read_bytes())
-                    resp_sec = next(
-                        (s for s in vmodel.get("sections", []) if s.get("name", "").lower() == "respawn"),
-                        None,
-                    )
-                    if resp_sec is None:
-                        continue
-                    sec_by_name = {s.get("name", ""): s for s in vmodel.get("sections", [])}
-                    changed_r = False
-                    for idx_r, (_skey, target_sec_name) in enumerate(resp_sec.get("pairs", [])):
-                        tsec = sec_by_name.get(str(target_sec_name))
-                        if tsec is None:
-                            continue
-                        mk = ordered_spawns[idx_r % len(ordered_spawns)]
-                        hdg_rad = math.radians(float(mk.heading_deg))
-                        dx_r = math.sin(hdg_rad)
-                        dz_r = math.cos(hdg_rad)
-                        px_r, _py_r, pz_r = (float(v) for v in mk.position)
-                        m4_r = compose_transform(mk.position, (float(mk.heading_deg), 0.0, 0.0), (1.0, 1.0, 1.0))
-                        frame64_r = we.encode_frame64(
-                            we.matrix_to_native_rows([float(v) for v in m4_r.reshape(-1)])
-                        )
-                        new_pairs_r: list[tuple[str, str]] = []
-                        has_dir = False
-                        has_pt = False
-                        has_f64 = False
-                        for k_r, v_r in tsec.get("pairs", []):
-                            kl_r = str(k_r).lower()
-                            if kl_r == "dir":
-                                new_pairs_r.append((k_r, f"{dx_r:.2f}, {dz_r:.2f}"))
-                                has_dir = True
-                            elif kl_r == "pt":
-                                new_pairs_r.append((k_r, f"{px_r:.2f}, {pz_r:.2f}"))
-                                has_pt = True
-                            elif kl_r == "unfloat_frame64":
-                                new_pairs_r.append((k_r, frame64_r))
-                                has_f64 = True
-                            else:
-                                new_pairs_r.append((k_r, v_r))
-                        if not has_dir:
-                            new_pairs_r.append(("dir", f"{dx_r:.2f}, {dz_r:.2f}"))
-                        if not has_pt:
-                            new_pairs_r.append(("pt", f"{px_r:.2f}, {pz_r:.2f}"))
-                        if not has_f64:
-                            new_pairs_r.append(("unfloat_frame64", frame64_r))
-                        tsec["pairs"] = new_pairs_r
-                        changed_r = True
-                    if changed_r:
-                        vmodel["root_count"] = sum(
-                            1 for s in vmodel["sections"] if not s.get("name", "").startswith("$")
-                        )
-                        va0_path.write_bytes(valt.compile_binary_valt(vmodel))
-                        respawn_patched = True
-                except Exception as exc:
-                    warnings.append(f"Respawn patch in {va0_name} warning: {exc}")
+        if world.battle_spawns_changed():
+            layout = next(tmp_p / n for n in all_va0_names if n.lower() == "c_battle.va0")
+            layout.write_bytes(_compile_battle_spawns(layout.read_bytes(), world))
+            members_replaced = True
 
         sobl_appended = False
         if combined_sobl_boxes:
@@ -3998,7 +4052,7 @@ def _compile_custom_objects_into_trk(
                     sol_path.write_bytes(new_sol)
                     sobl_appended = True
 
-        if not placed_records and not sobl_appended and not members_replaced and not noclip_patched and not respawn_patched:
+        if not placed_records and not sobl_appended and not members_replaced and not noclip_patched:
             return 0
 
         manifest_p.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -4453,6 +4507,9 @@ def export_mod_layer(
     patching dirty member payloads + exact 0TSR CRCs in-place without re-copying or re-parsing
     untouched retail members!
     """
+    missing = sorted({o.model_key for o in world.objects if not o.deleted and o.model_key not in world.models})
+    if missing:
+        raise ValueError(f"Restore or remove these missing model references before exporting: {', '.join(missing)}")
     t_compile_ns = time.perf_counter_ns()
     out = Path(os.path.abspath(str(dest_dir)))
     retail_trk_abs = os.path.abspath(str(world.trk_path))
@@ -4711,9 +4768,10 @@ def export_mod_layer(
             if known_solid_ids is not None:
                 known_solid_ids.add(o.obj_id)
 
-    has_custom_spawns = any(
-        m.kind in ("Spawn", "Start Grid", "Car") and m.source != "Retail" for m in world.markers
-    )
+    has_custom_spawns = world.battle_spawns_changed()
+    if has_custom_spawns:
+        raw_layout, _ = mb.payload(world.trk_path, "c_battle.va0", world.entries)
+        _compile_battle_spawns(raw_layout, world)  # Validate before writing the mod archive.
     can_delta = (
         allow_delta
         and prev_state is not None
@@ -5091,6 +5149,8 @@ def export_mod_layer(
                 all_walls_noclip=bool(world.all_walls_noclip),
             )
         except Exception as exc:
+            if has_custom_spawns:
+                raise
             place_warnings.append(f"Custom object .TRK compile warning: {exc}")
 
     # Build 32-bit unified .eodcol collision mesh + top-down minimap preview whenever procedural roads or edited objects exist

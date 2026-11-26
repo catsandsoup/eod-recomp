@@ -6,6 +6,7 @@
 // DIR is the root of the game disc (the directory that contains
 // SLUS_209.10 and DATA/).  Defaults to the executable's directory, then the
 // current directory.
+#include "vfs/custom_map.h"
 #include "app/online_profile.h"
 #include "core/r7_audit.h"
 #include "core/frame_pacing.h"
@@ -335,7 +336,15 @@ static int run_setup_screen(PlatformConfig cfg, const std::string &config_path, 
 }
 #endif
 
+#ifdef EOD_RIBBON_PARITY_TEST
+int test_ribbon_strip(const char *elf);
+#endif
+
 int main(int argc, char **argv) {
+#ifdef EOD_RIBBON_PARITY_TEST
+    if (argc == 3 && std::strcmp(argv[1], "--test-ribbon-strip") == 0)
+        return test_ribbon_strip(argv[2]);
+#endif
     eod_profile::init();
 #ifdef _WIN32
     windows_utf8_arguments(argc, argv);
@@ -352,6 +361,7 @@ int main(int argc, char **argv) {
 #endif
     PlatformConfig cfg;
     std::string data_dir;
+    std::string map_path;
     std::string config_path;
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
@@ -402,6 +412,7 @@ int main(int argc, char **argv) {
             return argv[++i];
         };
         if (a == "--data") data_dir = next();
+        else if (a == "--map") map_path = next();
         else if (a == "--config") next();
         else if (a == "--renderer") g_config.renderer = next();
         else if (a == "--require-plume") require_plume = true;
@@ -434,7 +445,7 @@ int main(int argc, char **argv) {
 #endif
         else if (a == "--help" || a == "-h") {
 #ifdef _WIN32
-            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
+            printf("usage: %s [--data DIR] [--config eod.ini] [--map COURSE.eodmap] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume] [--modern|--classic]\n"
@@ -442,7 +453,7 @@ int main(int argc, char **argv) {
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
                    argv[0]);
 #else
-            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
+            printf("usage: %s [--data DIR] [--config eod.ini] [--map COURSE.eodmap] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--invincible] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
                    "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2] [--require-plume] [--modern|--classic]\n"
@@ -452,6 +463,13 @@ int main(int argc, char **argv) {
                    argv[0], argv[0]);
 #endif
             return 0;
+        }
+    }
+    if (!map_path.empty()) {
+        std::string error;
+        if (!eod::vfs::mount_map(std::filesystem::u8path(map_path), eod::vfs::Layer::EphemeralPie, error)) {
+            std::fprintf(stderr, "Cannot load custom map: %s\n", error.c_str());
+            return 2;
         }
     }
 #ifdef EOD_R7_RELEASE
