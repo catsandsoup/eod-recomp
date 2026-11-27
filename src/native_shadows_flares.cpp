@@ -15,6 +15,7 @@
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
+#include "remaster/scene_bridge.h"
 #include "render/native_renderer.h"
 
 #include <cstdint>
@@ -531,6 +532,9 @@ void viewport_render_finish_parity() {
     const bool lift = split_parity() && !diff_on() && views >= 2;
     if (!lift) {
         f_0020F2D8_orig();
+        if (g_config.remaster_engine) {
+            remaster::ee_end_frame(native::environment_override());
+        }
         return;
     }
     // Run the exact original function; since views >= 2, it skips 0x304D50, so we invoke 0x304D50
@@ -596,6 +600,10 @@ void viewport_render_finish_parity() {
     sw(0x495C68, lwu(0x495C68) + 1u);
     set(4, 2);
     call(f_0034DFE0, 0x20F478);
+
+    if (g_config.remaster_engine) {
+        remaster::ee_end_frame(native::environment_override());
+    }
 
     set64(31, saved_ra);
     set(29, (int32_t)(sp + 0x70));

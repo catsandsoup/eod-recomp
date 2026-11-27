@@ -23,6 +23,7 @@ Config::Config() {
 #endif
 #ifdef EOD_R7_RELEASE
     plume_modern = true;
+    remaster_engine = true;
     render_scale = 6;
     frame_skip = false;
     fullscreen = true;
@@ -144,7 +145,10 @@ bool config_load(const std::string &path, Config &c) {
             else if (ieq(k, "SmoothDisplay")) c.smooth_display = to_bool(v);
             else if (ieq(k, "FrameSkip")) c.frame_skip = to_bool(v);
             else if (ieq(k, "ShowFps")) c.show_fps = to_bool(v);
-            else if (ieq(k, "Look") && (ieq(v, "Classic") || ieq(v, "Modern"))) c.plume_modern = ieq(v, "Modern");
+            else if (ieq(k, "Look") && (ieq(v, "Classic") || ieq(v, "Modern") || ieq(v, "Remaster"))) {
+                c.remaster_engine = ieq(v, "Remaster");
+                c.plume_modern = ieq(v, "Modern") || c.remaster_engine;
+            }
             else if (ieq(k, "ModernRenderer")) c.modern_renderer = to_bool(v);
             else if (ieq(k, "NativeRenderer")) c.native_renderer = to_bool(v);
             else if (ieq(k, "SplitScreenParity")) c.split_screen_parity = to_bool(v);
@@ -303,7 +307,7 @@ bool config_save(const std::string &path, const Config &c) {
     fprintf(f, "SmoothDisplay=%d\n", c.smooth_display ? 1 : 0);
     fprintf(f, "FrameSkip=%d\n", c.frame_skip ? 1 : 0);
     fprintf(f, "ShowFps=%d\n", c.show_fps ? 1 : 0);
-    fprintf(f, "Look=%s\n", c.plume_modern ? "Modern" : "Classic");
+    fprintf(f, "Look=%s\n", c.remaster_engine ? "Remaster" : (c.plume_modern ? "Modern" : "Classic"));
     fprintf(f, "ModernRenderer=%d     ; the modern renderer (F9 or L1+R1+R3 switch it live); effects in percent:\n",
             c.modern_renderer ? 1 : 0);
     fprintf(f, "NativeRenderer=%d     ; cars, props and characters drawn by the native renderer (preview)\n",

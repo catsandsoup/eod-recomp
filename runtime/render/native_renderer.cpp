@@ -10,6 +10,7 @@
 #include "core/trace.h"
 #include "native_renderer.h"
 #include "editor_environment.h"
+#include "../remaster/remaster_renderer.h"
 
 #include <algorithm>
 #include <array>
@@ -188,7 +189,6 @@ uint64_t context_xyoffset() {
 using namespace scene;
 #include "native_sun_cascades_spv.inc"
 #include "native_modern_spv.inc"
-#include "native_post_spv.inc"
 
 constexpr uint32_t kAuthoredEnvironment = 1u << 31; // Modern mode.z, above the material class
 enum : uint32_t { M_TME = 0x1, M_TCC = 0x2, M_TFX_SHIFT = 2, M_ATE = 0x10, M_ATST_SHIFT = 5, M_AFAIL_DISCARD = 0x100,
@@ -362,125 +362,8 @@ struct SunMaps {
     uint64_t scene_binds = 0, composites = 0, armed = 0, resolved = 0;
 };
 
-struct PostConstants {
-    float inv_size[4];
-    float view_rect[4];
-    float proj_params[4];
-    float sun_screen[4];
-    float sun_view_dir[4];
-    float sky_horizon[4];
-    float sky_zenith[4];
-    float grade_params[4];
-};
-
-struct DynamicLightWorld {
-    float pos[3];
-    float radius;
-    float col[3];
-    float cut;        // <= 0: omnidirectional point light; > 0: spotlight cos cutoff
-    float dir[3];     // world-space spotlight direction
-    float vol;        // volumetric beam scatter intensity
-    float day_gain;   // 0.0: night-only (stadium floodlights); >0: also visible in daylight (sparks, fires, exhaust)
-};
-
-struct CarOccluderWorld {
-    float center[3];  // world-space bottom center of chassis
-    float radius;     // bounding radius
-    float right[3];   // world-space right unit vector
-    float hx;         // half width
-    float fwd[3];     // world-space forward unit vector
-    float hz;         // half length
-    float down[3];    // world-space down unit vector
-    float height;     // chassis height
-};
-
-struct TransientSparkLight {
-    float pos[3];
-    float intensity;
-    uint64_t birth_frame;
-};
-
 std::mutex g_ee_floodlights_mtx;
 std::vector<std::array<float, 3>> g_ee_floodlights;
-
-struct DynamicLightsUBO {
-    static constexpr uint32_t kMax = 32;
-    static constexpr uint32_t kMaxCars = 16;
-    uint32_t light_meta[4];
-    float cam_right[4];
-    float cam_down[4];
-    float cam_fwd[4];
-    float prev_reproj[4][4];
-    float light_pos_rad[kMax][4];
-    float light_col_cut[kMax][4];
-    float light_dir_vol[kMax][4];
-    float car_center_rad[kMaxCars][4];
-    float car_right_hx[kMaxCars][4];
-    float car_fwd_hz[kMaxCars][4];
-    float car_down_pad[kMaxCars][4];
-};
-
-struct RemasterView {
-    Packet camera{};
-    Target target{};
-    uint64_t color_image = 0, depth_image = 0;
-    uint64_t color_ownership = 0, depth_ownership = 0;
-    double ox = 0.0, oy = 0.0;
-    int32_t sc[4] = {};
-    bool active = false, applied = false;
-    std::vector<DynamicLightWorld> lights;
-    std::vector<CarOccluderWorld> cars;
-
-    void reset() {
-        active = applied = false;
-        lights.clear();
-        cars.clear();
-    }
-};
-
-struct RemasterPost {
-    static constexpr size_t kBloomMips = 5;
-    bool attempted = false;
-    bool ready = false;
-    std::unique_ptr<plume::RenderPipelineLayout> layout;
-    std::unique_ptr<plume::RenderPipeline> p_gtao, p_ao_blur, p_hdr_atmo, p_taa;
-    std::unique_ptr<plume::RenderPipeline> p_bloom_pre, p_bloom_down, p_bloom_up;
-    std::unique_ptr<plume::RenderPipeline> p_auto_exp, p_composite;
-    std::unique_ptr<plume::RenderSampler> linear_clamp;
-    std::unique_ptr<plume::RenderBuffer> dyn_lights_buf;
-    std::unique_ptr<plume::RenderTexture> exp_tex[2];
-    std::unique_ptr<plume::RenderFramebuffer> fb_exp[2];
-    std::vector<TransientSparkLight> spark_lights;
-    double prev_clip[4][4] = {};
-    float prev_cam_pos[3] = {};
-    bool has_prev_clip = false;
-    bool has_prev_exp = false;
-    uint32_t taa_idx = 0;
-
-    // Resolution-dependent offscreen targets
-    uint32_t w = 0, h = 0, ao_w = 0, ao_h = 0;
-    uint64_t bound_color = 0, bound_depth = 0;
-    std::unique_ptr<plume::RenderTexture> scene_copy;
-    std::unique_ptr<plume::RenderTexture> hdr_scene;
-    std::unique_ptr<plume::RenderTexture> taa_hist[2];
-    std::unique_ptr<plume::RenderTexture> ao_raw, ao_blur;
-    std::unique_ptr<plume::RenderTexture> bloom[kBloomMips];
-    uint32_t bloom_w[kBloomMips] = {}, bloom_h[kBloomMips] = {};
-
-    std::unique_ptr<plume::RenderFramebuffer> fb_hdr, fb_ao_raw, fb_ao_blur;
-    std::unique_ptr<plume::RenderFramebuffer> fb_taa[2];
-    std::unique_ptr<plume::RenderFramebuffer> fb_bloom[kBloomMips];
-    std::unique_ptr<plume::RenderTexture> ext_color, ext_depth;
-    std::unique_ptr<plume::RenderFramebuffer> fb_out;
-
-    std::unique_ptr<plume::RenderDescriptorSet> ds_gtao, ds_ao_blur, ds_hdr_atmo;
-    std::unique_ptr<plume::RenderDescriptorSet> ds_taa[2];
-    std::unique_ptr<plume::RenderDescriptorSet> ds_bloom_pre[2];
-    std::unique_ptr<plume::RenderDescriptorSet> ds_bloom_down[kBloomMips - 1];
-    std::unique_ptr<plume::RenderDescriptorSet> ds_bloom_up[kBloomMips - 1];
-    std::unique_ptr<plume::RenderDescriptorSet> ds_auto_exp[2];
-    std::unique_ptr<plume::RenderDescriptorSet> ds_composite[2];
-};
 
 struct ModernFastShaders {
     std::unique_ptr<plume::RenderShader> vs_modern;
@@ -560,12 +443,12 @@ struct Renderer {
     std::vector<Item> shadow_pending;
     SunView sun_view;
     SunMaps sun_maps;
-    RemasterView remaster_view;
-    RemasterPost remaster_post;
     bool hybrid_shadow_prepared = false;
     int split_shadow_view = -1;
     Target main_target{};
     bool has_main_target = false;
+    bool remaster_3d_seen = false;
+    bool remaster_drawn = false;
     uint64_t main_xy = 0;
     int32_t main_sc[4] = {};
     Texture shadow_mask;
@@ -1857,7 +1740,7 @@ void observe_sun_caster(const Item &it, const Target &target, const gs::hw::Nati
         view.reset();
         return;
     }
-    if ((p.kind != KIND_QUEUE && p.kind != KIND_WORLD) || p.editor_environment || it.second || !surface.depth)
+    if ((p.kind != KIND_QUEUE && p.kind != KIND_WORLD) || it.second || !surface.depth)
         return;
     const Material *mat = it.tex && it.tex->mat >= 0 ? &g_mats[static_cast<size_t>(it.tex->mat)] : nullptr;
     const bool is_ate = (it.pc.mode[0] & M_ATE) != 0 || (mat && mat->cls == C_FOLIAGE);
@@ -2059,7 +1942,6 @@ bool bind_sun_target(const gs::hw::NativeSurfaces &surface) {
         maps.mask_size[0] = mw;
         maps.mask_size[1] = mh;
         maps.mask_scale = mscale;
-        g_r.remaster_post.bound_color = 0; // force remaster_post to rebind shadow_mask
     }
     auto color = make_wrapper(surface.color, surface.width, surface.height, false);
     auto depth = make_wrapper(surface.depth, surface.width, surface.height, true);
@@ -2094,7 +1976,7 @@ void arm_sun_cascades(const gs::hw::NativeSurfaces &surface, const Packet &shado
                            input.target == g_r.main_target && input.xy == g_r.main_xy;
     const uint32_t fog = shadow.fogcol;
     // 2026 Remaster: enable soft CSM shadows on BOTH day AND night tracks, INCLUDING Career Free Roam/Quarry (fge=1)!
-    input.armed = shadow.retail_shadow_view && !shadow.editor_environment && same_view &&
+    input.armed = shadow.retail_shadow_view && same_view &&
                   !input.casters.empty();
     if (input.armed && !sun_cascades::daylight(fog)) {
         // On night stadium tracks (Anoka), orient the key shadow caster direction from the overhead
@@ -2221,8 +2103,7 @@ uint32_t draw_sun_cascades(plume::RenderCommandList &list, const gs::hw::NativeS
     }
     pc.depth_fade[2] = kFarFadeStart;
     pc.depth_fade[3] = kFarFadeEnd;
-    static const bool post_disabled = std::getenv("EOD_REMASTER_POST") && *std::getenv("EOD_REMASTER_POST") == '0';
-    const bool use_linear_hdr_mask = !post_disabled && !mask && maps.shadow_mask && maps.mask_fb && maps.mask_pipeline;
+    const bool use_linear_hdr_mask = false;
     pc.transition[0] = kNearBlendStart;
     pc.transition[1] = kNearBlendEnd;
     pc.transition[2] = camera.near_z;
@@ -3241,131 +3122,6 @@ void flush() {
         uint32_t samp = it.tex ? it.sampler : 0;
         bool vfx_billboard = false;
         if (modern) {
-            // Never re-arm remaster_view once it has already been applied in this vblank (prevents
-            // post-HUD 3D draws from triggering a second post-process pass over the 2D HUD!).
-            if (depth && !g_r.remaster_view.applied && (it.p.kind == KIND_WORLD || it.p.kind == KIND_QUEUE) &&
-                (!g_r.remaster_view.active ||
-                 (it.p.kind == KIND_WORLD && g_r.remaster_view.camera.kind != KIND_WORLD))) {
-                g_r.remaster_view.camera = it.p;
-                g_r.remaster_view.target = tg;
-                g_r.remaster_view.color_image = s.color;
-                g_r.remaster_view.depth_image = s.depth;
-                g_r.remaster_view.color_ownership = s.color_ownership;
-                g_r.remaster_view.depth_ownership = s.depth_ownership;
-                g_r.remaster_view.ox = it.ox;
-                g_r.remaster_view.oy = it.oy;
-                for (int k = 0; k < 4; ++k) g_r.remaster_view.sc[k] = it.sc[k];
-                g_r.remaster_view.active = true;
-                g_r.remaster_view.applied = false;
-            }
-            // Collect real vehicle chassis occluders (for grounded contact AO) and real event-driven
-            // dynamic point lights (collision sparks, exhaust backfires, engine/barrel fires — ZERO fake headlights!).
-            if (g_r.remaster_view.active && !g_r.remaster_view.applied) {
-                auto near_existing_light = [&](float x, float y, float z, float min_d2) {
-                    for (const auto &l : g_r.remaster_view.lights) {
-                        const float dx = l.pos[0] - x, dy = l.pos[1] - y, dz = l.pos[2] - z;
-                        if (dx * dx + dy * dy + dz * dz < min_d2) return true;
-                    }
-                    return false;
-                };
-                auto near_existing_car = [&](float x, float y, float z, float min_d2) {
-                    for (const auto &c : g_r.remaster_view.cars) {
-                        const float dx = c.center[0] - x, dy = c.center[1] - y, dz = c.center[2] - z;
-                        if (dx * dx + dy * dy + dz * dz < min_d2) return true;
-                    }
-                    return false;
-                };
-                if (it.p.kind == KIND_QUEUE && it.mesh && it.mesh->has_bounds && g_r.remaster_view.cars.size() < 32) {
-                    const float lx = it.mesh->bmax[0] - it.mesh->bmin[0];
-                    const float ly = it.mesh->bmax[1] - it.mesh->bmin[1];
-                    const float lz = it.mesh->bmax[2] - it.mesh->bmin[2];
-                    const bool is_paint = it.tex && it.tex->mat >= 0 &&
-                        (g_mats[(size_t)it.tex->mat].cls == C_PAINT || g_mats[(size_t)it.tex->mat].stock == STOCK_PAINT);
-                    const bool car_sized = (lz > 2.2f && lz < 12.5f && lx > 1.1f && lx < 4.5f && ly > 0.45f && ly < 4.5f);
-                    const bool has_lit_n = it.mesh->cpu && !it.mesh->cpu->vertices.empty() && it.mesh->cpu->vertices[0].n[3] != 0;
-                    if (car_sized && (is_paint || (has_lit_n && ly < 3.8f))) {
-                        const float *M = it.p.model;
-                        const float cx = 0.5f * (it.mesh->bmin[0] + it.mesh->bmax[0]);
-                        const float cz = 0.5f * (it.mesh->bmin[2] + it.mesh->bmax[2]);
-                        // Determine which local Y extreme is lower in world space (+Y is down in EOD world)
-                        const float wy_min = M[4] * cx + M[5] * it.mesh->bmin[1] + M[6] * cz + M[7];
-                        const float wy_max = M[4] * cx + M[5] * it.mesh->bmax[1] + M[6] * cz + M[7];
-                        const float bot_ly = (wy_max >= wy_min) ? it.mesh->bmax[1] : it.mesh->bmin[1];
-                        const float wx = M[0] * cx + M[1] * bot_ly + M[2] * cz + M[3];
-                        const float wy = M[4] * cx + M[5] * bot_ly + M[6] * cz + M[7];
-                        const float wz = M[8] * cx + M[9] * bot_ly + M[10] * cz + M[11];
-                        if (!near_existing_car(wx, wy, wz, 5.2f)) {
-                            float rx = M[0], ry = M[4], rz = M[8];
-                            float dx = M[1], dy = M[5], dz = M[9];
-                            float fx = M[2], fy = M[6], fz = M[10];
-                            const float rlen = std::sqrt(rx * rx + ry * ry + rz * rz);
-                            const float dlen = std::sqrt(dx * dx + dy * dy + dz * dz);
-                            const float flen = std::sqrt(fx * fx + fy * fy + fz * fz);
-                            if (rlen > 1e-4f && dlen > 1e-4f && flen > 1e-4f) {
-                                rx /= rlen; ry /= rlen; rz /= rlen;
-                                dx /= dlen; dy /= dlen; dz /= dlen;
-                                fx /= flen; fy /= flen; fz /= flen;
-                                // Ensure down axis points downward (+Y in world space)
-                                if (dy < 0.0f) { dx = -dx; dy = -dy; dz = -dz; }
-                                const float hx = 0.5f * lx * rlen;
-                                const float hz = 0.5f * lz * flen;
-                                const float ch = ly * dlen;
-                                const float rad = std::sqrt(hx * hx + hz * hz) + 0.5f;
-                                g_r.remaster_view.cars.push_back({{wx, wy, wz}, rad, {rx, ry, rz}, hx, {fx, fy, fz}, hz, {dx, dy, dz}, ch});
-                            }
-                        }
-                    }
-                } else if (it.tex && it.tex->mat >= 0 && it.mesh && !it.mesh->cpu->vertices.empty() &&
-                           (it.p.kind == KIND_PARTICLE || it.p.kind == KIND_SPRITE || it.p.kind == KIND_IMMEDIATE)) {
-                    const Material &mat = g_mats[(size_t)it.tex->mat];
-                    if (mat.cls == C_VFX_SPARK || mat.cls == C_VFX_FIRE) {
-                        // Compute world-space center of emitter vertices (up to 4 sample verts)
-                        const auto &verts = it.mesh->cpu->vertices;
-                        const size_t n = std::min<size_t>(verts.size(), 4);
-                        float lx = 0.0f, ly = 0.0f, lz = 0.0f;
-                        for (size_t vi = 0; vi < n; ++vi) {
-                            lx += verts[vi].p[0]; ly += verts[vi].p[1]; lz += verts[vi].p[2];
-                        }
-                        const float inv_n = 1.0f / (float)n;
-                        lx *= inv_n; ly *= inv_n; lz *= inv_n;
-                        const float *M = it.p.model;
-                        const float wx = M[0] * lx + M[1] * ly + M[2] * lz + M[3];
-                        const float wy = M[4] * lx + M[5] * ly + M[6] * lz + M[7];
-                        const float wz = M[8] * lx + M[9] * ly + M[10] * lz + M[11];
-
-                        if (mat.cls == C_VFX_SPARK) {
-                            // Transient metal-on-metal collision spark flash (decays smoothly over ~115ms)
-                            bool merged = false;
-                            for (auto &sl : g_r.remaster_post.spark_lights) {
-                                const float sdx = sl.pos[0] - wx, sdy = sl.pos[1] - wy, sdz = sl.pos[2] - wz;
-                                if (sdx * sdx + sdy * sdy + sdz * sdz < 4.0f) {
-                                    sl.pos[0] = wx; sl.pos[1] = wy; sl.pos[2] = wz;
-                                    sl.birth_frame = it.p.frame;
-                                    sl.intensity = std::min(1.5f, sl.intensity + 0.35f);
-                                    merged = true;
-                                    break;
-                                }
-                            }
-                            if (!merged && g_r.remaster_post.spark_lights.size() < 24) {
-                                g_r.remaster_post.spark_lights.push_back({{wx, wy, wz}, 1.0f, it.p.frame});
-                            }
-                        } else if (mat.cls == C_VFX_FIRE && g_r.remaster_view.lights.size() < 96) {
-                            const bool is_exhaust = (mat.id == "T2004" || mat.id == "T2005" || mat.id == "T2006");
-                            if (is_exhaust) {
-                                if (!near_existing_light(wx, wy, wz, 2.25f)) {
-                                    g_r.remaster_view.lights.push_back({{wx, wy, wz}, 4.5f, {3.4f, 1.45f, 0.32f}, 0.0f, {0, 0, 0}, 0.0f, 0.70f});
-                                }
-                            } else {
-                                if (!near_existing_light(wx, wy, wz, 4.0f)) {
-                                    const float flk = 0.88f + 0.12f * std::sin((float)(it.p.frame % 600) * 0.45f + wx * 1.7f);
-                                    // Crisp warm firelight on nearby fenders, hay bales & dirt (vol = 0 -> zero orange fog smear!)
-                                    g_r.remaster_view.lights.push_back({{wx, wy, wz}, 7.0f, {2.8f * flk, 1.05f * flk, 0.22f * flk}, 0.0f, {0, 0, 0}, 0.0f, 0.85f});
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             const uint32_t mx = pc.mode[0];
             samp = 8 | (((mx >> M_WMS_SHIFT) & 3) ? 2u : 0u) | (((mx >> M_WMT_SHIFT) & 3) ? 4u : 0u);
             modern_patch(it, pc, mpc);
@@ -3645,666 +3401,6 @@ void finish_sun_cascades(uint64_t frame, uint32_t boundary) {
     }
     gs::hw::native_end();
     input.reset();
-}
-
-// ---------------------------------------------------------------------------
-// 2026 Remaster Multi-Pass HDR Post-Process & Screen-Space Lighting Stack
-// ---------------------------------------------------------------------------
-plume::RenderDescriptorSetDesc remaster_post_desc() {
-    static const plume::RenderDescriptorRange ranges[] = {
-        {plume::RenderDescriptorRangeType::TEXTURE, 0, 1},
-        {plume::RenderDescriptorRangeType::TEXTURE, 1, 1},
-        {plume::RenderDescriptorRangeType::TEXTURE, 2, 1},
-        {plume::RenderDescriptorRangeType::SAMPLER, 3, 1},
-        {plume::RenderDescriptorRangeType::CONSTANT_BUFFER, 4, 1},
-        {plume::RenderDescriptorRangeType::TEXTURE, 5, 1}};
-    return plume::RenderDescriptorSetDesc(ranges, 6);
-}
-
-bool ensure_remaster_post() {
-    RemasterPost &rp = g_r.remaster_post;
-    if (rp.attempted) return rp.ready;
-    rp.attempted = true;
-    using namespace plume;
-    const RenderPushConstantRange pc(0, 0, 0, sizeof(PostConstants), RenderShaderStageFlag::PIXEL);
-    const RenderDescriptorSetDesc desc = remaster_post_desc();
-    rp.layout = g_r.dev->createPipelineLayout(RenderPipelineLayoutDesc(&pc, 1, &desc, 1));
-    auto vs = g_r.dev->createShader(k_native_vs_post_quad, sizeof k_native_vs_post_quad, "vs_post_quad", RenderShaderFormat::SPIRV);
-    auto ps_gtao = g_r.dev->createShader(k_native_ps_gtao_contact, sizeof k_native_ps_gtao_contact, "ps_gtao_contact", RenderShaderFormat::SPIRV);
-    auto ps_blur = g_r.dev->createShader(k_native_ps_ao_blur, sizeof k_native_ps_ao_blur, "ps_ao_blur", RenderShaderFormat::SPIRV);
-    auto ps_hdr  = g_r.dev->createShader(k_native_ps_hdr_atmo, sizeof k_native_ps_hdr_atmo, "ps_hdr_atmo", RenderShaderFormat::SPIRV);
-    auto ps_taa  = g_r.dev->createShader(k_native_ps_taa_resolve, sizeof k_native_ps_taa_resolve, "ps_taa_resolve", RenderShaderFormat::SPIRV);
-    auto ps_pre  = g_r.dev->createShader(k_native_ps_bloom_prefilter, sizeof k_native_ps_bloom_prefilter, "ps_bloom_prefilter", RenderShaderFormat::SPIRV);
-    auto ps_dn   = g_r.dev->createShader(k_native_ps_bloom_down, sizeof k_native_ps_bloom_down, "ps_bloom_down", RenderShaderFormat::SPIRV);
-    auto ps_up   = g_r.dev->createShader(k_native_ps_bloom_up, sizeof k_native_ps_bloom_up, "ps_bloom_up", RenderShaderFormat::SPIRV);
-    auto ps_exp  = g_r.dev->createShader(k_native_ps_auto_exposure, sizeof k_native_ps_auto_exposure, "ps_auto_exposure", RenderShaderFormat::SPIRV);
-    auto ps_comp = g_r.dev->createShader(k_native_ps_remaster_composite, sizeof k_native_ps_remaster_composite, "ps_remaster_composite", RenderShaderFormat::SPIRV);
-    if (!rp.layout || !vs || !ps_gtao || !ps_blur || !ps_hdr || !ps_taa || !ps_pre || !ps_dn || !ps_up || !ps_exp || !ps_comp) return false;
-
-    RenderSamplerDesc sd;
-    sd.minFilter = sd.magFilter = RenderFilter::LINEAR;
-    sd.mipmapMode = RenderMipmapMode::LINEAR;
-    sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::CLAMP;
-    rp.linear_clamp = g_r.dev->createSampler(sd);
-    rp.dyn_lights_buf = g_r.dev->createBuffer(RenderBufferDesc::UploadBuffer(sizeof(DynamicLightsUBO), RenderBufferFlag::CONSTANT));
-    if (!rp.linear_clamp || !rp.dyn_lights_buf) return false;
-    for (int k = 0; k < 2; ++k) {
-        rp.exp_tex[k] = g_r.dev->createTexture(RenderTextureDesc::ColorTarget(1, 1, RenderFormat::R16G16B16A16_FLOAT));
-        if (!rp.exp_tex[k]) return false;
-        const RenderTexture *ce[] = {rp.exp_tex[k].get()};
-        rp.fb_exp[k] = g_r.dev->createFramebuffer(RenderFramebufferDesc(ce, 1));
-        if (!rp.fb_exp[k]) return false;
-    }
-
-    auto make_pipe = [&](RenderShader *ps, RenderFormat fmt, bool additive, uint8_t mask) {
-        RenderGraphicsPipelineDesc d{};
-        d.pipelineLayout = rp.layout.get();
-        d.vertexShader = vs.get();
-        d.pixelShader = ps;
-        d.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
-        d.cullMode = RenderCullMode::NONE;
-        d.renderTargetCount = 1;
-        d.renderTargetFormat[0] = fmt;
-        if (additive) {
-            d.renderTargetBlend[0].blendEnabled = true;
-            d.renderTargetBlend[0].srcBlend = RenderBlend::ONE;
-            d.renderTargetBlend[0].dstBlend = RenderBlend::ONE;
-            d.renderTargetBlend[0].blendOp = RenderBlendOperation::ADD;
-            d.renderTargetBlend[0].srcBlendAlpha = RenderBlend::ONE;
-            d.renderTargetBlend[0].dstBlendAlpha = RenderBlend::ZERO;
-            d.renderTargetBlend[0].blendOpAlpha = RenderBlendOperation::ADD;
-        }
-        d.renderTargetBlend[0].renderTargetWriteMask = mask;
-        auto pipe = g_r.dev->createGraphicsPipeline(d);
-        if (pipe && !static_cast<VulkanGraphicsPipeline *>(pipe.get())->vk) pipe.reset();
-        return pipe;
-    };
-
-    rp.p_gtao       = make_pipe(ps_gtao.get(), RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_ao_blur    = make_pipe(ps_blur.get(), RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_hdr_atmo   = make_pipe(ps_hdr.get(),  RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_taa        = make_pipe(ps_taa.get(),  RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_bloom_pre  = make_pipe(ps_pre.get(),  RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_bloom_down = make_pipe(ps_dn.get(),   RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_bloom_up   = make_pipe(ps_up.get(),   RenderFormat::R16G16B16A16_FLOAT, true,  7);
-    rp.p_auto_exp   = make_pipe(ps_exp.get(),  RenderFormat::R16G16B16A16_FLOAT, false, 15);
-    rp.p_composite  = make_pipe(ps_comp.get(), RenderFormat::R8G8B8A8_UNORM,     false, 7);
-    rp.ready = rp.p_gtao && rp.p_ao_blur && rp.p_hdr_atmo && rp.p_taa && rp.p_bloom_pre &&
-               rp.p_bloom_down && rp.p_bloom_up && rp.p_auto_exp && rp.p_composite;
-    if (rp.ready) std::fprintf(stderr, "[remaster] 2026 HDR post-process pipeline initialized\n");
-    return rp.ready;
-}
-
-bool bind_remaster_post(const gs::hw::NativeSurfaces &surface) {
-    RemasterPost &rp = g_r.remaster_post;
-    const uint32_t w = surface.width, h = surface.height;
-    if (w < 8 || h < 8) return false;
-    if (rp.w == w && rp.h == h && rp.bound_color == surface.color && rp.bound_depth == surface.depth && rp.fb_out)
-        return true;
-
-    auto retire_tex = [](std::unique_ptr<plume::RenderTexture> &t) {
-        if (!t) return;
-        Trash tr{g_r.vb}; tr.tex = std::move(t); g_r.trash.push_back(std::move(tr));
-    };
-    auto retire_fb = [](std::unique_ptr<plume::RenderFramebuffer> &f) {
-        if (!f) return;
-        Trash tr{g_r.vb}; tr.fb = std::move(f); g_r.trash.push_back(std::move(tr));
-    };
-    auto retire_ds = [](std::unique_ptr<plume::RenderDescriptorSet> &s) {
-        if (!s) return;
-        Trash tr{g_r.vb}; tr.sets[0] = std::move(s); g_r.trash.push_back(std::move(tr));
-    };
-
-    retire_fb(rp.fb_out);
-    retire_tex(rp.ext_color);
-    retire_tex(rp.ext_depth);
-    retire_ds(rp.ds_gtao);
-    retire_ds(rp.ds_ao_blur);
-    retire_ds(rp.ds_hdr_atmo);
-    for (int k = 0; k < 2; ++k) {
-        retire_ds(rp.ds_taa[k]);
-        retire_ds(rp.ds_auto_exp[k]);
-        retire_ds(rp.ds_composite[k]);
-    }
-
-    if (rp.w != w || rp.h != h) {
-        retire_fb(rp.fb_hdr); retire_fb(rp.fb_ao_raw); retire_fb(rp.fb_ao_blur);
-        retire_tex(rp.scene_copy); retire_tex(rp.hdr_scene); retire_tex(rp.ao_raw); retire_tex(rp.ao_blur);
-        for (int k = 0; k < 2; ++k) {
-            retire_fb(rp.fb_taa[k]);
-            retire_tex(rp.taa_hist[k]);
-            retire_ds(rp.ds_bloom_pre[k]);
-        }
-        rp.has_prev_clip = false;
-        for (size_t i = 0; i < RemasterPost::kBloomMips; ++i) {
-            retire_fb(rp.fb_bloom[i]);
-            retire_tex(rp.bloom[i]);
-        }
-        for (size_t i = 0; i + 1 < RemasterPost::kBloomMips; ++i) {
-            retire_ds(rp.ds_bloom_down[i]);
-            retire_ds(rp.ds_bloom_up[i]);
-        }
-
-        using namespace plume;
-        // Cap low-frequency GTAO/SSGI & Bloom Mip0 at 960x540 so RenderScale 6x/8x stays locked 60 FPS!
-        const uint32_t hw = std::min(std::max(1u, w / 2), 960u);
-        const uint32_t hh = std::min(std::max(1u, h / 2), 540u);
-        rp.ao_w = hw;
-        rp.ao_h = hh;
-        rp.scene_copy = g_r.dev->createTexture(RenderTextureDesc::Texture2D(w, h, 1, RenderFormat::R8G8B8A8_UNORM));
-        rp.hdr_scene  = g_r.dev->createTexture(RenderTextureDesc::ColorTarget(w, h, RenderFormat::R16G16B16A16_FLOAT));
-        rp.ao_raw     = g_r.dev->createTexture(RenderTextureDesc::ColorTarget(hw, hh, RenderFormat::R16G16B16A16_FLOAT));
-        rp.ao_blur    = g_r.dev->createTexture(RenderTextureDesc::ColorTarget(hw, hh, RenderFormat::R16G16B16A16_FLOAT));
-        const bool use_taa = (w <= 2560u);
-        for (int k = 0; k < 2; ++k) {
-            if (use_taa) {
-                rp.taa_hist[k] = g_r.dev->createTexture(RenderTextureDesc::ColorTarget(w, h, RenderFormat::R16G16B16A16_FLOAT));
-                if (!rp.taa_hist[k]) return false;
-                const RenderTexture *ct[] = {rp.taa_hist[k].get()};
-                rp.fb_taa[k] = g_r.dev->createFramebuffer(RenderFramebufferDesc(ct, 1));
-                if (!rp.fb_taa[k]) return false;
-            }
-        }
-        if (!rp.scene_copy || !rp.hdr_scene || !rp.ao_raw || !rp.ao_blur) return false;
-
-        const RenderTexture *c_hdr[] = {rp.hdr_scene.get()};
-        const RenderTexture *c_ao0[] = {rp.ao_raw.get()};
-        const RenderTexture *c_ao1[] = {rp.ao_blur.get()};
-        rp.fb_hdr     = g_r.dev->createFramebuffer(RenderFramebufferDesc(c_hdr, 1));
-        rp.fb_ao_raw  = g_r.dev->createFramebuffer(RenderFramebufferDesc(c_ao0, 1));
-        rp.fb_ao_blur = g_r.dev->createFramebuffer(RenderFramebufferDesc(c_ao1, 1));
-        if (!rp.fb_hdr || !rp.fb_ao_raw || !rp.fb_ao_blur) return false;
-
-        uint32_t bw = hw, bh = hh;
-        for (size_t i = 0; i < RemasterPost::kBloomMips; ++i) {
-            rp.bloom_w[i] = bw;
-            rp.bloom_h[i] = bh;
-            rp.bloom[i] = g_r.dev->createTexture(RenderTextureDesc::ColorTarget(bw, bh, RenderFormat::R16G16B16A16_FLOAT));
-            if (!rp.bloom[i]) return false;
-            const RenderTexture *cb[] = {rp.bloom[i].get()};
-            rp.fb_bloom[i] = g_r.dev->createFramebuffer(RenderFramebufferDesc(cb, 1));
-            if (!rp.fb_bloom[i]) return false;
-            bw = std::max(1u, bw / 2);
-            bh = std::max(1u, bh / 2);
-        }
-
-        const auto make_ds = [&](RenderTexture *t0, RenderTexture *t1, RenderTexture *t2, RenderTexture *t5 = nullptr) {
-            auto ds = g_r.dev->createDescriptorSet(remaster_post_desc());
-            if (!ds || !static_cast<VulkanDescriptorSet *>(ds.get())->vk) return std::unique_ptr<RenderDescriptorSet>{};
-            const auto sr = RenderTextureLayout::SHADER_READ;
-            ds->setTexture(0, t0 ? t0 : g_r.white.tex.get(), sr);
-            ds->setTexture(1, t1 ? t1 : g_r.white.tex.get(), sr);
-            ds->setTexture(2, t2 ? t2 : g_r.white.tex.get(), sr);
-            ds->setSampler(3, rp.linear_clamp.get());
-            ds->setBuffer(4, rp.dyn_lights_buf.get(), sizeof(DynamicLightsUBO));
-            ds->setTexture(5, t5 ? t5 : g_r.white.tex.get(), sr);
-            return ds;
-        };
-
-        for (int k = 0; k < 2; ++k) {
-            RenderTexture *src_hdr = rp.taa_hist[k] ? rp.taa_hist[k].get() : rp.hdr_scene.get();
-            rp.ds_bloom_pre[k] = make_ds(src_hdr, nullptr, nullptr);
-            if (!rp.ds_bloom_pre[k]) return false;
-        }
-        for (size_t i = 0; i + 1 < RemasterPost::kBloomMips; ++i) {
-            rp.ds_bloom_down[i] = make_ds(rp.bloom[i].get(), nullptr, nullptr);
-            rp.ds_bloom_up[i]   = make_ds(rp.bloom[i + 1].get(), nullptr, nullptr);
-            if (!rp.ds_bloom_down[i] || !rp.ds_bloom_up[i]) return false;
-        }
-        rp.w = w;
-        rp.h = h;
-    }
-
-    using namespace plume;
-    rp.ext_color = make_wrapper(surface.color, w, h, false);
-    rp.ext_depth = make_wrapper(surface.depth, w, h, true);
-    const RenderTexture *cout[] = {rp.ext_color.get()};
-    rp.fb_out = g_r.dev->createFramebuffer(RenderFramebufferDesc(cout, 1));
-    auto make_ext_ds = [&](RenderTexture *t0, RenderTexture *t1, RenderTexture *t2, RenderTexture *t5 = nullptr) {
-        auto ds = g_r.dev->createDescriptorSet(remaster_post_desc());
-        if (!ds || !static_cast<VulkanDescriptorSet *>(ds.get())->vk) return std::unique_ptr<RenderDescriptorSet>{};
-        const auto sr = RenderTextureLayout::SHADER_READ;
-        ds->setTexture(0, t0, sr);
-        ds->setTexture(1, t1, sr);
-        ds->setTexture(2, t2, sr);
-        ds->setSampler(3, rp.linear_clamp.get());
-        ds->setBuffer(4, rp.dyn_lights_buf.get(), sizeof(DynamicLightsUBO));
-        ds->setTexture(5, t5 ? t5 : g_r.white.tex.get(), sr);
-        return ds;
-    };
-    RenderTexture *csm_tex = g_r.sun_maps.shadow_mask ? g_r.sun_maps.shadow_mask.get() : g_r.white.tex.get();
-    rp.ds_gtao     = make_ext_ds(rp.scene_copy.get(), rp.ext_depth.get(), g_r.white.tex.get());
-    rp.ds_ao_blur  = make_ext_ds(rp.ao_raw.get(),     rp.ext_depth.get(), g_r.white.tex.get());
-    rp.ds_hdr_atmo = make_ext_ds(rp.scene_copy.get(), rp.ext_depth.get(), rp.ao_blur.get(), csm_tex);
-    for (int k = 0; k < 2; ++k) {
-        rp.ds_auto_exp[k] = make_ext_ds(rp.hdr_scene.get(), rp.ext_depth.get(), g_r.white.tex.get(), rp.exp_tex[1 - k].get());
-        if (!rp.ds_auto_exp[k]) return false;
-        if (rp.taa_hist[k]) {
-            rp.ds_taa[k]       = make_ext_ds(rp.hdr_scene.get(),   rp.ext_depth.get(), rp.taa_hist[1 - k].get());
-            rp.ds_composite[k] = make_ext_ds(rp.taa_hist[k].get(), rp.ext_depth.get(), rp.bloom[0].get(), rp.exp_tex[k].get());
-            if (!rp.ds_taa[k] || !rp.ds_composite[k]) return false;
-        } else {
-            rp.ds_composite[k] = make_ext_ds(rp.hdr_scene.get(), rp.ext_depth.get(), rp.bloom[0].get(), rp.exp_tex[k].get());
-            if (!rp.ds_composite[k]) return false;
-        }
-    }
-    if (!rp.fb_out || !rp.ds_gtao || !rp.ds_ao_blur || !rp.ds_hdr_atmo) return false;
-
-    rp.bound_color = surface.color;
-    rp.bound_depth = surface.depth;
-    return true;
-}
-
-void draw_remaster_post(plume::RenderCommandList &list, const gs::hw::NativeSurfaces &surface,
-                        const RemasterView &view, plume::RenderTexture *color, plume::RenderTexture *depth) {
-    if (!ensure_remaster_post() || !bind_remaster_post(surface)) return;
-    RemasterPost &rp = g_r.remaster_post;
-    using namespace plume;
-
-    const uint32_t w = surface.width, h = surface.height;
-    const uint32_t hw = rp.ao_w, hh = rp.ao_h;
-
-    // Derive exact camera projection, depth mapping & sun screen projection from EE camera packet
-    Packet world = view.camera;
-    std::fill_n(world.model, 12, 0.0f);
-    world.model[0] = world.model[5] = world.model[10] = 1.0f;
-    double screen[4][4];
-    screen_matrix(world, screen);
-    const double gw = surface.gs_width, gh = surface.gs_height;
-    const double dz = depth_range(view.target.zpsm);
-    double clip[4][4];
-    for (int c = 0; c < 4; ++c) {
-        clip[0][c] = (2.0 / gw) * screen[0][c] + ((0.5 - view.ox) * 2.0 / gw - 1.0) * screen[3][c];
-        clip[1][c] = (2.0 / gh) * screen[1][c] + ((0.5 - view.oy) * 2.0 / gh - 1.0) * screen[3][c];
-        clip[2][c] = screen[2][c] / dz;
-        clip[3][c] = screen[3][c];
-    }
-    const double nw2 = clip[3][0] * clip[3][0] + clip[3][1] * clip[3][1] + clip[3][2] * clip[3][2];
-    const double nw = std::sqrt(std::max(nw2, 1e-12));
-    const double depth_b = (clip[2][0] * clip[3][0] + clip[2][1] * clip[3][1] + clip[2][2] * clip[3][2]) / std::max(nw2, 1e-12);
-    const double depth_k = (clip[2][3] - depth_b * clip[3][3]) / nw;
-    const double nx = std::sqrt(std::max(clip[0][0] * clip[0][0] + clip[0][1] * clip[0][1] + clip[0][2] * clip[0][2], 1e-12));
-    const double ny = std::sqrt(std::max(clip[1][0] * clip[1][0] + clip[1][1] * clip[1][1] + clip[1][2] * clip[1][2], 1e-12));
-    const float tan_x = (float)(nw / nx);
-    const float tan_y = (float)(nw / ny);
-
-    // Sun direction in world & camera view space
-    double slen = std::sqrt(g_sun_world[0] * g_sun_world[0] + g_sun_world[1] * g_sun_world[1] + g_sun_world[2] * g_sun_world[2]);
-    double sx = slen > 1e-6 ? g_sun_world[0] / slen : 0.3;
-    double sy = slen > 1e-6 ? g_sun_world[1] / slen : -0.7;
-    double sz = slen > 1e-6 ? g_sun_world[2] / slen : 0.6;
-    const float *rot = view.camera.rotation;
-    const float svx = (float)(rot[0] * sx + rot[1] * sy + rot[2] * sz);
-    const float svy = (float)(rot[3] * sx + rot[4] * sy + rot[5] * sz);
-    const float svz = (float)(rot[6] * sx + rot[7] * sy + rot[8] * sz);
-
-    // Project distant sun point to screen UV for volumetric sun shafts
-    const double sun_wx = view.camera.position[0] + sx * 1000.0;
-    const double sun_wy = view.camera.position[1] + sy * 1000.0;
-    const double sun_wz = view.camera.position[2] + sz * 1000.0;
-    const double sun_cw = clip[3][0] * sun_wx + clip[3][1] * sun_wy + clip[3][2] * sun_wz + clip[3][3];
-    float sun_u = 0.5f, sun_v = 0.25f, sun_front = 0.0f;
-    if (sun_cw > 1e-4) {
-        const double sun_cx = clip[0][0] * sun_wx + clip[0][1] * sun_wy + clip[0][2] * sun_wz + clip[0][3];
-        const double sun_cy = clip[1][0] * sun_wx + clip[1][1] * sun_wy + clip[1][2] * sun_wz + clip[1][3];
-        sun_u = (float)((sun_cx / sun_cw) * 0.5 + 0.5);
-        sun_v = (float)((sun_cy / sun_cw) * 0.5 + 0.5);
-        sun_front = std::clamp((float)((svz - 0.05f) / 0.35f), 0.0f, 1.0f);
-    }
-
-    // Sky horizon & zenith colors + daylight factor from EE FOGCOL & sky texture
-    const uint32_t fog = view.camera.fogcol & 0xFFFFFFu;
-    auto lum8 = [](uint32_t c) { return (0.2126f * (c & 0xFF) + 0.7152f * ((c >> 8) & 0xFF) + 0.0722f * ((c >> 16) & 0xFF)) / 255.0f; };
-    const float hor_lum = g_sky_seen ? std::min(lum8(fog), lum8(g_sky_hor)) : lum8(fog);
-    const float daylight = std::clamp((hor_lum - 0.06f) / 0.28f, 0.0f, 1.0f);
-    auto to_lin = [](uint32_t c, int shift) {
-        const float s = (float)((c >> shift) & 0xFF) / 255.0f;
-        return std::pow(s, 2.2f);
-    };
-    const uint32_t hor_c = g_sky_seen ? g_sky_hor : fog;
-    const uint32_t zen_c = g_sky_seen ? g_sky_top : fog;
-    const float day_scale = g_sky_seen ? std::min(1.0f, lum8(fog) / std::max(0.01f, lum8(g_sky_hor))) : 1.0f;
-
-    // Viewport scissor in UV space (handles split-screen viewports cleanly!)
-    const int sc_scale = std::max(1, surface.scale);
-    const float vx0 = std::clamp((float)(view.sc[0] * sc_scale) / (float)w, 0.0f, 1.0f);
-    const float vy0 = std::clamp((float)(view.sc[1] * sc_scale) / (float)h, 0.0f, 1.0f);
-    const float vx1 = std::clamp((float)((view.sc[2] + 1) * sc_scale) / (float)w, vx0 + 0.01f, 1.0f);
-    const float vy1 = std::clamp((float)((view.sc[3] + 1) * sc_scale) / (float)h, vy0 + 0.01f, 1.0f);
-
-    PostConstants pc{};
-    pc.view_rect[0] = vx0; pc.view_rect[1] = vy0;
-    pc.view_rect[2] = vx1 - vx0; pc.view_rect[3] = vy1 - vy0;
-    pc.proj_params[0] = (float)depth_b;
-    pc.proj_params[1] = (float)depth_k;
-    pc.proj_params[2] = tan_x;
-    pc.proj_params[3] = tan_y;
-    pc.sun_screen[0] = sun_u; pc.sun_screen[1] = sun_v;
-    pc.sun_screen[2] = sun_front; pc.sun_screen[3] = daylight;
-    pc.sun_view_dir[0] = svx; pc.sun_view_dir[1] = svy; pc.sun_view_dir[2] = svz;
-    pc.sun_view_dir[3] = (float)(g_r.vb % 60000ull) / 60.0f;
-    pc.sky_horizon[0] = to_lin(hor_c, 0) * day_scale;
-    pc.sky_horizon[1] = to_lin(hor_c, 8) * day_scale;
-    pc.sky_horizon[2] = to_lin(hor_c, 16) * day_scale;
-    pc.sky_horizon[3] = (float)g_config.modern_bloom / 100.0f;
-    pc.sky_zenith[0]  = to_lin(zen_c, 0) * day_scale;
-    pc.sky_zenith[1]  = to_lin(zen_c, 8) * day_scale;
-    pc.sky_zenith[2]  = to_lin(zen_c, 16) * day_scale;
-    pc.sky_zenith[3]  = (float)g_config.modern_ao / 100.0f;
-    pc.grade_params[0] = (float)g_config.modern_exposure / 100.0f;
-    pc.grade_params[1] = (float)g_config.modern_haze / 100.0f;
-    pc.grade_params[2] = (float)g_config.modern_grade / 100.0f;
-    pc.grade_params[3] = (float)g_config.modern_vignette / 100.0f;
-
-    // Upload Dynamic Local Lights (view-space) + Previous-Frame Velocity Reprojection Matrix
-    {
-        DynamicLightsUBO ubo{};
-        ubo.cam_right[0] = rot[0]; ubo.cam_right[1] = rot[1]; ubo.cam_right[2] = rot[2];
-        ubo.cam_down[0]  = rot[3]; ubo.cam_down[1]  = rot[4]; ubo.cam_down[2]  = rot[5];
-        ubo.cam_fwd[0]   = rot[6]; ubo.cam_fwd[1]   = rot[7]; ubo.cam_fwd[2]   = rot[8];
-        const float cx = view.camera.position[0], cy = view.camera.position[1], cz = view.camera.position[2];
-        const float cdx = cx - rp.prev_cam_pos[0], cdy = cy - rp.prev_cam_pos[1], cdz = cz - rp.prev_cam_pos[2];
-        const bool valid_prev = rp.has_prev_clip && (cdx * cdx + cdy * cdy + cdz * cdz < 144.0f);
-        const bool valid_csm  = (g_r.sun_maps.mask_valid_vb == g_r.vb) && (g_r.sun_maps.shadow_mask != nullptr);
-        ubo.light_meta[1] = (valid_prev ? 1u : 0u) | (valid_csm ? 2u : 0u) | (rp.has_prev_exp ? 4u : 0u);
-        if (valid_prev) {
-            // inv_view maps view-space (px, py, pz, 1) -> world-space W = cam_pos + R^T * P
-            const double iv[4][4] = {
-                {rot[0], rot[3], rot[6], cx},
-                {rot[1], rot[4], rot[7], cy},
-                {rot[2], rot[5], rot[8], cz},
-                {0.0,    0.0,    0.0,    1.0}};
-            for (int r = 0; r < 4; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    double s = 0.0;
-                    for (int k = 0; k < 4; ++k) s += rp.prev_clip[r][k] * iv[k][c];
-                    ubo.prev_reproj[r][c] = (float)s;
-                }
-            }
-        }
-        // Combine real EE 3D stadium floodlights (from 0x3DBB48) + fires + exhaust + decaying collision sparks!
-        // Aim each stadium floodlight tower downward & inward toward the track center as a true directional spotlight!
-        std::vector<DynamicLightWorld> all_lights = view.lights;
-        {
-            const uint64_t cur_f = view.camera.frame;
-            auto &sparks = rp.spark_lights;
-            for (size_t si = 0; si < sparks.size(); ) {
-                const uint64_t age = (cur_f >= sparks[si].birth_frame) ? (cur_f - sparks[si].birth_frame) : 0;
-                if (age > 7) {
-                    sparks.erase(sparks.begin() + (ptrdiff_t)si);
-                    continue;
-                }
-                const float decay = (1.0f - (float)age / 8.0f);
-                const float str = decay * decay * sparks[si].intensity;
-                all_lights.push_back({
-                    {sparks[si].pos[0], sparks[si].pos[1], sparks[si].pos[2]},
-                    6.5f,
-                    {5.8f * str, 2.55f * str, 0.55f * str},
-                    0.0f, {0, 0, 0}, 0.0f, 0.65f});
-                ++si;
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lk(g_ee_floodlights_mtx);
-            if (!g_ee_floodlights.empty()) {
-                float ax = 0.0f, ay = 0.0f, az = 0.0f;
-                for (const auto &fl : g_ee_floodlights) { ax += fl[0]; ay += fl[1]; az += fl[2]; }
-                const float inv_n = 1.0f / (float)g_ee_floodlights.size();
-                ax *= inv_n; ay = (ay * inv_n) + 12.0f; az *= inv_n; // target track surface below tower ring
-                for (const auto &fl : g_ee_floodlights) {
-                    float dx = ax - fl[0], dy = ay - fl[1], dz = az - fl[2];
-                    const float dlen = std::sqrt(dx * dx + dy * dy + dz * dz);
-                    if (dlen > 1e-4f) { dx /= dlen; dy /= dlen; dz /= dlen; }
-                    else { dx = 0.0f; dy = 1.0f; dz = 0.0f; }
-                    all_lights.push_back({{fl[0], fl[1], fl[2]}, 60.0f, {5.6f, 4.95f, 4.15f}, 0.22f, {dx, dy, dz}, 0.36f, 0.0f});
-                }
-            }
-        }
-        // Sort dynamic lights: prioritize transient sparks/fires/exhaust ahead of distant stadium towers
-        std::vector<std::pair<float, size_t>> order;
-        order.reserve(all_lights.size());
-        for (size_t i = 0; i < all_lights.size(); ++i) {
-            const auto &l = all_lights[i];
-            const float dx = l.pos[0] - cx, dy = l.pos[1] - cy, dz = l.pos[2] - cz;
-            const float d2 = dx * dx + dy * dy + dz * dz;
-            const float prio = (l.day_gain > 0.01f) ? (d2 * 0.15f) : d2;
-            order.emplace_back(prio, i);
-        }
-        std::sort(order.begin(), order.end(), [](auto &a, auto &b) { return a.first < b.first; });
-        const float night_gain = std::pow(std::max(0.0f, 1.0f - daylight), 1.6f);
-        const uint32_t max_active_lights = (w > 2560u) ? 10u : 22u;
-        uint32_t out_n = 0;
-        for (const auto &entry : order) {
-            if (out_n >= max_active_lights) break;
-            const auto &l = all_lights[entry.second];
-            const float gain = std::max(night_gain, l.day_gain);
-            if (gain < 0.01f) continue;
-            const float dx = l.pos[0] - cx, dy = l.pos[1] - cy, dz = l.pos[2] - cz;
-            const float vx = rot[0] * dx + rot[1] * dy + rot[2] * dz;
-            const float vy = rot[3] * dx + rot[4] * dy + rot[5] * dz;
-            const float vz = rot[6] * dx + rot[7] * dy + rot[8] * dz;
-            if (vz < -l.radius || vz > 160.0f) continue;
-            const float vdx = rot[0] * l.dir[0] + rot[1] * l.dir[1] + rot[2] * l.dir[2];
-            const float vdy = rot[3] * l.dir[0] + rot[4] * l.dir[1] + rot[5] * l.dir[2];
-            const float vdz = rot[6] * l.dir[0] + rot[7] * l.dir[1] + rot[8] * l.dir[2];
-            ubo.light_pos_rad[out_n][0] = vx;
-            ubo.light_pos_rad[out_n][1] = vy;
-            ubo.light_pos_rad[out_n][2] = vz;
-            ubo.light_pos_rad[out_n][3] = l.radius;
-            ubo.light_col_cut[out_n][0] = l.col[0] * gain;
-            ubo.light_col_cut[out_n][1] = l.col[1] * gain;
-            ubo.light_col_cut[out_n][2] = l.col[2] * gain;
-            ubo.light_col_cut[out_n][3] = l.cut;
-            ubo.light_dir_vol[out_n][0] = vdx;
-            ubo.light_dir_vol[out_n][1] = vdy;
-            ubo.light_dir_vol[out_n][2] = vdz;
-            ubo.light_dir_vol[out_n][3] = l.vol * night_gain;
-            ++out_n;
-        }
-        ubo.light_meta[0] = out_n;
-
-        // Upload up to 16 nearest vehicle chassis occluders in view space for grounded contact AO
-        std::vector<std::pair<float, size_t>> car_order;
-        car_order.reserve(view.cars.size());
-        for (size_t i = 0; i < view.cars.size(); ++i) {
-            const auto &c = view.cars[i];
-            const float dx = c.center[0] - cx, dy = c.center[1] - cy, dz = c.center[2] - cz;
-            car_order.emplace_back(dx * dx + dy * dy + dz * dz, i);
-        }
-        std::sort(car_order.begin(), car_order.end(), [](auto &a, auto &b) { return a.first < b.first; });
-        uint32_t out_cars = 0;
-        for (const auto &entry : car_order) {
-            if (out_cars >= DynamicLightsUBO::kMaxCars) break;
-            const auto &c = view.cars[entry.second];
-            const float dx = c.center[0] - cx, dy = c.center[1] - cy, dz = c.center[2] - cz;
-            const float vx = rot[0] * dx + rot[1] * dy + rot[2] * dz;
-            const float vy = rot[3] * dx + rot[4] * dy + rot[5] * dz;
-            const float vz = rot[6] * dx + rot[7] * dy + rot[8] * dz;
-            if (vz < -c.radius - 2.0f || vz > 115.0f) continue;
-            ubo.car_center_rad[out_cars][0] = vx;
-            ubo.car_center_rad[out_cars][1] = vy;
-            ubo.car_center_rad[out_cars][2] = vz;
-            ubo.car_center_rad[out_cars][3] = c.radius;
-            ubo.car_right_hx[out_cars][0] = rot[0] * c.right[0] + rot[1] * c.right[1] + rot[2] * c.right[2];
-            ubo.car_right_hx[out_cars][1] = rot[3] * c.right[0] + rot[4] * c.right[1] + rot[5] * c.right[2];
-            ubo.car_right_hx[out_cars][2] = rot[6] * c.right[0] + rot[7] * c.right[1] + rot[8] * c.right[2];
-            ubo.car_right_hx[out_cars][3] = c.hx;
-            ubo.car_fwd_hz[out_cars][0] = rot[0] * c.fwd[0] + rot[1] * c.fwd[1] + rot[2] * c.fwd[2];
-            ubo.car_fwd_hz[out_cars][1] = rot[3] * c.fwd[0] + rot[4] * c.fwd[1] + rot[5] * c.fwd[2];
-            ubo.car_fwd_hz[out_cars][2] = rot[6] * c.fwd[0] + rot[7] * c.fwd[1] + rot[8] * c.fwd[2];
-            ubo.car_fwd_hz[out_cars][3] = c.hz;
-            ubo.car_down_pad[out_cars][0] = rot[0] * c.down[0] + rot[1] * c.down[1] + rot[2] * c.down[2];
-            ubo.car_down_pad[out_cars][1] = rot[3] * c.down[0] + rot[4] * c.down[1] + rot[5] * c.down[2];
-            ubo.car_down_pad[out_cars][2] = rot[6] * c.down[0] + rot[7] * c.down[1] + rot[8] * c.down[2];
-            ubo.car_down_pad[out_cars][3] = c.height;
-            ++out_cars;
-        }
-        ubo.light_meta[2] = out_cars;
-        ubo.light_meta[3] = (w > 2560u) ? 1u : 0u;
-        if (void *mapped = rp.dyn_lights_buf->map()) {
-            std::memcpy(mapped, &ubo, sizeof ubo);
-            rp.dyn_lights_buf->unmap();
-        }
-        std::memcpy(rp.prev_clip, clip, sizeof clip);
-        rp.prev_cam_pos[0] = cx; rp.prev_cam_pos[1] = cy; rp.prev_cam_pos[2] = cz;
-        rp.has_prev_clip = true;
-    }
-
-    // 1. Copy surface.color -> rp.scene_copy so we can sample it cleanly and write final back to surface.color
-    const RenderTextureBarrier pre_copy[] = {
-        {color, RenderTextureLayout::COPY_SOURCE},
-        {rp.scene_copy.get(), RenderTextureLayout::COPY_DEST},
-        {depth, RenderTextureLayout::SHADER_READ}};
-    list.barriers(RenderBarrierStage::ALL, pre_copy, 3);
-    list.copyTexture(rp.scene_copy.get(), color);
-
-    const RenderTextureBarrier post_copy[] = {
-        {rp.scene_copy.get(), RenderTextureLayout::SHADER_READ},
-        {rp.ao_raw.get(), RenderTextureLayout::COLOR_WRITE}};
-    list.barriers(RenderBarrierStage::ALL, post_copy, 2);
-
-    list.setGraphicsPipelineLayout(rp.layout.get());
-
-    auto run_pass = [&](RenderFramebuffer *fb, RenderPipeline *pipe, RenderDescriptorSet *ds,
-                        uint32_t dw, uint32_t dh, uint32_t sw, uint32_t sh) {
-        pc.inv_size[0] = 1.0f / (float)dw; pc.inv_size[1] = 1.0f / (float)dh;
-        pc.inv_size[2] = 1.0f / (float)sw; pc.inv_size[3] = 1.0f / (float)sh;
-        list.setFramebuffer(fb);
-        list.setViewports(RenderViewport(0.0f, 0.0f, (float)dw, (float)dh));
-        list.setScissors(RenderRect(0, 0, (int32_t)dw, (int32_t)dh));
-        list.setPipeline(pipe);
-        list.setGraphicsDescriptorSet(ds, 0);
-        list.setGraphicsPushConstants(0, &pc);
-        list.drawInstanced(3, 1, 0, 0);
-    };
-
-    // 2. Half-res Horizon GTAO + Screen-Space Sun Contact Shadows
-    run_pass(rp.fb_ao_raw.get(), rp.p_gtao.get(), rp.ds_gtao.get(), hw, hh, w, h);
-
-    // 3. Depth-aware Cross-Bilateral AO Blur
-    const RenderTextureBarrier b_ao[] = {
-        {rp.ao_raw.get(), RenderTextureLayout::SHADER_READ},
-        {rp.ao_blur.get(), RenderTextureLayout::COLOR_WRITE}};
-    list.barriers(RenderBarrierStage::GRAPHICS, b_ao, 2);
-    run_pass(rp.fb_ao_blur.get(), rp.p_ao_blur.get(), rp.ds_ao_blur.get(), hw, hh, hw, hh);
-
-    // 4. Full-res Linear HDR Decode + GTAO/Contact + Aerial Perspective + Volumetric Sun Shafts
-    const RenderTextureBarrier b_hdr[] = {
-        {rp.ao_blur.get(), RenderTextureLayout::SHADER_READ},
-        {rp.hdr_scene.get(), RenderTextureLayout::COLOR_WRITE}};
-    list.barriers(RenderBarrierStage::GRAPHICS, b_hdr, 2);
-    run_pass(rp.fb_hdr.get(), rp.p_hdr_atmo.get(), rp.ds_hdr_atmo.get(), w, h, w, h);
-
-    // 4b. Temporal Anti-Aliasing (TAA) at <= 1440p; at 6x/8x supersampling (>2560px) go straight from HDR -> Bloom/Composite!
-    const bool use_taa = (rp.taa_hist[0] != nullptr);
-    const uint32_t cur_taa = rp.taa_idx & 1u;
-    const uint32_t prev_taa = 1u - cur_taa;
-    if (use_taa) {
-        const RenderTextureBarrier b_taa[] = {
-            {rp.hdr_scene.get(), RenderTextureLayout::SHADER_READ},
-            {rp.taa_hist[prev_taa].get(), RenderTextureLayout::SHADER_READ},
-            {rp.taa_hist[cur_taa].get(), RenderTextureLayout::COLOR_WRITE}};
-        list.barriers(RenderBarrierStage::GRAPHICS, b_taa, 3);
-        run_pass(rp.fb_taa[cur_taa].get(), rp.p_taa.get(), rp.ds_taa[cur_taa].get(), w, h, w, h);
-
-        // 5. Half-res Karis-weighted HDR Bloom Prefilter (from temporally-stable TAA HDR!)
-        const RenderTextureBarrier b_pre[] = {
-            {rp.taa_hist[cur_taa].get(), RenderTextureLayout::SHADER_READ},
-            {rp.bloom[0].get(), RenderTextureLayout::COLOR_WRITE}};
-        list.barriers(RenderBarrierStage::GRAPHICS, b_pre, 2);
-        run_pass(rp.fb_bloom[0].get(), rp.p_bloom_pre.get(), rp.ds_bloom_pre[cur_taa].get(), rp.bloom_w[0], rp.bloom_h[0], w, h);
-    } else {
-        const RenderTextureBarrier b_pre[] = {
-            {rp.hdr_scene.get(), RenderTextureLayout::SHADER_READ},
-            {rp.bloom[0].get(), RenderTextureLayout::COLOR_WRITE}};
-        list.barriers(RenderBarrierStage::GRAPHICS, b_pre, 2);
-        run_pass(rp.fb_bloom[0].get(), rp.p_bloom_pre.get(), rp.ds_bloom_pre[cur_taa].get(), rp.bloom_w[0], rp.bloom_h[0], w, h);
-    }
-
-    // 5b. GPU-Resident 1x1 Temporal Auto-Exposure (Eye Adaptation)
-    {
-        const RenderTextureBarrier b_exp[] = {
-            {rp.exp_tex[prev_taa].get(), RenderTextureLayout::SHADER_READ},
-            {rp.exp_tex[cur_taa].get(), RenderTextureLayout::COLOR_WRITE}};
-        list.barriers(RenderBarrierStage::GRAPHICS, b_exp, 2);
-        run_pass(rp.fb_exp[cur_taa].get(), rp.p_auto_exp.get(), rp.ds_auto_exp[cur_taa].get(), 1, 1, w, h);
-        rp.has_prev_exp = true;
-    }
-
-    // 6. 5-Mip CoD-Next-Gen Bloom Downsample Chain
-    for (size_t i = 0; i + 1 < RemasterPost::kBloomMips; ++i) {
-        const RenderTextureBarrier b_dn[] = {
-            {rp.bloom[i].get(), RenderTextureLayout::SHADER_READ},
-            {rp.bloom[i + 1].get(), RenderTextureLayout::COLOR_WRITE}};
-        list.barriers(RenderBarrierStage::GRAPHICS, b_dn, 2);
-        run_pass(rp.fb_bloom[i + 1].get(), rp.p_bloom_down.get(), rp.ds_bloom_down[i].get(),
-                 rp.bloom_w[i + 1], rp.bloom_h[i + 1], rp.bloom_w[i], rp.bloom_h[i]);
-    }
-
-    // 7. 5-Mip Tent-Filter Additive Bloom Upsample Chain
-    for (int i = (int)RemasterPost::kBloomMips - 2; i >= 0; --i) {
-        const RenderTextureBarrier b_up[] = {
-            {rp.bloom[i + 1].get(), RenderTextureLayout::SHADER_READ},
-            {rp.bloom[i].get(), RenderTextureLayout::COLOR_WRITE}};
-        list.barriers(RenderBarrierStage::GRAPHICS, b_up, 2);
-        run_pass(rp.fb_bloom[i].get(), rp.p_bloom_up.get(), rp.ds_bloom_up[i].get(),
-                 rp.bloom_w[i], rp.bloom_h[i], rp.bloom_w[i + 1], rp.bloom_h[i + 1]);
-    }
-
-    // 8. Final Remaster Composite (TAA HDR + Bloom + Auto-Exposure + AgX Filmic Tonemap + Grade + CAS) -> surface.color
-    const RenderTextureBarrier b_comp[] = {
-        {rp.bloom[0].get(), RenderTextureLayout::SHADER_READ},
-        {rp.exp_tex[cur_taa].get(), RenderTextureLayout::SHADER_READ},
-        {color, RenderTextureLayout::COLOR_WRITE}};
-    list.barriers(RenderBarrierStage::GRAPHICS, b_comp, 3);
-    run_pass(rp.fb_out.get(), rp.p_composite.get(), rp.ds_composite[cur_taa].get(), w, h, w, h);
-    list.setFramebuffer(nullptr);
-    rp.taa_idx ^= 1u;
-}
-
-void finish_remaster_post() {
-    RemasterView &view = g_r.remaster_view;
-    if (!view.active || view.applied || !g_config.plume_modern) return;
-    static const bool disabled = std::getenv("EOD_REMASTER_POST") && *std::getenv("EOD_REMASTER_POST") == '0';
-    if (disabled) {
-        view.applied = true;
-        return;
-    }
-    if (g_r.sun_view.armed)
-        finish_sun_cascades(g_r.sun_view.camera.frame, KIND_HUD);
-    flush();
-    if (!view.active || view.applied || !g_config.plume_modern) return;
-
-    const Target &target = view.target;
-    gs::Env e{};
-    e.fbp = target.fbp;
-    e.fbw = target.fbw;
-    e.fpsm_mem = target.fpsm;
-    e.zbp = target.zbp;
-    e.zpsm = target.zpsm;
-    e.scy1 = target.rows - 1;
-    gs::hw::NativeSurfaces surface{};
-    if (!gs::hw::native_begin(e, true, surface, true)) {
-        view.applied = true;
-        return;
-    }
-    if (surface.color == view.color_image && surface.depth == view.depth_image &&
-        surface.color_ownership == view.color_ownership && surface.depth_ownership == view.depth_ownership) {
-        const auto vk = static_cast<VkCommandBuffer>(surface.cmd);
-        auto *bridge_list = static_cast<plume::VulkanCommandList *>(g_r.list.get());
-        const auto owned = bridge_list->vk;
-        bridge_list->vk = vk;
-        auto *list = g_r.list.get();
-        auto *color = wrapper(surface.color, surface.width, surface.height, false);
-        auto *depth = wrapper(surface.depth, surface.width, surface.height, true);
-        draw_remaster_post(*list, surface, view, color, depth);
-        const plume::RenderTextureBarrier done[] = {{color, plume::RenderTextureLayout::GENERAL},
-                                                    {depth, plume::RenderTextureLayout::GENERAL}};
-        list->barriers(plume::RenderBarrierStage::ALL, done, 2);
-        bridge_list->vk = owned;
-    }
-    gs::hw::native_end();
-    view.applied = true;
 }
 
 // GS ALPHA (A - B) * C + D, A/B/D in {Cs, Cd, 0} and C in {As, Ad, FIX}, as fixed-function blending
@@ -4783,6 +3879,21 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
         fs.k_lost[kind]++;
         return;
     }
+    if (g_config.remaster_engine &&
+        (kind == KIND_WORLD || kind == KIND_QUEUE || kind == KIND_SHADOW || kind == KIND_WATER)) {
+        // Halo 2 Anniversary Remaster engine owns 100% of 3D geometry & real 3-cascade CSM shadows.
+        // Suppress legacy 3D & PS2 blob shadows; record main_target so finish_remaster_3d() draws
+        // into it strictly BEFORE 2D HUD / menus composite on top!
+        if (kind == KIND_WORLD || kind == KIND_QUEUE) {
+            g_r.remaster_3d_seen = true;
+            if (g_have_env && !g_r.has_main_target && g_env.fbw > 0) {
+                g_r.main_target = {g_env.fbp, g_env.fbw, g_env.fpsm_mem, g_env.zbp, g_env.zpsm,
+                                   static_cast<uint32_t>(std::max(1, g_env.scy1 + 1))};
+                g_r.has_main_target = true;
+            }
+        }
+        return;
+    }
     const auto ready = g_queue_material ? g_queue_material->readiness : nullptr;
     const auto pinned = ready ? g_queue_resources.find(ready) : g_queue_resources.end();
     GpuMesh *mesh = strip ? strip->mesh : pinned != g_queue_resources.end() ? pinned->second.mesh.get() :
@@ -5129,7 +4240,39 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     }
 }
 
+void finish_remaster_3d() {
+    if (!g_config.remaster_engine || !g_r.remaster_3d_seen || g_r.remaster_drawn || !g_r.has_main_target)
+        return;
+    flush();
+    const Target &target = g_r.main_target;
+    gs::Env e{};
+    e.fbp = target.fbp;
+    e.fbw = target.fbw;
+    e.fpsm_mem = target.fpsm;
+    e.zbp = target.zbp;
+    e.zpsm = target.zpsm;
+    e.scy1 = target.rows - 1;
+    gs::hw::NativeSurfaces surface{};
+    // require_no_readback = false because Pass 4 overwrites the color target cleanly.
+    if (gs::hw::native_begin(e, false, surface, false)) {
+        remaster::OutputTarget out{};
+        out.vk_command_buffer = surface.cmd;
+        out.vk_color_image = surface.color;
+        out.width = surface.width;
+        out.height = surface.height;
+        if (remaster::render_frame(out)) {
+            g_r.remaster_drawn = true;
+        }
+        gs::hw::native_end();
+    }
+}
+
 void end_vblank(uint64_t vb) {
+    // Only render here if 3D was seen and no 2D/HUD pass already triggered finish_remaster_3d().
+    // Pure 2D menus (remaster_3d_seen == false) NEVER run remaster::render_frame()!
+    finish_remaster_3d();
+    g_r.remaster_3d_seen = false;
+    g_r.remaster_drawn = false;
     // Simulation vblanks can outrun render submissions during loading and
     // fast-forward. Associate the work since the last vblank with its real
     // Vulkan fence before freeing any images, framebuffers, or mesh buffers.
@@ -5143,9 +4286,7 @@ void end_vblank(uint64_t vb) {
         g_r.first_uncompleted_vblank = fences.front().first + 1;
         fences.pop_front();
     }
-    if (g_r.remaster_view.active && !g_r.remaster_view.applied) finish_remaster_post();
     g_r.sun_view.reset();
-    g_r.remaster_view.reset();
     g_r.split_shadow_view = -1;
     g_r.vb = vb;
     if (scene_capture_log()) {
@@ -5531,9 +4672,9 @@ void begin_object(const Packet &p) {
 #ifdef EOD_PLUME
     if (g_r.sun_view.armed && p.kind != KIND_QUEUE && p.kind != KIND_WORLD && p.kind != KIND_SHADOW)
         finish_sun_cascades(p.frame, p.kind);
-    if (g_r.remaster_view.active && !g_r.remaster_view.applied &&
+    if (g_config.remaster_engine && g_r.remaster_3d_seen && !g_r.remaster_drawn &&
         (p.kind == KIND_HUD || p.kind == KIND_COCKPIT))
-        finish_remaster_post();
+        finish_remaster_3d();
 #endif
     g_cur = p;
     g_active = true;
@@ -6327,9 +5468,9 @@ bool gs_draw(const gs::Env &e, const gs::Vertex &v, const gs::Vertex *b, const g
         const bool retained_gs = !native_only() || (native_only_level() == 2 && b && !c);
         if (g_r.sun_view.armed && retained_gs && !e.write_none && e.fbp == g_r.sun_view.target.fbp)
             finish_sun_cascades(g_r.sun_view.camera.frame, KIND_COUNT);
-        if (g_r.remaster_view.active && !g_r.remaster_view.applied && retained_gs &&
-            !e.write_none && e.fbp == g_r.remaster_view.target.fbp)
-            finish_remaster_post();
+        if (g_config.remaster_engine && g_r.remaster_3d_seen && !g_r.remaster_drawn &&
+            retained_gs && !e.write_none && g_r.has_main_target && e.fbp == g_r.main_target.fbp)
+            finish_remaster_3d();
         if (!g_r.pending.empty() || !g_r.shadow_pending.empty()) flush();  // before the GS draws something of its own
         if (retained_gs && !e.write_none && b && !c && !e.tme && !e.abe && e.ztst == 1 && !e.zmsk) {
             for (const auto &view : g_r.scene_views) {
@@ -6589,6 +5730,7 @@ void r6_report() {
 bool look_available() { return g_r.ok.load(std::memory_order_acquire); }
 bool toggle_look() {
     const bool modern = g_config.plume_modern.toggle();
+    g_config.remaster_engine = modern;
     ++g_look_toggles;
     return modern;
 }

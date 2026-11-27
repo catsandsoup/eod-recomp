@@ -379,8 +379,9 @@ int main(int argc, char **argv) {
     }
     config_load(config_path);
     if (const char *look = getenv("EOD_LOOK")) {
-        if (*look == 'm' || *look == 'M') g_config.plume_modern = true;
-        if (*look == 'c' || *look == 'C') g_config.plume_modern = false;
+        if (*look == 'r' || *look == 'R') { g_config.remaster_engine = true; g_config.plume_modern = true; }
+        else if (*look == 'm' || *look == 'M') { g_config.remaster_engine = false; g_config.plume_modern = true; }
+        else if (*look == 'c' || *look == 'C') { g_config.remaster_engine = false; g_config.plume_modern = false; }
     }
     cfg.width = g_config.width;
     cfg.height = g_config.height;
@@ -416,8 +417,14 @@ int main(int argc, char **argv) {
         else if (a == "--config") next();
         else if (a == "--renderer") g_config.renderer = next();
         else if (a == "--require-plume") require_plume = true;
+        else if (a == "--remaster") {
+            require_plume = true;
+            g_config.remaster_engine = true;
+            g_config.plume_modern = true;
+        }
         else if (a == "--modern" || a == "--classic") {
             require_plume = true;
+            g_config.remaster_engine = false;
             g_config.plume_modern = a == "--modern";
         }
         else if (a == "--fullscreen") cfg.fullscreen = true;

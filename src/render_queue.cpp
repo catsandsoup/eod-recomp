@@ -22,9 +22,11 @@
 //
 // Live native rendering extends each bucket with host records after the guest pool fills. Original
 // and EOD_DIFF use the guest layout and its original limit so the recompiled code can compare state.
+#include "core/config.h"
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
+#include "remaster/scene_bridge.h"
 #include "render/native_renderer.h"
 #include "render/scene_tap.h"
 
@@ -242,6 +244,12 @@ void submit_model() {
     const uint32_t saved_mask = lwu(kLayerMask);
     sw(kLayerMask, layer_mask);
     transform_centre(header, m, centre);
+    if (g_config.remaster_engine && m) {
+        float mat12[12];
+        for (int i = 0; i < 12; ++i) mat12[i] = lf(m + static_cast<uint32_t>(i) * 4u);
+        remaster::ee_submit_entity(static_cast<uint32_t>(model), mat12, static_cast<uint32_t>(material),
+                                   false, layer_mask);
+    }
     if (sphere_visible(centre, clip, depth, lwu(header + 0x18), 0x34BF2C)) {
         set(4, (int32_t)m);
         call(f_0035CD28, 0x34BF3C);

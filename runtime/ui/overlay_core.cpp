@@ -516,7 +516,7 @@ void overlay_enable() {
 const char *overlay_renderer_look_label(RendererLook look) {
     switch (look) {
     case RendererLook::Classic: return "RENDERER: CLASSIC";
-    case RendererLook::Modern: return "RENDERER: MODERN";
+    case RendererLook::Modern: return "RENDERER: REMASTER";
     case RendererLook::Original: return "RENDERER: ORIGINAL";
     }
     return "";

@@ -2025,8 +2025,7 @@ void ee_shadow_begin(int32_t alpha, bool retail_single_view, int retail_split_y,
     g_shadow_cam.retail_shadow_view = retail_single_view;
     g_retail_split_y = retail_split_y;
     g_retail_quad_view = retail_quad_view;
-    g_hybrid_shadow_cascades = sun_cascades_enabled() && look_modern() && retail_single_view &&
-                              !g_shadow_cam.editor_environment;
+    g_hybrid_shadow_cascades = sun_cascades_enabled() && look_modern() && retail_single_view;
     // 0x363480: intensity = (alpha >> 1) + (alpha >> 7) in GS 0..128 alpha units
     const int32_t half = (alpha - (alpha >> 31)) >> 1;
     const int32_t adj = (alpha < 0 ? alpha + 0x7F : alpha) >> 7;

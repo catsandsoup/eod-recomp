@@ -23,6 +23,8 @@
 #include "core/diff_harness.h"
 #include "core/limit_tracker.h"
 #include "core/memory.h"
+#include "kernel/kernel.h"
+#include "remaster/scene_bridge.h"
 #include "render/native_renderer.h"
 #include "render/world_visibility.h"
 #include "vfs/custom_map.h"
@@ -208,6 +210,10 @@ bool split_parity() {
 // ---------------------------------------------------------------------------------------------
 // 0x214B68 WorldFrameRender
 void world_frame_render() {
+    if (g_config.remaster_engine) {
+        remaster::ee_begin_frame(kernel_vblank_count());
+        remaster::ee_sync_world_from_ram("TRACK");
+    }
     Frame f(0x60);
     const uint32_t sp = f.sp();
     call(f_00212DD0, 0x214B80);
@@ -281,6 +287,8 @@ void world_frame_render() {
         call(f_00358BD0, 0x214C78);
     }
     call(f_00359238, 0x214C80);
+    // Note: remaster::ee_end_frame() is intentionally NOT called here — it runs ONCE per
+    // viewport at the end of ViewportRenderFinish (0x20F2D8) after all dynamic cars/props submit.
 }
 
 // ---------------------------------------------------------------------------------------------

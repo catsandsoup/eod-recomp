@@ -66,6 +66,7 @@ struct Config {
     // its effects in percent of the default look (docs/SCENE_CAPTURE.md "Modern renderer")
     ModernRendererPreference modern_renderer;
     ModernRendererPreference plume_modern; // native Plume look, independent of the legacy GS preference
+    bool remaster_engine = false;          // Halo 2 Anniversary zero-VU/GS Forward+ Linear HDR engine (Look=Remaster)
     // the native renderer (docs/NATIVE_RENDERER.md, R1): queued 3D objects drawn by plume
     bool native_renderer = false;
     // split-screen views run the single-view track passes, mlist and water (P8; docs/NATIVE_RENDERER.md R2)

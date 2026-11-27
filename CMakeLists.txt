@@ -78,9 +78,12 @@ file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/runtime/vfs/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/spu/*.cpp
   ${CMAKE_SOURCE_DIR}/runtime/render/*.cpp
+  ${CMAKE_SOURCE_DIR}/runtime/remaster/*.cpp
   ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.c)
 # The optional standalone Plume scene library owns this source.
 list(REMOVE_ITEM RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/render/plume_scene.cpp)
+# decomp_graphics_env.cpp awaits config/hle.txt wrap entries before linking into eod.
+list(REMOVE_ITEM RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/src/decomp_graphics_env.cpp)
 list(APPEND RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/main.cpp ${CMAKE_SOURCE_DIR}/runtime/app/online_profile.cpp)
 if(WIN32)
   file(GLOB PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/runtime/platform/win32/*.cpp ${CMAKE_SOURCE_DIR}/runtime/gs/d3d11/*.cpp
@@ -1025,6 +1028,15 @@ if(BUILD_TESTING)
   add_executable(netplay_online_test tests/netplay_online_test.cpp)
   target_include_directories(netplay_online_test PRIVATE src)
   add_test(NAME netplay_online_codec COMMAND netplay_online_test)
+  add_executable(remaster_engine_test
+    tests/remaster_engine_test.cpp
+    runtime/remaster/ee_texture_decoder.cpp
+    runtime/remaster/graf_loader.cpp
+    runtime/remaster/asset_registry.cpp
+    runtime/remaster/scene_bridge.cpp
+    runtime/remaster/remaster_renderer.cpp)
+  target_include_directories(remaster_engine_test PRIVATE runtime runtime/include)
+  add_test(NAME RemasterEngine COMMAND remaster_engine_test)
   if(NOT WIN32)
     add_executable(netplay_online_probe tests/netplay_online_probe.cpp src/netplay_online.cpp)   # developer probe, not a test
     target_include_directories(netplay_online_probe PRIVATE src)

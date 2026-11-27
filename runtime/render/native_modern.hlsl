@@ -196,9 +196,27 @@ float3 srgb_to_linear(float3 c) {
     return pow(max(c, 0.0), 2.2);
 }
 float3 hdr_encode(float3 lin) {
-    const float3 c = max(lin, 0.0);
-    const float3 y = c / (c + 0.85);
-    return sqrt(y);
+    // Khronos PBR Neutral + linear-to-sRGB directly (zero dark post-process dependency).
+    float3 c = max(lin, 0.0);
+    const float start_compression = 0.76;
+    const float desaturation = 0.15;
+    const float x = min(c.r, min(c.g, c.b));
+    const float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    c -= offset;
+    const float peak = max(c.r, max(c.g, c.b));
+    if (peak >= start_compression) {
+        const float d = 1.0 - start_compression;
+        const float new_peak = 1.0 - d * d / (peak + d - start_compression);
+        c *= new_peak / peak;
+        const float g = 1.0 - 1.0 / (desaturation * (peak - new_peak) + 1.0);
+        c = lerp(c, float3(new_peak, new_peak, new_peak), g);
+    }
+    c = saturate(c);
+    const float3 lo = c * 12.92;
+    const float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    return float3(c.r <= 0.0031308 ? lo.r : hi.r,
+                  c.g <= 0.0031308 ? lo.g : hi.g,
+                  c.b <= 0.0031308 ? lo.b : hi.b);
 }
 float3 hdr_decode(float3 s) {
     const float3 c = saturate(s);

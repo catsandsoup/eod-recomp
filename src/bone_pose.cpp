@@ -15,10 +15,12 @@
 //
 // EOD_FREEZE_POSE=<vblank> (diagnostic): from that vblank on, every upload replays the pose the
 // same call (by return address and order within the frame) uploaded on that vblank.
+#include "core/config.h"
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
 #include "kernel/kernel.h"
+#include "remaster/scene_bridge.h"
 #include "render/native_renderer.h"
 
 #include <cstdint>
@@ -86,6 +88,10 @@ uint32_t bone_palette_write(uint32_t first, uint32_t bones, int32_t count) {
         // 4 components per vector, 4 vectors per bone, to VU1 qword 0x90 + 4*first
         vif_write_unpack_mscal(packet, (uint32_t)qwc, 4 * first + 1, 4, 4 * (uint32_t)count, palette);
         native::ee_pose_check(packet, bones, (uint32_t)count);
+        if (g_config.remaster_engine && count > 0) {
+            remaster::ee_record_bone_palette(packet, reinterpret_cast<const float *>(g_ram + palette),
+                                             static_cast<uint32_t>(count));
+        }
     }
     g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;
     return packet;
@@ -104,7 +110,13 @@ uint32_t dent_offset_write(uint32_t addr, uint32_t offsets, int32_t count) {
     g_ee.r[31].ud[0] = 0x35DD78;
     f_00366C88();
     const uint32_t packet = g_ee.r[2].uw[0];
-    if (packet) vif_write_unpack_mscal(packet, (uint32_t)qwc, addr, 3, (uint32_t)count, offsets);
+    if (packet) {
+        vif_write_unpack_mscal(packet, (uint32_t)qwc, addr, 3, (uint32_t)count, offsets);
+        if (g_config.remaster_engine && count > 0) {
+            remaster::ee_record_dent_offsets(packet, reinterpret_cast<const float *>(g_ram + offsets),
+                                             static_cast<uint32_t>(count));
+        }
+    }
     g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;
     return packet;
 }
