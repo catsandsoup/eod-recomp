@@ -46,6 +46,41 @@ inline uint8_t expand_ps2_alpha(uint8_t a) {
     return static_cast<uint8_t>(v > 255u ? 255u : v);
 }
 
+// Self-contained FNV-1a 64-bit texture identity keys matching material_table.inc
+// (identical to runtime/gs/texture_replacements.cpp without any runtime/gs/* include).
+constexpr uint64_t kFnvOffset = 0xCBF29CE484222325ull;
+constexpr uint64_t kFnvPrime  = 0x100000001B3ull;
+
+inline uint64_t fnv1a64(const void *data, size_t n, uint64_t h = kFnvOffset) {
+    const uint8_t *p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * kFnvPrime;
+    return h;
+}
+
+uint64_t compute_index_key(uint32_t bits, uint32_t width, uint32_t height, const uint8_t *indices) {
+    uint8_t head[16];
+    std::memcpy(head, "EODTEX1", 7);
+    head[7] = static_cast<uint8_t>(bits);
+    for (int i = 0; i < 4; ++i) {
+        head[8 + i] = static_cast<uint8_t>(width >> (8 * i));
+        head[12 + i] = static_cast<uint8_t>(height >> (8 * i));
+    }
+    return fnv1a64(indices, static_cast<size_t>(width) * height, fnv1a64(head, sizeof(head)));
+}
+
+uint64_t compute_palette_key(const uint32_t *pal, uint32_t n) {
+    uint64_t h = kFnvOffset;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t rgb[3] = {
+            static_cast<uint8_t>(pal[i] & 0xFFu),
+            static_cast<uint8_t>((pal[i] >> 8) & 0xFFu),
+            static_cast<uint8_t>((pal[i] >> 16) & 0xFFu),
+        };
+        h = fnv1a64(rgb, 3, h);
+    }
+    return h;
+}
+
 bool ieq_name(const char *a, const std::string &b) {
     size_t i = 0;
     for (; i < 16 && a[i] != '\0'; ++i) {
@@ -171,6 +206,9 @@ bool decode_ee_texture_header(const uint8_t *ram, uint32_t ram_size,
     out.width = w;
     out.height = h;
     out.is_srgb = true;
+    out.index_key = 0;
+    out.palette_key = 0;
+    out.has_indexed_keys = false;
     out.pixels.resize(static_cast<size_t>(w) * h * 4);
 
     if (bpp_type == 8u) {
@@ -186,11 +224,13 @@ bool decode_ee_texture_header(const uint8_t *ram, uint32_t ram_size,
         const uint8_t *src = ram + data_ptr;
         const bool swizzled = (h >= 32u && w >= 16u);
         const std::vector<uint32_t> *tbl = swizzled ? &get_psmt4_table(w, h) : nullptr;
+        std::vector<uint8_t> plane(static_cast<size_t>(w) * h);
         for (uint32_t y = 0; y < h; ++y) {
             for (uint32_t x = 0; x < w; ++x) {
                 const uint32_t nib = tbl ? (*tbl)[static_cast<size_t>(y) * w + x] : (y * w + x);
                 const uint32_t byte_i = nib >> 1;
                 const uint8_t idx = (byte_i < data_bytes) ? ((src[byte_i] >> ((nib & 1u) * 4u)) & 0xFu) : 0u;
+                plane[static_cast<size_t>(y) * w + x] = idx;
                 const uint32_t c = clut[idx];
                 uint8_t *dst = out.pixels.data() + (static_cast<size_t>(y) * w + x) * 4;
                 dst[0] = static_cast<uint8_t>(c & 0xFFu);
@@ -199,6 +239,9 @@ bool decode_ee_texture_header(const uint8_t *ram, uint32_t ram_size,
                 dst[3] = expand_ps2_alpha(static_cast<uint8_t>((c >> 24) & 0xFFu));
             }
         }
+        out.index_key = compute_index_key(4u, w, h, plane.data());
+        out.palette_key = compute_palette_key(clut, 16u);
+        out.has_indexed_keys = true;
         return true;
     } else if (bpp_type == 4u) {
         // 8-bit indexed (PSMT8)
@@ -213,10 +256,12 @@ bool decode_ee_texture_header(const uint8_t *ram, uint32_t ram_size,
         }
         const uint8_t *src = ram + data_ptr;
         const bool swizzled = (h >= 32u && w >= 16u);
+        std::vector<uint8_t> plane(static_cast<size_t>(w) * h);
         for (uint32_t y = 0; y < h; ++y) {
             for (uint32_t x = 0; x < w; ++x) {
                 const uint32_t addr = swizzled ? upload_addr8(x, y, w) : (y * w + x);
                 const uint8_t idx = (addr < data_bytes) ? src[addr] : 0u;
+                plane[static_cast<size_t>(y) * w + x] = idx;
                 const uint32_t c = clut[idx];
                 uint8_t *dst = out.pixels.data() + (static_cast<size_t>(y) * w + x) * 4;
                 dst[0] = static_cast<uint8_t>(c & 0xFFu);
@@ -225,6 +270,9 @@ bool decode_ee_texture_header(const uint8_t *ram, uint32_t ram_size,
                 dst[3] = expand_ps2_alpha(static_cast<uint8_t>((c >> 24) & 0xFFu));
             }
         }
+        out.index_key = compute_index_key(8u, w, h, plane.data());
+        out.palette_key = compute_palette_key(clut, 256u);
+        out.has_indexed_keys = true;
         return true;
     } else if (bpp_type == 0u || bpp_type == 1u) {
         // 32-bit direct RGBA

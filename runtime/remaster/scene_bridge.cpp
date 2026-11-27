@@ -75,6 +75,8 @@ struct BridgeState {
     std::unordered_map<uint32_t, std::vector<float>> dent_offsets;
     std::unordered_map<uint64_t, std::vector<CachedModelPart>> dynamic_model_parts; // key = (model_handle<<32)|header_addr
     std::unordered_map<uint64_t, bool> dynamic_model_is_sky;                        // suppress sky double-draw/shadow-cast
+    bool in_water = false;
+    WaterMesh cur_water{};
 };
 
 BridgeState &state() {
@@ -91,8 +93,8 @@ SceneEnvironment extract_environment_from_ram(const uint8_t *ram, uint32_t ram_s
     // Strong direct sun vs. cool sky-fill ambient (~3.5:1 ratio) gives crisp grounded shadows!
     env.sun_dir[0] = 0.35f; env.sun_dir[1] = 0.82f; env.sun_dir[2] = -0.45f;
     env.sun_intensity = 5.6f;
-    env.ambient_sky[0] = 0.42f; env.ambient_sky[1] = 0.58f; env.ambient_sky[2] = 0.88f;
-    env.ambient_ground[0] = 0.26f; env.ambient_ground[1] = 0.21f; env.ambient_ground[2] = 0.16f;
+    env.ambient_sky[0] = 0.62f; env.ambient_sky[1] = 0.66f; env.ambient_sky[2] = 0.72f;
+    env.ambient_ground[0] = 0.30f; env.ambient_ground[1] = 0.28f; env.ambient_ground[2] = 0.25f;
     env.ambient_intensity = 0.58f;
     env.shadow_strength = 1.0f;
 
@@ -165,13 +167,15 @@ SceneEnvironment extract_environment_from_ram(const uint8_t *ram, uint32_t ram_s
             float amb_lin[3];
             unpack_rrggbb_linear(amb, amb_lin);
             if (env.is_day) {
-                // Crisp, cool sky hemisphere vs neutral ground bounce (never washes out CSM shadows or adds orange)
-                env.ambient_sky[0] = amb_lin[0] * 0.80f + 0.20f;
-                env.ambient_sky[1] = amb_lin[1] * 0.95f + 0.28f;
-                env.ambient_sky[2] = amb_lin[2] * 1.15f + 0.42f;
-                env.ambient_ground[0] = amb_lin[0] * 0.55f + 0.10f;
-                env.ambient_ground[1] = amb_lin[1] * 0.55f + 0.10f;
-                env.ambient_ground[2] = amb_lin[2] * 0.55f + 0.10f;
+                // Clean, neutral daylight hemisphere fill (ZERO blue cast in concrete/billboard shadows)
+                const float amb_luma = 0.2126f * amb_lin[0] + 0.7152f * amb_lin[1] + 0.0722f * amb_lin[2];
+                const float amb_scale = std::clamp(0.78f + amb_luma * 0.45f, 0.70f, 1.15f);
+                env.ambient_sky[0] = 0.62f * amb_scale;
+                env.ambient_sky[1] = 0.66f * amb_scale;
+                env.ambient_sky[2] = 0.72f * amb_scale;
+                env.ambient_ground[0] = 0.30f * amb_scale;
+                env.ambient_ground[1] = 0.28f * amb_scale;
+                env.ambient_ground[2] = 0.25f * amb_scale;
             } else {
                 // Gently modulate night ambient with track's EE ambient while preserving full readability
                 env.ambient_sky[0] = 0.22f + amb_lin[0] * 0.12f;
@@ -243,9 +247,11 @@ void rebuild_camera_projection(SceneCamera &cam, uint32_t target_width, uint32_t
                              : (640.0f / 448.0f);
     const float fy = cam.fov_scale * (0.93333334f / ee_asp) * vp_asp;
     const float fx = fy / std::max(0.1f, cam.aspect);
+    // Reversed-Z projection (near -> 1.0, far -> 0.0) for D32_FLOAT:
+    // Eliminates far-plane depth quantization across large tracks (near=0.35m, far=9200m).
     const float z_range = std::max(1.0f, cam.far_z - cam.near_z);
-    const float a = cam.far_z / z_range;
-    const float b = -(cam.far_z * cam.near_z) / z_range;
+    const float a = -cam.near_z / z_range;
+    const float b = (cam.far_z * cam.near_z) / z_range;
     const float proj[16] = {
         fx,   0.0f, 0.0f, 0.0f,
         0.0f, -fy,  0.0f, 0.0f,
@@ -269,7 +275,7 @@ SceneCamera extract_camera_from_ram(const uint8_t *ram, uint32_t ram_size,
         const float fz = rd_f32(ram, ee_addr::kFarZ);
         const float fs = rd_f32(ram, ee_addr::kFovScale);
         if (std::isfinite(nz) && nz > 0.01f) cam.near_z = nz;
-        if (std::isfinite(fz) && fz > cam.near_z + 1.0f) cam.far_z = fz;
+        if (std::isfinite(fz) && fz > cam.near_z + 1.0f) cam.far_z = std::max(fz, 8000.0f);
         if (std::isfinite(fs) && fs > 0.05f && fs < 10.0f) cam.fov_scale = fs;
     }
     if (valid_addr(ee_addr::kAspect, 4, ram_size)) {
@@ -346,7 +352,7 @@ void extract_flare_lights_from_ram(const uint8_t *ram, uint32_t ram_size,
         l.pos[0] = px; l.pos[1] = py; l.pos[2] = pz;
         l.radius = is_day ? 60.0f : 160.0f;
         // Neutral metal-halide stadium white (ZERO orange/amber tint)
-        l.color[0] = 0.94f; l.color[1] = 0.97f; l.color[2] = 1.00f;
+        l.color[0] = 0.95f; l.color[1] = 0.97f; l.color[2] = 1.00f;
         l.intensity = (is_day ? 1.2f : 4.5f) * gain;
         l.dir[0] = dx; l.dir[1] = dy; l.dir[2] = dz;
         l.spot_cos = is_day ? 0.22f : -0.25f;
@@ -363,6 +369,8 @@ void ee_begin_frame(uint64_t vblank) {
     if (s.world) s.building.track_name = s.world->track_name;
     s.bone_palettes.clear();
     s.dent_offsets.clear();
+    s.in_water = false;
+    s.cur_water = WaterMesh{};
 }
 
 void ee_sync_world_from_ram(const std::string &track_name) {
@@ -526,6 +534,111 @@ void ee_submit_hud_quad(const HudQuad &quad) {
     auto &s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
     s.building.hud_quads.push_back(quad);
+}
+
+void ee_water_begin(uint32_t /*surface_addr*/, int32_t texture_slot) {
+    auto &s = state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    s.cur_water = WaterMesh{};
+    if (texture_slot >= 0 && texture_slot < 512) {
+        std::string slot_name = get_ee_texture_slot_name(g_ram, EE_RAM_SIZE, texture_slot);
+        if (slot_name.empty()) slot_name = "water";
+        s.cur_water.texture_id = "slot/" + std::to_string(texture_slot) + "/" + slot_name;
+    } else {
+        s.cur_water.texture_id = "tex/water";
+    }
+    s.cur_water.vertices.reserve(512);
+    s.cur_water.indices.reserve(1024);
+    s.in_water = true;
+}
+
+bool ee_in_water() {
+    auto &s = state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    return s.in_water;
+}
+
+void ee_water_vertex(const float xyz[3], const float st[2], uint32_t /*colour*/, uint32_t strip) {
+    if (!xyz || !st) return;
+    if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) return;
+    auto &s = state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    if (!s.in_water) return;
+
+    PbrVertex v{};
+    v.pos[0] = xyz[0];
+    v.pos[1] = xyz[1];
+    v.pos[2] = xyz[2];
+    v.normal[0] = 0.0f;
+    v.normal[1] = 1.0f;
+    v.normal[2] = 0.0f;
+    v.tangent[0] = 1.0f;
+    v.tangent[1] = 0.0f;
+    v.tangent[2] = 0.0f;
+    v.tangent[3] = 1.0f;
+    v.uv[0] = std::isfinite(st[0]) ? st[0] : 0.0f;
+    v.uv[1] = std::isfinite(st[1]) ? st[1] : 0.0f;
+
+    const uint32_t idx = static_cast<uint32_t>(s.cur_water.vertices.size());
+    s.cur_water.vertices.push_back(v);
+    if (strip != 0u && idx >= 2u) {
+        s.cur_water.indices.push_back(idx - 2u);
+        s.cur_water.indices.push_back(idx - 1u);
+        s.cur_water.indices.push_back(idx);
+    }
+}
+
+void ee_water_end(bool drawn) {
+    auto &s = state();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    if (!s.in_water) return;
+    s.in_water = false;
+
+    if (!drawn || s.cur_water.vertices.empty() || s.cur_water.indices.size() < 3u) {
+        s.cur_water = WaterMesh{};
+        return;
+    }
+
+    auto &verts = s.cur_water.vertices;
+    auto &inds = s.cur_water.indices;
+
+    // Ensure every triangle in the EE water strip is consistently oriented +Y UP so
+    // alternating strip triangles never cancel out during smooth normal accumulation.
+    for (size_t t = 0; t + 2 < inds.size(); t += 3) {
+        const auto &p0 = verts[inds[t + 0]].pos;
+        const auto &p1 = verts[inds[t + 1]].pos;
+        const auto &p2 = verts[inds[t + 2]].pos;
+        const float e1x = p1[0] - p0[0], e1z = p1[2] - p0[2];
+        const float e2x = p2[0] - p0[0], e2z = p2[2] - p0[2];
+        const float ny = e1z * e2x - e1x * e2z;
+        if (ny < 0.0f) {
+            std::swap(inds[t + 1], inds[t + 2]);
+        }
+    }
+
+    // Weld adjacent water tile corners and compute smooth area-weighted wave normals (+Y UP).
+    compute_smooth_normals_and_tangents(verts, inds, 1e-2f);
+
+    float bmin[3] = {verts[0].pos[0], verts[0].pos[1], verts[0].pos[2]};
+    float bmax[3] = {bmin[0], bmin[1], bmin[2]};
+    for (const auto &v : verts) {
+        for (int k = 0; k < 3; ++k) {
+            bmin[k] = std::min(bmin[k], v.pos[k]);
+            bmax[k] = std::max(bmax[k], v.pos[k]);
+        }
+    }
+    for (int k = 0; k < 3; ++k) s.cur_water.center[k] = 0.5f * (bmin[k] + bmax[k]);
+    float max_r2 = 0.0f;
+    for (const auto &v : verts) {
+        const float dx = v.pos[0] - s.cur_water.center[0];
+        const float dy = v.pos[1] - s.cur_water.center[1];
+        const float dz = v.pos[2] - s.cur_water.center[2];
+        max_r2 = std::max(max_r2, dx * dx + dy * dy + dz * dz);
+    }
+    s.cur_water.radius = std::sqrt(max_r2);
+
+    s.building.water_meshes.push_back(std::move(s.cur_water));
+    s.cur_water = WaterMesh{};
 }
 
 void ee_end_frame(const editor_environment::Override *editor_override) {

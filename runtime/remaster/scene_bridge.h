@@ -71,6 +71,10 @@ void ee_record_bone_palette(uint32_t packet_addr, const float *matrices_4x4, uin
 void ee_record_dent_offsets(uint32_t packet_addr, const float *offsets_xyz, uint32_t count);
 void ee_submit_dynamic_light(const DynamicLight &light);
 void ee_submit_hud_quad(const HudQuad &quad);
+void ee_water_begin(uint32_t surface_addr, int32_t texture_slot);
+bool ee_in_water();
+void ee_water_vertex(const float xyz[3], const float st[2], uint32_t colour, uint32_t strip);
+void ee_water_end(bool drawn);
 void ee_end_frame(const editor_environment::Override *editor_override = nullptr);
 
 // ---- Renderer Thread Consumers ----

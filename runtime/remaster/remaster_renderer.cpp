@@ -21,6 +21,7 @@
 #include <vector>
 
 #ifdef EOD_PLUME
+#include "../core/config.h"
 #include "../render/plume_device.h"
 #include <plume_vulkan.h>
 #include "remaster_shaders_spv.inc"
@@ -118,9 +119,10 @@ void build_cubemap_face_vp(const float center[3], uint32_t face, float near_z, f
         (float)fwd.x,   (float)fwd.y,   (float)fwd.z,   (float)-v_dot(fwd, eye),
         0.0f,           0.0f,           0.0f,           1.0f
     };
+    // Reversed-Z (near -> 1.0, far -> 0.0) matching Pass 3 and vs_pbr_main sky far-plane pinning
     const float z_range = std::max(1.0f, far_z - near_z);
-    const float a = far_z / z_range;
-    const float b = -(far_z * near_z) / z_range;
+    const float a = -near_z / z_range;
+    const float b = (far_z * near_z) / z_range;
     // Negative proj[5] maps +Y up in view space to -1 (top) in Vulkan NDC
     const float proj[16] = {
         1.0f,  0.0f, 0.0f, 0.0f,
@@ -139,11 +141,13 @@ void build_cubemap_face_vp(const float center[3], uint32_t face, float near_z, f
 
 } // namespace
 
-CsmCascadeSet compute_csm_cascades(const SceneCamera &cam, const SceneEnvironment &env, uint32_t resolution) {
+CsmCascadeSet compute_csm_cascades(const SceneCamera &cam, const SceneEnvironment &env,
+                                   uint32_t resolution, bool max_quality) {
     CsmCascadeSet out{};
-    out.splits[0] = 24.0f;
-    out.splits[1] = 80.0f;
-    out.splits[2] = 260.0f;
+    // Full-horizon shadow cascades at maximum quality (zero widescreen edge pop-out, 600m+ coverage).
+    out.splits[0] = max_quality ? 34.0f  : 26.0f;
+    out.splits[1] = max_quality ? 135.0f : 90.0f;
+    out.splits[2] = max_quality ? 600.0f : 280.0f;
 
     const Vec3 toward_sun = v_unit({env.sun_dir[0], env.sun_dir[1], env.sun_dir[2]});
     // Light ray travels away from the sun
@@ -155,20 +159,26 @@ CsmCascadeSet compute_csm_cascades(const SceneCamera &cam, const SceneEnvironmen
     const Vec3 cam_pos{cam.pos[0], cam.pos[1], cam.pos[2]};
     const Vec3 cam_fwd = v_unit({cam.rotation[6], cam.rotation[7], cam.rotation[8]});
 
-    static constexpr double kRadii[3]     = {26.0, 88.0, 270.0};
-    static constexpr double kFocusDist[3] = {12.0, 46.0, 130.0};
-    static constexpr double kHalfDepth[3] = {65.0, 160.0, 320.0};
+    const double radii[3]     = {max_quality ? 38.0  : 28.0,
+                                 max_quality ? 148.0 : 96.0,
+                                 max_quality ? 640.0 : 300.0};
+    const double focus_d[3]   = {max_quality ? 16.0  : 12.0,
+                                 max_quality ? 70.0  : 48.0,
+                                 max_quality ? 280.0 : 140.0};
+    const double half_dep[3]  = {max_quality ? 120.0 : 75.0,
+                                 max_quality ? 280.0 : 170.0,
+                                 max_quality ? 720.0 : 360.0};
     const double res = static_cast<double>(std::max(1u, resolution));
 
     for (uint32_t i = 0; i < CsmCascadeSet::kCascadeCount; ++i) {
-        const Vec3 focus = v_add(cam_pos, v_scale(cam_fwd, kFocusDist[i]));
-        const double texel_world = (2.0 * kRadii[i]) / res;
+        const Vec3 focus = v_add(cam_pos, v_scale(cam_fwd, focus_d[i]));
+        const double texel_world = (2.0 * radii[i]) / res;
         const double cx = std::round(v_dot(light_x, focus) / texel_world) * texel_world;
         const double cy = std::round(v_dot(light_y, focus) / texel_world) * texel_world;
         const double cz = std::round(v_dot(light_z, focus));
 
-        const double inv_r = 1.0 / kRadii[i];
-        const double inv_2d = 0.5 / kHalfDepth[i];
+        const double inv_r = 1.0 / radii[i];
+        const double inv_2d = 0.5 / half_dep[i];
 
         float *m = out.view_proj[i];
         // Row-major orthographic light-space matrix mapping world -> NDC [-1,1]x[-1,1]x[0,1]
@@ -251,6 +261,8 @@ struct alignas(16) FrameUBO {
     float light_pos_rad[32][4];
     float light_col_int[32][4];
     float light_dir_pad[32][4];
+    float water_wakes[32][4];
+    float water_wake_meta[4];
 };
 
 struct alignas(16) DrawPC {
@@ -276,7 +288,10 @@ struct GpuTextureSet {
     bool has_alpha_cutout = false;
     bool has_alpha_blend = false;
     bool has_alpha_additive = false;
+    bool has_resolved_material = false;
+    bool has_material_table_match = false;
     float resolved_emissive_scale = 0.0f;
+    PbrMaterial resolved_material;
     std::unique_ptr<plume::RenderTexture> albedo, normal, roughness, metallic, ao;
     std::unique_ptr<plume::RenderDescriptorSet> ds;
 };
@@ -292,6 +307,8 @@ struct StaticBatch {
     PbrMaterial material;
     uint32_t alpha_mode = 0; // 0=opaque, 1=cutout, 2=alpha_blend, 3=additive
     uint32_t optional_terrain_mask = 0;
+    int16_t layer_index = 0;
+    uint32_t first_order = 0; // original GRAF traversal order for deterministic alpha-blend layering
     bool is_optional_terrain = false;
     bool is_sky = false;
     bool is_foliage = false;
@@ -302,6 +319,40 @@ struct StaticBatch {
 struct PosedVboSlice {
     plume::RenderBuffer *buf = nullptr;
     uint64_t offset = 0;
+};
+
+struct WaterDrawSlice {
+    size_t mesh_index = 0;
+    uint64_t vbo_offset = 0;
+    uint64_t ibo_offset = 0;
+    uint32_t vertex_count = 0;
+    uint32_t index_count = 0;
+};
+
+struct WaterWakeStamp {
+    float x = 0.0f;
+    float z = 0.0f;
+    float birth_t = -100.0f;
+    float strength = 0.0f;
+};
+
+struct TrackedWaterVehicle {
+    float x = 0.0f;
+    float z = 0.0f;
+    float last_stamp_x = 0.0f;
+    float last_stamp_z = 0.0f;
+    float last_stamp_t = -100.0f;
+};
+
+struct WaterSprayParticle {
+    float pos[3] = {};
+    float vel[3] = {};
+    float age = 0.0f;
+    float lifetime = 0.0f;
+    float size_start = 0.25f;
+    float size_end = 0.9f;
+    float seed = 0.0f;
+    float is_droplet = 0.0f; // 0 = mist puff, 1 = droplet cluster
 };
 
 struct HudVertex {
@@ -324,9 +375,10 @@ struct RetiredResource {
 };
 
 struct RemasterEngine {
-    static constexpr uint32_t kCubeRes = 128;
+    static constexpr uint32_t kCubeRes = 256;
     static constexpr uint32_t kFramesInFlight = 3;
     static constexpr uint64_t kDynVboSlotBytes = 8ull * 1024ull * 1024ull;
+    static constexpr uint64_t kDynIboSlotBytes = 2ull * 1024ull * 1024ull;
     static constexpr uint64_t kRetireFrames = 8;
     bool attempted = false;
     bool ready = false;
@@ -386,6 +438,7 @@ struct RemasterEngine {
     std::unique_ptr<plume::RenderDescriptorSet> cube_ds[kFramesInFlight][6];
     std::unique_ptr<plume::RenderBuffer> hud_vbo[kFramesInFlight];
     std::unique_ptr<plume::RenderBuffer> dyn_vbo[kFramesInFlight];
+    std::unique_ptr<plume::RenderBuffer> dyn_ibo[kFramesInFlight];
 
     // Batched static world mega-VBO/IBOs + dynamic mesh/texture GPU caches & safe retirement queue
     std::vector<StaticBatch> static_batches;
@@ -397,9 +450,22 @@ struct RemasterEngine {
     uint64_t render_frame_id = 0;
     uint32_t uploaded_track_gen = 0;
     bool logged_first_draw = false;
+    bool logged_first_water = false;
     double frame_ms_sum = 0.0;
     double frame_ms_max = 0.0;
     uint32_t frame_ms_count = 0;
+
+    // Reactive water wake ring buffer + 3D wheel spray particle pool
+    static constexpr uint32_t kMaxWaterWakes = 32;
+    static constexpr uint32_t kMaxSprayParticles = 512;
+    WaterWakeStamp water_wakes[kMaxWaterWakes]{};
+    uint32_t water_wake_cursor = 0;
+    std::vector<TrackedWaterVehicle> tracked_water_vehicles;
+    uint32_t water_wake_track_gen = 0;
+    WaterSprayParticle spray_pool[kMaxSprayParticles]{};
+    uint32_t spray_cursor = 0;
+    uint32_t spray_rng = 0x13579BDFu;
+    std::string last_water_tex_id;
 };
 
 RemasterEngine g_eng;
@@ -481,24 +547,86 @@ void gc_retired_resources() {
 }
 
 // MUST only be called OUTSIDE any active render pass (in the pre-pass before Pass 1).
+// Generates a full trilinear mipmap chain so 16x Anisotropic Filtering keeps roads, fences,
+// billboards, and track surfaces razor-sharp to the horizon with zero distant shimmer.
 std::unique_ptr<plume::RenderTexture> upload_rgba8_texture(plume::RenderCommandList &list,
                                                            const CpuImageRgba8 &img) {
     using namespace plume;
     if (img.width == 0 || img.height == 0 || img.pixels.empty()) return nullptr;
+
+    uint32_t mip_levels = 1;
+    for (uint32_t mw = img.width, mh = img.height; mw > 1 || mh > 1; ++mip_levels) {
+        mw = std::max(1u, mw >> 1);
+        mh = std::max(1u, mh >> 1);
+    }
+
     auto tex = g_eng.dev->createTexture(
-        RenderTextureDesc::Texture2D(img.width, img.height, 1, RenderFormat::R8G8B8A8_UNORM));
+        RenderTextureDesc::Texture2D(img.width, img.height, mip_levels, RenderFormat::R8G8B8A8_UNORM));
     if (!tex) return nullptr;
-    const size_t bytes = img.pixels.size();
-    auto stage = g_eng.dev->createBuffer(RenderBufferDesc::UploadBuffer(bytes, RenderBufferFlag::NONE));
+
+    // Build all mip levels into one contiguous staging buffer (2x2 box filter).
+    struct MipSlice {
+        uint32_t w, h;
+        uint64_t offset;
+        std::vector<uint8_t> data;
+    };
+    std::vector<MipSlice> mips;
+    mips.reserve(mip_levels);
+    uint64_t total_bytes = 0;
+    {
+        MipSlice m0{};
+        m0.w = img.width;
+        m0.h = img.height;
+        m0.offset = 0;
+        m0.data = img.pixels;
+        total_bytes += m0.data.size();
+        mips.push_back(std::move(m0));
+    }
+    for (uint32_t level = 1; level < mip_levels; ++level) {
+        const auto &prev = mips[level - 1];
+        MipSlice cur{};
+        cur.w = std::max(1u, prev.w >> 1);
+        cur.h = std::max(1u, prev.h >> 1);
+        // Align staging offset to 16 bytes for Vulkan buffer-to-image copy compliance
+        total_bytes = (total_bytes + 15ull) & ~15ull;
+        cur.offset = total_bytes;
+        cur.data.resize(static_cast<size_t>(cur.w) * cur.h * 4u);
+        for (uint32_t y = 0; y < cur.h; ++y) {
+            const uint32_t sy0 = std::min(prev.h - 1u, y * 2u);
+            const uint32_t sy1 = std::min(prev.h - 1u, y * 2u + 1u);
+            for (uint32_t x = 0; x < cur.w; ++x) {
+                const uint32_t sx0 = std::min(prev.w - 1u, x * 2u);
+                const uint32_t sx1 = std::min(prev.w - 1u, x * 2u + 1u);
+                const uint8_t *p00 = prev.data.data() + (static_cast<size_t>(sy0) * prev.w + sx0) * 4u;
+                const uint8_t *p10 = prev.data.data() + (static_cast<size_t>(sy0) * prev.w + sx1) * 4u;
+                const uint8_t *p01 = prev.data.data() + (static_cast<size_t>(sy1) * prev.w + sx0) * 4u;
+                const uint8_t *p11 = prev.data.data() + (static_cast<size_t>(sy1) * prev.w + sx1) * 4u;
+                uint8_t *dst = cur.data.data() + (static_cast<size_t>(y) * cur.w + x) * 4u;
+                for (int c = 0; c < 4; ++c) {
+                    dst[c] = static_cast<uint8_t>((static_cast<uint32_t>(p00[c]) + p10[c] + p01[c] + p11[c] + 2u) >> 2);
+                }
+            }
+        }
+        total_bytes += cur.data.size();
+        mips.push_back(std::move(cur));
+    }
+
+    auto stage = g_eng.dev->createBuffer(RenderBufferDesc::UploadBuffer(total_bytes, RenderBufferFlag::NONE));
     if (!stage) return nullptr;
     if (void *p = stage->map()) {
-        std::memcpy(p, img.pixels.data(), bytes);
+        uint8_t *base = static_cast<uint8_t *>(p);
+        for (const auto &m : mips) {
+            std::memcpy(base + m.offset, m.data.data(), m.data.size());
+        }
         stage->unmap();
     }
     list.barriers(RenderBarrierStage::COPY, RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
-    list.copyTextureRegion(RenderTextureCopyLocation::Subresource(tex.get()),
-                           RenderTextureCopyLocation::PlacedFootprint(
-                               stage.get(), RenderFormat::R8G8B8A8_UNORM, img.width, img.height, 1, img.width));
+    for (uint32_t level = 0; level < mip_levels; ++level) {
+        const auto &m = mips[level];
+        list.copyTextureRegion(RenderTextureCopyLocation::Subresource(tex.get(), level, 0),
+                               RenderTextureCopyLocation::PlacedFootprint(
+                                   stage.get(), RenderFormat::R8G8B8A8_UNORM, m.w, m.h, 1, m.w, m.offset));
+    }
     list.barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
     // Keep staging buffer alive until GPU finishes executing the copy!
     retire_buffer(std::move(stage));
@@ -521,7 +649,10 @@ GpuTextureSet *ensure_gpu_texture_set(plume::RenderCommandList &list, const std:
     set->has_alpha_cutout = cpu->has_alpha_cutout;
     set->has_alpha_blend  = cpu->has_alpha_blend;
     set->has_alpha_additive = cpu->has_alpha_additive;
+    set->has_resolved_material = true;
+    set->has_material_table_match = cpu->has_material_table_match;
     set->resolved_emissive_scale = cpu->material.emissive_scale;
+    set->resolved_material = cpu->material;
     set->albedo    = upload_rgba8_texture(list, cpu->albedo);
     set->normal    = upload_rgba8_texture(list, cpu->normal);
     set->roughness = upload_rgba8_texture(list, cpu->roughness);
@@ -753,6 +884,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
         std::string texture_id;
         uint32_t alpha_mode = 0;
         uint32_t optional_terrain_mask = 0;
+        int16_t layer_index = 0;
         int32_t rough_q = 0;
         int32_t metal_q = 0;
         int32_t emissive_q = 0;
@@ -764,7 +896,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
 
         bool operator==(const BatchKey &o) const {
             return cell_x == o.cell_x && cell_z == o.cell_z && alpha_mode == o.alpha_mode &&
-                   optional_terrain_mask == o.optional_terrain_mask &&
+                   optional_terrain_mask == o.optional_terrain_mask && layer_index == o.layer_index &&
                    rough_q == o.rough_q && metal_q == o.metal_q && emissive_q == o.emissive_q &&
                    is_optional_terrain == o.is_optional_terrain && is_sky == o.is_sky &&
                    is_foliage == o.is_foliage && cast_shadow == o.cast_shadow &&
@@ -781,6 +913,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
             mix(static_cast<uint32_t>(k.cell_z));
             mix(k.alpha_mode);
             mix(k.optional_terrain_mask);
+            mix(static_cast<uint32_t>(static_cast<int32_t>(k.layer_index)));
             mix(static_cast<uint32_t>(k.rough_q));
             mix(static_cast<uint32_t>(k.metal_q));
             mix(static_cast<uint32_t>(k.emissive_q));
@@ -793,6 +926,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
     struct BatchBuild {
         BatchKey key;
         PbrMaterial mat;
+        uint32_t first_order = 0;
         std::vector<PbrVertex> verts;
         std::vector<uint32_t> indices;
     };
@@ -802,17 +936,19 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
     std::vector<BatchBuild> builds;
     builds.reserve(256);
 
+    uint32_t inst_order = 0;
     for (const auto &inst : world.instances) {
+        const uint32_t cur_order = inst_order++;
         auto cpu = AssetRegistry::instance().get_mesh(inst.mesh_handle);
         if (!cpu || cpu->vertices.empty() || cpu->indices.empty()) continue;
 
         GpuTextureSet *gt = lookup_gpu_texture_set(cpu->texture_id);
-        const bool is_additive = !inst.is_sky && (cpu->material.alpha_additive || (gt && gt->has_alpha_additive));
-        const bool is_cutout = !inst.is_sky && !is_additive && (cpu->material.alpha_cutout || (gt && gt->has_alpha_cutout));
-        const bool is_blend = !inst.is_sky && !is_additive && !is_cutout && (cpu->material.alpha_blend || (gt && gt->has_alpha_blend));
+        PbrMaterial mat = (!inst.is_sky && gt && gt->has_resolved_material) ? gt->resolved_material : cpu->material;
+        const bool is_additive = !inst.is_sky && (mat.alpha_additive || (gt && gt->has_alpha_additive));
+        const bool is_cutout = !inst.is_sky && !is_additive && (mat.alpha_cutout || (gt && gt->has_alpha_cutout));
+        const bool is_blend = !inst.is_sky && !is_additive && !is_cutout && (mat.alpha_blend || (gt && gt->has_alpha_blend));
         const uint32_t alpha_mode = is_additive ? 3u : (is_cutout ? 1u : (is_blend ? 2u : 0u));
 
-        PbrMaterial mat = cpu->material;
         if (is_additive) {
             mat.alpha_additive = true;
             mat.alpha_cutout = false;
@@ -832,6 +968,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
         key.texture_id = cpu->texture_id;
         key.alpha_mode = alpha_mode;
         key.optional_terrain_mask = inst.optional_terrain_mask;
+        key.layer_index = cpu->layer_index;
         key.rough_q = static_cast<int32_t>(std::lround(mat.roughness * 100.0f));
         key.metal_q = static_cast<int32_t>(std::lround(mat.metallic * 100.0f));
         key.emissive_q = static_cast<int32_t>(std::lround(mat.emissive_scale * 100.0f));
@@ -846,7 +983,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
         if (it == key_to_idx.end()) {
             bi = builds.size();
             key_to_idx[key] = bi;
-            builds.push_back(BatchBuild{key, mat, {}, {}});
+            builds.push_back(BatchBuild{key, mat, cur_order, {}, {}});
         } else {
             bi = it->second;
         }
@@ -898,6 +1035,8 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
         sb.material = b.mat;
         sb.alpha_mode = b.key.alpha_mode;
         sb.optional_terrain_mask = b.key.optional_terrain_mask;
+        sb.layer_index = b.key.layer_index;
+        sb.first_order = b.first_order;
         sb.is_optional_terrain = b.key.is_optional_terrain;
         sb.is_sky = b.key.is_sky;
         sb.is_foliage = b.key.is_foliage;
@@ -906,11 +1045,20 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
         g_eng.static_batches.push_back(std::move(sb));
     }
 
-    // Sort by (is_sky, alpha_mode, double_sided, texture_id) to minimize pipeline & descriptor binds
+    // Sort:
+    //  - Opaque/cutout & sky: by (is_sky, alpha_mode, double_sided, texture_id) for minimal state changes.
+    //  - Alpha-blended/additive overlays: preserve (layer_index, first_order) so coplanar road/dirt
+    //    strips & decals composite in deterministic GRAF artist painter's order.
     std::sort(g_eng.static_batches.begin(), g_eng.static_batches.end(),
               [](const StaticBatch &a, const StaticBatch &b) {
-                  return std::tie(a.is_sky, a.alpha_mode, a.double_sided, a.texture_id) <
-                         std::tie(b.is_sky, b.alpha_mode, b.double_sided, b.texture_id);
+                  if (a.is_sky != b.is_sky) return a.is_sky < b.is_sky;
+                  if (a.alpha_mode != b.alpha_mode) return a.alpha_mode < b.alpha_mode;
+                  if (a.alpha_mode >= 2u) {
+                      return std::tie(a.layer_index, a.first_order) <
+                             std::tie(b.layer_index, b.first_order);
+                  }
+                  return std::tie(a.double_sided, a.texture_id) <
+                         std::tie(b.double_sided, b.texture_id);
               });
 }
 
@@ -932,11 +1080,13 @@ bool initialize() {
     g_eng.list = g_eng.queue->createCommandList();
     if (!g_eng.list) return false;
 
-    // Samplers: linear wrap for PBR textures, linear clamp+comparison for CSM shadow maps
+    // Samplers: 16x Anisotropic trilinear wrap for PBR textures, linear clamp+comparison for CSM shadow maps
     RenderSamplerDesc sd{};
     sd.minFilter = sd.magFilter = RenderFilter::LINEAR;
     sd.mipmapMode = RenderMipmapMode::LINEAR;
     sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::WRAP;
+    sd.anisotropyEnabled = true;
+    sd.maxAnisotropy = 16;
     g_eng.samp_linear = g_eng.dev->createSampler(sd);
 
     RenderSamplerDesc shd{};
@@ -1013,14 +1163,14 @@ bool initialize() {
         d.renderTargetBlend[0].renderTargetWriteMask = 15;
         d.depthTargetFormat = RenderFormat::D32_FLOAT;
         d.depthEnabled = d.depthWriteEnabled = true;
-        d.depthFunction = RenderComparisonFunction::LESS_EQUAL;
+        d.depthFunction = RenderComparisonFunction::GREATER_EQUAL; // Reversed-Z (near=1.0, far=0.0)
         g_eng.pipe_cubemap = g_eng.dev->createGraphicsPipeline(d);
 
         d.depthWriteEnabled = false;
         g_eng.pipe_cubemap_sky = g_eng.dev->createGraphicsPipeline(d);
     }
 
-    // Pass 3 Pipelines (Forward+ Linear HDR PBR: opaque, double-sided foliage, sky dome no-depth-write)
+    // Pass 3 Pipelines (Forward+ Linear HDR PBR: Reversed-Z [1.0 -> 0.0] + depth bias for coplanar overlays)
     {
         RenderGraphicsPipelineDesc d{};
         d.pipelineLayout = g_eng.pbr_layout.get();
@@ -1036,17 +1186,21 @@ bool initialize() {
         d.renderTargetBlend[0].renderTargetWriteMask = 15;
         d.depthTargetFormat = RenderFormat::D32_FLOAT;
         d.depthEnabled = d.depthWriteEnabled = true;
-        d.depthFunction = RenderComparisonFunction::LESS_EQUAL;
+        d.depthFunction = RenderComparisonFunction::GREATER_EQUAL; // Reversed-Z
         g_eng.pipe_pbr_opaque = g_eng.dev->createGraphicsPipeline(d);
 
         d.cullMode = RenderCullMode::NONE;
         g_eng.pipe_pbr_double_sided = g_eng.dev->createGraphicsPipeline(d);
 
         d.depthWriteEnabled = false;
-        d.depthFunction = RenderComparisonFunction::LESS_EQUAL;
+        d.depthFunction = RenderComparisonFunction::GREATER_EQUAL;
         g_eng.pipe_pbr_sky = g_eng.dev->createGraphicsPipeline(d);
 
+        // Positive depth bias in Reversed-Z pulls coplanar road-edge/decal overlays slightly toward
+        // the camera so they cleanly pass GREATER_EQUAL over base terrain without Z-fighting.
         d.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+        d.depthBias = 8;
+        d.slopeScaledDepthBias = 1.5f;
         g_eng.pipe_pbr_alpha_blend = g_eng.dev->createGraphicsPipeline(d);
 
         // Additive pipeline for bridge string lights, flares, and stadium spotlight beam cones:
@@ -1061,6 +1215,8 @@ bool initialize() {
         add_blend.blendOpAlpha = RenderBlendOperation::ADD;
         add_blend.renderTargetWriteMask = 15;
         d.renderTargetBlend[0] = add_blend;
+        d.depthBias = 4;
+        d.slopeScaledDepthBias = 1.0f;
         g_eng.pipe_pbr_additive = g_eng.dev->createGraphicsPipeline(d);
     }
 
@@ -1150,7 +1306,8 @@ bool initialize() {
         g_eng.frame_ds[s]  = g_eng.dev->createDescriptorSet(frame_ds_desc());
         g_eng.hud_vbo[s]   = g_eng.dev->createBuffer(RenderBufferDesc::UploadBuffer(sizeof(HudVertex) * 6 * 512, RenderBufferFlag::VERTEX));
         g_eng.dyn_vbo[s]   = g_eng.dev->createBuffer(RenderBufferDesc::UploadBuffer(RemasterEngine::kDynVboSlotBytes, RenderBufferFlag::VERTEX));
-        if (!g_eng.frame_ubo[s] || !g_eng.frame_ds[s] || !g_eng.hud_vbo[s] || !g_eng.dyn_vbo[s]) return false;
+        g_eng.dyn_ibo[s]   = g_eng.dev->createBuffer(RenderBufferDesc::UploadBuffer(RemasterEngine::kDynIboSlotBytes, RenderBufferFlag::INDEX));
+        if (!g_eng.frame_ubo[s] || !g_eng.frame_ds[s] || !g_eng.hud_vbo[s] || !g_eng.dyn_vbo[s] || !g_eng.dyn_ibo[s]) return false;
         bind_frame_ds(g_eng.frame_ds[s].get(), g_eng.frame_ubo[s].get());
         for (uint32_t f = 0; f < 6; ++f) {
             g_eng.cube_ubo[s][f] = g_eng.dev->createBuffer(RenderBufferDesc::UploadBuffer(sizeof(FrameUBO), RenderBufferFlag::CONSTANT));
@@ -1227,8 +1384,11 @@ bool render_frame(const OutputTarget &target) {
     }
 
     std::unordered_map<uint64_t, PosedVboSlice> posed_vbos;
+    std::vector<WaterDrawSlice> water_slices;
     uint8_t *dyn_base = nullptr;
     uint64_t dyn_cursor = 0;
+    uint8_t *dyn_ibo_base = nullptr;
+    uint64_t dyn_ibo_cursor = 0;
     for (size_t ei = 0; ei < frame->entities.size(); ++ei) {
         const auto &ent = frame->entities[ei];
         const bool has_pose = !ent.dent_offsets.empty() || !ent.bone_palette.empty();
@@ -1249,12 +1409,49 @@ bool render_frame(const OutputTarget &target) {
             }
         }
     }
+    if (!frame->water_meshes.empty()) {
+        water_slices.reserve(frame->water_meshes.size());
+        for (size_t wi = 0; wi < frame->water_meshes.size(); ++wi) {
+            const auto &wm = frame->water_meshes[wi];
+            if (wm.vertices.empty() || wm.indices.size() < 3u) continue;
+            ensure_gpu_texture_set(list, wm.texture_id, false, false);
+            if (!dyn_base && g_eng.dyn_vbo[slot]) {
+                dyn_base = static_cast<uint8_t *>(g_eng.dyn_vbo[slot]->map());
+            }
+            if (!dyn_ibo_base && g_eng.dyn_ibo[slot]) {
+                dyn_ibo_base = static_cast<uint8_t *>(g_eng.dyn_ibo[slot]->map());
+            }
+            if (!dyn_base || !dyn_ibo_base) continue;
+            const uint64_t vb_bytes = static_cast<uint64_t>(wm.vertices.size()) * sizeof(PbrVertex);
+            const uint64_t ib_bytes = static_cast<uint64_t>(wm.indices.size()) * sizeof(uint32_t);
+            const uint64_t v_off = (dyn_cursor + 15ull) & ~15ull;
+            const uint64_t i_off = (dyn_ibo_cursor + 15ull) & ~15ull;
+            if (v_off + vb_bytes > RemasterEngine::kDynVboSlotBytes ||
+                i_off + ib_bytes > RemasterEngine::kDynIboSlotBytes) {
+                continue;
+            }
+            std::memcpy(dyn_base + v_off, wm.vertices.data(), static_cast<size_t>(vb_bytes));
+            std::memcpy(dyn_ibo_base + i_off, wm.indices.data(), static_cast<size_t>(ib_bytes));
+            dyn_cursor = v_off + vb_bytes;
+            dyn_ibo_cursor = i_off + ib_bytes;
+            water_slices.push_back(WaterDrawSlice{
+                wi, v_off, i_off,
+                static_cast<uint32_t>(wm.vertices.size()),
+                static_cast<uint32_t>(wm.indices.size())
+            });
+        }
+    }
     if (dyn_base && g_eng.dyn_vbo[slot]) {
         g_eng.dyn_vbo[slot]->unmap();
     }
+    if (dyn_ibo_base && g_eng.dyn_ibo[slot]) {
+        g_eng.dyn_ibo[slot]->unmap();
+    }
 
     // Build CSM cascades strictly from SceneEnvironment.sun_dir + SceneCamera
-    const CsmCascadeSet csm = compute_csm_cascades(cam, frame->env, CsmCascadeSet::kResolution);
+    const bool max_quality = (g_config.detail == "maximum" || g_config.draw_distance >= 4.0f ||
+                              g_config.remaster_engine);
+    const CsmCascadeSet csm = compute_csm_cascades(cam, frame->env, CsmCascadeSet::kResolution, max_quality);
 
     FrameUBO ubo{};
     std::memcpy(ubo.view_proj, cam.view_proj, sizeof(ubo.view_proj));
@@ -1282,6 +1479,247 @@ bool render_frame(const OutputTarget &target) {
     ubo.ambient_ground_pad[0] = frame->env.ambient_ground[0];
     ubo.ambient_ground_pad[1] = frame->env.ambient_ground[1];
     ubo.ambient_ground_pad[2] = frame->env.ambient_ground[2];
+    // Update reactive water wake ripples & 3D wheel water spray particles
+    const float water_time = static_cast<float>(std::fmod(static_cast<double>(g_eng.render_frame_id) / 60.0, 10000.0));
+    ubo.ambient_ground_pad[3] = water_time;
+    if (g_eng.water_wake_track_gen != frame->track_generation) {
+        g_eng.water_wake_track_gen = frame->track_generation;
+        g_eng.tracked_water_vehicles.clear();
+        for (auto &wk : g_eng.water_wakes) wk = WaterWakeStamp{};
+        for (auto &sp : g_eng.spray_pool) sp = WaterSprayParticle{};
+        g_eng.water_wake_cursor = 0;
+        g_eng.spray_cursor = 0;
+    }
+
+    auto next_rand = [&]() -> float {
+        g_eng.spray_rng = g_eng.spray_rng * 1664525u + 1013904223u;
+        return static_cast<float>((g_eng.spray_rng >> 8) & 0xFFFFu) / 65535.0f;
+    };
+
+    float water_y_global = 0.0f;
+    if (!frame->water_meshes.empty()) {
+        float wmin_x = 1e9f, wmax_x = -1e9f, wmin_z = 1e9f, wmax_z = -1e9f, wy_sum = 0.0f;
+        size_t wy_cnt = 0;
+        g_eng.last_water_tex_id = frame->water_meshes[0].texture_id;
+        for (const auto &wm : frame->water_meshes) {
+            for (const auto &v : wm.vertices) {
+                wmin_x = std::min(wmin_x, v.pos[0]);
+                wmax_x = std::max(wmax_x, v.pos[0]);
+                wmin_z = std::min(wmin_z, v.pos[2]);
+                wmax_z = std::max(wmax_z, v.pos[2]);
+                wy_sum += v.pos[1];
+                ++wy_cnt;
+            }
+        }
+        water_y_global = wy_cnt > 0 ? (wy_sum / static_cast<float>(wy_cnt)) : 0.0f;
+        auto push_wake = [&](float wx, float wz, float strength) {
+            auto &dst = g_eng.water_wakes[g_eng.water_wake_cursor % RemasterEngine::kMaxWaterWakes];
+            dst.x = wx;
+            dst.z = wz;
+            dst.birth_t = water_time;
+            dst.strength = std::clamp(strength, 0.1f, 1.0f);
+            ++g_eng.water_wake_cursor;
+        };
+        auto spawn_spray = [&](float px, float py, float pz, float vx, float vy, float vz,
+                               float lifetime, float s0, float s1, bool is_droplet) {
+            auto &p = g_eng.spray_pool[g_eng.spray_cursor % RemasterEngine::kMaxSprayParticles];
+            ++g_eng.spray_cursor;
+            p.pos[0] = px; p.pos[1] = py; p.pos[2] = pz;
+            p.vel[0] = vx; p.vel[1] = vy; p.vel[2] = vz;
+            p.age = 0.0f;
+            p.lifetime = lifetime;
+            p.size_start = s0;
+            p.size_end = s1;
+            p.seed = next_rand() * 100.0f;
+            p.is_droplet = is_droplet ? 1.0f : 0.0f;
+        };
+
+        std::vector<TrackedWaterVehicle> next_tracked;
+        next_tracked.reserve(32);
+        for (const auto &ent : frame->entities) {
+            if (!ent.is_vehicle && !ent.is_player_vehicle) continue;
+            const float ex = ent.world_matrix[9];
+            const float ey = ent.world_matrix[10];
+            const float ez = ent.world_matrix[11];
+            if (!std::isfinite(ex) || !std::isfinite(ey) || !std::isfinite(ez)) continue;
+            if (ex < wmin_x - 3.0f || ex > wmax_x + 3.0f || ez < wmin_z - 3.0f || ez > wmax_z + 3.0f) continue;
+            if (ey < water_y_global - 2.5f || ey > water_y_global + 2.5f) continue;
+
+            // Deduplicate multi-part vehicles (chassis + wheels) within 2.5m
+            bool dup = false;
+            for (const auto &nt : next_tracked) {
+                const float ddx = ex - nt.x, ddz = ez - nt.z;
+                if (ddx * ddx + ddz * ddz < 6.25f) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            const TrackedWaterVehicle *prev = nullptr;
+            float best_d2 = 36.0f;
+            for (const auto &pt : g_eng.tracked_water_vehicles) {
+                const float ddx = ex - pt.x, ddz = ez - pt.z;
+                const float d2 = ddx * ddx + ddz * ddz;
+                if (d2 < best_d2) { best_d2 = d2; prev = &pt; }
+            }
+
+            TrackedWaterVehicle cur{};
+            cur.x = ex;
+            cur.z = ez;
+            if (prev) {
+                cur.last_stamp_x = prev->last_stamp_x;
+                cur.last_stamp_z = prev->last_stamp_z;
+                cur.last_stamp_t = prev->last_stamp_t;
+                const float vx_car = (ex - prev->x) * 60.0f;
+                const float vz_car = (ez - prev->z) * 60.0f;
+                const float speed_mps = std::sqrt(vx_car * vx_car + vz_car * vz_car);
+                const float sdx = ex - cur.last_stamp_x;
+                const float sdz = ez - cur.last_stamp_z;
+                const float dist_since = std::sqrt(sdx * sdx + sdz * sdz);
+                const float dt_since = water_time - cur.last_stamp_t;
+
+                // Right & Forward axes of the vehicle from EE 4x3 world_matrix
+                const float rx = ent.world_matrix[0], rz = ent.world_matrix[2];
+                const float fx = ent.world_matrix[6], fz = ent.world_matrix[8];
+
+                // Only disturb water when the vehicle is actually moving (still pond when parked!)
+                if (speed_mps > 0.8f && (dist_since >= 1.1f || dt_since >= 0.11f)) {
+                    const float str = std::clamp(0.28f + speed_mps * 0.048f, 0.28f, 1.0f);
+                    // Stamp dual left/right wheel wakes for a realistic twin-track Kelvin wake
+                    push_wake(ex - rx * 0.80f, ez - rz * 0.80f, str * 0.85f);
+                    push_wake(ex + rx * 0.80f, ez + rz * 0.80f, str * 0.85f);
+                    cur.last_stamp_x = ex;
+                    cur.last_stamp_z = ez;
+                    cur.last_stamp_t = water_time;
+                }
+
+                // Kick up 3D wheel water spray mist & glistening droplets proportional to speed!
+                if (speed_mps > 1.5f) {
+                    const float intensity = std::clamp((speed_mps - 1.5f) / 14.0f, 0.15f, 1.0f);
+                    const int bursts = (intensity > 0.55f) ? 2 : 1;
+                    static constexpr float kWheelOff[4][2] = {
+                        {-0.92f,  1.35f}, { 0.92f,  1.35f},
+                        {-0.92f, -1.35f}, { 0.92f, -1.35f},
+                    };
+                    for (int b = 0; b < bursts; ++b) {
+                        for (int w = 0; w < 4; ++w) {
+                            if (next_rand() > 0.45f + intensity * 0.50f) continue;
+                            const float side = (kWheelOff[w][0] < 0.0f) ? -1.0f : 1.0f;
+                            const float wx = ex + rx * kWheelOff[w][0] + fx * kWheelOff[w][1];
+                            const float wz = ez + rz * kWheelOff[w][0] + fz * kWheelOff[w][1];
+                            const float wy = water_y_global + 0.12f;
+                            const float out_v = (1.6f + next_rand() * 2.8f) * intensity * side;
+                            const float up_v  = (1.8f + next_rand() * 3.4f) * intensity;
+                            const float back_v = -0.35f + (next_rand() - 0.5f) * 0.25f;
+                            const float pvx = vx_car * back_v + rx * out_v + (next_rand() - 0.5f) * 1.2f;
+                            const float pvz = vz_car * back_v + rz * out_v + (next_rand() - 0.5f) * 1.2f;
+                            const bool drop = (next_rand() > 0.42f);
+                            if (drop) {
+                                spawn_spray(wx, wy, wz, pvx * 1.15f, up_v * 1.25f, pvz * 1.15f,
+                                            0.45f + next_rand() * 0.35f, 0.18f, 0.34f, true);
+                            } else {
+                                spawn_spray(wx, wy + 0.08f, wz, pvx * 0.75f, up_v * 0.80f, pvz * 0.75f,
+                                            0.55f + next_rand() * 0.45f, 0.35f, 1.15f + intensity * 0.65f, false);
+                            }
+                        }
+                    }
+                }
+            } else {
+                cur.last_stamp_x = ex;
+                cur.last_stamp_z = ez;
+                cur.last_stamp_t = water_time;
+            }
+            next_tracked.push_back(cur);
+        }
+        g_eng.tracked_water_vehicles = std::move(next_tracked);
+
+        uint32_t active_wakes = 0;
+        for (uint32_t wi = 0; wi < RemasterEngine::kMaxWaterWakes; ++wi) {
+            const auto &wk = g_eng.water_wakes[wi];
+            const float age = water_time - wk.birth_t;
+            if (wk.strength > 0.001f && age >= 0.0f && age <= 4.2f) {
+                ubo.water_wakes[active_wakes][0] = wk.x;
+                ubo.water_wakes[active_wakes][1] = wk.z;
+                ubo.water_wakes[active_wakes][2] = wk.birth_t;
+                ubo.water_wakes[active_wakes][3] = wk.strength;
+                ++active_wakes;
+            }
+        }
+        ubo.water_wake_meta[0] = static_cast<float>(active_wakes);
+        ubo.water_wake_meta[1] = water_y_global;
+    }
+
+    // Step 3D ballistic water spray particles (gravity + air drag) & build camera-facing quads
+    constexpr float kDt = 1.0f / 60.0f;
+    static thread_local std::vector<PbrVertex> spray_verts;
+    static thread_local std::vector<uint32_t> spray_inds;
+    spray_verts.clear();
+    spray_inds.clear();
+    const float cam_rx = cam.rotation[0], cam_ry = cam.rotation[1], cam_rz = cam.rotation[2];
+    const float cam_ux = cam.rotation[3], cam_uy = cam.rotation[4], cam_uz = cam.rotation[5];
+    for (auto &sp : g_eng.spray_pool) {
+        if (sp.lifetime <= 0.0f || sp.age >= sp.lifetime) continue;
+        sp.age += kDt;
+        if (sp.age >= sp.lifetime) { sp.lifetime = 0.0f; continue; }
+        sp.vel[1] -= 9.8f * kDt; // real gravity
+        const float drag = sp.is_droplet > 0.5f ? 0.985f : 0.955f;
+        sp.vel[0] *= drag;
+        sp.vel[2] *= drag;
+        sp.pos[0] += sp.vel[0] * kDt;
+        sp.pos[1] += sp.vel[1] * kDt;
+        sp.pos[2] += sp.vel[2] * kDt;
+        if (sp.pos[1] < water_y_global - 0.1f && sp.vel[1] < 0.0f) {
+            sp.lifetime = 0.0f;
+            continue;
+        }
+        const float t_life = std::clamp(sp.age / sp.lifetime, 0.0f, 1.0f);
+        const float half_sz = 0.5f * (sp.size_start + (sp.size_end - sp.size_start) * t_life);
+        const float fade_in = std::min(1.0f, t_life * 5.0f);
+        const float fade_out = (1.0f - t_life) * (1.0f - t_life);
+        const float alpha = fade_in * fade_out * (sp.is_droplet > 0.5f ? 0.88f : 0.46f);
+        const uint32_t vb = static_cast<uint32_t>(spray_verts.size());
+        static constexpr float kCorner[4][2] = {{-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
+        static constexpr float kUV[4][2]     = {{ 0.0f,  0.0f}, {1.0f,  0.0f}, {1.0f, 1.0f}, { 0.0f, 1.0f}};
+        for (int c = 0; c < 4; ++c) {
+            PbrVertex v{};
+            v.pos[0] = sp.pos[0] + (cam_rx * kCorner[c][0] + cam_ux * kCorner[c][1]) * half_sz;
+            v.pos[1] = sp.pos[1] + (cam_ry * kCorner[c][0] + cam_uy * kCorner[c][1]) * half_sz;
+            v.pos[2] = sp.pos[2] + (cam_rz * kCorner[c][0] + cam_uz * kCorner[c][1]) * half_sz;
+            v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+            v.tangent[0] = alpha;
+            v.tangent[1] = sp.seed;
+            v.tangent[2] = sp.is_droplet;
+            v.tangent[3] = 1.0f;
+            v.uv[0] = kUV[c][0];
+            v.uv[1] = kUV[c][1];
+            spray_verts.push_back(v);
+        }
+        spray_inds.push_back(vb + 0); spray_inds.push_back(vb + 1); spray_inds.push_back(vb + 2);
+        spray_inds.push_back(vb + 0); spray_inds.push_back(vb + 2); spray_inds.push_back(vb + 3);
+    }
+
+    WaterDrawSlice spray_slice{};
+    if (!spray_verts.empty() && !spray_inds.empty() && g_eng.dyn_vbo[slot] && g_eng.dyn_ibo[slot]) {
+        const uint64_t vb_bytes = static_cast<uint64_t>(spray_verts.size()) * sizeof(PbrVertex);
+        const uint64_t ib_bytes = static_cast<uint64_t>(spray_inds.size()) * sizeof(uint32_t);
+        const uint64_t v_off = (dyn_cursor + 15ull) & ~15ull;
+        const uint64_t i_off = (dyn_ibo_cursor + 15ull) & ~15ull;
+        if (v_off + vb_bytes <= RemasterEngine::kDynVboSlotBytes &&
+            i_off + ib_bytes <= RemasterEngine::kDynIboSlotBytes) {
+            if (auto *vb_p = static_cast<uint8_t *>(g_eng.dyn_vbo[slot]->map())) {
+                std::memcpy(vb_p + v_off, spray_verts.data(), static_cast<size_t>(vb_bytes));
+                g_eng.dyn_vbo[slot]->unmap();
+            }
+            if (auto *ib_p = static_cast<uint8_t *>(g_eng.dyn_ibo[slot]->map())) {
+                std::memcpy(ib_p + i_off, spray_inds.data(), static_cast<size_t>(ib_bytes));
+                g_eng.dyn_ibo[slot]->unmap();
+            }
+            dyn_cursor = v_off + vb_bytes;
+            dyn_ibo_cursor = i_off + ib_bytes;
+            spray_slice.vbo_offset = v_off;
+            spray_slice.ibo_offset = i_off;
+            spray_slice.vertex_count = static_cast<uint32_t>(spray_verts.size());
+            spray_slice.index_count = static_cast<uint32_t>(spray_inds.size());
+        }
+    }
     ubo.fog_color_density[0] = frame->env.fog_color[0];
     ubo.fog_color_density[1] = frame->env.fog_color[1];
     ubo.fog_color_density[2] = frame->env.fog_color[2];
@@ -1345,12 +1783,6 @@ bool render_frame(const OutputTarget &target) {
             }
 
             if (!sb.is_sky) {
-                if (shadow_pass) {
-                    if (cascade_idx == 1u && sb.radius < 1.0f) return;
-                    if (cascade_idx == 2u && (sb.radius < 3.5f || sb.is_foliage)) return;
-                } else if (cubemap_pass) {
-                    if (sb.radius < 0.8f) return;
-                }
                 if (max_dist > 0.0f && view_origin) {
                     const float dx = sb.center[0] - view_origin[0];
                     const float dy = sb.center[1] - view_origin[1];
@@ -1443,17 +1875,23 @@ bool render_frame(const OutputTarget &target) {
             if (shadow_pass && !ent.cast_shadow) continue;
             if (cubemap_pass && ent.is_player_vehicle) continue; // Exclude player vehicle from its own reflection probe
 
-            // Coarse entity-level distance & frustum cull (conservative 8m sphere covers any vehicle/prop)
+            // True per-entity bounding sphere (floored at 18m) so trucks, buses, trailers, and large
+            // dynamic props NEVER clip or pop at widescreen (16:9 / 21:9 / 32:9) edges.
             const float ex = ent.world_matrix[9], ey = ent.world_matrix[10], ez = ent.world_matrix[11];
-            constexpr float kEntRadius = 8.0f;
+            float ent_radius = 18.0f;
+            for (uint32_t handle : ent.part_handles) {
+                if (auto mit = g_eng.gpu_meshes.find(handle); mit != g_eng.gpu_meshes.end() && mit->second) {
+                    ent_radius = std::max(ent_radius, mit->second->radius + 4.0f);
+                }
+            }
             if (max_dist > 0.0f && view_origin) {
                 const float dx = ex - view_origin[0];
                 const float dy = ey - view_origin[1];
                 const float dz = ez - view_origin[2];
-                const float limit = max_dist + kEntRadius;
+                const float limit = max_dist + ent_radius;
                 if (dx * dx + dy * dy + dz * dz > limit * limit) continue;
             }
-            if (!frustum_intersects_sphere(frustum, ex, ey, ez, kEntRadius)) continue;
+            if (!frustum_intersects_sphere(frustum, ex, ey, ez, ent_radius)) continue;
 
             for (uint32_t handle : ent.part_handles) {
                 auto mit = g_eng.gpu_meshes.find(handle);
@@ -1463,9 +1901,10 @@ bool render_frame(const OutputTarget &target) {
                 GpuTextureSet *gt = lookup_gpu_texture_set(tex_id);
                 if (!gt || !gt->ds) continue;
 
-                const bool is_additive = gm->material.alpha_additive || gt->has_alpha_additive;
-                const bool is_cutout = !is_additive && (gm->material.alpha_cutout || gt->has_alpha_cutout);
-                const bool is_blend = !is_additive && !is_cutout && (gm->material.alpha_blend || gt->has_alpha_blend);
+                const PbrMaterial &mat = gt->has_resolved_material ? gt->resolved_material : gm->material;
+                const bool is_additive = mat.alpha_additive || gt->has_alpha_additive;
+                const bool is_cutout = !is_additive && (mat.alpha_cutout || gt->has_alpha_cutout);
+                const bool is_blend = !is_additive && !is_cutout && (mat.alpha_blend || gt->has_alpha_blend);
                 const bool is_trans = is_blend || is_additive;
                 if (shadow_pass) {
                     if (is_trans) continue;
@@ -1478,8 +1917,8 @@ bool render_frame(const OutputTarget &target) {
                     bind_pipe(is_additive ? g_eng.pipe_pbr_additive.get() : g_eng.pipe_pbr_alpha_blend.get());
                 } else {
                     if (is_trans) continue;
-                    bind_pipe((gm->material.double_sided || is_cutout) ? g_eng.pipe_pbr_double_sided.get()
-                                                                       : g_eng.pipe_pbr_opaque.get());
+                    bind_pipe((mat.double_sided || is_cutout) ? g_eng.pipe_pbr_double_sided.get()
+                                                              : g_eng.pipe_pbr_opaque.get());
                 }
 
                 // Transpose EE 4x3 row-vector matrix (m[0..2]=X, m[3..5]=Y, m[6..8]=Z, m[9..11]=T)
@@ -1490,13 +1929,13 @@ bool render_frame(const OutputTarget &target) {
                 pc.model[4]  = m[1]; pc.model[5]  = m[4]; pc.model[6]  = m[7]; pc.model[7]  = m[10];
                 pc.model[8]  = m[2]; pc.model[9]  = m[5]; pc.model[10] = m[8]; pc.model[11] = m[11];
                 pc.model[12] = 0.0f; pc.model[13] = 0.0f; pc.model[14] = 0.0f; pc.model[15] = 1.0f;
-                std::memcpy(pc.base_color, gm->material.base_color, sizeof(pc.base_color));
-                pc.pbr_params[0] = gm->material.roughness;
-                pc.pbr_params[1] = gm->material.metallic;
-                pc.pbr_params[2] = gm->material.ao;
-                pc.pbr_params[3] = (is_additive && gm->material.emissive_scale <= 0.0f)
+                std::memcpy(pc.base_color, mat.base_color, sizeof(pc.base_color));
+                pc.pbr_params[0] = mat.roughness;
+                pc.pbr_params[1] = mat.metallic;
+                pc.pbr_params[2] = mat.ao;
+                pc.pbr_params[3] = (is_additive && mat.emissive_scale <= 0.0f)
                                        ? (gt->resolved_emissive_scale > 0.0f ? gt->resolved_emissive_scale : 0.50f)
-                                       : gm->material.emissive_scale;
+                                       : mat.emissive_scale;
                 pc.flags[0] = is_additive ? 3u : (is_cutout ? 1u : (is_blend ? 2u : 0u));
                 pc.flags[1] = 0u;
                 pc.flags[2] = cascade_idx;
@@ -1545,7 +1984,7 @@ bool render_frame(const OutputTarget &target) {
         list.setViewports(RenderViewport(0.0f, 0.0f, (float)CsmCascadeSet::kResolution, (float)CsmCascadeSet::kResolution));
         list.setScissors(RenderRect(0, 0, (int32_t)CsmCascadeSet::kResolution, (int32_t)CsmCascadeSet::kResolution));
         list.clearDepth(true, 1.0f);
-        if (frame->env.is_day || ci == 0u) {
+        if (max_quality || frame->env.is_day || ci == 0u) {
             const Frustum csm_frustum = extract_frustum_from_vp(csm.view_proj[ci]);
             draw_static_world(true, ci, false, nullptr, false, csm_frustum, 0.0f);
             draw_dynamic_entities(true, ci, false, false, csm_frustum, nullptr, 0.0f);
@@ -1556,22 +1995,25 @@ bool render_frame(const OutputTarget &target) {
     }
 
     // ========================================================================
-    // PASS 2: Dynamic 128x128 Environment Reflection Cubemap
-    // (6 faces on first frame, then 1 face every 2 frames for locked 60 FPS!)
+    // PASS 2: Dynamic 256x256 HDR Environment Reflection Cubemap
+    // At Maximum Quality: ALL 6 faces refreshed every frame, unlimited draw distance
+    // (0.0f = no 180m/120m cutoff) and 4000m far plane so reflections never stop or lag.
     // ========================================================================
-    if (!g_eng.cube_faces_initialized || (g_eng.render_frame_id & 1u) == 0u) {
+    {
         const float *base_probe = frame->has_player_vehicle ? frame->player_vehicle_pos : cam.pos;
         const float probe_pos[3] = {base_probe[0], base_probe[1] + 1.4f, base_probe[2]};
         list.barriers(RenderBarrierStage::GRAPHICS,
                       RenderTextureBarrier(g_eng.env_cube.get(), RenderTextureLayout::COLOR_WRITE));
         list.barriers(RenderBarrierStage::GRAPHICS,
                       RenderTextureBarrier(g_eng.env_cube_depth.get(), RenderTextureLayout::DEPTH_WRITE));
-        const uint32_t face_steps = g_eng.cube_faces_initialized ? 1u : 6u;
+        const uint32_t face_steps = (max_quality || !g_eng.cube_faces_initialized) ? 6u : 2u;
+        const float cube_far = max_quality ? 4000.0f : 1500.0f;
+        const float cube_max_dist = max_quality ? 0.0f : 320.0f;
         for (uint32_t step = 0; step < face_steps; ++step) {
             const uint32_t face = (g_eng.cube_face_cursor + step) % 6u;
             if (!g_eng.env_face_fb[face] || !g_eng.cube_ubo[slot][face] || !g_eng.cube_ds[slot][face]) continue;
             FrameUBO cube_u = ubo;
-            build_cubemap_face_vp(probe_pos, face, 1.0f, 600.0f, cube_u.view_proj);
+            build_cubemap_face_vp(probe_pos, face, 0.5f, cube_far, cube_u.view_proj);
             const Frustum cube_frustum = extract_frustum_from_vp(cube_u.view_proj);
             if (void *p = g_eng.cube_ubo[slot][face]->map()) {
                 std::memcpy(p, &cube_u, sizeof(cube_u));
@@ -1582,10 +2024,10 @@ bool render_frame(const OutputTarget &target) {
             list.setScissors(RenderRect(0, 0, (int32_t)RemasterEngine::kCubeRes, (int32_t)RemasterEngine::kCubeRes));
             const RenderColor sky_clear(frame->env.fog_color[0], frame->env.fog_color[1], frame->env.fog_color[2], 1.0f);
             list.clearColor(0, sky_clear);
-            list.clearDepth(true, 1.0f);
+            list.clearDepth(true, 0.0f); // Reversed-Z far clear
             list.setGraphicsDescriptorSet(g_eng.cube_ds[slot][face].get(), 0);
-            draw_static_world(false, 0, true, probe_pos, false, cube_frustum, 180.0f);
-            draw_dynamic_entities(false, 0, true, false, cube_frustum, probe_pos, 120.0f);
+            draw_static_world(false, 0, true, probe_pos, false, cube_frustum, cube_max_dist);
+            draw_dynamic_entities(false, 0, true, false, cube_frustum, probe_pos, cube_max_dist);
             list.setFramebuffer(nullptr);
         }
         g_eng.cube_faces_initialized = true;
@@ -1608,7 +2050,7 @@ bool render_frame(const OutputTarget &target) {
     list.setScissors(RenderRect(0, 0, (int32_t)target.width, (int32_t)target.height));
     const RenderColor bg_clear(frame->env.fog_color[0], frame->env.fog_color[1], frame->env.fog_color[2], 1.0f);
     list.clearColor(0, bg_clear);
-    list.clearDepth(true, 1.0f);
+    list.clearDepth(true, 0.0f); // Reversed-Z far clear
     list.setGraphicsDescriptorSet(g_eng.frame_ds[slot].get(), 0);
     // Pass 3A: Opaque + Alpha-Cutout geometry (CPU frustum culled, batched static world)
     draw_static_world(false, 0, false, cam.pos, false, main_frustum, 0.0f);
@@ -1616,6 +2058,74 @@ bool render_frame(const OutputTarget &target) {
     // Pass 3B: True Linear-HDR Alpha-Blended + Additive geometry (road decals, glass, bridge lights, spotlight cones)
     draw_static_world(false, 0, false, cam.pos, true, main_frustum, 0.0f);
     draw_dynamic_entities(false, 0, false, true, main_frustum, cam.pos, 0.0f);
+
+    // Pass 3B (Water): Physically reflective, rippling EE water surfaces (no CSM, no cubemap, depth-write off)
+    uint64_t water_tris = 0;
+    if (!water_slices.empty()) {
+        const RenderInputSlot pbr_slot(0, sizeof(PbrVertex));
+        list.setPipeline(g_eng.pipe_pbr_alpha_blend.get());
+        RenderDescriptorSet *cur_water_ds = nullptr;
+        for (const auto &ws : water_slices) {
+            const auto &wm = frame->water_meshes[ws.mesh_index];
+            if (!frustum_intersects_sphere(main_frustum, wm.center[0], wm.center[1], wm.center[2], wm.radius))
+                continue;
+            GpuTextureSet *gt = lookup_gpu_texture_set(wm.texture_id);
+            if (!gt || !gt->ds) continue;
+
+            DrawPC pc{};
+            pc.model[0] = pc.model[5] = pc.model[10] = pc.model[15] = 1.0f;
+            pc.base_color[0] = 1.0f; pc.base_color[1] = 1.0f; pc.base_color[2] = 1.0f; pc.base_color[3] = 1.0f;
+            pc.pbr_params[0] = 0.05f; // roughness
+            pc.pbr_params[1] = 0.0f;  // metallic
+            pc.pbr_params[2] = 1.0f;  // ao
+            pc.pbr_params[3] = 0.0f;  // emissive
+            pc.flags[0] = 2u;         // alpha blend
+            pc.flags[1] = 2u;         // water shading mode
+            pc.flags[2] = 0u;
+
+            if (gt->ds.get() != cur_water_ds) {
+                list.setGraphicsDescriptorSet(gt->ds.get(), 1);
+                cur_water_ds = gt->ds.get();
+            }
+            list.setGraphicsPushConstants(0, &pc);
+            const RenderVertexBufferView vbv(RenderBufferReference(g_eng.dyn_vbo[slot].get(), ws.vbo_offset),
+                                             ws.vertex_count * sizeof(PbrVertex));
+            const RenderIndexBufferView ibv(RenderBufferReference(g_eng.dyn_ibo[slot].get(), ws.ibo_offset),
+                                            ws.index_count * sizeof(uint32_t), RenderFormat::R32_UINT);
+            list.setVertexBuffers(0, &vbv, 1, &pbr_slot);
+            list.setIndexBuffer(&ibv);
+            list.drawIndexedInstanced(ws.index_count, 1, 0, 0, 0);
+            ++main_draws;
+            water_tris += ws.index_count / 3u;
+            main_pass_tris += ws.index_count / 3u;
+        }
+    }
+
+    // Pass 3B (Wheel Water Spray): 3D sunlit droplets & roostertail mist plumes kicked up by wheels
+    if (spray_slice.index_count > 0) {
+        GpuTextureSet *gt = lookup_gpu_texture_set(g_eng.last_water_tex_id);
+        if (!gt && !g_eng.gpu_textures.empty()) gt = g_eng.gpu_textures.begin()->second.get();
+        if (gt && gt->ds) {
+            const RenderInputSlot pbr_slot(0, sizeof(PbrVertex));
+            list.setPipeline(g_eng.pipe_pbr_alpha_blend.get());
+            list.setGraphicsDescriptorSet(gt->ds.get(), 1);
+            DrawPC pc{};
+            pc.model[0] = pc.model[5] = pc.model[10] = pc.model[15] = 1.0f;
+            pc.base_color[0] = 1.0f; pc.base_color[1] = 1.0f; pc.base_color[2] = 1.0f; pc.base_color[3] = 1.0f;
+            pc.flags[0] = 2u; // alpha blend
+            pc.flags[1] = 3u; // water spray particle mode
+            list.setGraphicsPushConstants(0, &pc);
+            const RenderVertexBufferView vbv(RenderBufferReference(g_eng.dyn_vbo[slot].get(), spray_slice.vbo_offset),
+                                             spray_slice.vertex_count * sizeof(PbrVertex));
+            const RenderIndexBufferView ibv(RenderBufferReference(g_eng.dyn_ibo[slot].get(), spray_slice.ibo_offset),
+                                            spray_slice.index_count * sizeof(uint32_t), RenderFormat::R32_UINT);
+            list.setVertexBuffers(0, &vbv, 1, &pbr_slot);
+            list.setIndexBuffer(&ibv);
+            list.drawIndexedInstanced(spray_slice.index_count, 1, 0, 0, 0);
+            ++main_draws;
+            main_pass_tris += spray_slice.index_count / 3u;
+        }
+    }
     list.setFramebuffer(nullptr);
 
     // ========================================================================
@@ -1677,15 +2187,18 @@ bool render_frame(const OutputTarget &target) {
         ++g_eng.frame_ms_count;
     }
 
-    if ((!g_eng.logged_first_draw || g_eng.render_frame_id == 460) && main_pass_tris > 0) {
+    if ((!g_eng.logged_first_draw || (!g_eng.logged_first_water && water_tris > 0) || g_eng.render_frame_id == 460) &&
+        main_pass_tris > 0) {
         g_eng.logged_first_draw = true;
-        uint32_t decoded_tex = 0, cutout_tex = 0, blend_tex = 0, add_tex = 0;
+        if (water_tris > 0) g_eng.logged_first_water = true;
+        uint32_t decoded_tex = 0, cutout_tex = 0, blend_tex = 0, add_tex = 0, mat_table_matched = 0;
         for (const auto &kv : g_eng.gpu_textures) {
             if (kv.second && kv.second->albedo_w > 1) {
                 ++decoded_tex;
                 if (kv.second->has_alpha_cutout) ++cutout_tex;
                 if (kv.second->has_alpha_blend) ++blend_tex;
                 if (kv.second->has_alpha_additive) ++add_tex;
+                if (kv.second->has_material_table_match) ++mat_table_matched;
             }
         }
         uint32_t veh_count = 0, drawn_ent = 0;
@@ -1696,16 +2209,20 @@ bool render_frame(const OutputTarget &target) {
         const double mean_ms = g_eng.frame_ms_count > 0 ? (g_eng.frame_ms_sum / g_eng.frame_ms_count) : frame_ms;
         std::fprintf(stderr,
                      "[remaster] frame %llu rendered (%ux%u, debug=%u): static_meshes=%zu static_batches=%zu "
-                     "dynamic_entities=%zu (drawn=%u vehicles=%u) draws(csm=%u cube=%u main=%u total=%u) "
+                     "dynamic_entities=%zu (drawn=%u vehicles=%u) water_meshes=%zu water_tris=%llu "
+                     "draws(csm=%u cube=%u main=%u total=%u) "
                      "cpu_ms(cur=%.2f mean=%.2f max=%.2f) event_mask=0x%x "
-                     "decoded_retail_textures=%u/%zu (cutout=%u blend=%u add=%u) main_tris=%llu "
+                     "decoded_retail_textures=%u/%zu (mat_table_matched=%u/%zu cutout=%u blend=%u add=%u) main_tris=%llu "
                      "is_day=%d sun=%.2f amb=%.2f lights=%u cam=(%.1f,%.1f,%.1f)\n",
                      (unsigned long long)g_eng.render_frame_id, target.width, target.height,
                      g_debug_mode.load(std::memory_order_relaxed),
                      world ? world->instances.size() : 0u, g_eng.static_batches.size(),
-                     frame->entities.size(), drawn_ent, veh_count, csm_draws, cube_draws, main_draws,
+                     frame->entities.size(), drawn_ent, veh_count,
+                     frame->water_meshes.size(), (unsigned long long)water_tris,
+                     csm_draws, cube_draws, main_draws,
                      csm_draws + cube_draws + main_draws, frame_ms, mean_ms, g_eng.frame_ms_max,
                      frame->session_event_mask, decoded_tex, g_eng.gpu_textures.size(),
+                     mat_table_matched, AssetRegistry::material_table_entry_count(),
                      cutout_tex, blend_tex, add_tex, (unsigned long long)main_pass_tris,
                      frame->env.is_day ? 1 : 0, frame->env.sun_intensity, frame->env.ambient_intensity,
                      n_lights, cam.pos[0], cam.pos[1], cam.pos[2]);

@@ -36,9 +36,11 @@
 //
 //   Indexed immediate triangles & cockpit non-queue quad (0x219C48 -> 0x34DB70 -> 0x35CAA0):
 //     0x35CAA0 ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices)
+#include "core/config.h"
 #include "core/cpu.h"
 #include "core/diff_harness.h"
 #include "core/memory.h"
+#include "remaster/scene_bridge.h"
 #include "render/native_renderer.h"
 
 #include <cstdint>
@@ -690,6 +692,9 @@ int32_t imm_vertex_body(uint32_t state, uint32_t colour, uint32_t strip,
     if (feed_native && !diff_in_original_side()) {
         const float xyz[3] = {fbits(x_u), fbits(y_u), fbits(z_u)};
         const float st[2] = {fbits(u_u), fbits(v_u)};
+        if (g_config.remaster_engine && remaster::ee_in_water()) {
+            remaster::ee_water_vertex(xyz, st, colour, strip);
+        }
         if (native::ee_in_water()) native::ee_water_vertex(xyz, st, colour, strip);
         else if (native::ee_in_flare()) native::ee_flare_vertex(xyz, st, colour, strip);
         else if (native::ee_in_imm()) {

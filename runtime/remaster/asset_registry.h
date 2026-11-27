@@ -23,12 +23,17 @@ struct CpuImageRgba8 {
     uint32_t width = 0;
     uint32_t height = 0;
     bool is_srgb = true;
+    uint64_t index_key = 0;
+    uint64_t palette_key = 0;
+    bool has_indexed_keys = false;
     std::vector<uint8_t> pixels; // RGBA8 tightly packed
 };
 
 struct PbrTextureSet {
     std::string texture_id;
     bool has_hd_override = false;
+    bool has_material_table_match = false;
+    std::string material_table_surface;
     bool has_alpha_cutout = false;
     bool has_alpha_blend = false;
     bool has_alpha_additive = false;
@@ -69,6 +74,12 @@ public:
 
     // Load an external binary glTF 2.0 (.glb) mesh into CpuMeshData.
     static bool load_glb_file(const std::string &path, const std::string &asset_id, CpuMeshData &out);
+
+    // Number of authored retail texture entries loaded from material_table.inc.
+    static size_t material_table_entry_count();
+
+    // Count how many decoded retail textures matched material_table.inc.
+    void material_table_stats(uint32_t &out_matched, uint32_t &out_decoded) const;
 
     void clear();
 

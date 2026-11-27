@@ -19,7 +19,8 @@ struct CsmCascadeSet {
 
 // Pure CPU helpers (also unit-tested in tests/remaster_engine_test.cpp):
 CsmCascadeSet compute_csm_cascades(const SceneCamera &cam, const SceneEnvironment &env,
-                                   uint32_t resolution = CsmCascadeSet::kResolution);
+                                   uint32_t resolution = CsmCascadeSet::kResolution,
+                                   bool max_quality = true);
 
 // Official Khronos PBR Neutral tone mapper (CPU reference for verification).
 std::array<float, 3> khronos_pbr_neutral_cpu(float r, float g, float b);

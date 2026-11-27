@@ -24,6 +24,7 @@
 #include "core/limit_tracker.h"
 #include "core/memory.h"
 #include "kernel/kernel.h"
+#include "mutator_warp.h"
 #include "remaster/scene_bridge.h"
 #include "render/native_renderer.h"
 #include "render/world_visibility.h"
@@ -640,8 +641,26 @@ void sky_destroy() {
 // 0x326168 WaterDrawIfPresent
 void water_draw_if_present() {
     static const bool log = std::getenv("EOD_NATIVE_WATER_LOG") != nullptr;
+    static const char *warp_env = std::getenv("EOD_WARP_CAR0");
+    static bool warped_once = false;
     static uint32_t calls = 0;
-    if (log && (calls++ % 300) == 0) {
+    if (warp_env && *warp_env && !warped_once && calls > 180) {
+        const uint32_t w = lwu(kWater);
+        float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+        bool have_pos = false;
+        if (std::strcmp(warp_env, "water") == 0 && w) {
+            wx = lf(w + 0x24); wy = lf(w + 0x28) + 0.45f; wz = lf(w + 0x2C);
+            have_pos = std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz);
+        } else if (std::sscanf(warp_env, "%f,%f,%f", &wx, &wy, &wz) == 3) {
+            have_pos = true;
+        }
+        if (have_pos && mutator::warp_slot(0, mutator::make_yaw_pose(wx, wy, wz, 0.0f), false)) {
+            warped_once = true;
+            std::fprintf(stderr, "[world] EOD_WARP_CAR0 warped car 0 to (%.2f, %.2f, %.2f)\n", wx, wy, wz);
+        }
+    }
+    ++calls;
+    if (log && (calls % 300) == 1) {
         const uint32_t w = lwu(kWater);
         uint32_t tiles = 0;
         if (w)
@@ -673,14 +692,19 @@ void water_draw() {
     call(f_0034F8D0, 0x325764);
     set(4, 0x3000);
     native::ee_water_begin(surface);
+    if (g_config.remaster_engine) remaster::ee_water_begin(surface, lw(surface + 0x3C));
     call(f_0035DF10, 0x32576C);
-    if (reg(2) == 0) native::ee_water_end(false);
+    if (reg(2) == 0) {
+        native::ee_water_end(false);
+        if (g_config.remaster_engine) remaster::ee_water_end(false);
+    }
     if (reg(2) != 0) {
         uint32_t tile = lwu(surface + 0x40);
         if (tile) {
             const uint32_t bounds = 0x423788;
             while (tile) {
-                if (fcmp_lt(lf(tile + 0x1A4), lf(bounds)) || fcmp_lt(lf(tile + 0x1A8), lf(bounds + 4)) ||
+                if (g_config.remaster_engine ||
+                    fcmp_lt(lf(tile + 0x1A4), lf(bounds)) || fcmp_lt(lf(tile + 0x1A8), lf(bounds + 4)) ||
                     fcmp_lt(lf(tile + 0x1AC), lf(bounds + 8)) || fcmp_lt(lf(tile + 0x1B0), lf(bounds + 12))) {
                     set(4, (int32_t)tile);
                     call(f_00324928, 0x3257EC);
@@ -718,6 +742,7 @@ void water_draw() {
         }
         call(f_00361BC8, 0x3258E0);
         native::ee_water_end(true);
+        if (g_config.remaster_engine) remaster::ee_water_end(true);
     }
     call(f_0034F888, 0x3258E8);
     call(f_0034F710, 0x3258F0);

@@ -47,6 +47,7 @@ float configured() {
         } else {
             v = g_config.draw_distance;
             if (!std::isfinite(v) || v < eod_draw::kMin || v > eod_draw::kMax) v = 1;
+            if (g_config.detail == "maximum") v = std::max(v, eod_draw::kMax);
         }
         if (v != 1) std::fprintf(stderr, "[draw] draw distance x%.9g\n", double(v));
         return v;

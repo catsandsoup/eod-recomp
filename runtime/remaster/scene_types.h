@@ -149,6 +149,14 @@ struct HudQuad {
     uint64_t texture_key = 0;
 };
 
+struct WaterMesh {
+    std::string texture_id;
+    std::vector<PbrVertex> vertices;
+    std::vector<uint32_t> indices;
+    float center[3] = {0.0f, 0.0f, 0.0f};
+    float radius = 0.0f;
+};
+
 enum class DebugViewMode : uint32_t {
     Final = 0,
     RawAlbedo = 1,
@@ -176,6 +184,7 @@ struct SceneFrame {
     SceneEnvironment env;
     SceneCamera camera;
     std::vector<EntityInstance> entities;
+    std::vector<WaterMesh> water_meshes;
     std::vector<DynamicLight> lights;
     std::vector<HudQuad> hud_quads;
     float player_vehicle_pos[3] = {0, 0, 0};

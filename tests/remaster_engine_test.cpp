@@ -61,6 +61,9 @@ void test_ee_environment_extraction() {
     assert(near_f(env.fog_start, 120.0f));
     assert(near_f(env.fog_end, 800.0f));
     assert(near_f(env.fog_density, 0.45f));
+    // Neutral daylight hemisphere fill: no blue shadow cast (B/R ratio <= 1.22)
+    assert(env.ambient_sky[0] > 0.35f && env.ambient_sky[2] / env.ambient_sky[0] < 1.22f);
+    assert(env.ambient_ground[0] > env.ambient_ground[2]); // neutral warm-earth ground bounce
 
     // Apply World Editor override and verify shadows stay ENABLED (shadow_strength == 1.0f)
     editor_environment::Override ov{};
@@ -132,12 +135,13 @@ void test_smooth_normals_and_csm_and_tonemap() {
     const auto chrome = remaster::classify_pbr_material("chrome_bumper", false, true);
     assert(chrome.roughness >= 0.05f && chrome.roughness <= 0.20f);
 
-    // 3-Cascade CSM math
+    // 3-Cascade CSM math (maximum quality covers >= 500m horizon with zero widescreen edge cutoff)
     remaster::SceneCamera cam{};
     cam.pos[0] = 10.0f; cam.pos[1] = -4.0f; cam.pos[2] = 20.0f;
     remaster::SceneEnvironment env{};
-    const auto csm = remaster::compute_csm_cascades(cam, env, 2048);
+    const auto csm = remaster::compute_csm_cascades(cam, env, 2048, true);
     assert(csm.splits[0] < csm.splits[1] && csm.splits[1] < csm.splits[2]);
+    assert(csm.splits[2] >= 500.0f);
     for (int c = 0; c < 3; ++c) {
         assert(std::isfinite(csm.view_proj[c][0]));
         assert(near_f(csm.view_proj[c][15], 1.0f));
@@ -149,6 +153,16 @@ void test_smooth_normals_and_csm_and_tonemap() {
     const auto bright = remaster::khronos_pbr_neutral_cpu(8.0f, 4.0f, 1.0f);
     assert(bright[0] > 0.85f && bright[0] < 1.0f);
     assert(bright[0] >= bright[1] && bright[1] >= bright[2]);
+
+    // Reversed-Z camera projection: near_z -> 1.0, far_z -> 0.0 for high D32_FLOAT precision
+    remaster::SceneCamera rcam{};
+    rcam.near_z = 0.35f;
+    rcam.far_z = 9200.0f;
+    remaster::rebuild_camera_projection(rcam, 1280, 720);
+    const float z_near_ndc = (rcam.proj[10] * rcam.near_z + rcam.proj[11]) / rcam.near_z;
+    const float z_far_ndc  = (rcam.proj[10] * rcam.far_z  + rcam.proj[11]) / rcam.far_z;
+    assert(near_f(z_near_ndc, 1.0f, 1e-5f));
+    assert(near_f(z_far_ndc, 0.0f, 1e-5f));
 }
 
 void test_asset_registry_injection() {
@@ -171,6 +185,9 @@ void test_asset_registry_injection() {
     assert(loaded->vertices.size() == 3); // Loaded from HD .obj override!
     assert(loaded->indices.size() == 3);
     assert(near_f(loaded->vertices[1].pos[0], 2.0f));
+
+    // Verify authored material_table.inc is loaded directly into AssetRegistry (3,000+ entries)
+    assert(remaster::AssetRegistry::material_table_entry_count() >= 3000u);
 
     // Fallback test when no HD file exists
     auto tex = reg.resolve_texture("tex/an-road1");

@@ -5,8 +5,10 @@
 #include "ee_texture_decoder.h"
 #include "graf_loader.h"
 #include "../core/memory.h"
+#include "../render/material_table.inc"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -75,6 +77,263 @@ CpuImageRgba8 make_solid_rgba8(uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool 
 std::string strip_tex_prefix(const std::string &name) {
     if (name.rfind("tex/", 0) == 0) return name.substr(4);
     return name;
+}
+
+std::string to_lower_copy(std::string s) {
+    for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+bool is_beam_or_cone_name(const std::string &bare) {
+    const std::string low = to_lower_copy(bare);
+    for (const char *n : {"beam", "cone", "lcone", "spot", "flood", "shaft", "glow", "halo"}) {
+        if (low.find(n) != std::string::npos) return true;
+    }
+    return false;
+}
+
+struct AuthoredMaterialRecord {
+    std::string id;
+    std::string surface;
+    float metalness = 0.0f;
+    float roughness = 0.85f;
+    bool emissive = false;
+    std::string alpha; // "opaque", "cutout", "blend"
+};
+
+struct MaterialTableDb {
+    struct Entry {
+        uint64_t pk = 0;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        uint32_t rec_idx = 0;
+    };
+    std::vector<AuthoredMaterialRecord> records;
+    std::unordered_map<uint64_t, std::vector<Entry>> by_ik;
+    size_t bound_rows = 0;
+
+    MaterialTableDb() {
+        std::unordered_map<std::string, uint32_t> by_id;
+        const char *p = k_material_tsv;
+        while (*p) {
+            const char *e = std::strchr(p, '\n');
+            if (!e) e = p + std::strlen(p);
+            const size_t len = static_cast<size_t>(e - p);
+            if (len > 0 && p[0] != '/' && p[0] != 's') {
+                std::string line(p, len);
+                std::vector<std::string> f;
+                f.reserve(14);
+                size_t a = 0;
+                for (;;) {
+                    const size_t b = line.find('\t', a);
+                    f.push_back(line.substr(a, b == std::string::npos ? std::string::npos : b - a));
+                    if (b == std::string::npos) break;
+                    a = b + 1;
+                }
+                if (f.size() >= 13) {
+                    uint32_t idx = 0;
+                    auto it = by_id.find(f[0]);
+                    if (it == by_id.end()) {
+                        AuthoredMaterialRecord rec;
+                        rec.id = f[0];
+                        rec.surface = f[5];
+                        rec.metalness = std::clamp(std::strtof(f[6].c_str(), nullptr), 0.0f, 1.0f);
+                        rec.roughness = std::clamp(std::strtof(f[7].c_str(), nullptr), 0.04f, 1.0f);
+                        rec.emissive = (f[9] == "1");
+                        rec.alpha = f[10];
+                        idx = static_cast<uint32_t>(records.size());
+                        records.push_back(std::move(rec));
+                        by_id[f[0]] = idx;
+                    } else {
+                        idx = it->second;
+                    }
+                    if (!f[1].empty() && f[1] != "-") {
+                        const uint64_t ik = std::strtoull(f[1].c_str(), nullptr, 16);
+                        const uint64_t pk = std::strtoull(f[2].c_str(), nullptr, 16);
+                        const uint32_t w = static_cast<uint32_t>(std::atoi(f[3].c_str()));
+                        const uint32_t h = static_cast<uint32_t>(std::atoi(f[4].c_str()));
+                        by_ik[ik].push_back({pk, w, h, idx});
+                        ++bound_rows;
+                    }
+                }
+            }
+            p = *e ? e + 1 : e;
+        }
+    }
+
+    const AuthoredMaterialRecord *lookup(uint64_t ik, uint64_t pk, uint32_t w, uint32_t h) const {
+        auto it = by_ik.find(ik);
+        if (it == by_ik.end()) return nullptr;
+        const AuthoredMaterialRecord *fallback = nullptr;
+        for (const auto &e : it->second) {
+            if (e.w != w || e.h != h) continue;
+            if (e.pk == pk) return &records[e.rec_idx];
+            if (!fallback) fallback = &records[e.rec_idx];
+        }
+        return fallback;
+    }
+};
+
+const MaterialTableDb &material_db() {
+    static const MaterialTableDb db;
+    return db;
+}
+
+bool is_authored_solid_non_emissive(const AuthoredMaterialRecord &rec) {
+    if (rec.emissive) return false;
+    const std::string &s = rec.surface;
+    return s == "dirt" || s == "grass_ground" || s == "gravel" || s == "mud" || s == "sand" ||
+           s == "asphalt" || s == "concrete" || s == "wood" || s == "brick" || s == "rock" ||
+           s == "sign_decal" || s == "foliage_cutout" || s == "crowd_sprite" || s == "bark" ||
+           s == "backdrop" || s == "fake_shadow" || s == "car_paint" || s == "rubber" ||
+           s == "car_interior" || s == "fabric" || s == "plastic";
+}
+
+PbrMaterial material_from_authored_record(const AuthoredMaterialRecord &rec,
+                                          const std::string &bare_name,
+                                          bool is_sky,
+                                          bool is_vehicle) {
+    PbrMaterial m{};
+    const std::string &su = rec.surface;
+
+    if (is_sky || su == "sky") {
+        m.mat_class = MaterialClass::Sky;
+        m.is_sky = true;
+        m.roughness = 1.0f;
+        m.metallic = 0.0f;
+        return m;
+    }
+
+    if (is_vehicle) {
+        if (su == "glass") {
+            m.mat_class = MaterialClass::Glass;
+            m.roughness = 0.06f;
+            m.metallic = 0.0f;
+        } else if (su == "chrome" || (su == "metal_bare" && rec.metalness >= 0.70f)) {
+            m.mat_class = MaterialClass::MetalChrome;
+            m.roughness = 0.16f;
+            m.metallic = 0.90f;
+        } else if (su == "metal_bare") {
+            m.mat_class = MaterialClass::MetalChrome;
+            m.roughness = std::clamp(rec.roughness, 0.16f, 0.45f);
+            m.metallic = std::max(rec.metalness, 0.80f);
+        } else if (su == "metal_rusty") {
+            // Oxidized iron: rough matte rust crust with subtle exposed-steel metallic grazing response
+            m.mat_class = MaterialClass::Default;
+            m.roughness = std::clamp(rec.roughness, 0.72f, 0.82f);
+            m.metallic = std::clamp(rec.metalness > 0.01f ? rec.metalness : 0.28f, 0.22f, 0.35f);
+        } else if (su == "rubber") {
+            m.mat_class = MaterialClass::Rubber;
+            m.roughness = 0.88f;
+            m.metallic = 0.0f;
+        } else if (su == "car_interior" || su == "fabric" || su == "plastic") {
+            m.mat_class = MaterialClass::Interior;
+            m.roughness = (su == "plastic") ? 0.50f : 0.88f;
+            m.metallic = 0.0f;
+        } else if (su == "emissive_light" || rec.emissive) {
+            m.mat_class = MaterialClass::Emissive;
+            m.roughness = 0.14f;
+            m.metallic = 0.0f;
+            m.emissive_scale = 2.0f;
+        } else if (su == "car_paint" || su == "metal_painted") {
+            m.mat_class = MaterialClass::CarPaint;
+            m.roughness = std::clamp(rec.roughness, 0.55f, 0.70f);
+            m.metallic = 0.10f;
+        } else {
+            m.mat_class = MaterialClass::CarPaint;
+            m.roughness = std::clamp(rec.roughness, 0.55f, 0.88f);
+            m.metallic = std::clamp(rec.metalness, 0.0f, 0.25f);
+        }
+    } else {
+        // Static world / track / environment: physically differentiated per real-world material!
+        // Dry terrain/dirt/grass/asphalt/concrete/wood/billboards stay strictly matte (rough >= 0.82..0.90),
+        // while galvanized steel, rusted iron, painted metal, wet mud, and molded plastic respond truthfully
+        // across day, dusk, night floodlights, and water.
+        if (su == "water") {
+            m.mat_class = MaterialClass::Water;
+            m.roughness = 0.10f;
+            m.metallic = 0.0f;
+        } else if (su == "glass") {
+            m.mat_class = MaterialClass::Glass;
+            m.roughness = 0.06f;
+            m.metallic = 0.0f;
+        } else if (su == "chrome") {
+            m.mat_class = MaterialClass::MetalChrome;
+            m.roughness = 0.16f;
+            m.metallic = 0.90f;
+        } else if (su == "metal_bare") {
+            // Galvanized steel guardrails, corrugated fences, light poles, stadium trusses
+            m.mat_class = MaterialClass::MetalChrome;
+            m.roughness = std::clamp(rec.roughness, 0.35f, 0.52f);
+            m.metallic = std::clamp(rec.metalness > 0.01f ? rec.metalness : 0.72f, 0.65f, 0.85f);
+        } else if (su == "metal_rusty") {
+            // Weathered rusted iron / scrap barriers: rough oxide with subtle metallic sheen on worn steel
+            m.mat_class = MaterialClass::Default;
+            m.roughness = std::clamp(rec.roughness, 0.72f, 0.82f);
+            m.metallic = std::clamp(rec.metalness > 0.01f ? rec.metalness : 0.28f, 0.22f, 0.35f);
+        } else if (su == "metal_painted") {
+            // Painted metal guardrails, barn roofs, painted steel structures: satin enamel over steel
+            m.mat_class = MaterialClass::Default;
+            m.roughness = std::clamp(rec.roughness, 0.48f, 0.62f);
+            m.metallic = 0.14f;
+        } else if (su == "mud") {
+            // Damp mud bogs / wet ruts: subtle water-film grazing reflection (distinct from dry dirt)
+            m.mat_class = MaterialClass::TerrainDirt;
+            m.roughness = 0.48f;
+            m.metallic = 0.0f;
+        } else if (su == "plastic") {
+            // Molded PVC traffic cones, plastic barrels: subtle satin dielectric
+            m.mat_class = MaterialClass::Default;
+            m.roughness = 0.46f;
+            m.metallic = 0.0f;
+        } else if (su == "emissive_light" || su == "fx" || su == "vfx_fire" || su == "vfx_spark") {
+            m.mat_class = MaterialClass::Emissive;
+            m.roughness = 0.90f;
+            m.metallic = 0.0f;
+            m.alpha_additive = true;
+            m.double_sided = true;
+            m.emissive_scale = is_beam_or_cone_name(bare_name) ? 0.45f : 1.50f;
+        } else if (su == "foliage_cutout" || su == "crowd_sprite" || su == "bark") {
+            m.mat_class = MaterialClass::Foliage;
+            m.roughness = std::max(rec.roughness, 0.88f);
+            m.metallic = 0.0f;
+            if (su != "bark" || rec.alpha == "cutout") {
+                m.alpha_cutout = true;
+                m.double_sided = true;
+            }
+        } else if (su == "dirt" || su == "gravel" || su == "sand" || su == "grass_ground") {
+            // Dry dirt, gravel, sand, and grass are ALWAYS strictly matte (never wet!)
+            m.mat_class = MaterialClass::TerrainDirt;
+            m.roughness = std::max(rec.roughness, 0.90f);
+            m.metallic = 0.0f;
+        } else if (su == "asphalt") {
+            m.mat_class = MaterialClass::Asphalt;
+            m.roughness = std::max(rec.roughness, 0.84f);
+            m.metallic = 0.0f;
+        } else if (su == "rubber") {
+            m.mat_class = MaterialClass::Rubber;
+            m.roughness = 0.88f;
+            m.metallic = 0.0f;
+        } else {
+            // concrete, brick, rock, wood, sign_decal, backdrop, mixed_atlas, fabric, fake_shadow, other
+            m.mat_class = MaterialClass::BuildingConcrete;
+            m.roughness = std::max(rec.roughness, 0.88f);
+            m.metallic = 0.0f;
+            if (rec.emissive) {
+                m.emissive_scale = 1.25f;
+            }
+        }
+    }
+
+    if (!m.alpha_additive) {
+        if (rec.alpha == "cutout") {
+            m.alpha_cutout = true;
+            m.double_sided = true;
+        } else if (rec.alpha == "blend") {
+            m.alpha_blend = true;
+        }
+    }
+    return m;
 }
 
 } // namespace
@@ -190,6 +449,22 @@ std::shared_ptr<const PbrTextureSet> AssetRegistry::resolve_texture(const std::s
         decode_ee_texture_by_name(g_ram, EE_RAM_SIZE, bare, set->albedo);
     }
 
+    // 2B. Resolve exact authored PBR material from runtime/render/material_table.inc
+    // using the decoded texture's FNV-1a (index_key, palette_key, w, h).
+    const AuthoredMaterialRecord *authored_rec = nullptr;
+    if (!is_sky && set->albedo.has_indexed_keys) {
+        authored_rec = material_db().lookup(set->albedo.index_key, set->albedo.palette_key,
+                                            set->albedo.width, set->albedo.height);
+        if (authored_rec) {
+            set->has_material_table_match = true;
+            set->material_table_surface = authored_rec->surface;
+            set->material = material_from_authored_record(*authored_rec, bare, is_sky, is_vehicle);
+            set->has_alpha_cutout = set->material.alpha_cutout;
+            set->has_alpha_blend = set->material.alpha_blend;
+            set->has_alpha_additive = set->material.alpha_additive;
+        }
+    }
+
     // Analyze actual decoded texture alpha & border luminance so:
     //   1. Additive black-background glows/bridge string lights/spotlight beam cones use
     //      additive blending (ZERO black squares around bridge lights, ZERO grey haze cones!).
@@ -225,43 +500,55 @@ std::shared_ptr<const PbrTextureSet> AssetRegistry::resolve_texture(const std::s
         const float mean_border_luma = n_border > 0 ? (sum_border_luma / static_cast<float>(n_border)) : 1.0f;
 
         // Detect PS2 additive light/glow/beam/cone textures on static world geometry:
-        // - Either black-background opaque glow (dark border + bright interior, e.g. bridge string lights)
-        // - Or name-classified additive light/beam/cone that isn't a solid bright opaque surface
+        // - Authored emissive_light / fx / vfx_fire / vfx_spark with dark border or alpha gradient
+        // - Black-background glows/bridge string lights (max_border_luma < 0.08 && max_center_luma > 0.35)
         bool is_additive = false;
         if (!is_vehicle) {
+            const bool authored_solid = authored_rec && is_authored_solid_non_emissive(*authored_rec);
             const bool black_border_bright_core =
-                (max_border_luma < 0.08f && max_center_luma > 0.45f) ||
-                (mean_border_luma < 0.03f && max_border_luma < 0.16f && max_center_luma > 0.55f);
-            if (black_border_bright_core && n_low == 0) {
+                (max_border_luma < 0.08f && max_center_luma > 0.35f) ||
+                (mean_border_luma < 0.03f && max_border_luma < 0.16f && max_center_luma > 0.45f);
+            if (black_border_bright_core && !authored_solid) {
                 is_additive = true;
             } else if (set->material.alpha_additive) {
                 // Keep additive for glows/beams/cones (with alpha gradient or dark border);
                 // only demote to opaque if the texture is completely opaque with bright borders.
-                if (n_low > 0 || n_semi > 0 || mean_border_luma < 0.22f) {
+                if (n_low > 0 || n_semi > 0 || mean_border_luma < 0.25f || max_border_luma < 0.12f) {
                     is_additive = true;
                 } else {
                     set->material.alpha_additive = false;
-                    set->material.emissive_scale = 1.2f;
+                    set->has_alpha_additive = false;
+                    set->material.emissive_scale = 1.4f;
                 }
             }
         }
 
         if (is_additive) {
             set->has_alpha_additive = true;
+            set->has_alpha_cutout = false;
+            set->has_alpha_blend = false;
             set->material.alpha_additive = true;
             set->material.alpha_cutout = false;
             set->material.alpha_blend = false;
             set->material.double_sided = true;
-            if (set->material.emissive_scale <= 0.0f) {
-                set->material.emissive_scale = 0.50f;
-            }
+            // Restrained emissive for beam cones / alpha-gradient FX (0.40-0.55) so sky stays crisp;
+            // crisp glow for compact black-border bridge string lights / bulbs (1.2-1.5) with zero black boxes.
+            const bool is_cone_or_fx = is_beam_or_cone_name(bare) ||
+                                       (authored_rec && authored_rec->surface == "fx") ||
+                                       (n_semi * 12u >= total);
+            set->material.emissive_scale = is_cone_or_fx ? 0.42f : 1.35f;
         } else if (n_low > 0 || n_semi > 0) {
             if (set->material.mat_class == MaterialClass::Glass) {
                 set->has_alpha_blend = true;
                 set->material.alpha_blend = true;
-            } else if (set->material.mat_class == MaterialClass::Foliage || (n_semi * 6u < total)) {
+                set->has_alpha_cutout = false;
+                set->material.alpha_cutout = false;
+            } else if (set->material.alpha_cutout || set->material.mat_class == MaterialClass::Foliage ||
+                       (n_semi * 6u < total)) {
                 set->has_alpha_cutout = true;
                 set->material.alpha_cutout = true;
+                set->has_alpha_blend = false;
+                set->material.alpha_blend = false;
                 set->material.double_sided = true;
             } else {
                 set->has_alpha_blend = true;
@@ -426,6 +713,22 @@ bool AssetRegistry::load_glb_file(const std::string &path, const std::string &as
     }
     compute_smooth_normals_and_tangents(out.vertices, out.indices);
     return true;
+}
+
+size_t AssetRegistry::material_table_entry_count() {
+    return material_db().records.size();
+}
+
+void AssetRegistry::material_table_stats(uint32_t &out_matched, uint32_t &out_decoded) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    out_matched = 0;
+    out_decoded = 0;
+    for (const auto &kv : textures_) {
+        if (kv.second && kv.second->albedo.width > 1) {
+            ++out_decoded;
+            if (kv.second->has_material_table_match) ++out_matched;
+        }
+    }
 }
 
 void AssetRegistry::clear() {
