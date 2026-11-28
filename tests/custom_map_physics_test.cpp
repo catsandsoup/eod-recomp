@@ -17,6 +17,9 @@ extern "C" void f_00176798();
 extern "C" void f_00176798_orig() {
     g_ee.r[2].sd[0] = 2;
 }
+extern "C" void eod_race_00176798() {
+    f_00176798_orig();
+}
 EEState g_ee{};
 uint8_t* g_ram = nullptr;
 extern "C" uint32_t ee_read32_slow(uint32_t) {
