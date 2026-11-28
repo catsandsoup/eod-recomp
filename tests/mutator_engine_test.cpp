@@ -47,6 +47,7 @@ extern "C" void f_001B8370_orig() {
         MEM_SW(person + 196, u);
     }
 }
+extern "C" void eod_physics_001B8370() { f_001B8370_orig(); }
 
 namespace {
 

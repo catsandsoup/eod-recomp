@@ -10,9 +10,9 @@
 002C2188 wrap     # LoadingScreenMenuProgress: rate-limits 3-vblank per-chunk wait for NVMe speed
 00337718 wrap     # TimerGetMs: skips artificial 2-4s post-load and memory card banner hold loops
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
-00212500 wrap     # merge portable map triangle samples into the native wheel ground query
+00212500 wrap     # WheelGroundQuery as readable C++ (src/decomp_physics_collision.cpp; EOD_DIFF); merges portable map triangle samples into native wheel ground query
 00176798 wrap     # RaceGetModeState as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); solo editor map preview countdown hook
-001DE7B0 wrap     # resolve swept chassis boxes against mounted portable map triangles
+001DE7B0 wrap     # ChassisSweptBoxCollide / VehiclePhysicsStep as readable C++ (src/decomp_physics_collision.cpp; EOD_DIFF); resolves swept chassis boxes against mounted portable map triangles
 00212B58 wrap     # optional Maximum: matched 1P projection/fog range in 2P
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
 0021C6E0 wrap     # VisualCarSelectLodIndex as readable C++ (src/native_lod.cpp; EOD_DIFF), Detail=maximum policy, trace
@@ -43,7 +43,7 @@
 001E0DC8 wrap     # DetachedPanelSpawn: live panel debris counted, ExpandDebris window (src/debris_pool.cpp), body still recompiled
 001B2868 wrap     # wheel Init: keeps the WHLP create record for ExpandDebris wheels (src/debris_pool.cpp), body still recompiled
 
-001B5840 wrap     # optional invincibility: suppress inline timed-damage feat during native update
+001B5840 wrap     # TimedDamageFeatUpdate as readable C++ (src/decomp_physics_collision.cpp; EOD_DIFF); optional invincibility/mutator Deadly Ambition hook
 0018AD20 wrap     # optional invincibility, then CarSetDamage as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF): scalar vehicle damage setter
 00189648 wrap     # online car-to-car handoff, then CarApplySolvedContact as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF): solved impulse & damage dispatch
 0018CA98 wrap     # optional invincibility, then CarApplyCollisionDamage as readable C++ (src/car_damage.cpp; EOD_DIFF): dents, panels, wreck state
@@ -61,7 +61,7 @@
 
 0039AFB0 wrap     # movie bit-buffer consume/refill: exact RAM fast path, generated fallback
 
-001B8370 wrap     # optional manual-only human countdown recovery
+001B8370 wrap     # CarUpdateOutOfBoundsRecovery as readable C++ (src/decomp_physics_collision.cpp; EOD_DIFF); optional manual-only human countdown recovery
 0017DA58 wrap     # decomp_chicken_weapon.cpp (diff_run) + blast radius/force scaling & online blast publish
 0017DDB0 wrap     # decomp_chicken_weapon.cpp (diff_run): WeaponRegistryUnregister
 0017DE30 wrap     # decomp_chicken_weapon.cpp (diff_run): WeaponRegistryRegister

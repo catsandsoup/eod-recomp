@@ -53,9 +53,11 @@ extern "C" void f_001B5840_orig() {
     native_update_cheats = MEM_LW(0x003C4190);
     MEM_SW(0x003C4190, native_update_cheats | 0x10000);
 }
+extern "C" void eod_physics_001B5840() { f_001B5840_orig(); }
 static int native_damage_calls = 0;
 static int native_collision_damage_calls = 0;
 extern "C" void f_0018AD20_orig() { ++native_damage_calls; }
+extern "C" void decomp_car_set_damage() { f_0018AD20_orig(); }
 extern "C" void f_0018CA98_orig() { ++native_collision_damage_calls; }
 extern "C" void car_apply_collision_damage() { f_0018CA98_orig(); }
 extern "C" void f_0017DA58_orig() {}
@@ -79,6 +81,7 @@ extern "C" void f_0018F2A8_orig() {
     MEM_SW(car + 0x1B6C, 0); // native neutral steering and throttle
     MEM_SW(car + 0x1B70, 0);
 }
+extern "C" void decomp_human_driver_update() { f_0018F2A8_orig(); }
 extern "C" void f_001A2D20_orig() {}
 extern "C" void f_001671E8() {}
 bool battle_bots_is_ai_slot(uint32_t) { return false; }
