@@ -28,10 +28,10 @@ void f_002E5758_orig(void);
 void f_002E3BC8_orig(void);
 void f_002E3E70_orig(void);
 void f_002E35F0_orig(void);
-void f_0018AAD0_orig(void);
+void decomp_car_can_take_damage(void);  // 0x18AAD0 as readable C++ (src/decomp_vehicle_control.cpp)
 void f_001741C0_orig(void);
-void f_0018AA70_orig(void);
-void f_0018AA68_orig(void);
+void decomp_car_set_throttle(void);     // 0x18AA70 as readable C++ (src/decomp_vehicle_control.cpp)
+void decomp_car_set_brake(void);        // 0x18AA68 as readable C++ (src/decomp_vehicle_control.cpp)
 void f_003702F0_orig(void);
 void f_00370608_orig(void);
 void f_0036E9C0_orig(void);
@@ -295,7 +295,7 @@ static void can_damage_probe() {
         const uint32_t car = ee_r32(0x447458 + 4 * i);
         if (!sane(car, 0x270)) continue;
         g_ee.r[4].ud[0] = car;
-        f_0018AAD0_orig();
+        decomp_car_can_take_damage();
         const int result = (int)g_ee.r[2].sd[0];
         const uint32_t drv = ee_r32(car + 0x260);
         LOG(LOG_CORE, "[CAN_DAMAGE_PROBE] call=%d car#%u %08x id=%x driver=%08x -> %d event_word=%08x", calls, i, car,
@@ -341,7 +341,7 @@ extern "C" void f_002E3E70(void) {
 // ---- challengers ------------------------------------------------------------------------------
 extern "C" void f_0018AAD0(void) {
     const uint32_t car = g_ee.r[4].uw[0];
-    f_0018AAD0_orig();
+    decomp_car_can_take_damage();
     static const bool trace = std::getenv("EOD_CAREER_TRACE") != nullptr;
     if (trace && sane(car, 0x270) && ee_r32(car + 0x1E0) != 0) {
         static int logged;
@@ -388,11 +388,11 @@ bool wrecked_freeroam_ai(uint32_t car) {
 
 extern "C" void f_0018AA70(void) {  // CarSetThrottle(car, $f12)
     if (wrecked_freeroam_ai(g_ee.r[4].uw[0])) FPR[12].f = 0.0f;
-    f_0018AA70_orig();
+    decomp_car_set_throttle();
 }
 extern "C" void f_0018AA68(void) {  // CarSetBrake(car, $f12)
     if (wrecked_freeroam_ai(g_ee.r[4].uw[0])) FPR[12].f = 1.0f;
-    f_0018AA68_orig();
+    decomp_car_set_brake();
 }
 
 // ---- per-frame (game_patches_vblank) ----------------------------------------------------------

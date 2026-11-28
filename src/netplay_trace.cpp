@@ -92,7 +92,7 @@ extern "C" void f_001D3FB8(void) {
     f_001D3FB8_orig();
 }
 
-extern "C" void f_00189648_orig(void);
+extern "C" void decomp_car_apply_solved_contact(void);  // 0x189648 as readable C++ (src/decomp_vehicle_control.cpp)
 extern "C" void f_00189648(void) {
     // This native callback receives the solved impulse for each body. It
     // calls the damage routine only above a second, higher threshold.
@@ -107,7 +107,7 @@ extern "C" void f_00189648(void) {
         if (strength2 > .01f)
             netplay::session().car_contact(victim, static_cast<int32_t>(ee_r32(other + 0x1DC)), other);
     }
-    f_00189648_orig();
+    decomp_car_apply_solved_contact();
 }
 
 extern "C" void f_00177718_orig(void);

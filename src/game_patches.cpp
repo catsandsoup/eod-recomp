@@ -297,10 +297,10 @@ static bool invincible_human(uint32_t car) {
         (ee_r32(car + 0x1E0) == 0x50 ||
         (netplay_hooks::remote_driver_car && netplay_hooks::remote_driver_car(car)));
 }
-extern "C" void f_0018AD20_orig(void);
+extern "C" void decomp_car_set_damage(void);       // 0x18AD20 as readable C++ (src/decomp_vehicle_control.cpp)
 extern "C" void f_0018CA98_orig(void);
 extern "C" void f_0018AD20(void) {
-    if (!invincible_human(g_ee.r[4].uw[0])) f_0018AD20_orig();
+    if (!invincible_human(g_ee.r[4].uw[0])) decomp_car_set_damage();
 }
 extern "C" void car_apply_collision_damage(void);  // 0x18CA98 as readable C++ (src/car_damage.cpp)
 extern "C" void f_0018CA98(void) {
@@ -402,7 +402,7 @@ extern "C" void f_0017DA58(void) {
 
 // HumanDriver must run for every human, including P2-P4. Its native update
 // owns weapon input, release-to-rearm, shifting, death and countdown handling.
-extern "C" void f_0018F2A8_orig(void);
+extern "C" void decomp_human_driver_update(void);  // 0x18F2A8 as readable C++ (src/decomp_vehicle_control.cpp)
 extern "C" void f_0018F2A8(void) {
     const uint32_t controller = (uint32_t)g_ee.r[4].ud[0];
     const bool valid = controller && !(controller & 3) && controller <= EE_RAM_SIZE - 0x44;
@@ -437,10 +437,10 @@ extern "C" void f_0018F2A8(void) {
             if (fb & mutator::FB_RAIN_CHICKENS) masked |= 0x80u;
         }
         ee_w32(0x003C4190, masked);
-        f_0018F2A8_orig();
+        decomp_human_driver_update();
         ee_w32(0x003C4190, saved_cheats);
     } else {
-        f_0018F2A8_orig();
+        decomp_human_driver_update();
     }
     // The contestant table is in starting-grid order. Use the native human
     // input device to identify local pad zero, regardless of grid position.
