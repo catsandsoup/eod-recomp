@@ -258,13 +258,13 @@ static float car_damage_scale(const std::string &model) {
     return v;
 }
 
-extern "C" void f_00165E10_orig(void);
+#include "decomp_online_sim.h"
 extern "C" void f_00165E10(void) {
     // 165D20 finds the local Human and stores its slot here just before
     // calling 165E10. All peers must protect and score the same bus.
     if (netplay_hooks::detention_bus_slot >= 0 && netplay_hooks::event_active && netplay_hooks::event_active())
         ee_w32(0x003CD8F4, static_cast<uint32_t>(netplay_hooks::detention_bus_slot));
-    f_00165E10_orig();
+    eod_online_sim_00165E10();
 }
 
 // Car setup (car in a0, its chassis parameters in a1: the mass at +8, the

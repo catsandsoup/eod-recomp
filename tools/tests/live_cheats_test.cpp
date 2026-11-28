@@ -41,6 +41,7 @@ void toggle_from_input(const char *) { ++input_toggles; }
 extern "C" void f_001244A8();
 extern "C" void f_001244A8_orig() {}
 extern "C" void f_00165E10_orig() { std::abort(); }
+extern "C" void eod_online_sim_00165E10() { f_00165E10_orig(); }
 extern "C" void car_setup_damage_and_panels() { std::abort(); }
 extern "C" void f_0018AD20();
 extern "C" void f_0018CA98();

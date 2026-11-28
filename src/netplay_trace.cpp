@@ -1,5 +1,6 @@
 // Default-off native diagnostics; separate explicit test controls/seed options
 // modify native inputs only when requested. Normal offline behavior is retained.
+#include "decomp_online_sim.h"
 #include "netplay_trace.h"
 #include "netplay_car.h"
 #include "netplay_impact_fixture.h"
@@ -111,14 +112,13 @@ extern "C" void f_00189648(void) {
     decomp_car_apply_solved_contact();
 }
 
-extern "C" void f_00177718_orig(void);
 extern "C" void f_00177718(void) {
  netplay::session().step_begin();
  // This hook wraps only the simulation step. The enclosing native race loop
  // still runs, sees session_abort_event's exit flags and performs teardown.
  if (!netplay::session().step_allowed()) return;
  netplay_car::before_step();
- f_00177718_orig(); ++step; record_step();
+ eod_online_sim_00177718(); ++step; record_step();
  netplay_car::after_step(); netplay::session().step_end();
 }
 
@@ -148,10 +148,9 @@ extern "C" void f_0038FF40(void) {
 }
 
 #include "netplay_control.h"
-extern "C" void f_00191548_orig(void);
 extern "C" void f_00191548(void) {
  const uint32_t input=R[4].uw[0], car=R[5].uw[0];
- f_00191548_orig();
+ eod_online_sim_00191548();
  if(!input || input>=EE_RAM_SIZE-48)return;
  const uint32_t record=ee_r32(input+8);
  if(!record || record>=EE_RAM_SIZE-6)return;
@@ -234,7 +233,6 @@ extern "C" void f_0012F4F0(void) {const uint32_t s=R[4].uw[0],c=R[31].uw[0];f_00
 
 // Driver wrapper (car+0x1C1C): a0 = wrapper, a1 = the driver that takes over (wrapper+8 or wrapper+12).
 // Diagnostic: with EOD_NETPLAY_DEBUG each switch is logged with its caller.
-extern "C" void f_00190A38_orig(void);
 extern "C" void f_00190A38(void) {
  static const bool debug=std::getenv("EOD_NETPLAY_DEBUG")!=nullptr;
  if(debug){
@@ -251,5 +249,5 @@ extern "C" void f_00190A38(void) {
                 master,master&&!(master&3)&&master<EE_RAM_SIZE-4?ee_r32(master):0,now[3],now[4],now[5],ee_r32(wrapper+40),ee_r32(wrapper+44),ee_r32(wrapper+48),ee_r32(wrapper+28));
   }
  }
- f_00190A38_orig();
+ eod_online_sim_00190A38();
 }

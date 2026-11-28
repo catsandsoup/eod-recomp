@@ -81,7 +81,7 @@
 00166B50 wrap     # Battle kill-message draw: marks the window where 0x119428 resolves a car name
 0012AEF0 wrap     # Battle (N AI): note the contest whose description is resolved next
 001116E0 wrap     # Battle (N AI) only: AI drivers/vehicles from every class; native records otherwise
-00165E10 wrap     # set DetentionMaster's online bus role before its first participant setup
+00165E10 wrap     # DetentionMasterSetupRole as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); sets DetentionMaster's online bus role before participant setup
 0020FD48 wrap     # optional Battle bots: create weapons through native scene factory
 001A2D20 wrap     # optional Battle bots: input after native AICar update
 
@@ -100,13 +100,13 @@
 002A8EF0 wrap     # CarChooseWidget label setter: decorate Arcade paint display text for overridden vehicles
 00120650 wrap     # per-event setup: pre-select the requested event once
 00120FB8 wrap     # EveHasMoreEvents as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); returns 0 after an online event completes so GameDoSingle unwinds to the main menu
-00177718 wrap     # default-off netplay world-step diagnostic boundary
+00177718 wrap     # WorldStepTick as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); default-off netplay world-step diagnostic boundary
 001D3FB8 wrap     # StartCrashOrbitPause as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); bypassed during online events
 0038FF40 wrap     # default-off netplay consumed SDK pad reply trace
-00191548 wrap     # native six-byte per-tick human replay record diagnostics
+00191548 wrap     # HumanReplayRecordTick as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); native six-byte per-tick human replay record diagnostics
 00176918 wrap     # RaceSessionSeedRng as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); opt-in netplay agreed native race RNG seeds
 00176698 wrap     # RaceSessionInitPhase as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); opt-in agreed native race-start phase and RNG epoch
-00190A38 wrap     # driver wrapper: set the active driver (pace-lap autopilot / player); EOD_NETPLAY_DEBUG logs each switch
+00190A38 wrap     # CarSetActiveDriver as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); driver wrapper active-driver switch with EOD_NETPLAY_DEBUG logging
 0012F3C8 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F470 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F4F0 wrap     # bounded opt-in RNG0 callsite diagnosis
