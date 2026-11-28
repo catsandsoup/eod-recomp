@@ -2341,7 +2341,7 @@ void flush_shadows(bool ordered_composite = false) {
         sh_draws++;
         cl->setFramebuffer(nullptr);
     }
-    if (ordered_composite && sun_cascades_enabled() && g_config.plume_modern)
+    if (ordered_composite && sun_cascades_enabled() && g_config.plume_modern && !g_config.remaster_engine)
         arm_sun_cascades(s, p0);
     gpu_timer_end((VkCommandBuffer)s.cmd, gpu_q, sh_draws);
     plume::RenderTextureBarrier out[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::GENERAL),
@@ -2964,7 +2964,7 @@ void flush() {
     plume::RenderTextureBarrier in[2] = {plume::RenderTextureBarrier(color, plume::RenderTextureLayout::COLOR_WRITE),
                                          plume::RenderTextureBarrier(depth, plume::RenderTextureLayout::DEPTH_WRITE)};
     cl->barriers(plume::RenderBarrierStage::GRAPHICS, in, depth ? 2 : 1);
-    const bool modern = g_config.plume_modern;  // stage R6: one look per flush
+    const bool modern = g_config.plume_modern && !g_config.remaster_engine;  // stage R6: one look per flush; Remaster uses Classic 2D/UI path
     const bool capture_sun = modern && sun_cascades_enabled() && sun_scene_target(tg);
     if (g_vfx_budget_vb != g_r.vb) {
         g_vfx_budget_vb = g_r.vb;
@@ -3359,7 +3359,7 @@ void finish_sun_cascades(uint64_t frame, uint32_t boundary) {
     if (!input.armed) return;
     flush();
     const uint64_t df = frame >= input.camera.frame ? (frame - input.camera.frame) : (input.camera.frame - frame);
-    if (!input.armed || df > 3 || !input.have_sun || !g_config.plume_modern) {
+    if (!input.armed || df > 3 || !input.have_sun || !g_config.plume_modern || g_config.remaster_engine) {
         static uint32_t guarded = 0;
         if (++guarded <= 8 || guarded % 120 == 0)
             std::fprintf(stderr, "[sun] foreground guard scene=%llu next=%llu kind=%u lit=%d armed=%d\n",
@@ -4163,7 +4163,7 @@ void finalize(const PreparedWorldStrip *strip = nullptr) {
     // when texel [alpha_min, alpha_max] + constant vertex alpha provably make 100% of fragments
     // pass or fail the alpha test, omit the provably-empty pass and strip M_ATE so the surviving
     // pass runs on the zero-discard Early-Z/HSR pipeline.
-    if (g_config.plume_modern && !(m & M_SPEC) && pc.ambient[3] >= 0.0f &&
+    if (g_config.plume_modern && !g_config.remaster_engine && !(m & M_SPEC) && pc.ambient[3] >= 0.0f &&
         kind != KIND_WATER && kind != KIND_PARTICLE && kind != KIND_SPRITE) {
         const uint32_t va = std::min<uint32_t>((uint32_t)std::floor(pc.ambient[3]), 255u);
         uint32_t a_lo = va, a_hi = va;
@@ -4899,6 +4899,10 @@ bool plume_ready() {
 bool gs_shadow_boundary(ShadowPass pass) {
 #ifdef EOD_PLUME
     if (!prepare() || (modern::g_on && modern::live())) return false;
+    if (g_config.remaster_engine) {
+        if (g_active) finalize();
+        return true; // Remaster owns 100% of shadows via 3-cascade CSM; swallow PS2 shadow RT prepare/composite.
+    }
     if (g_active) finalize();
     SunView &view = g_r.sun_view;
     const int index = int(shadow_view_index(pass));

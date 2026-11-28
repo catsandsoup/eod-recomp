@@ -25,7 +25,10 @@ EEState g_ee{};
 uint8_t *g_ram = nullptr;
 Config::Config() = default;
 Config g_config;
-int session_ai_override() { return -1; }
+static int test_ai_override = -1;
+static uint32_t test_single_event_contest = 0xFFFFFFFFu;
+int session_ai_override() { return test_ai_override; }
+uint32_t session_single_event_contest() { return test_single_event_contest; }
 extern "C" uint32_t eod_visual_car_slot_read(uint32_t address) { return ee_r32(address); }
 
 namespace {
@@ -56,7 +59,8 @@ void reset() {
     originalCountCalls = originalWorldCalls = lookupCalls = suppressionCalls = resetCalls = 0;
     nativeCountResult = 2; suppressionResult = 0; createSceneInOriginal = true;
     registerImmediately = false; // Native factory queues physical registration.
-    g_config.battle_bots = true; variantContest = variantAi = 0;
+    g_config.battle_bots = true; g_config.offline_ai_bots = 0; variantContest = variantAi = 0;
+    test_ai_override = -1; test_single_event_contest = 0xFFFFFFFFu;
     ee_w32(contest + 8, battle); ee_w32(0x439858, 2);
     ee_w32(description + 0x9A4, battle); ee_w32(description + 0x98C, 4);
     ee_w32(0x3CF19C, battle);
@@ -382,7 +386,47 @@ void offlineMutatorWeaponOrder() {
     mutator_hooks::reset();
 }
 
+void davmapGuardCases() {
+    reset();
+    // 1. Single-event target contest returns 0 for all other contests in the Eve.
+    ee_w32(contest, 42);
+    ee_w32(contest + 8, 0x100);
+    ee_w32(0x439858, 1);
+    test_ai_override = 12;
+    test_single_event_contest = 99;
+    g_ee.r[4].ud[0] = contest;
+    f_0012C158();
+    require(g_ee.r[2].uw[0] == 0, "unused contest in single-event Eve returns 0");
+
+    // Matching target contest uses override_ai.
+    test_single_event_contest = 42;
+    g_ee.r[4].ud[0] = contest;
+    f_0012C158();
+    require(g_ee.r[2].uw[0] == 13, "target contest in single-event Eve uses override_ai");
+
+    // 2. Trailer Race (bit 0x800) is capped at kMaxCars / 2 = 8 drivers (16 total with trailers).
+    ee_w32(contest + 8, 0x09000800);
+    test_ai_override = 15;
+    g_ee.r[4].ud[0] = contest;
+    f_0012C158();
+    require(g_ee.r[2].uw[0] == battle_layout::kMaxCars / 2, "Trailer Race caps driver count to kMaxCars/2");
+
+    // 3. Multi-event offline Eve does not inflate special-chassis events above orig_count.
+    reset();
+    constexpr uint32_t kSpecialType = 0x09002223;
+    ee_w32(0x003CBEE8, kSpecialType); // register in native special-chassis table
+    ee_w32(contest, 7);
+    ee_w32(contest + 8, kSpecialType);
+    ee_w32(0x439858, 1);
+    nativeCountResult = 6;
+    g_config.offline_ai_bots = 14;
+    test_single_event_contest = 0xFFFFFFFFu;
+    g_ee.r[4].ud[0] = contest;
+    f_0012C158();
+    require(g_ee.r[2].uw[0] == 6, "multi-event offline Eve does not inflate special-chassis contest above orig_count");
+}
+
 int main() {
-    countCases(); killNames(); weaponsAndIdentity(); offlineMutatorWeaponOrder(); capacity(); variantCounts(); mountedSpawns(); placement(); mixedClasses();
+    countCases(); davmapGuardCases(); killNames(); weaponsAndIdentity(); offlineMutatorWeaponOrder(); capacity(); variantCounts(); mountedSpawns(); placement(); mixedClasses();
     std::puts("Battle construction bridge checks passed");
 }

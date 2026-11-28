@@ -118,7 +118,7 @@ uint32_t native(void (*fn)(void), std::initializer_list<uint32_t> args = {}) {
 struct Plan {
     bool requested = false, armed = false;
     SessionRequest req;
-    uint32_t eve = 0, contest = 0, car = 0;
+    uint32_t eve = 0, contest = 0xFFFFFFFFu, car = 0;
     bool car_done = false, track_done = false, event_done = false;
     bool players_done = false;  // humans > 1: the head-to-head join/car screen was answered
     bool mode_answered = false;   // online: the Arcade single/multi prompt was answered once
@@ -915,6 +915,14 @@ int session_ai_override() {
         return g_pending_offline.ai_bots;
     }
     return (P.requested && P.req.mode == "action") ? P.req.ai : -1;
+}
+
+uint32_t session_single_event_contest() {
+    if (P.armed && P.contest != 0xFFFFFFFFu &&
+        (P.net || g_pending_offline.active || P.req.mode == "action")) {
+        return P.contest;
+    }
+    return 0xFFFFFFFFu;
 }
 
 bool session_test_native_lap() {

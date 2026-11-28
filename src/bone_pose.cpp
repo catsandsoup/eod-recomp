@@ -90,7 +90,7 @@ uint32_t bone_palette_write(uint32_t first, uint32_t bones, int32_t count) {
         native::ee_pose_check(packet, bones, (uint32_t)count);
         if (g_config.remaster_engine && count > 0) {
             remaster::ee_record_bone_palette(packet, reinterpret_cast<const float *>(g_ram + palette),
-                                             static_cast<uint32_t>(count));
+                                             static_cast<uint32_t>(count), first);
         }
     }
     g_ee.r[29].ud[0] = (uint64_t)(int64_t)(int32_t)sp;

@@ -47,6 +47,7 @@ struct PbrMaterial {
     bool alpha_additive = false;
     bool double_sided = false;
     bool is_sky = false;
+    bool is_fake_shadow = false; // legacy PS2 baked/blob shadow decal suppressed when real CSM shadows are active
     MaterialClass mat_class = MaterialClass::Default;
 };
 
@@ -97,6 +98,7 @@ struct DynamicLight {
 struct VertexSkin {
     uint16_t bone[2] = {0, 0};
     float weight[2] = {0.0f, 0.0f};
+    float pos_w = 1.0f; // vertex position .w lane (VU1 translation weight from TOP+2+3*k)
     uint8_t mode = 0; // 0 = rigid, 1 = car dent offset (MSCAL 0x5C), 2 = driver/ped bone matrix (MSCAL 0x63/0x496)
 };
 
@@ -136,6 +138,7 @@ struct EntityInstance {
     float world_matrix[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}; // 3x4 row-major
     std::vector<float> dent_offsets;   // live car dent displacement vectors (3 floats/bone)
     std::vector<float> bone_palette;   // live skeletal 4x4 bone matrices (16 floats/bone)
+    uint32_t bone_first = 0;           // first bone index uploaded by 0x35DBD8 (VU1 qword 0x90 + 4*first)
     std::string material_override;
     bool is_player_vehicle = false;
     bool is_vehicle = false;
@@ -155,6 +158,14 @@ struct WaterMesh {
     std::vector<uint32_t> indices;
     float center[3] = {0.0f, 0.0f, 0.0f};
     float radius = 0.0f;
+};
+
+struct VehiclePhysics {
+    float pos[3] = {0.0f, 0.0f, 0.0f};
+    float right[3] = {1.0f, 0.0f, 0.0f};
+    float forward[3] = {0.0f, 0.0f, 1.0f};
+    float vel[3] = {0.0f, 0.0f, 0.0f};
+    float speed = 0.0f; // true physics speed in m/s (0.0 when parked!)
 };
 
 enum class DebugViewMode : uint32_t {
@@ -184,6 +195,7 @@ struct SceneFrame {
     SceneEnvironment env;
     SceneCamera camera;
     std::vector<EntityInstance> entities;
+    std::vector<VehiclePhysics> vehicles;
     std::vector<WaterMesh> water_meshes;
     std::vector<DynamicLight> lights;
     std::vector<HudQuad> hud_quads;

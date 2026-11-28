@@ -25,6 +25,10 @@ CsmCascadeSet compute_csm_cascades(const SceneCamera &cam, const SceneEnvironmen
 // Official Khronos PBR Neutral tone mapper (CPU reference for verification).
 std::array<float, 3> khronos_pbr_neutral_cpu(float r, float g, float b);
 
+// Pure CPU skinning / dent evaluation matching PS2 VU1 skin_vertices() 1:1.
+bool apply_entity_skinning_cpu(const CpuMeshData &cpu, const EntityInstance &ent,
+                               std::vector<PbrVertex> &out_posed);
+
 // Debug Buffer Inspection Mode (0..5), initialized from EOD_REMASTER_DEBUG env var.
 DebugViewMode debug_view_mode();
 void set_debug_view_mode(DebugViewMode mode);

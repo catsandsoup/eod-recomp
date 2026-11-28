@@ -57,6 +57,16 @@ bool ram_object(uint32_t address, uint32_t size) {
     return address && !(address & 3) && size <= EE_RAM_SIZE && address <= EE_RAM_SIZE - size;
 }
 
+// Native special-chassis event table (0x003CBEE8, 4 entries x 0x14 bytes, read by f_0012C580/f_0012C398).
+bool is_special_chassis_event(uint32_t event_type) {
+    if (!event_type) return false;
+    constexpr uint32_t kSpecialTable = 0x003CBEE8;
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (ee_r32(kSpecialTable + i * 0x14) == event_type) return true;
+    }
+    return false;
+}
+
 bool world_has_weapon_capacity() {
     // 20E360 allocates each object pointer array with 0x12C0 bytes (1200
     // entries); 2110D8 appends without checking capacity. 17DE30 likewise
@@ -78,8 +88,17 @@ bool battle_bots_is_ai_slot(uint32_t slot) {
 
 extern "C" void f_0012C158(void) {
     const uint32_t contest = arg_u32(0);
+    const uint32_t contest_id = ram_object(contest, 4) ? ee_r32(contest) : 0xFFFFFFFFu;
+    const uint32_t target = session_single_event_contest();
+    if (target != 0xFFFFFFFFu && contest_id != target) {
+        ret_s32(0);
+        return;
+    }
     const uint32_t humans = ee_r32(kHumanCount);
-    const bool battle = humans >= 1 && humans <= 4 && ram_object(contest, 0x14) && ee_r32(contest + 8) == kBattle;
+    const uint32_t event_type = ram_object(contest, 0x14) ? ee_r32(contest + 8) : 0;
+    const bool battle = humans >= 1 && humans <= 4 && event_type == kBattle;
+    const bool trailer_race = (event_type & 0x800u) != 0;
+    const uint32_t max_drivers = trailer_race ? (battle_layout::kMaxCars / 2) : battle_layout::kMaxCars;
     // "Battle (4 AI)" / "Battle (8 AI)": the humans plus that many AI, within the
     // ten cars native 0x12C158 already allows two humans. Their participant
     // records fit the enlarged BattleMaster (battle_layout.h).
@@ -87,18 +106,22 @@ extern "C" void f_0012C158(void) {
     const bool fill = !ai && battle && g_config.battle_bots;
     const int override_ai = session_ai_override();
     f_0012C158_orig();
-    // Explicit EOD_DIRECT_START ai=<0..12> override: works on Battle AND any Race/Derby/Gauntlet
+    const uint32_t orig_count = g_ee.r[2].uw[0];
+    // Explicit EOD_DIRECT_START ai=<0..15> override: works on Battle AND any Race/Derby/Gauntlet
     // template so "Force Free Roam" (ai=0) spawns only the player car on that exact map variation,
-    // and ai=1..12 spawns the requested AI count.
+    // and ai=1..15 spawns the requested AI count.
     if (override_ai >= 0 && humans >= 1 && humans <= 4) {
         const uint32_t remote = netplay_hooks::remote_humans ? netplay_hooks::remote_humans() : 0;
-        const uint32_t total = std::min(humans + remote + static_cast<uint32_t>(override_ai), battle_layout::kMaxCars);
+        const uint32_t total = std::min(humans + remote + static_cast<uint32_t>(override_ai), max_drivers);
         ret_s32(static_cast<int32_t>(total));
         return;
     }
     const bool online = netplay_hooks::event_active && netplay_hooks::event_active();
     if (!online && g_config.offline_ai_bots > 0 && humans >= 1 && humans <= 4) {
-        const uint32_t total = std::min(humans + static_cast<uint32_t>(g_config.offline_ai_bots), battle_layout::kMaxCars);
+        uint32_t total = std::min(humans + static_cast<uint32_t>(g_config.offline_ai_bots), max_drivers);
+        if (target == 0xFFFFFFFFu && (trailer_race || is_special_chassis_event(event_type))) {
+            total = std::min(total, orig_count);
+        }
         ret_s32(static_cast<int32_t>(total));
         return;
     }
@@ -108,7 +131,7 @@ extern "C" void f_0012C158(void) {
     if (ai) {
         // online: remote players are extra cars in the same world (puppets driven by their owners)
         const uint32_t remote = netplay_hooks::remote_humans ? netplay_hooks::remote_humans() : 0;
-        ret_s32(static_cast<int32_t>(std::min(humans + remote + (ai == 1 ? 0 : ai), battle_layout::kMaxCars)));
+        ret_s32(static_cast<int32_t>(std::min(humans + remote + (ai == 1 ? 0 : ai), max_drivers)));
     }
     else if (fill) ret_s32(4);
 }

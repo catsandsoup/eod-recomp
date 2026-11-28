@@ -187,7 +187,8 @@ void decode_4sps_geometry(const uint8_t *ram, uint32_t ram_size, uint32_t part_a
             const uint32_t q_nrm = 1u + 3u * i;
             const uint32_t q_pos = 2u + 3u * i;
             const uint32_t q_uv  = 3u + 3u * i;
-            const uint32_t q_skn = 150u + i;
+            // VU1 microcode reads skin quadwords in reverse order: TOP + 149 + nverts - i.
+            const uint32_t q_skn = 149u + nverts - i;
             if (q_pos >= kSlots || !slot_valid[q_pos]) break;
 
             RawTriVertex v{};
@@ -233,16 +234,19 @@ void decode_4sps_geometry(const uint8_t *ram, uint32_t ram_size, uint32_t part_a
                 v.skin.mode = batch_skin_mode;
                 v.skin.bone[0] = static_cast<uint16_t>(slot_data[q_skn][0] & 0xFFFFu);
                 v.skin.bone[1] = static_cast<uint16_t>(slot_data[q_skn][1] & 0xFFFFu);
-                if (raw_valid[q_skn] & 0x0Cu) {
+                // VU1 skin weights are IEEE-754 floats biased by 32768.0f (STROW 0x47000000 + raw).
+                const float wa = bits_to_f32(slot_data[q_skn][2]) - 32768.0f;
+                const float wb = bits_to_f32(slot_data[q_skn][3]) - 32768.0f;
+                if (std::isfinite(wa) && std::isfinite(wb) &&
+                    std::fabs(wa) <= 4.0f && std::fabs(wb) <= 4.0f) {
+                    v.skin.weight[0] = wa;
+                    v.skin.weight[1] = wb;
+                } else {
                     v.skin.weight[0] = static_cast<float>(raw_data[q_skn][2] & 0xFFu) / 256.0f;
                     v.skin.weight[1] = static_cast<float>(raw_data[q_skn][3] & 0xFFu) / 256.0f;
-                } else {
-                    // Fallback when weights came from STROW (e.g. V1-8 partial unpack)
-                    const int32_t w0 = static_cast<int32_t>(slot_data[q_skn][2]) - 32768;
-                    const int32_t w1 = static_cast<int32_t>(slot_data[q_skn][3]) - 32768;
-                    v.skin.weight[0] = static_cast<float>(w0) / 256.0f;
-                    v.skin.weight[1] = static_cast<float>(w1) / 256.0f;
                 }
+                const float pw = bits_to_f32(slot_data[q_pos][3]);
+                v.skin.pos_w = (std::isfinite(pw) && std::fabs(pw) <= 16.0f) ? pw : 1.0f;
                 has_any_skin = true;
             }
             strip.push_back(v);
@@ -457,6 +461,15 @@ PbrMaterial classify_pbr_material(const std::string &texture_name, bool is_sky, 
         m.roughness = 1.0f;
         m.metallic = 0.0f;
         m.is_sky = true;
+        return m;
+    }
+
+    if (contains_any(low, {"carshad", "shopshad", "-shad", "_shad", "shadow.tex", "shad.tex"}) ||
+        low == "shadow") {
+        m.mat_class = MaterialClass::Default;
+        m.roughness = 0.92f;
+        m.metallic = 0.0f;
+        m.is_fake_shadow = true;
         return m;
     }
 

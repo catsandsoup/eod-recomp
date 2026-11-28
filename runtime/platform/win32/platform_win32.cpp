@@ -677,6 +677,7 @@ int platform_audio_queued_frames() {
 static HWAVEIN g_wave_in = nullptr;
 static WAVEHDR g_in_hdr[4] = {};
 static std::vector<int16_t> g_in_buf[4];
+static int g_in_next = 0;
 
 bool platform_mic_open(int sample_rate) {
     if (g_cfg.headless) return false;
@@ -700,6 +701,7 @@ bool platform_mic_open(int sample_rate) {
         waveInPrepareHeader(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
         waveInAddBuffer(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
     }
+    g_in_next = 0;
     waveInStart(g_wave_in);
     return true;
 }
@@ -712,17 +714,20 @@ void platform_mic_close() {
             waveInUnprepareHeader(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
     waveInClose(g_wave_in);
     g_wave_in = nullptr;
+    g_in_next = 0;
 }
 
 int platform_mic_read(int16_t *samples, int max_samples) {
     if (!g_wave_in || max_samples < 960) return 0;
-    for (int i = 0; i < 4; i++) {
+    for (int step = 0; step < 4; step++) {
+        int i = (g_in_next + step) & 3;
         if (g_in_hdr[i].dwFlags & WHDR_DONE) {
             int got = (int)(g_in_hdr[i].dwBytesRecorded / 2);
             if (got > max_samples) got = max_samples;
             if (got > 0) memcpy(samples, g_in_buf[i].data(), (size_t)got * 2);
             g_in_hdr[i].dwBytesRecorded = 0;
             waveInAddBuffer(g_wave_in, &g_in_hdr[i], sizeof(WAVEHDR));
+            g_in_next = (i + 1) & 3;
             if (got > 0) return got;
         }
     }

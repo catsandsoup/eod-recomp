@@ -137,16 +137,14 @@ bool mac_app_select_mods(bool headless, std::string *problem) {
         fprintf(stderr, "EOD_NATIVE_ONLY=1: launching the retail game without the integrated content\n");
         return true;
     }
-    // Public packages ship disc-only on both platforms. A previous personal
-    // build may have left an integrated pack in Application Support. It can
-    // still be selected explicitly or used to match a modded host.
-    if (bundle_flag(@"EODIntegratedContentOptional")) return true;
-    // An unbundled game or an older public app may have no packaging metadata.
-    // Only a build explicitly packaged with personal content requires the profile.
-    const bool allow_missing = ![[[NSBundle mainBundle] infoDictionary][@"EODIntegratedContentOptional"] isEqual:@NO];
+    // Public packages and unbundled builds default to disc-only (matching Windows).
+    // Only a bundle explicitly packaged with EODIntegratedContentOptional=NO requires the integrated pack.
+    // Installed overlays in Application Support can still be auto-switched when joining a modded host.
+    const bool require_integrated = [[[NSBundle mainBundle] infoDictionary][@"EODIntegratedContentOptional"] isEqual:@NO];
+    if (!require_integrated) return true;
     std::string why;
     bool loaded = false;
-    if (activate_integrated(&why, allow_missing, &loaded)) {
+    if (activate_integrated(&why, false, &loaded)) {
         // Everything lockable is unlocked by default in the player path, whatever eod.ini says; the
         // stored file is not rewritten. EOD_UNLOCK_ALL stays an explicit override. The native
         // mechanism (src/game_patches.cpp) writes global prize/feat/track flags, so Career shares them.
@@ -154,7 +152,6 @@ bool mac_app_select_mods(bool headless, std::string *problem) {
         return true;
     }
     fprintf(stderr, "Integrated content: %s\n", why.c_str());
-    if (allow_missing) return true;  // The verified retail library can launch on its own.
     if (problem) {  // shown in-game by the front end (runtime/ui) instead of a Cocoa alert
         *problem = why + "\n\nEve of Destruction will not start with only part of the game. Reinstall or restore the app, "
                          "or restore the previous copy from backup.";

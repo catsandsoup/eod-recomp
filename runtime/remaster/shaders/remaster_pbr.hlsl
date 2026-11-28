@@ -106,8 +106,8 @@ VSOut vs_pbr_main(VSIn vin) {
         o.clip_pos.z = 0.0;
     }
     o.world_n = normalize(mul_rows3(pc.model[0], pc.model[1], pc.model[2], vin.normal));
-    if (pc.flags.y == 3u) {
-        // Water spray particle: pass per-particle metadata directly in world_t (x=alpha, y=seed, z=kind, w=1)
+    if (pc.flags.y >= 2u) {
+        // Water (2) & Water Spray (3): pass fluid foam / particle metadata directly in world_t
         o.world_t = vin.tangent;
     } else {
         o.world_t = float4(normalize(mul_rows3(pc.model[0], pc.model[1], pc.model[2], vin.tangent.xyz)), vin.tangent.w);
@@ -183,23 +183,17 @@ float3 water_noise_grad(float2 x) {
     return float3(val, grad);
 }
 
-// 3-octave domain-rotated ultra-calm still-pond micro-ripple gradient (ZERO stream flow, ZERO tiling)
+// Ultra-calm still-pond micro-breeze normal (virtually still when undisturbed, ZERO stream flow)
 float2 eval_organic_water_grad(float2 wp_xz, float t) {
-    float2 p0 = wp_xz * 0.36 + float2(t * 0.028, t * 0.019);
-    float2 g0 = water_noise_grad(p0).yz * 0.36;
+    float2 p0 = wp_xz * 0.32 + float2(t * 0.014, t * 0.010);
+    float2 g0 = water_noise_grad(p0).yz * 0.32;
 
-    // Rotate domain by ~37 deg so octaves never align into a lattice
     float2 r1 = float2(wp_xz.x * 0.80 - wp_xz.y * 0.60, wp_xz.x * 0.60 + wp_xz.y * 0.80);
-    float2 p1 = r1 * 0.88 + float2(-t * 0.042, t * 0.033);
-    float2 gr1 = water_noise_grad(p1).yz * 0.88;
+    float2 p1 = r1 * 0.85 + float2(-t * 0.020, t * 0.016);
+    float2 gr1 = water_noise_grad(p1).yz * 0.85;
     float2 g1 = float2(gr1.x * 0.80 + gr1.y * 0.60, -gr1.x * 0.60 + gr1.y * 0.80);
 
-    float2 r2 = float2(wp_xz.x * 0.52 + wp_xz.y * 0.85, -wp_xz.x * 0.85 + wp_xz.y * 0.52);
-    float2 p2 = r2 * 2.10 + float2(t * 0.065, -t * 0.052);
-    float2 gr2 = water_noise_grad(p2).yz * 2.10;
-    float2 g2 = float2(gr2.x * 0.52 - gr2.y * 0.85, gr2.x * 0.85 + gr2.y * 0.52);
-
-    return g0 * 0.0085 + g1 * 0.0045 + g2 * 0.0020;
+    return g0 * 0.0042 + g1 * 0.0020;
 }
 
 float3 eval_direct_brdf(float3 N, float3 V, float3 L, float3 albedo, float rough, float metallic, float3 radiance) {
@@ -330,75 +324,47 @@ float4 ps_pbr_forward(VSOut pin, bool is_front_face : SV_IsFrontFace) : SV_Targe
     }
 
     if (pc.flags.y == 2u) {
-        // Pass 3B Physical Water Surface (EE live wave mesh + organic non-repeating micro-ripples
-        // + reactive vehicle wakes & expanding concentric ripple rings + Fresnel cubemap reflection)
+        // Pass 3B 2026 Physically-Simulated Pond Water (96x96 2D wave-equation fluid heightfield
+        // + real analytical wave normals + lacy physical wake foam + 256x256 live cubemap reflections)
         float3 to_cam = frame.cam_pos_debug.xyz - pin.world_pos;
         float view_dist = length(to_cam);
         float3 V = to_cam / max(view_dist, 1e-4);
 
-        float3 Ng = normalize(pin.world_n);
-        if (Ng.y < 0.0) Ng = -Ng;
-        // Amplify subtle EE WaterSimulate heightfield slope so live EE splashes read clearly
-        Ng = normalize(float3(Ng.x * 2.4, Ng.y, Ng.z * 2.4));
+        // Real fluid simulation normal (already analytical -dh/dx, 1, -dh/dz from the 96x96 PDE)
+        float3 N_fluid = normalize(pin.world_n);
+        if (N_fluid.y < 0.0) N_fluid = -N_fluid;
 
         float t = frame.ambient_ground_pad.w;
         float2 p = pin.world_pos.xz;
         float ripple_fade = saturate(1.0 - view_dist / 800.0);
         float2 micro_grad = eval_organic_water_grad(p, t) * ripple_fade;
 
-        // Reactive vehicle wakes & expanding dispersive concentric ripple rings (up to 32 stamps)
-        float2 wake_grad = float2(0.0, 0.0);
-        float wake_foam_raw = 0.0;
-        uint n_wakes = min(uint(frame.water_wake_meta.x + 0.5), 32u);
-        for (uint wi = 0u; wi < n_wakes; ++wi) {
-            float4 wk = frame.water_wakes[wi];
-            float age = t - wk.z;
-            if (age < 0.0 || age > 4.2 || wk.w <= 0.001) continue;
-            float2 d = p - wk.xy;
-            float dist = length(d);
-            float max_r = 2.2 + age * 4.8 + 4.0;
-            if (dist > max_r) continue;
-            float2 dir = d / max(dist, 0.05);
+        // Add subtle fine capillary ripples only where the fluid is actively disturbed
+        float wave_energy = saturate(length(N_fluid.xz) * 4.0);
+        float2 cap_grad = water_noise_grad(p * 3.8 + float2(t * 0.55, -t * 0.42)).yz * (0.045 * wave_energy);
 
-            // Expanding primary wave + fine trailing capillary ripples
-            float wave_r = 0.85 + age * 4.4;
-            float delta = dist - wave_r;
-            float env = exp(-delta * delta * 0.45) * exp(-age * 0.85) * wk.w;
-            float phase = delta * 4.2;
-            float cap_env = exp(-(delta + 0.7) * (delta + 0.7) * 0.65) * exp(-age * 1.15) * wk.w;
-            float slope = env * cos(phase) * 0.38 + cap_env * cos((delta + 0.7) * 8.5) * 0.14;
-            wake_grad += dir * slope;
+        float3 N = normalize(N_fluid + float3(-(micro_grad.x + cap_grad.x), 0.0, -(micro_grad.y + cap_grad.y)));
 
-            // Turbulent wheel-churn foam near hull and wave crests
-            float hull_env = exp(-dist * dist * 0.34) * exp(-age * 2.0) * wk.w;
-            float crest_foam = env * saturate(sin(phase) * 0.5 + 0.5) * exp(-age * 1.05);
-            wake_foam_raw += (hull_env * 0.65 + crest_foam * 0.42);
-        }
-
-        // Break up wake foam with high-frequency frothy bubble noise so it looks like real churned water foam
-        float foam_n1 = water_noise_grad(p * 3.4 + float2(t * 0.12, -t * 0.09)).x;
-        float foam_n2 = water_noise_grad(p * 8.2 - float2(t * 0.18, t * 0.15)).x;
-        float foam_tex = foam_n1 * 0.60 + foam_n2 * 0.40;
-        float wake_foam = saturate(smoothstep(0.24, 0.78, wake_foam_raw * (0.55 + foam_tex * 0.85)));
-
-        float2 total_grad = micro_grad + wake_grad;
-        float3 N = normalize(Ng + float3(-total_grad.x, 0.0, -total_grad.y));
+        // Physical fluid foam from simulation (world_t.x) + wave steepness, broken into lacy frothy bubbles
+        float sim_foam = saturate(pin.world_t.x);
+        float shore_depth = saturate(pin.world_t.y); // 0 at outer edge, 1 inside pond
+        float foam_n1 = water_noise_grad(p * 4.5 + float2(t * 0.06, -t * 0.05)).x;
+        float foam_n2 = water_noise_grad(p * 11.5 - float2(t * 0.09, t * 0.08)).x;
+        float foam_lacy = foam_n1 * 0.55 + foam_n2 * 0.45;
+        float wake_foam = saturate(smoothstep(0.32, 0.82, sim_foam * (0.35 + foam_lacy * 1.05)));
 
         float ndv = max(dot(N, V), 0.0);
         float fresnel = 0.02 + 0.98 * pow(clamp(1.0 - ndv, 0.0, 1.0), 5.0);
-        float water_alpha = saturate(lerp(0.66, 0.96, fresnel) + wake_foam * 0.28);
+        float base_alpha = lerp(0.58, 0.96, fresnel) * lerp(0.75, 1.0, shore_depth);
+        float water_alpha = saturate(base_alpha + wake_foam * 0.25);
 
-        // Blend two rotated UV samples of the retail water texture with natural pond depth tint
-        // so the low-res PS2 water texture never shows visible tile repetition
-        float2 uv_flow = total_grad * 0.12;
-        float3 tex_a = srgb_to_linear3(tex_albedo.Sample(samp_linear, pin.uv + uv_flow).rgb);
-        float2 uv_b = float2(pin.uv.x * 0.61 - pin.uv.y * 0.79, pin.uv.x * 0.79 + pin.uv.y * 0.61) * 0.53 - uv_flow;
-        float3 tex_b = srgb_to_linear3(tex_albedo.Sample(samp_linear, uv_b).rgb);
-        float3 pond_base = float3(0.055, 0.085, 0.092);
-        float3 water_albedo = lerp(pond_base, (tex_a * 0.55 + tex_b * 0.45) * 0.55, 0.45) * pc.base_color.rgb;
+        // Deep realistic pond water absorption (clear muddy-amber shallows -> deep olive-teal center)
+        float3 shallow_col = float3(0.095, 0.088, 0.065);
+        float3 deep_col    = float3(0.032, 0.056, 0.058);
+        float3 water_albedo = lerp(shallow_col, deep_col, shore_depth) * pc.base_color.rgb;
 
         if (debug_mode == 1u) return float4(water_albedo, water_alpha);
-        if (debug_mode == 2u) return float4(0.05, 0.0, 0.0, water_alpha);
+        if (debug_mode == 2u) return float4(0.03, 0.0, 0.0, water_alpha);
         if (debug_mode == 3u) return float4(N * 0.5 + 0.5, water_alpha);
 
         float3 L_sun = normalize(frame.sun_dir_intensity.xyz);
@@ -406,12 +372,12 @@ float4 ps_pbr_forward(VSOut pin, bool is_front_face : SV_IsFrontFace) : SV_Targe
         float csm_vis = compute_csm_visibility(pin.world_pos, N, L_sun, view_dist);
         float ndl = max(dot(N, L_sun), 0.0);
 
-        // Crisp direct sun GGX specular sparkle (roughness = 0.04) modulated by CSM shadows
+        // Crisp direct sun GGX specular sparkle (roughness = 0.035) modulated by CSM shadows
         float3 H = normalize(V + L_sun);
         float ndh = max(dot(N, H), 0.0);
         float hdv = max(dot(H, V), 0.0);
-        float D = distribution_ggx(ndh, 0.04);
-        float G = geometry_smith(max(ndv, 1e-4), max(ndl, 1e-4), 0.04);
+        float D = distribution_ggx(ndh, 0.035);
+        float G = geometry_smith(max(ndv, 1e-4), max(ndl, 1e-4), 0.035);
         float3 F_sun = fresnel_schlick(hdv, float3(0.02, 0.02, 0.02));
         float3 sun_spec = ((D * G * F_sun) / max(4.0 * max(ndv, 1e-4) * max(ndl, 1e-4), 1e-4)) * sun_rad * ndl * csm_vis;
         float3 sun_diff = (water_albedo / PI) * sun_rad * ndl * csm_vis;
@@ -420,7 +386,7 @@ float4 ps_pbr_forward(VSOut pin, bool is_front_face : SV_IsFrontFace) : SV_Targe
 
         // Live 256x256 environment cubemap reflection
         float3 R = reflect(-V, N);
-        R.y = max(R.y, 0.05);
+        R.y = max(R.y, 0.04);
         R = normalize(R);
         float3 env_refl = env_cube.SampleLevel(samp_linear, R, 0.0).rgb;
 
@@ -431,9 +397,9 @@ float4 ps_pbr_forward(VSOut pin, bool is_front_face : SV_IsFrontFace) : SV_Targe
         float3 water_body = water_albedo * ((sun_rad / PI) * ndl * csm_vis + hemi);
         float3 color = lerp(water_body, env_refl, fresnel) + sun_spec;
 
-        // Frothy sunlit whitecap/splash foam on car wakes
-        float3 foam_col = float3(0.84, 0.88, 0.90) * ((sun_rad / PI) * ndl * csm_vis + hemi * 1.15);
-        color = lerp(color, foam_col, wake_foam * 0.82);
+        // Subtle, lacy, translucent wake froth (never thick opaque white paint)
+        float3 foam_col = float3(0.86, 0.90, 0.92) * ((sun_rad / PI) * ndl * csm_vis + hemi * 1.15);
+        color = lerp(color, foam_col, wake_foam * 0.58);
 
         float fog_start = frame.fog_start_end_lights.x;
         float fog_end = max(fog_start + 1.0, frame.fog_start_end_lights.y);
@@ -444,36 +410,21 @@ float4 ps_pbr_forward(VSOut pin, bool is_front_face : SV_IsFrontFace) : SV_Targe
     }
 
     if (pc.flags.y == 3u) {
-        // Pass 3B 3D Wheel Water Spray / Droplet Plumes (sunlit backlit droplets & mist)
+        // Pass 3B 3D Wheel Water Spray Mist (feathery backlit mist sheets, ZERO chunky grey dots)
         if (debug_mode >= 2u) discard;
-        float2 q = pin.uv * 2.0 - 1.0; // [-1, 1] quad space
+        float2 q = pin.uv * 2.0 - 1.0;
         float r2 = dot(q, q);
         if (r2 >= 1.0) discard;
 
         float life_alpha = pin.world_t.x;
         float seed = pin.world_t.y;
-        float is_droplet = pin.world_t.z; // 0 = spray mist puff, 1 = crisp droplet cluster
-
-        float mask = 0.0;
-        if (is_droplet > 0.5) {
-            // Cluster of 4 crisp water droplets inside the billboard
-            float2 c0 = float2(sin(seed * 12.7) * 0.35, cos(seed * 9.3) * 0.35);
-            float2 c1 = float2(cos(seed * 17.1) * 0.45, sin(seed * 21.4) * 0.42);
-            float2 c2 = float2(sin(seed * 29.3) * 0.48, -cos(seed * 14.9) * 0.38);
-            float d0 = smoothstep(0.28, 0.08, length(q - c0));
-            float d1 = smoothstep(0.22, 0.06, length(q - c1));
-            float d2 = smoothstep(0.20, 0.05, length(q - c2));
-            float d3 = smoothstep(0.32, 0.10, length(q));
-            mask = saturate(max(max(d0, d1), max(d2, d3 * 0.85)));
-        } else {
-            // Soft wispy water mist / roostertail foam cloud
-            float n = water_noise_grad(q * 2.6 + float2(seed * 13.7, seed * 7.1)).x;
-            float radial = pow(saturate(1.0 - r2), 1.65);
-            mask = saturate(radial * (0.45 + 0.85 * n));
-        }
+        float n1 = water_noise_grad(q * 2.8 + float2(seed * 13.7, seed * 7.1)).x;
+        float n2 = water_noise_grad(q * 6.4 - float2(seed * 5.3, seed * 11.9)).x;
+        float radial = pow(saturate(1.0 - r2), 2.1);
+        float mask = saturate(radial * smoothstep(0.22, 0.88, n1 * 0.65 + n2 * 0.35));
 
         float spray_alpha = saturate(mask * life_alpha);
-        if (spray_alpha < 0.01) discard;
+        if (spray_alpha < 0.008) discard;
 
         float3 to_cam = frame.cam_pos_debug.xyz - pin.world_pos;
         float view_dist = length(to_cam);
@@ -481,11 +432,9 @@ float4 ps_pbr_forward(VSOut pin, bool is_front_face : SV_IsFrontFace) : SV_Targe
         float3 L_sun = normalize(frame.sun_dir_intensity.xyz);
         float3 sun_rad = frame.sun_color_day.rgb * frame.sun_dir_intensity.w;
 
-        // Forward-scattering backlit sunlight glow + soft sky/ground fill
-        float backscatter = pow(saturate(dot(-V, L_sun)), 3.0) * 0.55;
-        float3 hemi = lerp(frame.ambient_ground_pad.rgb, frame.ambient_sky_int.rgb, 0.72) * frame.ambient_sky_int.w;
-        float3 spray_albedo = lerp(float3(0.76, 0.82, 0.85), float3(0.92, 0.96, 1.0), is_droplet);
-        float3 color = spray_albedo * ((sun_rad / PI) * (0.65 + backscatter) + hemi * 1.25);
+        float backscatter = pow(saturate(dot(-V, L_sun)), 3.0) * 0.65;
+        float3 hemi = lerp(frame.ambient_ground_pad.rgb, frame.ambient_sky_int.rgb, 0.78) * frame.ambient_sky_int.w;
+        float3 color = float3(0.86, 0.91, 0.94) * ((sun_rad / PI) * (0.65 + backscatter) + hemi * 1.25);
 
         float fog_start = frame.fog_start_end_lights.x;
         float fog_end = max(fog_start + 1.0, frame.fog_start_end_lights.y);

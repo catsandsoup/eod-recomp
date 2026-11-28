@@ -64,6 +64,11 @@ struct CachedModelPart {
     int16_t layer_index = -1;
 };
 
+struct RecordedBonePalette {
+    uint32_t first_bone = 0;
+    std::vector<float> matrices;
+};
+
 struct BridgeState {
     std::mutex mtx;
     SceneFrame building{};
@@ -71,7 +76,7 @@ struct BridgeState {
     std::shared_ptr<const LoadedWorld> world;
     uint32_t loaded_graf_addr = 0;
     uint32_t track_generation = 0;
-    std::unordered_map<uint32_t, std::vector<float>> bone_palettes;
+    std::unordered_map<uint32_t, RecordedBonePalette> bone_palettes;
     std::unordered_map<uint32_t, std::vector<float>> dent_offsets;
     std::unordered_map<uint64_t, std::vector<CachedModelPart>> dynamic_model_parts; // key = (model_handle<<32)|header_addr
     std::unordered_map<uint64_t, bool> dynamic_model_is_sky;                        // suppress sky double-draw/shadow-cast
@@ -394,12 +399,14 @@ void ee_sync_world_from_ram(const std::string &track_name) {
     }
 }
 
-void ee_record_bone_palette(uint32_t packet_addr, const float *matrices_4x4, uint32_t bone_count) {
+void ee_record_bone_palette(uint32_t packet_addr, const float *matrices_4x4, uint32_t bone_count,
+                            uint32_t first_bone) {
     if (!packet_addr || !matrices_4x4 || bone_count == 0) return;
     auto &s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
     auto &dst = s.bone_palettes[packet_addr];
-    dst.assign(matrices_4x4, matrices_4x4 + static_cast<size_t>(bone_count) * 16);
+    dst.first_bone = first_bone;
+    dst.matrices.assign(matrices_4x4, matrices_4x4 + static_cast<size_t>(bone_count) * 16);
 }
 
 void ee_record_dent_offsets(uint32_t packet_addr, const float *offsets_xyz, uint32_t count) {
@@ -425,8 +432,10 @@ void ee_submit_entity(uint32_t model_handle, const float world_matrix[12],
     inst.cast_shadow = true;
 
     if (material_packet && material_packet != 0xFFFFFFFFu) {
-        if (auto bit = s.bone_palettes.find(material_packet); bit != s.bone_palettes.end())
-            inst.bone_palette = bit->second;
+        if (auto bit = s.bone_palettes.find(material_packet); bit != s.bone_palettes.end()) {
+            inst.bone_first = bit->second.first_bone;
+            inst.bone_palette = bit->second.matrices;
+        }
         if (auto dit = s.dent_offsets.find(material_packet); dit != s.dent_offsets.end()) {
             inst.dent_offsets = dit->second;
             inst.is_vehicle = true;
@@ -649,6 +658,36 @@ void ee_end_frame(const editor_environment::Override *editor_override) {
     s.building.camera = extract_camera_from_ram(g_ram, EE_RAM_SIZE, 1280, 720);
     s.building.lights.clear();
     extract_flare_lights_from_ram(g_ram, EE_RAM_SIZE, s.building.env.is_day, s.building.lights);
+
+    // Extract exact physics pose & linear velocity for all active cars from EE participant table 0x447458.
+    // CarObject layout (SLUS_209.10): +0x64 = 4x3 pose (right, up, forward, pos), +0x104 = linear vel (m/s).
+    s.building.vehicles.clear();
+    if (valid_addr(ee_addr::kParticipantTbl, 16u * 4u, EE_RAM_SIZE)) {
+        for (uint32_t slot = 0; slot < 16u; ++slot) {
+            const uint32_t car = rd_u32(g_ram, ee_addr::kParticipantTbl + slot * 4u);
+            if (!car || (car & 3u) || !valid_addr(car, 0x120u, EE_RAM_SIZE)) continue;
+            VehiclePhysics vp{};
+            vp.right[0]   = rd_f32(g_ram, car + 0x64u + 0u);
+            vp.right[1]   = rd_f32(g_ram, car + 0x64u + 4u);
+            vp.right[2]   = rd_f32(g_ram, car + 0x64u + 8u);
+            vp.forward[0] = rd_f32(g_ram, car + 0x64u + 24u);
+            vp.forward[1] = rd_f32(g_ram, car + 0x64u + 28u);
+            vp.forward[2] = rd_f32(g_ram, car + 0x64u + 32u);
+            vp.pos[0]     = rd_f32(g_ram, car + 0x64u + 36u);
+            vp.pos[1]     = rd_f32(g_ram, car + 0x64u + 40u);
+            vp.pos[2]     = rd_f32(g_ram, car + 0x64u + 44u);
+            vp.vel[0]     = rd_f32(g_ram, car + 0x104u + 0u);
+            vp.vel[1]     = rd_f32(g_ram, car + 0x104u + 4u);
+            vp.vel[2]     = rd_f32(g_ram, car + 0x104u + 8u);
+            if (!std::isfinite(vp.pos[0]) || !std::isfinite(vp.pos[1]) || !std::isfinite(vp.pos[2]) ||
+                !std::isfinite(vp.vel[0]) || !std::isfinite(vp.vel[1]) || !std::isfinite(vp.vel[2])) {
+                continue;
+            }
+            vp.speed = std::sqrt(vp.vel[0] * vp.vel[0] + vp.vel[2] * vp.vel[2]);
+            if (vp.speed > 120.0f) continue; // reject uninitialized garbage
+            s.building.vehicles.push_back(vp);
+        }
+    }
 
     // Per SLUS_209.10:0x211150 + 0x223090, 0x00495BE0 is the session struct DIRECTLY (not a pointer).
     // Active event mode bitmask is at 0x00495BE0 + 0x3C = 0x00495C1C.

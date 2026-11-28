@@ -67,11 +67,11 @@ int main(int argc,char**argv){
     fs::remove(content/"DATA/CAR/CUPCAR.CAR");
     require(!mac_app_activate_integrated(&why)&&why.find("CUPCAR.CAR")!=std::string::npos&&!getenv("EOD_MOD_DIR"),9);
     std::ofstream(content/"DATA/CAR/CUPCAR.CAR")<<"fixture DATA/CAR/CUPCAR.CAR";
-    // Startup default: no UI, integrated activated.
-    g_config.unlock_all=false; // as if the owner's eod.ini said UnlockAll=0
-    require(mac_app_select_mods(false)&&fs::path(getenv("EOD_MOD_DIR"))==content&&g_config.unlock_all,10);
-    unsetenv("EOD_MOD_DIR");g_config.unlock_all=false;setenv("EOD_UNLOCK_ALL","0",1); // explicit override wins
-    require(mac_app_select_mods(false)&&!g_config.unlock_all,14);
+    // Startup default (unbundled): disc-only, matching Windows and public bundles.
+    g_config.unlock_all=false;
+    require(mac_app_select_mods(false)&&!getenv("EOD_MOD_DIR")&&!g_config.unlock_all,10);
+    unsetenv("EOD_MOD_DIR");g_config.unlock_all=false;setenv("EOD_UNLOCK_ALL","0",1);
+    require(mac_app_select_mods(false)&&!getenv("EOD_MOD_DIR")&&!g_config.unlock_all,14);
     unsetenv("EOD_UNLOCK_ALL");unsetenv("EOD_MOD_DIR");
     // A standalone checkout can share the installed app's staged bundle assets.
     const fs::path staged = root / "bundle-mods" / "integrated";

@@ -86,7 +86,15 @@ std::string to_lower_copy(std::string s) {
 
 bool is_beam_or_cone_name(const std::string &bare) {
     const std::string low = to_lower_copy(bare);
-    for (const char *n : {"beam", "cone", "lcone", "spot", "flood", "shaft", "glow", "halo"}) {
+    for (const char *n : {"beam", "cone", "lcone", "shaft", "glow", "halo"}) {
+        if (low.find(n) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool is_light_fixture_name(const std::string &bare) {
+    const std::string low = to_lower_copy(bare);
+    for (const char *n : {"bulb", "lamp", "flood", "spot", "lite", "light", "neon"}) {
         if (low.find(n) != std::string::npos) return true;
     }
     return false;
@@ -204,6 +212,14 @@ PbrMaterial material_from_authored_record(const AuthoredMaterialRecord &rec,
         return m;
     }
 
+    if (su == "fake_shadow") {
+        m.mat_class = MaterialClass::Default;
+        m.is_fake_shadow = true;
+        m.roughness = 0.92f;
+        m.metallic = 0.0f;
+        return m;
+    }
+
     if (is_vehicle) {
         if (su == "glass") {
             m.mat_class = MaterialClass::Glass;
@@ -290,9 +306,17 @@ PbrMaterial material_from_authored_record(const AuthoredMaterialRecord &rec,
             m.mat_class = MaterialClass::Emissive;
             m.roughness = 0.90f;
             m.metallic = 0.0f;
-            m.alpha_additive = true;
-            m.double_sided = true;
-            m.emissive_scale = is_beam_or_cone_name(bare_name) ? 0.45f : 1.50f;
+            const bool beam_or_cone = is_beam_or_cone_name(bare_name);
+            const bool is_opaque_fixture = (su == "emissive_light" && rec.alpha == "opaque" && !beam_or_cone);
+            if (is_opaque_fixture) {
+                // Opaque stadium floodlight / bulb fixture: crisp bright linear-HDR white glow
+                m.alpha_additive = false;
+                m.emissive_scale = 4.0f;
+            } else {
+                m.alpha_additive = true;
+                m.double_sided = true;
+                m.emissive_scale = beam_or_cone ? 0.42f : 3.5f;
+            }
         } else if (su == "foliage_cutout" || su == "crowd_sprite" || su == "bark") {
             m.mat_class = MaterialClass::Foliage;
             m.roughness = std::max(rec.roughness, 0.88f);
@@ -320,7 +344,7 @@ PbrMaterial material_from_authored_record(const AuthoredMaterialRecord &rec,
             m.roughness = std::max(rec.roughness, 0.88f);
             m.metallic = 0.0f;
             if (rec.emissive) {
-                m.emissive_scale = 1.25f;
+                m.emissive_scale = 3.5f;
             }
         }
     }
@@ -518,8 +542,12 @@ std::shared_ptr<const PbrTextureSet> AssetRegistry::resolve_texture(const std::s
                 } else {
                     set->material.alpha_additive = false;
                     set->has_alpha_additive = false;
-                    set->material.emissive_scale = 1.4f;
+                    set->material.emissive_scale = 4.0f;
                 }
+            } else if (!set->material.alpha_additive && set->material.emissive_scale <= 0.0f &&
+                       is_light_fixture_name(bare) && !is_beam_or_cone_name(bare) &&
+                       !authored_solid) {
+                set->material.emissive_scale = 3.8f;
             }
         }
 

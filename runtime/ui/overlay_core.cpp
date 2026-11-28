@@ -478,10 +478,12 @@ void fps_text(char *text, size_t n) {
 
 // While the game is held (pause), the SPU does not run: feed the menu sounds directly.
 void pump_paused_audio() {
+    bool has_menu_snd = false;
     {
         std::lock_guard<std::mutex> lk(g_snd_mtx);
-        if (g_snd.empty()) return;
+        has_menu_snd = !g_snd.empty();
     }
+    if (!has_menu_snd && !netplay::session().active()) return;
     if (platform_audio_queued_frames() > 48000 / 20) return;
     static int16_t buf[1600 * 2];
     memset(buf, 0, sizeof buf);

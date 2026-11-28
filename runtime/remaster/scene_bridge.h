@@ -67,7 +67,8 @@ void ee_sync_world_from_ram(const std::string &track_name);
 void ee_submit_entity(uint32_t model_handle, const float world_matrix[12],
                       uint32_t material_packet, bool is_player_vehicle = false,
                       uint32_t layer_mask = 0xFFFFFFFFu);
-void ee_record_bone_palette(uint32_t packet_addr, const float *matrices_4x4, uint32_t bone_count);
+void ee_record_bone_palette(uint32_t packet_addr, const float *matrices_4x4, uint32_t bone_count,
+                            uint32_t first_bone = 0);
 void ee_record_dent_offsets(uint32_t packet_addr, const float *offsets_xyz, uint32_t count);
 void ee_submit_dynamic_light(const DynamicLight &light);
 void ee_submit_hud_quad(const HudQuad &quad);

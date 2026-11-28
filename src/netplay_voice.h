@@ -7,7 +7,7 @@
 namespace netplay::voice {
 constexpr unsigned SampleRate=48000, FrameSamples=960, MaxPeers=16;
 constexpr unsigned HeaderBytes=19, MaxPayloadBytes=400, MaxPacketBytes=HeaderBytes+MaxPayloadBytes;
-constexpr unsigned JitterFrames=8, StartupFrames=2;
+constexpr unsigned JitterFrames=16, StartupFrames=3;
 using Frame=std::array<int16_t,FrameSamples>;
 struct Packet { std::array<uint8_t,MaxPacketBytes> bytes{}; size_t size=0; };
 enum class Receive { Accepted, Inactive, Invalid, WrongSession, WrongSender, Duplicate, Stale, OutsideWindow };

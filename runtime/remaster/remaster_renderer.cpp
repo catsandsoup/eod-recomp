@@ -224,6 +224,100 @@ std::array<float, 3> khronos_pbr_neutral_cpu(float r, float g, float b) {
     return {c[0], c[1], c[2]};
 }
 
+bool apply_entity_skinning_cpu(const CpuMeshData &cpu, const EntityInstance &ent,
+                               std::vector<PbrVertex> &out_posed) {
+    if (cpu.vertices.empty() || cpu.skin.size() != cpu.vertices.size()) return false;
+    if (ent.dent_offsets.empty() && ent.bone_palette.empty()) return false;
+
+    out_posed = cpu.vertices;
+    bool moved = false;
+
+    if (!ent.bone_palette.empty()) {
+        const size_t n_bones = ent.bone_palette.size() / 16u;
+        for (size_t i = 0; i < out_posed.size(); ++i) {
+            const auto &sk = cpu.skin[i];
+            if (sk.mode != 2u) continue;
+            if (!(std::fabs(sk.weight[0]) <= 4.0f && std::fabs(sk.weight[1]) <= 4.0f)) continue;
+            const float x = out_posed[i].pos[0], y = out_posed[i].pos[1], z = out_posed[i].pos[2];
+            const float pw = sk.pos_w;
+            const float nx = out_posed[i].normal[0], ny = out_posed[i].normal[1], nz = out_posed[i].normal[2];
+            const float tx = out_posed[i].tangent[0], ty = out_posed[i].tangent[1], tz = out_posed[i].tangent[2];
+            float px = 0.0f, py = 0.0f, pz = 0.0f;
+            float rnx = 0.0f, rny = 0.0f, rnz = 0.0f;
+            float rtx = 0.0f, rty = 0.0f, rtz = 0.0f;
+            bool any_bone = false;
+            for (int j = 0; j < 2; ++j) {
+                const float w = sk.weight[j];
+                const uint32_t raw_bi = static_cast<uint32_t>(sk.bone[j]) / 4u;
+                if (raw_bi < ent.bone_first) continue;
+                const size_t bi = static_cast<size_t>(raw_bi - ent.bone_first);
+                if (bi >= n_bones) continue;
+                const float *m = ent.bone_palette.data() + bi * 16u;
+                // bone_pose.cpp widens 3x4 -> 4x4 as 4 column vectors (c0=m[0..3], c1=m[4..7], c2=m[8..11], c3=m[12..15]).
+                // Matches VU1 skin_vertices: pa[k] = A[0][k]*x + A[1][k]*y + A[2][k]*z + A[3][k]*pw.
+                px  += w * (m[0] * x + m[4] * y + m[8]  * z + m[12] * pw);
+                py  += w * (m[1] * x + m[5] * y + m[9]  * z + m[13] * pw);
+                pz  += w * (m[2] * x + m[6] * y + m[10] * z + m[14] * pw);
+                rnx += w * (m[0] * nx + m[4] * ny + m[8]  * nz);
+                rny += w * (m[1] * nx + m[5] * ny + m[9]  * nz);
+                rnz += w * (m[2] * nx + m[6] * ny + m[10] * nz);
+                rtx += w * (m[0] * tx + m[4] * ty + m[8]  * tz);
+                rty += w * (m[1] * tx + m[5] * ty + m[9]  * tz);
+                rtz += w * (m[2] * tx + m[6] * ty + m[10] * tz);
+                any_bone = true;
+            }
+            if (any_bone && std::fabs(px) < 1e6f && std::fabs(py) < 1e6f && std::fabs(pz) < 1e6f) {
+                out_posed[i].pos[0] = px;
+                out_posed[i].pos[1] = py;
+                out_posed[i].pos[2] = pz;
+                const float nlen = std::sqrt(rnx * rnx + rny * rny + rnz * rnz);
+                if (nlen > 1e-5f) {
+                    out_posed[i].normal[0] = rnx / nlen;
+                    out_posed[i].normal[1] = rny / nlen;
+                    out_posed[i].normal[2] = rnz / nlen;
+                }
+                const float tlen = std::sqrt(rtx * rtx + rty * rty + rtz * rtz);
+                if (tlen > 1e-5f) {
+                    out_posed[i].tangent[0] = rtx / tlen;
+                    out_posed[i].tangent[1] = rty / tlen;
+                    out_posed[i].tangent[2] = rtz / tlen;
+                }
+                moved = true;
+            }
+        }
+    } else if (!ent.dent_offsets.empty()) {
+        const size_t n_dents = ent.dent_offsets.size() / 3u;
+        for (size_t i = 0; i < out_posed.size(); ++i) {
+            const auto &sk = cpu.skin[i];
+            if (sk.mode != 1u) continue;
+            if (!(std::fabs(sk.weight[0]) <= 4.0f && std::fabs(sk.weight[1]) <= 4.0f)) continue;
+            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+            for (int j = 0; j < 2; ++j) {
+                if (sk.bone[j] == 0u) continue;
+                const size_t di = static_cast<size_t>(sk.bone[j] - 1u);
+                if (di >= n_dents) continue;
+                const float ox = ent.dent_offsets[di * 3u + 0u];
+                const float oy = ent.dent_offsets[di * 3u + 1u];
+                const float oz = ent.dent_offsets[di * 3u + 2u];
+                if (std::isfinite(ox) && std::fabs(ox) <= 2.5f) dx += sk.weight[j] * ox;
+                if (std::isfinite(oy) && std::fabs(oy) <= 2.5f) dy += sk.weight[j] * oy;
+                if (std::isfinite(oz) && std::fabs(oz) <= 2.5f) dz += sk.weight[j] * oz;
+            }
+            if (dx * dx + dy * dy + dz * dz > 1e-8f) {
+                out_posed[i].pos[0] += dx;
+                out_posed[i].pos[1] += dy;
+                out_posed[i].pos[2] += dz;
+                moved = true;
+            }
+        }
+        if (moved && !cpu.indices.empty()) {
+            compute_smooth_normals_and_tangents(out_posed, cpu.indices);
+        }
+    }
+
+    return moved;
+}
+
 DebugViewMode debug_view_mode() {
     return static_cast<DebugViewMode>(g_debug_mode.load(std::memory_order_relaxed));
 }
@@ -329,19 +423,180 @@ struct WaterDrawSlice {
     uint32_t index_count = 0;
 };
 
-struct WaterWakeStamp {
-    float x = 0.0f;
-    float z = 0.0f;
-    float birth_t = -100.0f;
-    float strength = 0.0f;
-};
+struct FluidPondSim {
+    static constexpr uint32_t kN = 96; // 96x96 = 9,216 verts, 18,050 smooth 3D wave triangles!
+    bool active = false;
+    uint32_t track_gen = 0;
+    float min_x = 0.0f, max_x = 0.0f;
+    float min_z = 0.0f, max_z = 0.0f;
+    float water_y = 0.0f;
+    std::string texture_id;
+    std::vector<float> h_prev;
+    std::vector<float> h_cur;
+    std::vector<float> h_next;
+    std::vector<float> foam;
+    std::vector<PbrVertex> verts;
+    std::vector<uint32_t> indices;
 
-struct TrackedWaterVehicle {
-    float x = 0.0f;
-    float z = 0.0f;
-    float last_stamp_x = 0.0f;
-    float last_stamp_z = 0.0f;
-    float last_stamp_t = -100.0f;
+    void reset() {
+        active = false;
+        h_prev.clear();
+        h_cur.clear();
+        h_next.clear();
+        foam.clear();
+        verts.clear();
+        indices.clear();
+    }
+
+    void ensure_initialized(uint32_t gen, float x0, float x1, float z0, float z1, float wy, const std::string &tex) {
+        if (active && track_gen == gen &&
+            x0 >= min_x - 0.5f && x1 <= max_x + 0.5f &&
+            z0 >= min_z - 0.5f && z1 <= max_z + 0.5f) {
+            if (!tex.empty()) texture_id = tex;
+            return;
+        }
+        // Expand bounds if new tiles appear; initialize 96x96 PDE grid
+        if (active && track_gen == gen) {
+            min_x = std::min(min_x, x0);
+            max_x = std::max(max_x, x1);
+            min_z = std::min(min_z, z0);
+            max_z = std::max(max_z, z1);
+        } else {
+            track_gen = gen;
+            min_x = x0; max_x = x1;
+            min_z = z0; max_z = z1;
+        }
+        water_y = wy;
+        texture_id = tex.empty() ? "tex/water" : tex;
+        const size_t total = static_cast<size_t>(kN) * kN;
+        h_prev.assign(total, 0.0f);
+        h_cur.assign(total, 0.0f);
+        h_next.assign(total, 0.0f);
+        foam.assign(total, 0.0f);
+        verts.resize(total);
+        indices.clear();
+        indices.reserve(static_cast<size_t>(kN - 1) * (kN - 1) * 6u);
+        for (uint32_t j = 0; j < kN - 1; ++j) {
+            for (uint32_t i = 0; i < kN - 1; ++i) {
+                const uint32_t i0 = j * kN + i;
+                const uint32_t i1 = i0 + 1u;
+                const uint32_t i2 = i0 + kN;
+                const uint32_t i3 = i2 + 1u;
+                indices.push_back(i0); indices.push_back(i2); indices.push_back(i1);
+                indices.push_back(i1); indices.push_back(i2); indices.push_back(i3);
+            }
+        }
+        active = true;
+    }
+
+    void splat_impulse(float wx, float wz, float radius_m, float dh, float add_foam) {
+        if (!active || max_x <= min_x + 0.1f || max_z <= min_z + 0.1f) return;
+        const float dx_cell = (max_x - min_x) / static_cast<float>(kN - 1);
+        const float dz_cell = (max_z - min_z) / static_cast<float>(kN - 1);
+        const float gx = (wx - min_x) / dx_cell;
+        const float gz = (wz - min_z) / dz_cell;
+        const int rx = std::max(1, static_cast<int>(std::ceil(radius_m / dx_cell)));
+        const int rz = std::max(1, static_cast<int>(std::ceil(radius_m / dz_cell)));
+        const int i0 = std::max(1, static_cast<int>(std::floor(gx)) - rx);
+        const int i1 = std::min(static_cast<int>(kN) - 2, static_cast<int>(std::ceil(gx)) + rx);
+        const int j0 = std::max(1, static_cast<int>(std::floor(gz)) - rz);
+        const int j1 = std::min(static_cast<int>(kN) - 2, static_cast<int>(std::ceil(gz)) + rz);
+        const float inv_r2 = 1.0f / std::max(0.04f, radius_m * radius_m);
+        for (int j = j0; j <= j1; ++j) {
+            const float pz = min_z + static_cast<float>(j) * dz_cell;
+            const float dz = pz - wz;
+            for (int i = i0; i <= i1; ++i) {
+                const float px = min_x + static_cast<float>(i) * dx_cell;
+                const float dx = px - wx;
+                const float d2 = (dx * dx + dz * dz) * inv_r2;
+                if (d2 >= 1.0f) continue;
+                const float w = (1.0f - d2) * (1.0f - d2);
+                const size_t idx = static_cast<size_t>(j) * kN + static_cast<size_t>(i);
+                h_cur[idx] = std::clamp(h_cur[idx] + dh * w, -0.45f, 0.45f);
+                if (add_foam > 0.0f) {
+                    foam[idx] = std::min(1.0f, foam[idx] + add_foam * w);
+                }
+            }
+        }
+    }
+
+    void step_and_build_mesh() {
+        if (!active) return;
+        // 2x sub-stepped 2D damped wave equation (CFL-stable, c2 = 0.22 <= 0.25)
+        constexpr float kC2 = 0.21f;
+        constexpr float kDamp = 0.018f;
+        for (int sub = 0; sub < 2; ++sub) {
+            for (uint32_t j = 1; j < kN - 1; ++j) {
+                const size_t row = static_cast<size_t>(j) * kN;
+                for (uint32_t i = 1; i < kN - 1; ++i) {
+                    const size_t idx = row + i;
+                    const float lap = h_cur[idx - 1] + h_cur[idx + 1] + h_cur[idx - kN] + h_cur[idx + kN] - 4.0f * h_cur[idx];
+                    float hn = (2.0f - kDamp) * h_cur[idx] - (1.0f - kDamp) * h_prev[idx] + kC2 * lap;
+                    if (std::fabs(hn) < 1e-5f) hn = 0.0f;
+                    h_next[idx] = std::clamp(hn, -0.50f, 0.50f);
+                }
+            }
+            // Soft absorbing boundary along pond edges
+            for (uint32_t k = 0; k < kN; ++k) {
+                h_next[k] = h_next[kN + k] * 0.4f;
+                h_next[(kN - 1) * kN + k] = h_next[(kN - 2) * kN + k] * 0.4f;
+                h_next[k * kN] = h_next[k * kN + 1] * 0.4f;
+                h_next[k * kN + (kN - 1)] = h_next[k * kN + (kN - 2)] * 0.4f;
+            }
+            h_prev.swap(h_cur);
+            h_cur.swap(h_next);
+        }
+
+        // Decay & gently diffuse foam so it dissolves smoothly when cars stop
+        const float dx_cell = std::max(0.05f, (max_x - min_x) / static_cast<float>(kN - 1));
+        const float dz_cell = std::max(0.05f, (max_z - min_z) / static_cast<float>(kN - 1));
+        const float inv_2dx = 0.5f / dx_cell;
+        const float inv_2dz = 0.5f / dz_cell;
+        for (uint32_t j = 0; j < kN; ++j) {
+            const float v_coord = static_cast<float>(j) / static_cast<float>(kN - 1);
+            const float pz = min_z + static_cast<float>(j) * dz_cell;
+            const uint32_t jm = (j > 0) ? (j - 1) : 0;
+            const uint32_t jp = (j + 1 < kN) ? (j + 1) : (kN - 1);
+            const float edge_z = std::min(v_coord, 1.0f - v_coord) * 8.0f;
+            for (uint32_t i = 0; i < kN; ++i) {
+                const size_t idx = static_cast<size_t>(j) * kN + i;
+                const float u_coord = static_cast<float>(i) / static_cast<float>(kN - 1);
+                const float px = min_x + static_cast<float>(i) * dx_cell;
+                const uint32_t im = (i > 0) ? (i - 1) : 0;
+                const uint32_t ip = (i + 1 < kN) ? (i + 1) : (kN - 1);
+
+                const float h = h_cur[idx];
+                const float dhdx = (h_cur[j * kN + ip] - h_cur[j * kN + im]) * inv_2dx;
+                const float dhdz = (h_cur[jp * kN + i] - h_cur[jm * kN + i]) * inv_2dz;
+                // Slightly boost wave slope so real 3D waves refract/reflect crisp sky highlights
+                const float nx = -dhdx * 2.2f;
+                const float ny = 1.0f;
+                const float nz = -dhdz * 2.2f;
+                const float inv_n = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+
+                // Smooth foam decay (completely vanishes within ~1.8s when parked)
+                foam[idx] *= 0.962f;
+                if (foam[idx] < 0.002f) foam[idx] = 0.0f;
+
+                const float edge_x = std::min(u_coord, 1.0f - u_coord) * 8.0f;
+                const float shore_depth = std::clamp(std::min(edge_x, edge_z), 0.0f, 1.0f);
+
+                PbrVertex &v = verts[idx];
+                v.pos[0] = px;
+                v.pos[1] = water_y + h;
+                v.pos[2] = pz;
+                v.normal[0] = nx * inv_n;
+                v.normal[1] = ny * inv_n;
+                v.normal[2] = nz * inv_n;
+                v.tangent[0] = foam[idx];
+                v.tangent[1] = shore_depth;
+                v.tangent[2] = 0.0f;
+                v.tangent[3] = 1.0f;
+                v.uv[0] = u_coord * 6.0f;
+                v.uv[1] = v_coord * 6.0f;
+            }
+        }
+    }
 };
 
 struct WaterSprayParticle {
@@ -455,13 +710,9 @@ struct RemasterEngine {
     double frame_ms_max = 0.0;
     uint32_t frame_ms_count = 0;
 
-    // Reactive water wake ring buffer + 3D wheel spray particle pool
-    static constexpr uint32_t kMaxWaterWakes = 32;
+    // Real-time 96x96 2D wave-equation fluid pond simulation + 3D wheel water spray pool
     static constexpr uint32_t kMaxSprayParticles = 512;
-    WaterWakeStamp water_wakes[kMaxWaterWakes]{};
-    uint32_t water_wake_cursor = 0;
-    std::vector<TrackedWaterVehicle> tracked_water_vehicles;
-    uint32_t water_wake_track_gen = 0;
+    FluidPondSim pond_sim;
     WaterSprayParticle spray_pool[kMaxSprayParticles]{};
     uint32_t spray_cursor = 0;
     uint32_t spray_rng = 0x13579BDFu;
@@ -790,75 +1041,7 @@ PosedVboSlice build_posed_vbo(const EntityInstance &ent, uint32_t mesh_handle,
     if (!cpu || cpu->vertices.empty() || cpu->skin.size() != cpu->vertices.size()) return {};
 
     static thread_local std::vector<PbrVertex> posed;
-    posed = cpu->vertices;
-    bool moved = false;
-
-    if (!ent.bone_palette.empty()) {
-        const size_t n_bones = ent.bone_palette.size() / 16u;
-        for (size_t i = 0; i < posed.size(); ++i) {
-            const auto &sk = cpu->skin[i];
-            if (sk.mode != 2u) continue;
-            const float x = posed[i].pos[0], y = posed[i].pos[1], z = posed[i].pos[2];
-            const float nx = posed[i].normal[0], ny = posed[i].normal[1], nz = posed[i].normal[2];
-            float px = 0.0f, py = 0.0f, pz = 0.0f;
-            float rnx = 0.0f, rny = 0.0f, rnz = 0.0f;
-            float wsum = 0.0f;
-            for (int j = 0; j < 2; ++j) {
-                const float w = sk.weight[j];
-                if (w <= 0.0f) continue;
-                const size_t bi = static_cast<size_t>(sk.bone[j]) / 4u;
-                if (bi >= n_bones) continue;
-                const float *m = ent.bone_palette.data() + bi * 16u;
-                // bone_pose.cpp stores 4 column vectors (c0=m[0..3], c1=m[4..7], c2=m[8..11], c3=m[12..15])
-                px  += w * (m[0] * x + m[4] * y + m[8]  * z + m[12]);
-                py  += w * (m[1] * x + m[5] * y + m[9]  * z + m[13]);
-                pz  += w * (m[2] * x + m[6] * y + m[10] * z + m[14]);
-                rnx += w * (m[0] * nx + m[4] * ny + m[8]  * nz);
-                rny += w * (m[1] * nx + m[5] * ny + m[9]  * nz);
-                rnz += w * (m[2] * nx + m[6] * ny + m[10] * nz);
-                wsum += w;
-            }
-            if (wsum > 1e-4f) {
-                posed[i].pos[0] = px; posed[i].pos[1] = py; posed[i].pos[2] = pz;
-                const float nlen = std::sqrt(rnx * rnx + rny * rny + rnz * rnz);
-                if (nlen > 1e-5f) {
-                    posed[i].normal[0] = rnx / nlen;
-                    posed[i].normal[1] = rny / nlen;
-                    posed[i].normal[2] = rnz / nlen;
-                }
-                moved = true;
-            }
-        }
-    } else if (!ent.dent_offsets.empty()) {
-        const size_t n_dents = ent.dent_offsets.size() / 3u;
-        for (size_t i = 0; i < posed.size(); ++i) {
-            const auto &sk = cpu->skin[i];
-            if (sk.mode != 1u) continue;
-            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-            for (int j = 0; j < 2; ++j) {
-                if (sk.bone[j] == 0u) continue;
-                const size_t di = static_cast<size_t>(sk.bone[j] - 1u);
-                if (di >= n_dents) continue;
-                const float ox = ent.dent_offsets[di * 3u + 0u];
-                const float oy = ent.dent_offsets[di * 3u + 1u];
-                const float oz = ent.dent_offsets[di * 3u + 2u];
-                if (std::isfinite(ox) && std::fabs(ox) <= 2.5f) dx += sk.weight[j] * ox;
-                if (std::isfinite(oy) && std::fabs(oy) <= 2.5f) dy += sk.weight[j] * oy;
-                if (std::isfinite(oz) && std::fabs(oz) <= 2.5f) dz += sk.weight[j] * oz;
-            }
-            if (dx * dx + dy * dy + dz * dz > 1e-8f) {
-                posed[i].pos[0] += dx;
-                posed[i].pos[1] += dy;
-                posed[i].pos[2] += dz;
-                moved = true;
-            }
-        }
-        if (moved && !cpu->indices.empty()) {
-            compute_smooth_normals_and_tangents(posed, cpu->indices);
-        }
-    }
-
-    if (!moved) return {};
+    if (!apply_entity_skinning_cpu(*cpu, ent, posed)) return {};
 
     const uint64_t bytes = static_cast<uint64_t>(posed.size()) * sizeof(PbrVertex);
     const uint64_t aligned_off = (dyn_cursor + 15ull) & ~15ull;
@@ -944,6 +1127,7 @@ void rebuild_static_world_batches(const LoadedWorld &world) {
 
         GpuTextureSet *gt = lookup_gpu_texture_set(cpu->texture_id);
         PbrMaterial mat = (!inst.is_sky && gt && gt->has_resolved_material) ? gt->resolved_material : cpu->material;
+        if (mat.is_fake_shadow || cpu->material.is_fake_shadow) continue;
         const bool is_additive = !inst.is_sky && (mat.alpha_additive || (gt && gt->has_alpha_additive));
         const bool is_cutout = !inst.is_sky && !is_additive && (mat.alpha_cutout || (gt && gt->has_alpha_cutout));
         const bool is_blend = !inst.is_sky && !is_additive && !is_cutout && (mat.alpha_blend || (gt && gt->has_alpha_blend));
@@ -1409,37 +1593,33 @@ bool render_frame(const OutputTarget &target) {
             }
         }
     }
+    if (g_eng.pond_sim.active && g_eng.pond_sim.track_gen != frame->track_generation) {
+        g_eng.pond_sim.reset();
+        for (auto &sp : g_eng.spray_pool) sp = WaterSprayParticle{};
+        g_eng.spray_cursor = 0;
+    }
     if (!frame->water_meshes.empty()) {
-        water_slices.reserve(frame->water_meshes.size());
-        for (size_t wi = 0; wi < frame->water_meshes.size(); ++wi) {
-            const auto &wm = frame->water_meshes[wi];
-            if (wm.vertices.empty() || wm.indices.size() < 3u) continue;
-            ensure_gpu_texture_set(list, wm.texture_id, false, false);
-            if (!dyn_base && g_eng.dyn_vbo[slot]) {
-                dyn_base = static_cast<uint8_t *>(g_eng.dyn_vbo[slot]->map());
+        float wmin_x = 1e9f, wmax_x = -1e9f, wmin_z = 1e9f, wmax_z = -1e9f, wy_sum = 0.0f;
+        size_t wy_cnt = 0;
+        for (const auto &wm : frame->water_meshes) {
+            for (const auto &v : wm.vertices) {
+                wmin_x = std::min(wmin_x, v.pos[0]);
+                wmax_x = std::max(wmax_x, v.pos[0]);
+                wmin_z = std::min(wmin_z, v.pos[2]);
+                wmax_z = std::max(wmax_z, v.pos[2]);
+                wy_sum += v.pos[1];
+                ++wy_cnt;
             }
-            if (!dyn_ibo_base && g_eng.dyn_ibo[slot]) {
-                dyn_ibo_base = static_cast<uint8_t *>(g_eng.dyn_ibo[slot]->map());
-            }
-            if (!dyn_base || !dyn_ibo_base) continue;
-            const uint64_t vb_bytes = static_cast<uint64_t>(wm.vertices.size()) * sizeof(PbrVertex);
-            const uint64_t ib_bytes = static_cast<uint64_t>(wm.indices.size()) * sizeof(uint32_t);
-            const uint64_t v_off = (dyn_cursor + 15ull) & ~15ull;
-            const uint64_t i_off = (dyn_ibo_cursor + 15ull) & ~15ull;
-            if (v_off + vb_bytes > RemasterEngine::kDynVboSlotBytes ||
-                i_off + ib_bytes > RemasterEngine::kDynIboSlotBytes) {
-                continue;
-            }
-            std::memcpy(dyn_base + v_off, wm.vertices.data(), static_cast<size_t>(vb_bytes));
-            std::memcpy(dyn_ibo_base + i_off, wm.indices.data(), static_cast<size_t>(ib_bytes));
-            dyn_cursor = v_off + vb_bytes;
-            dyn_ibo_cursor = i_off + ib_bytes;
-            water_slices.push_back(WaterDrawSlice{
-                wi, v_off, i_off,
-                static_cast<uint32_t>(wm.vertices.size()),
-                static_cast<uint32_t>(wm.indices.size())
-            });
         }
+        if (wy_cnt > 0 && wmax_x > wmin_x + 0.5f && wmax_z > wmin_z + 0.5f) {
+            const float wy = wy_sum / static_cast<float>(wy_cnt);
+            g_eng.pond_sim.ensure_initialized(frame->track_generation, wmin_x, wmax_x, wmin_z, wmax_z, wy,
+                                              frame->water_meshes[0].texture_id);
+        }
+    }
+    if (g_eng.pond_sim.active) {
+        ensure_gpu_texture_set(list, g_eng.pond_sim.texture_id, false, false);
+        g_eng.last_water_tex_id = g_eng.pond_sim.texture_id;
     }
     if (dyn_base && g_eng.dyn_vbo[slot]) {
         g_eng.dyn_vbo[slot]->unmap();
@@ -1479,49 +1659,21 @@ bool render_frame(const OutputTarget &target) {
     ubo.ambient_ground_pad[0] = frame->env.ambient_ground[0];
     ubo.ambient_ground_pad[1] = frame->env.ambient_ground[1];
     ubo.ambient_ground_pad[2] = frame->env.ambient_ground[2];
-    // Update reactive water wake ripples & 3D wheel water spray particles
+    // Step real-time 96x96 2D wave-equation fluid simulation coupled to EXACT CarObject physics velocity!
     const float water_time = static_cast<float>(std::fmod(static_cast<double>(g_eng.render_frame_id) / 60.0, 10000.0));
     ubo.ambient_ground_pad[3] = water_time;
-    if (g_eng.water_wake_track_gen != frame->track_generation) {
-        g_eng.water_wake_track_gen = frame->track_generation;
-        g_eng.tracked_water_vehicles.clear();
-        for (auto &wk : g_eng.water_wakes) wk = WaterWakeStamp{};
-        for (auto &sp : g_eng.spray_pool) sp = WaterSprayParticle{};
-        g_eng.water_wake_cursor = 0;
-        g_eng.spray_cursor = 0;
-    }
 
     auto next_rand = [&]() -> float {
         g_eng.spray_rng = g_eng.spray_rng * 1664525u + 1013904223u;
         return static_cast<float>((g_eng.spray_rng >> 8) & 0xFFFFu) / 65535.0f;
     };
 
-    float water_y_global = 0.0f;
-    if (!frame->water_meshes.empty()) {
-        float wmin_x = 1e9f, wmax_x = -1e9f, wmin_z = 1e9f, wmax_z = -1e9f, wy_sum = 0.0f;
-        size_t wy_cnt = 0;
-        g_eng.last_water_tex_id = frame->water_meshes[0].texture_id;
-        for (const auto &wm : frame->water_meshes) {
-            for (const auto &v : wm.vertices) {
-                wmin_x = std::min(wmin_x, v.pos[0]);
-                wmax_x = std::max(wmax_x, v.pos[0]);
-                wmin_z = std::min(wmin_z, v.pos[2]);
-                wmax_z = std::max(wmax_z, v.pos[2]);
-                wy_sum += v.pos[1];
-                ++wy_cnt;
-            }
-        }
-        water_y_global = wy_cnt > 0 ? (wy_sum / static_cast<float>(wy_cnt)) : 0.0f;
-        auto push_wake = [&](float wx, float wz, float strength) {
-            auto &dst = g_eng.water_wakes[g_eng.water_wake_cursor % RemasterEngine::kMaxWaterWakes];
-            dst.x = wx;
-            dst.z = wz;
-            dst.birth_t = water_time;
-            dst.strength = std::clamp(strength, 0.1f, 1.0f);
-            ++g_eng.water_wake_cursor;
-        };
+    float water_y_global = g_eng.pond_sim.water_y;
+    WaterDrawSlice pond_slice{};
+    if (g_eng.pond_sim.active) {
+        auto &sim = g_eng.pond_sim;
         auto spawn_spray = [&](float px, float py, float pz, float vx, float vy, float vz,
-                               float lifetime, float s0, float s1, bool is_droplet) {
+                               float lifetime, float s0, float s1) {
             auto &p = g_eng.spray_pool[g_eng.spray_cursor % RemasterEngine::kMaxSprayParticles];
             ++g_eng.spray_cursor;
             p.pos[0] = px; p.pos[1] = py; p.pos[2] = pz;
@@ -1531,123 +1683,84 @@ bool render_frame(const OutputTarget &target) {
             p.size_start = s0;
             p.size_end = s1;
             p.seed = next_rand() * 100.0f;
-            p.is_droplet = is_droplet ? 1.0f : 0.0f;
+            p.is_droplet = 0.0f;
         };
 
-        std::vector<TrackedWaterVehicle> next_tracked;
-        next_tracked.reserve(32);
-        for (const auto &ent : frame->entities) {
-            if (!ent.is_vehicle && !ent.is_player_vehicle) continue;
-            const float ex = ent.world_matrix[9];
-            const float ey = ent.world_matrix[10];
-            const float ez = ent.world_matrix[11];
-            if (!std::isfinite(ex) || !std::isfinite(ey) || !std::isfinite(ez)) continue;
-            if (ex < wmin_x - 3.0f || ex > wmax_x + 3.0f || ez < wmin_z - 3.0f || ez > wmax_z + 3.0f) continue;
-            if (ey < water_y_global - 2.5f || ey > water_y_global + 2.5f) continue;
+        // Couple EVERY vehicle using its exact EE physics velocity (0.0 m/s when parked = ZERO foam/spray!)
+        for (const auto &vp : frame->vehicles) {
+            const float ex = vp.pos[0], ey = vp.pos[1], ez = vp.pos[2];
+            if (ex < sim.min_x - 2.5f || ex > sim.max_x + 2.5f ||
+                ez < sim.min_z - 2.5f || ez > sim.max_z + 2.5f) continue;
+            if (ey < sim.water_y - 2.5f || ey > sim.water_y + 2.2f) continue;
 
-            // Deduplicate multi-part vehicles (chassis + wheels) within 2.5m
-            bool dup = false;
-            for (const auto &nt : next_tracked) {
-                const float ddx = ex - nt.x, ddz = ez - nt.z;
-                if (ddx * ddx + ddz * ddz < 6.25f) { dup = true; break; }
-            }
-            if (dup) continue;
+            // Strictly idle when parked or barely creeping!
+            if (vp.speed < 0.6f) continue;
 
-            const TrackedWaterVehicle *prev = nullptr;
-            float best_d2 = 36.0f;
-            for (const auto &pt : g_eng.tracked_water_vehicles) {
-                const float ddx = ex - pt.x, ddz = ez - pt.z;
-                const float d2 = ddx * ddx + ddz * ddz;
-                if (d2 < best_d2) { best_d2 = d2; prev = &pt; }
-            }
+            const float rx = vp.right[0], rz = vp.right[2];
+            const float fx = vp.forward[0], fz = vp.forward[2];
+            const float speed_norm = std::clamp(vp.speed / 18.0f, 0.05f, 1.0f);
 
-            TrackedWaterVehicle cur{};
-            cur.x = ex;
-            cur.z = ez;
-            if (prev) {
-                cur.last_stamp_x = prev->last_stamp_x;
-                cur.last_stamp_z = prev->last_stamp_z;
-                cur.last_stamp_t = prev->last_stamp_t;
-                const float vx_car = (ex - prev->x) * 60.0f;
-                const float vz_car = (ez - prev->z) * 60.0f;
-                const float speed_mps = std::sqrt(vx_car * vx_car + vz_car * vz_car);
-                const float sdx = ex - cur.last_stamp_x;
-                const float sdz = ez - cur.last_stamp_z;
-                const float dist_since = std::sqrt(sdx * sdx + sdz * sdz);
-                const float dt_since = water_time - cur.last_stamp_t;
+            // Physical bow wave (push up ahead of bumper) + hull trough (push down under chassis)
+            const float bow_x = ex + fx * 2.1f, bow_z = ez + fz * 2.1f;
+            sim.splat_impulse(bow_x, bow_z, 1.8f, +0.16f * speed_norm, vp.speed > 2.8f ? 0.14f * speed_norm : 0.0f);
+            sim.splat_impulse(ex, ez, 2.2f, -0.14f * speed_norm, 0.0f);
 
-                // Right & Forward axes of the vehicle from EE 4x3 world_matrix
-                const float rx = ent.world_matrix[0], rz = ent.world_matrix[2];
-                const float fx = ent.world_matrix[6], fz = ent.world_matrix[8];
+            // 4 wheel contact displacements + localized wheel-churn foam
+            static constexpr float kWheelOff[4][2] = {
+                {-0.95f,  1.35f}, { 0.95f,  1.35f},
+                {-0.95f, -1.35f}, { 0.95f, -1.35f},
+            };
+            for (int w = 0; w < 4; ++w) {
+                const float side = (kWheelOff[w][0] < 0.0f) ? -1.0f : 1.0f;
+                const float wx = ex + rx * kWheelOff[w][0] + fx * kWheelOff[w][1];
+                const float wz = ez + rz * kWheelOff[w][0] + fz * kWheelOff[w][1];
+                const float add_f = (vp.speed > 2.2f) ? (0.24f * speed_norm) : 0.0f;
+                sim.splat_impulse(wx, wz, 1.35f, -0.15f * speed_norm, add_f);
 
-                // Only disturb water when the vehicle is actually moving (still pond when parked!)
-                if (speed_mps > 0.8f && (dist_since >= 1.1f || dt_since >= 0.11f)) {
-                    const float str = std::clamp(0.28f + speed_mps * 0.048f, 0.28f, 1.0f);
-                    // Stamp dual left/right wheel wakes for a realistic twin-track Kelvin wake
-                    push_wake(ex - rx * 0.80f, ez - rz * 0.80f, str * 0.85f);
-                    push_wake(ex + rx * 0.80f, ez + rz * 0.80f, str * 0.85f);
-                    cur.last_stamp_x = ex;
-                    cur.last_stamp_z = ez;
-                    cur.last_stamp_t = water_time;
+                // Kick up feathery 3D spray mist ONLY when genuinely driving (> 3.2 m/s),
+                // strictly outward from the wheel wells (never floating over the trunk!)
+                if (vp.speed > 3.2f && next_rand() < (0.25f + speed_norm * 0.55f)) {
+                    const float sp_int = std::clamp((vp.speed - 3.2f) / 14.0f, 0.12f, 1.0f);
+                    const float out_x = wx + rx * (0.28f * side);
+                    const float out_z = wz + rz * (0.28f * side);
+                    const float out_v = (2.2f + next_rand() * 2.6f) * sp_int * side;
+                    const float up_v  = (1.4f + next_rand() * 2.2f) * sp_int;
+                    const float pvx = vp.vel[0] * 0.25f + rx * out_v;
+                    const float pvz = vp.vel[2] * 0.25f + rz * out_v;
+                    spawn_spray(out_x, sim.water_y + 0.10f, out_z, pvx, up_v, pvz,
+                                0.45f + next_rand() * 0.35f, 0.32f, 1.10f + sp_int * 0.70f);
                 }
-
-                // Kick up 3D wheel water spray mist & glistening droplets proportional to speed!
-                if (speed_mps > 1.5f) {
-                    const float intensity = std::clamp((speed_mps - 1.5f) / 14.0f, 0.15f, 1.0f);
-                    const int bursts = (intensity > 0.55f) ? 2 : 1;
-                    static constexpr float kWheelOff[4][2] = {
-                        {-0.92f,  1.35f}, { 0.92f,  1.35f},
-                        {-0.92f, -1.35f}, { 0.92f, -1.35f},
-                    };
-                    for (int b = 0; b < bursts; ++b) {
-                        for (int w = 0; w < 4; ++w) {
-                            if (next_rand() > 0.45f + intensity * 0.50f) continue;
-                            const float side = (kWheelOff[w][0] < 0.0f) ? -1.0f : 1.0f;
-                            const float wx = ex + rx * kWheelOff[w][0] + fx * kWheelOff[w][1];
-                            const float wz = ez + rz * kWheelOff[w][0] + fz * kWheelOff[w][1];
-                            const float wy = water_y_global + 0.12f;
-                            const float out_v = (1.6f + next_rand() * 2.8f) * intensity * side;
-                            const float up_v  = (1.8f + next_rand() * 3.4f) * intensity;
-                            const float back_v = -0.35f + (next_rand() - 0.5f) * 0.25f;
-                            const float pvx = vx_car * back_v + rx * out_v + (next_rand() - 0.5f) * 1.2f;
-                            const float pvz = vz_car * back_v + rz * out_v + (next_rand() - 0.5f) * 1.2f;
-                            const bool drop = (next_rand() > 0.42f);
-                            if (drop) {
-                                spawn_spray(wx, wy, wz, pvx * 1.15f, up_v * 1.25f, pvz * 1.15f,
-                                            0.45f + next_rand() * 0.35f, 0.18f, 0.34f, true);
-                            } else {
-                                spawn_spray(wx, wy + 0.08f, wz, pvx * 0.75f, up_v * 0.80f, pvz * 0.75f,
-                                            0.55f + next_rand() * 0.45f, 0.35f, 1.15f + intensity * 0.65f, false);
-                            }
-                        }
-                    }
-                }
-            } else {
-                cur.last_stamp_x = ex;
-                cur.last_stamp_z = ez;
-                cur.last_stamp_t = water_time;
-            }
-            next_tracked.push_back(cur);
-        }
-        g_eng.tracked_water_vehicles = std::move(next_tracked);
-
-        uint32_t active_wakes = 0;
-        for (uint32_t wi = 0; wi < RemasterEngine::kMaxWaterWakes; ++wi) {
-            const auto &wk = g_eng.water_wakes[wi];
-            const float age = water_time - wk.birth_t;
-            if (wk.strength > 0.001f && age >= 0.0f && age <= 4.2f) {
-                ubo.water_wakes[active_wakes][0] = wk.x;
-                ubo.water_wakes[active_wakes][1] = wk.z;
-                ubo.water_wakes[active_wakes][2] = wk.birth_t;
-                ubo.water_wakes[active_wakes][3] = wk.strength;
-                ++active_wakes;
             }
         }
-        ubo.water_wake_meta[0] = static_cast<float>(active_wakes);
-        ubo.water_wake_meta[1] = water_y_global;
+
+        sim.step_and_build_mesh();
+
+        // Upload the 96x96 fluid mesh into our persistent ring VBO/IBO (zero per-frame allocations!)
+        const uint64_t vb_bytes = static_cast<uint64_t>(sim.verts.size()) * sizeof(PbrVertex);
+        const uint64_t ib_bytes = static_cast<uint64_t>(sim.indices.size()) * sizeof(uint32_t);
+        const uint64_t v_off = (dyn_cursor + 15ull) & ~15ull;
+        const uint64_t i_off = (dyn_ibo_cursor + 15ull) & ~15ull;
+        if (g_eng.dyn_vbo[slot] && g_eng.dyn_ibo[slot] &&
+            v_off + vb_bytes <= RemasterEngine::kDynVboSlotBytes &&
+            i_off + ib_bytes <= RemasterEngine::kDynIboSlotBytes) {
+            if (auto *vb_p = static_cast<uint8_t *>(g_eng.dyn_vbo[slot]->map())) {
+                std::memcpy(vb_p + v_off, sim.verts.data(), static_cast<size_t>(vb_bytes));
+                g_eng.dyn_vbo[slot]->unmap();
+            }
+            if (auto *ib_p = static_cast<uint8_t *>(g_eng.dyn_ibo[slot]->map())) {
+                std::memcpy(ib_p + i_off, sim.indices.data(), static_cast<size_t>(ib_bytes));
+                g_eng.dyn_ibo[slot]->unmap();
+            }
+            dyn_cursor = v_off + vb_bytes;
+            dyn_ibo_cursor = i_off + ib_bytes;
+            pond_slice.vbo_offset = v_off;
+            pond_slice.ibo_offset = i_off;
+            pond_slice.vertex_count = static_cast<uint32_t>(sim.verts.size());
+            pond_slice.index_count = static_cast<uint32_t>(sim.indices.size());
+        }
     }
 
-    // Step 3D ballistic water spray particles (gravity + air drag) & build camera-facing quads
+    // Step 3D ballistic water spray mist particles (gravity + air drag) & build camera-facing quads
     constexpr float kDt = 1.0f / 60.0f;
     static thread_local std::vector<PbrVertex> spray_verts;
     static thread_local std::vector<uint32_t> spray_inds;
@@ -1659,10 +1772,9 @@ bool render_frame(const OutputTarget &target) {
         if (sp.lifetime <= 0.0f || sp.age >= sp.lifetime) continue;
         sp.age += kDt;
         if (sp.age >= sp.lifetime) { sp.lifetime = 0.0f; continue; }
-        sp.vel[1] -= 9.8f * kDt; // real gravity
-        const float drag = sp.is_droplet > 0.5f ? 0.985f : 0.955f;
-        sp.vel[0] *= drag;
-        sp.vel[2] *= drag;
+        sp.vel[1] -= 9.8f * kDt;
+        sp.vel[0] *= 0.96f;
+        sp.vel[2] *= 0.96f;
         sp.pos[0] += sp.vel[0] * kDt;
         sp.pos[1] += sp.vel[1] * kDt;
         sp.pos[2] += sp.vel[2] * kDt;
@@ -1674,7 +1786,7 @@ bool render_frame(const OutputTarget &target) {
         const float half_sz = 0.5f * (sp.size_start + (sp.size_end - sp.size_start) * t_life);
         const float fade_in = std::min(1.0f, t_life * 5.0f);
         const float fade_out = (1.0f - t_life) * (1.0f - t_life);
-        const float alpha = fade_in * fade_out * (sp.is_droplet > 0.5f ? 0.88f : 0.46f);
+        const float alpha = fade_in * fade_out * 0.36f;
         const uint32_t vb = static_cast<uint32_t>(spray_verts.size());
         static constexpr float kCorner[4][2] = {{-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
         static constexpr float kUV[4][2]     = {{ 0.0f,  0.0f}, {1.0f,  0.0f}, {1.0f, 1.0f}, { 0.0f, 1.0f}};
@@ -1686,7 +1798,7 @@ bool render_frame(const OutputTarget &target) {
             v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
             v.tangent[0] = alpha;
             v.tangent[1] = sp.seed;
-            v.tangent[2] = sp.is_droplet;
+            v.tangent[2] = 0.0f;
             v.tangent[3] = 1.0f;
             v.uv[0] = kUV[c][0];
             v.uv[1] = kUV[c][1];
@@ -1902,6 +2014,7 @@ bool render_frame(const OutputTarget &target) {
                 if (!gt || !gt->ds) continue;
 
                 const PbrMaterial &mat = gt->has_resolved_material ? gt->resolved_material : gm->material;
+                if (mat.is_fake_shadow || gm->material.is_fake_shadow) continue;
                 const bool is_additive = mat.alpha_additive || gt->has_alpha_additive;
                 const bool is_cutout = !is_additive && (mat.alpha_cutout || gt->has_alpha_cutout);
                 const bool is_blend = !is_additive && !is_cutout && (mat.alpha_blend || gt->has_alpha_blend);
@@ -2059,45 +2172,36 @@ bool render_frame(const OutputTarget &target) {
     draw_static_world(false, 0, false, cam.pos, true, main_frustum, 0.0f);
     draw_dynamic_entities(false, 0, false, true, main_frustum, cam.pos, 0.0f);
 
-    // Pass 3B (Water): Physically reflective, rippling EE water surfaces (no CSM, no cubemap, depth-write off)
+    // Pass 3B (Water): 96x96 2D wave-equation physically-simulated pond water (NEVER PS2-culled!)
     uint64_t water_tris = 0;
-    if (!water_slices.empty()) {
-        const RenderInputSlot pbr_slot(0, sizeof(PbrVertex));
-        list.setPipeline(g_eng.pipe_pbr_alpha_blend.get());
-        RenderDescriptorSet *cur_water_ds = nullptr;
-        for (const auto &ws : water_slices) {
-            const auto &wm = frame->water_meshes[ws.mesh_index];
-            if (!frustum_intersects_sphere(main_frustum, wm.center[0], wm.center[1], wm.center[2], wm.radius))
-                continue;
-            GpuTextureSet *gt = lookup_gpu_texture_set(wm.texture_id);
-            if (!gt || !gt->ds) continue;
-
+    if (pond_slice.index_count > 0 && g_eng.pond_sim.active) {
+        GpuTextureSet *gt = lookup_gpu_texture_set(g_eng.pond_sim.texture_id);
+        if (!gt && !g_eng.gpu_textures.empty()) gt = g_eng.gpu_textures.begin()->second.get();
+        if (gt && gt->ds) {
+            const RenderInputSlot pbr_slot(0, sizeof(PbrVertex));
+            list.setPipeline(g_eng.pipe_pbr_alpha_blend.get());
+            list.setGraphicsDescriptorSet(gt->ds.get(), 1);
             DrawPC pc{};
             pc.model[0] = pc.model[5] = pc.model[10] = pc.model[15] = 1.0f;
             pc.base_color[0] = 1.0f; pc.base_color[1] = 1.0f; pc.base_color[2] = 1.0f; pc.base_color[3] = 1.0f;
-            pc.pbr_params[0] = 0.05f; // roughness
-            pc.pbr_params[1] = 0.0f;  // metallic
-            pc.pbr_params[2] = 1.0f;  // ao
-            pc.pbr_params[3] = 0.0f;  // emissive
-            pc.flags[0] = 2u;         // alpha blend
-            pc.flags[1] = 2u;         // water shading mode
+            pc.pbr_params[0] = 0.035f; // roughness
+            pc.pbr_params[1] = 0.0f;   // metallic
+            pc.pbr_params[2] = 1.0f;   // ao
+            pc.pbr_params[3] = 0.0f;   // emissive
+            pc.flags[0] = 2u;          // alpha blend
+            pc.flags[1] = 2u;          // fluid water shading mode
             pc.flags[2] = 0u;
-
-            if (gt->ds.get() != cur_water_ds) {
-                list.setGraphicsDescriptorSet(gt->ds.get(), 1);
-                cur_water_ds = gt->ds.get();
-            }
             list.setGraphicsPushConstants(0, &pc);
-            const RenderVertexBufferView vbv(RenderBufferReference(g_eng.dyn_vbo[slot].get(), ws.vbo_offset),
-                                             ws.vertex_count * sizeof(PbrVertex));
-            const RenderIndexBufferView ibv(RenderBufferReference(g_eng.dyn_ibo[slot].get(), ws.ibo_offset),
-                                            ws.index_count * sizeof(uint32_t), RenderFormat::R32_UINT);
+            const RenderVertexBufferView vbv(RenderBufferReference(g_eng.dyn_vbo[slot].get(), pond_slice.vbo_offset),
+                                             pond_slice.vertex_count * sizeof(PbrVertex));
+            const RenderIndexBufferView ibv(RenderBufferReference(g_eng.dyn_ibo[slot].get(), pond_slice.ibo_offset),
+                                            pond_slice.index_count * sizeof(uint32_t), RenderFormat::R32_UINT);
             list.setVertexBuffers(0, &vbv, 1, &pbr_slot);
             list.setIndexBuffer(&ibv);
-            list.drawIndexedInstanced(ws.index_count, 1, 0, 0, 0);
+            list.drawIndexedInstanced(pond_slice.index_count, 1, 0, 0, 0);
             ++main_draws;
-            water_tris += ws.index_count / 3u;
-            main_pass_tris += ws.index_count / 3u;
+            water_tris += pond_slice.index_count / 3u;
+            main_pass_tris += pond_slice.index_count / 3u;
         }
     }
 

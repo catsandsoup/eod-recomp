@@ -195,12 +195,136 @@ void test_asset_registry_injection() {
     reg.clear();
 }
 
+void test_fake_shadow_and_driver_bone_skinning() {
+    // Bug A: Legacy fake-shadow decal textures must be flagged is_fake_shadow=true
+    // so Remaster suppresses them in favor of real-time 3-cascade CSM shadows.
+    for (const char *shad_name : {"carshad.tex", "shopshad.tex", "tr-shad.tex",
+                                  "st-shad.tex", "sh-shad.tex", "shadow.tex"}) {
+        const auto m_world = remaster::classify_pbr_material(shad_name, false, false);
+        const auto m_veh = remaster::classify_pbr_material(shad_name, false, true);
+        assert(m_world.is_fake_shadow);
+        assert(m_veh.is_fake_shadow);
+    }
+    for (const char *real_name : {"Algar.tex", "Chassis.tex", "an-road1.tex", "Drvr_anm.tex"}) {
+        assert(!remaster::classify_pbr_material(real_name, false, false).is_fake_shadow);
+        assert(!remaster::classify_pbr_material(real_name, false, true).is_fake_shadow);
+    }
+
+    // Bug B: Verify 4SPS reverse-order @150 skinning (TOP + 149 + n - k) and
+    // float-biased weight decoding (sk[2] - 32768.0f) + bone matrix math match
+    // PS2 VU1 skin_vertices() 1:1.
+    std::vector<uint8_t> ram(0x4000, 0);
+    auto push_u32 = [&](uint32_t &c, uint32_t v) { wr_u32(ram, c, v); c += 4; };
+    auto push_f32 = [&](uint32_t &c, float v) { wr_f32(ram, c, v); c += 4; };
+
+    const uint32_t model_addr = 0x100;
+    const uint32_t part_tbl = 0x180;
+    const uint32_t part_addr = 0x200;
+    wr_u32(ram, model_addr + 0x00, 1u);          // n_parts = 1
+    wr_u32(ram, model_addr + 0x04, part_tbl);    // partTable
+    wr_u32(ram, part_tbl + 0x00, part_addr);     // part[0]
+
+    std::memcpy(ram.data() + part_addr, "4SPS", 4);
+    std::memcpy(ram.data() + part_addr + 0x08, "Drvr_anm.tex", 12);
+
+    uint32_t cur = part_addr + 0x38;
+    // UNPACK V1-32 n=1 addr=0 -> nverts = 3
+    push_u32(cur, (0x60u << 24) | (1u << 16) | 0u);
+    push_u32(cur, 3u);
+
+    // STCYCL cl=3 wl=1; UNPACK V4-32 n=3 addr=2 (positions with w=1.0f)
+    push_u32(cur, (0x01u << 24) | (1u << 8) | 3u);
+    push_u32(cur, (0x6Cu << 24) | (3u << 16) | 2u);
+    const float vpos[3][3] = {
+        {0.0f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+    };
+    for (int i = 0; i < 3; ++i) {
+        push_f32(cur, vpos[i][0]);
+        push_f32(cur, vpos[i][1]);
+        push_f32(cur, vpos[i][2]);
+        push_f32(cur, 1.0f);
+    }
+
+    // UNPACK V4-8 n=3 addr=1 (unit normals pointing +Z, ADC=0)
+    push_u32(cur, (0x6Eu << 24) | (3u << 16) | (1u << 14) | 1u);
+    for (int i = 0; i < 3; ++i) {
+        // raw_data = {128, 128, 255, 0} -> normal (0, 0, +1)
+        push_u32(cur, 128u | (128u << 8) | (255u << 16) | (0u << 24));
+    }
+
+    // STCYCL cl=1 wl=1; STMOD 1; STROW [0, 0, 0x47000000 (32768.0f), 0x47000000]
+    push_u32(cur, (0x01u << 24) | (1u << 8) | 1u);
+    push_u32(cur, (0x05u << 24) | 1u);
+    push_u32(cur, (0x30u << 24));
+    push_u32(cur, 0u);
+    push_u32(cur, 0u);
+    push_u32(cur, 0x47000000u);
+    push_u32(cur, 0x47000000u);
+
+    // UNPACK V4-16 (usn=1) n=3 addr=150:
+    // VU1 reads vertex k from TOP + 149 + n - k:
+    //   slot 150 -> vertex 2: bone 1 (idx=4) weight 1.0 (256), bone 0 weight 0.0 (0)
+    //   slot 151 -> vertex 1: bone 0 (idx=0) weight 0.5 (128), bone 1 (idx=4) weight 0.5 (128)
+    //   slot 152 -> vertex 0: bone 0 (idx=0) weight 1.0 (256), bone 1 weight 0.0 (0)
+    push_u32(cur, (0x6Du << 24) | (3u << 16) | (1u << 14) | 150u);
+    auto push_u16x4 = [&](uint16_t a, uint16_t b, uint16_t c, uint16_t d) {
+        push_u32(cur, static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 16));
+        push_u32(cur, static_cast<uint32_t>(c) | (static_cast<uint32_t>(d) << 16));
+    };
+    push_u16x4(4u, 0u, 256u, 0u);   // slot 150 -> vertex 2 (100% bone 1; tests 256 -> 1.0f without & 0xFF truncation!)
+    push_u16x4(0u, 4u, 128u, 128u); // slot 151 -> vertex 1 (50% bone 0, 50% bone 1)
+    push_u16x4(0u, 4u, 256u, 0u);   // slot 152 -> vertex 0 (100% bone 0)
+
+    // MSCAL 0x63 (driver bone skinning)
+    push_u32(cur, (0x14u << 24) | 0x63u);
+    wr_u32(ram, part_addr + 0x04, cur - part_addr); // part_size
+
+    std::vector<remaster::CpuMeshData> parts;
+    const bool decoded = remaster::decode_mrmodel_from_ram(ram.data(), (uint32_t)ram.size(),
+                                                           model_addr, "test/driver", true, parts);
+    assert(decoded && parts.size() == 1);
+    const auto &mesh = parts[0];
+    assert(mesh.vertices.size() == 3 && mesh.skin.size() == 3);
+
+    // Verify reverse-order @150 mapping & float-biased weight 1.0f (256/256)
+    assert(mesh.skin[0].bone[0] == 0u && near_f(mesh.skin[0].weight[0], 1.0f, 1e-4f));
+    assert(mesh.skin[1].bone[0] == 0u && mesh.skin[1].bone[1] == 4u &&
+           near_f(mesh.skin[1].weight[0], 0.5f, 1e-4f) && near_f(mesh.skin[1].weight[1], 0.5f, 1e-4f));
+    assert(mesh.skin[2].bone[0] == 4u && near_f(mesh.skin[2].weight[0], 1.0f, 1e-4f));
+
+    // Build 2 bone matrices in exact bone_pose.cpp 4-column-vector layout:
+    //   Bone 0: identity + translation (+2, +3, +4)
+    //   Bone 1: 90 deg rotation around Z (c0=(0,1,0), c1=(-1,0,0), c2=(0,0,1)) + translation (-1, +5, +2)
+    remaster::EntityInstance ent{};
+    ent.bone_first = 0;
+    ent.bone_palette = {
+        // Bone 0 (c0, c1, c2, c3)
+        1, 0, 0, 0,   0, 1, 0, 0,   0, 0, 1, 0,   2, 3, 4, 1,
+        // Bone 1 (c0, c1, c2, c3)
+        0, 1, 0, 0,  -1, 0, 0, 0,   0, 0, 1, 0,  -1, 5, 2, 1,
+    };
+
+    std::vector<remaster::PbrVertex> posed;
+    const bool moved = remaster::apply_entity_skinning_cpu(mesh, ent, posed);
+    assert(moved && posed.size() == 3);
+
+    // Vertex 0 (0,0,0), 100% bone 0 -> (2, 3, 4)
+    assert(near_f(posed[0].pos[0], 2.0f) && near_f(posed[0].pos[1], 3.0f) && near_f(posed[0].pos[2], 4.0f));
+    // Vertex 1 (1,0,0), 50% bone 0 -> (3,3,4), 50% bone 1 -> (-1,6,2) => avg (1.0, 4.5, 3.0)
+    assert(near_f(posed[1].pos[0], 1.0f) && near_f(posed[1].pos[1], 4.5f) && near_f(posed[1].pos[2], 3.0f));
+    // Vertex 2 (0,1,0), 100% bone 1 -> (-1-1, 0+5, 0+2) = (-2, 5, 2)
+    assert(near_f(posed[2].pos[0], -2.0f) && near_f(posed[2].pos[1], 5.0f) && near_f(posed[2].pos[2], 2.0f));
+}
+
 } // namespace
 
 int main() {
     test_ee_environment_extraction();
     test_smooth_normals_and_csm_and_tonemap();
     test_asset_registry_injection();
+    test_fake_shadow_and_driver_bone_skinning();
     std::printf("remaster_engine_test: ALL PASSED\n");
     return 0;
 }

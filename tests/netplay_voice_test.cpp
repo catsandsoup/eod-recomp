@@ -14,7 +14,7 @@ constexpr uint64_t nonce=0x1020304050607080ull;
 Frame input(unsigned index){Frame f{};for(unsigned i=0;i<FrameSamples;++i)f[i]=int16_t(10000*std::sin((index*FrameSamples+i)*0.0575958653));return f;}
 bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){return v==0;});}
 [[maybe_unused]] void seq(Packet& p,uint32_t n){for(unsigned i=0;i<4;++i)p.bytes[18-i]=uint8_t(n>>(8*i));}
-[[maybe_unused]] void prime(Session& s){Frame out;assert(s.playout(0,out)==Playback::Priming&&silent(out));assert(s.playout(0,out)==Playback::Priming&&silent(out));}
+[[maybe_unused]] void prime(Session& s){Frame out;for(unsigned i=0;i<StartupFrames;++i)assert(s.playout(0,out)==Playback::Priming&&silent(out));}
 [[maybe_unused]] void lifecycle(){
  Session tx,rx;Packet p;Frame out;
  assert(!tx.encode(input(0),p)&&p.size==0);assert(!tx.start(0,1,0));assert(!tx.start(nonce,1,MaxPeers));
@@ -30,23 +30,23 @@ bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){r
 }
 [[maybe_unused]] void reorder_loss_and_bounds(){
  Session tx,ordered,reordered;assert(tx.start(nonce,1,0)&&ordered.start(nonce,1,1)&&reordered.start(nonce,1,1));tx.set_transmit_enabled(true);
- std::array<Packet,10> packets{};for(unsigned i=0;i<packets.size();++i)assert(tx.encode(input(i),packets[i]));
+ std::array<Packet,JitterFrames+2> packets{};for(unsigned i=0;i<packets.size();++i)assert(tx.encode(input(i),packets[i]));
  for(unsigned i=0;i<3;++i)assert(ordered.receive(0,packets[i].bytes.data(),packets[i].size)==Receive::Accepted);
  for(unsigned i:{0u,2u,1u})assert(reordered.receive(0,packets[i].bytes.data(),packets[i].size)==Receive::Accepted);
  assert(reordered.receive(0,packets[1].bytes.data(),packets[1].size)==Receive::Duplicate);
- assert(reordered.receive(0,packets[8].bytes.data(),packets[8].size)==Receive::OutsideWindow);
+ assert(reordered.receive(0,packets[JitterFrames].bytes.data(),packets[JitterFrames].size)==Receive::OutsideWindow);
  prime(ordered);prime(reordered);Frame a,b;
  for(unsigned i=0;i<3;++i){assert(ordered.playout(0,a)==Playback::Decoded);assert(reordered.playout(0,b)==Playback::Decoded);assert(a==b);}
  assert(reordered.receive(0,packets[0].bytes.data(),packets[0].size)==Receive::Stale);
  assert(reordered.playout(0,b)==Playback::Concealed);
  assert(reordered.receive(0,packets[4].bytes.data(),packets[4].size)==Receive::Accepted);
  assert(reordered.playout(0,b)==Playback::Decoded);
- // Bounded queue accepts8, rejects9th; modular sequence wraps correctly.
+ // Bounded queue accepts JitterFrames, rejects next; modular sequence wraps correctly.
  Session wrap;assert(wrap.start(nonce,1,1));
- for(unsigned i=0;i<8;++i){seq(packets[i],0xfffffffeu+i);assert(wrap.receive(0,packets[i].bytes.data(),packets[i].size)==Receive::Accepted);}
- seq(packets[8],6);assert(wrap.receive(0,packets[8].bytes.data(),packets[8].size)==Receive::OutsideWindow);prime(wrap);
- for(unsigned i=0;i<8;++i)assert(wrap.playout(0,b)==Playback::Decoded);
- assert(wrap.receive(0,packets[8].bytes.data(),packets[8].size)==Receive::Accepted);
+ for(unsigned i=0;i<JitterFrames;++i){seq(packets[i],0xfffffffeu+i);assert(wrap.receive(0,packets[i].bytes.data(),packets[i].size)==Receive::Accepted);}
+ seq(packets[JitterFrames],0xfffffffeu+JitterFrames);assert(wrap.receive(0,packets[JitterFrames].bytes.data(),packets[JitterFrames].size)==Receive::OutsideWindow);prime(wrap);
+ for(unsigned i=0;i<JitterFrames;++i)assert(wrap.playout(0,b)==Playback::Decoded);
+ assert(wrap.receive(0,packets[JitterFrames].bytes.data(),packets[JitterFrames].size)==Receive::Accepted);
 }
 [[maybe_unused]] void invalid_packets(){
  Session tx,rx;assert(tx.start(nonce,9,0)&&rx.start(nonce,9,1));tx.set_transmit_enabled(true);Packet p;assert(tx.encode(input(0),p));
@@ -71,7 +71,7 @@ bool silent(const Frame& f){return std::all_of(f.begin(),f.end(),[](int16_t v){r
  assert(a.encode(input(0),pa)&&b.encode(input(5),pb));
  assert(rx.receive(0,pa.bytes.data(),pa.size)==Receive::Accepted);
  assert(rx.receive(2,pb.bytes.data(),pb.size)==Receive::Accepted);
- prime(rx);assert(rx.playout(2,out)==Playback::Priming);assert(rx.playout(2,out)==Playback::Priming);
+ prime(rx);for(unsigned j=0;j<StartupFrames;++j)assert(rx.playout(2,out)==Playback::Priming);
  rx.set_peer_muted(0,true);assert(rx.playout(0,out)==Playback::Concealed&&silent(out));
  assert(rx.playout(2,out)==Playback::Decoded&&!silent(out));
  assert(rx.receive(0,pb.bytes.data(),pb.size)==Receive::WrongSender);
