@@ -244,3 +244,11 @@
 00361ED8 wrap     # ImmStaticDraw(bufObj*)
 00361C30 wrap     # ImmStaticEmitRef(bufObj*)
 0035CAA0 wrap     # ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices) + cockpit quad (0x219C48)
+
+# Task 10: MMO headless dedicated-server simulation core inside WorldStepTick (src/decomp_mmo_sim.cpp; EOD_DIFF)
+001779C0 wrap     # EntityMatrixOrthonormalizeRoundRobin (src/decomp_mmo_sim.cpp; EOD_DIFF)
+00177B40 wrap     # SimSnapshotHistoryStep (src/decomp_mmo_sim.cpp; EOD_DIFF)
+00177CA0 wrap     # DynamicEntitiesPhysicsStep (src/decomp_mmo_sim.cpp; EOD_DIFF)
+00178258 wrap     # DynamicEntitiesPostStep (src/decomp_mmo_sim.cpp; EOD_DIFF)
+001792E8 wrap     # TrackRacePreStep (src/decomp_mmo_sim.cpp; EOD_DIFF)
+001793B8 wrap     # TrackRaceMidStep (src/decomp_mmo_sim.cpp; EOD_DIFF)
