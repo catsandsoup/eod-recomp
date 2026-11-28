@@ -11,7 +11,7 @@
 00337718 wrap     # TimerGetMs: skips artificial 2-4s post-load and memory card banner hold loops
 0034E530 wrap     # opt-in bounded projection trace, native calculation unchanged
 00212500 wrap     # merge portable map triangle samples into the native wheel ground query
-00176798 wrap     # solo editor map preview: shorten the opening Battle countdown at its native release check
+00176798 wrap     # RaceGetModeState as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); solo editor map preview countdown hook
 001DE7B0 wrap     # resolve swept chassis boxes against mounted portable map triangles
 00212B58 wrap     # optional Maximum: matched 1P projection/fog range in 2P
 0021ABF8 wrap     # bounded loaded car table trace; opt-in threshold multiplier
@@ -99,13 +99,13 @@
 00270C10 wrap     # MenuRun: the Arcade 'single / multi' prompt is auto-answered (single) for online events
 002A8EF0 wrap     # CarChooseWidget label setter: decorate Arcade paint display text for overridden vehicles
 00120650 wrap     # per-event setup: pre-select the requested event once
-00120FB8 wrap     # EveHasMoreEvents: returns 0 after an online event completes so GameDoSingle unwinds to the main menu
+00120FB8 wrap     # EveHasMoreEvents as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); returns 0 after an online event completes so GameDoSingle unwinds to the main menu
 00177718 wrap     # default-off netplay world-step diagnostic boundary
-001D3FB8 wrap     # single-view crash orbit requests a three-second world pause; bypass during online events
+001D3FB8 wrap     # StartCrashOrbitPause as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); bypassed during online events
 0038FF40 wrap     # default-off netplay consumed SDK pad reply trace
 00191548 wrap     # native six-byte per-tick human replay record diagnostics
-00176918 wrap     # opt-in netplay agreed native race RNG seeds
-00176698 wrap     # opt-in agreed native race-start phase and RNG epoch
+00176918 wrap     # RaceSessionSeedRng as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); opt-in netplay agreed native race RNG seeds
+00176698 wrap     # RaceSessionInitPhase as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); opt-in agreed native race-start phase and RNG epoch
 00190A38 wrap     # driver wrapper: set the active driver (pace-lap autopilot / player); EOD_NETPLAY_DEBUG logs each switch
 0012F3C8 wrap     # bounded opt-in RNG0 callsite diagnosis
 0012F470 wrap     # bounded opt-in RNG0 callsite diagnosis
@@ -134,7 +134,7 @@
 0018AA68 wrap     # CarSetBrake: KillableChallengers holds a wrecked free-roam challenger on full brake
 0016FE48 wrap     # Home Driver per-frame update (Career free roam): EOD_DIRECT_START mode=career teleports to its place
 001741C0 wrap     # Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck
-00114358 wrap     # Finish one online contest after native race cleanup
+00114358 wrap     # RunRaceContest as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); finish one online contest after native race cleanup
 0036E9C0 wrap     # dealer Buy screen: pass-through to MenuRun loop
 00370DD8 wrap     # dealer get_slot_for_car: maps vehicle to yard slot without panicking
 00370608 wrap     # dealer: buy the highlighted car (trade screen); a page turn ends the list menu through it without buying

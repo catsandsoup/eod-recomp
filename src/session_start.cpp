@@ -1483,13 +1483,15 @@ extern "C" void f_00120650(void) {
 // EveHasMoreEvents (0x120FB8) is checked before each contest in GameDoSingle's inner loop
 // (0x2A2FC4). Once the single online event has run (P.event_done is true), returning 0 exits
 // the inner Eve loop instead of opening the native in-world Eve event selection screen (0x11F640).
+#include "decomp_race_lifecycle.h"
+
 extern "C" void f_00120FB8(void) {
     if (g_unwind_active || (P.armed && (P.net || g_pending_offline.active) && P.event_done)) {
         log("event finished / unwind -> leave Eve inner loop");
         ret_s32(0);
         return;
     }
-    f_00120FB8_orig();
+    eod_race_00120FB8();
 }
 
 void session_abort_event() {
@@ -1507,9 +1509,8 @@ void session_abort_event() {
 
 // The native contest clears the exit flag during teardown. Its caller checks it
 // immediately after return to decide whether to open the Eve event list again.
-extern "C" void f_00114358_orig();
 extern "C" void f_00114358() {
     const bool online = P.net && P.armed && g_ee.r[31].uw[0] == 0x00114BA0;
-    f_00114358_orig();
+    eod_race_00114358();
     if (online) ee_w32(0x00437BA8, 1);
 }

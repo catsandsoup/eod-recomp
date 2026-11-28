@@ -82,14 +82,15 @@ void netplay_trace_pad(int port,int slot,uint32_t length,const uint8_t *data) {
 // SLUS_209.10's incident dispatcher (2577F0) starts this orbit for a qualifying
 // crash. The native single-viewport check passes on every online machine. The
 // orbit requests a physics pause at 1D4020 and resumes after 3s at 1C6AF0.
-extern "C" void f_001D3FB8_orig(void);
+#include "decomp_race_lifecycle.h"
+
 extern "C" void f_001D3FB8(void) {
     if (netplay::session().event_active()) {
         if (std::getenv("EOD_NETPLAY_LIFECYCLE"))
             std::fprintf(stderr, "[netplay] crash camera skipped at native tick %u\n", ee_r32(0x003CDA8C));
         return;
     }
-    f_001D3FB8_orig();
+    eod_race_001D3FB8();
 }
 
 extern "C" void f_00189648_orig(void);
@@ -175,10 +176,9 @@ extern "C" void f_00191548(void) {
  std::fprintf(f,"\",\"test_pattern\":%s}\n",pattern?"true":"false");
 }
 
-extern "C" void f_00176918_orig(void);
 extern "C" void f_00176918(void) {
  const uint32_t dst=R[4].uw[0];
- f_00176918_orig();
+ eod_race_00176918();
  const char *env=std::getenv("EOD_NETPLAY_SEED");
  if(!env || !*env)return;
  char *end=nullptr;const unsigned long value=std::strtoul(env,&end,10);
@@ -190,11 +190,10 @@ extern "C" void f_00176918(void) {
  FILE *f=trace();if(f)std::fprintf(f,"{\"event\":\"session_seed\",\"dst\":%u,\"first\":%u,\"second\":%u}\n",dst,seeds.first,seeds.second);
 }
 
-extern "C" void f_00176698_orig(void);
 extern "C" void f_0012EF50(void);
 extern "C" void f_00176698(void) {
  const uint32_t previous=ee_r32(0x3cda8c), next=R[4].uw[0];
- f_00176698_orig();
+ eod_race_00176698();
  static const bool align=[](){const char *s=std::getenv("EOD_NETPLAY_ALIGN_START");return s && *s=='1';}();
  if(!align || !netplay::begins_epoch(previous,next,step>0))return;
  const char *env=std::getenv("EOD_NETPLAY_SEED");

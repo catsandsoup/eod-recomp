@@ -189,9 +189,10 @@ extern "C" void f_001DE7B0() {
 // simulation frame against the countdown deadline (0x1B8DA8..0x1B8DC8).
 // Moving the deadline leaves native controller release, start bookkeeping,
 // and the BattleMaster start notification in their normal order.
-extern "C" void f_00176798_orig();
+#include "decomp_race_lifecycle.h"
+
 extern "C" void f_00176798() {
-    f_00176798_orig();
+    eod_race_00176798();
     if (g_ee.r[31].uw[0] != 0x001B8DA8 || g_ee.r[2].sw[0] != 2) return;
     static const bool editor = [] {
         const char* value = std::getenv("EOD_EDITOR_MAP_TEST");
