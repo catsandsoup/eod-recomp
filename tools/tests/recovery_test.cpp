@@ -23,6 +23,7 @@ extern "C" void f_001B8370_orig() {
     if(active&&MEM_LW(automatic)) { ++resets; putf(p+196,15); }
     std::memset(&g_ee,0xa5,sizeof g_ee); native_after=g_ee;
 }
+extern "C" void eod_physics_001B8370() { f_001B8370_orig(); }
 static void invoke() {
     g_ee={}; g_ee.r[4].uw[0]=timer; g_ee.r[5].uw[0]=p;
     f_001B8370();

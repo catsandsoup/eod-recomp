@@ -333,7 +333,7 @@ extern "C" void f_0018CA98(void) {
 // The native world update has one inline damage write for the timed-damage
 // feat (master + bit 0x40), bypassing the collision damage callbacks. Keep the
 // rest of that update intact, and preserve changes to every unrelated flag.
-extern "C" void f_001B5840_orig(void);
+#include "decomp_physics_collision.h"
 extern "C" void f_001B5840(void) {
     if (mutator_hooks::on_world_tick) mutator_hooks::on_world_tick();
     const uint32_t flags = ee_r32(0x003C4190);
@@ -354,7 +354,7 @@ extern "C" void f_001B5840(void) {
     }
     const bool changed = (desired != flags);
     if (changed) ee_w32(0x003C4190, desired);
-    f_001B5840_orig();
+    eod_physics_001B5840();
     if (changed) ee_w32(0x003C4190, (ee_r32(0x003C4190) & ~0x41u) | (flags & 0x41u));
 }
 

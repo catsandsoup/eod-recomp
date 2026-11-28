@@ -74,6 +74,7 @@ extern "C" void f_00212500_orig() {
     }
     g_ee.r[2].sd[0] = base_hit;
 }
+extern "C" void eod_physics_00212500() { f_00212500_orig(); }
 extern "C" void f_001DE7B0_orig() {
     store(sample, probe);
     g_ee.r[5].uw[0] = sample;
@@ -85,6 +86,7 @@ extern "C" void f_001DE7B0_orig() {
     store(body + 0x60, {});
     store(wheel + 0x40, destination);
 }
+extern "C" void eod_physics_001DE7B0() { f_001DE7B0_orig(); }
 
 int main() {
     auto map = std::make_shared<eod::vfs::CustomMap>();

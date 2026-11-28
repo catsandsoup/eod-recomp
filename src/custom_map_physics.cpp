@@ -2,15 +2,13 @@
 #include "battle_layout.h"
 #include "core/cpu.h"
 #include "core/memory.h"
+#include "decomp_physics_collision.h"
 #include "netplay_hooks.h"
 #include "vfs/custom_map.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-
-extern "C" void f_00212500_orig();
-extern "C" void f_001DE7B0_orig();
 
 namespace {
 using eod::physics::CustomMapCollision;
@@ -127,14 +125,14 @@ void resolve_body(const CustomMapCollision& mesh, uint32_t body, uint32_t wheels
 
 extern "C" void f_00212500() {
     if (!wheel_mesh) {
-        f_00212500_orig();
+        eod_physics_00212500();
         return;
     }
     // a0 is the retail SCOL cache, a1 is xyz in/out, a2 is the output
     // normal and a3 is the material. Preserve the native index for next tick.
     const uint32_t sample = g_ee.r[5].uw[0], normal = g_ee.r[6].uw[0], material = g_ee.r[7].uw[0];
     P top = point(sample);
-    f_00212500_orig();
+    eod_physics_00212500();
     top[1] += .05f; // permit small penetration, while allowing travel below a bridge
     const float retail_y = g_ee.r[2].ud[0] ? point(sample)[1] : top[1] - 10.f;
     MapContact contact;
@@ -149,7 +147,7 @@ extern "C" void f_00212500() {
 extern "C" void f_001DE7B0() {
     const auto map = eod::vfs::active_map();
     if (!map) {
-        f_001DE7B0_orig();
+        eod_physics_001DE7B0();
         return;
     }
     // Hold one immutable mount across every vehicle, both wheel sample calls
@@ -175,7 +173,7 @@ extern "C" void f_001DE7B0() {
             car.active = true;
         }
     }
-    f_001DE7B0_orig();
+    eod_physics_001DE7B0();
     wheel_mesh = previous;
     if (valid) {
         for (uint32_t i = 0; i < count; ++i)
