@@ -3,6 +3,7 @@
 #include "battle_driver.h"
 #include "chicken_prop.h"
 #include "chicken_weapon.h"
+#include "decomp_chicken_weapon.h"
 #include "netplay_hooks.h"
 #include "core/cpu.h"
 #include "funcs.h"
@@ -40,7 +41,7 @@ struct NativeCall {
         g_ee.r[4].ud[0] = iface;
         g_ee.r[5].ud[0] = car;
         g_ee.r[6].ud[0] = scratch + 16;
-        f_0017E000_orig(); // already routed by the session
+        chicken_launch_native(); // already routed by the session
     }
 };
 }
@@ -86,7 +87,7 @@ extern "C" void f_0017E718(void) {
         f_0017D338();
         return;
     }
-    f_0017E718_orig();
+    chicken_impact_native();
 }
 
 bool battle_chicken_replay_blast(uint32_t slot, const float pos[3]) {
@@ -110,7 +111,7 @@ bool battle_chicken_replay_blast(uint32_t slot, const float pos[3]) {
     g_ee.r[6].ud[0] = call.scratch + 16;
     g_ee.r[7].ud[0] = 0x70;
     g_ee.r[8].ud[0] = 0;
-    f_0017E718_orig();
+    chicken_impact_native();
     trace("replay_blast", slot, pos);
     return !ee_r32(body + 0x1F4);
 }

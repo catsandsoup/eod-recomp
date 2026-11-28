@@ -68,6 +68,9 @@ extern "C" void f_0017E4D8_orig() {
     float t; uint32_t bits = MEM_LW(0x003CDACC); std::memcpy(&t, &bits, 4); t += 3.0f; std::memcpy(&bits, &t, 4);
     MEM_SW(body + 0x1E0, 0); MEM_SW(body + 0x1E4, bits);
 }
+extern "C" void chicken_explosion_blast_native() { f_0017DA58_orig(); }
+extern "C" void chicken_launch_native() { f_0017E000_orig(); }
+extern "C" void chicken_reload_start_native() { f_0017E4D8_orig(); }
 static int native_driver_calls = 0;
 extern "C" void f_0018F2A8();
 extern "C" void f_0018F2A8_orig() {
