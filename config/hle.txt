@@ -62,10 +62,18 @@
 0039AFB0 wrap     # movie bit-buffer consume/refill: exact RAM fast path, generated fallback
 
 001B8370 wrap     # optional manual-only human countdown recovery
-0017DA58 wrap     # scale chicken explosion blast radius and impulse force
-0017E000 wrap     # publish successful native chicken launches
-0017E718 wrap     # play the host-confirmed impact on online replicas
-0017E4D8 wrap     # chicken reload start: always initialised, so Chicken Fight can be switched on mid-race
+0017DA58 wrap     # decomp_chicken_weapon.cpp (diff_run) + blast radius/force scaling & online blast publish
+0017DDB0 wrap     # decomp_chicken_weapon.cpp (diff_run): WeaponRegistryUnregister
+0017DE30 wrap     # decomp_chicken_weapon.cpp (diff_run): WeaponRegistryRegister
+0017DE78 wrap     # decomp_chicken_weapon.cpp (diff_run): WeaponRegistryQuery
+0017DFA8 wrap     # decomp_chicken_weapon.cpp (diff_run): ChickenWeaponAlloc
+0017E000 wrap     # decomp_chicken_weapon.cpp (diff_run) + Straight/Mortar/Rain launch & online publish
+0017E440 wrap     # decomp_chicken_weapon.cpp (diff_run): ChickenWeaponGetHudStatus
+0017E4D8 wrap     # decomp_chicken_weapon.cpp (diff_run) + reload cooldown init & ChickenReload override
+0017E520 wrap     # decomp_chicken_weapon.cpp (diff_run): ChickenWeaponCaptureReplayState
+0017E5C8 wrap     # decomp_chicken_weapon.cpp (diff_run): ChickenWeaponUpdate
+0017E718 wrap     # decomp_chicken_weapon.cpp (diff_run) + online replica host-confirmed impact replay
+0017E8C0 wrap     # decomp_chicken_weapon.cpp (diff_run): ChickenWeaponRetire
 0018F2A8 wrap     # optional turbo boost scaling (speed cap and acceleration)
 001244A8 wrap     # optional single player battle mode injection into action eves
 

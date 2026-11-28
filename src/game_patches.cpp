@@ -32,6 +32,7 @@
 #include "game_patches.h"
 #include "battle_driver.h"
 #include "chicken_weapon.h"
+#include "decomp_chicken_weapon.h"
 #include "netplay_puppet.h"
 #include "battle_layout.h"
 #include "hle_career.h"
@@ -397,7 +398,7 @@ extern "C" void f_0017DA58(void) {
         chicken_weapon::trace("blast", arg_u32(1), pos);
         netplay_hooks::chicken_blast(arg_u32(1), pos);
     }
-    f_0017DA58_orig();
+    chicken_explosion_blast_native();
 }
 
 // HumanDriver must run for every human, including P2-P4. Its native update
@@ -598,10 +599,10 @@ extern "C" void f_0017E000(void) {
             if (fb & mutator::FB_RAIN_CHICKENS) masked |= 0x80u;
         }
         ee_w32(0x003C4190, masked);
-        f_0017E000_orig();
+        chicken_launch_native();
         ee_w32(0x003C4190, saved_cheats);
     } else {
-        f_0017E000_orig();
+        chicken_launch_native();
     }
     if (capture) {
         const uint32_t body = iface - chicken_weapon::kInterface;
@@ -623,7 +624,7 @@ extern "C" void f_0017E000(void) {
 extern "C" void f_0017E4D8_orig(void);
 extern "C" void f_0017E4D8(void) {
     const uint32_t body = g_ee.r[4].uw[0];
-    f_0017E4D8_orig();
+    chicken_reload_start_native();
     if (!body || (body & 3) || body > EE_RAM_SIZE - 0x1E8) return;
     // Reload time: 3 s natively; per-slot mutator trait if active, else lobby/personal setting.
     float reload = netplay_hooks::tuned(netplay_hooks::ChickenReload, g_config.chicken_reload);
