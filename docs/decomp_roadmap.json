@@ -1,0 +1,194 @@
+{
+  "project": "Test Drive: Eve of Destruction (SLUS_209.10) — Engine Byte-Exact Decompilation",
+  "updated_at": "2026-11-28 16:38 +10:00",
+  "active_task_id": "T1",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Vehicle Control, Damage/Invincibility, Turbo & Online Car-to-Car Impulse",
+      "subsystem": "Vehicle Control & Online Impact",
+      "priority": "Mod + Online",
+      "tags": ["online", "mods", "physics"],
+      "status": "done",
+      "commit": "5bb2862 (main)",
+      "notes": "Completed & merged on main: 0 EOD_DIFF mismatches & 0 heap errors across Battle + Dennison Race (0x18AA68: 1221/1221, 0x18AA70: 1221/1221, 0x18AAD0: 8/8, 0x18F2A8: 322/322, 0x189648: 457/457; 0x18AD20 9-insn leaf static verified).",
+      "functions": [
+        { "addr": "0018AA68", "name": "CarSetBrake", "what": "Applies brake input to a vehicle; hooked by KillableChallengers mod to hold wrecked challengers.", "tags": ["mods", "physics"], "diff_calls": "1221", "diff_mismatches": 0 },
+        { "addr": "0018AA70", "name": "CarSetThrottle", "what": "Applies throttle input to a vehicle; hooked by KillableChallengers mod.", "tags": ["mods", "physics"], "diff_calls": "1221", "diff_mismatches": 0 },
+        { "addr": "0018AAD0", "name": "CarCanTakeDamage", "what": "Checks whether a vehicle can receive damage; hooked by Career/KillableChallengers.", "tags": ["mods", "physics"], "diff_calls": "8", "diff_mismatches": 0 },
+        { "addr": "0018AD20", "name": "CarSetDamage", "what": "Scalar vehicle damage setter; hooked by Invincibility mod.", "tags": ["mods", "online", "physics"], "diff_calls": "0 (9-insn leaf verified)", "diff_mismatches": 0 },
+        { "addr": "0018F2A8", "name": "HumanDriverUpdate", "what": "Updates human driver inputs and turbo boost speed cap/acceleration; hooked by Turbo Boost mod.", "tags": ["mods", "online", "physics"], "diff_calls": "322", "diff_mismatches": 0 },
+        { "addr": "00189648", "name": "CarApplySolvedContact", "what": "Resolves car-to-car collision impulses; hooked by online netplay for peer impulse handoff.", "tags": ["online", "physics"], "diff_calls": "457", "diff_mismatches": 0 }
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "Online Race Start, Countdown, RNG, Crash Orbit & Event Completion",
+      "subsystem": "Online Session & Race Lifecycle",
+      "priority": "Online",
+      "tags": ["online", "mods"],
+      "status": "done",
+      "commit": "6b1f63b (merged to main)",
+      "notes": "Completed & verified with 0 EOD_DIFF mismatches (0x176698: 1024/1024, 0x176798: 719/719, 0x176918: 9/9, 0x120FB8: 1/1; 0x114358 end-to-end verified; 0x1D3FB8 static verified). Unit tests pass.",
+      "functions": [
+        { "addr": "00176698", "name": "RaceSessionInitPhase", "what": "Sets race-start phase and RNG epoch; synchronized across online peers.", "tags": ["online"], "diff_calls": "1024", "diff_mismatches": 0 },
+        { "addr": "00176798", "name": "RaceGetModeState", "what": "Checks opening race/Battle countdown release; hooked by solo editor map preview.", "tags": ["online", "mods"], "diff_calls": "719", "diff_mismatches": 0 },
+        { "addr": "00176918", "name": "RaceSessionSeedRng", "what": "Initializes native race RNG seeds; agreed across online lobby peers.", "tags": ["online"], "diff_calls": "9", "diff_mismatches": 0 },
+        { "addr": "001D3FB8", "name": "StartCrashOrbitPause", "what": "Requests 3-second world pause during single-view crash orbit; bypassed in online events.", "tags": ["online"], "diff_calls": "0 (static verified)", "diff_mismatches": 0 },
+        { "addr": "00120FB8", "name": "EveHasMoreEvents", "what": "Checks whether more events remain in the current Eve; returns 0 to unwind online events.", "tags": ["online"], "diff_calls": "1", "diff_mismatches": 0 },
+        { "addr": "00114358", "name": "RunRaceContest", "what": "Finishes one contest after native race cleanup; triggers online post-race transition.", "tags": ["online"], "diff_calls": "5 runs e2e", "diff_mismatches": 0 }
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "Explosive Chicken Weapon & Online Projectile Sync (+8 Cluster Helpers)",
+      "subsystem": "Explosive Chicken Weapons",
+      "priority": "Online + Mod",
+      "tags": ["online", "mods", "weapons"],
+      "status": "done",
+      "commit": "76f6acf (merged to main)",
+      "notes": "Completed & merged on main: 12 functions decompiled with 0 EOD_DIFF mismatches across solo Battle 8 AI + online host/guest Battle; native_weapon_test 197/197 PASS, eod_live_cheats_test PASS.",
+      "functions": [
+        { "addr": "0017DA58", "name": "ChickenExplosionApplyShockwave", "what": "Computes radial chicken blast shockwave on 100x100 spatial hash grid; scaled by mods & published online.", "tags": ["online", "mods", "weapons"], "diff_calls": "53+", "diff_mismatches": 0 },
+        { "addr": "0017E000", "name": "ChickenWeaponTrigger", "what": "Launches explosive chicken projectile (Straight/Mortar/Rain); publishes launches online.", "tags": ["online", "weapons"], "diff_calls": "2130", "diff_mismatches": 0 },
+        { "addr": "0017E4D8", "name": "ChickenWeaponStartCooldown", "what": "Starts 3.0s chicken reload cooldown; always initialized so Chicken Fight toggles mid-race.", "tags": ["online", "mods", "weapons"], "diff_calls": "194+", "diff_mismatches": 0 },
+        { "addr": "0017E718", "name": "ChickenWeaponDetonate", "what": "Resolves chicken impact & detonation; replays host-confirmed impacts on online replicas.", "tags": ["online", "weapons"], "diff_calls": "179", "diff_mismatches": 0 },
+        { "addr": "0017DDB0", "name": "WeaponRegistryUnregister", "what": "Unregisters a weapon instance from the global 16-weapon registry.", "tags": ["weapons"], "diff_calls": "0 (teardown verified)", "diff_mismatches": 0 },
+        { "addr": "0017DE30", "name": "WeaponRegistryRegister", "what": "Registers a weapon instance in the global 16-weapon registry.", "tags": ["weapons"], "diff_calls": "9", "diff_mismatches": 0 },
+        { "addr": "0017DE78", "name": "WeaponRegistryQuery", "what": "Queries the global weapon registry by owner/slot.", "tags": ["weapons"], "diff_calls": "138", "diff_mismatches": 0 },
+        { "addr": "0017DFA8", "name": "ChickenWeaponAlloc", "what": "Allocates and constructs a 0x228-byte Explosive Chicken weapon instance.", "tags": ["weapons"], "diff_calls": "9", "diff_mismatches": 0 },
+        { "addr": "0017E440", "name": "ChickenWeaponGetHudStatus", "what": "Computes HUD cooldown/ready status for the chicken weapon.", "tags": ["weapons", "ui"], "diff_calls": "20", "diff_mismatches": 0 },
+        { "addr": "0017E520", "name": "ChickenWeaponCaptureReplayState", "what": "Captures chicken weapon state for replay/netplay synchronization.", "tags": ["online", "weapons"], "diff_calls": "202", "diff_mismatches": 0 },
+        { "addr": "0017E5C8", "name": "ChickenWeaponUpdate", "what": "Per-tick chicken weapon state machine & flight/reload update.", "tags": ["online", "weapons"], "diff_calls": "900", "diff_mismatches": 0 },
+        { "addr": "0017E8C0", "name": "ChickenWeaponRetire", "what": "Retires an exploded/expired chicken projectile back to idle.", "tags": ["weapons"], "diff_calls": "18", "diff_mismatches": 0 }
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "Online World-Step, Active Driver & Input Replay",
+      "subsystem": "Online Simulation & Input",
+      "priority": "Online",
+      "tags": ["online", "physics"],
+      "status": "done",
+      "commit": "e46adf7 (main)",
+      "notes": "Completed & merged on main: 0 EOD_DIFF mismatches & 0 heap errors across Woodly Jump Race, Dundas No-Rules Race, and Dennison Detention (0x177718: 1097/1097, 0x190A38: 663/663, 0x191548: 591/591, 0x165E10: 4/4). Mapped full MMO headless server sim vs client-only callees inside WorldStepTick.",
+      "functions": [
+        { "addr": "00177718", "name": "WorldStepTick", "what": "Main per-tick simulation step boundary traced/synchronized by netplay; core of future 24/7 headless MMO server.", "tags": ["online", "physics"], "diff_calls": "1097", "diff_mismatches": 0 },
+        { "addr": "00190A38", "name": "CarSetActiveDriver", "what": "Switches vehicle active driver between pace-lap autopilot and human/remote player.", "tags": ["online"], "diff_calls": "663", "diff_mismatches": 0 },
+        { "addr": "00191548", "name": "HumanReplayRecordTick", "what": "Encodes/consumes 6-byte per-tick human input replay record.", "tags": ["online"], "diff_calls": "591", "diff_mismatches": 0 },
+        { "addr": "00165E10", "name": "DetentionMasterSetupRole", "what": "Configures DetentionMaster participant/bus role before setup (online bus sync).", "tags": ["online"], "diff_calls": "4", "diff_mismatches": 0 }
+      ]
+    },
+    {
+      "id": "T5",
+      "title": "Recovery, Timed Damage & Custom Map Collision",
+      "subsystem": "Custom Map Physics & Recovery",
+      "priority": "Mod",
+      "tags": ["mods", "physics"],
+      "status": "in_progress",
+      "commit": "",
+      "notes": "Parallel Subagent #5 active in d:\\eod-worktrees\\t5-physics-collision: manual recovery countdown, inline timed-damage feat, and custom map wheel ground / swept chassis box collision.",
+      "functions": [
+        { "addr": "001B8370", "name": "CarUpdateOutOfBoundsRecovery", "what": "Handles countdown recovery when upside down or out of bounds; hooked for manual-only recovery.", "tags": ["mods", "online", "physics"] },
+        { "addr": "001B5840", "name": "CarUpdateTimedDamage", "what": "Applies inline timed-damage during vehicle update; suppressed by Invincibility mod.", "tags": ["mods", "physics"] },
+        { "addr": "00212500", "name": "WheelGroundQuery", "what": "Queries track surface triangles under wheels; merges portable custom map triangles.", "tags": ["mods", "physics"] },
+        { "addr": "001DE7B0", "name": "ChassisSweptBoxCollide", "what": "Resolves swept chassis OBB collisions against track geometry; merges custom map triangles.", "tags": ["mods", "physics"] }
+      ]
+    },
+    {
+      "id": "T6",
+      "title": "Battle Mode Spawns, Respawn, Update & AI Control Injection",
+      "subsystem": "Battle Mode & AI Bots",
+      "priority": "Mod + Online",
+      "tags": ["mods", "online", "battle"],
+      "status": "queued",
+      "commit": "",
+      "notes": "Battle arena spawn tables, online SELECT respawn validation, BattleMaster update, and AI car input injection.",
+      "functions": [
+        { "addr": "001671E8", "name": "BattleSelectRespawn", "what": "Handles SELECT respawn delay & spawn choice; validated by online host.", "tags": ["online", "battle"] },
+        { "addr": "001673B8", "name": "BattleLookupRespawnPose", "what": "Looks up respawn transform in spawn table; extended for creator maps.", "tags": ["mods", "battle"] },
+        { "addr": "00167A88", "name": "BattleBuildSpawnTable", "what": "Constructs Battle spawn table from track data or mounted creator map.", "tags": ["mods", "battle"] },
+        { "addr": "00167C70", "name": "BattleInitialPlacement", "what": "Places cars on Battle grid; offsets cars beyond native spawn count.", "tags": ["mods", "battle"] },
+        { "addr": "00167D58", "name": "BattleMasterUpdate", "what": "Main BattleMaster per-frame progression & win-state evaluation.", "tags": ["mods", "online", "battle"] },
+        { "addr": "001A2D20", "name": "AiCarUpdateInput", "what": "Injects AI steering, throttle, brake, clutch, and gear inputs; hooked by Battle bots.", "tags": ["mods", "battle"] }
+      ]
+    },
+    {
+      "id": "T7",
+      "title": "Battle Roster, Event Tables & Kill Feed",
+      "subsystem": "Battle Mode & AI Bots",
+      "priority": "Mod",
+      "tags": ["mods", "battle"],
+      "status": "queued",
+      "commit": "",
+      "notes": "Single-player Battle injection, 4-AI / 8-AI rosters, cross-class AI selection, and named rival kill feed.",
+      "functions": [
+        { "addr": "001244A8", "name": "ActionEveInjectBattle", "what": "Builds Action Eve contest list; injects Battle (4 AI)/(8 AI) events.", "tags": ["mods", "battle"] },
+        { "addr": "0012C158", "name": "BattleBuildRoster", "what": "Populates Battle participant roster; extended to fill AI bots.", "tags": ["mods", "battle"] },
+        { "addr": "001116E0", "name": "BattlePickAiDriverVehicle", "what": "Selects AI driver & vehicle records across classes for Battle (N AI).", "tags": ["mods", "battle"] },
+        { "addr": "00119428", "name": "BattleResolveDriverName", "what": "Resolves rival driver display name for kill feed messages.", "tags": ["mods", "online", "battle"] },
+        { "addr": "00166B50", "name": "BattleDrawKillMessage", "what": "Draws Battle kill announcement banner on HUD.", "tags": ["mods", "battle"] },
+        { "addr": "0020FD48", "name": "SceneCreateWeapons", "what": "Creates vehicle weapons through native scene factory for Battle bots.", "tags": ["mods", "battle"] }
+      ]
+    },
+    {
+      "id": "T8",
+      "title": "Career Unlocks, Dealership, Extended Garage & Part Upgrades",
+      "subsystem": "Career & Garage Economy",
+      "priority": "Mod",
+      "tags": ["mods", "career"],
+      "status": "queued",
+      "commit": "",
+      "notes": "Career rank gates, dealer stock pagination, trade-in valuation, 16-slot garage, and cross-class part compatibility.",
+      "functions": [
+        { "addr": "002E35F0", "name": "AutoShopSetAvailable", "what": "Selects dealership available car lineup; extended to page through full roster.", "tags": ["mods", "career"] },
+        { "addr": "002E5200", "name": "CareerCheckEveRankGate", "what": "Tests Career rank eligibility for an Eve; bypassed by OpenCareer mod.", "tags": ["mods", "career"] },
+        { "addr": "002E6C78", "name": "CareerUpdateRankAfterEve", "what": "Computes new Career rank after an Eve; prevents forced Career end.", "tags": ["mods", "career"] },
+        { "addr": "002E3BC8", "name": "CareerCalcDepreciation", "what": "Computes car sale/trade-in depreciation; zeroed by FreeSwap mod.", "tags": ["mods", "career"] },
+        { "addr": "002E3E70", "name": "CareerGetUsedValue", "what": "Returns 90% used value of owned car; full value under FreeSwap mod.", "tags": ["mods", "career"] },
+        { "addr": "002DFDF8", "name": "CareerPartCompatMask", "what": "Looks up upgrade part compatibility bitmask; extended for cross-class parts.", "tags": ["mods", "career"] },
+        { "addr": "002DED18", "name": "CareerValidatePartPurchase", "what": "Validates part purchase & multi-stage upgrade swaps.", "tags": ["mods", "career"] },
+        { "addr": "002E1BB0", "name": "CareerGarageGetCount", "what": "Returns owned garage car count; extended up to 16 cars.", "tags": ["mods", "career"] },
+        { "addr": "002E1BC0", "name": "CareerGarageAddCar", "what": "Adds a purchased car to garage; routes slots 4..15 to extended storage.", "tags": ["mods", "career"] },
+        { "addr": "002E1380", "name": "CareerGarageGetTuning", "what": "Returns tuning block pointer for a garage slot (0..15).", "tags": ["mods", "career"] }
+      ]
+    },
+    {
+      "id": "T9",
+      "title": "HUD, Menus, Camera Director & NASCAR Audio/Wheel Hooks",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "priority": "Mod",
+      "tags": ["mods", "ui", "audio"],
+      "status": "queued",
+      "commit": "",
+      "notes": "Widescreen HUD rows, MenuRun modal engine, showroom 360 orbit camera, and NASCAR audio/transmission hooks.",
+      "functions": [
+        { "addr": "00119888", "name": "HudDrawLeftRaceRows", "what": "Draws left HUD position/lap/damage rows with widescreen edge anchors.", "tags": ["mods", "ui"] },
+        { "addr": "00119F40", "name": "HudDrawRightSpeedRows", "what": "Draws right HUD speed/tachometer rows with widescreen edge anchors.", "tags": ["mods", "ui"] },
+        { "addr": "00270C10", "name": "MenuRun", "what": "Core modal UI/dialog loop; auto-answers online Arcade prompts.", "tags": ["online", "ui"] },
+        { "addr": "001C31A0", "name": "CameraDirectorUpdate", "what": "Updates camera director; injects 360 showroom/garage turntable orbit.", "tags": ["mods", "ui"] },
+        { "addr": "0023C400", "name": "CarAudioLoadVal", "what": "Loads vehicle engine audio parameters; hooks NASCAR ESFX loader.", "tags": ["mods", "audio"] },
+        { "addr": "0023C8D0", "name": "CarAudioMixFrame", "what": "Per-frame vehicle engine audio mixer; hooks NASCAR ESFX mixer.", "tags": ["mods", "audio"] },
+        { "addr": "00186DC8", "name": "CarBuildTransmission", "what": "Builds transmission & shift table from .gar; hooks dynamic NASCAR class gears.", "tags": ["mods", "audio", "physics"] }
+      ]
+    },
+    {
+      "id": "T10",
+      "title": "MMO Headless Dedicated-Server Core (WorldStepTick Physics & Snapshot Callees)",
+      "subsystem": "Online Simulation & Input",
+      "priority": "MMO Server",
+      "tags": ["online", "physics"],
+      "status": "queued",
+      "commit": "",
+      "notes": "Pure simulation callees inside WorldStepTick (0x00177718) required to compile a zero-GPU 24/7 authoritative MMO server and lift the 20-car world pool cap.",
+      "functions": [
+        { "addr": "001779C0", "name": "EntityMatrixOrthonormalizeRoundRobin", "what": "96-insn round-robin entity matrix orthonormalizer inside WorldStepTick.", "tags": ["online", "physics"] },
+        { "addr": "00177B40", "name": "SimSnapshotHistoryStep", "what": "87-insn simulation snapshot history ring step inside WorldStepTick.", "tags": ["online", "physics"] },
+        { "addr": "00178258", "name": "DynamicEntitiesPostStep", "what": "72-insn post-physics coordinator & snapshot capture hook inside WorldStepTick.", "tags": ["online", "physics"] },
+        { "addr": "001792E8", "name": "TrackRacePreStep", "what": "51-insn track/race state pre-step inside WorldStepTick.", "tags": ["online", "physics"] },
+        { "addr": "001793B8", "name": "TrackRaceMidStep", "what": "71-insn track/race state mid-step inside WorldStepTick.", "tags": ["online", "physics"] },
+        { "addr": "00177CA0", "name": "DynamicEntitiesPhysicsStep", "what": "365-insn rigid-body/vehicle/constraint physics integration loop over g_ActiveDynamicEntities (0x003CDBE8).", "tags": ["online", "physics"] }
+      ]
+    }
+  ]
+}

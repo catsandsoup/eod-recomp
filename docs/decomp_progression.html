@@ -1,0 +1,5810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>EOD Full-Game Engine Decompilation Progression Map</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #131a26;
+    --panel-2: #192233;
+    --border: #263248;
+    --text: #e6edf7;
+    --muted: #8ea0bc;
+    --done: #22c55e;
+    --done-bg: rgba(34, 197, 94, 0.16);
+    --prog: #f59e0b;
+    --prog-bg: rgba(245, 158, 11, 0.18);
+    --prio: #38bdf8;
+    --prio-bg: rgba(56, 189, 248, 0.14);
+    --other: #64748b;
+    --other-bg: rgba(100, 116, 139, 0.16);
+    --raw: #1e293b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--text); line-height: 1.45; }
+  header { padding: 22px 28px 18px; border-bottom: 1px solid var(--border); background: linear-gradient(180deg, #121a2a 0%, var(--bg) 100%); display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 14px; }
+  h1 { margin: 0; font-size: 21px; font-weight: 700; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .timestamp { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  main { max-width: 1440px; margin: 0 auto; padding: 20px 28px 60px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  .kpi-label { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .kpi-val { font-size: 26px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .kpi-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .bar-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+  .bar-header { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }
+  .stacked-bar { height: 15px; border-radius: 999px; background: var(--raw); overflow: hidden; display: flex; }
+  .seg-done { background: var(--done); }
+  .seg-prog { background: var(--prog); }
+  .seg-prio { background: var(--prio); }
+  .seg-other { background: var(--other); }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+  .tabs { display: flex; gap: 8px; margin: 18px 0 16px; flex-wrap: wrap; }
+  .tab-btn { background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .tab-btn.active { background: #1e3a5f; color: #fff; border-color: #38bdf8; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; align-items: center; }
+  .controls input, .controls select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+  .controls input { min-width: 260px; flex: 1; max-width: 420px; }
+  .band-list { display: flex; flex-direction: column; gap: 10px; }
+  .band-row { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
+  .band-top { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin-bottom: 8px; flex-wrap: wrap; }
+  .subsystem-grid { display: flex; flex-direction: column; gap: 16px; }
+  .sub-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  .sub-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .sub-title { font-weight: 700; font-size: 15px; }
+  .sub-stats { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  .mini-bar { height: 6px; border-radius: 999px; background: var(--raw); overflow: hidden; display: flex; margin-bottom: 14px; }
+  .tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 9px; }
+  .tile { border-radius: 9px; padding: 10px 12px; border: 1px solid var(--border); cursor: pointer; transition: transform 0.1s ease, border-color 0.15s ease; }
+  .tile:hover { transform: translateY(-1px); border-color: #94a3b8; }
+  .tile.done { background: var(--done-bg); border-color: rgba(34, 197, 94, 0.35); }
+  .tile.in_progress { background: var(--prog-bg); border-color: rgba(245, 158, 11, 0.65); }
+  .tile.queued_priority { background: var(--prio-bg); border-color: rgba(56, 189, 248, 0.32); }
+  .tile.queued_other { background: var(--other-bg); border-color: rgba(100, 116, 139, 0.3); }
+  .tile-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .addr { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted); }
+  .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 999px; letter-spacing: 0.04em; }
+  .b-done { background: rgba(34,197,94,0.25); color: #86efac; }
+  .b-prog { background: rgba(245,158,11,0.3); color: #fcd34d; }
+  .b-prio { background: rgba(56,189,248,0.22); color: #7dd3fc; }
+  .b-other { background: rgba(148,163,184,0.2); color: #cbd5e1; }
+  .fn-name { font-weight: 700; font-size: 13px; margin-top: 4px; word-break: break-word; }
+  .fn-what { font-size: 11.5px; color: #c7d4e6; margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .tag-row { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; }
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.07); color: #cbd5e1; }
+  .tag.online { background: rgba(168,85,247,0.25); color: #d8b4fe; }
+  .tag.mods { background: rgba(236,72,153,0.22); color: #f9a8d4; }
+  .task-list { display: flex; flex-direction: column; gap: 14px; }
+  .task-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+  .task-card.in_progress { border-color: rgba(245, 158, 11, 0.7); }
+  .task-card.done { border-color: rgba(34, 197, 94, 0.5); }
+  .task-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .task-id { font-family: ui-monospace, Consolas, monospace; font-size: 12px; font-weight: 800; padding: 3px 8px; border-radius: 6px; background: #1e293b; margin-right: 8px; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; max-width: 580px; width: 100%; padding: 20px 22px; }
+  .modal h2 { margin: 0 0 6px; font-size: 18px; }
+  .modal-meta { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .modal-row { margin: 8px 0; font-size: 13px; }
+  .modal-row strong { color: var(--muted); display: inline-block; min-width: 115px; }
+  .close-btn { margin-top: 14px; background: #263248; color: #fff; border: none; border-radius: 8px; padding: 8px 14px; cursor: pointer; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>EOD-Recomp Full-Game Engine Decompilation Progression Map</h1>
+    <div class="subtitle">Honest tracking of ALL <code>SLUS_209.10</code> functions + Mod &amp; Online priority surface (<code>diff_run</code> / <code>EOD_DIFF</code> verified)</div>
+  </div>
+  <div class="timestamp" id="genAt"></div>
+</header>
+
+<main>
+  <div class="kpis" id="kpis"></div>
+  <div class="bar-card" id="fullBinaryBar"></div>
+  <div class="bar-card" id="trackedSurfaceBar"></div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-view="fullmap">Full Binary Map (All 13,481 Functions)</button>
+    <button class="tab-btn" data-view="pipeline">Mod &amp; Online Priority Pipeline</button>
+    <button class="tab-btn" data-view="subsystems">Detailed Tracked Functions</button>
+  </div>
+
+  <div id="viewFullmap" class="band-list"></div>
+  <div id="viewPipeline" class="task-list" style="display:none;"></div>
+
+  <div class="controls" id="controls" style="display:none;">
+    <input type="text" id="search" placeholder="Search by address (0x00189648), function name, or what it does..." />
+    <select id="statusFilter">
+      <option value="all">Status: All</option>
+      <option value="done">Done (EOD_DIFF Verified)</option>
+      <option value="in_progress">In Progress (Active Subagent)</option>
+      <option value="queued_priority">Left — Mod &amp; Online Priority</option>
+      <option value="queued_other">Left — Other Hooked Engine</option>
+      <option value="left">All Left (Not Yet Done)</option>
+    </select>
+    <select id="tagFilter">
+      <option value="all">Tag: All</option>
+      <option value="online">Online Multiplayer</option>
+      <option value="mods">Mod Focuses</option>
+      <option value="physics">Physics &amp; Vehicle</option>
+      <option value="weapons">Explosive Chicken</option>
+      <option value="battle">Battle &amp; AI</option>
+      <option value="career">Career &amp; Garage</option>
+      <option value="rendering">Rendering &amp; World</option>
+      <option value="ui">UI &amp; HUD</option>
+      <option value="audio">Audio</option>
+    </select>
+  </div>
+  <div id="viewSubsystems" class="subsystem-grid" style="display:none;"></div>
+</main>
+
+<div class="modal-backdrop" id="modalBackdrop"><div class="modal" id="modalBody"></div></div>
+
+<script>
+const DATA = {
+  "project": "Test Drive: Eve of Destruction (SLUS_209.10) \u2014 Engine Byte-Exact Decompilation",
+  "generated_at": "2026-11-28 17:54",
+  "total_elf_funcs": 13481,
+  "game_elf_funcs": 11960,
+  "sdk_elf_funcs": 1521,
+  "done_total": 136,
+  "done_game": 136,
+  "symbols_count": 355,
+  "hle_count": 213,
+  "bands": [
+    {
+      "label": "0x100k\u201312F \u00b7 Core Loop, Events, HUD, Memory Allocator",
+      "lo": "0x00100000",
+      "hi": "0x00130000",
+      "is_sdk": false,
+      "total": 1020,
+      "done": 2,
+      "in_progress": 0,
+      "queued_priority": 6,
+      "hle_wrapped": 12,
+      "raw_recomp": 1000
+    },
+    {
+      "label": "0x130k\u201315F \u00b7 Config, Options, Track/Event Tables, Util",
+      "lo": "0x00130000",
+      "hi": "0x00160000",
+      "is_sdk": false,
+      "total": 1125,
+      "done": 0,
+      "in_progress": 0,
+      "queued_priority": 0,
+      "hle_wrapped": 1,
+      "raw_recomp": 1124
+    },
+    {
+      "label": "0x160k\u201317F \u00b7 Battle, Race Lifecycle, Chicken Weapons, Contact",
+      "lo": "0x00160000",
+      "hi": "0x00180000",
+      "is_sdk": false,
+      "total": 812,
+      "done": 18,
+      "in_progress": 0,
+      "queued_priority": 12,
+      "hle_wrapped": 4,
+      "raw_recomp": 778
+    },
+    {
+      "label": "0x180k\u20131BF \u00b7 Vehicle Physics, Damage, Turbo, AI, Recovery",
+      "lo": "0x00180000",
+      "hi": "0x001C0000",
+      "is_sdk": false,
+      "total": 1130,
+      "done": 13,
+      "in_progress": 2,
+      "queued_priority": 2,
+      "hle_wrapped": 1,
+      "raw_recomp": 1112
+    },
+    {
+      "label": "0x1C0k\u20131FF \u00b7 Camera, Swept Collision, Debris, Deformation",
+      "lo": "0x001C0000",
+      "hi": "0x00200000",
+      "is_sdk": false,
+      "total": 575,
+      "done": 3,
+      "in_progress": 1,
+      "queued_priority": 1,
+      "hle_wrapped": 2,
+      "raw_recomp": 568
+    },
+    {
+      "label": "0x200k\u201323F \u00b7 Scene Graph, Visual Cars, World/LOD, Sky, Car Audio",
+      "lo": "0x00200000",
+      "hi": "0x00240000",
+      "is_sdk": false,
+      "total": 1355,
+      "done": 25,
+      "in_progress": 1,
+      "queued_priority": 3,
+      "hle_wrapped": 9,
+      "raw_recomp": 1317
+    },
+    {
+      "label": "0x240k\u20132DF \u00b7 UI Engine, MenuRun, Screens, Front-End",
+      "lo": "0x00240000",
+      "hi": "0x002E0000",
+      "is_sdk": false,
+      "total": 3180,
+      "done": 0,
+      "in_progress": 0,
+      "queued_priority": 3,
+      "hle_wrapped": 8,
+      "raw_recomp": 3169
+    },
+    {
+      "label": "0x2E0k\u20132FF \u00b7 Career Progression, Dealership, Garage, Upgrades",
+      "lo": "0x002E0000",
+      "hi": "0x00300000",
+      "is_sdk": false,
+      "total": 622,
+      "done": 0,
+      "in_progress": 0,
+      "queued_priority": 8,
+      "hle_wrapped": 2,
+      "raw_recomp": 612
+    },
+    {
+      "label": "0x300k\u201333F \u00b7 Flares, Water, Fog, Streamer, Timers",
+      "lo": "0x00300000",
+      "hi": "0x00340000",
+      "is_sdk": false,
+      "total": 1300,
+      "done": 11,
+      "in_progress": 0,
+      "queued_priority": 0,
+      "hle_wrapped": 6,
+      "raw_recomp": 1283
+    },
+    {
+      "label": "0x340k\u201336F \u00b7 Render Queue, VU1/GS Packets, Particles, Shadows",
+      "lo": "0x00340000",
+      "hi": "0x00370000",
+      "is_sdk": false,
+      "total": 841,
+      "done": 64,
+      "in_progress": 0,
+      "queued_priority": 0,
+      "hle_wrapped": 24,
+      "raw_recomp": 753
+    },
+    {
+      "label": "0x370k+ \u00b7 Sony PS2 SDK, libgcc, newlib CRT (HLE/Native Replaced)",
+      "lo": "0x00370000",
+      "hi": "0x00500000",
+      "is_sdk": true,
+      "total": 1521,
+      "done": 0,
+      "in_progress": 0,
+      "queued_priority": 0,
+      "hle_wrapped": 7,
+      "raw_recomp": 1514
+    }
+  ],
+  "entries": [
+    {
+      "addr": "0x00106338",
+      "hex": "00106338",
+      "name": "RaceDrawGameplayViewports",
+      "what": "actual gameplay world/HUD callback: editor-only first-race evidence",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "actual gameplay world/HUD callback: editor-only first-race evidence",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0010AFA0",
+      "hex": "0010AFA0",
+      "name": "EventTypeGetDisplayName",
+      "what": "event-type name: Battle (4 AI)/(8 AI) only for an added contest in $v0/$s2",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "event-type name: Battle (4 AI)/(8 AI) only for an added contest in $v0/$s2",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001116E0",
+      "hex": "001116E0",
+      "name": "BattlePickAiDriverVehicle",
+      "what": "Selects AI driver & vehicle records across classes for Battle (N AI).",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T7",
+      "hle_comment": "Battle (N AI) only: AI drivers/vehicles from every class; native records otherwise",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00113FF8",
+      "hex": "00113FF8",
+      "name": "SessionDrawFrame",
+      "what": "scope the generic session draw; loading states never establish readiness",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "scope the generic session draw; loading states never establish readiness",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00114358",
+      "hex": "00114358",
+      "name": "RunRaceContest",
+      "what": "Finishes one contest after native race cleanup; triggers online post-race transition.",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_race_lifecycle.cpp",
+      "cpp_fn": "decomp_00114358",
+      "task_id": "T2",
+      "hle_comment": "RunRaceContest as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); finish one online contest after native race cleanup",
+      "diff_calls": "5 runs e2e",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00119428",
+      "hex": "00119428",
+      "name": "BattleResolveDriverName",
+      "what": "Resolves rival driver display name for kill feed messages.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods",
+        "online"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T7",
+      "hle_comment": "Battle with AI: kill messages name a slot from its description record, not the 4 profile names",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00119888",
+      "hex": "00119888",
+      "name": "HudDrawLeftRaceRows",
+      "what": "Draws left HUD position/lap/damage rows with widescreen edge anchors.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "mods",
+        "ui"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "left position/lap/damage rows in each supported race viewport",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00119F40",
+      "hex": "00119F40",
+      "name": "HudDrawRightSpeedRows",
+      "what": "Draws right HUD speed/tachometer rows with widescreen edge anchors.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "mods",
+        "ui"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "right speed rows in each supported race viewport",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0011DC30",
+      "hex": "0011DC30",
+      "name": "HudGetRightEdge",
+      "what": "same right edge for the separate skull/count draw in 00128090",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "same right edge for the separate skull/count draw in 00128090",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00120650",
+      "hex": "00120650",
+      "name": "EventSetupSelectInitial",
+      "what": "per-event setup: pre-select the requested event once",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "per-event setup: pre-select the requested event once",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00120FB8",
+      "hex": "00120FB8",
+      "name": "EveHasMoreEvents",
+      "what": "Checks whether more events remain in the current Eve; returns 0 to unwind online events.",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_race_lifecycle.cpp",
+      "cpp_fn": "decomp_00120FB8",
+      "task_id": "T2",
+      "hle_comment": "EveHasMoreEvents as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); returns 0 after an online event completes so GameDoSingle unwinds to the main menu",
+      "diff_calls": "1",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001244A8",
+      "hex": "001244A8",
+      "name": "ActionEveInjectBattle",
+      "what": "Builds Action Eve contest list; injects Battle (4 AI)/(8 AI) events.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T7",
+      "hle_comment": "optional single player battle mode injection into action eves",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001252C0",
+      "hex": "001252C0",
+      "name": "EveGetContestDisplayName",
+      "what": "Battle (4 AI)/(8 AI) contest display names; native names otherwise",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "Battle (4 AI)/(8 AI) contest display names; native names otherwise",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012AEF0",
+      "hex": "0012AEF0",
+      "name": "RosterSelectContest",
+      "what": "Battle (N AI): note the contest whose description is resolved next",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "Battle (N AI): note the contest whose description is resolved next",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012C158",
+      "hex": "0012C158",
+      "name": "BattleBuildRoster",
+      "what": "Populates Battle participant roster; extended to fill AI bots.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T7",
+      "hle_comment": "optional Battle bots: native roster builder fills to four cars",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012DB78",
+      "hex": "0012DB78",
+      "name": "MemFree",
+      "what": "MemFree(ptr)",
+      "subsystem": "Kernel, Memory & I/O",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "MemFree(ptr)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012DDB8",
+      "hex": "0012DDB8",
+      "name": "MemAlloc",
+      "what": "MemAlloc(pool, size, name)",
+      "subsystem": "Kernel, Memory & I/O",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "MemAlloc(pool, size, name)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012F3C8",
+      "hex": "0012F3C8",
+      "name": "RngNextFloat01",
+      "what": "bounded opt-in RNG0 callsite diagnosis",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "bounded opt-in RNG0 callsite diagnosis",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012F470",
+      "hex": "0012F470",
+      "name": "RngNextRange",
+      "what": "bounded opt-in RNG0 callsite diagnosis",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "bounded opt-in RNG0 callsite diagnosis",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0012F4F0",
+      "hex": "0012F4F0",
+      "name": "RngNextSignedFloat",
+      "what": "bounded opt-in RNG0 callsite diagnosis",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "bounded opt-in RNG0 callsite diagnosis",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001515B8",
+      "hex": "001515B8",
+      "name": "TrackLookupBattleSection",
+      "what": "Battle external table for tracks without c_battle (Welch); native otherwise",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "Battle external table for tracks without c_battle (Welch); native otherwise",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00165E10",
+      "hex": "00165E10",
+      "name": "DetentionMasterSetupRole",
+      "what": "Configures DetentionMaster participant/bus role before setup (online bus sync).",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_online_sim.cpp",
+      "cpp_fn": "decomp_00165E10",
+      "task_id": "T4",
+      "hle_comment": "DetentionMasterSetupRole as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); sets DetentionMaster's online bus role before participant setup",
+      "diff_calls": "4",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00166B50",
+      "hex": "00166B50",
+      "name": "BattleDrawKillMessage",
+      "what": "Draws Battle kill announcement banner on HUD.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T7",
+      "hle_comment": "Battle kill-message draw: marks the window where 0x119428 resolves a car name",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001671E8",
+      "hex": "001671E8",
+      "name": "BattleSelectRespawn",
+      "what": "Handles SELECT respawn delay & spawn choice; validated by online host.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "online"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T6",
+      "hle_comment": "Battle SELECT respawn: the host validates the native delay and chooses the spawn",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001673B8",
+      "hex": "001673B8",
+      "name": "BattleLookupRespawnPose",
+      "what": "Looks up respawn transform in spawn table; extended for creator maps.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T6",
+      "hle_comment": "Battle respawn pose lookup in the mounted map",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00167A88",
+      "hex": "00167A88",
+      "name": "BattleBuildSpawnTable",
+      "what": "Constructs Battle spawn table from track data or mounted creator map.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T6",
+      "hle_comment": "Battle spawn table construction from a mounted creator map",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00167C70",
+      "hex": "00167C70",
+      "name": "BattleInitialPlacement",
+      "what": "Places cars on Battle grid; offsets cars beyond native spawn count.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T6",
+      "hle_comment": "Battle initial placement: offset cars beyond the native respawn count",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00167D58",
+      "hex": "00167D58",
+      "name": "BattleMasterUpdate",
+      "what": "Main BattleMaster per-frame progression & win-state evaluation.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods",
+        "online"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T6",
+      "hle_comment": "Battle update (developer EOD_BATTLE_END_AFTER forces a winner)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0016F4E8",
+      "hex": "0016F4E8",
+      "name": "HomebaseGetSlotForCar",
+      "what": "HomebaseGetSlotForCar: maps car index to homebase lot slot safely",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "HomebaseGetSlotForCar: maps car index to homebase lot slot safely",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0016F748",
+      "hex": "0016F748",
+      "name": "HomebaseGetBuySlotForCar",
+      "what": "HomebaseGetBuySlotForCar: maps car to homebase buy slot 0..4 without asserting",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "HomebaseGetBuySlotForCar: maps car to homebase buy slot 0..4 without asserting",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0016FE48",
+      "hex": "0016FE48",
+      "name": "HomeDriverUpdate",
+      "what": "Home Driver per-frame update (Career free roam): EOD_DIRECT_START mode=career teleports to its place",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "Home Driver per-frame update (Career free roam): EOD_DIRECT_START mode=career teleports to its place",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001741C0",
+      "hex": "001741C0",
+      "name": "CareerIsFreeRoamActive",
+      "what": "Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "Career free-roam / challenge active check: KillableChallengers lets AI challengers reach 100% damage and wreck",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00176698",
+      "hex": "00176698",
+      "name": "RaceSessionInitPhase",
+      "what": "Sets race-start phase and RNG epoch; synchronized across online peers.",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_race_lifecycle.cpp",
+      "cpp_fn": "decomp_00176698",
+      "task_id": "T2",
+      "hle_comment": "RaceSessionInitPhase as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); opt-in agreed native race-start phase and RNG epoch",
+      "diff_calls": "1024",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00176798",
+      "hex": "00176798",
+      "name": "RaceGetModeState",
+      "what": "Checks opening race/Battle countdown release; hooked by solo editor map preview.",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "mods",
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_race_lifecycle.cpp",
+      "cpp_fn": "decomp_00176798",
+      "task_id": "T2",
+      "hle_comment": "RaceGetModeState as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); solo editor map preview countdown hook",
+      "diff_calls": "719",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00176918",
+      "hex": "00176918",
+      "name": "RaceSessionSeedRng",
+      "what": "Initializes native race RNG seeds; agreed across online lobby peers.",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_race_lifecycle.cpp",
+      "cpp_fn": "decomp_00176918",
+      "task_id": "T2",
+      "hle_comment": "RaceSessionSeedRng as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); opt-in netplay agreed native race RNG seeds",
+      "diff_calls": "9",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00177718",
+      "hex": "00177718",
+      "name": "WorldStepTick",
+      "what": "Main per-tick simulation step boundary traced/synchronized by netplay; core of future 24/7 headless MMO server.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_online_sim.cpp",
+      "cpp_fn": "decomp_00177718",
+      "task_id": "T4",
+      "hle_comment": "WorldStepTick as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); default-off netplay world-step diagnostic boundary",
+      "diff_calls": "1097",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001779C0",
+      "hex": "001779C0",
+      "name": "EntityMatrixOrthonormalizeRoundRobin",
+      "what": "96-insn round-robin entity matrix orthonormalizer inside WorldStepTick.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T10",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00177B40",
+      "hex": "00177B40",
+      "name": "SimSnapshotHistoryStep",
+      "what": "87-insn simulation snapshot history ring step inside WorldStepTick.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T10",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00177CA0",
+      "hex": "00177CA0",
+      "name": "DynamicEntitiesPhysicsStep",
+      "what": "365-insn rigid-body/vehicle/constraint physics integration loop over g_ActiveDynamicEntities (0x003CDBE8).",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T10",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00178258",
+      "hex": "00178258",
+      "name": "DynamicEntitiesPostStep",
+      "what": "72-insn post-physics coordinator & snapshot capture hook inside WorldStepTick.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T10",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001792E8",
+      "hex": "001792E8",
+      "name": "TrackRacePreStep",
+      "what": "51-insn track/race state pre-step inside WorldStepTick.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T10",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001793B8",
+      "hex": "001793B8",
+      "name": "TrackRaceMidStep",
+      "what": "71-insn track/race state mid-step inside WorldStepTick.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T10",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0017B918",
+      "hex": "0017B918",
+      "name": "ContactRecord",
+      "what": "ContactRecord: contact pool 0x3CE3F0 + 16 per object (src/car_damage.cpp, readable C++; EOD_DIFF)",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/car_damage.cpp",
+      "cpp_fn": "contact_record",
+      "task_id": "BASE",
+      "hle_comment": "ContactRecord: contact pool 0x3CE3F0 + 16 per object (src/car_damage.cpp, readable C++; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017DA58",
+      "hex": "0017DA58",
+      "name": "ChickenExplosionApplyShockwave",
+      "what": "Computes radial chicken blast shockwave on 100x100 spatial hash grid; scaled by mods & published online.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "mods",
+        "online",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_explosion_blast_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run) + blast radius/force scaling & online blast publish",
+      "diff_calls": "53+",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017DDB0",
+      "hex": "0017DDB0",
+      "name": "WeaponRegistryUnregister",
+      "what": "Unregisters a weapon instance from the global 16-weapon registry.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "weapon_registry_unregister_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): WeaponRegistryUnregister",
+      "diff_calls": "0 (teardown verified)",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017DE30",
+      "hex": "0017DE30",
+      "name": "WeaponRegistryRegister",
+      "what": "Registers a weapon instance in the global 16-weapon registry.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "weapon_registry_register_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): WeaponRegistryRegister",
+      "diff_calls": "9",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017DE78",
+      "hex": "0017DE78",
+      "name": "WeaponRegistryQuery",
+      "what": "Queries the global weapon registry by owner/slot.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "weapon_registry_query_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): WeaponRegistryQuery",
+      "diff_calls": "138",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017DFA8",
+      "hex": "0017DFA8",
+      "name": "ChickenWeaponAlloc",
+      "what": "Allocates and constructs a 0x228-byte Explosive Chicken weapon instance.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_weapon_alloc_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): ChickenWeaponAlloc",
+      "diff_calls": "9",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E000",
+      "hex": "0017E000",
+      "name": "ChickenWeaponTrigger",
+      "what": "Launches explosive chicken projectile (Straight/Mortar/Rain); publishes launches online.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "online",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_launch_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run) + Straight/Mortar/Rain launch & online publish",
+      "diff_calls": "2130",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E440",
+      "hex": "0017E440",
+      "name": "ChickenWeaponGetHudStatus",
+      "what": "Computes HUD cooldown/ready status for the chicken weapon.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "ui",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_weapon_get_hud_status_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): ChickenWeaponGetHudStatus",
+      "diff_calls": "20",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E4D8",
+      "hex": "0017E4D8",
+      "name": "ChickenWeaponStartCooldown",
+      "what": "Starts 3.0s chicken reload cooldown; always initialized so Chicken Fight toggles mid-race.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "mods",
+        "online",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_reload_start_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run) + reload cooldown init & ChickenReload override",
+      "diff_calls": "194+",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E520",
+      "hex": "0017E520",
+      "name": "ChickenWeaponCaptureReplayState",
+      "what": "Captures chicken weapon state for replay/netplay synchronization.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "online",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_weapon_capture_replay_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): ChickenWeaponCaptureReplayState",
+      "diff_calls": "202",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E5C8",
+      "hex": "0017E5C8",
+      "name": "ChickenWeaponUpdate",
+      "what": "Per-tick chicken weapon state machine & flight/reload update.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "online",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_weapon_update_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): ChickenWeaponUpdate",
+      "diff_calls": "900",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E718",
+      "hex": "0017E718",
+      "name": "ChickenWeaponDetonate",
+      "what": "Resolves chicken impact & detonation; replays host-confirmed impacts on online replicas.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "online",
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_impact_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run) + online replica host-confirmed impact replay",
+      "diff_calls": "179",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0017E8C0",
+      "hex": "0017E8C0",
+      "name": "ChickenWeaponRetire",
+      "what": "Retires an exploded/expired chicken projectile back to idle.",
+      "subsystem": "Explosive Chicken Weapons",
+      "tags": [
+        "weapons"
+      ],
+      "status": "done",
+      "file": "src/decomp_chicken_weapon.cpp",
+      "cpp_fn": "chicken_weapon_retire_impl",
+      "task_id": "T3",
+      "hle_comment": "decomp_chicken_weapon.cpp (diff_run): ChickenWeaponRetire",
+      "diff_calls": "18",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00186DC8",
+      "hex": "00186DC8",
+      "name": "CarBuildTransmission",
+      "what": "Builds transmission & shift table from .gar; hooks dynamic NASCAR class gears.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "audio",
+        "mods",
+        "physics"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "dynamic NASCAR track-class .gar transmission & shift-table builder (src/hle_nascar_audio.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00189648",
+      "hex": "00189648",
+      "name": "CarApplySolvedContact",
+      "what": "Resolves car-to-car collision impulses; hooked by online netplay for peer impulse handoff.",
+      "subsystem": "Vehicle Control & Online Impact",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_vehicle_control.cpp",
+      "cpp_fn": "car_apply_solved_contact",
+      "task_id": "T1",
+      "hle_comment": "online car-to-car handoff, then CarApplySolvedContact as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF): solved impulse & damage dispatch",
+      "diff_calls": "457",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018AA68",
+      "hex": "0018AA68",
+      "name": "CarSetBrake",
+      "what": "Applies brake input to a vehicle; hooked by KillableChallengers mod to hold wrecked challengers.",
+      "subsystem": "Vehicle Control & Online Impact",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_vehicle_control.cpp",
+      "cpp_fn": "car_set_brake",
+      "task_id": "T1",
+      "hle_comment": "KillableChallengers brake clamp, then CarSetBrake as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF)",
+      "diff_calls": "1221",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018AA70",
+      "hex": "0018AA70",
+      "name": "CarSetThrottle",
+      "what": "Applies throttle input to a vehicle; hooked by KillableChallengers mod.",
+      "subsystem": "Vehicle Control & Online Impact",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_vehicle_control.cpp",
+      "cpp_fn": "car_set_throttle",
+      "task_id": "T1",
+      "hle_comment": "KillableChallengers throttle clamp, then CarSetThrottle as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF)",
+      "diff_calls": "1221",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018AAD0",
+      "hex": "0018AAD0",
+      "name": "CarCanTakeDamage",
+      "what": "Checks whether a vehicle can receive damage; hooked by Career/KillableChallengers.",
+      "subsystem": "Vehicle Control & Online Impact",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_vehicle_control.cpp",
+      "cpp_fn": "car_can_take_damage",
+      "task_id": "T1",
+      "hle_comment": "EOD_CAREER_TRACE probe, then CarCanTakeDamage as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF)",
+      "diff_calls": "8",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018AD20",
+      "hex": "0018AD20",
+      "name": "CarSetDamage",
+      "what": "Scalar vehicle damage setter; hooked by Invincibility mod.",
+      "subsystem": "Vehicle Control & Online Impact",
+      "tags": [
+        "mods",
+        "online",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_vehicle_control.cpp",
+      "cpp_fn": "car_set_damage",
+      "task_id": "T1",
+      "hle_comment": "optional invincibility, then CarSetDamage as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF): scalar vehicle damage setter",
+      "diff_calls": "0 (9-insn leaf verified)",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018AFE0",
+      "hex": "0018AFE0",
+      "name": "CarSetupDamageAndPanels",
+      "what": "CarSetupDamageAndPanels as readable C++ (src/car_damage.cpp; EOD_DIFF), then the CarDurability damage_scale",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/car_damage.cpp",
+      "cpp_fn": "setup_damage_and_panels",
+      "task_id": "BASE",
+      "hle_comment": "CarSetupDamageAndPanels as readable C++ (src/car_damage.cpp; EOD_DIFF), then the CarDurability damage_scale",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018CA98",
+      "hex": "0018CA98",
+      "name": "CarApplyCollisionDamage",
+      "what": "optional invincibility, then CarApplyCollisionDamage as readable C++ (src/car_damage.cpp; EOD_DIFF): dents, panels, wreck state",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/car_damage.cpp",
+      "cpp_fn": "apply_collision_damage",
+      "task_id": "BASE",
+      "hle_comment": "optional invincibility, then CarApplyCollisionDamage as readable C++ (src/car_damage.cpp; EOD_DIFF): dents, panels, wreck state",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0018F2A8",
+      "hex": "0018F2A8",
+      "name": "HumanDriverUpdate",
+      "what": "Updates human driver inputs and turbo boost speed cap/acceleration; hooked by Turbo Boost mod.",
+      "subsystem": "Vehicle Control & Online Impact",
+      "tags": [
+        "mods",
+        "online",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/decomp_vehicle_control.cpp",
+      "cpp_fn": "human_driver_update",
+      "task_id": "T1",
+      "hle_comment": "per-slot mutator/turbo/weapon hooks, then HumanDriverUpdate as readable C++ (src/decomp_vehicle_control.cpp; EOD_DIFF)",
+      "diff_calls": "322",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00190A38",
+      "hex": "00190A38",
+      "name": "CarSetActiveDriver",
+      "what": "Switches vehicle active driver between pace-lap autopilot and human/remote player.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_online_sim.cpp",
+      "cpp_fn": "decomp_00190A38",
+      "task_id": "T4",
+      "hle_comment": "CarSetActiveDriver as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); driver wrapper active-driver switch with EOD_NETPLAY_DEBUG logging",
+      "diff_calls": "663",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00191548",
+      "hex": "00191548",
+      "name": "HumanReplayRecordTick",
+      "what": "Encodes/consumes 6-byte per-tick human input replay record.",
+      "subsystem": "Online Simulation & Input",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_online_sim.cpp",
+      "cpp_fn": "decomp_00191548",
+      "task_id": "T4",
+      "hle_comment": "HumanReplayRecordTick as readable C++ (src/decomp_online_sim.cpp; EOD_DIFF); native six-byte per-tick human replay record diagnostics",
+      "diff_calls": "591",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001A2D20",
+      "hex": "001A2D20",
+      "name": "AiCarUpdateInput",
+      "what": "Injects AI steering, throttle, brake, clutch, and gear inputs; hooked by Battle bots.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T6",
+      "hle_comment": "optional Battle bots: input after native AICar update",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001B2868",
+      "hex": "001B2868",
+      "name": "DetachedWheelPoolReset",
+      "what": "wheel Init: keeps the WHLP create record for ExpandDebris wheels (src/debris_pool.cpp), body still recompiled",
+      "subsystem": "Vehicle Physics & Custom Maps",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "wheel Init: keeps the WHLP create record for ExpandDebris wheels (src/debris_pool.cpp), body still recompiled",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001B3068",
+      "hex": "001B3068",
+      "name": "DetachedWheelSpawn",
+      "what": "DetachedWheelSpawn: wheel debris ring 0x484E68 (src/debris_pool.cpp, readable C++; EOD_DIFF; live use tracked)",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/debris_pool.cpp",
+      "cpp_fn": "wheel_spawn",
+      "task_id": "BASE",
+      "hle_comment": "DetachedWheelSpawn: wheel debris ring 0x484E68 (src/debris_pool.cpp, readable C++; EOD_DIFF; live use tracked)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001B3180",
+      "hex": "001B3180",
+      "name": "DetachedWheelDebrisResetCount",
+      "what": "wheel debris count reset (src/debris_pool.cpp; EOD_DIFF)",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/debris_pool.cpp",
+      "cpp_fn": "wheel_count_reset",
+      "task_id": "BASE",
+      "hle_comment": "wheel debris count reset (src/debris_pool.cpp; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001B3190",
+      "hex": "001B3190",
+      "name": "DetachedWheelDebrisResetRing",
+      "what": "wheel debris count and ring reset (src/debris_pool.cpp; EOD_DIFF)",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/debris_pool.cpp",
+      "cpp_fn": "wheel_pool_reset",
+      "task_id": "BASE",
+      "hle_comment": "wheel debris count and ring reset (src/debris_pool.cpp; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001B5840",
+      "hex": "001B5840",
+      "name": "CarUpdateTimedDamage",
+      "what": "Applies inline timed-damage during vehicle update; suppressed by Invincibility mod.",
+      "subsystem": "Custom Map Physics & Recovery",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "in_progress",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T5",
+      "hle_comment": "optional invincibility: suppress inline timed-damage feat during native update",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001B8370",
+      "hex": "001B8370",
+      "name": "CarUpdateOutOfBoundsRecovery",
+      "what": "Handles countdown recovery when upside down or out of bounds; hooked for manual-only recovery.",
+      "subsystem": "Custom Map Physics & Recovery",
+      "tags": [
+        "mods",
+        "online",
+        "physics"
+      ],
+      "status": "in_progress",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T5",
+      "hle_comment": "optional manual-only human countdown recovery",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001C31A0",
+      "hex": "001C31A0",
+      "name": "CameraDirectorUpdate",
+      "what": "Updates camera director; injects 360 showroom/garage turntable orbit.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "mods",
+        "ui"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "CameraDirectorUpdate: injects 360 orbit & turntable in showroom/garage",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001D2DC8",
+      "hex": "001D2DC8",
+      "name": "CameraDirectorPlayTrack",
+      "what": "CameraDirectorPlayTrack: tracks active clip track",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "CameraDirectorPlayTrack: tracks active clip track",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001D3FB8",
+      "hex": "001D3FB8",
+      "name": "StartCrashOrbitPause",
+      "what": "Requests 3-second world pause during single-view crash orbit; bypassed in online events.",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "done",
+      "file": "src/decomp_race_lifecycle.cpp",
+      "cpp_fn": "decomp_001D3FB8",
+      "task_id": "T2",
+      "hle_comment": "StartCrashOrbitPause as readable C++ (src/decomp_race_lifecycle.cpp; EOD_DIFF); bypassed during online events",
+      "diff_calls": "0 (static verified)",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001DE7B0",
+      "hex": "001DE7B0",
+      "name": "ChassisSweptBoxCollide",
+      "what": "Resolves swept chassis OBB collisions against track geometry; merges custom map triangles.",
+      "subsystem": "Custom Map Physics & Recovery",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "in_progress",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T5",
+      "hle_comment": "resolve swept chassis boxes against mounted portable map triangles",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001E0DC8",
+      "hex": "001E0DC8",
+      "name": "DetachedPanelPoolInit",
+      "what": "DetachedPanelSpawn: live panel debris counted, ExpandDebris window (src/debris_pool.cpp), body still recompiled",
+      "subsystem": "Vehicle Physics & Custom Maps",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "DetachedPanelSpawn: live panel debris counted, ExpandDebris window (src/debris_pool.cpp), body still recompiled",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x001E1E88",
+      "hex": "001E1E88",
+      "name": "DetachedPanelSpawn",
+      "what": "'Panl' ctor: panel debris pool 0x494D60 (src/debris_pool.cpp, readable C++; EOD_DIFF)",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/debris_pool.cpp",
+      "cpp_fn": "panel_create",
+      "task_id": "BASE",
+      "hle_comment": "'Panl' ctor: panel debris pool 0x494D60 (src/debris_pool.cpp, readable C++; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x001E29C0",
+      "hex": "001E29C0",
+      "name": "DetachedPanelPoolClear",
+      "what": "panel debris dtor (src/debris_pool.cpp, readable C++; EOD_DIFF)",
+      "subsystem": "Vehicle Damage & Debris Pools",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "file": "src/debris_pool.cpp",
+      "cpp_fn": "panel_destroy",
+      "task_id": "BASE",
+      "hle_comment": "panel debris dtor (src/debris_pool.cpp, readable C++; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0020D220",
+      "hex": "0020D220",
+      "name": "MRAnimCreate",
+      "what": "MRAnim create (developer EOD_HEAP_CHECK logs its bone count against the fixed 0x740 block)",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "MRAnim create (developer EOD_HEAP_CHECK logs its bone count against the fixed 0x740 block)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0020F2D8",
+      "hex": "0020F2D8",
+      "name": "ViewportRenderFinish",
+      "what": "ViewportRenderFinish: lift single-viewport flare check for split-screen parity (src/native_shadows_flares.cpp)",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "ViewportRenderFinish: lift single-viewport flare check for split-screen parity (src/native_shadows_flares.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0020F4A0",
+      "hex": "0020F4A0",
+      "name": "VisualCarFrameRender",
+      "what": "frame renderer ordered visual-car traversal",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "frame renderer ordered visual-car traversal",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0020FD48",
+      "hex": "0020FD48",
+      "name": "SceneCreateWeapons",
+      "what": "Creates vehicle weapons through native scene factory for Battle bots.",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T7",
+      "hle_comment": "optional Battle bots: create weapons through native scene factory",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00212500",
+      "hex": "00212500",
+      "name": "WheelGroundQuery",
+      "what": "Queries track surface triangles under wheels; merges portable custom map triangles.",
+      "subsystem": "Custom Map Physics & Recovery",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "in_progress",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T5",
+      "hle_comment": "merge portable map triangle samples into the native wheel ground query",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00212808",
+      "hex": "00212808",
+      "name": "DrawDistanceApplyOption",
+      "what": "DrawDistanceApplyOption as readable C++ (src/native_lod.cpp; EOD_DIFF)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_lod.cpp",
+      "cpp_fn": "draw_distance_apply_option",
+      "task_id": "BASE",
+      "hle_comment": "DrawDistanceApplyOption as readable C++ (src/native_lod.cpp; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00212B58",
+      "hex": "00212B58",
+      "name": "CameraBuildViewportProjection",
+      "what": "optional Maximum: matched 1P projection/fog range in 2P",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "optional Maximum: matched 1P projection/fog range in 2P",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00214678",
+      "hex": "00214678",
+      "name": "GrafTrackLoad",
+      "what": "GRAF load: optional DrawDistance scales each mlist LOD group final cutoff",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "GRAF load: optional DrawDistance scales each mlist LOD group final cutoff",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00214B68",
+      "hex": "00214B68",
+      "name": "WorldFrameRender",
+      "what": "WorldFrameRender: mlist calc and world passes 0..4 around the queued frame",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "world_frame_render",
+      "task_id": "BASE",
+      "hle_comment": "WorldFrameRender: mlist calc and world passes 0..4 around the queued frame",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00218E68",
+      "hex": "00218E68",
+      "name": "VisualCarBatchSelectAndSubmit",
+      "what": "visual-car batch traversal and LOD diagnostics",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "visual-car batch traversal and LOD diagnostics",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0021ABF8",
+      "hex": "0021ABF8",
+      "name": "VisualCarLoadLodTable",
+      "what": "bounded loaded car table trace; opt-in threshold multiplier",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "bounded loaded car table trace; opt-in threshold multiplier",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0021C370",
+      "hex": "0021C370",
+      "name": "VisualCarUpdateTransforms",
+      "what": "ordered visual-car transform update",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "ordered visual-car transform update",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0021C6E0",
+      "hex": "0021C6E0",
+      "name": "VisualCarSelectLodIndex",
+      "what": "VisualCarSelectLodIndex as readable C++ (src/native_lod.cpp; EOD_DIFF), Detail=maximum policy, trace",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/hle_lod.cpp",
+      "cpp_fn": "eod_visual_car_select_lod_index",
+      "task_id": "BASE",
+      "hle_comment": "VisualCarSelectLodIndex as readable C++ (src/native_lod.cpp; EOD_DIFF), Detail=maximum policy, trace",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00220788",
+      "hex": "00220788",
+      "name": "WheelSelectSlowOrFastModel",
+      "what": "bounded opt-in Cup actual slow/fast selection trace",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "bounded opt-in Cup actual slow/fast selection trace",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00221B18",
+      "hex": "00221B18",
+      "name": "flare_source_alloc",
+      "what": "Decompiled C++ replacement (flare_source_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "flare_source_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00221CC8",
+      "hex": "00221CC8",
+      "name": "fog_color_alloc",
+      "what": "Decompiled C++ replacement (fog_color_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "fog_color_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00221D08",
+      "hex": "00221D08",
+      "name": "sun_intensity_alloc",
+      "what": "Decompiled C++ replacement (sun_intensity_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_intensity_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00221D48",
+      "hex": "00221D48",
+      "name": "shadow_color_alloc",
+      "what": "Decompiled C++ replacement (shadow_color_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "shadow_color_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00221D88",
+      "hex": "00221D88",
+      "name": "ambient_color_alloc",
+      "what": "Decompiled C++ replacement (ambient_color_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "ambient_color_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00221DC8",
+      "hex": "00221DC8",
+      "name": "sun_alloc",
+      "what": "Decompiled C++ replacement (sun_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00221E00",
+      "hex": "00221E00",
+      "name": "sky_alloc",
+      "what": "Decompiled C++ replacement (sky_alloc) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sky_alloc",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002224C0",
+      "hex": "002224C0",
+      "name": "flare_source_init",
+      "what": "Decompiled C++ replacement (flare_source_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "flare_source_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223488",
+      "hex": "00223488",
+      "name": "fog_color_apply",
+      "what": "Decompiled C++ replacement (fog_color_apply) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "fog_color_apply",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002234E0",
+      "hex": "002234E0",
+      "name": "fog_color_init",
+      "what": "Decompiled C++ replacement (fog_color_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "fog_color_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223520",
+      "hex": "00223520",
+      "name": "sun_intensity_apply",
+      "what": "Decompiled C++ replacement (sun_intensity_apply) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_intensity_apply",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223548",
+      "hex": "00223548",
+      "name": "sun_intensity_init",
+      "what": "Decompiled C++ replacement (sun_intensity_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_intensity_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002235D8",
+      "hex": "002235D8",
+      "name": "shadow_color_apply",
+      "what": "Decompiled C++ replacement (shadow_color_apply) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "shadow_color_apply",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002235F8",
+      "hex": "002235F8",
+      "name": "shadow_color_init",
+      "what": "Decompiled C++ replacement (shadow_color_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "shadow_color_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223638",
+      "hex": "00223638",
+      "name": "ambient_color_apply",
+      "what": "Decompiled C++ replacement (ambient_color_apply) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "ambient_color_apply",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223678",
+      "hex": "00223678",
+      "name": "ambient_color_init",
+      "what": "Decompiled C++ replacement (ambient_color_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "ambient_color_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002236A8",
+      "hex": "002236A8",
+      "name": "sun_draw",
+      "what": "Decompiled C++ replacement (sun_draw) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_draw",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002236B0",
+      "hex": "002236B0",
+      "name": "sun_apply",
+      "what": "Decompiled C++ replacement (sun_apply) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_apply",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x002237D8",
+      "hex": "002237D8",
+      "name": "sun_init",
+      "what": "Decompiled C++ replacement (sun_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223800",
+      "hex": "00223800",
+      "name": "SkyDestroy",
+      "what": "SkyDestroy (vtable 0x408318 slot 2)",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "sky_destroy",
+      "task_id": "BASE",
+      "hle_comment": "SkyDestroy (vtable 0x408318 slot 2)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223858",
+      "hex": "00223858",
+      "name": "SkyDraw",
+      "what": "SkyDraw: dome parts through the draw queue",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "sky_draw",
+      "task_id": "BASE",
+      "hle_comment": "SkyDraw: dome parts through the draw queue",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00223A50",
+      "hex": "00223A50",
+      "name": "sky_init",
+      "what": "Decompiled C++ replacement (sky_init) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sky_init",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0023C400",
+      "hex": "0023C400",
+      "name": "CarAudioLoadVal",
+      "what": "Loads vehicle engine audio parameters; hooks NASCAR ESFX loader.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "audio",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "native NASCAR ESFX engine audio loader (src/hle_nascar_audio.cpp); retail *.val passthrough",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0023C8D0",
+      "hex": "0023C8D0",
+      "name": "CarAudioMixFrame",
+      "what": "Per-frame vehicle engine audio mixer; hooks NASCAR ESFX mixer.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "audio",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "native NASCAR ESFX per-frame engine mixer (src/hle_nascar_audio.cpp); retail passthrough",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00270C10",
+      "hex": "00270C10",
+      "name": "MenuRun",
+      "what": "Core modal UI/dialog loop; auto-answers online Arcade prompts.",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "tags": [
+        "online",
+        "ui"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T9",
+      "hle_comment": "MenuRun: the Arcade 'single / multi' prompt is auto-answered (single) for online events",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002A1298",
+      "hex": "002A1298",
+      "name": "MainMenuUpdate",
+      "what": "main menu: start the requested Action session when first reached",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "main menu: start the requested Action session when first reached",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002A75E0",
+      "hex": "002A75E0",
+      "name": "SinglePlayerCarSelectUpdate",
+      "what": "GameDoSingle car screen: answered once for a direct start",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "GameDoSingle car screen: answered once for a direct start",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002A8EF0",
+      "hex": "002A8EF0",
+      "name": "CarChooseSetLabel",
+      "what": "CarChooseWidget label setter: decorate Arcade paint display text for overridden vehicles",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "CarChooseWidget label setter: decorate Arcade paint display text for overridden vehicles",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002BEC08",
+      "hex": "002BEC08",
+      "name": "TitleScreenUpdate",
+      "what": "title screen: passed immediately when EOD_DIRECT_START is set",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "title screen: passed immediately when EOD_DIRECT_START is set",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002C1A20",
+      "hex": "002C1A20",
+      "name": "LoadingScreenEventProgress",
+      "what": "LoadingScreenEventProgress: rate-limits 3-vblank per-chunk wait for NVMe speed",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "LoadingScreenEventProgress: rate-limits 3-vblank per-chunk wait for NVMe speed",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002C2188",
+      "hex": "002C2188",
+      "name": "LoadingScreenMenuProgress",
+      "what": "LoadingScreenMenuProgress: rate-limits 3-vblank per-chunk wait for NVMe speed",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "LoadingScreenMenuProgress: rate-limits 3-vblank per-chunk wait for NVMe speed",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002C7340",
+      "hex": "002C7340",
+      "name": "SinglePlayerTrackSelectUpdate",
+      "what": "GameDoSingle track screen: answered once for a direct start",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "GameDoSingle track screen: answered once for a direct start",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002D58E8",
+      "hex": "002D58E8",
+      "name": "CareerFreeRoamRun",
+      "what": "Career free-roam run (developer EOD_CAREER_EVE skips it once)",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "Career free-roam run (developer EOD_CAREER_EVE skips it once)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002DED18",
+      "hex": "002DED18",
+      "name": "CareerValidatePartPurchase",
+      "what": "Validates part purchase & multi-stage upgrade swaps.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "Career part purchase validation: multi-stage upgrades and category swapping",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002DFDF8",
+      "hex": "002DFDF8",
+      "name": "CareerPartCompatMask",
+      "what": "Looks up upgrade part compatibility bitmask; extended for cross-class parts.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "Career part compatibility bitmask lookup: universal cross-class part fitting",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E0F10",
+      "hex": "002E0F10",
+      "name": "CareerGetPlayerRank",
+      "what": "get Career rank: CareerRank shows 1st on the Career screens that only display it",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "get Career rank: CareerRank shows 1st on the Career screens that only display it",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E1380",
+      "hex": "002E1380",
+      "name": "CareerGarageGetTuning",
+      "what": "Returns tuning block pointer for a garage slot (0..15).",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "Career get car tuning block: tuning parameters for extended garage slots",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E1BB0",
+      "hex": "002E1BB0",
+      "name": "CareerGarageGetCount",
+      "what": "Returns owned garage car count; extended up to 16 cars.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "Career garage car count: extended garage slots (up to 16 cars)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E1BC0",
+      "hex": "002E1BC0",
+      "name": "CareerGarageAddCar",
+      "what": "Adds a purchased car to garage; routes slots 4..15 to extended storage.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "Career add car to garage: routes vehicles 4..15 into extended garage",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E35F0",
+      "hex": "002E35F0",
+      "name": "AutoShopSetAvailable",
+      "what": "Selects dealership available car lineup; extended to page through full roster.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "dealer stock: AutoShopSetAvailable(out[5], mincap); AllCars pages through every car",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E3BC8",
+      "hex": "002E3BC8",
+      "name": "CareerCalcDepreciation",
+      "what": "Computes car sale/trade-in depreciation; zeroed by FreeSwap mod.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "depreciation of a car being sold or traded in: FreeSwap = none (full refund)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E3E70",
+      "hex": "002E3E70",
+      "name": "CareerGetUsedValue",
+      "what": "Returns 90% used value of owned car; full value under FreeSwap mod.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "used value of an owned car (90 % of its price): FreeSwap = the full price",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E5200",
+      "hex": "002E5200",
+      "name": "CareerCheckEveRankGate",
+      "what": "Tests Career rank eligibility for an Eve; bypassed by OpenCareer mod.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "Eve rank window test (rank, eve): OpenCareer = every Eve open",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E5758",
+      "hex": "002E5758",
+      "name": "CareerLoadChallengesVal",
+      "what": "challenges.val / home_challenges.val loader: OpenCareer clears rep_required (Troy's Place)",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "challenges.val / home_challenges.val loader: OpenCareer clears rep_required (Troy's Place)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x002E6C78",
+      "hex": "002E6C78",
+      "name": "CareerUpdateRankAfterEve",
+      "what": "Computes new Career rank after an Eve; prevents forced Career end.",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_priority",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "T8",
+      "hle_comment": "new rank after an Eve: CareerRank never reaches 0 (champion ends the Career)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00304D50",
+      "hex": "00304D50",
+      "name": "FlareRender",
+      "what": "FlareRender: sun glare & point-light flares (src/native_shadows_flares.cpp)",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "flare_render",
+      "task_id": "BASE",
+      "hle_comment": "FlareRender: sun glare & point-light flares (src/native_shadows_flares.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x003052F0",
+      "hex": "003052F0",
+      "name": "flare_source_append",
+      "what": "Decompiled C++ replacement (flare_source_append) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "flare_source_append",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00305350",
+      "hex": "00305350",
+      "name": "sun_flare_set_enabled",
+      "what": "Decompiled C++ replacement (sun_flare_set_enabled) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_flare_set_enabled",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00305360",
+      "hex": "00305360",
+      "name": "sun_flare_set_intensity",
+      "what": "Decompiled C++ replacement (sun_flare_set_intensity) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_flare_set_intensity",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x003053C0",
+      "hex": "003053C0",
+      "name": "sun_flare_set_color",
+      "what": "Decompiled C++ replacement (sun_flare_set_color) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "sun_flare_set_color",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0030AA00",
+      "hex": "0030AA00",
+      "name": "shadow_set_alpha_from_color",
+      "what": "Decompiled C++ replacement (shadow_set_alpha_from_color) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "shadow_set_alpha_from_color",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0030AA10",
+      "hex": "0030AA10",
+      "name": "shadow_set_direction",
+      "what": "Decompiled C++ replacement (shadow_set_direction) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "shadow_set_direction",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00325728",
+      "hex": "00325728",
+      "name": "WaterDraw",
+      "what": "WaterDraw(surface): tiles through the immediate geometry API",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "water_draw",
+      "task_id": "BASE",
+      "hle_comment": "WaterDraw(surface): tiles through the immediate geometry API",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00325E40",
+      "hex": "00325E40",
+      "name": "WaterSimulate",
+      "what": "WaterSimulate: car splashes",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "water_simulate",
+      "task_id": "BASE",
+      "hle_comment": "WaterSimulate: car splashes",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00326168",
+      "hex": "00326168",
+      "name": "WaterDrawIfPresent",
+      "what": "WaterDrawIfPresent",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "water_draw_if_present",
+      "task_id": "BASE",
+      "hle_comment": "WaterDrawIfPresent",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00326188",
+      "hex": "00326188",
+      "name": "WaterCreate",
+      "what": "WaterCreate(pos, axis a, axis b): only with one view; SplitScreenParity creates it in split screen too (P8)",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "WaterCreate(pos, axis a, axis b): only with one view; SplitScreenParity creates it in split screen too (P8)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00331DF0",
+      "hex": "00331DF0",
+      "name": "Panic",
+      "what": "panic(fmt, ...) - game fatal error",
+      "subsystem": "Kernel, Memory & I/O",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "panic(fmt, ...) - game fatal error",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00337718",
+      "hex": "00337718",
+      "name": "TimerGetMs",
+      "what": "TimerGetMs: skips artificial 2-4s post-load and memory card banner hold loops",
+      "subsystem": "Kernel, Memory & I/O",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "TimerGetMs: skips artificial 2-4s post-load and memory card banner hold loops",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0033D4F8",
+      "hex": "0033D4F8",
+      "name": "StrmFindFile",
+      "what": "StrmFindFile(path) -> TOC index: logs files missing from the disc",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "StrmFindFile(path) -> TOC index: logs files missing from the disc",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0033EC78",
+      "hex": "0033EC78",
+      "name": "FrameWaitAndService",
+      "what": "wait for native race frame publication before editor readiness",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "wait for native race frame publication before editor readiness",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0033ECB8",
+      "hex": "0033ECB8",
+      "name": "FogConfigureRange",
+      "what": "FogConfigureRange (thunk) as readable C++, feeds native fog (src/native_fog.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_fog.cpp",
+      "cpp_fn": "fog_configure_range",
+      "task_id": "BASE",
+      "hle_comment": "FogConfigureRange (thunk) as readable C++, feeds native fog (src/native_fog.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034AF98",
+      "hex": "0034AF98",
+      "name": "RenderQueueFlush",
+      "what": "Flush(layer, set)",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "flush",
+      "task_id": "BASE",
+      "hle_comment": "Flush(layer, set)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034B140",
+      "hex": "0034B140",
+      "name": "RenderQueueAppendModelBatches",
+      "what": "append a model's batches to the queue",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "append_batches",
+      "task_id": "BASE",
+      "hle_comment": "append a model's batches to the queue",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034BDA8",
+      "hex": "0034BDA8",
+      "name": "ModelSubmitVu1Packets",
+      "what": "ModelSubmitVu1Packets: queue draw records",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "submit_model",
+      "task_id": "BASE",
+      "hle_comment": "ModelSubmitVu1Packets: queue draw records",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034BF90",
+      "hex": "0034BF90",
+      "name": "RenderQueueAppendWithoutMaterial",
+      "what": "queue draw records without material",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "submit_model_key",
+      "task_id": "BASE",
+      "hle_comment": "queue draw records without material",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C208",
+      "hex": "0034C208",
+      "name": "ShadowSubmit",
+      "what": "projected shadow submit (src/native_shadows_flares.cpp + render_trace.cpp)",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "shadow_submit",
+      "task_id": "BASE",
+      "hle_comment": "projected shadow submit (src/native_shadows_flares.cpp + render_trace.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C4B0",
+      "hex": "0034C4B0",
+      "name": "ShadowSubmitMasked",
+      "what": "projected shadow submit (layer mask, src/native_shadows_flares.cpp + render_trace.cpp)",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "shadow_submit_masked",
+      "task_id": "BASE",
+      "hle_comment": "projected shadow submit (layer mask, src/native_shadows_flares.cpp + render_trace.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C798",
+      "hex": "0034C798",
+      "name": "ShadowEnd",
+      "what": "ShadowEnd: close & composite shadow RT (src/native_shadows_flares.cpp)",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "shadow_end",
+      "task_id": "BASE",
+      "hle_comment": "ShadowEnd: close & composite shadow RT (src/native_shadows_flares.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C7D0",
+      "hex": "0034C7D0",
+      "name": "ShadowBegin",
+      "what": "ShadowBegin: copy dir, open shadow RT, snapshot main viewport (src/native_shadows_flares.cpp)",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "shadow_begin",
+      "task_id": "BASE",
+      "hle_comment": "ShadowBegin: copy dir, open shadow RT, snapshot main viewport (src/native_shadows_flares.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C828",
+      "hex": "0034C828",
+      "name": "RenderQueueClearBuckets",
+      "what": "clear draw buckets and discard native overflow",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "clear draw buckets and discard native overflow",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034C860",
+      "hex": "0034C860",
+      "name": "RenderQueueFlushLayer9AndReset",
+      "what": "flush layer 9, reset queue",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "flush_layer_9",
+      "task_id": "BASE",
+      "hle_comment": "flush layer 9, reset queue",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C8C0",
+      "hex": "0034C8C0",
+      "name": "RenderQueueFlushSingleLayer",
+      "what": "alternate single-layer flush, with a layer-9 reset",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "alternate single-layer flush, with a layer-9 reset",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034C930",
+      "hex": "0034C930",
+      "name": "RenderQueueFlushLayers0To8",
+      "what": "flush layers 0..8",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "flush_layers_0_to_8",
+      "task_id": "BASE",
+      "hle_comment": "flush layers 0..8",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C9C0",
+      "hex": "0034C9C0",
+      "name": "RenderQueueFrameBegin",
+      "what": "FrameBegin: open queue set 1",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "begin_frame",
+      "task_id": "BASE",
+      "hle_comment": "FrameBegin: open queue set 1",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034C9F8",
+      "hex": "0034C9F8",
+      "name": "BonePaletteUpload",
+      "what": "BonePaletteUpload: skinned pose to VU1 (src/bone_pose.cpp)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "BonePaletteUpload: skinned pose to VU1 (src/bone_pose.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034CA18",
+      "hex": "0034CA18",
+      "name": "DentOffsetUpload",
+      "what": "DentOffsetUpload: forwards to 0x35DD28 (src/bone_pose.cpp, readable C++; EOD_DIFF)",
+      "subsystem": "Animation & Car Deformation",
+      "tags": [
+        "physics",
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/bone_pose.cpp",
+      "cpp_fn": "f_0034CA18_new",
+      "task_id": "BASE",
+      "hle_comment": "DentOffsetUpload: forwards to 0x35DD28 (src/bone_pose.cpp, readable C++; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034CC98",
+      "hex": "0034CC98",
+      "name": "RenderQueueSubmitWorldModel",
+      "what": "queue a world-space model (src/render_queue.cpp)",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_queue.cpp",
+      "cpp_fn": "submit_static",
+      "task_id": "BASE",
+      "hle_comment": "queue a world-space model (src/render_queue.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034CEF0",
+      "hex": "0034CEF0",
+      "name": "ModelLoadFromArchive",
+      "what": "optional Cup source fast wheel geometry; exact native fallback",
+      "subsystem": "Vehicle Physics & Custom Maps",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "optional Cup source fast wheel geometry; exact native fallback",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034D088",
+      "hex": "0034D088",
+      "name": "RenderQueueFreePool",
+      "what": "free the guest pool and the native overflow",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "free the guest pool and the native overflow",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034D1F8",
+      "hex": "0034D1F8",
+      "name": "RenderQueueAllocatePool",
+      "what": "allocate the guest draw pool and start a new native queue lifetime",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "allocate the guest draw pool and start a new native queue lifetime",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034D328",
+      "hex": "0034D328",
+      "name": "DisplaySetAspectMode",
+      "what": "display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "display mode (0 normal, 1 widescreen, 2 letterbox) - AspectRatio=16:9 / 4:3 forces it",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034D8A0",
+      "hex": "0034D8A0",
+      "name": "viewport_set",
+      "what": "Decompiled C++ replacement (viewport_set) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "viewport_set",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034E308",
+      "hex": "0034E308",
+      "name": "FrustumTestSphere",
+      "what": "bounded actual CPU sphere visibility trace",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "bounded actual CPU sphere visibility trace",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034E530",
+      "hex": "0034E530",
+      "name": "ProjectionSetPerspective",
+      "what": "opt-in bounded projection trace, native calculation unchanged",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "opt-in bounded projection trace, native calculation unchanged",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0034E848",
+      "hex": "0034E848",
+      "name": "fog_set_color_packed",
+      "what": "Decompiled C++ replacement (fog_set_color_packed) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "fog_set_color_packed",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034E868",
+      "hex": "0034E868",
+      "name": "commit_sun_direction_and_intensity",
+      "what": "Decompiled C++ replacement (commit_sun_direction_and_intensity) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "commit_sun_direction_and_intensity",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034E880",
+      "hex": "0034E880",
+      "name": "set_sun_direction",
+      "what": "Decompiled C++ replacement (set_sun_direction) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "set_sun_direction",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034E8A8",
+      "hex": "0034E8A8",
+      "name": "set_directional_light_color",
+      "what": "Decompiled C++ replacement (set_directional_light_color) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "set_directional_light_color",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034EE70",
+      "hex": "0034EE70",
+      "name": "SphereImmSubmit",
+      "what": "SphereImmSubmit(obj*)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "sphere_imm_submit",
+      "task_id": "BASE",
+      "hle_comment": "SphereImmSubmit(obj*)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034EEB8",
+      "hex": "0034EEB8",
+      "name": "SphereImmSubmitTransformed",
+      "what": "SphereImmSubmitTransformed(obj*, mat*)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "sphere_imm_submit_transformed",
+      "task_id": "BASE",
+      "hle_comment": "SphereImmSubmitTransformed(obj*, mat*)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034F570",
+      "hex": "0034F570",
+      "name": "set_light_intensity",
+      "what": "Decompiled C++ replacement (set_light_intensity) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "set_light_intensity",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0034F5A0",
+      "hex": "0034F5A0",
+      "name": "set_ambient_color",
+      "what": "Decompiled C++ replacement (set_ambient_color) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "set_ambient_color",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00353470",
+      "hex": "00353470",
+      "name": "texture_slot_note_distance",
+      "what": "Decompiled C++ replacement (texture_slot_note_distance) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "texture_slot_note_distance",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x003582B8",
+      "hex": "003582B8",
+      "name": "MlistVisibilityCalc",
+      "what": "mlist calc: EOD_CULL_TRACE per-test rejection counts (diagnostic)",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "mlist_visibility_calc",
+      "task_id": "BASE",
+      "hle_comment": "mlist calc: EOD_CULL_TRACE per-test rejection counts (diagnostic)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00358BD0",
+      "hex": "00358BD0",
+      "name": "WorldRenderPass",
+      "what": "WorldRenderPass(pass): DMA REFs to the visible world batches",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "world_render_pass",
+      "task_id": "BASE",
+      "hle_comment": "WorldRenderPass(pass): DMA REFs to the visible world batches",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035A810",
+      "hex": "0035A810",
+      "name": "VifWriteUnpackMscal",
+      "what": "VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)",
+      "subsystem": "Animation & Car Deformation",
+      "tags": [
+        "physics",
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/bone_pose.cpp",
+      "cpp_fn": "f_0035A810_new",
+      "task_id": "BASE",
+      "hle_comment": "VifWriteUnpackMscal (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035B3D0",
+      "hex": "0035B3D0",
+      "name": "Vu1WriteCameraPacket",
+      "what": "camera packet (VU1 qwords 1..16)",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "vu1_write_camera_packet",
+      "task_id": "BASE",
+      "hle_comment": "camera packet (VU1 qwords 1..16)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035BBD0",
+      "hex": "0035BBD0",
+      "name": "DisplayCopyBuildPacket",
+      "what": "display copy packet builder: attach 0x1180 -> 0 composition to its DMA tag",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "display copy packet builder: attach 0x1180 -> 0 composition to its DMA tag",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0035BE08",
+      "hex": "0035BE08",
+      "name": "BootstrapIconBuildQuad",
+      "what": "bootstrap icon rotation and ordered native quad",
+      "subsystem": "Rendering: Draw Queue & Submission",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/render_trace.cpp",
+      "cpp_fn": "build_bootstrap_quad",
+      "task_id": "BASE",
+      "hle_comment": "bootstrap icon rotation and ordered native quad",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035CAA0",
+      "hex": "0035CAA0",
+      "name": "ImmediateDrawIndexedTris",
+      "what": "ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices) + cockpit quad (0x219C48)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "immediate_draw_indexed_tris",
+      "task_id": "BASE",
+      "hle_comment": "ImmediateDrawIndexedTris(verts*, numVerts, indices*, numIndices) + cockpit quad (0x219C48)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035CB88",
+      "hex": "0035CB88",
+      "name": "Vu1EmitQueuedBatch",
+      "what": "emit one queued batch to the VU1 DMA chain",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "emit one queued batch to the VU1 DMA chain",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0035CBB8",
+      "hex": "0035CBB8",
+      "name": "PacketCommit",
+      "what": "PacketCommit(qwc) (0x366CD0)",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "packet_commit",
+      "task_id": "BASE",
+      "hle_comment": "PacketCommit(qwc) (0x366CD0)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035CD28",
+      "hex": "0035CD28",
+      "name": "Vu1WriteMatrixPacket",
+      "what": "matrix packet (VU1 TOPS+0..6)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "matrix packet (VU1 TOPS+0..6)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0035D170",
+      "hex": "0035D170",
+      "name": "ShadowEmitBatchPass",
+      "what": "ShadowEmitBatchPass: emit matrix + shadow batch DMA REF (src/native_shadows_flares.cpp)",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "shadow_emit_batch_pass",
+      "task_id": "BASE",
+      "hle_comment": "ShadowEmitBatchPass: emit matrix + shadow batch DMA REF (src/native_shadows_flares.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035D298",
+      "hex": "0035D298",
+      "name": "ShadowEmitBatch",
+      "what": "emit one shadow batch",
+      "subsystem": "Rendering: Shadows & Flares",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_shadows_flares.cpp",
+      "cpp_fn": "shadow_emit_batch",
+      "task_id": "BASE",
+      "hle_comment": "emit one shadow batch",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035DBD8",
+      "hex": "0035DBD8",
+      "name": "BonePaletteWrite",
+      "what": "BonePaletteWrite (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)",
+      "subsystem": "Animation & Car Deformation",
+      "tags": [
+        "physics",
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/bone_pose.cpp",
+      "cpp_fn": "f_0035DBD8_new",
+      "task_id": "BASE",
+      "hle_comment": "BonePaletteWrite (src/bone_pose.cpp, readable C++; EOD_DIFF checks it)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035DD28",
+      "hex": "0035DD28",
+      "name": "DentOffsetWrite",
+      "what": "DentOffsetWrite: car dent offsets to VU1 0x90 (src/bone_pose.cpp, readable C++; EOD_DIFF)",
+      "subsystem": "Animation & Car Deformation",
+      "tags": [
+        "physics",
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/bone_pose.cpp",
+      "cpp_fn": "f_0035DD28_new",
+      "task_id": "BASE",
+      "hle_comment": "DentOffsetWrite: car dent offsets to VU1 0x90 (src/bone_pose.cpp, readable C++; EOD_DIFF)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035DEE0",
+      "hex": "0035DEE0",
+      "name": "WorldPacketBegin",
+      "what": "WorldPacketBegin(qwc)",
+      "subsystem": "Rendering: Track World, Sky & Water",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_world.cpp",
+      "cpp_fn": "world_packet_begin",
+      "task_id": "BASE",
+      "hle_comment": "WorldPacketBegin(qwc)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035DF10",
+      "hex": "0035DF10",
+      "name": "ImmediateBegin",
+      "what": "ImmediateBegin(numVerts) (VU1 0x0270)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "immediate_begin",
+      "task_id": "BASE",
+      "hle_comment": "ImmediateBegin(numVerts) (VU1 0x0270)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035E200",
+      "hex": "0035E200",
+      "name": "vu1_set_viewport",
+      "what": "Decompiled C++ replacement (vu1_set_viewport) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "vu1_set_viewport",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035E388",
+      "hex": "0035E388",
+      "name": "vu1_set_directional_light_color",
+      "what": "Decompiled C++ replacement (vu1_set_directional_light_color) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "vu1_set_directional_light_color",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035E3F0",
+      "hex": "0035E3F0",
+      "name": "vu1_set_light_direction",
+      "what": "Decompiled C++ replacement (vu1_set_light_direction) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "vu1_set_light_direction",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035E420",
+      "hex": "0035E420",
+      "name": "vu1_set_ambient_color",
+      "what": "Decompiled C++ replacement (vu1_set_ambient_color) verified via EOD_DIFF.",
+      "subsystem": "Rendering: Lighting, Sky & Environment State",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/decomp_graphics_env.cpp",
+      "cpp_fn": "vu1_set_ambient_color",
+      "task_id": "BASE",
+      "hle_comment": "",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x0035F9A0",
+      "hex": "0035F9A0",
+      "name": "TextureBindBuild",
+      "what": "TextureBindBuild: typed texture and mip state (src/native_material_state.cpp)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "TextureBindBuild: typed texture and mip state (src/native_material_state.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0035FC40",
+      "hex": "0035FC40",
+      "name": "TextureUploadBuild",
+      "what": "typed PATH3 texture and palette upload producer (src/native_texture_upload.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_texture_upload.cpp",
+      "cpp_fn": "gs::build_texture_upload",
+      "task_id": "BASE",
+      "hle_comment": "typed PATH3 texture and palette upload producer (src/native_texture_upload.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00360E18",
+      "hex": "00360E18",
+      "name": "GsStateInit",
+      "what": "GS state init: publishes its fog constants to the native feed (src/native_fog.cpp)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "GS state init: publishes its fog constants to the native feed (src/native_fog.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00361468",
+      "hex": "00361468",
+      "name": "ImmediatePacketBegin",
+      "what": "ImmediatePacketBegin(numVerts)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "immediate_packet_begin",
+      "task_id": "BASE",
+      "hle_comment": "ImmediatePacketBegin(numVerts)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00361708",
+      "hex": "00361708",
+      "name": "ImmediateVertex",
+      "what": "ImmediateVertex: readable C++ (src/native_effects_imm.cpp, R4 A2; water/flare/cockpit/immediate)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "immediate_vertex",
+      "task_id": "BASE",
+      "hle_comment": "ImmediateVertex: readable C++ (src/native_effects_imm.cpp, R4 A2; water/flare/cockpit/immediate)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00361BC8",
+      "hex": "00361BC8",
+      "name": "ImmediateEnd",
+      "what": "ImmediateEnd()",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "immediate_end",
+      "task_id": "BASE",
+      "hle_comment": "ImmediateEnd()",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00361C30",
+      "hex": "00361C30",
+      "name": "ImmStaticEmitRef",
+      "what": "ImmStaticEmitRef(bufObj*)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "imm_static_emit_ref",
+      "task_id": "BASE",
+      "hle_comment": "ImmStaticEmitRef(bufObj*)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00361ED8",
+      "hex": "00361ED8",
+      "name": "ImmStaticDraw",
+      "what": "ImmStaticDraw(bufObj*)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "imm_static_draw",
+      "task_id": "BASE",
+      "hle_comment": "ImmStaticDraw(bufObj*)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00361F80",
+      "hex": "00361F80",
+      "name": "RenderStateCommit",
+      "what": "RenderStateCommit material state at return site 0x362588",
+      "subsystem": "Other Engine HLE",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "RenderStateCommit material state at return site 0x362588",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x003639D0",
+      "hex": "003639D0",
+      "name": "ParticleAdd",
+      "what": "ParticleAdd(col_rgb, col_alpha, size, x, y, z, angle)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "particle_add",
+      "task_id": "BASE",
+      "hle_comment": "ParticleAdd(col_rgb, col_alpha, size, x, y, z, angle)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363B68",
+      "hex": "00363B68",
+      "name": "ParticleEnd",
+      "what": "ParticleEnd()",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "particle_end",
+      "task_id": "BASE",
+      "hle_comment": "ParticleEnd()",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363B98",
+      "hex": "00363B98",
+      "name": "ParticleBegin",
+      "what": "ParticleBegin(count, scale) (VU1 0x08E0)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "particle_begin",
+      "task_id": "BASE",
+      "hle_comment": "ParticleBegin(count, scale) (VU1 0x08E0)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363C18",
+      "hex": "00363C18",
+      "name": "AtlasSpriteAdd",
+      "what": "AtlasSpriteAdd(r128 col, tile, size, x, y, z)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "atlas_sprite_add",
+      "task_id": "BASE",
+      "hle_comment": "AtlasSpriteAdd(r128 col, tile, size, x, y, z)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363D48",
+      "hex": "00363D48",
+      "name": "AtlasSpriteEnd",
+      "what": "AtlasSpriteEnd()",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "atlas_sprite_end",
+      "task_id": "BASE",
+      "hle_comment": "AtlasSpriteEnd()",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363D78",
+      "hex": "00363D78",
+      "name": "AtlasSpriteBegin",
+      "what": "AtlasSpriteBegin(count, gridSize) (VU1 0x05E0)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "atlas_sprite_begin",
+      "task_id": "BASE",
+      "hle_comment": "AtlasSpriteBegin(count, gridSize) (VU1 0x05E0)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363DE8",
+      "hex": "00363DE8",
+      "name": "SpriteAdd",
+      "what": "SpriteAdd(r128 col, flip, size, x, y, z)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "sprite_add",
+      "task_id": "BASE",
+      "hle_comment": "SpriteAdd(r128 col, flip, size, x, y, z)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363F18",
+      "hex": "00363F18",
+      "name": "SpriteEnd",
+      "what": "SpriteEnd()",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "sprite_end",
+      "task_id": "BASE",
+      "hle_comment": "SpriteEnd()",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363F48",
+      "hex": "00363F48",
+      "name": "SpriteBegin",
+      "what": "SpriteBegin(count) (VU1 0x01B8)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "sprite_begin",
+      "task_id": "BASE",
+      "hle_comment": "SpriteBegin(count) (VU1 0x01B8)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00363FF8",
+      "hex": "00363FF8",
+      "name": "ParticlePacketReserve",
+      "what": "ParticlePacketReserve(state*)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "particle_packet_reserve",
+      "task_id": "BASE",
+      "hle_comment": "ParticlePacketReserve(state*)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x003642B8",
+      "hex": "003642B8",
+      "name": "AtlasSpritePacketReserve",
+      "what": "AtlasSpritePacketReserve(state*) [RA 0x3642F4]",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "atlas_sprite_packet_reserve",
+      "task_id": "BASE",
+      "hle_comment": "AtlasSpritePacketReserve(state*) [RA 0x3642F4]",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00364548",
+      "hex": "00364548",
+      "name": "SpritePacketReserve",
+      "what": "SpritePacketReserve(state*)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "sprite_packet_reserve",
+      "task_id": "BASE",
+      "hle_comment": "SpritePacketReserve(state*)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00364D18",
+      "hex": "00364D18",
+      "name": "ImmediateVertexContinue",
+      "what": "ImmediateVertexContinue(state*, colour, strip, x, y, z, u, v)",
+      "subsystem": "Rendering: Particles, Sprites & Immediate Geo",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_effects_imm.cpp",
+      "cpp_fn": "immediate_vertex_continue",
+      "task_id": "BASE",
+      "hle_comment": "ImmediateVertexContinue(state*, colour, strip, x, y, z, u, v)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x003652A8",
+      "hex": "003652A8",
+      "name": "TextureSetLodState",
+      "what": "TextureSetLodState: TEX1 K template 0x4D8BAC / MXL 0x4D8BBC (src/native_texstate.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_texstate.cpp",
+      "cpp_fn": "texture_set_lod_state",
+      "task_id": "BASE",
+      "hle_comment": "TextureSetLodState: TEX1 K template 0x4D8BAC / MXL 0x4D8BBC (src/native_texstate.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00365308",
+      "hex": "00365308",
+      "name": "LodBiasSet",
+      "what": "LodBiasSet: sprite/particle K delta 0x4D8BB8, publishes after the original (src/native_texstate.cpp)",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "LodBiasSet: sprite/particle K delta 0x4D8BB8, publishes after the original (src/native_texstate.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x003653F8",
+      "hex": "003653F8",
+      "name": "GsFogWriteTables",
+      "what": "GsFogWriteTables: fog start/end/density 0x4D8B84..8C (src/native_fog.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_fog.cpp",
+      "cpp_fn": "fog_write_tables",
+      "task_id": "BASE",
+      "hle_comment": "GsFogWriteTables: fog start/end/density 0x4D8B84..8C (src/native_fog.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00365428",
+      "hex": "00365428",
+      "name": "FogSetColour",
+      "what": "FogSetColour: FOGCOL state 0x4D8B80 (src/native_fog.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_fog.cpp",
+      "cpp_fn": "fog_set_colour",
+      "task_id": "BASE",
+      "hle_comment": "FogSetColour: FOGCOL state 0x4D8B80 (src/native_fog.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x003654E0",
+      "hex": "003654E0",
+      "name": "BlendSelect",
+      "what": "BlendSelect: ALPHA_1 select 0x4D8B78 (src/native_texstate.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_texstate.cpp",
+      "cpp_fn": "blend_select",
+      "task_id": "BASE",
+      "hle_comment": "BlendSelect: ALPHA_1 select 0x4D8B78 (src/native_texstate.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00365540",
+      "hex": "00365540",
+      "name": "RenderFlagsCommit",
+      "what": "RenderFlagsCommit: 0x4D8BC8, bit 3 = GS PRIM.FGE (src/native_fog.cpp)",
+      "subsystem": "Rendering: Fog, Textures & LOD",
+      "tags": [
+        "rendering"
+      ],
+      "status": "done",
+      "file": "src/native_fog.cpp",
+      "cpp_fn": "render_flags_commit",
+      "task_id": "BASE",
+      "hle_comment": "RenderFlagsCommit: 0x4D8BC8, bit 3 = GS PRIM.FGE (src/native_fog.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": 0
+    },
+    {
+      "addr": "0x00365578",
+      "hex": "00365578",
+      "name": "GsStateReset",
+      "what": "GS state reset: publishes the LOD/blend values it stored (src/native_texstate.cpp)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "GS state reset: publishes the LOD/blend values it stored (src/native_texstate.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00365878",
+      "hex": "00365878",
+      "name": "DmaBankCompletionFence",
+      "what": "second DMA bank completion fence (src/native_texture_upload.cpp)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "second DMA bank completion fence (src/native_texture_upload.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00366C88",
+      "hex": "00366C88",
+      "name": "DmaPacketReserveTop",
+      "what": "packet reserve (top): tagged for VU1 start attribution (render_trace)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "packet reserve (top): tagged for VU1 start attribution (render_trace)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00366D30",
+      "hex": "00366D30",
+      "name": "DmaPacketReserve",
+      "what": "packet reserve: tagged for VU1 start attribution",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "packet reserve: tagged for VU1 start attribution",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00366D78",
+      "hex": "00366D78",
+      "name": "DmaSecondManagerPacketReserve",
+      "what": "packet reserve, second manager: tagged for VU1 start attribution",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "packet reserve, second manager: tagged for VU1 start attribution",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00366DD8",
+      "hex": "00366DD8",
+      "name": "DmaSecondManagerPacketReserveAlternate",
+      "what": "packet reserve, second manager: tagged for VU1 start attribution",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "packet reserve, second manager: tagged for VU1 start attribution",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x003670C8",
+      "hex": "003670C8",
+      "name": "MoviePlay",
+      "what": "MoviePlay(name) - EOD_SKIP_MOVIES",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "MoviePlay(name) - EOD_SKIP_MOVIES",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0036E9C0",
+      "hex": "0036E9C0",
+      "name": "DealerBuyScreen",
+      "what": "dealer Buy screen: pass-through to MenuRun loop",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "dealer Buy screen: pass-through to MenuRun loop",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x003702F0",
+      "hex": "003702F0",
+      "name": "AutoShopUpdateSelection",
+      "what": "dealer car list: per-frame selection details; tells career_vblank the dealer screen is up (page banner)",
+      "subsystem": "Battle Mode & AI Bots",
+      "tags": [
+        "battle",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "dealer car list: per-frame selection details; tells career_vblank the dealer screen is up (page banner)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00370608",
+      "hex": "00370608",
+      "name": "DealerBuySelected",
+      "what": "dealer: buy the highlighted car (trade screen); a page turn ends the list menu through it without buying",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "dealer: buy the highlighted car (trade screen); a page turn ends the list menu through it without buying",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x00370DD8",
+      "hex": "00370DD8",
+      "name": "DealerGetSlotForCar",
+      "what": "dealer get_slot_for_car: maps vehicle to yard slot without panicking",
+      "subsystem": "Career & Garage Economy",
+      "tags": [
+        "career",
+        "mods"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "dealer get_slot_for_car: maps vehicle to yard slot without panicking",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x003896E8",
+      "hex": "003896E8",
+      "name": "GsExecuteLoadImage",
+      "what": "SDK normal-DMA image submission: 16 boot VRAM pages (src/native_texture_upload.cpp)",
+      "subsystem": "Rendering & GS/VU1 Pipeline",
+      "tags": [
+        "rendering"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "SDK normal-DMA image submission: 16 boot VRAM pages (src/native_texture_upload.cpp)",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0038FF40",
+      "hex": "0038FF40",
+      "name": "scePadRead",
+      "what": "default-off netplay consumed SDK pad reply trace",
+      "subsystem": "Online Session & Race Lifecycle",
+      "tags": [
+        "online"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "default-off netplay consumed SDK pad reply trace",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x0039AFB0",
+      "hex": "0039AFB0",
+      "name": "MovieBitBufferRefill",
+      "what": "movie bit-buffer consume/refill: exact RAM fast path, generated fallback",
+      "subsystem": "UI, Camera & Session Flow",
+      "tags": [
+        "ui"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "movie bit-buffer consume/refill: exact RAM fast path, generated fallback",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    },
+    {
+      "addr": "0x003A60E0",
+      "hex": "003A60E0",
+      "name": "printf",
+      "what": "printf (newlib) - mirrored to the log",
+      "subsystem": "Kernel, Memory & I/O",
+      "tags": [
+        "core"
+      ],
+      "status": "queued_other",
+      "file": "",
+      "cpp_fn": "",
+      "task_id": "",
+      "hle_comment": "printf (newlib) - mirrored to the log",
+      "diff_calls": "",
+      "diff_mismatches": ""
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Vehicle Control, Damage/Invincibility, Turbo & Online Car-to-Car Impulse",
+      "subsystem": "Vehicle Control & Online Impact",
+      "priority": "Mod + Online",
+      "tags": [
+        "online",
+        "mods",
+        "physics"
+      ],
+      "status": "done",
+      "commit": "5bb2862 (main)",
+      "notes": "Completed & merged on main: 0 EOD_DIFF mismatches & 0 heap errors across Battle + Dennison Race (0x18AA68: 1221/1221, 0x18AA70: 1221/1221, 0x18AAD0: 8/8, 0x18F2A8: 322/322, 0x189648: 457/457; 0x18AD20 9-insn leaf static verified).",
+      "done_count": 6,
+      "total_count": 6,
+      "functions": [
+        {
+          "addr": "0x0018AA68",
+          "name": "CarSetBrake",
+          "what": "Applies brake input to a vehicle; hooked by KillableChallengers mod to hold wrecked challengers.",
+          "tags": [
+            "mods",
+            "physics"
+          ],
+          "diff_calls": "1221",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_vehicle_control.cpp"
+        },
+        {
+          "addr": "0x0018AA70",
+          "name": "CarSetThrottle",
+          "what": "Applies throttle input to a vehicle; hooked by KillableChallengers mod.",
+          "tags": [
+            "mods",
+            "physics"
+          ],
+          "diff_calls": "1221",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_vehicle_control.cpp"
+        },
+        {
+          "addr": "0x0018AAD0",
+          "name": "CarCanTakeDamage",
+          "what": "Checks whether a vehicle can receive damage; hooked by Career/KillableChallengers.",
+          "tags": [
+            "mods",
+            "physics"
+          ],
+          "diff_calls": "8",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_vehicle_control.cpp"
+        },
+        {
+          "addr": "0x0018AD20",
+          "name": "CarSetDamage",
+          "what": "Scalar vehicle damage setter; hooked by Invincibility mod.",
+          "tags": [
+            "mods",
+            "online",
+            "physics"
+          ],
+          "diff_calls": "0 (9-insn leaf verified)",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_vehicle_control.cpp"
+        },
+        {
+          "addr": "0x0018F2A8",
+          "name": "HumanDriverUpdate",
+          "what": "Updates human driver inputs and turbo boost speed cap/acceleration; hooked by Turbo Boost mod.",
+          "tags": [
+            "mods",
+            "online",
+            "physics"
+          ],
+          "diff_calls": "322",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_vehicle_control.cpp"
+        },
+        {
+          "addr": "0x00189648",
+          "name": "CarApplySolvedContact",
+          "what": "Resolves car-to-car collision impulses; hooked by online netplay for peer impulse handoff.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "diff_calls": "457",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_vehicle_control.cpp"
+        }
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "Online Race Start, Countdown, RNG, Crash Orbit & Event Completion",
+      "subsystem": "Online Session & Race Lifecycle",
+      "priority": "Online",
+      "tags": [
+        "online",
+        "mods"
+      ],
+      "status": "done",
+      "commit": "6b1f63b (merged to main)",
+      "notes": "Completed & verified with 0 EOD_DIFF mismatches (0x176698: 1024/1024, 0x176798: 719/719, 0x176918: 9/9, 0x120FB8: 1/1; 0x114358 end-to-end verified; 0x1D3FB8 static verified). Unit tests pass.",
+      "done_count": 6,
+      "total_count": 6,
+      "functions": [
+        {
+          "addr": "0x00176698",
+          "name": "RaceSessionInitPhase",
+          "what": "Sets race-start phase and RNG epoch; synchronized across online peers.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "1024",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_race_lifecycle.cpp"
+        },
+        {
+          "addr": "0x00176798",
+          "name": "RaceGetModeState",
+          "what": "Checks opening race/Battle countdown release; hooked by solo editor map preview.",
+          "tags": [
+            "online",
+            "mods"
+          ],
+          "diff_calls": "719",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_race_lifecycle.cpp"
+        },
+        {
+          "addr": "0x00176918",
+          "name": "RaceSessionSeedRng",
+          "what": "Initializes native race RNG seeds; agreed across online lobby peers.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "9",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_race_lifecycle.cpp"
+        },
+        {
+          "addr": "0x001D3FB8",
+          "name": "StartCrashOrbitPause",
+          "what": "Requests 3-second world pause during single-view crash orbit; bypassed in online events.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "0 (static verified)",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_race_lifecycle.cpp"
+        },
+        {
+          "addr": "0x00120FB8",
+          "name": "EveHasMoreEvents",
+          "what": "Checks whether more events remain in the current Eve; returns 0 to unwind online events.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "1",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_race_lifecycle.cpp"
+        },
+        {
+          "addr": "0x00114358",
+          "name": "RunRaceContest",
+          "what": "Finishes one contest after native race cleanup; triggers online post-race transition.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "5 runs e2e",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_race_lifecycle.cpp"
+        }
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "Explosive Chicken Weapon & Online Projectile Sync (+8 Cluster Helpers)",
+      "subsystem": "Explosive Chicken Weapons",
+      "priority": "Online + Mod",
+      "tags": [
+        "online",
+        "mods",
+        "weapons"
+      ],
+      "status": "done",
+      "commit": "76f6acf (merged to main)",
+      "notes": "Completed & merged on main: 12 functions decompiled with 0 EOD_DIFF mismatches across solo Battle 8 AI + online host/guest Battle; native_weapon_test 197/197 PASS, eod_live_cheats_test PASS.",
+      "done_count": 12,
+      "total_count": 12,
+      "functions": [
+        {
+          "addr": "0x0017DA58",
+          "name": "ChickenExplosionApplyShockwave",
+          "what": "Computes radial chicken blast shockwave on 100x100 spatial hash grid; scaled by mods & published online.",
+          "tags": [
+            "online",
+            "mods",
+            "weapons"
+          ],
+          "diff_calls": "53+",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E000",
+          "name": "ChickenWeaponTrigger",
+          "what": "Launches explosive chicken projectile (Straight/Mortar/Rain); publishes launches online.",
+          "tags": [
+            "online",
+            "weapons"
+          ],
+          "diff_calls": "2130",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E4D8",
+          "name": "ChickenWeaponStartCooldown",
+          "what": "Starts 3.0s chicken reload cooldown; always initialized so Chicken Fight toggles mid-race.",
+          "tags": [
+            "online",
+            "mods",
+            "weapons"
+          ],
+          "diff_calls": "194+",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E718",
+          "name": "ChickenWeaponDetonate",
+          "what": "Resolves chicken impact & detonation; replays host-confirmed impacts on online replicas.",
+          "tags": [
+            "online",
+            "weapons"
+          ],
+          "diff_calls": "179",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017DDB0",
+          "name": "WeaponRegistryUnregister",
+          "what": "Unregisters a weapon instance from the global 16-weapon registry.",
+          "tags": [
+            "weapons"
+          ],
+          "diff_calls": "0 (teardown verified)",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017DE30",
+          "name": "WeaponRegistryRegister",
+          "what": "Registers a weapon instance in the global 16-weapon registry.",
+          "tags": [
+            "weapons"
+          ],
+          "diff_calls": "9",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017DE78",
+          "name": "WeaponRegistryQuery",
+          "what": "Queries the global weapon registry by owner/slot.",
+          "tags": [
+            "weapons"
+          ],
+          "diff_calls": "138",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017DFA8",
+          "name": "ChickenWeaponAlloc",
+          "what": "Allocates and constructs a 0x228-byte Explosive Chicken weapon instance.",
+          "tags": [
+            "weapons"
+          ],
+          "diff_calls": "9",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E440",
+          "name": "ChickenWeaponGetHudStatus",
+          "what": "Computes HUD cooldown/ready status for the chicken weapon.",
+          "tags": [
+            "weapons",
+            "ui"
+          ],
+          "diff_calls": "20",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E520",
+          "name": "ChickenWeaponCaptureReplayState",
+          "what": "Captures chicken weapon state for replay/netplay synchronization.",
+          "tags": [
+            "online",
+            "weapons"
+          ],
+          "diff_calls": "202",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E5C8",
+          "name": "ChickenWeaponUpdate",
+          "what": "Per-tick chicken weapon state machine & flight/reload update.",
+          "tags": [
+            "online",
+            "weapons"
+          ],
+          "diff_calls": "900",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        },
+        {
+          "addr": "0x0017E8C0",
+          "name": "ChickenWeaponRetire",
+          "what": "Retires an exploded/expired chicken projectile back to idle.",
+          "tags": [
+            "weapons"
+          ],
+          "diff_calls": "18",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_chicken_weapon.cpp"
+        }
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "Online World-Step, Active Driver & Input Replay",
+      "subsystem": "Online Simulation & Input",
+      "priority": "Online",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "done",
+      "commit": "e46adf7 (main)",
+      "notes": "Completed & merged on main: 0 EOD_DIFF mismatches & 0 heap errors across Woodly Jump Race, Dundas No-Rules Race, and Dennison Detention (0x177718: 1097/1097, 0x190A38: 663/663, 0x191548: 591/591, 0x165E10: 4/4). Mapped full MMO headless server sim vs client-only callees inside WorldStepTick.",
+      "done_count": 4,
+      "total_count": 4,
+      "functions": [
+        {
+          "addr": "0x00177718",
+          "name": "WorldStepTick",
+          "what": "Main per-tick simulation step boundary traced/synchronized by netplay; core of future 24/7 headless MMO server.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "diff_calls": "1097",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_online_sim.cpp"
+        },
+        {
+          "addr": "0x00190A38",
+          "name": "CarSetActiveDriver",
+          "what": "Switches vehicle active driver between pace-lap autopilot and human/remote player.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "663",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_online_sim.cpp"
+        },
+        {
+          "addr": "0x00191548",
+          "name": "HumanReplayRecordTick",
+          "what": "Encodes/consumes 6-byte per-tick human input replay record.",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "591",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_online_sim.cpp"
+        },
+        {
+          "addr": "0x00165E10",
+          "name": "DetentionMasterSetupRole",
+          "what": "Configures DetentionMaster participant/bus role before setup (online bus sync).",
+          "tags": [
+            "online"
+          ],
+          "diff_calls": "4",
+          "diff_mismatches": 0,
+          "done": true,
+          "file": "src/decomp_online_sim.cpp"
+        }
+      ]
+    },
+    {
+      "id": "T5",
+      "title": "Recovery, Timed Damage & Custom Map Collision",
+      "subsystem": "Custom Map Physics & Recovery",
+      "priority": "Mod",
+      "tags": [
+        "mods",
+        "physics"
+      ],
+      "status": "in_progress",
+      "commit": "",
+      "notes": "Parallel Subagent #5 active in d:\\eod-worktrees\\t5-physics-collision: manual recovery countdown, inline timed-damage feat, and custom map wheel ground / swept chassis box collision.",
+      "done_count": 0,
+      "total_count": 4,
+      "functions": [
+        {
+          "addr": "0x001B8370",
+          "name": "CarUpdateOutOfBoundsRecovery",
+          "what": "Handles countdown recovery when upside down or out of bounds; hooked for manual-only recovery.",
+          "tags": [
+            "mods",
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001B5840",
+          "name": "CarUpdateTimedDamage",
+          "what": "Applies inline timed-damage during vehicle update; suppressed by Invincibility mod.",
+          "tags": [
+            "mods",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00212500",
+          "name": "WheelGroundQuery",
+          "what": "Queries track surface triangles under wheels; merges portable custom map triangles.",
+          "tags": [
+            "mods",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001DE7B0",
+          "name": "ChassisSweptBoxCollide",
+          "what": "Resolves swept chassis OBB collisions against track geometry; merges custom map triangles.",
+          "tags": [
+            "mods",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        }
+      ]
+    },
+    {
+      "id": "T6",
+      "title": "Battle Mode Spawns, Respawn, Update & AI Control Injection",
+      "subsystem": "Battle Mode & AI Bots",
+      "priority": "Mod + Online",
+      "tags": [
+        "mods",
+        "online",
+        "battle"
+      ],
+      "status": "queued",
+      "commit": "",
+      "notes": "Battle arena spawn tables, online SELECT respawn validation, BattleMaster update, and AI car input injection.",
+      "done_count": 0,
+      "total_count": 6,
+      "functions": [
+        {
+          "addr": "0x001671E8",
+          "name": "BattleSelectRespawn",
+          "what": "Handles SELECT respawn delay & spawn choice; validated by online host.",
+          "tags": [
+            "online",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001673B8",
+          "name": "BattleLookupRespawnPose",
+          "what": "Looks up respawn transform in spawn table; extended for creator maps.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00167A88",
+          "name": "BattleBuildSpawnTable",
+          "what": "Constructs Battle spawn table from track data or mounted creator map.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00167C70",
+          "name": "BattleInitialPlacement",
+          "what": "Places cars on Battle grid; offsets cars beyond native spawn count.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00167D58",
+          "name": "BattleMasterUpdate",
+          "what": "Main BattleMaster per-frame progression & win-state evaluation.",
+          "tags": [
+            "mods",
+            "online",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001A2D20",
+          "name": "AiCarUpdateInput",
+          "what": "Injects AI steering, throttle, brake, clutch, and gear inputs; hooked by Battle bots.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        }
+      ]
+    },
+    {
+      "id": "T7",
+      "title": "Battle Roster, Event Tables & Kill Feed",
+      "subsystem": "Battle Mode & AI Bots",
+      "priority": "Mod",
+      "tags": [
+        "mods",
+        "battle"
+      ],
+      "status": "queued",
+      "commit": "",
+      "notes": "Single-player Battle injection, 4-AI / 8-AI rosters, cross-class AI selection, and named rival kill feed.",
+      "done_count": 0,
+      "total_count": 6,
+      "functions": [
+        {
+          "addr": "0x001244A8",
+          "name": "ActionEveInjectBattle",
+          "what": "Builds Action Eve contest list; injects Battle (4 AI)/(8 AI) events.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x0012C158",
+          "name": "BattleBuildRoster",
+          "what": "Populates Battle participant roster; extended to fill AI bots.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001116E0",
+          "name": "BattlePickAiDriverVehicle",
+          "what": "Selects AI driver & vehicle records across classes for Battle (N AI).",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00119428",
+          "name": "BattleResolveDriverName",
+          "what": "Resolves rival driver display name for kill feed messages.",
+          "tags": [
+            "mods",
+            "online",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00166B50",
+          "name": "BattleDrawKillMessage",
+          "what": "Draws Battle kill announcement banner on HUD.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x0020FD48",
+          "name": "SceneCreateWeapons",
+          "what": "Creates vehicle weapons through native scene factory for Battle bots.",
+          "tags": [
+            "mods",
+            "battle"
+          ],
+          "done": false,
+          "file": ""
+        }
+      ]
+    },
+    {
+      "id": "T8",
+      "title": "Career Unlocks, Dealership, Extended Garage & Part Upgrades",
+      "subsystem": "Career & Garage Economy",
+      "priority": "Mod",
+      "tags": [
+        "mods",
+        "career"
+      ],
+      "status": "queued",
+      "commit": "",
+      "notes": "Career rank gates, dealer stock pagination, trade-in valuation, 16-slot garage, and cross-class part compatibility.",
+      "done_count": 0,
+      "total_count": 10,
+      "functions": [
+        {
+          "addr": "0x002E35F0",
+          "name": "AutoShopSetAvailable",
+          "what": "Selects dealership available car lineup; extended to page through full roster.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E5200",
+          "name": "CareerCheckEveRankGate",
+          "what": "Tests Career rank eligibility for an Eve; bypassed by OpenCareer mod.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E6C78",
+          "name": "CareerUpdateRankAfterEve",
+          "what": "Computes new Career rank after an Eve; prevents forced Career end.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E3BC8",
+          "name": "CareerCalcDepreciation",
+          "what": "Computes car sale/trade-in depreciation; zeroed by FreeSwap mod.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E3E70",
+          "name": "CareerGetUsedValue",
+          "what": "Returns 90% used value of owned car; full value under FreeSwap mod.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002DFDF8",
+          "name": "CareerPartCompatMask",
+          "what": "Looks up upgrade part compatibility bitmask; extended for cross-class parts.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002DED18",
+          "name": "CareerValidatePartPurchase",
+          "what": "Validates part purchase & multi-stage upgrade swaps.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E1BB0",
+          "name": "CareerGarageGetCount",
+          "what": "Returns owned garage car count; extended up to 16 cars.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E1BC0",
+          "name": "CareerGarageAddCar",
+          "what": "Adds a purchased car to garage; routes slots 4..15 to extended storage.",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x002E1380",
+          "name": "CareerGarageGetTuning",
+          "what": "Returns tuning block pointer for a garage slot (0..15).",
+          "tags": [
+            "mods",
+            "career"
+          ],
+          "done": false,
+          "file": ""
+        }
+      ]
+    },
+    {
+      "id": "T9",
+      "title": "HUD, Menus, Camera Director & NASCAR Audio/Wheel Hooks",
+      "subsystem": "UI, Camera & NASCAR Audio",
+      "priority": "Mod",
+      "tags": [
+        "mods",
+        "ui",
+        "audio"
+      ],
+      "status": "queued",
+      "commit": "",
+      "notes": "Widescreen HUD rows, MenuRun modal engine, showroom 360 orbit camera, and NASCAR audio/transmission hooks.",
+      "done_count": 0,
+      "total_count": 7,
+      "functions": [
+        {
+          "addr": "0x00119888",
+          "name": "HudDrawLeftRaceRows",
+          "what": "Draws left HUD position/lap/damage rows with widescreen edge anchors.",
+          "tags": [
+            "mods",
+            "ui"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00119F40",
+          "name": "HudDrawRightSpeedRows",
+          "what": "Draws right HUD speed/tachometer rows with widescreen edge anchors.",
+          "tags": [
+            "mods",
+            "ui"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00270C10",
+          "name": "MenuRun",
+          "what": "Core modal UI/dialog loop; auto-answers online Arcade prompts.",
+          "tags": [
+            "online",
+            "ui"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001C31A0",
+          "name": "CameraDirectorUpdate",
+          "what": "Updates camera director; injects 360 showroom/garage turntable orbit.",
+          "tags": [
+            "mods",
+            "ui"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x0023C400",
+          "name": "CarAudioLoadVal",
+          "what": "Loads vehicle engine audio parameters; hooks NASCAR ESFX loader.",
+          "tags": [
+            "mods",
+            "audio"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x0023C8D0",
+          "name": "CarAudioMixFrame",
+          "what": "Per-frame vehicle engine audio mixer; hooks NASCAR ESFX mixer.",
+          "tags": [
+            "mods",
+            "audio"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00186DC8",
+          "name": "CarBuildTransmission",
+          "what": "Builds transmission & shift table from .gar; hooks dynamic NASCAR class gears.",
+          "tags": [
+            "mods",
+            "audio",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        }
+      ]
+    },
+    {
+      "id": "T10",
+      "title": "MMO Headless Dedicated-Server Core (WorldStepTick Physics & Snapshot Callees)",
+      "subsystem": "Online Simulation & Input",
+      "priority": "MMO Server",
+      "tags": [
+        "online",
+        "physics"
+      ],
+      "status": "queued",
+      "commit": "",
+      "notes": "Pure simulation callees inside WorldStepTick (0x00177718) required to compile a zero-GPU 24/7 authoritative MMO server and lift the 20-car world pool cap.",
+      "done_count": 0,
+      "total_count": 6,
+      "functions": [
+        {
+          "addr": "0x001779C0",
+          "name": "EntityMatrixOrthonormalizeRoundRobin",
+          "what": "96-insn round-robin entity matrix orthonormalizer inside WorldStepTick.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00177B40",
+          "name": "SimSnapshotHistoryStep",
+          "what": "87-insn simulation snapshot history ring step inside WorldStepTick.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00178258",
+          "name": "DynamicEntitiesPostStep",
+          "what": "72-insn post-physics coordinator & snapshot capture hook inside WorldStepTick.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001792E8",
+          "name": "TrackRacePreStep",
+          "what": "51-insn track/race state pre-step inside WorldStepTick.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x001793B8",
+          "name": "TrackRaceMidStep",
+          "what": "71-insn track/race state mid-step inside WorldStepTick.",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        },
+        {
+          "addr": "0x00177CA0",
+          "name": "DynamicEntitiesPhysicsStep",
+          "what": "365-insn rigid-body/vehicle/constraint physics integration loop over g_ActiveDynamicEntities (0x003CDBE8).",
+          "tags": [
+            "online",
+            "physics"
+          ],
+          "done": false,
+          "file": ""
+        }
+      ]
+    }
+  ]
+};
+const STATUS_LABEL = {
+  done: ["Done", "b-done"],
+  in_progress: ["In Progress", "b-prog"],
+  queued_priority: ["Queued (Mod/Online)", "b-prio"],
+  queued_other: ["Queued (Engine)", "b-other"],
+};
+
+document.getElementById("genAt").textContent = `Updated: ${DATA.generated_at} · ELF Total: ${DATA.total_elf_funcs.toLocaleString()} · Named Symbols: ${DATA.symbols_count}`;
+
+const counts = { done: 0, in_progress: 0, queued_priority: 0, queued_other: 0 };
+for (const e of DATA.entries) counts[e.status] = (counts[e.status] || 0) + 1;
+const trackedTotal = DATA.entries.length;
+const prioTotal = DATA.tasks.reduce((a, t) => a + t.total_count, 0);
+const prioDone = DATA.tasks.reduce((a, t) => a + t.done_count, 0);
+const rawRemainingGame = DATA.game_elf_funcs - DATA.done_game;
+
+document.getElementById("kpis").innerHTML = `
+  <div class="kpi">
+    <div class="kpi-label">True Full-Game Progress</div>
+    <div class="kpi-val" style="color:var(--done)">${DATA.done_game} / ${DATA.game_elf_funcs.toLocaleString()}</div>
+    <div class="kpi-sub">${((DATA.done_game / DATA.game_elf_funcs) * 100).toFixed(2)}% of game code (+ ${DATA.sdk_elf_funcs.toLocaleString()} Sony SDK/CRT)</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Game Functions Remaining</div>
+    <div class="kpi-val" style="color:#f8fafc">${rawRemainingGame.toLocaleString()}</div>
+    <div class="kpi-sub">Still running as static recomp C (gen/rec_*.c)</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Active Parallel Subagents</div>
+    <div class="kpi-val" style="color:var(--prog)">${counts.in_progress} fns</div>
+    <div class="kpi-sub">Active in priority tasks (isolated worktrees)</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Mod &amp; Online Wave 1</div>
+    <div class="kpi-val" style="color:var(--prio)">${prioDone} / ${prioTotal}</div>
+    <div class="kpi-sub">${prioTotal - prioDone} priority entrypoints left in Wave 1</div>
+  </div>
+`;
+
+const pctGame = ((DATA.done_game / DATA.game_elf_funcs) * 100).toFixed(2);
+document.getElementById("fullBinaryBar").innerHTML = `
+  <div class="bar-header">
+    <strong>Full Game Binary (SLUS_209.10 Game Code: ${DATA.game_elf_funcs.toLocaleString()} functions, excluding ${DATA.sdk_elf_funcs.toLocaleString()} Sony SDK/CRT)</strong>
+    <span style="font-family:ui-monospace,Consolas,monospace">${DATA.done_game} decompiled (${pctGame}%) · ${rawRemainingGame.toLocaleString()} still static recomp C</span>
+  </div>
+  <div class="stacked-bar">
+    <div class="seg-done" style="width:${Math.max(0.4, (DATA.done_game / DATA.game_elf_funcs) * 100)}%"></div>
+    <div class="seg-prog" style="width:${Math.max(0.2, (counts.in_progress / DATA.game_elf_funcs) * 100)}%"></div>
+    <div class="seg-prio" style="width:${Math.max(0.3, (counts.queued_priority / DATA.game_elf_funcs) * 100)}%"></div>
+  </div>
+`;
+
+document.getElementById("trackedSurfaceBar").innerHTML = `
+  <div class="bar-header">
+    <strong>Hooked / Priority Engine Surface (${trackedTotal} functions currently mapped in HLE + Wave 1)</strong>
+    <span style="font-family:ui-monospace,Consolas,monospace">${counts.done} done · ${counts.in_progress} active · ${counts.queued_priority + counts.queued_other} left (${((counts.done / trackedTotal) * 100).toFixed(1)}%)</span>
+  </div>
+  <div class="stacked-bar">
+    <div class="seg-done" style="width:${(counts.done / trackedTotal) * 100}%"></div>
+    <div class="seg-prog" style="width:${(counts.in_progress / trackedTotal) * 100}%"></div>
+    <div class="seg-prio" style="width:${(counts.queued_priority / trackedTotal) * 100}%"></div>
+    <div class="seg-other" style="width:${(counts.queued_other / trackedTotal) * 100}%"></div>
+  </div>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--done)"></span>Byte-Exact C++ Verified (${counts.done})</span>
+    <span><span class="dot" style="background:var(--prog)"></span>In Progress (${counts.in_progress})</span>
+    <span><span class="dot" style="background:var(--prio)"></span>Wave 1 Mod &amp; Online (${counts.queued_priority})</span>
+    <span><span class="dot" style="background:var(--other)"></span>Other HLE Wrapped (${counts.queued_other})</span>
+    <span><span class="dot" style="background:var(--raw);border:1px solid #475569"></span>Unmapped Static Recomp C (${(DATA.game_elf_funcs - trackedTotal).toLocaleString()} game fns)</span>
+  </div>
+`;
+
+// Render Full Binary Address-Space Bands
+document.getElementById("viewFullmap").innerHTML = DATA.bands.map(b => {
+  const pct = b.total ? ((b.done / b.total) * 100).toFixed(2) : "0.00";
+  return `
+    <div class="band-row" style="${b.is_sdk ? 'opacity:0.75' : ''}">
+      <div class="band-top">
+        <strong>${b.label}</strong>
+        <span class="sub-stats">${b.done} done / ${b.total.toLocaleString()} total (${pct}%) · ${b.in_progress} active · ${b.queued_priority} priority · ${b.hle_wrapped} HLE · ${b.raw_recomp.toLocaleString()} raw recomp</span>
+      </div>
+      <div class="stacked-bar" style="height:10px;">
+        <div class="seg-done" style="width:${b.done ? Math.max(0.5, (b.done / b.total) * 100) : 0}%"></div>
+        <div class="seg-prog" style="width:${b.in_progress ? Math.max(0.4, (b.in_progress / b.total) * 100) : 0}%"></div>
+        <div class="seg-prio" style="width:${b.queued_priority ? Math.max(0.4, (b.queued_priority / b.total) * 100) : 0}%"></div>
+        <div class="seg-other" style="width:${b.hle_wrapped ? Math.max(0.4, (b.hle_wrapped / b.total) * 100) : 0}%"></div>
+      </div>
+    </div>
+  `;
+}).join("");
+
+function openModal(e) {
+  const [lbl, cls] = STATUS_LABEL[e.status] || ["Queued", "b-other"];
+  document.getElementById("modalBody").innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+      <h2>${e.name}</h2>
+      <span class="badge ${cls}">${lbl}</span>
+    </div>
+    <div class="modal-meta">${e.addr} · ${e.subsystem}${e.task_id ? " · Task " + e.task_id : ""}</div>
+    <div class="modal-row"><strong>What it is:</strong> ${e.what || "—"}</div>
+    <div class="modal-row"><strong>Source file:</strong> <code>${e.file || "Not yet decompiled"}</code></div>
+    ${e.cpp_fn ? `<div class="modal-row"><strong>C++ symbol:</strong> <code>${e.cpp_fn}</code></div>` : ""}
+    ${e.hle_comment ? `<div class="modal-row"><strong>HLE note:</strong> ${e.hle_comment}</div>` : ""}
+    <div class="tag-row" style="margin-top:12px;">${e.tags.map(t => `<span class="tag ${t}">${t}</span>`).join("")}</div>
+    <button class="close-btn" onclick="document.getElementById('modalBackdrop').classList.remove('open')">Close</button>
+  `;
+  document.getElementById("modalBackdrop").classList.add("open");
+}
+document.getElementById("modalBackdrop").addEventListener("click", (ev) => {
+  if (ev.target.id === "modalBackdrop") ev.target.classList.remove("open");
+});
+
+function renderSubsystems() {
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  const sf = document.getElementById("statusFilter").value;
+  const tf = document.getElementById("tagFilter").value;
+  const filtered = DATA.entries.filter(e => {
+    if (sf === "left" && e.status === "done") return false;
+    if (sf !== "all" && sf !== "left" && e.status !== sf) return false;
+    if (tf !== "all" && !e.tags.includes(tf)) return false;
+    if (q && !(e.addr + " " + e.name + " " + e.what + " " + e.subsystem + " " + e.file).toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const groups = new Map();
+  for (const e of filtered) {
+    if (!groups.has(e.subsystem)) groups.set(e.subsystem, []);
+    groups.get(e.subsystem).push(e);
+  }
+  const sortedGroups = [...groups.entries()].sort((a, b) => {
+    const score = (arr) => arr.some(x => x.status === "in_progress") ? 0 : arr.some(x => x.status === "queued_priority") ? 1 : arr.some(x => x.status === "queued_other") ? 2 : 3;
+    return score(a[1]) - score(b[1]) || a[0].localeCompare(b[0]);
+  });
+  const container = document.getElementById("viewSubsystems");
+  if (!sortedGroups.length) { container.innerHTML = `<div class="sub-card" style="color:var(--muted)">No functions match.</div>`; return; }
+  container.innerHTML = "";
+  for (const [sub, items] of sortedGroups) {
+    const d = items.filter(x => x.status === "done").length;
+    const p = items.filter(x => x.status === "in_progress").length;
+    const qp = items.filter(x => x.status === "queued_priority").length;
+    const qo = items.filter(x => x.status === "queued_other").length;
+    const n = items.length;
+    const card = document.createElement("div");
+    card.className = "sub-card";
+    card.innerHTML = `
+      <div class="sub-head"><div class="sub-title">${sub}</div><div class="sub-stats">${d}/${n} done${p ? ` · ${p} active` : ""}${qp+qo ? ` · ${qp+qo} left` : ""}</div></div>
+      <div class="mini-bar"><div class="seg-done" style="width:${(d/n)*100}%"></div><div class="seg-prog" style="width:${(p/n)*100}%"></div><div class="seg-prio" style="width:${(qp/n)*100}%"></div><div class="seg-other" style="width:${(qo/n)*100}%"></div></div>
+      <div class="tile-grid"></div>`;
+    const grid = card.querySelector(".tile-grid");
+    for (const e of items) {
+      const [lbl, cls] = STATUS_LABEL[e.status] || ["Queued", "b-other"];
+      const tile = document.createElement("div");
+      tile.className = "tile " + e.status;
+      tile.innerHTML = `<div class="tile-top"><span class="addr">${e.addr}</span><span class="badge ${cls}">${lbl}</span></div><div class="fn-name">${e.name}</div><div class="fn-what">${e.what}</div><div class="tag-row">${e.task_id ? `<span class="tag">${e.task_id}</span>` : ""}${e.tags.map(t => `<span class="tag ${t}">${t}</span>`).join("")}</div>`;
+      tile.addEventListener("click", () => openModal(e));
+      grid.appendChild(tile);
+    }
+    container.appendChild(card);
+  }
+}
+
+function renderPipeline() {
+  const el = document.getElementById("viewPipeline");
+  el.innerHTML = DATA.tasks.map(t => {
+    const [lbl, cls] = t.status === "done" ? ["Done", "b-done"] : t.status === "in_progress" ? ["In Progress", "b-prog"] : ["Queued", "b-prio"];
+    return `
+      <div class="task-card ${t.status}">
+        <div class="task-head">
+          <div><span class="task-id">${t.id}</span><strong>${t.title}</strong></div>
+          <div><span class="sub-stats" style="margin-right:10px;">${t.done_count}/${t.total_count} done${t.commit ? " · " + t.commit : ""}</span><span class="badge ${cls}">${lbl}</span></div>
+        </div>
+        <div class="subtitle" style="margin:6px 0 12px;">${t.notes}</div>
+        <div class="tile-grid">
+          ${t.functions.map(f => {
+            const st = f.done ? "done" : (t.status === "in_progress" ? "in_progress" : "queued_priority");
+            const [fl, fc] = STATUS_LABEL[st];
+            return `<div class="tile ${st}"><div class="tile-top"><span class="addr">${f.addr}</span><span class="badge ${fc}">${fl}</span></div><div class="fn-name">${f.name}</div><div class="fn-what">${f.what}</div></div>`;
+          }).join("")}
+        </div>
+      </div>`;
+  }).join("");
+}
+
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    const v = btn.dataset.view;
+    document.getElementById("viewFullmap").style.display = v === "fullmap" ? "flex" : "none";
+    document.getElementById("viewPipeline").style.display = v === "pipeline" ? "flex" : "none";
+    document.getElementById("viewSubsystems").style.display = v === "subsystems" ? "flex" : "none";
+    document.getElementById("controls").style.display = v === "subsystems" ? "flex" : "none";
+  });
+});
+document.getElementById("search").addEventListener("input", renderSubsystems);
+document.getElementById("statusFilter").addEventListener("change", renderSubsystems);
+document.getElementById("tagFilter").addEventListener("change", renderSubsystems);
+renderSubsystems();
+renderPipeline();
+</script>
+</body>
+</html>
